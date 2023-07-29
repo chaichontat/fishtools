@@ -1,8 +1,8 @@
 import logging
 from concurrent.futures import ProcessPoolExecutor
-from functools import partial
 from itertools import chain
 from pathlib import Path
+from typing import Callable
 
 import click
 import numpy as np
@@ -12,7 +12,6 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
 def dax_reader(path: Path):
@@ -30,7 +29,7 @@ def dax_reader(path: Path):
     return image_data
 
 
-def run(path: Path, *, level: int, remove: bool = False):
+def run(path: Path, *, level: int, delete: bool = False):
     match path.suffix:
         case ".jp2":
             import glymur
@@ -45,7 +44,7 @@ def run(path: Path, *, level: int, remove: bool = False):
             raise NotImplementedError(f"Unknown file type {path.suffix}")
 
     path.with_suffix(".jxl").write_bytes(jpegxl_encode(img, level=level))
-    if remove:
+    if delete:
         path.unlink()
 
 
@@ -60,16 +59,22 @@ def run(path: Path, *, level: int, remove: bool = False):
     help="JPEG XL quality level (-inf-100) 100 = lossless",
 )
 def main(path: Path, delete: bool = False, quality: int = 99):
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    path = Path(path)
     file_types = [".tif", ".tiff", ".jp2", ".dax"]
     files = list(chain.from_iterable([Path(path).glob(f"**/*{file_type}") for file_type in file_types]))
-    click.echo(f"Found {len(files)} files")
+    log.info(f"Found {len(files)} files")
     with ProcessPoolExecutor() as pool:
         with tqdm(total=len(files)) as progress, logging_redirect_tqdm():
             futures = []
+
+            def gen(msg: str) -> Callable[..., None]:
+                return lambda _: log.info(msg)
+
             for file in files:
-                future = pool.submit(run, file, level=quality, remove=delete)
+                future = pool.submit(run, file, level=quality, delete=delete)
                 future.add_done_callback(lambda _: progress.update())
-                future.add_done_callback(partial(log.info, f"Finished {file}"))
+                future.add_done_callback(gen(f"Finished {file.as_posix()}"))
                 futures.append(future)
             [future.result() for future in futures]
             log.info("Done")
