@@ -1,0 +1,53 @@
+[tool.poetry]
+authors = ["Chaichontat Sriworarat <csriwor1@jh.edu>"]
+description = ""
+license = "MIT"
+name = "fishtools"
+packages = [{include = "fishtools"}]
+readme = "README.md"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+click = "^8.1.6"
+glymur = "^0.12.8"
+imagecodecs = "^2023.7.10"
+numpy = "^1.25.1"
+python = "^3.10"
+tifffile = "^2023.7.18"
+tqdm = "^4.65.0"
+
+[tool.poetry.scripts]
+todax = "fishtools.compress.todax:main"
+tojxl = "fishtools.compress.tojxl:main"
+
+[build-system]
+build-backend = "poetry.core.masonry.api"
+requires = ["poetry-core"]
+
+[tool.black]
+line-length = 110
+target-version = ['py310']
+
+[tool.pyright]
+include = ["fishtools"]
+pythonVersion = "3.10"
+reportMissingTypeStubs = false
+reportPrivateUsage = false
+reportPropertyTypeMismatch = false
+reportUnknownArgumentType = false
+reportUnknownLambdaType = false
+reportUnknownMemberType = false
+reportUnknownVariableType = false
+reportUntypedFunctionDecorator = false
+reportUnusedImport = false
+reportUnusedVariable = "warning"
+typeCheckingMode = "strict"
+
+[tool.ruff]
+line-length = 110
+
+[tool.isort]
+line_length = 110
+profile = "black"
+py_version = 310
+src_paths = ["fishtools"]
