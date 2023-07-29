@@ -6,6 +6,7 @@ from typing import Any, Callable
 import click
 import numpy.typing as npt
 from imagecodecs import imread
+from tifffile import TiffFile
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -13,13 +14,20 @@ log = logging.getLogger(__name__)
 
 
 def run(path: Path, *, delete: bool):
-    if path.suffix != ".jxl":
-        raise ValueError(f"Unknown file type {path}. Must be .jxl")
-
-    img: npt.NDArray[Any] = imread(path)  # type: ignore
+    if path.suffix == ".jxl":
+        img: npt.NDArray[Any] = imread(path)  # type: ignore
+    elif path.suffix == ".tif":
+        with TiffFile(path) as tif:
+            if tif.pages[0].compression != 22610:
+                return False
+            img = tif.asarray()
+    else:
+        raise ValueError(f"Unknown file type {path}. Must be .jxl or .tif")
     img.tofile(path.with_suffix(".dax"))
     if delete:
         path.unlink()
+
+    return True
 
 
 @click.command()
@@ -42,7 +50,7 @@ def main(path: Path, delete: bool = False):
             futures = []
 
             def gen(msg: str) -> Callable[..., None]:
-                return lambda _: log.info(msg)
+                return lambda x: log.info(msg) if x.result() else None
 
             for file in files:
                 future = pool.submit(run, file, delete=delete)
