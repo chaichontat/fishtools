@@ -27,15 +27,17 @@ By default, `tojxl` will convert all TIFF, JP2, and DAX files in the specified d
 
 You can also specify the quality level of the JXL files using the `--quality` or `-q` option. The quality level should be an integer between -inf and 100, where 100 is lossless. The default quality level is 99 (about 10x reduction in file size).
 
-98 is also very usable with 20x reduction in file size.
-![image](https://github.com/chaichontat/fishtools/assets/34997334/b65eacb7-64f9-4b71-826f-8e3ef4fbbe3b)
-(left original, right 98)
+![output](https://github.com/chaichontat/fishtools/assets/34997334/95230a08-4817-433d-a98d-67b5c442439d)
 
 If you want to delete the original files after conversion, you can use the `--delete` or `-d` option.
 
 To use `todax`, simply run the `todax` command followed by the path to the JXL file or directory containing JXL files that you want to convert.
 By default, `todax` will convert all JXL files in the specified directory and its subdirectories.
 The converted DAX files will be saved in the same directory as the original JXL files with the same name but with a `.dax` extension.
+
+**BioFormat in ImageJ does not support JPEG-XL yet.
+It does support JPEG-XR which provides the same performance for lossless compression.
+JPEG-XR does not compress >8-channel images (compression scheme not in the specification).**
 
 #### Examples
 
