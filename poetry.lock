@@ -26,6 +26,20 @@ files = [
 ]
 
 [[package]]
+name = "expression"
+version = "4.2.4"
+description = "Practical functional programming for Python 3.9+"
+optional = false
+python-versions = ">=3.9,<4"
+files = [
+    {file = "expression-4.2.4-py3-none-any.whl", hash = "sha256:3830916c6030868a84b78944cd1a19f7e9afcb4699f82cc06d81f31acd603039"},
+    {file = "expression-4.2.4.tar.gz", hash = "sha256:1bfb44b4b63b133abf201a23eeb800791dee239901382209f36c6b7bb4a735ff"},
+]
+
+[package.dependencies]
+typing-extensions = ">=4.1.1,<5.0.0"
+
+[[package]]
 name = "glymur"
 version = "0.12.8"
 description = ""
@@ -233,6 +247,38 @@ files = [
 ]
 
 [[package]]
+name = "polars"
+version = "0.18.9"
+description = "Blazingly fast DataFrame library"
+optional = false
+python-versions = ">=3.8"
+files = [
+    {file = "polars-0.18.9-cp38-abi3-macosx_10_7_x86_64.whl", hash = "sha256:d4e4d063beb6f5663ceaa53a12ab7b7a6052601e55e05b7bb2b21eac56aa369e"},
+    {file = "polars-0.18.9-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:e23b44c94bde9ea21e8d89b0539919a1d4e18a4f049b973d48ff289f2e3f1821"},
+    {file = "polars-0.18.9-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:9830041ff128e61f61465c7eb7a75a5ff03d338436190cbed842662f0b09146b"},
+    {file = "polars-0.18.9-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:60ea395ba76aa06734939c55e9a54ace8a10048699ee26d1feef64c39b2fce2d"},
+    {file = "polars-0.18.9-cp38-abi3-win_amd64.whl", hash = "sha256:ad3d55c52cc8e48927b727e74bb9fe3235a38f02403f868dc2542c6408b5a1f7"},
+    {file = "polars-0.18.9.tar.gz", hash = "sha256:39a0684398f72ca12d76940a6b4cf52b2a62d73e84a239c300bae7a5bf0a2cf5"},
+]
+
+[package.extras]
+adbc = ["adbc_driver_sqlite"]
+all = ["polars[adbc,cloudpickle,connectorx,deltalake,fsspec,matplotlib,numpy,pandas,pyarrow,pydantic,sqlalchemy,timezone,xlsx2csv,xlsxwriter]"]
+cloudpickle = ["cloudpickle"]
+connectorx = ["connectorx"]
+deltalake = ["deltalake (>=0.10.0)"]
+fsspec = ["fsspec"]
+matplotlib = ["matplotlib"]
+numpy = ["numpy (>=1.16.0)"]
+pandas = ["pandas", "pyarrow (>=7.0.0)"]
+pyarrow = ["pyarrow (>=7.0.0)"]
+pydantic = ["pydantic"]
+sqlalchemy = ["pandas", "sqlalchemy"]
+timezone = ["backports.zoneinfo", "tzdata"]
+xlsx2csv = ["xlsx2csv (>=0.8.0)"]
+xlsxwriter = ["xlsxwriter"]
+
+[[package]]
 name = "tifffile"
 version = "2023.7.18"
 description = "Read and write TIFF files"
@@ -269,7 +315,18 @@ notebook = ["ipywidgets (>=6)"]
 slack = ["slack-sdk"]
 telegram = ["requests"]
 
+[[package]]
+name = "typing-extensions"
+version = "4.7.1"
+description = "Backported and Experimental Type Hints for Python 3.7+"
+optional = false
+python-versions = ">=3.7"
+files = [
+    {file = "typing_extensions-4.7.1-py3-none-any.whl", hash = "sha256:440d5dd3af93b060174bf433bccd69b0babc3b15b1a8dca43789fd7f61514b36"},
+    {file = "typing_extensions-4.7.1.tar.gz", hash = "sha256:b75ddc264f0ba5615db7ba217daeb99701ad295353c45f9e95963337ceeeffb2"},
+]
+
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.10"
-content-hash = "a1869a6db4249d44d7b915ebf1d84f93b04c4de92a6636be500808793461f3d0"
+content-hash = "da0385ad520e86ca9decd1a9a2da3d2fc745cec3b6061209007cbef14509be5e"
