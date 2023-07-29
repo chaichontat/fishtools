@@ -1,5 +1,6 @@
 import logging
 from concurrent.futures import ProcessPoolExecutor
+from functools import partial
 from itertools import chain
 from pathlib import Path
 
@@ -66,10 +67,9 @@ def main(path: Path, delete: bool = False, quality: int = 99):
         with tqdm(total=len(files)) as progress, logging_redirect_tqdm():
             futures = []
             for file in files:
-                curr_file = file
                 future = pool.submit(run, file, level=quality, remove=delete)
                 future.add_done_callback(lambda _: progress.update())
-                future.add_done_callback(lambda _: log.info(f"Finished {curr_file}"))
+                future.add_done_callback(partial(log.info, f"Finished {file}"))
                 futures.append(future)
             [future.result() for future in futures]
             log.info("Done")
