@@ -1,10 +1,11 @@
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import click
-from imagecodecs import jpegxl_decode
+import numpy.typing as npt
+from imagecodecs import imread
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -15,7 +16,8 @@ def run(path: Path, *, delete: bool):
     if path.suffix != ".jxl":
         raise ValueError(f"Unknown file type {path}. Must be .jxl")
 
-    jpegxl_decode(path.read_bytes()).tofile(path.with_suffix(".dax"))
+    img: npt.NDArray[Any] = imread(path)  # type: ignore
+    img.tofile(path.with_suffix(".dax"))
     if delete:
         path.unlink()
 
@@ -33,7 +35,7 @@ def run(path: Path, *, delete: bool):
 def main(path: Path, delete: bool = False):
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     path = Path(path)
-    files = list(path.glob("**/*.jxl")) if path.is_dir() else [path]
+    files = list(path.glob("**/*.jxl")) + list(path.glob("**/*.tif")) if path.is_dir() else [path]
     log.info(f"Found {len(files)} files")
     with ProcessPoolExecutor() as pool:
         with tqdm(total=len(files)) as progress, logging_redirect_tqdm():

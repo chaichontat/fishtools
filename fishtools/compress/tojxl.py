@@ -8,6 +8,7 @@ import click
 import numpy as np
 import tifffile
 from imagecodecs import jpegxl_encode
+from tifffile import imwrite
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
@@ -42,10 +43,16 @@ def run(path: Path, *, level: int, delete: bool = False):
             img = dax_reader(path)
         case _:
             raise NotImplementedError(f"Unknown file type {path.suffix}")
-
-    path.with_suffix(".jxl").write_bytes(jpegxl_encode(img, level=level))
-    if delete:
-        path.unlink()
+    try:
+        if level == 100:
+            imwrite(path.with_suffix(".tif"), img, photometric="minisblack", compression=22610)
+        else:
+            path.with_suffix(".jxl").write_bytes(jpegxl_encode(img, level=level, photometric=2))
+    except Exception as e:
+        log.error(f"Failed to compress {path} with error {e}")
+    else:
+        if delete and path.suffix != ".tif":
+            path.unlink()
 
 
 @click.command()
