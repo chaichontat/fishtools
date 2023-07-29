@@ -25,7 +25,11 @@ tojxl path/to/directory
 
 By default, `tojxl` will convert all TIFF, JP2, and DAX files in the specified directory and its subdirectories. The converted JXL files will be saved in the same directory as the original files with the same name but with a `.jxl` extension.
 
-You can also specify the quality level of the JXL files using the `--quality` or `-q` option. The quality level should be an integer between -inf and 100, where 100 is lossless. The default quality level is 99.
+You can also specify the quality level of the JXL files using the `--quality` or `-q` option. The quality level should be an integer between -inf and 100, where 100 is lossless. The default quality level is 99 (about 10x reduction in file size).
+
+98 is also very usable with 20x reduction in file size.
+![image](https://github.com/chaichontat/fishtools/assets/34997334/b65eacb7-64f9-4b71-826f-8e3ef4fbbe3b)
+(left original, right 98)
 
 If you want to delete the original files after conversion, you can use the `--delete` or `-d` option.
 
@@ -41,10 +45,10 @@ Convert all TIFF, JP2, and DAX files in a directory:
 tojxl path/to/directory
 ```
 
-Convert all TIFF, JP2, and DAX files in a directory with a quality level of 80 and delete the original files:
+Convert all TIFF, JP2, and DAX files in a directory with a quality level of 98 and delete the original files:
 
 ```sh
-tojxl path/to/directory --quality 80 --delete
+tojxl path/to/directory --quality 98 --delete
 ```
 
 Convert a single JXL file to DAX:
