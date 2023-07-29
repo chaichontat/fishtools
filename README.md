@@ -15,6 +15,8 @@ pip install -e .
 - `tojxl` is a command-line interface (CLI) tool that converts TIFF, JP2, and DAX image files to JPEG XL (JXL) files.
 - `todax` is a CLI tool that converts JXL files back to DAX files.
 
+![Comparison of different compression quality](https://github.com/chaichontat/fishtools/assets/34997334/95230a08-4817-433d-a98d-67b5c442439d)
+
 #### Usage
 
 To use `tojxl`, simply run the `tojxl` command followed by the path to the directory containing TIFF, JP2, or DAX files that you want to convert:
@@ -28,8 +30,6 @@ By default, `tojxl` will convert all TIFF, JP2, and DAX files in the specified d
 You can also specify the quality level of the JXL files using the `--quality` or `-q` option. The quality level should be an integer between -inf and 100, where 100 is lossless. The default quality level is 99 (about 10x reduction in file size).
 
 When the lossless option is selected, the output file is a `.tif` file with JPEG-XR encoding so that the file can be opened in ImageJ/BioFormats.
-
-![output](https://github.com/chaichontat/fishtools/assets/34997334/95230a08-4817-433d-a98d-67b5c442439d)
 
 > BioFormats in ImageJ does not support JPEG-XL yet.
 > It does support JPEG-XR which provides the same performance for lossless compression.
