@@ -27,17 +27,19 @@ By default, `tojxl` will convert all TIFF, JP2, and DAX files in the specified d
 
 You can also specify the quality level of the JXL files using the `--quality` or `-q` option. The quality level should be an integer between -inf and 100, where 100 is lossless. The default quality level is 99 (about 10x reduction in file size).
 
+When the lossless option is selected, the output file is a `.tif` file with JPEG-XR encoding so that the file can be opened in ImageJ/BioFormats.
+
 ![output](https://github.com/chaichontat/fishtools/assets/34997334/95230a08-4817-433d-a98d-67b5c442439d)
+
+> BioFormats in ImageJ does not support JPEG-XL yet.
+> It does support JPEG-XR which provides the same performance for lossless compression.
+> JPEG-XR does not compress >8-channel images (compression scheme not in the specification).
 
 If you want to delete the original files after conversion, you can use the `--delete` or `-d` option.
 
 To use `todax`, simply run the `todax` command followed by the path to the JXL file or directory containing JXL files that you want to convert.
 By default, `todax` will convert all JXL files in the specified directory and its subdirectories.
 The converted DAX files will be saved in the same directory as the original JXL files with the same name but with a `.dax` extension.
-
-**BioFormat in ImageJ does not support JPEG-XL yet.
-It does support JPEG-XR which provides the same performance for lossless compression.
-JPEG-XR does not compress >8-channel images (compression scheme not in the specification).**
 
 #### Examples
 
@@ -47,10 +49,10 @@ Convert all TIFF, JP2, and DAX files in a directory:
 tojxl path/to/directory
 ```
 
-Convert all TIFF, JP2, and DAX files in a directory with a quality level of 98 and delete the original files:
+Convert all TIFF, JP2, and DAX files in a directory to a lossless TIFF with JPEG-XR encoding and delete the original files:
 
 ```sh
-tojxl path/to/directory --quality 98 --delete
+tojxl path/to/directory --quality 100 --delete
 ```
 
 Convert a single JXL file to DAX:
