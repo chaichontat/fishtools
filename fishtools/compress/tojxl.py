@@ -58,7 +58,7 @@ def run(path: Path, *, level: int, remove: bool = False):
     type=int,
     help="JPEG XL quality level (-inf-100) 100 = lossless",
 )
-def main(path: Path, remove: bool = False, quality: int = 99):
+def main(path: Path, delete: bool = False, quality: int = 99):
     file_types = [".tif", ".tiff", ".jp2", ".dax"]
     files = list(chain.from_iterable([Path(path).glob(f"**/*{file_type}") for file_type in file_types]))
     click.echo(f"Found {len(files)} files")
@@ -66,7 +66,7 @@ def main(path: Path, remove: bool = False, quality: int = 99):
         with tqdm(total=len(files)) as progress, logging_redirect_tqdm():
             futures = []
             for file in files:
-                future = pool.submit(run, file, level=quality, remove=remove)
+                future = pool.submit(run, file, level=quality, remove=delete)
                 future.add_done_callback(lambda _: progress.update())
                 future.add_done_callback(lambda _: log.info(f"Finished {file}"))
                 futures.append(future)
