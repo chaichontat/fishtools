@@ -12,22 +12,20 @@ pip install -e .
 
 ## Compression
 
-### `tojxl` and `todax`
-
-- `tojxl` is a command-line interface (CLI) tool that converts TIFF, JP2, and DAX image files to JPEG XL (JXL) files.
-- `todax` is a CLI tool that converts JXL files back to DAX files.
+- `fishtools compress` is a command-line interface (CLI) tool that converts TIFF, JP2, and DAX image files to JPEG XL (JXL) files.
+- `fishtools decompress` is a CLI tool that converts JXL files back to DAX files.
 
 ![Comparison of different compression quality](https://github.com/chaichontat/fishtools/assets/34997334/95230a08-4817-433d-a98d-67b5c442439d)
 
 #### Usage
 
-To use `tojxl`, simply run the `tojxl` command followed by the path to the directory containing TIFF, JP2, or DAX files that you want to convert:
+To use `fishtools`, simply run the `fishtools` command followed by the subcommand and path to the directory containing TIFF, JP2, or DAX files that you want to convert:
 
 ```sh
-tojxl path/to/directory
+fishtools compress path/to/directory
 ```
 
-By default, `tojxl` will convert all TIFF, JP2, and DAX files in the specified directory and its subdirectories. The converted JXL files will be saved in the same directory as the original files with the same name but with a `.jxl` extension.
+By default, `fishtools compress` will convert all TIFF, JP2, and DAX files in the specified directory and its subdirectories. The converted JXL files will be saved in the same directory as the original files with the same name but with a `.jxl` extension.
 
 You can also specify the quality level of the JXL files using the `--quality` or `-q` option. The quality level should be an integer between -inf and 100, where 100 is lossless. The default quality level is 99 (about 10x reduction in file size).
 
@@ -39,34 +37,34 @@ When the lossless option is selected, the output file is a `.tif` file with JPEG
 
 If you want to delete the original files after conversion, you can use the `--delete` or `-d` option.
 
-To use `todax`, simply run the `todax` command followed by the path to the JXL file or directory containing JXL files that you want to convert.
-By default, `todax` will convert all JXL files in the specified directory and its subdirectories.
+To use `fishtools decompress`, simply run the `fishtools decompress` command followed by the path to the JXL file or directory containing JXL files that you want to convert.
+By default, `fishtools decompress` will convert all JXL files in the specified directory and its subdirectories.
 The converted DAX files will be saved in the same directory as the original JXL files with the same name but with a `.dax` extension.
 
 #### Examples
 
-Convert all TIFF, JP2, and DAX files in a directory:
+Convert all TIFF, JP2, and DAX files in a directory and its subdirectories to JXL files:
 
 ```sh
-tojxl path/to/directory
+fishtools compress path/to/directory
 ```
 
-Convert all TIFF, JP2, and DAX files in a directory to a lossless TIFF with JPEG-XR encoding and delete the original files:
+Convert all TIFF, JP2, and DAX files in a directory to lossless TIFFs with JPEG-XR encoding and delete the original files:
 
 ```sh
-tojxl path/to/directory --quality 100 --delete
+fishtools compress path/to/directory --quality 100 --delete
 ```
 
 Convert a single JXL file to DAX:
 
 ```sh
-todax path/to/file.jxl
+fishtools decompress path/to/file.jxl
 ```
 
 Convert all JXL files in a directory to DAX:
 
 ```sh
-todax path/to/directory
+fishtools decompress path/to/directory
 ```
 
 ## License
