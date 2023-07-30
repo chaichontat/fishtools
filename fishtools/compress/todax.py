@@ -1,7 +1,7 @@
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import click
 import numpy.typing as npt
@@ -44,20 +44,19 @@ def main(path: Path, delete: bool = False):
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     path = Path(path)
     files = list(path.glob("**/*.jxl")) + list(path.glob("**/*.tif")) if path.is_dir() else [path]
-    log.info(f"Found {len(files)} files")
+
     with ProcessPoolExecutor() as pool:
         with tqdm(total=len(files)) as progress, logging_redirect_tqdm():
-            futures = []
 
-            def gen(msg: str) -> Callable[..., None]:
-                return lambda x: log.info(msg) if x.result() else None
-
-            for file in files:
+            def submit(file: Path):
                 future = pool.submit(run, file, delete=delete)
                 future.add_done_callback(lambda _: progress.update())
-                future.add_done_callback(gen(f"Finished {file.as_posix()}"))
-                futures.append(future)
-            [future.result() for future in futures]
+                future.add_done_callback(
+                    lambda x: log.info(f"Finished {file.as_posix()}") if x.result() else None
+                )
+                return future
+
+            [fut.result() for fut in list(map(submit, files))]
             log.info("Done")
 
 

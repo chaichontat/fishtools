@@ -2,7 +2,6 @@ import logging
 from concurrent.futures import ProcessPoolExecutor
 from itertools import chain
 from pathlib import Path
-from typing import Callable
 
 import click
 import numpy as np
@@ -73,17 +72,14 @@ def main(path: Path, delete: bool = False, quality: int = 99):
     log.info(f"Found {len(files)} files")
     with ProcessPoolExecutor() as pool:
         with tqdm(total=len(files)) as progress, logging_redirect_tqdm():
-            futures = []
 
-            def gen(msg: str) -> Callable[..., None]:
-                return lambda _: log.info(msg)
-
-            for file in files:
+            def submit(file: Path):
                 future = pool.submit(run, file, level=quality, delete=delete)
                 future.add_done_callback(lambda _: progress.update())
-                future.add_done_callback(gen(f"Finished {file.as_posix()}"))
-                futures.append(future)
-            [future.result() for future in futures]
+                future.add_done_callback(lambda x: log.info(f"Finished {file.as_posix()}"))
+                return future
+
+            [fut.result() for fut in list(map(submit, files))]
             log.info("Done")
 
 
