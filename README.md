@@ -1,5 +1,7 @@
 # fishtools
 
+[![Install and run](https://github.com/chaichontat/fishtools/actions/workflows/test.yml/badge.svg)](https://github.com/chaichontat/fishtools/actions/workflows/test.yml)
+
 Tools for FISH analysis
 
 ## Installation
