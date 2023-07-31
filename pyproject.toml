@@ -23,6 +23,7 @@ tqdm = "^4.65.0"
 fishtools = "fishtools.cli:main"
 
 [tool.poetry.group.dev.dependencies]
+pre-commit = "^3.3.3"
 pytest = "^7.4.0"
 pytest-cov = "^4.1.0"
 
@@ -50,6 +51,7 @@ reportUnusedVariable = "warning"
 typeCheckingMode = "strict"
 
 [tool.ruff]
+ignore = ["E501"]
 line-length = 110
 
 [tool.isort]
@@ -64,3 +66,11 @@ log_cli = 1
 # log_cli_level = "DEBUG"
 minversion = "7.0"
 testpaths = ["test"]
+
+[tool.bandit]
+exclude = "test"
+skips = ["B101", "B404", "B603", "B607"]
+targets = "fishtools"
+
+[tool.codespell]
+skip = 'scripts/'
