@@ -1,6 +1,7 @@
 [tool.poetry]
 authors = ["Chaichontat Sriworarat <csriwor1@jh.edu>"]
 description = ""
+include = [{path = 'static/*', format = 'wheel'}]
 license = "MIT"
 name = "fishtools"
 packages = [{include = "fishtools"}]
@@ -8,19 +9,24 @@ readme = "README.md"
 version = "0.1.0"
 
 [tool.poetry.dependencies]
+biopython = "^1.81"
 click = "^8.1.6"
 expression = "^4.2.4"
 glymur = "^0.12.8"
 imagecodecs = "^2023.7.10"
+mygene = "^3.2.2"
 numpy = "^1.25.1"
 polars = "^0.18.9"
+pyfastx = "^1.1.0"
 python = "^3.10"
 rich-click = "^1.6.1"
 tifffile = "^2023.7.18"
 tqdm = "^4.65.0"
+loguru = "^0.7.0"
 
 [tool.poetry.scripts]
 fishtools = "fishtools.cli:main"
+mkprobes = "fishtools.mkprobes.mkprobes:main"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^3.3.3"
