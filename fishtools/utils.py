@@ -2,7 +2,8 @@ import logging
 import sys
 from functools import wraps
 from pathlib import Path
-from typing import Callable, ParamSpec, TypeVar
+from subprocess import PIPE, Popen
+from typing import Callable, Collection, ParamSpec, Sequence, TypeVar
 
 from loguru import logger
 
@@ -49,3 +50,14 @@ def check_if_posix(f: Callable[P, R]) -> Callable[P, R]:
         return f(*args, **kwargs)
 
     return inner
+
+
+def run_process(cmd: Sequence[str], input: bytes) -> bytes:
+    process = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+    stdout, stderr = process.communicate(input=input)
+
+    if process.returncode != 0:
+        logging.critical(stderr.decode())
+        raise RuntimeError(f"{cmd} failed")
+
+    return stdout

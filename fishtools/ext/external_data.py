@@ -3,15 +3,12 @@ import gzip
 from functools import cache
 from io import StringIO
 from pathlib import Path
-from typing import Any, Iterable, Sequence, TypedDict, cast, overload
+from typing import Any, Sequence, overload
 
 import mygene
 import polars as pl
 import pyfastx
-from Bio import SeqIO
 from loguru import logger as log
-from oligocheck.boilerplate import jprint
-from oligocheck.merfish.alignment import gen_fasta
 
 mg = mygene.MyGeneInfo()
 

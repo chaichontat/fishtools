@@ -17,7 +17,7 @@ from loguru import logger as log
 from fishtools.ext.external_data import ExternalData
 from fishtools.io.io import download, get_file_name, set_cwd
 from fishtools.mkprobes.initial_screen.alignment import gen_fasta
-from fishtools.utils import check_if_posix
+from fishtools.utils import check_if_posix, run_process
 
 url_files = {
     "mouse": Path(__file__).parent / "../../" / "static" / "mouseurls.tsv",
@@ -55,27 +55,21 @@ def jellyfish(
     """
     http://www.cs.cmu.edu/~ckingsf/software/jellyfish/jellyfish-manual-1.1.pdf
     """
+    out = Path(out).resolve()
     if isinstance(seqs, str):
-        stdin = Path(seqs).read_text()
+        stdin = Path(seqs).read_bytes()
     else:
-        stdin = gen_fasta(map(str, range(len(seqs))), seqs).getvalue()
+        stdin = gen_fasta(map(str, range(len(seqs))), seqs).getvalue().encode()
 
-    res = subprocess.run(
+    stdout1 = run_process(
         shlex.split(
             rf"jellyfish count -o /dev/stdout -m {kmer} -t {thread} -s {hash_size} -L {minimum} -c {counter} {'--both-strands' if both_strands else ''} /dev/stdin"
         ),
-        input=stdin,
-        stdout=subprocess.PIPE,
-        check=True,
+        stdin,
     )
-    res = subprocess.run(
-        # -c == column format
-        shlex.split(rf"jellyfish dump -c -L 1 /dev/stdin > {out}"),
-        input=res.stdout,
-        stdout=subprocess.PIPE,
-        encoding="ascii",
-        check=True,
-    )
+    stdout2 = run_process(shlex.split("jellyfish dump -c -L 1 /dev/stdin"), stdout1)
+
+    Path(out).write_bytes(stdout2)
 
 
 def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]) -> Gtfs:
@@ -148,12 +142,12 @@ def run_jellyfish(path: Path | str):
         )[1]
 
         log.info("Running jellyfish for 15-mers in r, t, snoRNAs.")
-        jellyfish(toexclude, path / "rtsno.jf", 15)
+        jellyfish(toexclude, "rtsno15.jf", 15)
 
         log.info("Running jellyfish for 18-mers in cDNA.")
         jellyfish(
             [x.seq for x in pyfastx.Fasta("cdna_ncrna_trna.fasta")],
-            path / "cdna.jf",
+            "cdna18.jf",
             18,
             minimum=10,
             counter=4,
