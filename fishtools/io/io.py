@@ -1,37 +1,45 @@
-import hashlib
 import os
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
-from typing import Literal, overload
+from typing import cast
 
 import requests
+from loguru import logger
+from tqdm.auto import tqdm
 
 
-@overload
-def download(url: str, path: None = ..., return_bytes: Literal[True] = ...) -> bytes:
-    ...
+def download(url: str, path: str | Path, name: str | None = None) -> None:
+    with requests.get(url, stream=True, allow_redirects=True) as r:
+        if r.status_code >= 400:
+            r.raise_for_status()
+            raise RuntimeError(f"Request to {url} returned status code {r.status_code}")
 
+        size = int(r.headers.get("Content-Length", 0))
+        if name is None:
+            name = url.split("/")[-1]
 
-@overload
-def download(url: str, path: None = ..., return_bytes: Literal[False] = ...) -> str:
-    ...
-
-
-@overload
-def download(url: str, path: Path | str) -> None:
-    ...
-
-
-def download(url: str, path: str | Path | None = None, return_bytes: bool = False) -> str | bytes | None:
-    with requests.get(url, stream=True) as r:
-        if path is None:
-            return r.content if return_bytes else r.text
-        path = Path(path)
+        path = Path(path).expanduser().resolve()
         path.mkdir(parents=True, exist_ok=True)
-        with open(path / url.split("/")[-1].split("?")[0], "wb") as f:
-            shutil.copyfileobj(r.raw, f)
+        path = path / name
+        if path.exists():
+            if size == path.stat().st_size:
+                logger.info(f"File {path} already exists. Skipping.")
+                return
+            else:
+                logger.warning(f"File {path} already exists but size is different. Redownloading.")
+        else:
+            logger.info(f"Downloading {url}")
+
+        with tqdm.wrapattr(r.raw, "read", total=size) as r_raw:
+            with open(f"{path}.tmp", "wb") as f:
+                shutil.copyfileobj(r_raw, f)
+                os.rename(f"{path}.tmp", path)
+
+    logger.info(f"Finished downloading {url}")
 
 
 def get_file_name(url: str) -> str:

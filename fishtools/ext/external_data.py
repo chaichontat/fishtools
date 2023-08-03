@@ -1,6 +1,7 @@
 # %%
 import gzip
 from functools import cache
+from io import StringIO
 from pathlib import Path
 from typing import Any, Iterable, Sequence, TypedDict, cast, overload
 
@@ -8,6 +9,7 @@ import mygene
 import polars as pl
 import pyfastx
 from Bio import SeqIO
+from loguru import logger as log
 from oligocheck.boilerplate import jprint
 from oligocheck.merfish.alignment import gen_fasta
 
@@ -15,14 +17,24 @@ mg = mygene.MyGeneInfo()
 
 
 class ExternalData:
-    def __init__(self, cache: Path | str, *, path: Path | str, fasta: Path | str) -> None:
-        self.fa = pyfastx.Fasta(fasta, key_func=lambda x: x.split(" ")[0].split(".")[0])
+    def __init__(
+        self,
+        cache: Path | str,
+        *,
+        fasta: Path | str,
+        gtf_path: Path | str | None = None,
+        regen_cache: bool = False,
+    ) -> None:
+        self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=lambda x: x.split(" ")[0].split(".")[0])
         self._ts_gene_map: dict[str, str] | None = None
 
-        if Path(cache).exists():
+        if Path(cache).exists() and not regen_cache:
             self.gtf: pl.DataFrame = pl.read_parquet(cache)
         else:
-            self.gtf = self.parse_gtf(path)
+            if gtf_path is None:
+                raise ValueError("gtf_path must be specified if cache does not exist.")
+            log.info("Parsing external GTF")
+            self.gtf = self.parse_gtf(Path(gtf_path).resolve())
             self.gtf.write_parquet(cache)
 
     @cache
@@ -87,7 +99,9 @@ class ExternalData:
         return self.gtf.filter(*args, **kwargs)
 
     @staticmethod
-    def parse_gtf(path: str | Path, filters: Sequence[str] = ("transcript",)) -> pl.DataFrame:
+    def parse_gtf(path: str | Path | StringIO, filters: Sequence[str] = ("transcript",)) -> pl.DataFrame:
+        if not isinstance(path, StringIO) and Path(path).suffix == ".gz":
+            path = StringIO(gzip.open(path, "rt").read())
         # fmt: off
         # To get the original keys.
         # list(reduce(lambda x, y: x | json.loads(y), jsoned['jsoned'].to_list(), {}).keys())
@@ -99,7 +113,7 @@ class ExternalData:
         # fmt: on
 
         return (
-            pl.scan_csv(
+            pl.read_csv(
                 path,
                 comment_char="#",
                 separator="\t",
@@ -145,7 +159,6 @@ class ExternalData:
                     pl.col("transcript_id").str.extract(r"(\w+)(\.\d+)?").alias("transcript_id"),
                 ]
             )
-            .collect()
         )
 
     def check_gene_names(self, genes: list[str]):
@@ -165,44 +178,3 @@ class ExternalData:
             {k: v["symbol"] for k, v in converted.items()},
             res,
         )
-
-
-# %%
-def get_rrna(path: str) -> set[str]:
-    # Get tRNA and rRNA
-    out = []
-    ncrna = SeqIO.parse(gzip.open(path, "rt") if path.endswith(".gz") else path, "fasta")
-    # Example line
-    # ENSMUST00000104605.4 ncrna chromosome:GRCm39:Y:1308273:1308377:-1 gene:ENSMUSG00000077793.4 gene_biotype:snRNA transcript_biotype:snRNA gene_symbol:Gm25565 description:predicted gene, 25565 [Source:MGI Symbol;Acc:MGI:5455342]
-    for line in ncrna:
-        attrs = line.description.split(", ")[0].split(" ")
-        attrs[0] = "transcript_id:" + attrs[0]
-        attrs[1] = "type:" + attrs[1]
-        actual = attrs[:7]
-        description = " ".join(attrs[7:]).split(":", maxsplit=1)
-        attrs = dict(
-            [
-                ["seq", str(line.seq)],
-                ["description", description[1].strip() if len(description) > 1 else ""],
-                *[x.split(":", maxsplit=1) for x in actual],
-            ]
-        )
-        out.append(attrs)
-
-    return set(pl.from_records(out).filter(pl.col("gene_biotype") == "rRNA")["transcript_id"])
-    # with open(path, "w") as f:
-    #     for _, row in out[out.gene_biotype == "rRNA"].iterrows():
-    #         f.write(f">{row.transcript_id}\n{row.seq}\n")
-
-    # return set(pd.read_table(path, header=None)[0].str.split(">", expand=True)[1].dropna())
-
-
-def gen_rrna_trna(gtf: ExternalData):
-    rrna = gtf.gtf.filter(pl.col("gene_biotype") == "rRNA")
-    if not len(rrna):
-        raise ValueError("No rRNA found in GTF. Use Ensembl GTF.")
-    seqs = [gtf.get_seq(x) for x in rrna["transcript_id"]]
-    Path("data/mm39/rrna.fasta").write_text(gen_fasta(rrna["transcript_id"], seqs).getvalue())
-
-
-# %%

@@ -5,7 +5,9 @@ import rich_click as click
 
 from fishtools.ext.external_data import ExternalData
 from fishtools.ext.fix_gene_name import check_gene_names
-from fishtools.io.pretty_print import jprint, setup_logging
+from fishtools.ext.prepare import download_gtf_fasta, run_jellyfish
+from fishtools.io.pretty_print import jprint
+from fishtools.utils import setup_logging
 
 log = setup_logging()
 
@@ -13,7 +15,7 @@ log = setup_logging()
 def load_gtf(path: str) -> ExternalData:
     return ExternalData(
         cache=f"{path}/gencode_vM32_transcripts.parquet",
-        path=f"{path}/gencode.vM32.chr_patch_hapl_scaff.basic.annotation.gtf",
+        gtf_path=f"{path}/gencode.vM32.chr_patch_hapl_scaff.basic.annotation.gtf",
         fasta=f"{path}/combi.fa.gz",
     )
 
@@ -56,7 +58,8 @@ def chkgenes(path: Path):
 # fmt: on
 def prepare(path: Path, species: Literal["human", "mouse"]):
     """Prepare genomic database"""
-    ...
+    # download_gtf_fasta(path, species)
+    run_jellyfish(path)
 
 
 if __name__ == "__main__":
