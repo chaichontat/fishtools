@@ -23,6 +23,9 @@ rich-click = "^1.6.1"
 tifffile = "^2023.7.18"
 tqdm = "^4.65.0"
 loguru = "^0.7.0"
+colorama = "^0.4.6"
+primer3-py = "^2.0.0"
+levenshtein = "^0.21.1"
 
 [tool.poetry.scripts]
 fishtools = "fishtools.cli:main"

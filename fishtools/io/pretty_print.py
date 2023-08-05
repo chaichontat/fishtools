@@ -1,6 +1,7 @@
 import json
 from typing import Any, Callable, Concatenate, ParamSpec, Protocol, TypeVar
 
+import colorama
 from loguru import logger
 from rich.console import Console
 from rich.syntax import Syntax
@@ -25,3 +26,18 @@ def _jprint(f: _JPrint[P]) -> Callable[Concatenate[Any, P], None]:
 
 
 jprint = _jprint(Syntax)
+
+
+def printc(seq: str):
+    for c in seq:
+        if c == "A" or c == "a":
+            print(colorama.Fore.GREEN + c, end="")
+        elif c == "T" or c == "t":
+            print(colorama.Fore.RED + c, end="")
+        elif c == "C" or c == "c":
+            print(colorama.Fore.BLUE + c, end="")
+        elif c == "G" or c == "g":
+            print(colorama.Fore.YELLOW + c, end="")
+        else:
+            print(colorama.Fore.WHITE + c, end="")
+    print(colorama.Fore.RESET)

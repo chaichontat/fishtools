@@ -7,7 +7,7 @@ from fishtools.ext.external_data import ExternalData
 from fishtools.ext.fix_gene_name import check_gene_names
 from fishtools.ext.prepare import download_gtf_fasta, run_jellyfish
 from fishtools.io.pretty_print import jprint
-from fishtools.utils import setup_logging
+from fishtools.utils.utils import setup_logging
 
 log = setup_logging()
 
@@ -58,7 +58,7 @@ def chkgenes(path: Path):
 # fmt: on
 def prepare(path: Path, species: Literal["human", "mouse"]):
     """Prepare genomic database"""
-    # download_gtf_fasta(path, species)
+    download_gtf_fasta(path, species)
     run_jellyfish(path)
 
 

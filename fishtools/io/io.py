@@ -1,11 +1,7 @@
 import os
-import re
 import shutil
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from functools import partial
 from pathlib import Path
-from typing import cast
 
 import requests
 from loguru import logger

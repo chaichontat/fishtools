@@ -16,8 +16,8 @@ from loguru import logger as log
 
 from fishtools.ext.external_data import ExternalData
 from fishtools.io.io import download, get_file_name, set_cwd
-from fishtools.mkprobes.initial_screen.alignment import gen_fasta
-from fishtools.utils import check_if_posix, run_process
+from fishtools.mkprobes.alignment import gen_fasta
+from fishtools.utils.utils import check_if_posix, run_process
 
 url_files = {
     "mouse": Path(__file__).parent / "../../" / "static" / "mouseurls.tsv",

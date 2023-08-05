@@ -1,14 +1,35 @@
 import logging
 import sys
-from functools import wraps
+from functools import cache, wraps
 from pathlib import Path
 from subprocess import PIPE, Popen
-from typing import Callable, Collection, ParamSpec, Sequence, TypeVar
+from typing import Any, Callable, Concatenate, ParamSpec, Sequence, Type, TypeVar, cast
 
 from loguru import logger
 
 P = ParamSpec("P")
 R = TypeVar("R", covariant=True)
+T = TypeVar("T", bound=type)
+
+
+def copy_signature(kwargs_call: Callable[P, Any]) -> Callable[[Callable[..., R]], Callable[P, R]]:
+    """Decorator does nothing but returning the casted original function"""
+
+    def return_func(func: Callable[..., R]) -> Callable[P, R]:
+        return cast(Callable[P, R], func)
+
+    return return_func
+
+
+def copy_signature_method(
+    kwargs_call: Callable[P, Any], cls: T
+) -> Callable[[Callable[..., R]], Callable[Concatenate[T, P], R]]:
+    """Decorator does nothing but returning the casted original function"""
+
+    def return_func(func: Callable[..., R]) -> Callable[Concatenate[T, P], R]:
+        return cast(Callable[Concatenate[T, P], R], func)
+
+    return return_func
 
 
 def setup_logging():
@@ -61,3 +82,8 @@ def run_process(cmd: Sequence[str], input: bytes) -> bytes:
         raise RuntimeError(f"{cmd} failed")
 
     return stdout
+
+
+@cache
+def slide(x: str, n: int = 20) -> list[str]:
+    return [x[i : i + n] for i in range(len(x) - n + 1)]
