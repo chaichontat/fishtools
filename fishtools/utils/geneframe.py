@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection, Iterable, Literal, ParamSpec, TypeVar, overload
 
 import polars as pl
+from loguru import logger
 from typing_extensions import Self
 
 from fishtools.mkprobes.alignment import run_bowtie
@@ -136,6 +137,8 @@ class GeneFrame(pl.DataFrame):
         #     "YT": "pair_state",
         # }
 
+        # fmt: off
+        logger.info("Parsing SAM output")
         df = (
             pl.read_csv(StringIO(sam), separator="\n", has_header=False)
             .lazy()
@@ -145,22 +148,10 @@ class GeneFrame(pl.DataFrame):
             .rename(
                 {
                     f"field_{i}": x
-                    for i, x in enumerate(
-                        [
-                            "name",
-                            "flag",
-                            "transcript",
-                            "pos",
-                            "mapq",
-                            "cigar",
-                            "rnext",
-                            "pnext",
-                            "tlen",
-                            "seq",
-                        ]
-                    )
+                    for i, x in enumerate(["name", "flag", "transcript", "pos", "mapq", "cigar", "rnext", "pnext", "tlen", "seq"])
                 }
             )
+
             .with_columns(
                 flag=pl.col("flag").cast(pl.UInt16),
                 pos=pl.col("pos").cast(pl.UInt32),
@@ -185,28 +176,22 @@ class GeneFrame(pl.DataFrame):
                 + [
                     pl.col("name").str.extract(r"(.+)_(.+):(\d+)-(\d+)", 1).alias("gene"),
                     pl.col("name").str.extract(r"(.+)_(.+):(\d+)-(\d+)", 2).alias("transcript_ori"),
-                    pl.col("name")
-                    .str.extract(r"(.+)_(.+):(\d+)-(\d+)", 3)
-                    .cast(pl.UInt32)
-                    .alias("pos_start"),
+                    pl.col("name").str.extract(r"(.+)_(.+):(\d+)-(\d+)", 3).cast(pl.UInt32).alias("pos_start"),
                     pl.col("name").str.extract(r"(.+)_(.+):(\d+)-(\d+)", 4).cast(pl.UInt32).alias("pos_end"),
                 ]
                 if split_name
                 else []
             )
             .with_columns(
-                [
-                    (pl.col("transcript") == pl.col("transcript_ori")).alias("is_ori_seq"),
-                ]
-                + [
-                    (pl.col("pos_end") - pl.col("pos_start") + 1).alias("length"),
-                ]
+                [(pl.col("transcript") == pl.col("transcript_ori")).alias("is_ori_seq")]
+                + [(pl.col("pos_end") - pl.col("pos_start") + 1).alias("length")]
                 if split_name
                 else []
             )
             .collect()
         )
         return cls._count_match(df) if count_match else cls(df)
+        # fmt: on
 
     @to_geneframe
     def filter_match(self, *, match: int, match_consec: int):

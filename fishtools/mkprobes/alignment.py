@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from Bio import AlignIO
+from loguru import logger
 
 
 def _n_generator() -> Iterable[str]:
@@ -37,6 +38,7 @@ def gen_fasta(seqs: Iterable[str], *, names: Iterable[Any] | None = None) -> io.
 
 
 def gen_bowtie_index(fasta: str, path: str, name: str) -> bytes:
+    logger.info(f"Generating bowtie2 index for {name}")
     Path(path).mkdir(exist_ok=True, parents=True)
     (Path(path) / (name + ".fasta")).write_text(fasta)
     return subprocess.run(
@@ -57,6 +59,7 @@ def run_bowtie(
     threshold: int = 15,
     fasta: bool = False,
 ) -> str:
+    logger.info(f"Running bowtie2 with {reference}")
     return subprocess.run(
         shlex.split(
             # A base that matches receives a bonus of +2 be default.

@@ -71,46 +71,40 @@ class Filters:
         )
 
     @staticmethod
-    def check_other_probes(
-        fasta: str, base: list[str] | None = None, match_consec_thresh: int = 11, match_thresh: int = 15
-    ):
-        gen_bowtie_index(
-            fasta if base is None else gen_fasta(base, names=map(str, range(len(base)))).getvalue(),
-            "temp",
-            "amplifiers",
-        )
-        bt = GeneFrame.from_bowtie(
-            fasta,
-            "temp/amplifiers",
-            seed_length=9,
-            threshold=12,
-            fasta=True,
-        )
+    def check_other_probes(fasta: str, match_consec_thresh: int = 11, match_thresh: int = 15):
+        """Checks for homology to other probes.
 
-        return (
-            bt.filter(pl.col("match_consec").lt(20))  # noself
+        Need to use negative selection because there is a chance that a probe may only bind to itself and no one else,
+        resulting in a false negative."""
+
+        gen_bowtie_index(fasta, "temp", "amplifiers")
+        bt = GeneFrame.from_bowtie(fasta, "temp/amplifiers", seed_length=9, threshold=12, fasta=True)
+
+        inverted = (
+            bt.filter(pl.col("name").ne(pl.col("transcript")))
             .groupby("name")
             .agg(match_consec=pl.col("match_consec").max(), match=pl.col("match").max())
             .filter(
-                (pl.col("match_consec").lt(match_consec_thresh) & pl.col("match").lt(match_thresh))
-                | pl.col("match").is_null()
+                (pl.col("match_consec").lt(match_consec_thresh) & pl.col("match").lt(match_thresh)).is_not()
             )
         )
 
+        return pl.DataFrame({"name": list(set(bt["name"].unique()) - set(inverted["name"].unique()))})
+
     @staticmethod
-    def run_primary(
+    def check_amplifiers(
         fasta: str,
         zero: dict[str, str],
         match_consec_thresh: int = 11,
         match_thresh: int = 15,
     ):
-        """Reverses the order of the base and candidates.
+        """Check amplifiers for interactions with its own base.
+        Expected amplifiers to be named i_j where i is the index of the base and j is the index of the candidate.
+
+        Reverses the order of the base and candidates.
         bowtie2 seems to have issues when the "reads" are longer than the reference.
         The idea here then is to create a reference using the "reads" and then align the base to it.
         Then, filter out the reads that align exactly to the base (perfect match, aligning to itself).
-
-        Need to use negative selection because there is a chance that a combination may only bind to itself and no one else,
-        resulting in a false negative.
         """
 
         gen_bowtie_index(fasta, "temp", "amplifiers")
@@ -122,7 +116,7 @@ class Filters:
                 threshold=12,
                 fasta=True,
             )
-            .filter(pl.col("transcript").ne("*"))  #
+            .filter(pl.col("transcript").ne("*"))
             .with_columns(transcript="name", name="transcript")
         )
 
@@ -199,13 +193,18 @@ def screen_amplifiers(
     screens: list[str] | None = None,
     generator: Callable[[str, str], str],
 ):
+    """Screens for homology to human and mouse
+    then screens for binding to `screens` (if provided) or `base`"""
+
     primaries: dict[str, str] = {
         f"{i}_{j}": generator(b, f) for i, b in enumerate(base) for j, f in enumerate(candidates)
     }
 
     _, passed = run_filter(lambda fasta: Filters.check_humouse(fasta), primaries, return_ok_seqs=True)
     _, passed = run_filter(
-        lambda fasta: Filters.run_primary(fasta, zero={str(i): b for i, b in enumerate(screens or base)}),
+        lambda fasta: Filters.check_amplifiers(
+            fasta, zero={str(i): b for i, b in enumerate(screens or base)}
+        ),
         passed,
         return_ok_seqs=True,
     )
@@ -225,13 +224,11 @@ def screen_amplifiers(
 # %%
 
 to_gen = 36
-SP6_F = reverse_complement("ACGTGACTGCTCC" + SP6)
 PRIMARY_REV = "CAAACTAACCTCCTTCTTCCTCCTTCCA"
 SECONDARY_REV = reverse_complement("TCACATCACACCTCTATCCATTATCAACCAC")
 
 ref = pl.read_csv("data/readout_ref_with_amp.csv")["seq"].to_list()
 zeroth_readouts = pl.read_csv("data/readout_ref.csv")
-
 
 candidates = screen_candidates(ref)
 assert not set(candidates) & set(ref)
@@ -254,7 +251,11 @@ pairing_2, seqs_2 = screen_amplifiers(
 # %%
 splitter: Callable[[int], Callable[[str], str]] = lambda i, s=" ": lambda x: x.split(s)[i]
 
+# sanity checks
 assert not set(map(splitter(-2), seqs)) & set(map(splitter(-2), seqs_2))
 assert list(map(splitter(-2), seqs)) == list(map(lambda x: reverse_complement(splitter(1)(x)), seqs_2))
 
+assert not (set(map(splitter(-2), seqs)) | set(map(splitter(-2), seqs_2))) & set(ref)
+assert list(map(splitter(1), seqs)) == zeroth_readouts["seq"].to_list()[:to_gen]
 # %%
+SP6_F = reverse_complement("ACGTGACTGCTCC" + SP6)
