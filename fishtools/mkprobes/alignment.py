@@ -2,7 +2,7 @@ import io
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from Bio import AlignIO
 
@@ -14,11 +14,11 @@ def _n_generator() -> Iterable[str]:
         i += 1
 
 
-def gen_fastq(seqs: Iterable[str], *, names: Iterable[str] | None = None) -> io.StringIO:
+def gen_fastq(seqs: Iterable[str], *, names: Iterable[Any] | None = None) -> io.StringIO:
     f = io.StringIO()
     if names is None:
         names = _n_generator()
-    for name, seq in zip(names, seqs):
+    for name, seq in zip(map(str, names), seqs):
         f.write(f"@{name}\n")
         f.write(seq + "\n")
         f.write("+\n")
@@ -26,11 +26,11 @@ def gen_fastq(seqs: Iterable[str], *, names: Iterable[str] | None = None) -> io.
     return f
 
 
-def gen_fasta(seqs: Iterable[str], *, names: Iterable[str] | None = None) -> io.StringIO:
+def gen_fasta(seqs: Iterable[str], *, names: Iterable[Any] | None = None) -> io.StringIO:
     f = io.StringIO()
     if names is None:
         names = _n_generator()
-    for name, seq in zip(names, seqs):
+    for name, seq in zip(map(str, names), seqs):
         f.write(f">{name}\n")
         f.write(seq + "\n")
     return f

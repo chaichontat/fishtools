@@ -3,13 +3,14 @@ import sys
 from functools import cache, wraps
 from pathlib import Path
 from subprocess import PIPE, Popen
-from typing import Any, Callable, Concatenate, ParamSpec, Sequence, Type, TypeVar, cast
+from typing import Any, Callable, Concatenate, ParamSpec, Sequence, TypeVar, cast
 
 from loguru import logger
 
 P = ParamSpec("P")
 R = TypeVar("R", covariant=True)
-T = TypeVar("T", bound=type)
+TType = TypeVar("TType", bound=type)
+TAny = TypeVar("TAny")
 
 
 def copy_signature(kwargs_call: Callable[P, Any]) -> Callable[[Callable[..., R]], Callable[P, R]]:
@@ -22,12 +23,12 @@ def copy_signature(kwargs_call: Callable[P, Any]) -> Callable[[Callable[..., R]]
 
 
 def copy_signature_method(
-    kwargs_call: Callable[P, Any], cls: T
-) -> Callable[[Callable[..., R]], Callable[Concatenate[T, P], R]]:
+    kwargs_call: Callable[P, Any], cls: TType
+) -> Callable[[Callable[..., R]], Callable[Concatenate[TType, P], R]]:
     """Decorator does nothing but returning the casted original function"""
 
-    def return_func(func: Callable[..., R]) -> Callable[Concatenate[T, P], R]:
-        return cast(Callable[Concatenate[T, P], R], func)
+    def return_func(func: Callable[..., R]) -> Callable[Concatenate[TType, P], R]:
+        return cast(Callable[Concatenate[TType, P], R], func)
 
     return return_func
 
