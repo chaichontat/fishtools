@@ -138,7 +138,7 @@ class GeneFrame(pl.DataFrame):
         # }
 
         # fmt: off
-        logger.info("Parsing SAM output")
+        logger.info(f"Parsing SAM output. Length of SAM: {len(sam.splitlines())}")
         df = (
             pl.read_csv(StringIO(sam), separator="\n", has_header=False)
             .lazy()

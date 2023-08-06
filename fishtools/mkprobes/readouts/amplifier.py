@@ -78,7 +78,9 @@ class Filters:
         resulting in a false negative."""
 
         gen_bowtie_index(fasta, "temp", "amplifiers")
-        bt = GeneFrame.from_bowtie(fasta, "temp/amplifiers", seed_length=9, threshold=12, fasta=True)
+        bt = GeneFrame.from_bowtie(
+            fasta, "temp/amplifiers", seed_length=9, threshold=12, fasta=True, no_reverse=True
+        )
 
         inverted = (
             bt.filter(pl.col("name").ne(pl.col("transcript")))
@@ -97,6 +99,7 @@ class Filters:
         zero: dict[str, str],
         match_consec_thresh: int = 11,
         match_thresh: int = 15,
+        mode: Literal["fw", "rc"] = "fw",
     ):
         """Check amplifiers for interactions with its own base.
         Expected amplifiers to be named i_j where i is the index of the base and j is the index of the candidate.
@@ -113,8 +116,10 @@ class Filters:
                 gen_fasta(zero.values(), names=zero.keys()).getvalue(),
                 "temp/amplifiers",
                 seed_length=9,
-                threshold=12,
+                threshold=11,
                 fasta=True,
+                no_reverse=mode == "fw",
+                no_forward=mode == "rc",
             )
             .filter(pl.col("transcript").ne("*"))
             .with_columns(transcript="name", name="transcript")
@@ -125,7 +130,10 @@ class Filters:
             .groupby("name")
             .agg(match_consec=pl.col("match_consec").max(), match=pl.col("match").max())
             .filter(
-                (pl.col("match_consec").lt(match_consec_thresh) & pl.col("match").lt(match_thresh)).is_not()
+                (
+                    pl.col("match_consec").lt(match_consec_thresh)
+                    & pl.col("match").lt(match_thresh if match_thresh != -1 else 1000)
+                ).is_not()
             )
         )
         return pl.DataFrame({"name": list(set(bt["name"].unique()) - set(inverted["name"].unique()))})
@@ -192,6 +200,8 @@ def screen_amplifiers(
     *,
     screens: list[str] | None = None,
     generator: Callable[[str, str], str],
+    mode: Literal["fw", "rc"] = "fw",
+    match_thresh: int = 15,
 ):
     """Screens for homology to human and mouse
     then screens for binding to `screens` (if provided) or `base`"""
@@ -203,7 +213,10 @@ def screen_amplifiers(
     _, passed = run_filter(lambda fasta: Filters.check_humouse(fasta), primaries, return_ok_seqs=True)
     _, passed = run_filter(
         lambda fasta: Filters.check_amplifiers(
-            fasta, zero={str(i): b for i, b in enumerate(screens or base)}
+            fasta,
+            zero={str(i): b for i, b in enumerate(screens or base)},
+            mode=mode,
+            match_thresh=match_thresh,
         ),
         passed,
         return_ok_seqs=True,
@@ -230,22 +243,24 @@ SECONDARY_REV = reverse_complement("TCACATCACACCTCTATCCATTATCAACCAC")
 ref = pl.read_csv("data/readout_ref_with_amp.csv")["seq"].to_list()
 zeroth_readouts = pl.read_csv("data/readout_ref.csv")
 
-candidates = screen_candidates(ref)
+candidates = screen_candidates(ref, seed=59)
 assert not set(candidates) & set(ref)
 
+# %%
 pairing, seqs = screen_amplifiers(
     zeroth_readouts["seq"].to_list()[:to_gen],
     candidates,
-    screens=zeroth_readouts["seq"].to_list()[:60],
-    generator=lambda b, f: PRIMARY_REV + " " + _gen_amplifier(b, f) + " C",
+    screens=zeroth_readouts["seq"].to_list(),
+    generator=lambda b, f: PRIMARY_REV + " " + _gen_amplifier(b, f) + " TTC",
 )
-
 
 pairing_2, seqs_2 = screen_amplifiers(
     base=Seq(range(36)).map(lambda x: pairing.get(x, -1)).map(lambda i: candidates[i]).to_list(),
     candidates=remove_chosen(candidates, pairing.values()),
     screens=seqs,
-    generator=lambda b, f: SECONDARY_REV + " " + _gen_amplifier(b, f, rc=True) + " " + " C",
+    generator=lambda b, f: SECONDARY_REV + " " + _gen_amplifier(b, f, rc=True) + " " + " TTC",
+    mode="rc",
+    match_thresh=-1,
 )
 
 # %%
@@ -258,4 +273,4 @@ assert list(map(splitter(-2), seqs)) == list(map(lambda x: reverse_complement(sp
 assert not (set(map(splitter(-2), seqs)) | set(map(splitter(-2), seqs_2))) & set(ref)
 assert list(map(splitter(1), seqs)) == zeroth_readouts["seq"].to_list()[:to_gen]
 # %%
-SP6_F = reverse_complement("ACGTGACTGCTCC" + SP6)
+SP6_F = reverse_complement("ACGTGACTGCTCC" + SP6[:-1])
