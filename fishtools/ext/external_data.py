@@ -1,5 +1,6 @@
 # %%
 import gzip
+from dataclasses import dataclass
 from functools import cache
 from io import StringIO
 from pathlib import Path
@@ -158,20 +159,48 @@ class ExternalData:
             )
         )
 
-    def check_gene_names(self, genes: list[str]):
-        notfound = []
-        ok: list[str] = []
-        for gene in genes:
-            try:
-                self.gene_to_eid(gene)
-                ok.append(gene)
-            except ValueError:
-                print(f"Gene {gene} not found in gtf")
-                notfound.append(gene)
-        converted, res = find_aliases(notfound)
 
-        return (
-            ok + [x["symbol"] for x in converted.values()],
-            {k: v["symbol"] for k, v in converted.items()},
-            res,
+# @dataclass(frozen=True)
+class Dataset:
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+
+        self.gencode = ExternalData(
+            cache=self.path / "gencode.parquet",
+            gtf_path=self.path / "gencode.gtf.gz",
+            fasta=self.path / "cdna_ncrna_trna.fasta",
         )
+
+        self.ensembl = ExternalData(
+            cache=self.path / "ensembl.parquet",
+            gtf_path=self.path / "ensembl.gtf.gz",
+            fasta=self.path / "cdna_ncrna_trna.fasta",
+        )
+
+        self.kmer18 = pl.read_csv(
+            self.path / "cdna18.jf", separator=" ", has_header=False, new_columns=["kmer", "count"]
+        )
+        self.trna_rna_kmers = set(
+            pl.read_csv(
+                self.path / "r_t_snorna15.jf", separator=" ", has_header=False, new_columns=["kmer", "count"]
+            )["kmer"]
+        )
+        self.kmerset = set(self.kmer18["kmer"])
+
+    # def check_gene_names(self, genes: list[str]):
+    #     notfound = []
+    #     ok: list[str] = []
+    #     for gene in genes:
+    #         try:
+    #             self.gene_to_eid(gene)
+    #             ok.append(gene)
+    #         except ValueError:
+    #             print(f"Gene {gene} not found in gtf")
+    #             notfound.append(gene)
+    #     converted, res = find_aliases(notfound)
+
+    #     return (
+    #         ok + [x["symbol"] for x in converted.values()],
+    #         {k: v["symbol"] for k, v in converted.items()},
+    #         res,
+    #     )

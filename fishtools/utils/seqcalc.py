@@ -72,11 +72,11 @@ CONDITIONS: dict[Model, Conditions] = {
 }
 
 
-def formamide_molar(percent: float = 30) -> float:
+def formamide_molar(percent: float) -> float:
     return percent * 10 * 1.13 / 45.04  # density / molar mass
 
 
-def formamide_correction(seq: str, fmd: float = 30) -> float:
+def formamide_correction(seq: str, fmd: float) -> float:
     return (0.453 * (gc_content(seq) / 100.0) - 2.88) * formamide_molar(fmd)
 
 
@@ -84,7 +84,7 @@ def tm_q5(seq: str, /, **kwargs: Unpack[Conditions]) -> float:
     return mt.Tm_NN(Seq(seq), **(CONDITIONS["q5"] | kwargs))
 
 
-def tm(seq: str, model: Model, formamide: float = 30, **kwargs: Unpack[Conditions]) -> float:
+def tm(seq: str, model: Model, formamide: float = 0, **kwargs: Unpack[Conditions]) -> float:
     return mt.Tm_NN(Seq(seq), **(CONDITIONS[model] | kwargs)) + formamide_correction(seq, fmd=formamide)
 
 
@@ -96,7 +96,7 @@ biopython_to_primer3 = {
 }
 
 
-def hp(seq: str, model: Model, formamide: float = 30, **kwargs: Unpack[Conditions]) -> float:
+def hp(seq: str, model: Model, formamide: float = 0, **kwargs: Unpack[Conditions]) -> float:
     combined = CONDITIONS[model] | kwargs
     conditions = {v: combined[k] for k, v in biopython_to_primer3.items()}
     return primer3.calc_hairpin_tm(seq, **conditions) + formamide_correction(seq, fmd=formamide)

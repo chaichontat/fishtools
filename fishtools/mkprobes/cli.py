@@ -4,20 +4,13 @@ from typing import Literal
 import rich_click as click
 
 from fishtools.ext.external_data import ExternalData
-from fishtools.ext.fix_gene_name import check_gene_names
-from fishtools.ext.prepare import download_gtf_fasta, run_jellyfish
 from fishtools.io.pretty_print import jprint
+from fishtools.mkprobes.alignment import bowtie_build, gen_bowtie_index
 from fishtools.utils.utils import setup_logging
 
+from .initial_screen.screen import screen
+
 log = setup_logging()
-
-
-def load_gtf(path: str) -> ExternalData:
-    return ExternalData(
-        cache=f"{path}/gencode_vM32_transcripts.parquet",
-        gtf_path=f"{path}/gencode.vM32.chr_patch_hapl_scaff.basic.annotation.gtf",
-        fasta=f"{path}/combi.fa.gz",
-    )
 
 
 @click.group()
@@ -27,10 +20,12 @@ def main():
 
 
 @main.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 def chkgenes(path: Path):
+    from fishtools.ext.fix_gene_name import check_gene_names
+
     """Validate/check that gene names are canonical in Ensembl"""
-    gtf = load_gtf("/home/chaichontat/oligocheck/data/mm39")
+    gtf = ExternalData.from_path("/home/chaichontat/oligocheck/data/mm39")
     genes = list(filter(lambda x: x, Path(path).read_text().splitlines()))
     if len(genes) != len(s := set(genes)):
         [genes.remove(x) for x in s]
@@ -53,13 +48,19 @@ def chkgenes(path: Path):
 
 # fmt: off
 @main.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=True, path_type=Path))
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--species", "-s", type=click.Choice(("human", "mouse")), default="mouse", help="Species to use for probe design")
 # fmt: on
 def prepare(path: Path, species: Literal["human", "mouse"]):
     """Prepare genomic database"""
+    from fishtools.ext.prepare import download_gtf_fasta, run_jellyfish
+
     download_gtf_fasta(path, species)
     run_jellyfish(path)
+    bowtie_build(path / "cdna_ncrna_trna.fasta", "txome")
+
+
+main.add_command(screen)
 
 
 if __name__ == "__main__":

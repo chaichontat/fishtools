@@ -1,12 +1,9 @@
 # %%
 import gzip
-import mmap
 import shlex
 import shutil
-import subprocess
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
-from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Collection, Literal, NamedTuple, TypedDict
 
@@ -17,7 +14,7 @@ from loguru import logger as log
 from fishtools.ext.external_data import ExternalData
 from fishtools.io.io import download, get_file_name, set_cwd
 from fishtools.mkprobes.alignment import gen_fasta
-from fishtools.utils.utils import check_if_posix, run_process
+from fishtools.utils.utils import check_if_exists, check_if_posix, run_process
 
 url_files = {
     "mouse": Path(__file__).parent / "../../" / "static" / "mouseurls.tsv",
@@ -41,6 +38,7 @@ def _process_tsv(file: Path | str) -> NecessaryFiles:
 
 
 @check_if_posix
+@check_if_exists(log, lambda kwargs: kwargs["out"])
 def jellyfish(
     seqs: Collection[str] | str,
     out: str | Path,
@@ -59,7 +57,7 @@ def jellyfish(
     if isinstance(seqs, str):
         stdin = Path(seqs).read_bytes()
     else:
-        stdin = gen_fasta(map(str, range(len(seqs))), seqs).getvalue().encode()
+        stdin = gen_fasta(seqs).getvalue().encode()
 
     stdout1 = run_process(
         shlex.split(
@@ -95,30 +93,32 @@ def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]) -> 
         filenames["trna"] = trna_name
 
         # Concatenate fasta and tRNA files
-        log.info("Concatenating fasta and tRNA files")
-        out = b""
-
-        for filename in [filenames["cdna"], filenames["ncrna"]]:
-            with gzip.open(filename, "rb") as input_file:
-                out += input_file.read()
-                out += b"\n"
-            with open(filenames["trna"], "rb") as f:
-                out += f.read()
-                out += b"\n"
-        Path("cdna_ncrna_trna.fasta").write_bytes(out)
+        if (p_ := Path("cdna_ncrna_trna.fasta")).exists():
+            log.info("cdna_ncrna_trna.fasta already exists. Skipping concatenation.")
+        else:
+            log.info("Concatenating fasta and tRNA files")
+            out = b""
+            for filename in [filenames["cdna"], filenames["ncrna"]]:
+                with gzip.open(filename, "rb") as input_file:
+                    out += input_file.read()
+                    out += b"\n"
+                with open(filenames["trna"], "rb") as f:
+                    out += f.read()
+                    out += b"\n"
+            p_.write_bytes(out)
 
         return Gtfs(
             ensembl=ExternalData(
                 cache="ensembl.parquet",
                 gtf_path="ensembl.gtf.gz",
                 fasta="cdna_ncrna_trna.fasta",
-                regen_cache=True,
+                # regen_cache=True,
             ),
             gencode=ExternalData(
                 cache="gencode.parquet",
                 gtf_path="gencode.gtf.gz",
                 fasta="cdna_ncrna_trna.fasta",
-                regen_cache=True,
+                # regen_cache=True,
             ),
         )
 
@@ -141,8 +141,8 @@ def run_jellyfish(path: Path | str):
             gtf
         )[1]
 
-        log.info("Running jellyfish for 15-mers in r, t, snoRNAs.")
-        jellyfish(toexclude, "rtsno15.jf", 15)
+        log.info("Running jellyfish for 15-mers in r, t, and, snoRNAs.")
+        jellyfish(toexclude, "r_t_snorna15.jf", 15)
 
         log.info("Running jellyfish for 18-mers in cDNA.")
         jellyfish(

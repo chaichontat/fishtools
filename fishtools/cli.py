@@ -4,13 +4,12 @@ from pathlib import Path
 from typing import Literal, ParamSpec, Protocol, TypeVar
 
 import rich_click as click
+from loguru import logger as log
 from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 import fishtools.compression.compression as lib
-from fishtools.io.pretty_print import setup_logging
 
-log = setup_logging()
 P, R = ParamSpec("P"), TypeVar("R", covariant=True)
 
 

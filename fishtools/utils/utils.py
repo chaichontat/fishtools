@@ -1,10 +1,12 @@
 import logging
 import sys
 from functools import cache, wraps
+from inspect import getcallargs
 from pathlib import Path
 from subprocess import PIPE, Popen
 from typing import Any, Callable, Concatenate, ParamSpec, Sequence, TypeVar, cast
 
+import loguru
 from loguru import logger
 
 P = ParamSpec("P")
@@ -88,3 +90,41 @@ def run_process(cmd: Sequence[str], input: bytes) -> bytes:
 @cache
 def slide(x: str, n: int = 20) -> list[str]:
     return [x[i : i + n] for i in range(len(x) - n + 1)]
+
+
+def check_if_exists(
+    logger: "loguru.Logger",
+    name_detector: Callable[[dict[str, Any]], str] = lambda kwargs: str(next(iter(kwargs.values()))),
+):
+    """
+    A decorator that checks if a file exists before executing a function.
+    Can override with the `overwrite` keyword argument.
+
+    Parameters:
+    -----------
+    logger : loguru.Logger
+        A logger object that is used to log warning messages if the file already exists.
+
+    name_detector : Callable[[list[Any], dict[str, Any]], str], optional
+        A callable that takes two arguments: a list of positional arguments and a dictionary of keyword arguments.
+        The kwargs include all the arguments passed to the decorated function (including args).
+        Should return the name of the file to check.
+
+    Returns:
+    --------
+    Callable[P, R | None]]
+        A decorator that may return None if the file already exists.
+    """
+
+    def decorator(f: Callable[P, R]) -> Callable[P, R | None]:
+        @wraps(f)
+        def inner(*args: P.args, **kwargs: P.kwargs) -> R | None:
+            if not (path := Path(name_detector(getcallargs(f, *args, **kwargs)))).exists() or kwargs.get(
+                "overwrite", False
+            ):
+                return f(*args, **kwargs)
+            logger.warning(f"{path} already exists. Skipping.")
+
+        return inner
+
+    return decorator

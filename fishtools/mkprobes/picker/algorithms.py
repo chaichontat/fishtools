@@ -1,3 +1,4 @@
+import sys
 from bisect import bisect_left
 from typing import Sequence
 
@@ -6,6 +7,7 @@ import numpy as np
 
 class OverlapWeighted:
     def __init__(self, start: Sequence[int], end: Sequence[int], priorities: Sequence[int], overlap: int = 0):
+        sys.setrecursionlimit(5000)
         self.start = start
         self.end = end
         self.priorities = priorities

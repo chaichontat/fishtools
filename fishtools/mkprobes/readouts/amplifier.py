@@ -253,12 +253,12 @@ pairing, seqs = screen_amplifiers(
     screens=zeroth_readouts["seq"].to_list(),
     generator=lambda b, f: PRIMARY_REV + " " + _gen_amplifier(b, f) + " TTC",
 )
-
+# %%
 pairing_2, seqs_2 = screen_amplifiers(
-    base=Seq(range(36)).map(lambda x: pairing.get(x, -1)).map(lambda i: candidates[i]).to_list(),
+    base=Seq(range(to_gen)).map(lambda x: pairing.get(x, -1)).map(candidates.__getitem__).to_list(),
     candidates=remove_chosen(candidates, pairing.values()),
     screens=seqs,
-    generator=lambda b, f: SECONDARY_REV + " " + _gen_amplifier(b, f, rc=True) + " " + " TTC",
+    generator=lambda b, f: SECONDARY_REV + " " + _gen_amplifier(b, f, rc=True) + " TTC",
     mode="rc",
     match_thresh=-1,
 )
@@ -274,3 +274,64 @@ assert not (set(map(splitter(-2), seqs)) | set(map(splitter(-2), seqs_2))) & set
 assert list(map(splitter(1), seqs)) == zeroth_readouts["seq"].to_list()[:to_gen]
 # %%
 SP6_F = reverse_complement("ACGTGACTGCTCC" + SP6[:-1])
+
+# %%
+idt = pl.concat(
+    [
+        pl.DataFrame(
+            {"Pool name": "Amp1-Aug23", "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs))}
+        ),
+        pl.DataFrame(
+            {"Pool name": "Amp2-Aug23", "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs_2))}
+        ),
+    ]
+)
+
+idt == pl.read_excel("amplifiers.xlsx")
+# idt.write_excel("amplifiers2.xlsx")
+
+# %%
+assert idt.select(pl.col("Sequence").str.contains(reverse_complement(SP6)))["Sequence"].all()
+# %%
+import pyfastx
+
+synthesized = list(map(lambda x: x.seq, pyfastx.Fasta("amplifiers.fasta")))
+
+# %%
+what = idt["Sequence"].to_list()
+# %%
+what[0]
+
+# %%
+final_readers = list(
+    map(reverse_complement, (map(lambda x: x[-(len(SP6_F) + 3) - 20 : -(len(SP6_F) + 3)], synthesized)))
+)[36:]
+# %%
+metas = {2: "TCCCAACACATCCTATCTCA", 3: "ACCCATTACTCCATTACCAT", 4: "TATCATCCTTACACCTCACT"}
+
+
+# %%
+def gen_idt(name: str, seq: str):
+    return f"{name}\t{seq}\t\t25nm\tSTD"
+
+
+for i in range(3):
+    for idx in range(8 * i, 8 * (i + 1)):
+        print(
+            gen_idt(
+                f"Linker{idx+1:02d}-MetaC-{i+2:02d}",
+                final_readers[idx] + reverse_complement("C" + metas[i + 2]),
+            )
+        )
+
+mod = lambda i: i % 3 + 2
+for i in range(24, 30):
+    print(
+        gen_idt(
+            f"Linker{i+1:02d}-MetaC-{mod(i):02d}", final_readers[i] + reverse_complement("C" + metas[mod(i)])
+        )
+    )
+# %%
+for k, v in {k: "/5AmMC6/C" + v + "/3AmMO/" for k, v in metas.items()}.items():
+    print(gen_idt(f"MetaReadout-C-Amp{k:02d}", v))
+# %%

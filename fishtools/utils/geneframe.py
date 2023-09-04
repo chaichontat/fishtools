@@ -255,7 +255,6 @@ class GeneFrame(pl.DataFrame):
         )
         nogo_soft = tm_offtarget.filter(pl.col("tm_offtarget").gt(40))
 
-        # print(f"Found {len(nogo.unique('name'))} hard and {len(nogo_soft.unique('name'))} soft no-gos.")
         filtered = (
             self.filter(~pl.col("name").is_in(nogo["name"]) & ~pl.col("name").is_in(nogo_soft["name"]))
             .join(unique, on="name", how="left")
