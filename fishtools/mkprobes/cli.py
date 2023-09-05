@@ -5,17 +5,33 @@ import rich_click as click
 
 from fishtools.ext.external_data import ExternalData
 from fishtools.io.pretty_print import jprint
-from fishtools.mkprobes.alignment import bowtie_build, gen_bowtie_index
+from fishtools.mkprobes.alignment import bowtie_build
+from fishtools.mkprobes.initial_screen.screen import screen
 from fishtools.utils.utils import setup_logging
 
 from .initial_screen.candidates import candidates
 
 log = setup_logging()
+click.rich_click.SHOW_ARGUMENTS = True
+click.rich_click.GROUP_ARGUMENTS_OPTIONS = True
+click.rich_click.USE_MARKDOWN = True
+click.rich_click.STYLE_HELPTEXT = ""
 
 
 @click.group()
 def main():
-    """Combinatorial FISH Probe Design Utilities"""
+    r"""Combinatorial FISH Probe Design Utilities
+
+    Basic order of operations:
+
+    - Prepare database with:
+        > fishtools mkprobes prepare \<path\> [--species <species>]
+    - Initial crawling with:
+        > fishtools mkprobes candidates \<path\> \<gene\> \<output\> [--allow-pseudo] [--ignore-revcomp]
+    - Screening and tiling of said candidates with:
+        > fishtools mkprobes screen \<path from crawling\> \<gene\> [--fpkm-path <path>] [--overlap <int>]
+
+    """
     ...
 
 
@@ -61,6 +77,7 @@ def prepare(path: Path, species: Literal["human", "mouse"]):
 
 
 main.add_command(candidates)
+main.add_command(screen)
 
 
 if __name__ == "__main__":

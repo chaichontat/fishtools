@@ -229,7 +229,7 @@ class GeneFrame(pl.DataFrame):
         )
         # Aggregate
         return (
-            self.filter(pl.col("transcript") == pl.col("transcript_ori"))
+            self.filter(pl.col("is_ori_seq"))
             .join(unique, on="name", how="left")
             .with_columns(
                 max_tm_offtarget=pl.col("max_tm_offtarget").fill_null(0.0),

@@ -131,20 +131,21 @@ def run(
         .all()
     )
 
-    ff = (
-        y.filter_by_match([*tss_all, *tss_pseudo], match=0.8, match_consec=0.8)
-        .agg_tm_offtarget([*tss_all, *tss_pseudo])
-        .filter(pl.col("max_tm_offtarget") < 42)
-    )
+    # ff = (
+    #     y.filter_by_match([*tss_all, *tss_pseudo], match=0.8, match_consec=0.8).agg_tm_offtarget(
+    #         [*tss_all, *tss_pseudo]
+    #     )
+    #     # .filter(pl.col("max_tm_offtarget") < 42)
+    # )
 
     ff = GeneFrame(
-        ff.lazy()
+        y.filter_by_match([*tss_all, *tss_pseudo], match=0.8, match_consec=0.8)
+        .agg_tm_offtarget([*tss_all, *tss_pseudo])
+        .lazy()
         .filter("is_ori_seq")
         .with_columns(
-            [
-                pl.col("transcript").apply(dataset.ensembl.ts_to_gene).alias("transcript_name"),
-                *PROBE_CRITERIA,
-            ]
+            transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
+            **PROBE_CRITERIA,
         )
         .with_columns(
             [

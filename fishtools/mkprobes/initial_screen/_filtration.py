@@ -2,17 +2,18 @@ from typing import Final
 
 import numpy as np
 import polars as pl
+from loguru import logger
 from oligocheck.algorithms import find_overlap, find_overlap_weighted
 
-PROBE_CRITERIA: Final = (
-    pl.col("seq").str.contains("GGGG").is_not().alias("ok_quad_c"),
-    pl.col("seq").str.contains("TTTT").is_not().alias("ok_quad_a"),
-    (pl.col("seq").str.count_match("T") / pl.col("seq").str.n_chars() < 0.28).alias("ok_comp_a"),
-    pl.all([pl.col("seq").str.slice(-6 - i, 6).str.count_match("G").lt(4) for i in range(6)]).alias(
-        "ok_stack_c"
-    ),
-    (pl.col("seq").str.count_match("G|C") / (pl.col("seq").str.n_chars())).alias("gc_content"),
+# fmt: off
+PROBE_CRITERIA: Final = dict(
+    ok_quad_c=pl.col("seq").str.contains("GGGG").is_not(),
+    ok_quad_a=pl.col("seq").str.contains("TTTT").is_not(),
+    ok_comp_a=(pl.col("seq").str.count_match("T") / pl.col("seq").str.n_chars() < 0.28),
+    ok_stack_c=pl.all([pl.col("seq").str.slice(-6 - i, 6).str.count_match("G").lt(4) for i in range(6)]),
+    gc_content=(pl.col("seq").str.count_match("G|C") / (pl.col("seq").str.n_chars()))
 )
+# fmt: on
 
 
 def handle_overlap(
@@ -40,10 +41,12 @@ def handle_overlap(
 
     selected_global = set()
     tss = df["transcript_ori"].unique().to_list()
+
     for ts in tss:
         this_transcript = df.filter(pl.col("transcript_ori") == ts)
-        print(len(this_transcript))
+        logger.info(f"Number of candidates: {len(this_transcript)}")
         if not len(this_transcript):
+            logger.error(f"No candidates for {ts}")
             continue
 
         for i in range(1, len(criteria) + 1):
@@ -62,7 +65,7 @@ def handle_overlap(
                 else:
                     ols = find_overlap_weighted(run["pos_start"], run["pos_end"], priorities, overlap=overlap)
                 sel_local = set(run[ols]["index"].to_list())
-                print(i, len(sel_local))
+                logger.info(f"Priority {i}, selected {len(sel_local)} probes")
                 if len(sel_local) > n:
                     break
             except RecursionError:
@@ -82,12 +85,11 @@ def the_filter(df: pl.DataFrame, overlap: int = -1) -> pl.DataFrame:
                 group,
                 criteria=[
                     # fmt: off
-                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("match_max_all").lt(21) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("match_max_all").lt(21) & pl.col("length").lt(42),
-                    (pl.col("oks") > 3) & (pl.col("hp") < 35) & pl.col("match_max_all").lt(24),
-                    (pl.col("oks") > 3) & pl.col("match_max_all").lt(28),
-                    (pl.col("oks") > 2) & pl.col("match_max_all").lt(28),
-                    (pl.col("oks") > 3),
+                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(42) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(42) & pl.col("length").lt(42),
+                    (pl.col("oks") > 3) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(47),
+                    (pl.col("oks") > 3) & pl.col("max_tm_offtarget").lt(47),
+                    (pl.col("oks") > 2) & pl.col("max_tm_offtarget").lt(47),
                     # fmt: on
                 ],
                 overlap=overlap,

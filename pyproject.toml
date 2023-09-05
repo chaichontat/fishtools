@@ -11,25 +11,25 @@ version = "0.1.0"
 [tool.poetry.dependencies]
 biopython = "^1.81"
 click = "^8.1.6"
+colorama = "^0.4.6"
 expression = "^4.2.4"
 glymur = "^0.12.8"
 imagecodecs = "^2023.7.10"
+levenshtein = "^0.21.1"
+loguru = "^0.7.0"
 mygene = "^3.2.2"
 numpy = "^1.25.1"
 polars = "^0.18.9"
+primer3-py = "^2.0.0"
 pyfastx = "^1.1.0"
 python = "^3.10"
 rich-click = "^1.6.1"
 tifffile = "^2023.7.18"
 tqdm = "^4.65.0"
-loguru = "^0.7.0"
-colorama = "^0.4.6"
-primer3-py = "^2.0.0"
-levenshtein = "^0.21.1"
 
 [tool.poetry.scripts]
 fishtools = "fishtools.cli:main"
-mkprobes = "fishtools.mkprobes.mkprobes:main"
+mkprobes = "fishtools.mkprobes.cli:main"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^3.3.3"
@@ -60,7 +60,7 @@ reportUnusedVariable = "warning"
 typeCheckingMode = "strict"
 
 [tool.ruff]
-ignore = ["E501"]
+ignore = ["E501", "E731"]
 line-length = 110
 
 [tool.isort]

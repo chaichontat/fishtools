@@ -1,73 +1,52 @@
-from pathlib import Path
 import sys
+from pathlib import Path
 
-from loguru import logger
 import click
-
-from fishtools.ext.external_data import Dataset
-
-sys.setrecursionlimit(5000)
 import polars as pl
+from loguru import logger
+
+from fishtools.utils.geneframe import GeneFrame
+
 from ._filtration import the_filter
 
-
-# print(ff)
-# ff.unique("name").write_parquet(f"output/{gene}_filtered.parquet")
-# final = the_filter(ff, overlap=overlap).filter(pl.col("flag") & 16 == 0)
-# logger.info(final)
-
-# ff.write_parquet(
-#     output
-#     / f"{gene}_crawled.parquet"
-#     # if overlap < 0
-#     # else output / f"{gene}_final_overlap_{overlap}.parquet"
-# )
-def filter_pseudogene(ff: pl.DataFrame, gene: str) -> pl.DataFrame:
-    """Filter pseudogenes."""
+sys.setrecursionlimit(5000)
 
 
 def run(
-    dataset: Dataset,
     data_dir: str | Path,
     gene: str,
-    output: str | Path,
     fpkm_path: str | Path | None = None,
     overlap: int = -2,
 ):
     data_dir = Path(data_dir)
-    ff = pl.read_parquet(data_dir / f"{gene}_crawled.parquet")
+    ff = GeneFrame(pl.read_parquet(data_dir / f"{gene}_crawled.parquet"))
 
-    final = the_filter(ff, overlap=overlap).filter(pl.col("flag") & 16 == 0)
-    logger.info(final)
+    if fpkm_path is not None:
+        fpkm = pl.read_parquet(fpkm_path)
+        ff = ff.left_join(fpkm, left_on="transcript", right_on="transcript_id(s)").filter(
+            pl.col("FPKM").lt(0.05 * pl.col("FPKM").first()) | pl.col("FPKM").lt(1) | pl.col("FPKM").is_null()
+        )
 
-
-
+    final = the_filter(ff, overlap=overlap)
+    final.write_parquet(data_dir / f"{gene}_screened.parquet")
+    logger.info("Done")
 
 
 @click.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("gene")
 @click.argument("data_dir", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("gene")
 @click.option("--fpkm_path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
-@click.option("--output", "-o", type=click.Path(), default="output/")
-@click.option("--debug", "-d", is_flag=True)
-@click.option("--ignore-revcomp", "-r", is_flag=True)
 @click.option("--overlap", "-l", type=int, default=-2)
-@click.option("--realign", is_flag=True)
-def candidates(
-    path: str,
+def screen(
     data_dir: str,
-    fpkm_path: Path | str,
     gene: str,
-    allow_pseudo: bool = True,
-    debug: bool = False,
+    fpkm_path: Path | str | None = None,
+    overlap: int = -2,
 ):
-    """Initial screening of probes candidates for a gene."""
+    """Screening of probes candidates for a gene."""
     run(
-        Dataset(path),
-        data_dir=data_dir,
-        fpkm_path=fpkm_path,
+        data_dir,
         gene,
-        allow_pseudo=allow_pseudo,
+        fpkm_path=fpkm_path,
         overlap=overlap,
     )
