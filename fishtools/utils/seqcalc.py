@@ -9,7 +9,7 @@ from Bio.Seq import Seq
 from Bio.SeqUtils import MeltingTemp as mt
 from typing_extensions import NotRequired, Unpack
 
-from fishtools.mkprobes.initial_screen.pairwise import pairwise_alignment
+from fishtools.mkprobes.initial_screen._pairwise import pairwise_alignment
 from fishtools.utils.sequtils import gc_content
 
 deltas = pl.read_csv(
@@ -106,9 +106,11 @@ r = re.compile(r"(\|{15,})")
 
 
 @cache
-def tm_match(seq: str, cigar: str, mismatched_reference: str, model: Model = "rna") -> float:
+def tm_pairwise(
+    seq: str, cigar: str, mismatched_reference: str, model: Model = "rna", formamide: float = 0
+) -> float:
     p = pairwise_alignment(seq, cigar, mismatched_reference)
     try:
-        return max(tm(seq[slice(*x.span())], model=model) for x in r.finditer(p[1]))
+        return max(tm(seq[slice(*x.span())], model=model, formamide=formamide) for x in r.finditer(p[1]))
     except ValueError:
         return 0

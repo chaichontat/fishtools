@@ -3,14 +3,14 @@ from __future__ import annotations
 from functools import reduce, wraps
 from io import StringIO
 from pathlib import Path
-from typing import Any, Callable, Collection, Iterable, Literal, ParamSpec, TypeVar, overload
+from typing import Any, Callable, Collection, Iterable, ParamSpec, TypeVar
 
 import polars as pl
 from loguru import logger
 from typing_extensions import Self
 
 from fishtools.mkprobes.alignment import run_bowtie
-from fishtools.utils.seqcalc import tm_match
+from fishtools.utils.seqcalc import tm_pairwise
 from fishtools.utils.utils import copy_signature, copy_signature_method
 
 T = TypeVar("T")
@@ -193,80 +193,48 @@ class GeneFrame(pl.DataFrame):
         return cls._count_match(df) if count_match else cls(df)
         # fmt: on
 
-    @to_geneframe
-    def filter_match(self, *, match: int, match_consec: int):
-        return (
-            self.groupby("name")
-            .agg(pl.col("match_consec").max())
-            .filter(
-                (pl.col("match_consec").lt(match_consec) & pl.col("match").lt(match))
-                | pl.col("match").is_null()
-            )
-            .with_columns(name=pl.col("name").cast(pl.UInt16))
-        )
-
-    @overload
     def filter_by_match(
-        self,
-        acceptable_tss: Collection[str],
-        match: float = ...,
-        match_consec: float = ...,
-        *,
-        return_nogo: Literal[True],
-    ) -> tuple[GeneFrame, list[str]]:
-        ...
-
-    @overload
-    def filter_by_match(
-        self,
-        acceptable_tss: Collection[str],
-        match: float = ...,
-        match_consec: float = ...,
-        *,
-        return_nogo: Literal[False] = ...,
+        self, acceptable_tss: Collection[str], match: float = 0.8, match_consec: float = 0.7
     ) -> GeneFrame:
-        ...
+        """Cannot do a groupby because this is a percent comparison.
+        Each transcript must be compared to its length."""
 
-    def filter_by_match(
-        self,
-        acceptable_tss: Collection[str],
-        match: float = 0.8,
-        match_consec: float = 0.7,
-        *,
-        return_nogo: bool = False,
-    ) -> tuple[GeneFrame, list[str]] | GeneFrame:
+        # Filter by match and match_consec.
         nogo = self.filter(
-            (pl.col("match").gt(pl.col("length") * match))
-            & (pl.col("match_consec").gt(pl.col("length") * match_consec))
+            (pl.col("match") > pl.col("length") * match)
+            & (pl.col("match_consec") > pl.col("length") * match_consec)
             & ~pl.col("transcript").is_in(acceptable_tss)
         )
 
+        return GeneFrame(self.filter(~pl.col("name").is_in(nogo["name"])))
+
+    @to_geneframe
+    def agg_tm_offtarget(self, acceptable_tss: Collection[str]):
+        # Filter by maximum offtarget Tms.
+        # Only calculate Tm for sequences with >15 consecutive matches
+        # to save time.
+
         tm_offtarget = self.filter(
-            pl.col("match_consec").is_between(pl.col("length") * 0.5, pl.col("length") * match_consec + 0.01)
+            ~pl.col("transcript").is_in(acceptable_tss)
+            & (pl.col("match_consec") > (pl.col("length") * 0.5))
             & pl.col("match_consec").gt(15)
         ).with_columns(
             tm_offtarget=pl.struct(["seq", "cigar", "mismatched_reference"]).apply(
-                lambda x: tm_match(x["seq"], x["cigar"], x["mismatched_reference"])  # type: ignore
+                lambda x: tm_pairwise(x["seq"], x["cigar"], x["mismatched_reference"], formamide=30)  # type: ignore
             )
         )
         unique = tm_offtarget.groupby("name").agg(
             pl.max("tm_offtarget").alias("max_tm_offtarget").cast(pl.Float32),
             pl.max("match_consec").alias("match_consec_all"),
         )
-        nogo_soft = tm_offtarget.filter(pl.col("tm_offtarget").gt(40))
-
-        filtered = (
-            self.filter(~pl.col("name").is_in(nogo["name"]) & ~pl.col("name").is_in(nogo_soft["name"]))
+        # Aggregate
+        return (
+            self.filter(pl.col("transcript") == pl.col("transcript_ori"))
             .join(unique, on="name", how="left")
             .with_columns(
                 max_tm_offtarget=pl.col("max_tm_offtarget").fill_null(0.0),
                 match_consec_all=pl.col("match_consec_all").fill_null(0),
             )
-        )
-        return (
-            GeneFrame(filtered)
-            if not return_nogo
-            else (GeneFrame(filtered), nogo["name"].unique().to_list() + nogo_soft["name"].unique().to_list())
         )
 
     @classmethod

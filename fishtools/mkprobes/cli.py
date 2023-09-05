@@ -8,7 +8,7 @@ from fishtools.io.pretty_print import jprint
 from fishtools.mkprobes.alignment import bowtie_build, gen_bowtie_index
 from fishtools.utils.utils import setup_logging
 
-from .initial_screen.screen import screen
+from .initial_screen.candidates import candidates
 
 log = setup_logging()
 
@@ -60,7 +60,7 @@ def prepare(path: Path, species: Literal["human", "mouse"]):
     bowtie_build(path / "cdna_ncrna_trna.fasta", "txome")
 
 
-main.add_command(screen)
+main.add_command(candidates)
 
 
 if __name__ == "__main__":
