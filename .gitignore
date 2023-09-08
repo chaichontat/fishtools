@@ -161,3 +161,6 @@ cython_debug/
 
 *.tif
 data/
+temp/
+output/
+*.gz
