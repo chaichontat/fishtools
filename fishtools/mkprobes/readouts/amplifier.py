@@ -11,7 +11,7 @@ from loguru import logger
 from fishtools.mkprobes.alignment import gen_bowtie_index, gen_fasta
 from fishtools.mkprobes.constants import DT, SP6
 from fishtools.mkprobes.definitions import Filter
-from fishtools.utils.geneframe import SAMFrame
+from fishtools.utils.samframe import SAMFrame
 from fishtools.utils.seqcalc import hp, tm
 from fishtools.utils.sequtils import gc_content, reverse_complement
 from fishtools.utils.utils import TAny, slide

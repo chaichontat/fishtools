@@ -29,7 +29,7 @@ def run(
 
     final = the_filter(ff, overlap=overlap)
     final.write_parquet(data_dir / f"{gene}_screened.parquet")
-    logger.info("Done")
+    return final
 
 
 @click.command()
@@ -37,16 +37,34 @@ def run(
 @click.argument("gene")
 @click.option("--fpkm_path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overlap", "-l", type=int, default=-2)
+@click.option(
+    "--minimum",
+    type=int,
+    help="Minimum number of probes per gene. "
+    "Will generate probe sets with more overlaps (up to --maxoverlap) until the number is reached. "
+    "Overrides --overlap.",
+)
+@click.option(
+    "--maxoverlap", type=int, default=20, help="Maximum sequence overlap between probes if minimum is set."
+)
 def screen(
     data_dir: str,
     gene: str,
     fpkm_path: Path | str | None = None,
     overlap: int = -2,
+    minimum: int | None = None,
+    maxoverlap: int = 20,
 ):
     """Screening of probes candidates for a gene."""
-    run(
-        data_dir,
-        gene,
-        fpkm_path=fpkm_path,
-        overlap=overlap,
-    )
+    if minimum is not None:
+        if maxoverlap % 5 != 0 or maxoverlap == 0:
+            raise ValueError("maxoverlap must be positive non-zero and a multiple of 5")
+
+        for i in range(0, maxoverlap + 1, 5):
+            final = run(data_dir, gene, fpkm_path=fpkm_path, overlap=i)
+            if len(final) >= minimum:
+                logger.info(f"Overlap {i} results in {len(final)} probes. Stopping.")
+                return
+            logger.warning(f"Overlap {i} results in {len(final)} probes. Trying next overlap.")
+
+    run(data_dir, gene, fpkm_path=fpkm_path, overlap=overlap)

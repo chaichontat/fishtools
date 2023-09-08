@@ -1,11 +1,9 @@
 # %%
-import json
 from pathlib import Path
 from typing import cast
 
 import click
 import polars as pl
-import requests
 from loguru import logger
 
 from fishtools.ext.external_data import Dataset, ExternalData, get_ensembl
@@ -56,16 +54,20 @@ def run(
     allow_pseudo: bool = True,
     ignore_revcomp: bool = False,
     realign: bool = False,
+    allow: list[str] | None = None,
+    disallow: list[str] | None = None,
 ):
+    allow, disallow = allow or [], disallow or []
     (output := Path(output)).mkdir(exist_ok=True)
     tss_gencode = set(dataset.gencode.filter_gene(gene)["transcript_id"])
-    tss_all = dataset.ensembl.filter_gene(gene)["transcript_id"]
+    tss_allofgene = set(dataset.ensembl.filter_gene(gene)["transcript_id"])
     if not len(tss_gencode):
         raise ValueError(f"Gene {gene} not found in GENCODE.")
 
     canonical = get_ensembl(output, dataset.gencode.filter_gene(gene)[0, "gene_id"])[
         "canonical_transcript"
     ].split(".")[0]
+
     tss_gencode.add(canonical)  # Some canonical transcripts are not in GENCODE.
     logger.info(f"Crawler running for {gene}")
     logger.info(f"Canonical transcript: {canonical}")
@@ -114,12 +116,13 @@ def run(
     tss_pseudo, pseudo_name = (
         get_pseudogenes(gene, dataset.ensembl, y) if allow_pseudo else (pl.Series(), pl.Series())
     )
-    logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
-    pl.DataFrame(dict(transcript=[*tss_all, *tss_pseudo])).write_csv(output / f"{gene}_acceptable_tss.csv")
+    # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
+    tss_others = set([*tss_pseudo, *allow]) - set(disallow)
+    pl.DataFrame(dict(transcript=list(tss_others))).write_csv(output / f"{gene}_acceptable_tss.csv")
 
-    if len(tss_pseudo):
+    if len(tss_others):
         names_with_pseudo = (
-            y.filter_isin(transcript=tss_pseudo)
+            y.filter_isin(transcript=tss_others)
             .rename(dict(transcript="maps_to_pseudo"))[["name", "maps_to_pseudo"]]
             .unique("name")
         )
@@ -133,16 +136,9 @@ def run(
         .all()
     )
 
-    # ff = (
-    #     y.filter_by_match([*tss_all, *tss_pseudo], match=0.8, match_consec=0.8).agg_tm_offtarget(
-    #         [*tss_all, *tss_pseudo]
-    #     )
-    #     # .filter(pl.col("max_tm_offtarget") < 42)
-    # )
-
     ff = SAMFrame(
-        y.filter_by_match([*tss_all, *tss_pseudo], match=0.8, match_consec=0.8)
-        .agg_tm_offtarget([*tss_all, *tss_pseudo])
+        y.filter_by_match(tss_allofgene | tss_others, match=0.8, match_consec=0.8)
+        .agg_tm_offtarget(tss_allofgene | tss_others)
         .filter("is_ori_seq")
         .with_columns(
             transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
@@ -158,20 +154,12 @@ def run(
         .with_columns(oks=pl.sum(pl.col("^ok_.*$")))
         .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
         .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.trna_rna_kmers, 15)))
-        # .collect()
         .join(names_with_pseudo, on="name", how="left")
         .join(isoforms, on="name", how="left")
     )
-    # print(ff)
-    # ff.unique("name").write_parquet(f"output/{gene}_filtered.parquet")
-    # final = the_filter(ff, overlap=overlap).filter(pl.col("flag") & 16 == 0)
-    # logger.info(final)
-    ff.write_parquet(
-        output
-        / f"{gene}_crawled.parquet"
-        # if overlap < 0
-        # else output / f"{gene}_final_overlap_{overlap}.parquet"
-    )
+    logger.info(f"Generated {len(ff)} candidates.")
+
+    ff.write_parquet(output / f"{gene}_crawled.parquet")
     return ff
 
 
