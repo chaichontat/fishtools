@@ -1,7 +1,6 @@
 # %%
 import gzip
 import json
-from dataclasses import dataclass
 from functools import cache
 from io import StringIO
 from pathlib import Path
@@ -21,6 +20,7 @@ def get_ensembl(path: Path | str, id_: str):
     if (p := (path / f"{id_}.json")).exists():
         return json.loads(p.read_text())
 
+    log.info(f"Fetching {id_} on ensembl")
     res = requests.get(f"https://rest.ensembl.org/lookup/id/{id_}?content-type=application/json")
     res.raise_for_status()
     p.write_text(res.text)
