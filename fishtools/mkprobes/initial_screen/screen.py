@@ -5,7 +5,7 @@ import click
 import polars as pl
 from loguru import logger
 
-from fishtools.utils.geneframe import GeneFrame
+from fishtools.utils.samframe import SAMFrame
 
 from ._filtration import the_filter
 
@@ -19,7 +19,7 @@ def run(
     overlap: int = -2,
 ):
     data_dir = Path(data_dir)
-    ff = GeneFrame(pl.read_parquet(data_dir / f"{gene}_crawled.parquet"))
+    ff = SAMFrame(pl.read_parquet(data_dir / f"{gene}_crawled.parquet"))
 
     if fpkm_path is not None:
         fpkm = pl.read_parquet(fpkm_path)

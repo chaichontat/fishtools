@@ -11,7 +11,7 @@ from loguru import logger
 from fishtools.mkprobes.alignment import gen_bowtie_index, gen_fasta
 from fishtools.mkprobes.constants import DT, SP6
 from fishtools.mkprobes.definitions import Filter
-from fishtools.utils.geneframe import GeneFrame
+from fishtools.utils.geneframe import SAMFrame
 from fishtools.utils.seqcalc import hp, tm
 from fishtools.utils.sequtils import gc_content, reverse_complement
 from fishtools.utils.utils import TAny, slide
@@ -56,7 +56,7 @@ def run_filter(f: Filter, seqs: T, return_ok_seqs: bool = False) -> pl.DataFrame
 class Filters:
     @staticmethod
     def check_humouse(fasta: str, match_consec_thresh: int = 16):
-        df = GeneFrame.from_bowtie(
+        df = SAMFrame.from_bowtie(
             fasta,
             "data/humouse/humouse",
             seed_length=10,
@@ -78,7 +78,7 @@ class Filters:
         resulting in a false negative."""
 
         gen_bowtie_index(fasta, "temp", "amplifiers")
-        bt = GeneFrame.from_bowtie(
+        bt = SAMFrame.from_bowtie(
             fasta, "temp/amplifiers", seed_length=9, threshold=12, fasta=True, no_reverse=True
         )
 
@@ -112,7 +112,7 @@ class Filters:
 
         gen_bowtie_index(fasta, "temp", "amplifiers")
         bt = (
-            GeneFrame.from_bowtie(
+            SAMFrame.from_bowtie(
                 gen_fasta(zero.values(), names=zero.keys()).getvalue(),
                 "temp/amplifiers",
                 seed_length=9,

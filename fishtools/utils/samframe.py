@@ -17,42 +17,42 @@ T = TypeVar("T")
 P, R = ParamSpec("P"), TypeVar("R")
 
 
-def to_geneframe(f: Callable[P, pl.DataFrame]) -> Callable[P, GeneFrame]:
+def to_samframe(f: Callable[P, pl.DataFrame]) -> Callable[P, SAMFrame]:
     @wraps(f)
-    def wrap(*args: P.args, **kwargs: P.kwargs) -> GeneFrame:
-        return GeneFrame(f(*args, **kwargs))
+    def wrap(*args: P.args, **kwargs: P.kwargs) -> SAMFrame:
+        return SAMFrame(f(*args, **kwargs))
 
     return wrap
 
 
-class LazyGeneFrame(pl.LazyFrame):
+class LazySAMFrame(pl.LazyFrame):
     def __init__(self, ldf: pl.LazyFrame):
         self._ldf = ldf._ldf
 
-    @to_geneframe
+    @to_samframe
     @copy_signature(pl.LazyFrame.collect)
     def collect(self, *args: Any, **kwargs: Any):
         return super().collect(*args, **kwargs)
 
 
-class GeneFrame(pl.DataFrame):
+class SAMFrame(pl.DataFrame):
     # NECESSARY_COLUMNS = {"seq", "transcript", "pos_start", "pos_end"}
     def __init__(self, df: pl.DataFrame):
         self._df = df._df
 
-    def lazy(self) -> LazyGeneFrame:
-        return LazyGeneFrame(super().lazy())
+    def lazy(self) -> LazySAMFrame:
+        return LazySAMFrame(super().lazy())
 
-    @to_geneframe
+    @to_samframe
     def count(self, col: str = "gene", descending: bool = False):
         return self.groupby(col).agg(pl.count()).sort("count", descending=descending)
 
-    @to_geneframe
+    @to_samframe
     @copy_signature(pl.DataFrame.join)
     def join(self, *args: Any, **kwargs: Any):
         return super().join(*args, **kwargs)
 
-    @to_geneframe
+    @to_samframe
     @copy_signature(pl.DataFrame.sort)
     def sort(self, *args: Any, **kwargs: Any):
         return super().sort(*args, **kwargs)
@@ -60,7 +60,7 @@ class GeneFrame(pl.DataFrame):
     def sort_(self, **kwargs: bool):
         return self.sort(by=list(kwargs.keys()), descending=list(kwargs.values()))
 
-    @to_geneframe
+    @to_samframe
     @copy_signature(pl.DataFrame.filter)
     def filter(self, *args: Any, **kwargs: Any):
         return super().filter(*args, **kwargs)
@@ -84,7 +84,7 @@ class GeneFrame(pl.DataFrame):
         return self.join(other, on=on, left_on=left_on, right_on=right_on, how="left")
 
     @classmethod
-    def concat(cls, dfs: Iterable[pl.DataFrame]) -> GeneFrame:
+    def concat(cls, dfs: Iterable[pl.DataFrame]) -> SAMFrame:
         return cls(pl.concat(dfs))
 
     @classmethod
@@ -92,8 +92,8 @@ class GeneFrame(pl.DataFrame):
         return cls(pl.read_parquet(path))
 
     @staticmethod
-    def _count_match(df: pl.DataFrame) -> GeneFrame:
-        return GeneFrame(
+    def _count_match(df: pl.DataFrame) -> SAMFrame:
+        return SAMFrame(
             df.join(
                 df[["id", "mismatched_reference"]]
                 .with_columns(mismatched_reference=pl.col("mismatched_reference").str.extract_all(r"(\d+)"))
@@ -110,7 +110,7 @@ class GeneFrame(pl.DataFrame):
         )
 
     @classmethod
-    def from_sam(cls, sam: str, split_name: bool = True, count_match: bool = True) -> GeneFrame:
+    def from_sam(cls, sam: str, split_name: bool = True, count_match: bool = True) -> SAMFrame:
         # s = (
         #     pl.DataFrame(dict(strs=[sam]))
         #     .lazy()
@@ -195,7 +195,7 @@ class GeneFrame(pl.DataFrame):
 
     def filter_by_match(
         self, acceptable_tss: Collection[str], match: float = 0.8, match_consec: float = 0.7
-    ) -> GeneFrame:
+    ) -> SAMFrame:
         """Cannot do a groupby because this is a percent comparison.
         Each transcript must be compared to its length."""
 
@@ -206,9 +206,9 @@ class GeneFrame(pl.DataFrame):
             & ~pl.col("transcript").is_in(acceptable_tss)
         )
 
-        return GeneFrame(self.filter(~pl.col("name").is_in(nogo["name"])))
+        return SAMFrame(self.filter(~pl.col("name").is_in(nogo["name"])))
 
-    @to_geneframe
+    @to_samframe
     def agg_tm_offtarget(self, acceptable_tss: Collection[str]):
         # Filter by maximum offtarget Tms.
         # Only calculate Tm for sequences with >15 consecutive matches
@@ -249,5 +249,5 @@ class GeneFrame(pl.DataFrame):
 
 
 if __name__ == "__main__":
-    g = GeneFrame(pl.DataFrame({"name": ["a", "b", "c"], "seq": ["A", "B", "C"]}))
+    g = SAMFrame(pl.DataFrame({"name": ["a", "b", "c"], "seq": ["A", "B", "C"]}))
     g.filter("fsd")

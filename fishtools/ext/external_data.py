@@ -1,5 +1,6 @@
 # %%
 import gzip
+import json
 from dataclasses import dataclass
 from functools import cache
 from io import StringIO
@@ -9,9 +10,21 @@ from typing import Any, Sequence, overload
 import mygene
 import polars as pl
 import pyfastx
+import requests
 from loguru import logger as log
 
 mg = mygene.MyGeneInfo()
+
+
+def get_ensembl(path: Path | str, id_: str):
+    path = Path(path)
+    if (p := (path / f"{id_}.json")).exists():
+        return json.loads(p.read_text())
+
+    res = requests.get(f"https://rest.ensembl.org/lookup/id/{id_}?content-type=application/json")
+    res.raise_for_status()
+    p.write_text(res.text)
+    return res.json()
 
 
 class ExternalData:

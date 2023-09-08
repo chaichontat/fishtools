@@ -71,7 +71,7 @@ def jellyfish(
 
 
 def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]) -> Gtfs:
-    path = Path(path)
+    (path := Path(path)).mkdir(exist_ok=True, parents=True)
     urls = _process_tsv(uf := url_files[species])
     shutil.copy(uf, path / "urls.tsv")
     del uf
@@ -84,13 +84,14 @@ def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]) -> 
             names = [k[:-4] + ".gtf.gz" if "gtf" in k else None for k in todownload]
             pool.map(download, todownload.values(), ["."] * len(urls), names)
 
-        trna_name = filenames["trna"].split(".")[0] + ".fa"
-        with tarfile.open(filenames["trna"], "r:gz") as tar:
-            for member in tar.getmembers():
-                if member.name == trna_name:
-                    tar.extract(member, ".")
-                    break
-        filenames["trna"] = trna_name
+        if filenames["trna"].endswith(".gz"):
+            trna_name = filenames["trna"].split(".")[0] + ".fa"
+            with tarfile.open(filenames["trna"], "r:gz") as tar:
+                for member in tar.getmembers():
+                    if member.name == trna_name:
+                        tar.extract(member, ".")
+                        break
+            filenames["trna"] = trna_name
 
         # Concatenate fasta and tRNA files
         if (p_ := Path("cdna_ncrna_trna.fasta")).exists():

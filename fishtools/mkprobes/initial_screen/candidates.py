@@ -1,14 +1,16 @@
 # %%
+import json
 from pathlib import Path
 from typing import cast
 
 import click
 import polars as pl
+import requests
 from loguru import logger
 
-from fishtools.ext.external_data import Dataset, ExternalData
+from fishtools.ext.external_data import Dataset, ExternalData, get_ensembl
 from fishtools.mkprobes.alignment import gen_fasta
-from fishtools.utils.geneframe import GeneFrame
+from fishtools.utils.samframe import SAMFrame
 from fishtools.utils.seqcalc import hp, tm
 
 from ._crawler import crawler
@@ -21,7 +23,7 @@ except NameError:
 
 
 def get_pseudogenes(
-    gene: str, ensembl: ExternalData, y: GeneFrame, limit: int = 5
+    gene: str, ensembl: ExternalData, y: SAMFrame, limit: int = 5
 ) -> tuple[pl.Series, pl.Series]:
     counts = (
         y.count("transcript")
@@ -61,9 +63,9 @@ def run(
     if not len(tss_gencode):
         raise ValueError(f"Gene {gene} not found in GENCODE.")
 
-    canonical = dataset.ensembl.filter_gene(gene).filter(pl.col("tag") == "Ensembl_canonical")[
-        0, "transcript_id"
-    ]
+    canonical = get_ensembl(output, dataset.gencode.filter_gene(gene)[0, "gene_id"])[
+        "canonical_transcript"
+    ].split(".")[0]
     tss_gencode.add(canonical)  # Some canonical transcripts are not in GENCODE.
     logger.info(f"Crawler running for {gene}")
     logger.info(f"Canonical transcript: {canonical}")
@@ -72,7 +74,7 @@ def run(
         seq = dataset.gencode.get_seq(canonical)
         crawled = crawler(seq, prefix=f"{gene}_{canonical}")
 
-        y = GeneFrame.from_bowtie_split_name(
+        y = SAMFrame.from_bowtie_split_name(
             gen_fasta(crawled["seq"], names=crawled["name"]).getvalue(),
             dataset.path / "txome",
             seed_length=13,
@@ -93,7 +95,7 @@ def run(
         offtargets.write_parquet(output / f"{gene}_offtargets.parquet")
     else:
         logger.warning(f"{gene} reading from cache.")
-        y = GeneFrame.read_parquet(output / f"{gene}_all.parquet")
+        y = SAMFrame.read_parquet(output / f"{gene}_all.parquet")
         offtargets = pl.read_parquet(output / f"{gene}_offtargets.parquet")
 
     # Print most common offtargets
@@ -138,10 +140,9 @@ def run(
     #     # .filter(pl.col("max_tm_offtarget") < 42)
     # )
 
-    ff = GeneFrame(
+    ff = SAMFrame(
         y.filter_by_match([*tss_all, *tss_pseudo], match=0.8, match_consec=0.8)
         .agg_tm_offtarget([*tss_all, *tss_pseudo])
-        .lazy()
         .filter("is_ori_seq")
         .with_columns(
             transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
@@ -157,7 +158,7 @@ def run(
         .with_columns(oks=pl.sum(pl.col("^ok_.*$")))
         .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
         .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.trna_rna_kmers, 15)))
-        .collect()
+        # .collect()
         .join(names_with_pseudo, on="name", how="left")
         .join(isoforms, on="name", how="left")
     )

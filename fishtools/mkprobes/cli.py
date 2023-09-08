@@ -64,7 +64,7 @@ def chkgenes(path: Path):
 
 # fmt: off
 @main.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("path", type=click.Path(dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--species", "-s", type=click.Choice(("human", "mouse")), default="mouse", help="Species to use for probe design")
 # fmt: on
 def prepare(path: Path, species: Literal["human", "mouse"]):
