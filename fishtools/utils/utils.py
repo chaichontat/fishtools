@@ -94,7 +94,7 @@ def slide(x: str, n: int = 20) -> list[str]:
 
 def check_if_exists(
     logger: "loguru.Logger",
-    name_detector: Callable[[dict[str, Any]], str] = lambda kwargs: str(next(iter(kwargs.values()))),
+    name_detector: Callable[[dict[str, Any]], Path | str] = lambda kwargs: str(next(iter(kwargs.values()))),
 ):
     """
     A decorator that checks if a file exists before executing a function.

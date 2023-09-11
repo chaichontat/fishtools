@@ -37,6 +37,10 @@ class ExternalData:
         regen_cache: bool = False,
     ) -> None:
         self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=lambda x: x.split(" ")[0].split(".")[0])
+        self.fa_masked = pyfastx.Fasta(
+            Path(fasta).with_suffix(Path(fasta).suffix + ".masked").as_posix(),
+            key_func=lambda x: x.split(" ")[0].split(".")[0],
+        )
         self._ts_gene_map: dict[str, str] | None = None
 
         if Path(cache).exists() and not regen_cache:
@@ -86,8 +90,8 @@ class ExternalData:
         return self.gtf.filter(pl.col("gene_id") == eid)["transcript_id"]
 
     @cache
-    def get_seq(self, eid: str) -> str:
-        res = self.fa[eid.split(".")[0]].seq
+    def get_seq(self, eid: str, *, masked: bool = False) -> str:
+        res = (self.fa if not masked else self.fa_masked)[eid.split(".")[0]].seq
         if not res:
             raise ValueError(f"Could not find {eid}")
         return res

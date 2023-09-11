@@ -41,6 +41,9 @@ def crawler(
     to_avoid.extend(["A" * 5, "T" * 5, "C" * 5, "G" * 5])
 
     for start in range(len(seq) - length_limit[0]):
+        if seq[start].lower() == "n":
+            continue
+
         while True:
             if end - start < length_limit[0]:
                 end += 1

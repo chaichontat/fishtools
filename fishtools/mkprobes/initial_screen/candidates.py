@@ -46,11 +46,11 @@ def get_pseudogenes(
 
 
 # %%
-def run(
+def run_candidates(
     dataset: Dataset,
     gene: str,
-    output: str | Path,
-    # overlap: int = -2,
+    output: str | Path = "output/",
+    *,
     allow_pseudo: bool = True,
     ignore_revcomp: bool = False,
     realign: bool = False,
@@ -73,7 +73,7 @@ def run(
     logger.info(f"Canonical transcript: {canonical}")
 
     if realign or not (output / f"{gene}_all.parquet").exists():
-        seq = dataset.gencode.get_seq(canonical)
+        seq = dataset.gencode.get_seq(canonical, masked=True)
         crawled = crawler(seq, prefix=f"{gene}_{canonical}")
 
         y = SAMFrame.from_bowtie_split_name(
@@ -118,7 +118,6 @@ def run(
     )
     # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
     tss_others = set([*tss_pseudo, *allow]) - set(disallow)
-    pl.DataFrame(dict(transcript=list(tss_others))).write_csv(output / f"{gene}_acceptable_tss.csv")
 
     if len(tss_others):
         names_with_pseudo = (
@@ -136,9 +135,17 @@ def run(
         .all()
     )
 
+    tss_allacceptable: list[str] = list(tss_allofgene | tss_others)
+    pl.DataFrame(
+        dict(
+            transcript_id=tss_allacceptable,
+            transcipt_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable],
+        )
+    ).write_csv(output / f"{gene}_acceptable_tss.csv")
+
     ff = SAMFrame(
-        y.filter_by_match(tss_allofgene | tss_others, match=0.8, match_consec=0.8)
-        .agg_tm_offtarget(tss_allofgene | tss_others)
+        y.filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
+        .agg_tm_offtarget(tss_allacceptable)
         .filter("is_ori_seq")
         .with_columns(
             transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
@@ -167,7 +174,6 @@ def run(
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("gene")
 @click.option("--output", "-o", type=click.Path(), default="output/")
-@click.option("--debug", "-d", is_flag=True)
 @click.option("--ignore-revcomp", "-r", is_flag=True)
 @click.option("--realign", is_flag=True)
 def candidates(
@@ -175,16 +181,14 @@ def candidates(
     gene: str,
     output: str,
     ignore_revcomp: bool,
-    allow_pseudo: bool = True,
-    debug: bool = False,
     realign: bool = False,
 ):
     """Initial screening of probes candidates for a gene."""
-    run(
+    run_candidates(
         Dataset(path),
         gene,
         output=output,
-        allow_pseudo=allow_pseudo,
+        allow_pseudo=True,
         ignore_revcomp=ignore_revcomp,
         realign=realign,
     )

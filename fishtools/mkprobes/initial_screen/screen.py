@@ -28,13 +28,17 @@ def run(
         )
 
     final = the_filter(ff, overlap=overlap)
-    final.write_parquet(data_dir / f"{gene}_screened.parquet")
+    final.write_parquet(
+        data_dir / f"{gene}_screened_ol{overlap}.parquet"
+        if overlap > 0
+        else data_dir / f"{gene}_screened.parquet"
+    )
     return final
 
 
 @click.command()
 @click.argument("data_dir", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("gene")
+@click.argument("gene", type=str)
 @click.option("--fpkm_path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overlap", "-l", type=int, default=-2)
 @click.option(

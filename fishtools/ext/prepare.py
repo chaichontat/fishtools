@@ -2,6 +2,7 @@
 import gzip
 import shlex
 import shutil
+import subprocess
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -129,6 +130,7 @@ def get_rrna_snorna(gtf: ExternalData):
     return ids, list(map(gtf.get_seq, ids))
 
 
+@check_if_exists(log, lambda kwargs: Path(kwargs["path"]) / "cdna18.jf")
 def run_jellyfish(path: Path | str):
     path = Path(path)
     with set_cwd(path):
@@ -153,6 +155,17 @@ def run_jellyfish(path: Path | str):
             minimum=10,
             counter=4,
         )
+
+
+@check_if_exists(
+    log, lambda kwargs: Path(kwargs["fasta"]).with_suffix(Path(kwargs["fasta"]).suffix + ".masked")
+)
+def run_repeatmasker(fasta: Path | str, species: str, threads: int = 16):
+    fasta = Path(fasta)
+    subprocess.run(
+        shlex.split(f'RepeatMasker -norna -pa {threads} -norna -species "{species}" {fasta.as_posix()}'),
+        check=True,
+    )
 
 
 # %%
