@@ -201,8 +201,10 @@ class SAMFrame(pl.DataFrame):
 
         # Filter by match and match_consec.
         nogo = self.filter(
-            (pl.col("match") > pl.col("length") * match)
-            & (pl.col("match_consec") > pl.col("length") * match_consec)
+            (
+                (pl.col("match") > pl.col("length") * match)
+                | (pl.col("match_consec") > pl.col("length") * match_consec)
+            )
             & ~pl.col("transcript").is_in(acceptable_tss)
         )
 
@@ -228,14 +230,17 @@ class SAMFrame(pl.DataFrame):
             pl.max("match_consec").alias("match_consec_all"),
         )
         # Aggregate
-        return (
-            self.filter(pl.col("is_ori_seq"))
+        out = (
+            self.filter(pl.col("length") == pl.col("match_consec"))
+            .unique("name")
             .join(unique, on="name", how="left")
             .with_columns(
                 max_tm_offtarget=pl.col("max_tm_offtarget").fill_null(0.0),
                 match_consec_all=pl.col("match_consec_all").fill_null(0),
             )
         )
+
+        return out
 
     @classmethod
     @copy_signature_method(run_bowtie, Self)

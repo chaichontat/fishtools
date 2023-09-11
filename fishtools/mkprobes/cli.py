@@ -6,6 +6,7 @@ import rich_click as click
 
 from fishtools.ext.prepare import run_repeatmasker
 from fishtools.mkprobes.alignment import bowtie_build
+from fishtools.mkprobes.codebook.finalconstruct import filter_genes
 from fishtools.mkprobes.initial_screen.screen import screen
 from fishtools.mkprobes.misc.chkgenes import chkgenes
 from fishtools.utils.utils import setup_logging
@@ -61,6 +62,7 @@ def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
 main.add_command(candidates)
 main.add_command(screen)
 main.add_command(chkgenes)
+main.add_command(filter_genes)
 
 
 if __name__ == "__main__":

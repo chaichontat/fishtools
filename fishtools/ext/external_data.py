@@ -204,6 +204,16 @@ class Dataset:
         )
         self.kmerset = set(self.kmer18["kmer"])
 
+    @property
+    @cache
+    def appris(self):
+        return pl.read_csv(
+            self.path / "appris_data.principal.txt",
+            separator="\t",
+            has_header=False,
+            new_columns=["gene_name", "gene_id", "transcript_id", "ccds", "annotation"],
+        )
+
     # def check_gene_names(self, genes: list[str]):
     #     notfound = []
     #     ok: list[str] = []
