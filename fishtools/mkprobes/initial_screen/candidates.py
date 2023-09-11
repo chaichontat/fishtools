@@ -68,6 +68,14 @@ def run_candidates(
         "canonical_transcript"
     ].split(".")[0]
 
+    appris = dataset.appris.filter(
+        (pl.col("gene_name") == gene) & (pl.col("annotation").str.contains("PRINCIPAL"))
+    ).sort("annotation")
+
+    if appris.filter(pl.col("transcript_id") != canonical).shape[0]:
+        logger.warning(f"Canonical transcript {canonical} not found in APPRIS.")
+        canonical = appris[0, "transcript_id"]
+
     tss_gencode.add(canonical)  # Some canonical transcripts are not in GENCODE.
     logger.info(f"Crawler running for {gene}")
     logger.info(f"Canonical transcript: {canonical}")
@@ -81,7 +89,7 @@ def run_candidates(
             dataset.path / "txome",
             seed_length=13,
             threshold=18,
-            n_return=500,
+            n_return=-1,
             fasta=True,
             no_reverse=ignore_revcomp,
         )
@@ -146,7 +154,6 @@ def run_candidates(
     ff = SAMFrame(
         y.filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
         .agg_tm_offtarget(tss_allacceptable)
-        .filter("is_ori_seq")
         .with_columns(
             transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
             **PROBE_CRITERIA,
@@ -159,7 +166,7 @@ def run_candidates(
             ]
         )
         .with_columns(oks=pl.sum(pl.col("^ok_.*$")))
-        .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
+        # .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
         .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.trna_rna_kmers, 15)))
         .join(names_with_pseudo, on="name", how="left")
         .join(isoforms, on="name", how="left")
