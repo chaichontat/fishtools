@@ -1,22 +1,30 @@
 # %%
 from pathlib import Path
-from typing import Any
+from typing import Any, Sized
 
 import numpy as np
 import numpy.typing as npt
+import polars as pl
+from loguru import logger
 
 
 class CodebookPicker:
     def __init__(
         self,
         mhd4: npt.NDArray[np.bool_] | str | Path,
+        genes: list[str],
         subset: tuple[int, int] | None = None,
         counts_existing: npt.NDArray[Any] | None = None,
         code_existing: npt.NDArray[np.bool_] | None = None,
     ) -> None:
         if isinstance(mhd4, str | Path):
             mhd4 = np.loadtxt(mhd4, delimiter=",", dtype=bool)
+
         self.mhd4 = mhd4
+        if not np.all(np.logical_or(self.mhd4 == 0, self.mhd4 == 1)):
+            raise ValueError("MHD4 must only contain 0 and 1")
+
+        self.genes = genes
         self.subset = subset
 
         if (counts_existing is not None) ^ (code_existing is not None):
@@ -45,17 +53,24 @@ class CodebookPicker:
         rand.shuffle(rmhd4)
         return rmhd4
 
-    # def _find_optimalish(self, seed: int, fpkm: Sized):
-    #     rmhd4 = self.gen_codebook(seed)
-    #     res = rmhd4[: len(fpkm)] * np.array(fpkm)
-    #     tocalc = res.sum(axis=0)
-    #     normed = tocalc / tocalc.sum()
-    #     return -np.sum(normed * np.log2(normed)), tocalc
+    def _find_optimalish(self, seed: int, fpkm: Sized):
+        rmhd4 = self.gen_codebook(seed)
+        res = rmhd4[: len(fpkm)] * np.array(fpkm)
+        tocalc = res.sum(axis=0)
+        normed = tocalc / tocalc.sum() + 1e-10
 
-    # def find_optimalish(self, fpkm: Sized, iterations: int = 5000):
-    #     res = [self._find_optimalish(i, fpkm)[0] for i in range(iterations)]
-    #     best = np.argmax(res)
-    #     return best, self._find_optimalish(int(best), fpkm)[1]
+        return -np.sum(normed * np.log2(normed)), tocalc
+
+    def export_codebook(self, seed: int) -> pl.DataFrame:
+        rmhd4 = self.gen_codebook(seed)
+        n_blanks = self.mhd4.shape[0] - len(self.genes)
+        return pl.concat(
+            [
+                pl.DataFrame(dict(genes=self.genes + [f"Blank-{i+1}" for i in range(n_blanks)])),
+                pl.DataFrame(rmhd4.astype(np.uint8)),
+            ],
+            how="horizontal",
+        )
 
 
 class CodebookPickerSingleCell(CodebookPicker):
@@ -63,88 +78,42 @@ class CodebookPickerSingleCell(CodebookPicker):
         self,
         counts: npt.NDArray[Any],
         *,
-        iterations: int = 1000,
+        iterations: int = 200,
+        percentile: float = 99.9,
     ):
         def _find(seed: int):
-            if seed % 1000 == 0:
-                print(seed)
             rmhd4 = self.gen_codebook(seed)
 
             # combicode[: self.existing.shape[0], : self.existing.shape[1]] = self.existing
             # combicode[self.existing.shape[0] :] = rmhd4
-            tocalc = np.percentile((counts @ rmhd4[: counts.shape[1]]), 99.99, axis=0)
+            # numpy bug??
+            tocalc = np.asarray(
+                np.percentile(
+                    (counts @ rmhd4[: counts.shape[1]]), np.full(self.mhd4.shape[1], percentile), axis=0
+                )[0]
+            ).squeeze()
             if self.counts_existing is not None:
                 tocalc = np.vstack([self.counts_existing, tocalc])
-            normed = tocalc / tocalc.sum()
-            # if not np.all(normed > 0):
-            #     print(np.where(normed == 0)[0], "is 0")
-            normed = normed[normed > 0]
+            normed = (tocalc + 1e-10) / tocalc.sum()
             return -np.sum(normed * np.log2(normed)), tocalc
+
+        if counts.shape[1] != len(self.genes):
+            raise ValueError("Mismatch array size between gene name list and counts matrix")
+
+        if counts.shape[1] > self.mhd4.shape[0]:
+            raise ValueError("Number of genes is larger than the number of possible codes")
+
+        if counts.shape[1] > 0.95 * self.mhd4.shape[0]:
+            logger.warning(
+                f"Number of genes ({counts.shape[1]}) is close to the number of possible codes ({self.mhd4.shape[1]}). "
+                "This may result in a suboptimal codebook. "
+                "Consider using a larger codebook or a smaller number of genes."
+            )
 
         res = [_find(i)[0] for i in range(iterations)]
         best = np.argmax(res)
-        return best, _find(int(best))[1]
-
-
-def what():
-    name = 'sm'
-readouts = pl.read_csv("data/readout_ref_filtered.csv")
-# genes = Path("zach_26.txt").read_text().splitlines()
-# genes = Path(f"{name}_25.txt").read_text().splitlines()
-smgenes = ['Cdc42','Neurog2','Ccnd2']
-genes, _, _ = gtf_all.check_gene_names(smgenes)
-acceptable_tss = {g: set(pl.read_csv(f"output/{g}_acceptable_tss.csv")["transcript"]) for g in genes}
-n, short_threshold = 67, 65
-# %%
-dfx, overlapped = {}, {}
-for gene in genes:
-    dfx[gene] = GeneFrame.read_parquet(f"output/{gene}_final.parquet")
-dfs = GeneFrame.concat(dfx.values())
-short = dfs.count("gene").filter(pl.col("count") < short_threshold)
-
-
-# %%
-fixed_n = {}
-short_fixed = {}
-
-
-def run_overlap(genes: Iterable[str], overlap: int):
-    def runpls(gene: str):
-        subprocess.run(
-            ["python", "scripts/new_postprocess.py", gene, "-O", str(overlap)],
-            check=True,
-            capture_output=True,
+        logger.info(
+            f"Best codebook found at seed {best} with entropy {res[best]:.3f} (worst entropy is {np.min(res):.3f})."
         )
 
-    with ThreadPoolExecutor(32) as executor:
-        for x in as_completed(
-            [
-                executor.submit(runpls, gene)
-                for gene in genes
-                if not Path(f"output/{gene}_final_overlap_{overlap}.parquet").exists()
-            ]
-        ):
-            print("ok")
-            x.result()
-
-
-    needs_fixing = set(short["gene"])
-
-    for ol in [5, 10, 15, 20]:
-        print(ol, needs_fixing)
-        run_overlap(needs_fixing, ol)
-        for gene in needs_fixing.copy():
-            df = GeneFrame.read_parquet(f"output/{gene}_final_overlap_{ol}.parquet")
-            if len(df) >= short_threshold or ol == 20:
-                needs_fixing.remove(gene)
-                fixed_n[gene] = ol
-                short_fixed[gene] = df
-    # else:
-    #     raise ValueError(f"Gene {gene} cannot be fixed")
-
-    short_fixed = GeneFrame.concat(short_fixed.values())
-    # %%
-    cutted = GeneFrame.concat([dfs.filter(~pl.col("gene").is_in(short["gene"])), short_fixed[dfs.columns]])
-    cutted = GeneFrame(
-        cutted.sort(["gene", "priority"]).groupby("gene").agg(pl.all().head(n)).explode(pl.all().exclude("gene"))
-    )
+        return best, _find(int(best))[1]
