@@ -43,16 +43,16 @@ The converted DAX files will be saved in the same directory as the original JXL 
 
 #### Examples
 
-Convert all TIFF, JP2, and DAX files in a directory and its subdirectories to JXL files:
+Convert all TIFF, JP2, and DAX files in a directory and its subdirectories to lossless TIFFs with JPEG-XR encoding:
 
 ```sh
 fishtools compress path/to/directory
 ```
 
-Convert all TIFF, JP2, and DAX files in a directory to lossless TIFFs with JPEG-XR encoding and delete the original files:
+Convert all TIFF, JP2, and DAX files in a directory to JPEG-XL files and delete the original files:
 
 ```sh
-fishtools compress path/to/directory --quality 100 --delete
+fishtools compress path/to/directory --quality 99 --delete
 ```
 
 Convert a single JXL file to DAX:

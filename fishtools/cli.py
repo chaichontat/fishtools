@@ -56,10 +56,10 @@ def process_path(path: Path, file_types: list[str]):
 @main.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=True, path_type=Path))
 @click.option("--delete", "-d", is_flag=True, help="Delete original files")
-@click.option("--quality", "-q", default=99, type=int, help="Quality level (-inf-100). 100 = lossless (outputs JPEG-XR TIF)")
+@click.option("--quality", "-q", default=100, type=int, help="Quality level (-inf-100). 100 = lossless (outputs JPEG-XR TIFF)")
 @click.option("--n-process", "-n", default=16, type=int, help="Number of processes to use")
 # fmt: on
-def compress(path: Path, delete: bool = False, quality: int = 99, n_process: int = 16):
+def compress(path: Path, delete: bool = False, quality: int = 100, n_process: int = 16):
     """Converts TIFF, JP2, and DAX image files to JPEG XL (JXL) (lossy) or TIFF-JPEG XR (lossless) files."""
     files = process_path(path, [".tif", ".tiff", ".jp2", ".dax"])
     log.info(f"Found {len(files)} potential file(s).")
