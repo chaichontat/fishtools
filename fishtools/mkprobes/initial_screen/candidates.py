@@ -46,9 +46,55 @@ def get_pseudogenes(
 
 
 # %%
+
+
 def run_candidates(
     dataset: Dataset,
-    gene: str,
+    gene: str | None = None,
+    transcript: str | None = None,
+    output: str | Path = "output/",
+    *,
+    allow_pseudo: bool = True,
+    ignore_revcomp: bool = False,
+    realign: bool = False,
+    allow: list[str] | None = None,
+    disallow: list[str] | None = None,
+):
+    if not ((gene is None) ^ (transcript is None)):
+        raise ValueError("Either gene or transcript must be specified.")
+
+    if transcript is None:
+        assert gene is not None
+        transcript = get_ensembl(output, dataset.gencode.filter_gene(gene)[0, "gene_id"])[
+            "canonical_transcript"
+        ].split(".")[0]
+
+        appris = dataset.appris.filter(
+            (pl.col("gene_name") == gene) & (pl.col("annotation").str.contains("PRINCIPAL"))
+        ).sort("annotation")
+
+        if not appris.filter(pl.col("transcript_id") == transcript).shape[0]:
+            logger.warning(f"Ensembl canonical transcript {transcript} not found in APPRIS.")
+            transcript = appris[0, "transcript_id"]
+
+        logger.info(f"Chosen transcript: {transcript}")
+
+    assert transcript is not None
+    run_transcript(
+        dataset=dataset,
+        transcript=transcript,
+        output=output,
+        allow_pseudo=allow_pseudo,
+        ignore_revcomp=ignore_revcomp,
+        realign=realign,
+        allow=allow,
+        disallow=disallow,
+    )
+
+
+def run_transcript(
+    dataset: Dataset,
+    transcript: str,
     output: str | Path = "output/",
     *,
     allow_pseudo: bool = True,
@@ -59,30 +105,26 @@ def run_candidates(
 ):
     allow, disallow = allow or [], disallow or []
     (output := Path(output)).mkdir(exist_ok=True)
-    tss_gencode = set(dataset.gencode.filter_gene(gene)["transcript_id"])
-    tss_allofgene = set(dataset.ensembl.filter_gene(gene)["transcript_id"])
+
+    try:
+        row = dataset.ensembl.filter(
+            pl.col("transcript_id" if transcript.startswith("ENS") else "transcript_name") == transcript
+        ).to_dicts()[0]
+    except IndexError:
+        raise ValueError(f"Transcript {transcript} not found in ensembl.")
+    del transcript
+
+    gene, transcript_id, transcript_name = row["gene_name"], row["transcript_id"], row["transcript_name"]
+    tss_gencode = set(dataset.gencode.filter(pl.col("gene_id") == row["gene_id"])["transcript_id"])
+    tss_allofgene = set(dataset.ensembl.filter(pl.col("gene_id") == row["gene_id"])["transcript_id"])
     if not len(tss_gencode):
-        raise ValueError(f"Gene {gene} not found in GENCODE.")
+        logger.warning(f"Transcript {transcript_id} not found in GENCODE basic.")
 
-    canonical = get_ensembl(output, dataset.gencode.filter_gene(gene)[0, "gene_id"])[
-        "canonical_transcript"
-    ].split(".")[0]
+    logger.info(f"Crawler running for {transcript_id}")
 
-    appris = dataset.appris.filter(
-        (pl.col("gene_name") == gene) & (pl.col("annotation").str.contains("PRINCIPAL"))
-    ).sort("annotation")
-
-    if appris.filter(pl.col("transcript_id") != canonical).shape[0]:
-        logger.warning(f"Canonical transcript {canonical} not found in APPRIS.")
-        canonical = appris[0, "transcript_id"]
-
-    tss_gencode.add(canonical)  # Some canonical transcripts are not in GENCODE.
-    logger.info(f"Crawler running for {gene}")
-    logger.info(f"Canonical transcript: {canonical}")
-
-    if realign or not (output / f"{gene}_all.parquet").exists():
-        seq = dataset.gencode.get_seq(canonical, masked=True)
-        crawled = crawler(seq, prefix=f"{gene}_{canonical}")
+    if realign or not (output / f"{transcript_name}_all.parquet").exists():
+        seq = dataset.gencode.get_seq(transcript_id, masked=True)
+        crawled = crawler(seq, prefix=f"{gene}_{transcript_id}")
 
         y = SAMFrame.from_bowtie_split_name(
             gen_fasta(crawled["seq"], names=crawled["name"]).getvalue(),
@@ -101,12 +143,12 @@ def run_candidates(
             .with_columns(name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene))
         )
 
-        y.write_parquet(output / f"{gene}_all.parquet")
-        offtargets.write_parquet(output / f"{gene}_offtargets.parquet")
+        y.write_parquet(output / f"{transcript_name}_all.parquet")
+        offtargets.write_parquet(output / f"{transcript_name}_offtargets.parquet")
     else:
-        logger.warning(f"{gene} reading from cache.")
-        y = SAMFrame.read_parquet(output / f"{gene}_all.parquet")
-        offtargets = pl.read_parquet(output / f"{gene}_offtargets.parquet")
+        logger.warning(f"{transcript_name} reading from cache.")
+        y = SAMFrame.read_parquet(output / f"{transcript_name}_all.parquet")
+        offtargets = pl.read_parquet(output / f"{transcript_name}_offtargets.parquet")
 
     # Print most common offtargets
     logger.info(
@@ -117,7 +159,6 @@ def run_candidates(
             .with_columns(name=pl.col("transcript").apply(dataset.ensembl.ts_to_tsname))[
                 ["name", "transcript", "count"]
             ]
-            # .join(dataset.fpkm, left_on="transcript", right_on="transcript_id(s)", how="left")
         )
     )
 
@@ -147,9 +188,9 @@ def run_candidates(
     pl.DataFrame(
         dict(
             transcript_id=tss_allacceptable,
-            transcipt_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable],
+            transcript_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable],
         )
-    ).write_csv(output / f"{gene}_acceptable_tss.csv")
+    ).sort("transcript_name").write_csv(output / f"{transcript_name}_acceptable_tss.csv")
 
     ff = SAMFrame(
         y.filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
@@ -173,19 +214,21 @@ def run_candidates(
     )
     logger.info(f"Generated {len(ff)} candidates.")
 
-    ff.write_parquet(output / f"{gene}_crawled.parquet")
+    ff.write_parquet(output / f"{transcript_name}_crawled.parquet")
     return ff
 
 
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("gene")
+@click.option("--gene", "-g", type=str, required=False, help="Gene name")
+@click.option("--transcript", "-t", type=str, required=False, help="Transcript id")
 @click.option("--output", "-o", type=click.Path(), default="output/")
 @click.option("--ignore-revcomp", "-r", is_flag=True)
 @click.option("--realign", is_flag=True)
 def candidates(
     path: str,
     gene: str,
+    transcript: str,
     output: str,
     ignore_revcomp: bool,
     realign: bool = False,
@@ -193,7 +236,8 @@ def candidates(
     """Initial screening of probes candidates for a gene."""
     run_candidates(
         Dataset(path),
-        gene,
+        gene=gene,
+        transcript=transcript,
         output=output,
         allow_pseudo=True,
         ignore_revcomp=ignore_revcomp,
