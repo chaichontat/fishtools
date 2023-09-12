@@ -24,18 +24,15 @@ def check_jpegxr(path: Path):
         return False, tif.asarray()
 
 
-def dax_reader(path: Path | str, n_frames: int | None = None):
+def dax_reader(path: Path | str):
     path = Path(path)
     if path.suffix != ".dax":
         raise ValueError(f"Unknown file type {path}. Must be .dax")
 
-    def parse_inf(f: str):
-        return dict(x.split(" = ") for x in f.split("\n") if x)
+    # def parse_inf(f: str):
+    #     return dict(x.split(" = ") for x in f.split("\n") if x)
 
-    if n_frames is None:
-        inf = parse_inf(path.with_suffix(".inf").read_text())
-        n_frames = int(inf["number of frames"])
-
+    n_frames = path.stat().st_size // (2048 * 2048 * 2)
     image_data = np.fromfile(path, dtype=np.uint16, count=2048 * 2048 * n_frames).reshape(
         n_frames, 2048, 2048
     )
