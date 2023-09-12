@@ -10,7 +10,7 @@ from click.testing import CliRunner
 from tifffile import imread, imwrite
 
 from fishtools.cli import main
-from fishtools.compression import compress, dax_reader, decompress
+from fishtools.compression.compression import compress, dax_reader, decompress
 
 path = Path("__temp.tif")
 N_FRAMES = 2
@@ -52,13 +52,13 @@ def test_lossy(img: npt.NDArray[np.uint16]):
     decompress(jxl, "tif")
     assert np.allclose(imgjxl, imread(path))
     decompress(jxl, "dax")
-    assert np.allclose(imgjxl, dax_reader(path.with_suffix(".dax"), n_frames=N_FRAMES))
+    assert np.allclose(imgjxl, dax_reader(path.with_suffix(".dax")))
 
 
 def test_dax(img: npt.NDArray[np.uint16]):
     compress(path, level=100)
     decompress(path, "dax")
-    assert np.allclose(img, dax_reader(path.with_suffix(".dax"), n_frames=N_FRAMES))
+    assert np.allclose(img, dax_reader(path.with_suffix(".dax")))
 
 
 # https://github.com/pallets/click/issues/824
