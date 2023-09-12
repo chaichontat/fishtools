@@ -26,11 +26,11 @@ from itertools import groupby, islice
 
 # https://github.com/samtools/hts-specs/blob/da805be01e2ceaaa69fdde9f33c5377bf9ee6369/SAMv1.tex#L383
 # operations that consume the reference
-_cigar_ref = set(("M", "D", "N", "=", "X", "EQ"))
+_cigar_ref = {"M", "D", "N", "=", "X", "EQ"}
 # operations that consume the query
-_cigar_query = set(("M", "I", "S", "=", "X", "EQ"))
+_cigar_query = {"M", "I", "S", "=", "X", "EQ"}
 # operations that do not represent an alignment
-_cigar_no_align = set(("H", "P"))
+_cigar_no_align = {"H", "P"}
 _valid_cigar = _cigar_ref | _cigar_query | _cigar_no_align
 # operations that can be represented as aligned to the reference
 _cigar_align = _cigar_ref & _cigar_query
@@ -155,7 +155,7 @@ def cigar_split(cigar):
         if op[1] in _valid_cigar:
             yield op
         else:
-            raise ValueError("CIGAR operation %s in record %s is invalid." % (op[1], cigar))
+            raise ValueError("CIGAR operation {} in record {} is invalid.".format(op[1], cigar))
 
 
 def mdz_expand(mdz):

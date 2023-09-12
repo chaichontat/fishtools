@@ -21,7 +21,7 @@ def get_ensembl(path: Path | str, id_: str):
         return json.loads(p.read_text())
 
     log.info(f"Fetching {id_} on ensembl")
-    res = requests.get(f"https://rest.ensembl.org/lookup/id/{id_}?content-type=application/json")
+    res = requests.get(f"https://rest.ensembl.org/lookup/id/{id_}?content-type=application/json", timeout=30)
     res.raise_for_status()
     p.write_text(res.text)
     return res.json()

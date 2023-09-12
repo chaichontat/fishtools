@@ -168,7 +168,7 @@ def _run_transcript(
         get_pseudogenes(gene, dataset.ensembl, y) if allow_pseudo else (pl.Series(), pl.Series())
     )
     # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
-    tss_others = set([*tss_pseudo, *allow]) - set(disallow)
+    tss_others = {*tss_pseudo, *allow} - set(disallow)
 
     if len(tss_others):
         names_with_pseudo = (
