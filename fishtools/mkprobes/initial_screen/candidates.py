@@ -1,4 +1,3 @@
-# %%
 from pathlib import Path
 from typing import cast
 
@@ -25,12 +24,12 @@ def get_pseudogenes(
 ) -> tuple[pl.Series, pl.Series]:
     counts = (
         y.count("transcript")
-        # .left_join(fpkm, left_on="transcript", right_on="transcript_id(s)")
         .join(
             ensembl.gtf[["transcript_id", "transcript_name"]],
             left_on="transcript",
             right_on="transcript_id",
-        ).sort("count", descending=True)
+        )
+        .sort("count", descending=True)
     )
 
     # Filtered based on expression and number of probes aligned.
@@ -43,9 +42,6 @@ def get_pseudogenes(
         )
     )
     return ok[:limit]["transcript"], ok[:limit]["transcript_name"]
-
-
-# %%
 
 
 def run_candidates(
@@ -65,13 +61,19 @@ def run_candidates(
 
     if transcript is None:
         assert gene is not None
-        transcript = get_ensembl(output, dataset.gencode.filter_gene(gene)[0, "gene_id"])[
-            "canonical_transcript"
-        ].split(".")[0]
+        # fmt: off
+        transcript = (
+            get_ensembl(output, dataset.gencode.filter_gene(gene)[0, "gene_id"])
+            ["canonical_transcript"]
+            .split(".")[0]
+        )
 
-        appris = dataset.appris.filter(
-            (pl.col("gene_name") == gene) & (pl.col("annotation").str.contains("PRINCIPAL"))
-        ).sort("annotation")
+        appris = (
+            dataset.appris
+            .filter((pl.col("gene_name") == gene) & (pl.col("annotation").str.contains("PRINCIPAL")))
+            .sort("annotation")
+        )
+        # fmt: on
 
         if not appris.filter(pl.col("transcript_id") == transcript).shape[0]:
             logger.warning(f"Ensembl canonical transcript {transcript} not found in APPRIS.")
@@ -80,7 +82,7 @@ def run_candidates(
         logger.info(f"Chosen transcript: {transcript}")
 
     assert transcript is not None
-    run_transcript(
+    _run_transcript(
         dataset=dataset,
         transcript=transcript,
         output=output,
@@ -92,7 +94,7 @@ def run_candidates(
     )
 
 
-def run_transcript(
+def _run_transcript(
     dataset: Dataset,
     transcript: str,
     output: str | Path = "output/",
@@ -225,7 +227,7 @@ def run_transcript(
 @click.option("--output", "-o", type=click.Path(), default="output/")
 @click.option("--ignore-revcomp", "-r", is_flag=True)
 @click.option("--realign", is_flag=True)
-def candidates(
+def _click_candidates(
     path: str,
     gene: str,
     transcript: str,
@@ -243,38 +245,3 @@ def candidates(
         ignore_revcomp=ignore_revcomp,
         realign=realign,
     )
-
-
-if __name__ == "__main__":
-    candidates()
-
-    # sys.setrecursionlimit(5000)
-    # pl.Config.set_fmt_str_lengths(100)
-    # pl.Config.set_tbl_rows(100)
-
-    # # %%
-    # # GENCODE primary only
-    # gtf = ExternalData(
-    #     cache="data/mm39/gencode_vM32_transcripts.parquet",
-    #     gtf_path="data/mm39/gencode.vM32.chr_patch_hapl_scaff.basic.annotation.gtf",
-    #     fasta="data/mm39/combi.fa.gz",
-    # )
-
-    # gtf_all = ExternalData(
-    #     cache="data/mm39/gencode_vM32_transcripts_all.parquet",
-    #     gtf_path="data/mm39/Mus_musculus.GRCm39.109.gtf",
-    #     fasta="data/mm39/combi.fa.gz",
-    # )
-
-    # fpkm = pl.read_parquet("data/fpkm/P0_combi.parquet")
-    # kmer18 = pl.read_csv(
-    #     "data/mm39/kmer_genome18.txt", separator=" ", has_header=False, new_columns=["kmer", "count"]
-    # )
-    # trna_rna_kmers = set(
-    #     pl.read_csv(
-    #         "data/mm39/kmer_trcombi15.txt", separator=" ", has_header=False, new_columns=["kmer", "count"]
-    #     )["kmer"]
-    # )
-    # kmerset = set(kmer18["kmer"])
-
-# %%
