@@ -31,6 +31,7 @@ class NecessaryFiles(TypedDict):
     gencode_gtf: str
     ncrna: str
     trna: str
+    appris: str
 
 
 def _process_tsv(file: Path | str) -> NecessaryFiles:
@@ -108,21 +109,6 @@ def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]) -> 
                     out += f.read()
                     out += b"\n"
             p_.write_bytes(out)
-
-        return Gtfs(
-            ensembl=ExternalData(
-                cache="ensembl.parquet",
-                gtf_path="ensembl.gtf.gz",
-                fasta="cdna_ncrna_trna.fasta",
-                # regen_cache=True,
-            ),
-            gencode=ExternalData(
-                cache="gencode.parquet",
-                gtf_path="gencode.gtf.gz",
-                fasta="cdna_ncrna_trna.fasta",
-                # regen_cache=True,
-            ),
-        )
 
 
 def get_rrna_snorna(gtf: ExternalData):
