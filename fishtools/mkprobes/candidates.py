@@ -40,6 +40,7 @@ def get_pseudogenes(
         & (
             pl.col("transcript_name").str.starts_with(gene + "-ps")
             | pl.col("transcript_name").str.starts_with("Gm")
+            | pl.col("transcript_name").str.starts_with("ENS")
         )
     )
     return ok[:limit]["transcript"], ok[:limit]["transcript_name"]
@@ -132,8 +133,9 @@ def _run_transcript(
     del transcript
 
     gene, transcript_id, transcript_name = row["gene_name"], row["transcript_id"], row["transcript_name"]
-    tss_gencode = set(dataset.gencode.filter(pl.col("gene_id") == row["gene_id"])["transcript_id"])
-    tss_allofgene = set(dataset.ensembl.filter(pl.col("gene_id") == row["gene_id"])["transcript_id"])
+    # need to be gene_name, not id, because of genes on scaffold assemblies
+    tss_gencode = set(dataset.gencode.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
+    tss_allofgene = set(dataset.ensembl.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
     if not len(tss_gencode):
         logger.warning(f"Transcript {transcript_id} not found in GENCODE basic.")
 
