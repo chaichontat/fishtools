@@ -4,12 +4,32 @@ from pathlib import Path
 from typing import Literal
 
 import polars as pl
+import requests
 import rich_click as click
 from loguru import logger as log
 
 from fishtools.utils.pretty_print import jprint
 
-from ..ext.external_data import Dataset
+from ..ext.external_data import Dataset, get_ensembl
+
+
+def find_outdated_ts(ts: str) -> set[tuple[str, str]]:
+    if not ts.startswith("ENST"):
+        raise ValueError(f"{ts} is not a human Ensembl transcript ID")
+    out = set()
+    for x in requests.get(
+        "https://dev-tark.ensembl.org/api/transcript/",
+        params={
+            "stable_id": ts,
+            "source_name": "ensembl",
+            "assembly_name": "GRCh38",
+            "expand": "genes",
+        },
+    ).json()["results"]:
+        for y in x["genes"]:
+            if y["name"]:
+                out.add((y["name"], y["stable_id"]))
+    return out
 
 
 @click.command()
@@ -50,9 +70,13 @@ def _gettranscript(
     gene: str,
     mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
 ) -> pl.DataFrame:
-    """Get transcript ID from gene name or gene ID"""
+    """Get transcript ID from gene name or gene ID
+    Returns:
+        pl.DataFrame[[transcript_id, transcript_name, tag]]
+        pl.DataFrame[[transcript_id, transcript_name, annotation, tag]] if appris
+    """
     dataset = Dataset(Path(path))
-    gene_id = gene if gene.startswith("ENSG") else dataset.ensembl.gene_to_eid(gene)
+    gene_id = gene if gene.startswith("ENS") else dataset.ensembl.gene_to_eid(gene)
     del gene
 
     log.info(f"Gene ID: {gene_id}")
@@ -67,37 +91,35 @@ def _gettranscript(
     ).sort("transcript_name")
     appris = ensembl.filter(pl.col("annotation").is_not_null())
 
-    # match mode:
-    #     case "canonical":
-    #         return [get_ensembl("output/", gene_id)["canonical_transcript"].split(".")[0]]
-    #     case "gencode":
-    #         return dataset.gencode.filter(pl.col("gene_id") == gene_id)["transcript_id"].to_list()
-    #     case "ensembl":
-    #         return dataset.ensembl.filter(pl.col("gene_id") == gene_id)["transcript_id"].to_list()
-    #     case "appris":
-    #         return appris.filter(pl.col("annotation").str.contains("PRINCIPAL"))["transcript_id"].to_list()
-    #     case "apprisalt":
-    #         return appris["transcript_id"].to_list()
-    log.info(ensembl)
-    log.info(appris)
-    if len(principal := appris.filter(pl.col("annotation").str.contains("PRINCIPAL"))):
-        log.info("Principal transcripts: " + "\n".join(principal["transcript_id"]))
+    to_return = ["transcript_id", "transcript_name", "tag"]
 
-    # tss_gencode = set(dataset.gencode.filter(pl.col("gene_id") == gene_id)["transcript_id"])
-    # tss_allofgene = set(dataset.ensembl.filter(pl.col("gene_id") == gene_id)["transcript_id"])
+    match mode:
+        case "canonical":
+            canonical = get_ensembl("output/", gene_id)["canonical_transcript"].split(".")[0]
+            return dataset.ensembl.filter(pl.col("transcript_id") == canonical)[to_return]
+        case "gencode":
+            return dataset.gencode.filter(pl.col("gene_id") == gene_id)[to_return]
+        case "ensembl":
+            return dataset.ensembl.filter(pl.col("gene_id") == gene_id)[to_return]
+        case "appris":
+            # if len(principal := appris.filter(pl.col("annotation").str.contains("PRINCIPAL"))):
+            #     log.info("Principal transcripts: " + "\n".join(principal["transcript_id"]))
+            return appris.filter(pl.col("annotation").str.contains("PRINCIPAL")).join(
+                dataset.ensembl[["transcript_id", "tag"]], on="transcript_id", how="left"
+            )
+        case "apprisalt":
+            return appris.join(dataset.ensembl[["transcript_id", "tag"]], on="transcript_id", how="left")
+        case _:  # type: ignore
+            raise ValueError(f"Unknown mode: {mode}")
 
-    # log.info(f"Canonical transcript: {canonical}")
-    # print(appris)
-
-    # if appris.filter(pl.col("transcript_id") != canonical).shape[0]:
-    #     log.warning(f"Canonical transcript {canonical} not found in APPRIS.")
-    #     canonical = appris[0, "transcript_id"]
+    # log.info(ensembl)
+    # log.info(appris)
 
 
 # fmt: off
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.option("--gene", "-g", type=str)
+@click.argument("gene", type=str)
 @click.option("--canonical", "mode", flag_value="canonical", default=True, help="Outputs canonical transcript only")
 @click.option("--gencode"  , "mode", flag_value="gencode", help="Outputs all transcripts from GENCODE basic")
 @click.option("--ensembl"  , "mode", flag_value="ensembl", help="Outputs all transcripts from Ensembl")
@@ -110,5 +132,4 @@ def gettranscript(
 ):
     """Get transcript ID from gene name or gene ID"""
     res = _gettranscript(path, gene, mode)
-    res = res if isinstance(res, list) else [res]
-    log.info(f"Transcript ID(s): {', '.join(res)}")
+    click.echo("\n".join(res["transcript_id"].to_list()))
