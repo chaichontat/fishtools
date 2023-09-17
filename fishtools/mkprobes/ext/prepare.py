@@ -12,10 +12,11 @@ import polars as pl
 import pyfastx
 from loguru import logger as log
 
-from fishtools.ext.external_data import ExternalData
-from fishtools.io.io import download, get_file_name, set_cwd
-from fishtools.mkprobes.alignment import gen_fasta
+from fishtools.utils.io import download, get_file_name, set_cwd
 from fishtools.utils.utils import check_if_exists, check_if_posix, run_process
+
+from ..utils._alignment import gen_fasta
+from .external_data import ExternalData
 
 url_files = {
     "mouse": Path(__file__).parent / "../../" / "static" / "mouseurls.tsv",
@@ -72,7 +73,7 @@ def jellyfish(
     Path(out).write_bytes(stdout2)
 
 
-def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]) -> Gtfs:
+def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]):
     (path := Path(path)).mkdir(exist_ok=True, parents=True)
     urls = _process_tsv(uf := url_files[species])
     shutil.copy(uf, path / "urls.tsv")

@@ -9,9 +9,10 @@ import polars as pl
 from loguru import logger
 from typing_extensions import Self
 
-from fishtools.mkprobes.alignment import run_bowtie
-from fishtools.utils.seqcalc import tm_pairwise
 from fishtools.utils.utils import copy_signature, copy_signature_method
+
+from ._alignment import run_bowtie
+from .seqcalc import tm_pairwise
 
 T = TypeVar("T")
 P, R = ParamSpec("P"), TypeVar("R")

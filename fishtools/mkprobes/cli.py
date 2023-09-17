@@ -4,15 +4,15 @@ from typing import Literal
 
 import rich_click as click
 
-from fishtools.ext.external_data import Dataset
-from fishtools.ext.prepare import run_repeatmasker
-from fishtools.mkprobes.alignment import bowtie_build
-from fishtools.mkprobes.codebook.finalconstruct import filter_genes
-from fishtools.mkprobes.genes.chkgenes import chkgenes, gettranscript
-from fishtools.mkprobes.initial_screen.screen import _click_screen
 from fishtools.utils.utils import setup_logging
 
-from .initial_screen.candidates import _click_candidates
+from .candidates import candidates
+from .codebook.finalconstruct import filter_genes
+from .ext.external_data import Dataset
+from .ext.prepare import run_repeatmasker
+from .genes.chkgenes import chkgenes, gettranscript
+from .screen import screen
+from .utils._alignment import bowtie_build
 
 log = setup_logging()
 click.rich_click.SHOW_ARGUMENTS = True
@@ -46,7 +46,7 @@ def main():
 # fmt: on
 def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
     """Prepare genomic database"""
-    from fishtools.ext.prepare import download_gtf_fasta, run_jellyfish
+    from .ext.prepare import download_gtf_fasta, run_jellyfish
 
     download_gtf_fasta(path / species, species)
     with ThreadPoolExecutor() as exc:
@@ -61,8 +61,8 @@ def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
     Dataset(path / species)  # test all components
 
 
-main.add_command(_click_candidates)
-main.add_command(_click_screen)
+main.add_command(candidates)
+main.add_command(screen)
 main.add_command(chkgenes)
 main.add_command(filter_genes)
 main.add_command(gettranscript)

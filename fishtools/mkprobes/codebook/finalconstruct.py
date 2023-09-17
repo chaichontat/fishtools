@@ -58,3 +58,64 @@ def filter_genes(output_path: Path, genes: Path, min_probes: int, out: Path | No
     if out:
         out.write_text("\n".join(gene for gene, n in ns.items() if n > min_probes))
 
+
+# readouts = pl.read_csv("data/readout_ref_filtered.csv")
+# # genes = Path("zach_26.txt").read_text().splitlines()
+# # genes = Path(f"{name}_25.txt").read_text().splitlines()
+# smgenes = ["Cdc42", "Neurog2", "Ccnd2"]
+# genes, _, _ = gtf_all.check_gene_names(smgenes)
+# acceptable_tss = {g: set(pl.read_csv(f"output/{g}_acceptable_tss.csv")["transcript"]) for g in genes}
+# n, short_threshold = 67, 65
+# # %%
+# dfx, overlapped = {}, {}
+# for gene in genes:
+#     dfx[gene] = GeneFrame.read_parquet(f"output/{gene}_final.parquet")
+# dfs = GeneFrame.concat(dfx.values())
+# short = dfs.count("gene").filter(pl.col("count") < short_threshold)
+
+
+# # %%
+# fixed_n = {}
+# short_fixed = {}
+
+
+# def run_overlap(genes: Iterable[str], overlap: int):
+#     def runpls(gene: str):
+#         subprocess.run(
+#             ["python", "scripts/new_postprocess.py", gene, "-O", str(overlap)],
+#             check=True,
+#             capture_output=True,
+#         )
+
+#     with ThreadPoolExecutor(32) as executor:
+#         for x in as_completed(
+#             [
+#                 executor.submit(runpls, gene)
+#                 for gene in genes
+#                 if not Path(f"output/{gene}_final_overlap_{overlap}.parquet").exists()
+#             ]
+#         ):
+#             print("ok")
+#             x.result()
+
+
+#     needs_fixing = set(short["gene"])
+
+#     for ol in [5, 10, 15, 20]:
+#         print(ol, needs_fixing)
+#         run_overlap(needs_fixing, ol)
+#         for gene in needs_fixing.copy():
+#             df = GeneFrame.read_parquet(f"output/{gene}_final_overlap_{ol}.parquet")
+#             if len(df) >= short_threshold or ol == 20:
+#                 needs_fixing.remove(gene)
+#                 fixed_n[gene] = ol
+#                 short_fixed[gene] = df
+#     # else:
+#     #     raise ValueError(f"Gene {gene} cannot be fixed")
+
+#     short_fixed = GeneFrame.concat(short_fixed.values())
+#     # %%
+#     cutted = GeneFrame.concat([dfs.filter(~pl.col("gene").is_in(short["gene"])), short_fixed[dfs.columns]])
+#     cutted = GeneFrame(
+#         cutted.sort(["gene", "priority"]).groupby("gene").agg(pl.all().head(n)).explode(pl.all().exclude("gene"))
+#     )

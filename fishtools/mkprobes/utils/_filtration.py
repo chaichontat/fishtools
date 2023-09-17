@@ -1,16 +1,17 @@
-from typing import Final
+from typing import Final, Sequence, cast
 
 import numpy as np
 import polars as pl
 from loguru import logger
-from oligocheck.algorithms import find_overlap, find_overlap_weighted
+
+from ._algorithms import find_overlap, find_overlap_weighted
 
 # fmt: off
 PROBE_CRITERIA: Final = dict(
-    ok_quad_c=pl.col("seq").str.contains("GGGG").is_not(),
-    ok_quad_a=pl.col("seq").str.contains("TTTT").is_not(),
-    ok_comp_a=(pl.col("seq").str.count_match("T") / pl.col("seq").str.n_chars() < 0.28),
-    ok_stack_c=pl.all([pl.col("seq").str.slice(-6 - i, 6).str.count_match("G").lt(4) for i in range(6)]),
+    ok_quad_c = pl.col("seq").str.contains("GGGG").is_not(),
+    ok_quad_a = pl.col("seq").str.contains("TTTT").is_not(),
+    ok_stack_c= pl.all([pl.col("seq").str.slice(-6 - i, 6).str.count_match("G").lt(4) for i in range(6)]),
+    ok_comp_a =(pl.col("seq").str.count_match("T") / pl.col("seq").str.n_chars() < 0.28),
     gc_content=(pl.col("seq").str.count_match("G|C") / (pl.col("seq").str.n_chars()))
 )
 # fmt: on
@@ -58,9 +59,18 @@ def handle_overlap(
         priorities = np.sqrt(len(criteria) + 1 - run["priority"])
         try:
             if i == 1:
-                ols = find_overlap(run["pos_start"], run["pos_end"], overlap=overlap)
+                ols = find_overlap(
+                    cast(Sequence[int], run["pos_start"]),
+                    cast(Sequence[int], run["pos_end"]),
+                    overlap=overlap,
+                )
             else:
-                ols = find_overlap_weighted(run["pos_start"], run["pos_end"], priorities, overlap=overlap)
+                ols = find_overlap_weighted(
+                    cast(Sequence[int], run["pos_start"]),
+                    cast(Sequence[int], run["pos_end"]),
+                    cast(Sequence[int], priorities),
+                    overlap=overlap,
+                )
             sel_local = set(run[ols]["index"].to_list())
             logger.info(f"Priority {i}, selected {len(sel_local)} probes")
             if len(sel_local) > n:

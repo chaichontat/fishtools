@@ -7,7 +7,6 @@ import pandas as pd
 import scipy.cluster.hierarchy as hc
 import scipy.spatial as sp
 import seaborn as sns
-
 from oligocheck.boilerplate import copy_signature
 
 

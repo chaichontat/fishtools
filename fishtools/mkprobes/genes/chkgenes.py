@@ -7,8 +7,9 @@ import polars as pl
 import rich_click as click
 from loguru import logger as log
 
-from fishtools.ext.external_data import Dataset
-from fishtools.io.pretty_print import jprint
+from fishtools.utils.pretty_print import jprint
+
+from ..ext.external_data import Dataset
 
 
 @click.command()
@@ -16,7 +17,7 @@ from fishtools.io.pretty_print import jprint
 @click.argument("genes", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 def chkgenes(path: Path, genes: Path):
     """Validate/check that gene names are canonical in Ensembl"""
-    from fishtools.ext.fix_gene_name import check_gene_names
+    from ..ext.fix_gene_name import check_gene_names
 
     ds = Dataset(path)
     gs: list[str] = re.split(r"[\s,]+", genes.read_text())

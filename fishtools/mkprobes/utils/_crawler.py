@@ -1,6 +1,7 @@
 import polars as pl
-from oligocheck.seqcalc import Model, hp_fish, tm
-from oligocheck.sequtils import gc_content
+
+from .seqcalc import Model, hp, tm
+from .sequtils import gc_content
 
 
 def crawler(
@@ -55,7 +56,7 @@ def crawler(
                 continue
 
             if tm(seq[start:end], model=tm_model) > tm_limit:
-                if hp_fish(seq[start:end]) < hairpin_limit:
+                if hp(seq[start:end], "rna") < hairpin_limit:
                     names.append(f"{prefix}:{start}-{end-1}")
                     seqs.append(seq[start:end])
                 break

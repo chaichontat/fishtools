@@ -5,14 +5,13 @@ import click
 import polars as pl
 from loguru import logger
 
-from fishtools.utils.samframe import SAMFrame
-
-from ._filtration import the_filter
+from .utils._filtration import the_filter
+from .utils.samframe import SAMFrame
 
 sys.setrecursionlimit(5000)
 
 
-def screen(
+def run_screen(
     data_dir: str | Path,
     gene: str,
     fpkm_path: str | Path | None = None,
@@ -51,7 +50,7 @@ def screen(
 @click.option(
     "--maxoverlap", type=int, default=20, help="Maximum sequence overlap between probes if minimum is set."
 )
-def _click_screen(
+def screen(
     data_dir: str,
     gene: str,
     fpkm_path: Path | str | None = None,
@@ -65,7 +64,7 @@ def _click_screen(
             raise ValueError("maxoverlap must be positive non-zero and a multiple of 5")
 
         for i in range(0, maxoverlap + 1, 5):
-            final = screen(data_dir, gene, fpkm_path=fpkm_path, overlap=i)
+            final = run_screen(data_dir, gene, fpkm_path=fpkm_path, overlap=i)
             if len(final) >= minimum:
                 logger.info(f"Overlap {i} results in {len(final)} probes. Stopping.")
                 return

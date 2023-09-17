@@ -2,14 +2,10 @@
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import polars as pl
-import scanpy as sc
 import seaborn as sns
-
 from oligocheck.external.external_data import ExternalData
 from oligocheck.picker.codebook import CodebookPickerSingleCell
-from oligocheck.picker.visualize import clustermap_
 
 # %%
 # counts = pl.read_parquet("data/fpkm/aging/aging_counts.parquet")

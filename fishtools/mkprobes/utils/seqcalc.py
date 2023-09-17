@@ -9,8 +9,8 @@ from Bio.Seq import Seq
 from Bio.SeqUtils import MeltingTemp as mt
 from typing_extensions import NotRequired, Unpack
 
-from fishtools.mkprobes.initial_screen._pairwise import pairwise_alignment
-from fishtools.utils.sequtils import gc_content
+from fishtools.mkprobes.utils._pairwise import pairwise_alignment
+from fishtools.mkprobes.utils.sequtils import gc_content
 
 deltas = pl.read_csv(
     io.StringIO(

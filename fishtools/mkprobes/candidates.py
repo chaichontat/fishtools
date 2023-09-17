@@ -5,16 +5,15 @@ import click
 import polars as pl
 from loguru import logger
 
-from fishtools.ext.external_data import Dataset, ExternalData, get_ensembl
-from fishtools.mkprobes.alignment import gen_fasta
-from fishtools.utils.samframe import SAMFrame
-from fishtools.utils.seqcalc import hp, tm
-
-from ._crawler import crawler
-from ._filtration import PROBE_CRITERIA, check_kmers
+from .ext.external_data import Dataset, ExternalData, get_ensembl
+from .utils._alignment import gen_fasta
+from .utils._crawler import crawler
+from .utils._filtration import PROBE_CRITERIA, check_kmers
+from .utils.samframe import SAMFrame
+from .utils.seqcalc import hp, tm
 
 try:
-    profile
+    profile  # type: ignore
 except NameError:
     profile = lambda x: x
 
@@ -44,7 +43,7 @@ def get_pseudogenes(
     return ok[:limit]["transcript"], ok[:limit]["transcript_name"]
 
 
-def run_candidates(
+def get_candidates(
     dataset: Dataset,
     gene: str | None = None,
     transcript: str | None = None,
@@ -227,7 +226,7 @@ def _run_transcript(
 @click.option("--output", "-o", type=click.Path(), default="output/")
 @click.option("--ignore-revcomp", "-r", is_flag=True)
 @click.option("--realign", is_flag=True)
-def _click_candidates(
+def candidates(
     path: str,
     gene: str,
     transcript: str,
@@ -236,7 +235,7 @@ def _click_candidates(
     realign: bool = False,
 ):
     """Initial screening of probes candidates for a gene."""
-    run_candidates(
+    get_candidates(
         Dataset(path),
         gene=gene,
         transcript=transcript,
