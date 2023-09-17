@@ -12,7 +12,7 @@ from ._filtration import the_filter
 sys.setrecursionlimit(5000)
 
 
-def run(
+def screen(
     data_dir: str | Path,
     gene: str,
     fpkm_path: str | Path | None = None,
@@ -51,7 +51,7 @@ def run(
 @click.option(
     "--maxoverlap", type=int, default=20, help="Maximum sequence overlap between probes if minimum is set."
 )
-def screen(
+def _click_screen(
     data_dir: str,
     gene: str,
     fpkm_path: Path | str | None = None,
@@ -65,10 +65,10 @@ def screen(
             raise ValueError("maxoverlap must be positive non-zero and a multiple of 5")
 
         for i in range(0, maxoverlap + 1, 5):
-            final = run(data_dir, gene, fpkm_path=fpkm_path, overlap=i)
+            final = screen(data_dir, gene, fpkm_path=fpkm_path, overlap=i)
             if len(final) >= minimum:
                 logger.info(f"Overlap {i} results in {len(final)} probes. Stopping.")
                 return
             logger.warning(f"Overlap {i} results in {len(final)} probes. Trying next overlap.")
 
-    run(data_dir, gene, fpkm_path=fpkm_path, overlap=overlap)
+    screen(data_dir, gene, fpkm_path=fpkm_path, overlap=overlap)

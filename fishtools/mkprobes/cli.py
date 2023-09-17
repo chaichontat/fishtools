@@ -9,10 +9,10 @@ from fishtools.ext.prepare import run_repeatmasker
 from fishtools.mkprobes.alignment import bowtie_build
 from fishtools.mkprobes.codebook.finalconstruct import filter_genes
 from fishtools.mkprobes.genes.chkgenes import chkgenes, gettranscript
-from fishtools.mkprobes.initial_screen.screen import screen
+from fishtools.mkprobes.initial_screen.screen import _click_screen
 from fishtools.utils.utils import setup_logging
 
-from .initial_screen.candidates import candidates
+from .initial_screen.candidates import _click_candidates
 
 log = setup_logging()
 click.rich_click.SHOW_ARGUMENTS = True
@@ -61,8 +61,8 @@ def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
     Dataset(path / species)  # test all components
 
 
-main.add_command(candidates)
-main.add_command(screen)
+main.add_command(_click_candidates)
+main.add_command(_click_screen)
 main.add_command(chkgenes)
 main.add_command(filter_genes)
 main.add_command(gettranscript)

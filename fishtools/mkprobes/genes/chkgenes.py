@@ -7,7 +7,7 @@ import polars as pl
 import rich_click as click
 from loguru import logger as log
 
-from fishtools.ext.external_data import Dataset, get_ensembl
+from fishtools.ext.external_data import Dataset
 from fishtools.io.pretty_print import jprint
 
 
