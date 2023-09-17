@@ -19,8 +19,8 @@ from ..utils._alignment import gen_fasta
 from .external_data import ExternalData
 
 url_files = {
-    "mouse": Path(__file__).parent / "../../" / "static" / "mouseurls.tsv",
-    "human": Path(__file__).parent / "../../" / "static" / "humanurls.tsv",
+    "mouse": Path(__file__).parent / "mouseurls.tsv",
+    "human": Path(__file__).parent / "humanurls.tsv",
 }
 
 Gtfs = NamedTuple("gtfs", [("ensembl", ExternalData), ("gencode", ExternalData)])

@@ -113,3 +113,7 @@ def gen_plate(name: str, seqs: list[str], order: Literal["C", "F"] = "C") -> pl.
             "Sequence": seqs,
         }
     )
+
+
+def kmers(seq: str, n: int) -> list[str]:
+    return [seq[i : i + n] for i in range(len(seq) - n + 1)]

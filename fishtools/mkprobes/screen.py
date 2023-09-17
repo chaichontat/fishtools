@@ -126,4 +126,12 @@ def screen(
     restriction: list[str] | None = None,
 ):
     """Screening of probes candidates for a gene."""
-    run_screen(data_dir, gene, fpkm_path=fpkm_path, overlap=overlap, minimum=minimum, maxoverlap=maxoverlap)
+    run_screen(
+        data_dir,
+        gene,
+        fpkm_path=fpkm_path,
+        overlap=overlap,
+        minimum=minimum,
+        maxoverlap=maxoverlap,
+        restriction=restriction,
+    )

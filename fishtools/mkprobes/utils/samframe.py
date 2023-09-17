@@ -195,16 +195,25 @@ class SAMFrame(pl.DataFrame):
         # fmt: on
 
     def filter_by_match(
-        self, acceptable_tss: Collection[str], match: float = 0.8, match_consec: float = 0.7
+        self,
+        acceptable_tss: Collection[str],
+        match: float = 0.8,
+        match_consec: float = 0.8,
+        min_length: int = 100,
+        min_consec_length: int = 100,
     ) -> SAMFrame:
         """Cannot do a groupby because this is a percent comparison.
-        Each transcript must be compared to its length."""
+        Each transcript must be compared to its length.
+
+        Percent match or minimum length, which ever is lower."""
 
         # Filter by match and match_consec.
         nogo = self.filter(
             (
                 (pl.col("match") > pl.col("length") * match)
+                | (pl.col("match") > min_length)
                 | (pl.col("match_consec") > pl.col("length") * match_consec)
+                | (pl.col("match_consec") > min_consec_length)
             )
             & ~pl.col("transcript").is_in(acceptable_tss)
         )
@@ -219,8 +228,7 @@ class SAMFrame(pl.DataFrame):
 
         tm_offtarget = self.filter(
             ~pl.col("transcript").is_in(acceptable_tss)
-            & (pl.col("match_consec") > (pl.col("length") * 0.5))
-            & pl.col("match_consec").gt(15)
+            & ((pl.col("match_consec") > (pl.col("length") * 0.5)) | pl.col("match_consec").gt(16))
         ).with_columns(
             tm_offtarget=pl.struct(["seq", "cigar", "mismatched_reference"]).apply(
                 lambda x: tm_pairwise(x["seq"], x["cigar"], x["mismatched_reference"], formamide=30)  # type: ignore

@@ -44,9 +44,7 @@ def bowtie_build(fasta_path: Path | str, name: str) -> bytes | None:
     fasta_path = Path(fasta_path)
     logger.info(f"Generating bowtie2 index for {name}")
     return subprocess.run(
-        shlex.split(f"bowtie2-build {fasta_path} {fasta_path.parent}/{name}"),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        ["bowtie2-build", fasta_path.as_posix(), (fasta_path.parent / name).as_posix()],
         check=True,
     ).stdout
 

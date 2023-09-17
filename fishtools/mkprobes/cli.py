@@ -10,7 +10,7 @@ from .candidates import candidates
 from .codebook.finalconstruct import filter_genes
 from .ext.external_data import Dataset
 from .ext.prepare import run_repeatmasker
-from .genes.chkgenes import chkgenes, gettranscript
+from .genes.chkgenes import chkgenes, transcripts
 from .screen import screen
 from .utils._alignment import bowtie_build
 
@@ -57,7 +57,7 @@ def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
             species=dict(human="homo sapiens", mouse="mus musculus")[species],
             threads=threads,
         )
-        exc.submit(bowtie_build, path / "cdna_ncrna_trna.fasta", "txome")
+        exc.submit(bowtie_build, path / species / "cdna_ncrna_trna.fasta", "txome")
     Dataset(path / species)  # test all components
 
 
@@ -65,7 +65,7 @@ main.add_command(candidates)
 main.add_command(screen)
 main.add_command(chkgenes)
 main.add_command(filter_genes)
-main.add_command(gettranscript)
+main.add_command(transcripts)
 
 
 if __name__ == "__main__":

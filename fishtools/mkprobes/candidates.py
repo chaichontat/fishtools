@@ -5,10 +5,12 @@ import click
 import polars as pl
 from loguru import logger
 
-from .ext.external_data import Dataset, ExternalData, get_ensembl
+from fishtools.mkprobes.genes.chkgenes import get_transcripts
+
+from .ext.external_data import Dataset, ExternalData
 from .utils._alignment import gen_fasta
 from .utils._crawler import crawler
-from .utils._filtration import PROBE_CRITERIA, check_kmers
+from .utils._filtration import PROBE_CRITERIA
 from .utils.samframe import SAMFrame
 from .utils.seqcalc import hp, tm
 
@@ -61,18 +63,8 @@ def get_candidates(
     if transcript is None:
         assert gene is not None
         # fmt: off
-        transcript = (
-            get_ensembl(output, dataset.gencode.filter_gene(gene)[0, "gene_id"])
-            ["canonical_transcript"]
-            .split(".")[0]
-        )
-
-        appris = (
-            dataset.appris
-            .filter((pl.col("gene_name") == gene) & (pl.col("annotation").str.contains("PRINCIPAL")))
-            .sort("annotation")
-        )
-        # fmt: on
+        transcript = get_transcripts(dataset, gene, mode="canonical")[0, "transcript_id"]
+        appris = get_transcripts(dataset, gene, mode="appris")
 
         if not appris.filter(pl.col("transcript_id") == transcript).shape[0]:
             logger.warning(f"Ensembl canonical transcript {transcript} not found in APPRIS.")
@@ -90,6 +82,30 @@ def get_candidates(
         realign=realign,
         allow=allow,
         disallow=disallow,
+    )
+
+
+def _run_bowtie(
+    dataset: Dataset,
+    seqs: pl.DataFrame,
+    ignore_revcomp: bool = False,
+):
+    y = SAMFrame.from_bowtie_split_name(
+        gen_fasta(seqs["seq"], names=seqs["name"]).getvalue(),
+        dataset.path / "txome",
+        seed_length=13,
+        threshold=18,
+        n_return=-1,
+        fasta=True,
+        no_reverse=ignore_revcomp,
+    )
+
+    return (
+        y,
+        y["transcript"]
+        .value_counts()
+        .sort("counts", descending=True)
+        .with_columns(name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene)),
     )
 
 
@@ -126,24 +142,7 @@ def _run_transcript(
     if realign or not (output / f"{transcript_name}_all.parquet").exists():
         seq = dataset.gencode.get_seq(transcript_id, masked=True)
         crawled = crawler(seq, prefix=f"{gene}_{transcript_id}")
-
-        y = SAMFrame.from_bowtie_split_name(
-            gen_fasta(crawled["seq"], names=crawled["name"]).getvalue(),
-            dataset.path / "txome",
-            seed_length=13,
-            threshold=18,
-            n_return=-1,
-            fasta=True,
-            no_reverse=ignore_revcomp,
-        )
-
-        offtargets = (
-            y["transcript"]
-            .value_counts()
-            .sort("counts", descending=True)
-            .with_columns(name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene))
-        )
-
+        y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
         y.write_parquet(output / f"{transcript_name}_all.parquet")
         offtargets.write_parquet(output / f"{transcript_name}_offtargets.parquet")
     else:
@@ -209,7 +208,7 @@ def _run_transcript(
         )
         .with_columns(oks=pl.sum(pl.col("^ok_.*$")))
         # .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
-        .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.trna_rna_kmers, 15)))
+        .filter(~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x))))
         .join(names_with_pseudo, on="name", how="left")
         .join(isoforms, on="name", how="left")
     )

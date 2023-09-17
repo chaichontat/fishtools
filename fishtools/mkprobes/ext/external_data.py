@@ -12,6 +12,8 @@ import pyfastx
 import requests
 from loguru import logger as log
 
+from fishtools.mkprobes.utils.sequtils import kmers
+
 mg = mygene.MyGeneInfo()
 
 
@@ -213,6 +215,14 @@ class Dataset:
             has_header=False,
             new_columns=["gene_name", "gene_id", "transcript_id", "ccds", "annotation"],
         )
+
+    def check_kmers(self, seq: str):
+        # fmt: off
+        return (
+            # any(x in self.kmerset for x in kmers(seq, 18))
+            any(x in self.trna_rna_kmers for x in kmers(seq, 15))
+        )
+        # fmt: on
 
     # def check_gene_names(self, genes: list[str]):
     #     notfound = []

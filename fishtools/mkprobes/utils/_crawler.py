@@ -31,6 +31,9 @@ def crawler(
         the function moves to the next start position in the sequence and restarts from step 1.
 
     The function excludes subsequences with homopolymer runs of A's, T's, C's, or G's in the final DataFrame.
+
+    Returns:
+        pl.DataFrame[[name: str, seq: str]]]
     """
 
     end = length_limit[0]

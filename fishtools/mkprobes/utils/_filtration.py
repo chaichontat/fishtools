@@ -92,19 +92,14 @@ def the_filter(df: pl.DataFrame, overlap: int = -1) -> pl.DataFrame:
                 group,
                 criteria=[
                     # fmt: off
-                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(42) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-                    (pl.col("oks") > 3) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(42) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(42) & pl.col("length").lt(42),
-                    (pl.col("oks") > 3) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(45),
-                    (pl.col("oks") > 3) & pl.col("max_tm_offtarget").lt(45),
-                    (pl.col("oks") > 2) & pl.col("max_tm_offtarget").lt(45),
+                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+                    (pl.col("oks") > 3) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42),
+                    (pl.col("oks") > 3) & (pl.col("hp") < 40) & pl.col("max_tm_offtarget").lt(42),
+                    (pl.col("oks") > 2) & (pl.col("hp") < 40) & pl.col("max_tm_offtarget").lt(42),
                     # fmt: on
                 ],
                 overlap=overlap,
             ).sort("priority")
         )
     return pl.concat(out)
-
-
-def check_kmers(seq: str, kmer: set[str], n: int) -> bool:
-    return any(seq[i : i + n] in kmer for i in range(len(seq) - n + 1))

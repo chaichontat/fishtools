@@ -1,7 +1,7 @@
 import json
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import polars as pl
 import requests
@@ -13,7 +13,7 @@ from fishtools.utils.pretty_print import jprint
 from ..ext.external_data import Dataset, get_ensembl
 
 
-def find_outdated_ts(ts: str) -> set[tuple[str, str]]:
+def find_outdated_ts(ts: str) -> tuple[Annotated[str, "gene_name"], Annotated[str, "gene_id"]]:
     if not ts.startswith("ENST"):
         raise ValueError(f"{ts} is not a human Ensembl transcript ID")
     out = set()
@@ -29,7 +29,10 @@ def find_outdated_ts(ts: str) -> set[tuple[str, str]]:
         for y in x["genes"]:
             if y["name"]:
                 out.add((y["name"], y["stable_id"]))
-    return out
+
+    if len(out) != 1:
+        log.error(f"Found {len(out)} genes for {ts}: {out}")
+    return list(out)[0]
 
 
 @click.command()
@@ -65,8 +68,8 @@ def chkgenes(path: Path, genes: Path):
         log.info(f"{len(s)} genes checked out. No changes needed")
 
 
-def _gettranscript(
-    path: Path,
+def get_transcripts(
+    dataset: Dataset,
     gene: str,
     mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
 ) -> pl.DataFrame:
@@ -75,7 +78,6 @@ def _gettranscript(
         pl.DataFrame[[transcript_id, transcript_name, tag]]
         pl.DataFrame[[transcript_id, transcript_name, annotation, tag]] if appris
     """
-    dataset = Dataset(Path(path))
     gene_id = gene if gene.startswith("ENS") else dataset.ensembl.gene_to_eid(gene)
     del gene
 
@@ -125,11 +127,11 @@ def _gettranscript(
 @click.option("--ensembl"  , "mode", flag_value="ensembl", help="Outputs all transcripts from Ensembl")
 @click.option("--appris"   , "mode", flag_value="appris" , help="Outputs all principal transcripts from APPRIS (dominant coding transcripts)")
 # fmt: on
-def gettranscript(
+def transcripts(
     path: Path,
     gene: str,
     mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
 ):
     """Get transcript ID from gene name or gene ID"""
-    res = _gettranscript(path, gene, mode)
+    res = get_transcripts(Dataset(path), gene, mode)
     click.echo("\n".join(res["transcript_id"].to_list()))
