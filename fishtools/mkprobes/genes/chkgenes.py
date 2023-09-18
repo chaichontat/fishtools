@@ -126,12 +126,17 @@ def get_transcripts(
 @click.option("--gencode"  , "mode", flag_value="gencode", help="Outputs all transcripts from GENCODE basic")
 @click.option("--ensembl"  , "mode", flag_value="ensembl", help="Outputs all transcripts from Ensembl")
 @click.option("--appris"   , "mode", flag_value="appris" , help="Outputs all principal transcripts from APPRIS (dominant coding transcripts)")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 # fmt: on
 def transcripts(
     path: Path,
     gene: str,
     mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
+    verbose: bool = False,
 ):
     """Get transcript ID from gene name or gene ID"""
     res = get_transcripts(Dataset(path), gene, mode)
-    click.echo("\n".join(res["transcript_id"].to_list()))
+    if verbose:
+        click.echo(res)
+    else:
+        click.echo("\n".join(res["transcript_id"].to_list()))

@@ -23,7 +23,11 @@ def _screen(
 ):
     data_dir = Path(data_dir)
 
-    ff = SAMFrame(pl.read_parquet(next(data_dir.glob(f"{gene}*_crawled.parquet"))))
+    try:
+        ff = SAMFrame(pl.read_parquet(next(data_dir.glob(f"{gene}*_crawled.parquet"))))
+    except StopIteration:
+        logger.critical(f"No crawled data found for {gene}. Aborting.")
+        raise Exception
 
     if fpkm_path is not None:
         fpkm = pl.read_parquet(fpkm_path)

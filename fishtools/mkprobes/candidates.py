@@ -38,7 +38,7 @@ def get_pseudogenes(
         (pl.col("count") > 0.1 * pl.col("count").max())
         # & (pl.col("FPKM").lt(0.05 * pl.col("FPKM").first()) | pl.col("FPKM").lt(1) | pl.col("FPKM").is_null())
         & (
-            pl.col("transcript_name").str.starts_with(gene)
+            pl.col("transcript_name").str.contains(rf"^{gene}.+")
             | pl.col("transcript_name").str.starts_with("Gm")
             | pl.col("transcript_name").is_null()
         )
@@ -110,6 +110,16 @@ def _run_bowtie(
     )
 
 
+def _convert_gene_to_tss(dataset: Dataset, gtss: list[str]):
+    out = []
+    for gts in gtss:
+        if gts.startswith("ENS"):
+            out.append(gts)
+            continue
+        out.extend(get_transcripts(dataset, gts, "ensembl")["transcript_id"].to_list())
+    return out
+
+
 def _run_transcript(
     dataset: Dataset,
     transcript: str,
@@ -123,8 +133,11 @@ def _run_transcript(
     formamide: int = 45,
 ):
     allow, disallow = allow or [], disallow or []
-    (output := Path(output)).mkdir(exist_ok=True)
+    allow = _convert_gene_to_tss(dataset, allow)
+    disallow = _convert_gene_to_tss(dataset, disallow)
 
+    (output := Path(output)).mkdir(exist_ok=True)
+    transcript = transcript.split(".")[0]
     try:
         row = dataset.ensembl.filter(
             pl.col("transcript_id" if transcript.startswith("ENS") else "transcript_name") == transcript
@@ -145,6 +158,11 @@ def _run_transcript(
     if realign or not (output / f"{transcript_name}_all.parquet").exists():
         seq = dataset.gencode.get_seq(transcript_id, masked=True)
         crawled = crawler(seq, prefix=f"{gene}_{transcript_id}")
+        if len(crawled) < 50:
+            raise Exception(f"Transcript {transcript_id} has only {len(crawled)} probes.")
+        if len(crawled) < 100:
+            logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
+
         y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
         y.write_parquet(output / f"{transcript_name}_all.parquet")
         offtargets.write_parquet(output / f"{transcript_name}_offtargets.parquet")
@@ -181,7 +199,7 @@ def _run_transcript(
         names_with_pseudo = pl.DataFrame({"name": y["name"].unique(), "maps_to_pseudo": ""})
 
     isoforms = (
-        y.filter_isin(transcript=tss_gencode)[["name", "transcript"]]
+        y.filter_isin(transcript=tss_allofgene)[["name", "transcript"]]
         .with_columns(isoforms=pl.col("transcript").apply(dataset.ensembl.ts_to_tsname))[["name", "isoforms"]]
         .groupby("name")
         .all()
@@ -195,9 +213,14 @@ def _run_transcript(
         )
     ).sort("transcript_name").write_csv(output / f"{transcript_name}_acceptable_tss.csv")
 
+    ff = y.filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
+    if not len(ff):
+        raise Exception(
+            f"No probes left after filtering for {transcript_name}. Most likely, there is a homologous gene involved."
+        )
+
     ff = SAMFrame(
-        y.filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
-        .agg_tm_offtarget(tss_allacceptable)
+        ff.agg_tm_offtarget(tss_allacceptable)
         .with_columns(
             transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
             **PROBE_CRITERIA,
