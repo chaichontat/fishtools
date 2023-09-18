@@ -1,9 +1,96 @@
+# %%
 import re
+from itertools import cycle, permutations
 from pathlib import Path
+from typing import Final, Iterable, Iterator, Sequence, cast
 
 import click
 import polars as pl
 from loguru import logger
+
+from fishtools.mkprobes.candidates import _run_bowtie
+from fishtools.mkprobes.ext.external_data import Dataset
+from fishtools.mkprobes.utils.seqcalc import tm_pairwise
+from fishtools.mkprobes.utils.sequtils import reverse_complement
+
+READOUTS: Final[dict[int, str]] = {
+    x["id"]: x["seq"] for x in pl.read_csv(Path(__file__).parent / "readout_ref_filtered.csv").to_dicts()
+}
+
+
+def assign_overlap(
+    output: Path | str, genes: list[str], *, min_probes: int = 72, max_overlap: int = 20
+) -> dict[str, int]:
+    if max_overlap % 5 != 0:
+        raise ValueError("max_overlap must be a multiple of 5")
+
+    output = Path(output)
+    assigned_ol = {}
+    for gene in genes:
+        for ol in range(0, max_overlap + 1, 5):
+            df = pl.read_parquet(
+                f"output/{gene}_screened_ol{ol}.parquet" if ol else f"output/{gene}_screened.parquet"
+            )
+
+            if len(df) >= min_probes or ol == max_overlap:
+                assigned_ol[gene] = ol
+                break
+    return assigned_ol
+
+
+def stitch(seq: str, codes: Sequence[int], sep: str = "TT") -> str:
+    return READOUTS[codes[0]] + sep + seq + sep + READOUTS[codes[1]]
+
+
+def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int]):
+    if any(idx not in READOUTS for idx in idxs):
+        raise ValueError(f"Invalid readout indices: {idxs}")
+
+    pairs = cast(
+        Iterable[tuple[int, int]],
+        cycle(permutations(idxs, 2)) if len(idxs) > 1 else cycle([idxs[0], idxs[0]]),
+    )
+
+    out = dict(name=[], seq=[], code1=[], code2=[])
+
+    for (name, seq), codes in zip(seq_encoding[["name", "seq"]].iter_rows(), pairs):
+        for sep in ["TTT", "TAA", "TAT", "TTA", "ATT", "ATA"]:
+            out["name"].append(f"{name};{sep}")
+            out["seq"].append(stitch(seq, codes, sep=sep))
+            out["code1"].append(codes[0])
+            out["code2"].append(codes[1])
+
+    return pl.DataFrame(out)
+
+
+def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss: list[str]):
+    sam = _run_bowtie(dataset, constructed, ignore_revcomp=True)[0]
+
+    return (
+        sam.agg_tm_offtarget(acceptable_tss)
+        .filter(
+            pl.col("max_tm_offtarget").lt(42)
+            & ~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x)))
+        )
+        .with_columns(name=res["name"].str.split(";").list.first())
+        .unique("name")
+    )
+
+
+# %%
+# import json
+
+# df = pl.read_parquet("output/DCN_screened_ol10.parquet")
+# cb = json.loads(Path("bgcb_cb.json").read_text())
+# cons = construct_encoding(df, cb["DCN"])
+
+# # %%
+# res = check_offtargets(
+#     Dataset("data/human"), cons, pl.read_csv("output/DCN-220_acceptable_tss.csv")["transcript_id"]
+# )[["name"]].join(df, on="name")
+
+# tm_pairwise(res[0, "seq"], res[0, "cigar"], res[0, "mismatched_reference"] "rna")
+# %%
 
 
 # fmt: off
@@ -23,7 +110,7 @@ def construct(
     codebook: Path,
     head: str = "",
     tail: str = "",
-    rc: bool = True,
+    rc: bool = False,
     maxn: int = 64,
     minn: int = 48,
 ):
@@ -119,3 +206,5 @@ def filter_genes(output_path: Path, genes: Path, min_probes: int, out: Path | No
 #     cutted = GeneFrame(
 #         cutted.sort(["gene", "priority"]).groupby("gene").agg(pl.all().head(n)).explode(pl.all().exclude("gene"))
 #     )
+
+# %%
