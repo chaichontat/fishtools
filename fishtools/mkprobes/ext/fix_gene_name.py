@@ -1,10 +1,12 @@
+from itertools import chain
 from typing import Iterable, TypedDict, cast
 
 import mygene
+import polars as pl
 from loguru import logger as log
 from oligocheck.boilerplate import jprint
 
-from fishtools.ext.external_data import ExternalData
+from fishtools.mkprobes.ext.external_data import ExternalData
 
 mg = mygene.MyGeneInfo()
 
@@ -20,7 +22,7 @@ class ResDict(TypedDict):
     missing: list[str]
 
 
-def find_aliases(genes: Iterable[str], species: str = "mouse"):
+def find_aliases(gtf: ExternalData, genes: Iterable[str], species: str = "mouse"):
     res = mg.querymany(
         genes, scopes="symbol,alias", fields="symbol,ensembl.gene", species=species, returnall=True
     )
@@ -33,6 +35,12 @@ def find_aliases(genes: Iterable[str], species: str = "mouse"):
         else:
             eid = [y["gene"] for y in x["ensembl"]]
         out[x["query"]] = GeneDict(gene=eid, symbol=x["symbol"])
+
+    # symbol is from Uniprot, can conflict with ensembl.
+    eids = list(chain.from_iterable(x["gene"] for x in out.values()))
+    df = gtf.filter(pl.col("gene_id").is_in(eids))
+    for v in out.values():
+        v["symbol"] = df.filter(pl.col("gene_id").is_in(v["gene"]))[0, "gene_name"]
 
     # Simple case of duplication: only keep ensembl name.
     for d, _ in res["dup"].copy():
@@ -70,7 +78,7 @@ def check_gene_names(gtf: ExternalData, genes: list[str]):
             ok.append(gene)
         except ValueError:
             notfound.append(gene)
-    converted, res = find_aliases(notfound)
+    converted, res = find_aliases(gtf, notfound)
     mapping = {k: v["symbol"] for k, v in converted.items()}
     no_fix_needed = True
 
