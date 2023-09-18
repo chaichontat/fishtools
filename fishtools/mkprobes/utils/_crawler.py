@@ -7,10 +7,10 @@ from .sequtils import gc_content
 def crawler(
     seq: str,
     prefix: str,
-    length_limit: tuple[int, int] = (25, 46),
+    length_limit: tuple[int, int] = (24, 46),
     gc_limit: tuple[float, float] = (0.3, 0.7),
-    tm_limit: float = 51,
-    hairpin_limit: float = 40 + 0.65 * 30,
+    tm_limit: tuple[float, float] = (51, 60),
+    hairpin_limit: float = 42 + 0.65 * 30,
     tm_model: Model = "rna",
     to_avoid: list[str] | None = None,
 ) -> pl.DataFrame:
@@ -58,7 +58,11 @@ def crawler(
                 end += 1
                 continue
 
-            if tm(seq[start:end], model=tm_model) > tm_limit:
+            curr_tm = tm(seq[start:end], model=tm_model, formamide=30)
+            if curr_tm > tm_limit[1]:
+                break
+
+            if curr_tm > tm_limit[0]:
                 if hp(seq[start:end], "rna") < hairpin_limit:
                     names.append(f"{prefix}:{start}-{end-1}")
                     seqs.append(seq[start:end])
