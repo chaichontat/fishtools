@@ -9,10 +9,11 @@ def crawler(
     prefix: str,
     length_limit: tuple[int, int] = (24, 46),
     gc_limit: tuple[float, float] = (0.3, 0.7),
-    tm_limit: tuple[float, float] = (51, 60),
-    hairpin_limit: float = 42 + 0.65 * 30,
+    tm_limit: tuple[float, float] = (50, 60),
+    hairpin_limit: float = 42,
     tm_model: Model = "rna",
     to_avoid: list[str] | None = None,
+    formamide: float = 45,
 ) -> pl.DataFrame:
     """
     Based on the monotonic relationship between Tm and sequence length.
@@ -58,12 +59,12 @@ def crawler(
                 end += 1
                 continue
 
-            curr_tm = tm(seq[start:end], model=tm_model, formamide=30)
+            curr_tm = tm(seq[start:end], model=tm_model, formamide=formamide)
             if curr_tm > tm_limit[1]:
                 break
 
             if curr_tm > tm_limit[0]:
-                if hp(seq[start:end], "rna") < hairpin_limit:
+                if hp(seq[start:end], "rna", formamide=formamide) < hairpin_limit:
                     names.append(f"{prefix}:{start}-{end-1}")
                     seqs.append(seq[start:end])
                 break

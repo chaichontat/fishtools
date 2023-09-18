@@ -85,21 +85,16 @@ def handle_overlap(
 
 
 def the_filter(df: pl.DataFrame, overlap: int = -1) -> pl.DataFrame:
-    out = []
-    for _, group in df.groupby("gene"):
-        out.append(
-            handle_overlap(
-                group,
-                criteria=[
-                    # fmt: off
-                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-                    (pl.col("oks") > 3) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-                    (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42),
-                    (pl.col("oks") > 3) & (pl.col("hp") < 40) & pl.col("max_tm_offtarget").lt(42),
-                    (pl.col("oks") > 2) & (pl.col("hp") < 40) & pl.col("max_tm_offtarget").lt(42),
-                    # fmt: on
-                ],
-                overlap=overlap,
-            ).sort("priority")
-        )
-    return pl.concat(out)
+    return handle_overlap(
+        df,
+        criteria=[
+            # fmt: off
+            (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+            (pl.col("oks") > 3) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+            (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42),
+            (pl.col("oks") > 3) & (pl.col("hp") < 40) & pl.col("max_tm_offtarget").lt(42),
+            (pl.col("oks") > 2) & (pl.col("hp") < 40) & pl.col("max_tm_offtarget").lt(42),
+            # fmt: on
+        ],
+        overlap=overlap,
+    ).sort("priority")

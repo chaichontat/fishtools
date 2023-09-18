@@ -31,7 +31,7 @@ def _screen(
             pl.col("FPKM").lt(0.05 * pl.col("FPKM").first()) | pl.col("FPKM").lt(1) | pl.col("FPKM").is_null()
         )
 
-    if restriction is not None:
+    if restriction:
         ff = ff.filter(
             pl.col("seq").apply(
                 lambda x: any(Restriction.RestrictionBatch(restriction).search(Seq(x)).values())

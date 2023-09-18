@@ -38,9 +38,9 @@ def get_pseudogenes(
         (pl.col("count") > 0.1 * pl.col("count").max())
         # & (pl.col("FPKM").lt(0.05 * pl.col("FPKM").first()) | pl.col("FPKM").lt(1) | pl.col("FPKM").is_null())
         & (
-            pl.col("transcript_name").str.starts_with(gene + "-ps")
+            pl.col("transcript_name").str.starts_with(gene)
             | pl.col("transcript_name").str.starts_with("Gm")
-            | pl.col("transcript_name").str.starts_with("ENS")
+            | pl.col("transcript_name").is_null()
         )
     )
     return ok[:limit]["transcript"], ok[:limit]["transcript_name"]
@@ -94,8 +94,8 @@ def _run_bowtie(
     y = SAMFrame.from_bowtie_split_name(
         gen_fasta(seqs["seq"], names=seqs["name"]).getvalue(),
         dataset.path / "txome",
-        seed_length=13,
-        threshold=18,
+        seed_length=12,
+        threshold=16,
         n_return=-1,
         fasta=True,
         no_reverse=ignore_revcomp,
@@ -120,6 +120,7 @@ def _run_transcript(
     realign: bool = False,
     allow: list[str] | None = None,
     disallow: list[str] | None = None,
+    formamide: int = 45,
 ):
     allow, disallow = allow or [], disallow or []
     (output := Path(output)).mkdir(exist_ok=True)
@@ -204,8 +205,8 @@ def _run_transcript(
         .with_columns(
             [
                 (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-                pl.col("seq").apply(lambda s: tm(cast(str, s), "rna", formamide=30)).alias("tm"),
-                pl.col("seq").apply(lambda s: hp(cast(str, s), "rna", formamide=30)).alias("hp"),
+                pl.col("seq").apply(lambda s: tm(cast(str, s), "rna", formamide=formamide)).alias("tm"),
+                pl.col("seq").apply(lambda s: hp(cast(str, s), "rna", formamide=formamide)).alias("hp"),
             ]
         )
         .with_columns(oks=pl.sum(pl.col("^ok_.*$")))

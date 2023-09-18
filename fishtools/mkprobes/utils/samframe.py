@@ -221,26 +221,26 @@ class SAMFrame(pl.DataFrame):
         return SAMFrame(self.filter(~pl.col("name").is_in(nogo["name"])))
 
     @to_samframe
-    def agg_tm_offtarget(self, acceptable_tss: Collection[str]):
+    def agg_tm_offtarget(self, acceptable_tss: Collection[str], formamide: int = 45):
         # Filter by maximum offtarget Tms.
         # Only calculate Tm for sequences with >15 consecutive matches
         # to save time.
 
         tm_offtarget = self.filter(
-            ~pl.col("transcript").is_in(acceptable_tss)
-            & ((pl.col("match_consec") > (pl.col("length") * 0.5)) | pl.col("match_consec").gt(16))
+            ~pl.col("transcript").is_in(acceptable_tss) & pl.col("match_consec").gt(16)
         ).with_columns(
             tm_offtarget=pl.struct(["seq", "cigar", "mismatched_reference"]).apply(
-                lambda x: tm_pairwise(x["seq"], x["cigar"], x["mismatched_reference"], formamide=30)  # type: ignore
+                lambda x: tm_pairwise(x["seq"], x["cigar"], x["mismatched_reference"], formamide=formamide)  # type: ignore
             )
         )
+
         unique = tm_offtarget.groupby("name").agg(
             pl.max("tm_offtarget").alias("max_tm_offtarget").cast(pl.Float32),
             pl.max("match_consec").alias("match_consec_all"),
         )
         # Aggregate
         out = (
-            self.filter(pl.col("length") == pl.col("match_consec"))
+            self.filter(pl.col("transcript").is_in(acceptable_tss))
             .unique("name")
             .join(unique, on="name", how="left")
             .with_columns(

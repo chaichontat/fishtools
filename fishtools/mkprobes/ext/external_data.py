@@ -19,6 +19,7 @@ mg = mygene.MyGeneInfo()
 
 def get_ensembl(path: Path | str, id_: str):
     path = Path(path)
+    path.mkdir(exist_ok=True, parents=True)
     if (p := (path / f"{id_}.json")).exists():
         return json.loads(p.read_text())
 
