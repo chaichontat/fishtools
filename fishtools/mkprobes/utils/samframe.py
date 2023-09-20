@@ -184,8 +184,7 @@ class SAMFrame(pl.DataFrame):
                 else []
             )
             .with_columns(
-                [(pl.col("transcript") == pl.col("transcript_ori")).alias("is_ori_seq")]
-                + [(pl.col("pos_end") - pl.col("pos_start") + 1).alias("length")]
+                [(pl.col("pos_end") - pl.col("pos_start") + 1).alias("length")]
                 if split_name
                 else []
             )

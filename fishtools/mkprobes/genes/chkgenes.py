@@ -43,6 +43,7 @@ def chkgenes(path: Path, genes: Path):
     from ..ext.fix_gene_name import check_gene_names
 
     ds = Dataset(path)
+    del path
     gs: list[str] = re.split(r"[\s,]+", genes.read_text())
     if not gs:
         raise ValueError("No genes provided")
@@ -51,8 +52,8 @@ def chkgenes(path: Path, genes: Path):
     if len(gs) != len(s := set(gs)):
         [gs.remove(x) for x in s]
         log.warning(f"Non-unique genes found: {', '.join(gs)}.\n")
-        path.with_suffix(".unique.txt").write_text("\n".join(sorted(list(s))))
-        log.error(f"Unique genes written to {path.with_suffix('.unique.txt')}.\n")
+        genes.with_suffix(".unique.txt").write_text("\n".join(sorted(list(s))))
+        log.error(f"Unique genes written to {genes.with_suffix('.unique.txt')}.\n")
         log.critical("Aborting.")
         return
 
@@ -60,8 +61,10 @@ def chkgenes(path: Path, genes: Path):
     if mapping:
         log.info("Mappings:")
         jprint(mapping)
-        path.with_suffix(".mapping.json").write_text(json.dumps(mapping))
-        path.with_suffix(".converted.txt").write_text("\n".join(sorted(converted)))
+        log.info(f"Mapping written to {genes.with_suffix('.mapping.json')}.")
+        genes.with_suffix(".mapping.json").write_text(json.dumps(mapping))
+        log.info(f"Converted genes written to {genes.with_suffix('.converted.txt')}.")
+        genes.with_suffix(".converted.txt").write_text("\n".join(sorted(converted)))
     elif not no_fixed_needed:
         log.warning("Some genes cannot be found.")
     else:

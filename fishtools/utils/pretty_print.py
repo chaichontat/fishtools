@@ -20,7 +20,7 @@ class _JPrint(Protocol[P]):
 
 def _jprint(f: _JPrint[P]) -> Callable[Concatenate[Any, P], None]:
     def inner(d: Any, *args: P.args, **kwargs: P.kwargs):
-        return logger.info(f(json.dumps(d, indent=2), "json", *args, **kwargs))
+        return console.print(f(json.dumps(d, indent=2), "json", *args, **kwargs))
 
     return inner
 

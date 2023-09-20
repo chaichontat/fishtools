@@ -1,8 +1,9 @@
 # %%
+import json
 import re
 from itertools import cycle, permutations
 from pathlib import Path
-from typing import Final, Iterable, Iterator, Sequence, cast
+from typing import Final, Iterable, Sequence, cast
 
 import click
 import polars as pl
@@ -10,8 +11,6 @@ from loguru import logger
 
 from fishtools.mkprobes.candidates import _run_bowtie
 from fishtools.mkprobes.ext.external_data import Dataset
-from fishtools.mkprobes.utils.seqcalc import tm_pairwise
-from fishtools.mkprobes.utils.sequtils import reverse_complement
 
 READOUTS: Final[dict[int, str]] = {
     x["id"]: x["seq"] for x in pl.read_csv(Path(__file__).parent / "readout_ref_filtered.csv").to_dicts()
@@ -19,23 +18,22 @@ READOUTS: Final[dict[int, str]] = {
 
 
 def assign_overlap(
-    output: Path | str, genes: list[str], *, min_probes: int = 72, max_overlap: int = 20
-) -> dict[str, int]:
-    if max_overlap % 5 != 0:
+    output: Path | str, gene: str, *, min_probes: int = 64, target_probes: int = 72, max_overlap: int = 20
+) -> int:
+    if max_overlap % 5 != 0 or max_overlap < 0:
         raise ValueError("max_overlap must be a multiple of 5")
-
     output = Path(output)
-    assigned_ol = {}
-    for gene in genes:
-        for ol in range(0, max_overlap + 1, 5):
-            df = pl.read_parquet(
-                f"output/{gene}_screened_ol{ol}.parquet" if ol else f"output/{gene}_screened.parquet"
-            )
+    for ol in range(0, max_overlap + 1, 5):
+        df = pl.read_parquet(
+            f"output/{gene}_screened_ol{ol}.parquet" if ol else f"output/{gene}_screened.parquet"
+        )
+        if len(df) >= target_probes:
+            return ol
 
-            if len(df) >= min_probes or ol == max_overlap:
-                assigned_ol[gene] = ol
-                break
-    return assigned_ol
+    # if len(df) >= min_probes:  # type: ignore
+    return ol  # type: ignore
+
+    # raise ValueError(f"Gene {gene} cannot be fixed")
 
 
 def stitch(seq: str, codes: Sequence[int], sep: str = "TT") -> str:
@@ -72,7 +70,7 @@ def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss
             pl.col("max_tm_offtarget").lt(42)
             & ~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x)))
         )
-        .with_columns(name=res["name"].str.split(";").list.first())
+        .with_columns(name=pl.col("name").str.split(";").list.first())
         .unique("name")
     )
 
@@ -80,41 +78,59 @@ def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss
 # %%
 # import json
 
-# df = pl.read_parquet("output/DCN_screened_ol10.parquet")
-# cb = json.loads(Path("bgcb_cb.json").read_text())
-# cons = construct_encoding(df, cb["DCN"])
-
-# # %%
-# res = check_offtargets(
-#     Dataset("data/human"), cons, pl.read_csv("output/DCN-220_acceptable_tss.csv")["transcript_id"]
-# )[["name"]].join(df, on="name")
-
-# tm_pairwise(res[0, "seq"], res[0, "cigar"], res[0, "mismatched_reference"] "rna")
 # %%
 
 
 # fmt: off
-@click.command()
+@click.command("construct")
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("output_path", type=click.Path(dir_okay=True, file_okay=False, path_type=Path))
-@click.option("--readouts", "-r", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--gene", "-g", type=str)
 @click.option("--codebook", "-c", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
-@click.option("--head", type=str, help="Sequence to add to the 5' end", default="")
-@click.option("--tail", type=str, help="Sequence to add to the 3' end", default ="")
-@click.option("--rc", is_flag=True, help="Reverse complement (for DNA probes which needs RT)")
-@click.option("--maxn", type=int, help="Maximum number of probes per gene", default=64)
-@click.option("--minn", type=int, help="Minimum number of probes per gene", default=48)
+@click.option("--target_probes", "-N", type=int, help="Maximum number of probes per gene", default=64)
+@click.option("--min_probes", "-n", type=int, help="Minimum number of probes per gene", default=48)
 # fmt: on
-def construct(
+def _click_construct(
+    path: Path,
     output_path: Path,
-    readouts: Path,
+    gene: str,
     codebook: Path,
-    head: str = "",
-    tail: str = "",
-    rc: bool = False,
-    maxn: int = 64,
-    minn: int = 48,
+    target_probes: int = 64,
+    min_probes: int = 48,
 ):
-    ...
+    res = construct(
+        Dataset(path),
+        output_path,
+        gene=gene,
+        codebook=json.loads(codebook.read_text()),
+        target_probes=target_probes,
+        min_probes=min_probes,
+    )
+    res.write_parquet(output_path / f"{gene}_final.parquet")
+
+
+def construct(
+    dataset: Dataset,
+    output_path: Path | str,
+    *,
+    gene: str,
+    codebook: dict[str, list[int]],
+    min_probes: int = 48,
+    target_probes: int = 64,
+):
+    output_path = Path(output_path)
+    overlap = assign_overlap(output_path, gene, min_probes=min_probes, target_probes=target_probes)
+    screened = pl.read_parquet(
+        f"output/{gene}_screened_ol{overlap}.parquet" if overlap else f"output/{gene}_screened.parquet"
+    )
+    acceptable_tss = pl.read_csv(next(output_path.glob(f"{gene}*_acceptable_tss.csv")))[
+        "transcript_id"
+    ].to_list()
+    cons = construct_encoding(screened, codebook[gene])
+
+    res = check_offtargets(dataset, cons, acceptable_tss=acceptable_tss)[["name"]].join(screened, on="name")
+    res.write_parquet(output_path / f"{gene}_final.parquet")
+    return res
 
 
 @click.command()

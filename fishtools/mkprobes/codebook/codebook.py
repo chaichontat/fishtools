@@ -1,6 +1,6 @@
 # %%
 from pathlib import Path
-from typing import Any, Sized
+from typing import Any, Literal, Sized
 
 import numpy as np
 import numpy.typing as npt
@@ -53,24 +53,56 @@ class CodebookPicker:
         rand.shuffle(rmhd4)
         return rmhd4
 
-    def _find_optimalish(self, seed: int, fpkm: Sized):
+    def _calc_entropy(self, seed: int, fpkm: Sized):
         rmhd4 = self.gen_codebook(seed)
-        res = rmhd4[: len(fpkm)] * np.array(fpkm)
+        res = rmhd4[: len(fpkm)] * np.array(fpkm).reshape(-1, 1)
         tocalc = res.sum(axis=0)
         normed = tocalc / tocalc.sum() + 1e-10
 
         return -np.sum(normed * np.log2(normed)), tocalc
 
-    def export_codebook(self, seed: int) -> pl.DataFrame:
+    def find_optimalish(self, fpkm: npt.NDArray[Any], iterations: int = 200):
+        if fpkm.size != len(self.genes):
+            raise ValueError("Mismatch array size between gene name list and counts matrix")
+
+        if fpkm.size > self.mhd4.shape[0]:
+            raise ValueError("Number of genes is larger than the number of possible codes")
+
+        if fpkm.size > 0.95 * self.mhd4.shape[0]:
+            logger.warning(
+                f"Number of genes ({fpkm.size}) is close to the number of possible codes ({self.mhd4.shape[1]}). "
+                "This may result in a suboptimal codebook. "
+                "Consider using a larger codebook or a smaller number of genes."
+            )
+
+        res = [self._calc_entropy(i, fpkm)[0] for i in range(iterations)]
+        best = np.argmax(res)
+        logger.info(
+            f"Best codebook found at seed {best} with entropy {res[best]:.3f} (worst entropy is {np.min(res):.3f})."
+        )
+
+        return int(best), self._calc_entropy(int(best), fpkm)[1]
+
+    def export_codebook(
+        self, seed: int, type: Literal["csv", "json"] = "json"
+    ) -> pl.DataFrame | dict[str, list[int]]:
         rmhd4 = self.gen_codebook(seed)
         n_blanks = self.mhd4.shape[0] - len(self.genes)
-        return pl.concat(
-            [
-                pl.DataFrame(dict(genes=self.genes + [f"Blank-{i+1}" for i in range(n_blanks)])),
-                pl.DataFrame(rmhd4.astype(np.uint8)),
-            ],
-            how="horizontal",
-        )
+        match type:
+            case "csv":
+                return pl.concat(
+                    [
+                        pl.DataFrame(dict(genes=self.genes + [f"Blank-{i+1}" for i in range(n_blanks)])),
+                        pl.DataFrame(rmhd4.astype(np.uint8)),
+                    ],
+                    how="horizontal",
+                )
+            case "json":
+                return {
+                    gene: list(np.flatnonzero(code) + 1) for gene, code in zip(self.genes, rmhd4.astype(int))
+                }
+            case _:  # type: ignore
+                raise ValueError(f"Unknown type {type}")
 
 
 class CodebookPickerSingleCell(CodebookPicker):

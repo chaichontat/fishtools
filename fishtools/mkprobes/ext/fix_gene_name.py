@@ -4,9 +4,9 @@ from typing import Iterable, TypedDict, cast
 import mygene
 import polars as pl
 from loguru import logger as log
-from oligocheck.boilerplate import jprint
 
 from fishtools.mkprobes.ext.external_data import ExternalData
+from fishtools.utils.pretty_print import jprint
 
 mg = mygene.MyGeneInfo()
 
@@ -83,7 +83,7 @@ def check_gene_names(gtf: ExternalData, genes: list[str]):
     no_fix_needed = True
 
     if len(res["dup"]):
-        log.info("Duplicates found. Please fix by selecting the correct index.")
+        log.info(f"Duplicates found {res['dup']}. Please fix by selecting the correct index.")
         manual_fix(res, mapping)
     if len(res["missing"]):
         log.error(f"Cannot find {res['missing']}")
