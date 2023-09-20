@@ -7,7 +7,7 @@ import rich_click as click
 from fishtools.utils.utils import setup_logging
 
 from .candidates import candidates
-from .codebook.finalconstruct import filter_genes
+from .codebook.finalconstruct import _click_construct, filter_genes
 from .ext.external_data import Dataset
 from .ext.prepare import run_repeatmasker
 from .genes.chkgenes import chkgenes, transcripts
@@ -66,6 +66,7 @@ main.add_command(screen)
 main.add_command(chkgenes)
 main.add_command(filter_genes)
 main.add_command(transcripts)
+main.add_command(_click_construct)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from typing import cast
 
 import click
 import polars as pl
+import pyfastx
 from loguru import logger
 
 from fishtools.mkprobes.genes.chkgenes import get_transcripts
@@ -20,9 +21,12 @@ except NameError:
     profile = lambda x: x
 
 
+pl.Config.set_tbl_rows(30)
+
+
 def get_pseudogenes(
-    gene: str, ensembl: ExternalData, y: SAMFrame, limit: int = 5
-) -> tuple[pl.Series, pl.Series]:
+    gene: str, ensembl: ExternalData, y: SAMFrame, limit: int = -1
+) -> tuple[pl.Series, pl.DataFrame]:
     counts = (
         y.count("transcript")
         .join(
@@ -31,37 +35,44 @@ def get_pseudogenes(
             right_on="transcript_id",
         )
         .sort("count", descending=True)
-    )
-
-    # Filtered based on expression and number of probes aligned.
-    ok = counts.filter(
-        (pl.col("count") > 0.1 * pl.col("count").max())
-        # & (pl.col("FPKM").lt(0.05 * pl.col("FPKM").first()) | pl.col("FPKM").lt(1) | pl.col("FPKM").is_null())
-        & (
-            pl.col("transcript_name").str.contains(rf"^{gene}.+")
+        .with_row_count("i")
+        .with_columns(
+            acceptable=pl.col("transcript_name").str.contains(rf"^{gene}.*")
             | pl.col("transcript_name").str.starts_with("Gm")
-            | pl.col("transcript_name").is_null()
+            | pl.col("transcript_name").is_null(),
+            significant=pl.col("count") > 0.1 * pl.col("count").max(),
         )
     )
-    return ok[:limit]["transcript"], ok[:limit]["transcript_name"]
+
+    not_acceptable = counts.filter(~pl.col("acceptable"))
+    # cutoff when the probes bind to other genes
+    limit = limit if limit > 0 else (not_acceptable[0, "i"] - 1 or 10)
+
+    if len(not_acceptable):
+        logger.warning(f"More than 10% of candidates of {gene} bind to other genes.")
+        print(not_acceptable[:100])
+
+    # Filter based on expression and number of probes aligned.
+    return counts.filter(pl.col("significant") & pl.col("acceptable"))[:limit]["transcript"], counts
 
 
 def get_candidates(
     dataset: Dataset,
     gene: str | None = None,
     transcript: str | None = None,
+    fasta: Path | str | None = None,
     output: str | Path = "output/",
     *,
-    allow_pseudo: bool = True,
     ignore_revcomp: bool = False,
     realign: bool = False,
     allow: list[str] | None = None,
     disallow: list[str] | None = None,
+    pseudogene_limit: int = -1,
 ):
-    if not ((gene is None) ^ (transcript is None)):
-        raise ValueError("Either gene or transcript must be specified.")
+    if not ((gene is not None) ^ (transcript is not None) ^ (fasta is not None)):
+        raise ValueError("Either gene or transcript or FASTA must be specified.")
 
-    if transcript is None:
+    if transcript is None and fasta is None:
         assert gene is not None
         # fmt: off
         transcript = get_transcripts(dataset, gene, mode="canonical")[0, "transcript_id"]
@@ -77,12 +88,13 @@ def get_candidates(
     _run_transcript(
         dataset=dataset,
         transcript=transcript,
+        fasta=fasta,
         output=output,
-        allow_pseudo=allow_pseudo,
         ignore_revcomp=ignore_revcomp,
         realign=realign,
         allow=allow,
         disallow=disallow,
+        pseudogene_limit=pseudogene_limit,
     )
 
 
@@ -122,42 +134,56 @@ def _convert_gene_to_tss(dataset: Dataset, gtss: list[str]):
 
 def _run_transcript(
     dataset: Dataset,
-    transcript: str,
+    transcript: str | None = None,
+    fasta: str | Path | None = None,
     output: str | Path = "output/",
     *,
-    allow_pseudo: bool = True,
     ignore_revcomp: bool = False,
     realign: bool = False,
     allow: list[str] | None = None,
     disallow: list[str] | None = None,
     formamide: int = 45,
+    pseudogene_limit: int = -1,
 ):
     allow, disallow = allow or [], disallow or []
     allow = _convert_gene_to_tss(dataset, allow)
     disallow = _convert_gene_to_tss(dataset, disallow)
 
     (output := Path(output)).mkdir(exist_ok=True)
-    transcript = transcript.split(".")[0]
-    try:
-        row = dataset.ensembl.filter(
-            pl.col("transcript_id" if transcript.startswith("ENS") else "transcript_name") == transcript
-        ).to_dicts()[0]
-    except IndexError:
-        raise ValueError(f"Transcript {transcript} not found in ensembl.")
-    del transcript
 
-    gene, transcript_id, transcript_name = row["gene_name"], row["transcript_id"], row["transcript_name"]
-    # need to be gene_name, not id, because of genes on scaffold assemblies
-    tss_gencode = set(dataset.gencode.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
-    tss_allofgene = set(dataset.ensembl.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
-    if not len(tss_gencode):
-        logger.warning(f"Transcript {transcript_id} not found in GENCODE basic.")
+    if not ((fasta is not None) ^ (transcript is not None)):
+        raise ValueError("Either FASTA or transcript must be specified.")
 
-    logger.info(f"Crawler running for {transcript_id}")
+    if transcript is not None:
+        transcript = transcript.split(".")[0]
+        try:
+            row = dataset.ensembl.filter(
+                pl.col("transcript_id" if transcript.startswith("ENS") else "transcript_name") == transcript
+            ).to_dicts()[0]
+        except IndexError:
+            raise ValueError(f"Transcript {transcript} not found in ensembl.")
 
-    if realign or not (output / f"{transcript_name}_all.parquet").exists():
-        seq = dataset.gencode.get_seq(transcript_id, masked=True)
-        crawled = crawler(seq, prefix=f"{gene}_{transcript_id}")
+        gene, transcript_id, transcript_name = row["gene_name"], row["transcript_id"], row["transcript_name"]
+        # need to be gene_name, not id, because of genes on scaffold assemblies
+        tss_gencode = set(dataset.gencode.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
+        tss_allofgene = set(dataset.ensembl.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
+        if not len(tss_gencode):
+            logger.warning(f"Transcript {transcript_id} not found in GENCODE basic.")
+
+        logger.info(f"Crawler running for {transcript_id}")
+
+    else:
+        tss_gencode = tss_allofgene = set()
+        gene, seq = next(pyfastx.Fastx(fasta))
+        transcript_id = transcript_name = gene
+
+    gene: str
+    transcript_id: str
+    transcript_name: str
+
+    if realign or not (output / f"{transcript_name}_bowtie.parquet").exists():
+        seq = dataset.gencode.get_seq(transcript_id, masked=True) if fasta is None else seq
+        crawled = crawler(seq, prefix=f"{gene if fasta is None else ''}_{transcript_id}")
         if len(crawled) < 50:
             raise Exception(f"Transcript {transcript_id} has only {len(crawled)} probes.")
         if len(crawled) < 100:
@@ -165,11 +191,11 @@ def _run_transcript(
 
         y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
         y.write_parquet(output / f"{transcript_name}_all.parquet")
-        offtargets.write_parquet(output / f"{transcript_name}_offtargets.parquet")
+        offtargets.write_parquet(output / f"{transcript_name}_bowtie.parquet")
     else:
         logger.warning(f"{transcript_name} reading from cache.")
         y = SAMFrame.read_parquet(output / f"{transcript_name}_all.parquet")
-        offtargets = pl.read_parquet(output / f"{transcript_name}_offtargets.parquet")
+        offtargets = pl.read_parquet(output / f"{transcript_name}_bowtie.parquet")
 
     # Print most common offtargets
     logger.info(
@@ -183,9 +209,15 @@ def _run_transcript(
         )
     )
 
-    tss_pseudo, pseudo_name = (
-        get_pseudogenes(gene, dataset.ensembl, y) if allow_pseudo else (pl.Series(), pl.Series())
+    tss_pseudo, counts = (
+        get_pseudogenes(gene, dataset.ensembl, y, limit=pseudogene_limit)
+        if pseudogene_limit
+        else (pl.Series(), pl.DataFrame())
     )
+
+    if len(bad_sig := counts.filter(~pl.col("acceptable") & pl.col("significant"))):
+        bad_sig.write_csv(output / f"{transcript_name}_offtarget_counts.csv")
+
     # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
     tss_others = {*tss_pseudo, *allow} - set(disallow)
 
@@ -248,24 +280,35 @@ def _run_transcript(
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--gene", "-g", type=str, required=False, help="Gene name")
 @click.option("--transcript", "-t", type=str, required=False, help="Transcript id")
+@click.option("--fasta", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--output", "-o", type=click.Path(), default="output/")
 @click.option("--ignore-revcomp", "-r", is_flag=True)
 @click.option("--realign", is_flag=True)
+@click.option("--pseudogene-limit", type=int, default=-1)
+@click.option("--allow", type=str, multiple=True, help="Don't filter out probes that bind to these genes")
+@click.option("--disallow", type=str, multiple=True, help="DO filter out probes that bind to these genes")
 def candidates(
     path: str,
-    gene: str,
-    transcript: str,
-    output: str,
-    ignore_revcomp: bool,
+    gene: str | None,
+    transcript: str | None,
+    fasta: Path | None,
+    output: str | Path = "output/",
+    ignore_revcomp: bool = True,
     realign: bool = False,
+    allow: list[str] | None = None,
+    disallow: list[str] | None = None,
+    pseudogene_limit: int = -1,
 ):
     """Initial screening of probes candidates for a gene."""
     get_candidates(
         Dataset(path),
         gene=gene,
         transcript=transcript,
+        fasta=fasta,
         output=output,
-        allow_pseudo=True,
         ignore_revcomp=ignore_revcomp,
         realign=realign,
+        allow=allow,
+        disallow=disallow,
+        pseudogene_limit=pseudogene_limit,
     )

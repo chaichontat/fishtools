@@ -46,15 +46,18 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int]):
 
     pairs = cast(
         Iterable[tuple[int, int]],
-        cycle(permutations(idxs, 2)) if len(idxs) > 1 else cycle([idxs[0], idxs[0]]),
+        cycle(permutations(idxs, 2)) if len(idxs) > 1 else cycle([(idxs[0], idxs[0])]),
     )
 
     out = dict(name=[], seq=[], code1=[], code2=[])
 
     for (name, seq), codes in zip(seq_encoding[["name", "seq"]].iter_rows(), pairs):
-        for sep in ["TTT", "TAA", "TAT", "TTA", "ATT", "ATA"]:
+        for sep in ["TAA", "TAT", "TTA", "ATT", "ATA"]:
+            stitched = stitch(seq, codes, sep=sep)
+            if "AAAAA" in stitched or "TTTTT" in stitched:
+                continue
             out["name"].append(f"{name};{sep}")
-            out["seq"].append(stitch(seq, codes, sep=sep))
+            out["seq"].append(stitched)
             out["code1"].append(codes[0])
             out["code2"].append(codes[1])
 
@@ -63,16 +66,18 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int]):
 
 def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss: list[str]):
     sam = _run_bowtie(dataset, constructed, ignore_revcomp=True)[0]
-
-    return (
+    df = (
         sam.agg_tm_offtarget(acceptable_tss)
         .filter(
             pl.col("max_tm_offtarget").lt(42)
             & ~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x)))
         )
+        .drop("seq")
+        .join(constructed, on="name")
         .with_columns(name=pl.col("name").str.split(";").list.first())
-        .unique("name")
+        .unique("name")[["name", "code1", "code2", "seq"]]
     )
+    return df
 
 
 # %%
@@ -123,13 +128,17 @@ def construct(
     screened = pl.read_parquet(
         f"output/{gene}_screened_ol{overlap}.parquet" if overlap else f"output/{gene}_screened.parquet"
     )
-    acceptable_tss = pl.read_csv(next(output_path.glob(f"{gene}*_acceptable_tss.csv")))[
+    acceptable_tss = pl.read_csv(next(output_path.glob(f"{gene}-*_acceptable_tss.csv")))[
         "transcript_id"
     ].to_list()
     cons = construct_encoding(screened, codebook[gene])
 
-    res = check_offtargets(dataset, cons, acceptable_tss=acceptable_tss)[["name"]].join(screened, on="name")
+    res = check_offtargets(dataset, cons, acceptable_tss=acceptable_tss).join(
+        screened.drop("seq"), on="name", how="left"
+    )
+    logger.info(f"Constructed {len(res)} probes for {gene}.")
     res.write_parquet(output_path / f"{gene}_final.parquet")
+    logger.info(f"Written to {output_path / f'{gene}_final.parquet'}")
     return res
 
 

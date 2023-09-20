@@ -248,6 +248,12 @@ class SAMFrame(pl.DataFrame):
             )
         )
 
+        if not len(out):
+            logger.critical(
+                "No transcripts found during aggregate. Most likely due to wrong acceptable_tss. Aborting."
+            )
+            raise ValueError
+
         return out
 
     @classmethod

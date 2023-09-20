@@ -24,7 +24,7 @@ def _screen(
     data_dir = Path(data_dir)
 
     try:
-        ff = SAMFrame(pl.read_parquet(next(data_dir.glob(f"{gene}*_crawled.parquet"))))
+        ff = SAMFrame(pl.read_parquet(next(data_dir.glob(f"{gene}-*_crawled.parquet"))))
     except StopIteration:
         logger.critical(f"No crawled data found for {gene}. Aborting.")
         raise Exception
@@ -36,11 +36,9 @@ def _screen(
         )
 
     if restriction:
-        ff = ff.filter(
-            pl.col("seq").apply(
-                lambda x: any(Restriction.RestrictionBatch(restriction).search(Seq(x)).values())
-            )
-        )
+        logger.info(f"Filtering for probes w/o {', '.join(restriction)} site(s).")
+        res = Restriction.RestrictionBatch(restriction)
+        ff = ff.filter(~pl.col("seq").apply(lambda x: any(res.search(Seq(x)).values())))
 
     final = the_filter(ff, overlap=overlap)
 
@@ -93,7 +91,9 @@ def run_screen(
 
         res = {}
         for i in range(0, maxoverlap + 1, 5):
-            res[i] = (final := _screen(data_dir, gene, fpkm_path=fpkm_path, overlap=i))
+            res[i] = (
+                final := _screen(data_dir, gene, fpkm_path=fpkm_path, overlap=i, restriction=restriction)
+            )
             if len(final) >= minimum:
                 logger.info(f"Overlap {i} results in {len(final)} probes. Stopping.")
                 return res
