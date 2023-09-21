@@ -1,9 +1,9 @@
 # %%
 import json
 import re
-from itertools import cycle, permutations
+from itertools import chain, cycle, permutations
 from pathlib import Path
-from typing import Final, Iterable, Sequence, cast
+from typing import Collection, Final, Iterable, Sequence, cast
 
 import click
 import polars as pl
@@ -18,15 +18,18 @@ READOUTS: Final[dict[int, str]] = {
 
 
 def assign_overlap(
-    output: Path | str, gene: str, *, min_probes: int = 64, target_probes: int = 72, max_overlap: int = 20
+    output: Path | str,
+    gene: str,
+    *,
+    target_probes: int = 72,
+    max_overlap: int = 20,
+    restriction: str = "",
 ) -> int:
     if max_overlap % 5 != 0 or max_overlap < 0:
         raise ValueError("max_overlap must be a multiple of 5")
     output = Path(output)
-    for ol in range(0, max_overlap + 1, 5):
-        df = pl.read_parquet(
-            f"output/{gene}_screened_ol{ol}.parquet" if ol else f"output/{gene}_screened.parquet"
-        )
+    for ol in chain((-2,), range(5, max_overlap + 1, 5)):
+        df = pl.read_parquet(output / f"{gene}_screened_ol{ol}{restriction}.parquet")
         if len(df) >= target_probes:
             return ol
 
@@ -92,53 +95,60 @@ def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss
 @click.argument("output_path", type=click.Path(dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--gene", "-g", type=str)
 @click.option("--codebook", "-c", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
-@click.option("--target_probes", "-N", type=int, help="Maximum number of probes per gene", default=64)
-@click.option("--min_probes", "-n", type=int, help="Minimum number of probes per gene", default=48)
+@click.option("--target_probes", "-N", type=int, help="Maximum number of probes per gene", default=72)
+@click.option("--restriction", multiple=True, type=str, help="Restriction enzymes to use")
 # fmt: on
 def _click_construct(
     path: Path,
     output_path: Path,
     gene: str,
     codebook: Path,
-    target_probes: int = 64,
-    min_probes: int = 48,
+    target_probes: int = 72,
+    restriction: list[str] | str | None = None,
 ):
-    res = construct(
+    construct(
         Dataset(path),
         output_path,
-        gene=gene,
+        transcript=gene,
         codebook=json.loads(codebook.read_text()),
         target_probes=target_probes,
-        min_probes=min_probes,
+        restriction=restriction,
     )
-    res.write_parquet(output_path / f"{gene}_final.parquet")
 
 
 def construct(
     dataset: Dataset,
     output_path: Path | str,
     *,
-    gene: str,
+    transcript: str,
     codebook: dict[str, list[int]],
-    min_probes: int = 48,
     target_probes: int = 64,
+    restriction: list[str] | str | None = None,
 ):
     output_path = Path(output_path)
-    overlap = assign_overlap(output_path, gene, min_probes=min_probes, target_probes=target_probes)
+
+    if isinstance(restriction, Collection):
+        restriction = "_" + "".join(restriction)
+    restriction = restriction or ""
+
+    overlap = assign_overlap(output_path, transcript, target_probes=target_probes, restriction=restriction)
     screened = pl.read_parquet(
-        f"output/{gene}_screened_ol{overlap}.parquet" if overlap else f"output/{gene}_screened.parquet"
+        scr_path := output_path / f"{transcript}_screened_ol{overlap}{restriction}.parquet"
     )
-    acceptable_tss = pl.read_csv(next(output_path.glob(f"{gene}-*_acceptable_tss.csv")))[
+    logger.debug(f"Using {scr_path} for {transcript}.")
+
+    assert not screened["seq"].str.contains("N").any()
+    acceptable_tss = pl.read_csv(next(output_path.glob(f"{transcript}_acceptable_tss.csv")))[
         "transcript_id"
     ].to_list()
-    cons = construct_encoding(screened, codebook[gene])
+    cons = construct_encoding(screened, codebook[transcript])
 
     res = check_offtargets(dataset, cons, acceptable_tss=acceptable_tss).join(
         screened.drop("seq"), on="name", how="left"
     )
-    logger.info(f"Constructed {len(res)} probes for {gene}.")
-    res.write_parquet(output_path / f"{gene}_final.parquet")
-    logger.info(f"Written to {output_path / f'{gene}_final.parquet'}")
+    logger.info(f"Constructed {len(res)} probes for {transcript}.")
+    res.write_parquet(output_path / f"{transcript}_final{restriction}.parquet")
+    logger.info(f"Written to {output_path / f'{transcript}_final{restriction}.parquet'}")
     return res
 
 

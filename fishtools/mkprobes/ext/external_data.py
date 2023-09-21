@@ -86,6 +86,22 @@ class ExternalData:
         eid = eid.split(".")[0]
         return self.gtf.filter(pl.col("gene_id") == eid)[0, "transcript_id"]
 
+    def batch_convert(self, val: list[str], src: str, dst: str):
+        res = pl.DataFrame({src: val}).join(self.gtf, on=src, how="left")[dst]
+        if not len(res):
+            raise ValueError(f"Could not find {val} in {src}")
+        if len(res) != len(val):
+            raise ValueError("Mapping not bijective.")
+        return res
+
+    def convert(self, val: str, *, src: str, dst: str) -> str:
+        res = self.gtf.filter(pl.col(src) == val)[dst]
+        if not len(res):
+            raise ValueError(f"Could not find {val} in {src}")
+        if len(res) > 1:
+            raise ValueError(f"Found multiple {val} in {src}")
+        return res[0]
+
     @cache
     def get_transcripts(self, gene: str | None = None, *, eid: str | None = None) -> pl.Series:
         if gene is not None:

@@ -37,7 +37,6 @@ def handle_overlap(
             on="index",
         )
     ddf = ddf.collect()
-    ddf.write_parquet(f"output/{gene}_filtered.parquet")
     df = ddf.filter(pl.col("priority") > 0)
 
     selected_global = set()

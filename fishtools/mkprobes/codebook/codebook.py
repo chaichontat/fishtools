@@ -14,8 +14,7 @@ class CodebookPicker:
         mhd4: npt.NDArray[np.bool_] | str | Path,
         genes: list[str],
         subset: tuple[int, int] | None = None,
-        counts_existing: npt.NDArray[Any] | None = None,
-        code_existing: npt.NDArray[np.bool_] | None = None,
+        existing: npt.NDArray[np.bool_] | None = None,
     ) -> None:
         if isinstance(mhd4, str | Path):
             mhd4 = np.loadtxt(mhd4, delimiter=",", dtype=bool)
@@ -26,30 +25,38 @@ class CodebookPicker:
 
         self.genes = genes
         self.subset = subset
+        self.existing = existing
 
-        if (counts_existing is not None) ^ (code_existing is not None):
-            raise ValueError("Either both counts and code must be provided or neither")
+        if self.existing is not None:
+            self.existing = np.hstack(
+                [
+                    self.existing,
+                    np.zeros(
+                        (self.existing.shape[0], self.mhd4.shape[1] - self.existing.shape[1]), dtype=bool
+                    ),
+                ]
+            )
+            assert self.existing.shape[1] == self.mhd4.shape[1]
+            assert np.all(self.existing.sum(axis=1) == 4)
+            self.mhd4 = np.array(
+                list({tuple(row) for row in self.mhd4} - {tuple(row) for row in self.existing})
+            )
 
-        self.code_existing = (
-            np.zeros((0, self.mhd4.shape[1]), dtype=bool) if code_existing is None else code_existing
-        )
-        assert self.code_existing.shape[1] == self.mhd4.shape[1]
-        self.used_code = {tuple(row) for row in self.code_existing}
-        if code_existing is not None and counts_existing is not None:
-            self.counts_existing = np.percentile(counts_existing @ code_existing, 99.99, axis=0)
-        else:
-            self.counts_existing = None
+        # if code_existing is not None and counts_existing is not None:
+        #     self.counts_existing = np.percentile(counts_existing @ code_existing, 99.99, axis=0)
+        # else:
+        #     self.counts_existing = None
 
-        self.r_ = (
-            np.r_[0 : self.subset[0], self.subset[1] : self.mhd4.shape[1]]
-            if self.subset is not None
-            else None
-        )
+        # self.r_ = (
+        #     np.r_[0 : self.subset[0], self.subset[1] : self.mhd4.shape[1]]
+        #     if self.subset is not None
+        #     else None
+        # )
 
     def gen_codebook(self, seed: int):
         rand = np.random.RandomState(seed)
-        mhd4 = self.mhd4[self.mhd4[:, self.r_].sum(axis=1) == 0] if self.subset is not None else self.mhd4
-        rmhd4 = np.array(list({tuple(row) for row in mhd4} - self.used_code))
+        # mhd4 = self.mhd4[self.mhd4[:, self.r_].sum(axis=1) == 0] if self.subset is not None else self.mhd4
+        rmhd4 = self.mhd4.copy()
         rand.shuffle(rmhd4)
         return rmhd4
 

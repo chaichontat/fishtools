@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import cast
 
@@ -50,7 +51,7 @@ def get_pseudogenes(
 
     if len(not_acceptable):
         logger.warning(f"More than 10% of candidates of {gene} bind to other genes.")
-        print(not_acceptable[:100])
+        print(not_acceptable[:50])
 
     # Filter based on expression and number of probes aligned.
     return counts.filter(pl.col("significant") & pl.col("acceptable"))[:limit]["transcript"], counts
@@ -59,7 +60,6 @@ def get_pseudogenes(
 def get_candidates(
     dataset: Dataset,
     gene: str | None = None,
-    transcript: str | None = None,
     fasta: Path | str | None = None,
     output: str | Path = "output/",
     *,
@@ -69,11 +69,10 @@ def get_candidates(
     disallow: list[str] | None = None,
     pseudogene_limit: int = -1,
 ):
-    if not ((gene is not None) ^ (transcript is not None) ^ (fasta is not None)):
-        raise ValueError("Either gene or transcript or FASTA must be specified.")
+    if not ((gene is not None) ^ (fasta is not None)):
+        raise ValueError("Either gene or FASTA must be specified.")
 
-    if transcript is None and fasta is None:
-        assert gene is not None
+    if fasta is None and gene and not (re.search(r"\-2\d\d", gene) or "ENSMUST" in gene or "ENST" in gene):
         # fmt: off
         transcript = get_transcripts(dataset, gene, mode="canonical")[0, "transcript_id"]
         appris = get_transcripts(dataset, gene, mode="appris")
@@ -83,8 +82,9 @@ def get_candidates(
             transcript = appris[0, "transcript_id"]
 
         logger.info(f"Chosen transcript: {transcript}")
+    else:
+        transcript = gene
 
-    assert transcript is not None
     _run_transcript(
         dataset=dataset,
         transcript=transcript,
@@ -108,7 +108,7 @@ def _run_bowtie(
         dataset.path / "txome",
         seed_length=12,
         threshold=16,
-        n_return=-1,
+        n_return=200,
         fasta=True,
         no_reverse=ignore_revcomp,
     )
@@ -182,8 +182,18 @@ def _run_transcript(
     transcript_name: str
 
     if realign or not (output / f"{transcript_name}_bowtie.parquet").exists():
-        seq = dataset.gencode.get_seq(transcript_id, masked=True) if fasta is None else seq
-        crawled = crawler(seq, prefix=f"{gene if fasta is None else ''}_{transcript_id}")
+        seq = dataset.gencode.get_seq(transcript_id) if fasta is None else seq
+        if len(seq) < 1500:
+            logger.warning(
+                f"Transcript {transcript_name} is only {len(seq)}bp long. There may not be enough probes."
+            )
+        else:
+            logger.info(f"{transcript_name}: {len(seq)}bp")
+
+        crawled = crawler(seq, prefix=f"{gene if fasta is None else ''}_{transcript_id}", formamide=formamide)
+        if len(crawled) > 5000:
+            logger.warning(f"Transcript {transcript_id} has {len(crawled)} probes. Using only 2000.")
+            crawled = crawled.sample(n=2000, shuffle=True, seed=3)
         if len(crawled) < 50:
             raise Exception(f"Transcript {transcript_id} has only {len(crawled)} probes.")
         if len(crawled) < 100:
@@ -252,7 +262,7 @@ def _run_transcript(
         )
 
     ff = SAMFrame(
-        ff.agg_tm_offtarget(tss_allacceptable)
+        ff.agg_tm_offtarget(tss_allacceptable, formamide=formamide)
         .with_columns(
             transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
             **PROBE_CRITERIA,
@@ -272,6 +282,7 @@ def _run_transcript(
     )
     logger.info(f"Generated {len(ff)} candidates.")
 
+    assert not ff["seq"].str.contains("N").any()
     ff.write_parquet(output / f"{transcript_name}_crawled.parquet")
     return ff
 
@@ -279,7 +290,6 @@ def _run_transcript(
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--gene", "-g", type=str, required=False, help="Gene name")
-@click.option("--transcript", "-t", type=str, required=False, help="Transcript id")
 @click.option("--fasta", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--output", "-o", type=click.Path(), default="output/")
 @click.option("--ignore-revcomp", "-r", is_flag=True)
@@ -290,7 +300,6 @@ def _run_transcript(
 def candidates(
     path: str,
     gene: str | None,
-    transcript: str | None,
     fasta: Path | None,
     output: str | Path = "output/",
     ignore_revcomp: bool = True,
@@ -303,7 +312,6 @@ def candidates(
     get_candidates(
         Dataset(path),
         gene=gene,
-        transcript=transcript,
         fasta=fasta,
         output=output,
         ignore_revcomp=ignore_revcomp,

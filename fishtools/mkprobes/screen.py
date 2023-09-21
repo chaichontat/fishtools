@@ -1,4 +1,6 @@
+import re
 import sys
+from itertools import chain
 from pathlib import Path
 from typing import overload
 
@@ -15,19 +17,24 @@ sys.setrecursionlimit(5000)
 
 
 def _screen(
-    data_dir: str | Path,
+    output_dir: str | Path,
     gene: str,
     fpkm_path: str | Path | None = None,
     overlap: int = -2,
     restriction: list[str] | None = None,
 ):
-    data_dir = Path(data_dir)
+    output_dir = Path(output_dir)
 
-    try:
-        ff = SAMFrame(pl.read_parquet(next(data_dir.glob(f"{gene}-*_crawled.parquet"))))
-    except StopIteration:
-        logger.critical(f"No crawled data found for {gene}. Aborting.")
-        raise Exception
+    # if re.search("-2\d\d", gene) is None:  # not transcript
+    #     try:
+    #         path = next(output_dir.glob(f"{gene}-_crawled.parquet"))
+    #         gene = path.name.split("_crawled")[0]
+    #         ff = SAMFrame(pl.read_parquet(path))
+    #     except StopIteration:
+    #         logger.critical(f"No crawled data found for {gene}. Aborting.")
+    #         raise Exception
+    # else:
+    ff = SAMFrame(pl.read_parquet(output_dir / f"{gene}_crawled.parquet"))
 
     if fpkm_path is not None:
         fpkm = pl.read_parquet(fpkm_path)
@@ -41,58 +48,81 @@ def _screen(
         ff = ff.filter(~pl.col("seq").apply(lambda x: any(res.search(Seq(x)).values())))
 
     final = the_filter(ff, overlap=overlap)
-
+    assert not final["seq"].str.contains("N").any(), "N appears out of nowhere."
     final.write_parquet(
-        data_dir / f"{gene}_screened_ol{overlap}.parquet"
-        if overlap > 0
-        else data_dir / f"{gene}_screened.parquet"
+        write_path := output_dir
+        / f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else '' }.parquet"
     )
+    logger.debug(f"Written to {write_path}.")
     return final
 
 
 @overload
 def run_screen(
-    data_dir: str,
+    output_dir: Path | str,
     gene: str,
     fpkm_path: Path | str | None = ...,
     overlap: int = ...,
     minimum: None = ...,
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
+    overwrite: bool = False,
 ) -> pl.DataFrame:
     ...
 
 
 @overload
 def run_screen(
-    data_dir: str,
+    output_dir: Path | str,
     gene: str,
     fpkm_path: Path | str | None = ...,
     overlap: int = ...,
     minimum: int = ...,
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
+    overwrite: bool = False,
 ) -> dict[int, pl.DataFrame]:
     ...
 
 
 def run_screen(
-    data_dir: str,
+    output_dir: Path | str,
     gene: str,
     fpkm_path: Path | str | None = None,
     overlap: int = -2,
     minimum: int | None = None,
     maxoverlap: int = 20,
     restriction: list[str] | None = None,
+    overwrite: bool = False,
 ) -> dict[int, pl.DataFrame] | pl.DataFrame:
+    output_dir = Path(output_dir)
+    if (
+        not overwrite
+        and (
+            output_dir
+            / (
+                file := f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else '' }.parquet"
+            )
+        ).exists()
+    ):
+        logger.warning(f"File {file} exists. Skipping.")
+        return pl.read_parquet(output_dir / file)
+
+    [
+        file.unlink()
+        for file in output_dir.glob(
+            f"{gene}_screened_ol*{'_' + ''.join(restriction) if restriction else '' }.parquet"
+        )
+    ]
+
     if minimum is not None:
         if maxoverlap % 5 != 0 or maxoverlap == 0:
             raise ValueError("maxoverlap must be positive non-zero and a multiple of 5")
 
         res = {}
-        for i in range(0, maxoverlap + 1, 5):
+        for i in chain((-2,), range(5, maxoverlap + 1, 5)):
             res[i] = (
-                final := _screen(data_dir, gene, fpkm_path=fpkm_path, overlap=i, restriction=restriction)
+                final := _screen(output_dir, gene, fpkm_path=fpkm_path, overlap=i, restriction=restriction)
             )
             if len(final) >= minimum:
                 logger.info(f"Overlap {i} results in {len(final)} probes. Stopping.")
@@ -101,7 +131,7 @@ def run_screen(
 
         return res
 
-    return _screen(data_dir, gene, fpkm_path=fpkm_path, overlap=overlap, restriction=restriction)
+    return _screen(output_dir, gene, fpkm_path=fpkm_path, overlap=overlap, restriction=restriction)
 
 
 @click.command()
@@ -120,6 +150,7 @@ def run_screen(
     "--maxoverlap", type=int, default=20, help="Maximum sequence overlap between probes if minimum is set."
 )
 @click.option("--restriction", type=str, multiple=True, help="Restriction enzymes to filter probes by.")
+@click.option("--overwrite", is_flag=True, help="Overwrite existing files.")
 def screen(
     data_dir: str,
     gene: str,
@@ -128,6 +159,7 @@ def screen(
     minimum: int | None = None,
     maxoverlap: int = 20,
     restriction: list[str] | None = None,
+    overwrite: bool = False,
 ):
     """Screening of probes candidates for a gene."""
     run_screen(
@@ -138,4 +170,5 @@ def screen(
         minimum=minimum,
         maxoverlap=maxoverlap,
         restriction=restriction,
+        overwrite=overwrite,
     )

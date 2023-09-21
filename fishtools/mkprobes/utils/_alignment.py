@@ -62,7 +62,7 @@ def run_bowtie(
     capture_stderr: bool = False,
     seed_length: int = 15,
     n_return: int = 100,
-    threads: int = 32,
+    threads: int = 16,
     threshold: int = 15,
     fasta: bool = False,
     no_reverse: bool = False,

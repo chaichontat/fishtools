@@ -1,4 +1,5 @@
 import polars as pl
+from loguru import logger
 
 from .seqcalc import Model, hp, tm
 from .sequtils import gc_content
@@ -37,6 +38,8 @@ def crawler(
         pl.DataFrame[[name: str, seq: str]]]
     """
 
+    fail_reasons = {"length": 0, "gc": 0, "tm_hi": 0, "hairpin": 0, "homopolymer": 0}
+
     end = length_limit[0]
     names = []
     seqs = []
@@ -54,6 +57,7 @@ def crawler(
                 end += 1
                 continue
             if end - start > length_limit[1] or end > len(seq):
+                fail_reasons["length"] += 1
                 break
             if (gc_content(seq[start:end]) < gc_limit[0]) or (gc_content(seq[start:end]) > gc_limit[1]):
                 end += 1
@@ -61,12 +65,26 @@ def crawler(
 
             curr_tm = tm(seq[start:end], model=tm_model, formamide=formamide)
             if curr_tm > tm_limit[1]:
+                fail_reasons["tm_hi"] += 1
                 break
 
             if curr_tm > tm_limit[0]:
-                if hp(seq[start:end], "rna", formamide=formamide) < hairpin_limit:
+                if (
+                    "N" not in seq[start:end]
+                    and hp(seq[start:end], "rna", formamide=formamide) < hairpin_limit
+                ):
                     names.append(f"{prefix}:{start}-{end-1}")
                     seqs.append(seq[start:end])
+                else:
+                    fail_reasons["hairpin"] += 1
                 break
             end += 1
-    return pl.DataFrame(dict(name=names, seq=seqs)).filter(~pl.col("seq").str.contains("|".join(to_avoid)))
+
+    df = pl.DataFrame(dict(name=names, seq=seqs))
+    ret = df.filter(~pl.col("seq").str.contains("|".join(to_avoid)))
+    assert not df["seq"].str.contains("N").any()
+    fail_reasons["homopolymer"] = len(df) - len(ret)
+
+    logger.debug(str(fail_reasons))
+
+    return ret
