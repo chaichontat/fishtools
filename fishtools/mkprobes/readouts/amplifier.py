@@ -8,9 +8,9 @@ from expression.collections import Seq
 from Levenshtein import distance
 from loguru import logger
 
-from fishtools.mkprobes.screen_utils._alignment import gen_bowtie_index, gen_fasta
 from fishtools.mkprobes.constants import DT, SP6
 from fishtools.mkprobes.definitions import Filter
+from fishtools.mkprobes.screen_utils._alignment import gen_bowtie_index, gen_fasta
 from fishtools.mkprobes.screen_utils.samframe import SAMFrame
 from fishtools.mkprobes.utils.seqcalc import hp, tm
 from fishtools.mkprobes.utils.sequtils import gc_content, reverse_complement
