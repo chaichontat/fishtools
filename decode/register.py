@@ -5,111 +5,129 @@ from typing import Any
 
 import itk
 import numpy as np
+import polars as pl
 import SimpleITK as sitk
 import tifffile
 from astropy.stats import sigma_clipped_stats
 from astropy.table.table import QTable
-from photutils.detection import DAOStarFinder, IRAFStarFinder, find_peaks
+from photutils.detection import IRAFStarFinder
 from scipy.ndimage import shift
 from scipy.spatial import cKDTree
 from tifffile import imread
 
+from fishtools.analysis.fiducial import align_fiducials
+
 # %%
-idx = 150
+
+idx = 3
+
+# %%
+n_z = 16
 imgs = {
     file.name: tifffile.imread(file)
-    for file in sorted(Path("/raid/data/raw/tricycle/").glob(f"*-{idx:03d}.tif"))
+    for file in sorted(Path("/raid/data/raw/tricyclecells2").glob(f"*-{idx:03d}.tif"))
+    if not file.name.startswith("dapi")
 }
-img = imgs[f"A_1_2-{idx:03d}.tif"]
-no_a = img[:-1].reshape(12, 3, 2048, 2048)[:, [1, 2], ...].reshape(-1, 2048, 2048)
-imgs[f"1_2-{idx:03d}.tif"] = np.concatenate([no_a, imgs[f"A_1_2-{idx:03d}.tif"][None, -1]], axis=0)
-del imgs[f"A_1_2-{idx:03d}.tif"]
-
-
-dark = imread("/raid/data/analysis/dark.tif")
-flat = (imread("/raid/data/analysis/flat_647.tif") - dark).astype(np.float32)
-flat /= np.min(flat)  # Prevents overflow
-for name in imgs:
-    img = imgs[name]
-    imgs[name] = ((img - dark).astype(np.float32) / flat).astype(np.uint16)
-
-fids = {k: v[-1] for k, v in imgs.items()}
-imgs = {k: v[:-1] for k, v in imgs.items()}
 keys = list(imgs.keys())
+nofids = {name: img[:-1].reshape(n_z, -1, 2048, 2048) for name, img in imgs.items()}
+fids = {name: img[-1] for name, img in imgs.items()}
+shifts = align_fiducials(fids, reference=r"A_1_2")
+del imgs
 # %%
-import pandas as pd
-
-
-def find_spots(data: np.ndarray[np.uint16, Any]) -> QTable:
-    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-    # return find_peaks(data, threshold=median + 10.0 * std, box_size=10)
-    daofind = IRAFStarFinder(threshold=5.0 * std, fwhm=3, exclude_border=True)
-    return daofind(data - median)  # [['xcentroid', 'ycentroid']].to_pandas()
-
-
-def calc_shift(ref: np.ndarray, img: np.ndarray):
-    return phase_cross_correlation(ref, img, upsample_factor=100)[0]
-
-
-# def export_elastix_csv(filename: str, img: np.ndarray[np.uint16, Any]) -> pd.DataFrame:
-#     y = find_spots(img)
-#     with open(filename, 'w') as f:
-#         f.write(f"point\n{len(y)}\n")
-#         y.to_csv(f, index=False, sep=" ", header=False)
-#     return y
+try:
+    nofids[f"1_2-{idx:03d}.tif"] = nofids[f"A_1_2-{idx:03d}.tif"][:, [1, 2], ...]
+    del nofids[f"A_1_2-{idx:03d}.tif"]
+except KeyError:
+    ...
+shifts[f"1_2-{idx:03d}.tif"] = shifts[f"A_1_2-{idx:03d}.tif"]
 
 
 # %%
+out = {k: shift(v[1, :], [0, *shifts[k]], order=1) for k, v in nofids.items()}
+# %%
 
-registration_method = sitk.ImageRegistrationMethod()
+tifffile.imwrite("comp.tif", np.concatenate(list(out.values())), compression=22610, imagej=True)
+# %%
+# %%
 
-# Similarity metric settings.
-registration_method.SetMetricAsMeanSquares()
-# registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-registration_method.SetMetricSamplingStrategy(registration_method.REGULAR)
-registration_method.SetMetricSamplingPercentage(0.01)
 
-registration_method.SetInterpolator(sitk.sitkLinear)
+# dark = imread("/raid/data/analysis/dark.tif")
+# flat = (imread("/raid/data/analysis/flat_647.tif") - dark).astype(np.float32)
+# flat /= np.min(flat)  # Prevents overflow
+# for name in imgs:
+#     img = imgs[name]
+#     imgs[name] = ((img - dark).astype(np.float32) / flat).astype(np.uint16)
 
-# Optimizer settings.
-# registration_method.SetOptimizerAsGradientDescent(
-#     learningRate=1.0, numberOfIterations=1000, convergenceMinimumValue=1e-6, convergenceWindowSize=10
-# )
-registration_method.SetOptimizerAsLBFGS2()
-# registration_method.SetOptimizerAsConjugateGradientLineSearch(learningRate=1.0, numberOfIterations=1000)
-registration_method.SetOptimizerScalesFromPhysicalShift()
+# fids = {k: v[-1] for k, v in imgs.items()}
+# imgs = {k: v[:-1] for k, v in imgs.items()}
+# keys = list(imgs.keys())
 
-# Setup for the multi-resolution framework.
-registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
-registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
-registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+# %%
 
+# %%
+
+# %%
+out = [fids[keys[0]]]
+for i, px in maps.items():
+    out.append(shift(fids[keys[i]], px, order=1))
+
+tifffile.imwrite("fids.tif", np.stack(out))
+# find_spots(fids[keys[0]])
+
+
+# %%
 img1 = sitk.Cast(sitk.GetImageFromArray(fids[keys[0]]), sitk.sitkFloat32)
-img2 = sitk.Cast(sitk.GetImageFromArray(fids[keys[8]]), sitk.sitkFloat32)
-
-# Don't optimize in-place, we would possibly like to run this cell multiple times.
-registration_method.SetInitialTransform(sitk.TranslationTransform(img1.GetDimension()), inPlace=False)
-
-
 fids_itk = []
 ts = []
 for i in range(1, len(keys)):
     img2 = sitk.Cast(sitk.GetImageFromArray(fids[keys[i]]), sitk.sitkFloat32)
+
+    registration_method = sitk.ImageRegistrationMethod()
+
+    # Similarity metric settings.
+    registration_method.SetMetricAsMeanSquares()
+    # registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    registration_method.SetMetricSamplingStrategy(registration_method.REGULAR)
+    registration_method.SetMetricSamplingPercentage(0.01)
+
+    registration_method.SetInterpolator(sitk.sitkLinear)
+
+    # Optimizer settings.
+    registration_method.SetOptimizerAsGradientDescent(
+        learningRate=1.0, numberOfIterations=1000, convergenceMinimumValue=1e-6, convergenceWindowSize=10
+    )
+    # registration_method.SetOptimizerAsLBFGS2()
+    # registration_method.SetOptimizerAsConjugateGradientLineSearch(learningRate=1.0, numberOfIterations=1000)
+    registration_method.SetOptimizerScalesFromPhysicalShift()
+
+    # Setup for the multi-resolution framework.
+    registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
+    registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
+    registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+
+    # Don't optimize in-place, we would possibly like to run this cell multiple times.
+    registration_method.SetInitialTransform(sitk.TranslationTransform(img1.GetDimension()), inPlace=False)
+
     final_transform = registration_method.Execute(img1, img2)
     ts.append(final_transform.GetParameters())
     print(i, ts[-1])
 
-    # resampler = sitk.ResampleImageFilter()
-    # resampler.SetReferenceImage(img1)
-    # resampler.SetInterpolator(sitk.sitkLinear)
-    # resampler.SetDefaultPixelValue(100)
-    # resampler.SetTransform(final_transform)
-    # print(final_transform)
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(img1)
+    resampler.SetInterpolator(sitk.sitkLinear)
+    resampler.SetDefaultPixelValue(100)
+    resampler.SetTransform(final_transform)
+    print(final_transform)
 
-    # out = resampler.Execute(img2)
-    # registered_array = sitk.GetArrayFromImage(out).astype(np.uint16)
-    # fids_itk.append(registered_array)
-    # assert registered_array.size
+    out = resampler.Execute(img2)
+    registered_array = sitk.GetArrayFromImage(out).astype(np.uint16)
+    fids_itk.append(registered_array)
+    assert registered_array.size
+
+
+import matplotlib.pyplot as plt
+
+plt.imshow(np.stack(fids_itk[:3], axis=-1)[500:1000, 500:1000] / fids_itk[0].max())
 
 # %%
 
@@ -125,7 +143,16 @@ for λ in [560, 750]:
     ats[λ] = t
 
 
-ref = sitk.Cast(sitk.GetImageFromArray(imgs[keys[0]].reshape(12, 2, 2048, 2048)[:, 0]), sitk.sitkFloat32)
+ref = sitk.Cast(sitk.GetImageFromArray(nofids[keys[0]][:, 0]), sitk.sitkFloat32)
+
+
+def resample(image, transform):
+    # Output image Origin, Spacing, Size, Direction are taken from the reference
+    # image in this call to Resample
+    reference_image = image
+    interpolator = sitk.sitkCosineWindowedSinc
+    default_value = 100.0
+    return sitk.Resample(image, reference_image, transform, interpolator, default_value)
 
 
 def st(img: np.ndarray[np.uint16, Any], transform: sitk.Transform):
@@ -135,49 +162,78 @@ def st(img: np.ndarray[np.uint16, Any], transform: sitk.Transform):
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(100)
     resampler.SetTransform(transform)
+
     return sitk.GetArrayFromImage(resampler.Execute(image)).astype(np.uint16)
 
 
-def run_image(key: str, img: np.ndarray[np.uint16, Any]):
+def run_image(key: str, img: np.ndarray[np.uint16, Any], shiftpx: np.ndarray):
+    if len(shiftpx) != 2:
+        raise ValueError
+
     translate = sitk.TranslationTransform(3)
-    tparam = ts[keys.index(key) - 1]
-    translate.SetParameters([*tparam, 0])
+    translate.SetParameters((shiftpx[1], shiftpx[0], 0.0))
 
     affine = sitk.AffineTransform(3)
     affine.SetMatrix(As[750].flatten())
-    affine.SetTranslation(ats[750])
-    affine.SetCenter([1023.5 + tparam[0], 1023.5 + tparam[1], 0])
+    affine.SetTranslation([*ats[750], 0])
+    affine.SetCenter([1023.5 + shiftpx[1], 1023.5 + shiftpx[0], 0])
 
-    composite = sitk.CompositeTransform(3)
-    composite.AddTransform(translate)
-    # composite.AddTransform(affine)
+    comp750 = sitk.CompositeTransform(3)
+    comp750.AddTransform(translate)
+    comp750.AddTransform(affine)
 
-    img = img.reshape(12, 2, 2048, 2048)
-    return {
-        int(key.split("-")[0].split("_")[0]): st(img[:, 0], translate),
-        int(key.split("-")[0].split("_")[1]): st(img[:, 1], composite),
-    }
+    if img.shape[1] == 2:
+        return {
+            int(key.split("-")[0].split("_")[0]): st(img[:, 0], translate),
+            int(key.split("-")[0].split("_")[1]): st(img[:, 1], comp750),
+        }
+
+    elif img.shape[1] == 3:
+        affine560 = sitk.AffineTransform(3)
+        affine560.SetMatrix(As[560].flatten())
+        affine560.SetTranslation([*ats[560], 0])
+        affine560.SetCenter([1023.5 + shiftpx[1], 1023.5 + shiftpx[0], 0])
+
+        comp560 = sitk.CompositeTransform(3)
+        comp560.AddTransform(translate)
+        comp560.AddTransform(affine560)
+        return {
+            int(key.split("-")[0].split("_")[0]): st(img[:, 0], comp560),
+            int(key.split("-")[0].split("_")[1]): st(img[:, 1], translate),
+            int(key.split("-")[0].split("_")[2]): st(img[:, 2], comp750),
+        }
+    else:
+        raise ValueError
 
 
-affine = sitk.AffineTransform(3)
-affine.SetMatrix(As[750].flatten())
-affine.SetTranslation(ats[750])
+# affine = sitk.AffineTransform(3)
+# affine.SetMatrix(As[750].flatten())
+# affine.SetTranslation(ats[750])
 
-transformed = {
-    int(keys[0].split("-")[0].split("_")[0]): imgs[keys[0]][:12],
-    int(keys[0].split("-")[0].split("_")[1]): st(imgs[keys[0]][12:], affine),
-}
-
-for i, (name, img) in enumerate(imgs.items()):
-    if i == 0:
-        continue
-    transformed |= (res := run_image(name, img))
+# transformed = {
+#     int(keys[0].split("-")[0].split("_")[0]): imgs[keys[0]][:12],
+#     int(keys[0].split("-")[0].split("_")[1]): st(imgs[keys[0]][12:], affine),
+# }
+transformed = {}
+for i, (name, img) in enumerate(nofids.items()):
+    # if name != "8_16_24-003.tif":
+    #     continue
+    transformed |= (res := run_image(name, img, -shifts[name]))
     print({k: np.mean(v) for k, v in res.items()})
+# %%
+import matplotlib.pyplot as plt
+
+u = np.stack(list(transformed.values()))[:, 1].swapaxes(0, 2)
+plt.imshow(u[500:650, 500:650, 5:8] / u[500:650, 500:650, 5:8].max(axis=(0, 1)))
+# %%
+
+img = out["8_16_24-003.tif"]
+plt.imshow(np.swapaxes(img, 0, 2)[500:650, 500:650] / img[:, 500:650, 500:650].max(axis=(1, 2)))
 
 # %%
 tifffile.imwrite(
-    "pls.tif",
-    np.stack([transformed[i][5:9].max(axis=0) for i in range(1, 25)]),
+    "cells.tif",
+    np.stack([transformed[i][1] for i in range(1, 25)]),
     compression=22610,
     imagej=True,
 )
@@ -187,24 +243,27 @@ tifffile.imwrite(
 
 # def show_registration(img1, img2):
 
+# fids_itk = [fids[keys[0]]]
+# fid_ref = sitk.Cast(sitk.GetImageFromArray(fids_itk[-1]), sitk.sitkFloat32)
+# for i in range(1, len(keys)):
+#     img2 = sitk.Cast(sitk.GetImageFromArray(fids[keys[i]]), sitk.sitkFloat32)
+#     final_transform = registration_method.Execute(img1, img2)
+#     resampler = sitk.ResampleImageFilter()
+#     resampler.SetReferenceImage(fid_ref)
 
-fids_itk = [fids[keys[0]]]
-for i in range(1, len(keys)):
-    img2 = sitk.Cast(sitk.GetImageFromArray(fids[keys[i]]), sitk.sitkFloat32)
-    final_transform = registration_method.Execute(img1, img2)
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(ref)
+#     resampler.SetTransform(final_transform)
+#     print(final_transform)
 
-    resampler.SetTransform(final_transform)
-    print(final_transform)
-
-    out = resampler.Execute(img2)
-    registered_array = sitk.GetArrayFromImage(out).astype(np.uint16)
-    fids_itk.append(registered_array)
-    print(i)
+#     out = resampler.Execute(img2)
+#     registered_array = sitk.GetArrayFromImage(out).astype(np.uint16)
+#     fids_itk.append(registered_array)
+#     print(i)
 
 
 tifffile.imwrite("fids.tif", np.stack(fids_itk), compression=22610, imagej=True)
+
+# %%
+
 
 # %%
 
