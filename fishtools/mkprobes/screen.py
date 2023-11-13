@@ -45,7 +45,7 @@ def _screen(
     if restriction:
         logger.info(f"Filtering for probes w/o {', '.join(restriction)} site(s).")
         res = Restriction.RestrictionBatch(restriction)
-        ff = ff.filter(~pl.col("seq").apply(lambda x: any(res.search(Seq(x)).values())))
+        ff = ff.filter(~pl.col("seq").apply(lambda x: any(res.search(Seq("NNNNNN" + x + "NNNNNN")).values())))
 
     final = the_filter(ff, overlap=overlap)
     assert not final["seq"].str.contains("N").any(), "N appears out of nowhere."
@@ -53,6 +53,7 @@ def _screen(
         write_path := output_dir
         / f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else '' }.parquet"
     )
+
     logger.debug(f"Written to {write_path}.")
     return final
 

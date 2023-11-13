@@ -9,8 +9,10 @@ import click
 import polars as pl
 from loguru import logger
 
+from fishtools import rc
 from fishtools.mkprobes.candidates import _run_bowtie
 from fishtools.mkprobes.ext.external_data import Dataset
+from fishtools.mkprobes.starmap.starmap import split_probe
 
 READOUTS: Final[dict[int, str]] = {
     x["id"]: x["seq"] for x in pl.read_csv(Path(__file__).parent / "readout_ref_filtered.csv").to_dicts()
@@ -21,9 +23,9 @@ def assign_overlap(
     output: Path | str,
     gene: str,
     *,
-    target_probes: int = 72,
-    max_overlap: int = 20,
-    restriction: str = "",
+    target_probes: int = 16,
+    max_overlap: int = 5,
+    restriction: str = "BsaI",
 ) -> int:
     if max_overlap % 5 != 0 or max_overlap < 0:
         raise ValueError("max_overlap must be a multiple of 5")
@@ -40,45 +42,56 @@ def assign_overlap(
 
 
 def stitch(seq: str, codes: Sequence[int], sep: str = "TT") -> str:
-    return READOUTS[codes[0]] + sep + seq + sep + READOUTS[codes[1]]
+    return sep.join(rc(READOUTS[c]) for c in codes[:-1]) + seq + rc(READOUTS[codes[-1]])
 
 
-def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int]):
+def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = 3):
+    if len(idxs) != n:
+        raise ValueError(f"Invalid number of readouts: {idxs}")
     if any(idx not in READOUTS for idx in idxs):
         raise ValueError(f"Invalid readout indices: {idxs}")
 
     pairs = cast(
         Iterable[tuple[int, int]],
-        cycle(permutations(idxs, 2)) if len(idxs) > 1 else cycle([(idxs[0], idxs[0])]),
+        cycle(permutations(idxs, n)) if len(idxs) > 1 else cycle([[idxs[0], idxs[0]] * n]),
     )
 
-    out = dict(name=[], seq=[], code1=[], code2=[])
+    out = dict(name=[], seq=[], spacer=[])
+    for n in range(1, n + 1):
+        out[f"code{n}"] = []
 
-    for (name, seq), codes in zip(seq_encoding[["name", "seq"]].iter_rows(), pairs):
-        for sep in ["TAA", "TAT", "TTA", "ATT", "ATA"]:
-            stitched = stitch(seq, codes, sep=sep)
-            if "AAAAA" in stitched or "TTTTT" in stitched:
-                continue
-            out["name"].append(f"{name};{sep}")
-            out["seq"].append(stitched)
-            out["code1"].append(codes[0])
-            out["code2"].append(codes[1])
+    for name, pad, padstart in seq_encoding[["name", "padlock", "padstart"]].iter_rows():
+        for codes, _ in zip(pairs, range(4)):
+            assert padstart > 17
+            # spacer = rc(seqori)[padstart - 3 : padstart]
+            # if spacer == "CCC" or spacer == "GGG":
+            #     spacer = "CAT"
+            for sep in ["TA", "AA", "AT", "AA"]:
+                stitched = stitch(pad, codes, sep=sep)
+                if "AAAAA" in stitched or "TTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
+                    continue
+                out["name"].append(f"{name};;{sep}{','.join(map(str,codes))}")
+                out["spacer"].append("")
+                out["seq"].append(stitched)
+                for n, code in enumerate(codes):
+                    out[f"code{n+1}"].append(code)
 
     return pl.DataFrame(out)
 
 
 def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss: list[str]):
     sam = _run_bowtie(dataset, constructed, ignore_revcomp=True)[0]
+    acc = sam.agg_tm_offtarget(acceptable_tss)
     df = (
-        sam.agg_tm_offtarget(acceptable_tss)
-        .filter(
-            pl.col("max_tm_offtarget").lt(42)
+        acc.filter(
+            pl.col("max_tm_offtarget").lt(37)
             & ~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x)))
         )
         .drop("seq")
-        .join(constructed, on="name")
-        .with_columns(name=pl.col("name").str.split(";").list.first())
-        .unique("name")[["name", "code1", "code2", "seq"]]
+        .join(constructed, on="name", suffix="padlock", how="inner")
+        .with_columns(name=pl.col("name").str.split(";;").list.first())
+        .sort("match", descending=True)
+        .unique("name", keep="first", maintain_order=True)
     )
     return df
 
@@ -126,10 +139,15 @@ def construct(
     restriction: list[str] | str | None = None,
 ):
     output_path = Path(output_path)
-
     if isinstance(restriction, Collection):
         restriction = "_" + "".join(restriction)
     restriction = restriction or ""
+
+    # if (final_path := Path(output_path / f"{transcript}_final{restriction}.parquet")).exists() and set(
+    #     pl.read_parquet(final_path)[["code1", "code2"]].to_numpy().flatten()
+    # ) != set(codebook[transcript]):
+    #     logger.critical(f"Codebook for {transcript} has changed.")
+    # exit(1)
 
     overlap = assign_overlap(output_path, transcript, target_probes=target_probes, restriction=restriction)
     screened = pl.read_parquet(
@@ -141,12 +159,25 @@ def construct(
     acceptable_tss = pl.read_csv(next(output_path.glob(f"{transcript}_acceptable_tss.csv")))[
         "transcript_id"
     ].to_list()
-    cons = construct_encoding(screened, codebook[transcript])
 
-    res = check_offtargets(dataset, cons, acceptable_tss=acceptable_tss).join(
-        screened.drop("seq"), on="name", how="left"
+    screened = (
+        screened.with_columns(splitted=pl.col("seq").apply(lambda x: split_probe(rc(x), 58)))
+        .with_columns(
+            splint=pl.col("splitted").list.get(0).apply(rc, return_dtype=pl.Utf8),
+            padlock=pl.col("splitted").list.get(1).apply(rc, return_dtype=pl.Utf8),
+            padstart=pl.col("splitted").list.get(2).cast(pl.Int16),
+        )
+        .drop("splitted")
+        .filter(pl.col("padstart") > 0)
     )
+
+    cons = construct_encoding(screened, codebook[transcript])
+    res = check_offtargets(dataset, cons, acceptable_tss=acceptable_tss).join(
+        screened.rename(dict(seq="seqori")), on="name", how="left"
+    )
+
     logger.info(f"Constructed {len(res)} probes for {transcript}.")
+    assert res["seq"].is_not_null().all()
     res.write_parquet(output_path / f"{transcript}_final{restriction}.parquet")
     logger.info(f"Written to {output_path / f'{transcript}_final{restriction}.parquet'}")
     return res

@@ -6,9 +6,9 @@ import colorama
 import numpy as np
 import numpy.typing as npt
 import polars as pl
+from Bio.Seq import Seq
 from matplotlib.axes import Axes
 
-table = str.maketrans("ACGTacgt ", "TGCAtgca ")
 name_splitter = re.compile(r"(.+)_(.+):(\d+)-(\d+)")
 
 c = re.compile(r"(\d+)S(\d+)M")
@@ -47,7 +47,7 @@ def printc(seq: str):
 def reverse_complement(seq: str) -> str:
     """Return the reverse complement of a DNA sequence."""
     # https://bioinformatics.stackexchange.com/a/3585
-    return seq.translate(table)[::-1]
+    return Seq(seq).reverse_complement().__str__()
 
 
 def pcr(seq: str, primer: str, primer_rc: str) -> str:

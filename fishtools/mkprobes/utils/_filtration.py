@@ -40,8 +40,8 @@ def handle_overlap(
     df = ddf.filter(pl.col("priority") > 0)
 
     selected_global = set()
-    tss = df["transcript_ori"].unique().to_list()
-    assert len(tss) == 1
+    # tss = df["transcript_ori"].unique().to_list()
+    # assert len(tss) == 1, df
 
     # for ts in tss:
     logger.info(f"Number of candidates that match any filter: {len(df)}/{len(ddf)}")
@@ -88,11 +88,11 @@ def the_filter(df: pl.DataFrame, overlap: int = -1) -> pl.DataFrame:
         df,
         criteria=[
             # fmt: off
-            (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 3) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 4) & (pl.col("hp") < 35) & pl.col("max_tm_offtarget").lt(35) & pl.col("length").lt(42),
-            (pl.col("oks") > 3) & (pl.col("hp") < 40) & pl.col("max_tm_offtarget").lt(42),
-            (pl.col("oks") > 2) & (pl.col("hp") < 40) & pl.col("max_tm_offtarget").lt(42),
+            (pl.col("oks") > 4) & (pl.col("hp") < 32) & pl.col("max_tm_offtarget").lt(30) & pl.col("length").lt(55) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+            (pl.col("oks") > 3) & (pl.col("hp") < 32) & pl.col("max_tm_offtarget").lt(30) & pl.col("length").lt(55) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+            (pl.col("oks") > 4) & (pl.col("hp") < 32) & pl.col("max_tm_offtarget").lt(30) & pl.col("length").lt(55),
+            (pl.col("oks") > 3) & (pl.col("hp") < 37) & pl.col("max_tm_offtarget").lt(34),
+            (pl.col("oks") > 2) & (pl.col("hp") < 37) & pl.col("max_tm_offtarget").lt(34),
             # fmt: on
         ],
         overlap=overlap,

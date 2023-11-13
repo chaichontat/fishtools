@@ -51,12 +51,6 @@ def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
     download_gtf_fasta(path / species, species)
     with ThreadPoolExecutor() as exc:
         exc.submit(run_jellyfish, path / species)
-        exc.submit(
-            run_repeatmasker,
-            path / species / "cdna_ncrna_trna.fasta",
-            species=dict(human="homo sapiens", mouse="mus musculus")[species],
-            threads=threads,
-        )
         exc.submit(bowtie_build, path / species / "cdna_ncrna_trna.fasta", "txome")
     Dataset(path / species)  # test all components
 

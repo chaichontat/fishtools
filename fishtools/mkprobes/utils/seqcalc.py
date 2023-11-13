@@ -1,8 +1,10 @@
+# %%
 import io
 import re
 from functools import cache
 from typing import Literal, TypedDict
 
+import numpy as np
 import polars as pl
 import primer3
 from Bio.Seq import Seq
@@ -12,6 +14,7 @@ from typing_extensions import NotRequired, Unpack
 from fishtools.mkprobes.utils._pairwise import pairwise_alignment
 from fishtools.mkprobes.utils.sequtils import gc_content
 
+# https://www.biorxiv.org/content/10.1101/2022.11.25.517909v1
 deltas = pl.read_csv(
     io.StringIO(
         """
@@ -85,7 +88,19 @@ def tm_q5(seq: str, /, **kwargs: Unpack[Conditions]) -> float:
 
 
 def tm(seq: str, model: Model, formamide: float = 0, **kwargs: Unpack[Conditions]) -> float:
-    return mt.Tm_NN(Seq(seq), **(CONDITIONS[model] | kwargs)) + formamide_correction(seq, fmd=formamide)
+    return (
+        mt.Tm_NN(Seq(seq), **(CONDITIONS[model] | kwargs), saltcorr=5 if model == "dna" else 0)
+        + formamide_correction(seq, fmd=formamide)
+        + (rna_salt_corr((CONDITIONS[model] | kwargs)["Na"], gc_content(seq)) if model != "dna" else 0)
+    )
+
+
+def rna_salt_corr(salt: float, gc: float) -> float:
+    # Correction from 1 M.
+    # gc is [0, 1].
+    # https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3859436/
+    salt /= 1000
+    return (-1.842 * gc + 2.675) * np.log(salt) - 0.7348 * np.log(salt) ** 2
 
 
 biopython_to_primer3 = {
@@ -114,3 +129,6 @@ def tm_pairwise(
         return max(tm(seq[slice(*x.span())], model=model, formamide=formamide) for x in r.finditer(p[1]))
     except ValueError:
         return 0
+
+
+# %%

@@ -98,11 +98,7 @@ def get_candidates(
     )
 
 
-def _run_bowtie(
-    dataset: Dataset,
-    seqs: pl.DataFrame,
-    ignore_revcomp: bool = False,
-):
+def _run_bowtie(dataset: Dataset, seqs: pl.DataFrame, ignore_revcomp: bool = False, **kwargs):
     y = SAMFrame.from_bowtie_split_name(
         gen_fasta(seqs["seq"], names=seqs["name"]).getvalue(),
         dataset.path / "txome",
@@ -111,6 +107,7 @@ def _run_bowtie(
         n_return=200,
         fasta=True,
         no_reverse=ignore_revcomp,
+        **kwargs,
     )
 
     return (
@@ -194,7 +191,7 @@ def _run_transcript(
         if len(crawled) > 5000:
             logger.warning(f"Transcript {transcript_id} has {len(crawled)} probes. Using only 2000.")
             crawled = crawled.sample(n=2000, shuffle=True, seed=3)
-        if len(crawled) < 50:
+        if len(crawled) < 5:
             raise Exception(f"Transcript {transcript_id} has only {len(crawled)} probes.")
         if len(crawled) < 100:
             logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
