@@ -139,7 +139,7 @@ def _run_transcript(
     realign: bool = False,
     allow: list[str] | None = None,
     disallow: list[str] | None = None,
-    formamide: int = 45,
+    formamide: int = 40,
     pseudogene_limit: int = -1,
 ):
     allow, disallow = allow or [], disallow or []
@@ -267,8 +267,8 @@ def _run_transcript(
         .with_columns(
             [
                 (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-                pl.col("seq").apply(lambda s: tm(cast(str, s), "rna", formamide=formamide)).alias("tm"),
-                pl.col("seq").apply(lambda s: hp(cast(str, s), "rna", formamide=formamide)).alias("hp"),
+                pl.col("seq").apply(lambda s: tm(cast(str, s), "hybrid", formamide=formamide)).alias("tm"),
+                pl.col("seq").apply(lambda s: hp(cast(str, s), "hybrid", formamide=formamide)).alias("hp"),
             ]
         )
         .with_columns(oks=pl.sum(pl.col("^ok_.*$")))

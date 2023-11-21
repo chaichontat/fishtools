@@ -1,4 +1,7 @@
-from itertools import combinations, cycle
+from dataclasses import dataclass
+
+import polars as pl
+import primer3
 
 from fishtools import rc, tm
 
@@ -33,6 +36,32 @@ def split_probe(seq: str, target_tm: float) -> tuple[str, str, str] | None:
                     return first, last, str(i + offset)  # bc of polars datatype
 
     return "", "", str(-1)
+
+
+def pad(s: str, target: int = 89):
+    assert len(s) <= target
+    return s + "ATAGTTATAT"[: target - len(s)]
+
+
+def gen_rotate(dfs: pl.DataFrame):
+    res = dfs.with_columns(
+        rotated=pl.col("seq")
+        .apply(rc)
+        .apply(pad)
+        .apply(lambda x: rotate(x, 20 - 6 - 3), return_dtype=pl.Utf8)
+    ).with_columns(
+        splint_="TGTTGATGAGGTGTTGATGAT"
+        + "AA"
+        + pl.col("splint").apply(rc)
+        + "ATA"  # mismatch
+        + pl.col("rotated").str.slice(0, 6).apply(rc)
+        + pl.col("rotated").str.slice(-6, 6).apply(rc)
+    )
+
+    # uyu = res["splint_"].apply(lambda x: BsaI.catalyze(Seq.Seq(x)))
+    # uyu.filter(uyu.list.lengths() != 1)
+
+    assert (res["splint_"].apply(lambda x: BsaI.search(Seq.Seq(x))).list.lengths() == 0).all()
 
 
 # def gen_3splint(
@@ -100,4 +129,40 @@ def split_probe(seq: str, target_tm: float) -> tuple[str, str, str] | None:
 #     return [s[0] for s in res], [s[1] for s in res]
 
 
-# def gen_phiamp():
+@dataclass
+class STARPrimers:
+    header: str
+    bsa_hang: str
+    footer: str
+    is_splint: bool = False
+
+    @staticmethod
+    def check_primer(seq: str):
+        if not primer3.calc_homodimer_tm(seq) < 40:
+            raise ValueError(primer3.calc_homodimer_tm(seq))
+        if not primer3.calc_hairpin_tm(seq) < 40:
+            raise ValueError(primer3.calc_hairpin_tm(seq))
+
+    def __post_init__(self):
+        if not len(self.bsa_hang) == 1:
+            raise ValueError(f"BsaI overhang must be 1 nt long. Got {self.bsa_hang}.")
+        if not len(self.footer) == 5:
+            raise ValueError(f"Footer must be 5 nt long. Got {self.footer}.")
+        self.check_primer(self.header)
+
+    def make_header(self):
+        return self.header + "GGTCTC" + self.bsa_hang
+
+    def gen_cleave1(self):
+        return (
+            ("DDDDDDDD" if not self.is_splint else "CATCAACA")
+            + rc(self.bsa_hang)
+            + rc("GGTCTC")
+            + rc(self.header)[:4]
+        )
+
+    def make_footer(self):
+        return self.footer + "GAGACC" + "ATTATCCCTATAGTGAG"
+
+    def gen_cleave2(self):
+        return rc(self.make_footer())[-(10 + 5) :] + ("HHHHH" if self.is_splint else "DDDDD")

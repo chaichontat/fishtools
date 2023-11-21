@@ -3,7 +3,7 @@ import json
 import re
 from itertools import chain, cycle, permutations
 from pathlib import Path
-from typing import Collection, Final, Iterable, Sequence, cast
+from typing import Callable, Collection, Final, Iterable, Sequence, cast
 
 import click
 import polars as pl
@@ -45,27 +45,23 @@ def stitch(seq: str, codes: Sequence[int], sep: str = "TT") -> str:
     return sep.join(rc(READOUTS[c]) for c in codes[:-1]) + seq + rc(READOUTS[codes[-1]])
 
 
-def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = 3):
+def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = -1):
+    if n == -1:
+        n = len(idxs)
     if len(idxs) != n:
         raise ValueError(f"Invalid number of readouts: {idxs}")
     if any(idx not in READOUTS for idx in idxs):
         raise ValueError(f"Invalid readout indices: {idxs}")
 
-    pairs = cast(
-        Iterable[tuple[int, int]],
-        cycle(permutations(idxs, n)) if len(idxs) > 1 else cycle([[idxs[0], idxs[0]] * n]),
-    )
+    pairs = cast(Iterable[tuple[int, int]], cycle(permutations(idxs, n)))
 
     out = dict(name=[], seq=[], spacer=[])
-    for n in range(1, n + 1):
-        out[f"code{n}"] = []
+    for i in range(n):
+        out[f"code{i+1}"] = []
 
     for name, pad, padstart in seq_encoding[["name", "padlock", "padstart"]].iter_rows():
         for codes, _ in zip(pairs, range(4)):
             assert padstart > 17
-            # spacer = rc(seqori)[padstart - 3 : padstart]
-            # if spacer == "CCC" or spacer == "GGG":
-            #     spacer = "CAT"
             for sep in ["TA", "AA", "AT", "AA"]:
                 stitched = stitch(pad, codes, sep=sep)
                 if "AAAAA" in stitched or "TTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
@@ -73,8 +69,8 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = 3):
                 out["name"].append(f"{name};;{sep}{','.join(map(str,codes))}")
                 out["spacer"].append("")
                 out["seq"].append(stitched)
-                for n, code in enumerate(codes):
-                    out[f"code{n+1}"].append(code)
+                for i, code in enumerate(codes):
+                    out[f"code{i+1}"].append(code)
 
     return pl.DataFrame(out)
 
@@ -95,9 +91,6 @@ def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss
     )
     return df
 
-
-# %%
-# import json
 
 # %%
 
@@ -137,6 +130,7 @@ def construct(
     codebook: dict[str, list[int]],
     target_probes: int = 64,
     restriction: list[str] | str | None = None,
+    construction_function: Callable | None = None,
 ):
     output_path = Path(output_path)
     if isinstance(restriction, Collection):

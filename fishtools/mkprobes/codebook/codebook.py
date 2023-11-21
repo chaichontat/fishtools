@@ -91,7 +91,7 @@ class CodebookPicker:
         return int(best), self._calc_entropy(int(best), fpkm)[1]
 
     def export_codebook(
-        self, seed: int, type: Literal["csv", "json"] = "json"
+        self, seed: int, type: Literal["csv", "json"] = "json", offset: int = 1
     ) -> pl.DataFrame | dict[str, list[int]]:
         rmhd4 = self.gen_codebook(seed)
         n_blanks = self.mhd4.shape[0] - len(self.genes)
@@ -106,7 +106,8 @@ class CodebookPicker:
                 )
             case "json":
                 return {
-                    gene: list(np.flatnonzero(code) + 1) for gene, code in zip(self.genes, rmhd4.astype(int))
+                    gene: list(np.flatnonzero(code) + offset)
+                    for gene, code in zip(self.genes, rmhd4.astype(int))
                 }
             case _:  # type: ignore
                 raise ValueError(f"Unknown type {type}")

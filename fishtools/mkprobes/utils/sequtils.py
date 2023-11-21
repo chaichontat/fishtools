@@ -60,6 +60,40 @@ def pcr(seq: str, primer: str, primer_rc: str) -> str:
     return seq[loc : None if loc_rc == 0 else -loc_rc]
 
 
+def is_subsequence(sub_dna: str):
+    iupac_dict = {
+        "R": "[AG]",
+        "Y": "[CT]",
+        "S": "[GC]",
+        "W": "[AT]",
+        "K": "[GT]",
+        "M": "[AC]",
+        "B": "[CGT]",
+        "D": "[AGT]",
+        "H": "[ACT]",
+        "V": "[ACG]",
+        "N": "[ACGT]",
+    }
+
+    # Convert sub_dna to regex
+    sub_dna_regex = ""
+    for base in sub_dna:
+        if base in iupac_dict:
+            sub_dna_regex += iupac_dict[base]
+        else:
+            sub_dna_regex += base
+
+    # Check if sub_dna is in main_dna
+    sub_dna_regex = re.compile(sub_dna_regex)
+
+    def inner(main_dna: str):
+        if match := sub_dna_regex.search(main_dna):
+            return match.span()
+        return None
+
+    return inner
+
+
 def gen_random_base(n: int) -> str:
     """Generate a random DNA sequence of length n."""
     return "".join(random.choices("ACGT", k=n))

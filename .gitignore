@@ -164,4 +164,4 @@ data/
 temp/
 output/
 *.gz
-output_synapse/
+**/output/
