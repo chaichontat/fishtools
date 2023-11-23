@@ -8,7 +8,7 @@ from .sequtils import gc_content
 def crawler(
     seq: str,
     prefix: str,
-    length_limit: tuple[int, int] = (40, 60),
+    length_limit: tuple[int, int] = (45, 52),
     gc_limit: tuple[float, float] = (0.3, 0.7),
     tm_limit: tuple[float, float] = (54, 65),
     hairpin_limit: float = 45,

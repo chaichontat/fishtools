@@ -10,12 +10,17 @@ def rotate(s: str, r: int):
     return s[r:] + s[:r]
 
 
-def test_splint_padlock(splint: str, padlock: str, length: int = 6):
+def test_splint_padlock(splint: str, padlock: str, lengths: tuple[int, int] = (6, 6)):
     # if not len(splint) & 1 == 0:
     #     raise ValueError("Splint must be even length")
     # mid = len(splint) // 2
-    splint = splint[-(length * 2) :]
-    return rc(splint[:length]) == padlock[:length] and rc(splint[length:]) == padlock[-length:]
+    splint, padlock = splint.upper(), padlock.upper()
+    start, end = lengths
+
+    splint = splint[-(start + end) :]
+    ok_start = rc(splint[:start]) == padlock[:start]
+    ok_end = rc(splint[start:]) == padlock[-end:]
+    return ok_start and ok_end
 
 
 def split_probe(seq: str, target_tm: float) -> tuple[str, str, str] | None:

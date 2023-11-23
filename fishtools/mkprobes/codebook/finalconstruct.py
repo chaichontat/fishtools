@@ -42,7 +42,8 @@ def assign_overlap(
 
 
 def stitch(seq: str, codes: Sequence[int], sep: str = "TT") -> str:
-    return sep.join(rc(READOUTS[c]) for c in codes[:-1]) + seq + rc(READOUTS[codes[-1]])
+    # A is to prevent the formation of restriction sites.
+    return sep.join(rc(READOUTS[c]).lower() for c in codes) + "A" + seq
 
 
 def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = -1):

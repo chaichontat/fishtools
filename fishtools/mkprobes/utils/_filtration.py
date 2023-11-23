@@ -83,16 +83,18 @@ def handle_overlap(
     return df.filter(pl.col("index").is_in(selected_global))
 
 
-def the_filter(df: pl.DataFrame, overlap: int = -1) -> pl.DataFrame:
+def the_filter(
+    df: pl.DataFrame, overlap: int = -1, max_tm_offtarget: float = 40, max_hp: float = 45
+) -> pl.DataFrame:
     return handle_overlap(
         df,
         criteria=[
             # fmt: off
-            (pl.col("oks") > 4) & (pl.col("hp") < 32) & pl.col("max_tm_offtarget").lt(30) & pl.col("length").lt(55) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 3) & (pl.col("hp") < 32) & pl.col("max_tm_offtarget").lt(30) & pl.col("length").lt(55) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 4) & (pl.col("hp") < 32) & pl.col("max_tm_offtarget").lt(30) & pl.col("length").lt(55),
-            (pl.col("oks") > 3) & (pl.col("hp") < 37) & pl.col("max_tm_offtarget").lt(34),
-            (pl.col("oks") > 2) & (pl.col("hp") < 37) & pl.col("max_tm_offtarget").lt(34),
+            (pl.col("oks") > 4) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget) & pl.col("length").lt(55) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+            (pl.col("oks") > 3) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget) & pl.col("length").lt(55) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+            (pl.col("oks") > 3) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget) & pl.col("length").lt(55),
+            (pl.col("oks") > 3) & (pl.col("hp") < max_hp + 5) & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
+            (pl.col("oks") > 2) & (pl.col("hp") < max_hp + 5) & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
             # fmt: on
         ],
         overlap=overlap,
