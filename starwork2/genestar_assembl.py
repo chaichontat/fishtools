@@ -12,7 +12,7 @@ import primer3
 from Bio import Seq
 from Bio.Restriction import BamHI, KpnI, RestrictionBatch
 
-from fishtools import gen_fasta, rc, tm
+from fishtools import gen_fasta, hp, rc, tm
 from fishtools.mkprobes.codebook.codebook import CodebookPicker
 from fishtools.mkprobes.codebook.finalconstruct import assign_overlap
 from fishtools.mkprobes.ext.external_data import Dataset
@@ -82,7 +82,7 @@ def rotate(s: str, r: int):
 def pad(s: str, target: int = 97):
     if len(s) > target:
         return s
-    return s + "ACTCACCTAT"[: target - len(s)]
+    return s + "ACTCACCTAC"[: target - len(s)]
 
 
 def backfill(seq: str, target: int = 137):
@@ -102,14 +102,45 @@ def until_first_g(seq: str, target: str = "G"):
 # assert (res["splint"].apply(rc).apply(lambda x: BsaI.search(Seq.Seq(x))).list.lengths() == 0).all()
 # First must be C for KpnI.
 # Last must be G for BamHI.
-res = dfs.with_columns(rotated=(("CAGCCCTAA" + pl.col("seq").apply(rc)).apply(pad) + "G")).with_columns(
-    splint_="C"
-    + "TGTTGATGAGGTGTTGATGAT"
-    + "AA"
-    + pl.col("splint").apply(rc)
-    + "ATA"  # mismatch
-    + pl.col("rotated").str.slice(0, 6).apply(rc)
-    + pl.col("rotated").apply(until_first_g).str.to_lowercase()
+
+
+def generate_head_splint(padlock: str, rand: np.random.Generator):
+    # Minimize the amount of secondary structures.
+    # Must start with C.
+    test = "TAA" + rc(padlock)
+    base_hp = hp(test, "dna")
+    while True:
+        cand = "C" + "".join(rand.choice(["A", "T", "C"], p=[0.125, 0.125, 0.75], size=5))
+        if "CCCC" in cand:
+            continue
+        if hp(cand + test, "dna") > base_hp + 3:
+            continue
+        break
+    assert len(cand) == 6
+    return cand
+
+
+rand = np.random.default_rng(0)
+
+res = (
+    dfs.with_columns(
+        rotated=(
+            pl.col("padlock").apply(lambda x: generate_head_splint(x, rand)).str.to_lowercase()
+            + "taa"
+            + pl.col("seq").apply(rc)
+        ).apply(pad)
+        + "G"
+    )
+    .with_columns(
+        splint_end=pl.col("rotated").apply(until_first_g).str.to_lowercase(),
+        splint_="C"
+        # + "TGTTGATGAGGTGTTGATGAT"
+        # + "AA"
+        + pl.col("splint").apply(rc) + "TAA" + pl.col("rotated").str.slice(0, 6).apply(rc),  # mismatch
+    )
+    .with_columns(
+        splint_=pl.col("splint_") + pl.col("splint_end"),
+    )
 )
 
 
@@ -129,9 +160,7 @@ def double_digest(s: str) -> str:
 # %%
 pl.Config.set_fmt_str_lengths(100)
 
-res = res.with_columns(splint_end_length=pl.col("splint_").apply(lambda s: len(re.findall(r"[a-z]+", s)[-1])))
-
-for s, r, ll in zip(res["splint_"], res["rotated"], res["splint_end_length"]):
+for s, r, ll in zip(res["splint_"], res["rotated"], res["splint_end"].str.lengths()):
     assert test_splint_padlock(s, r, lengths=(6, ll)), (s, r)
 
 out = res.with_columns(
@@ -140,7 +169,7 @@ out = res.with_columns(
     splintcons=hf["splint"][0][:-1].lower() + pl.col("splint_") + hf["splint"][1][1:],
 ).with_columns(splintcons=pl.col("splintcons").apply(backfill))
 
-for s, r, ll in zip(out["splintcons"], out["padlockcons"], out["splint_end_length"]):
+for s, r, ll in zip(out["splintcons"], out["padlockcons"], out["splint_end"].str.lengths()):
     assert test_splint_padlock(*map(double_digest, (s, r)), lengths=(6, ll)), (s, r, ll)
 # %%
 

@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import polars as pl
 import primer3
 
-from fishtools import rc, tm
+from fishtools import hp, rc, tm
 
 
 def rotate(s: str, r: int):
@@ -38,7 +38,9 @@ def split_probe(seq: str, target_tm: float) -> tuple[str, str, str] | None:
 
                 if tm(last := seq[i + offset : i + offset + j], "hybrid") - 5 > target_tm:
                     assert len(last) > 0
-                    return first, last, str(i + offset)  # bc of polars datatype
+                    if hp(first, "dna") < target_tm and hp(last, "dna") < target_tm:
+                        # bc of polars datatype
+                        return first, last, str(i + offset)
 
     return "", "", str(-1)
 
