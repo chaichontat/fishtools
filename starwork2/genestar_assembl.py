@@ -52,6 +52,7 @@ tss = Path("starwork2/genestar.tss.txt").read_text().splitlines()
 
 # %%
 
+
 # ols = {}
 
 # ols[ts] = assign_overlap("starwork/output", ts, restriction="_BamHIKpnI")
@@ -136,17 +137,32 @@ res = dfs.with_columns(
     + "G"
 )
 # %%
-res = res.with_columns(
-    splint_end=pl.col("rotated").apply(until_first_g).str.to_lowercase(),
-    # mismatch
-).with_columns(
-    splint_="CTTT"
-    # + "TGTTGATGAGGTGTTGATGAT"
-    # + "AA"
-    + pl.col("splint").apply(rc)
-    + "TA"
-    + pl.col("rotated").str.slice(0, 6).apply(rc)
-    + pl.col("splint_end"),
+from itertools import cycle, islice
+
+it = cycle("ATAAT")
+
+
+def splint_pad(seq: str, target: int = 45):
+    if len(seq) > target - 1:
+        return "C" + seq
+    return "C" + "".join(islice(it, target - len(seq) - 1)) + seq
+
+
+res = (
+    res.with_columns(
+        splint_end=pl.col("rotated").apply(until_first_g).str.to_lowercase(),
+        # mismatch
+    )
+    .with_columns(
+        splint_=
+        # + "TGTTGATGAGGTGTTGATGAT"
+        # + "AA"
+        pl.col("splint").apply(rc)
+        + "TA"
+        + pl.col("rotated").str.slice(0, 6).apply(rc)
+        + pl.col("splint_end"),
+    )
+    .with_columns(splint_=pl.col("splint_").apply(splint_pad))
 )
 # %%
 
