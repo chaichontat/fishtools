@@ -90,7 +90,7 @@ class ExternalData:
             raise ValueError("Mapping not bijective.")
         return res
 
-    def convert(self, val: str, *, src: str, dst: str) -> str:
+    def convert(self, val: str, src: str, dst: str) -> str:
         res = self.gtf.filter(pl.col(src) == val)[dst]
         if not len(res):
             raise ValueError(f"Could not find {val} in {src}")
@@ -106,6 +106,9 @@ class ExternalData:
 
     @cache
     def get_seq(self, eid: str) -> str:
+        if "-" in eid:
+            eid = self.convert(eid, "transcript_name", "transcript_id")
+
         res = self.fa[eid.split(".")[0]].seq
         if not res:
             raise ValueError(f"Could not find {eid}")
@@ -233,7 +236,7 @@ class Dataset:
         # fmt: off
         return (
             # any(x in self.kmerset for x in kmers(seq, 18))
-            any(x in self.trna_rna_kmers for x in kmers(seq, 15))
+            any(x in self.trna_rna_kmers for x in kmers(seq, 18))
         )
         # fmt: on
 

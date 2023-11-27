@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import polars as pl
 import primer3
+from loguru import logger
 
 from fishtools import hp, rc, tm
 
@@ -26,19 +27,23 @@ def test_splint_padlock(splint: str, padlock: str, lengths: tuple[int, int] = (6
 def split_probe(seq: str, target_tm: float) -> tuple[str, str, str] | None:
     first, last = "", ""
     i = 0
-    for start in range(5):
+    for start in range(8):
         for i in range(start + 18, start + 28):
             if tm(first := seq[start:i], "hybrid") - 5 > target_tm:
                 break
 
+        if hp(first, "dna") > target_tm:
+            # logger.debug("first hp exceeded")
+            continue
+
         for offset in reversed(range(3)):  # 2, 1, 0
-            for j in range(18, 28):
+            for j in range(18, 30):
                 if i + offset + j >= len(seq):
                     break
 
                 if tm(last := seq[i + offset : i + offset + j], "hybrid") - 5 > target_tm:
                     assert len(last) > 0
-                    if hp(first, "dna") < target_tm and hp(last, "dna") < target_tm:
+                    if (hpl := hp(last, "dna")) < target_tm + 2:
                         # bc of polars datatype
                         return first, last, str(i + offset)
 

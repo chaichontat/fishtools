@@ -109,16 +109,14 @@ def run_screen(
         logger.warning(f"File {file} exists. Skipping.")
         return pl.read_parquet(output_dir / file)
 
-    [
-        file.unlink()
-        for file in output_dir.glob(
-            f"{gene}_screened_ol*{'_' + ''.join(restriction) if restriction else '' }.parquet"
-        )
-    ]
+    for file in output_dir.glob(
+        f"{gene}_screened_ol*{'_' + ''.join(restriction) if restriction else '' }.parquet"
+    ):
+        file.unlink(missing_ok=True)
 
     if minimum is not None:
-        if maxoverlap % 5 != 0 or maxoverlap == 0:
-            raise ValueError("maxoverlap must be positive non-zero and a multiple of 5")
+        if maxoverlap % 5 != 0:
+            raise ValueError("maxoverlap must be multiple of 5")
 
         res = {}
         for i in chain((-2,), range(5, maxoverlap + 1, 5)):

@@ -52,14 +52,14 @@ tss = Path("starwork2/genestar.tss.txt").read_text().splitlines()
 
 # %%
 
-ols = {}
-# for ts in tss:
-# ols[ts] = assign_overlap("starwork/output", ts, restriction="_BsaI")
+# ols = {}
+
+# ols[ts] = assign_overlap("starwork/output", ts, restriction="_BamHIKpnI")
 dfs = pl.concat(
     [
         pl.read_parquet(f"starwork2/output/{ts}_final_BamHIKpnI.parquet")
-        .sample(shuffle=True, seed=4, fraction=1)
-        .sort("priority")[:15]
+        # .sample(shuffle=True, seed=4, fraction=1)
+        .sort(["priority", "hp"])[:30]
         for ts in tss
     ]
 )
@@ -79,7 +79,9 @@ def rotate(s: str, r: int):
     return s[r:] + s[:r]
 
 
-def pad(s: str, target: int = 97):
+def pad(s: str, target: int = 98):
+    if len(s) > target + 2:
+        raise ValueError("Too long")
     if len(s) > target:
         return s
     return s + "ACTCACCTAC"[: target - len(s)]
@@ -93,7 +95,7 @@ def until_first_g(seq: str, target: str = "G"):
     r, target = rc(seq.upper()), target.upper()
     res, truncated = r[:6], r[6:]
     res += "" if res[-1] == target else truncated[: truncated.index(target) + 1]
-    if len(res) > 10:
+    if len(res) > 12:
         raise ValueError("No G found")
     assert res[-1] == target
     return res
@@ -102,47 +104,51 @@ def until_first_g(seq: str, target: str = "G"):
 # assert (res["splint"].apply(rc).apply(lambda x: BsaI.search(Seq.Seq(x))).list.lengths() == 0).all()
 # First must be C for KpnI.
 # Last must be G for BamHI.
+# %%
 
 
 def generate_head_splint(padlock: str, rand: np.random.Generator):
     # Minimize the amount of secondary structures.
     # Must start with C.
     test = "TAA" + rc(padlock)
-    base_hp = hp(test, "dna")
-    while True:
-        cand = "C" + "".join(rand.choice(["A", "T", "C"], p=[0.125, 0.125, 0.75], size=5))
-        if "CCCC" in cand:
+    # base_hp = hp(test, "dna")
+    out = []
+    for _ in range(10):
+        cand = "CAC" + "".join(rand.choice(["A", "T", "C"], p=[0.125, 0.125, 0.75], size=3))
+        if "CCCCC" in cand:
             continue
-        if hp(cand + test, "dna") > base_hp + 3:
-            continue
-        break
+        out.append((cand, hp(cand + test, "dna")))
+
+    cand, hp_ = min(out, key=lambda x: x[1])
     assert len(cand) == 6
     return cand
 
 
 rand = np.random.default_rng(0)
 
-res = (
-    dfs.with_columns(
-        rotated=(
-            pl.col("padlock").apply(lambda x: generate_head_splint(x, rand)).str.to_lowercase()
-            + "taa"
-            + pl.col("seq").apply(rc)
-        ).apply(pad)
-        + "G"
-    )
-    .with_columns(
-        splint_end=pl.col("rotated").apply(until_first_g).str.to_lowercase(),
-        splint_="C"
-        # + "TGTTGATGAGGTGTTGATGAT"
-        # + "AA"
-        + pl.col("splint").apply(rc) + "TAA" + pl.col("rotated").str.slice(0, 6).apply(rc),  # mismatch
-    )
-    .with_columns(
-        splint_=pl.col("splint_") + pl.col("splint_end"),
-    )
+res = dfs.with_columns(
+    rotated=(
+        # head
+        pl.col("padlock").apply(lambda x: generate_head_splint(x, rand)).str.to_lowercase()
+        + "ta"
+        + pl.col("seq").apply(rc)
+    ).apply(pad)
+    + "G"
 )
-
+# %%
+res = res.with_columns(
+    splint_end=pl.col("rotated").apply(until_first_g).str.to_lowercase(),
+    # mismatch
+).with_columns(
+    splint_="CTTT"
+    # + "TGTTGATGAGGTGTTGATGAT"
+    # + "AA"
+    + pl.col("splint").apply(rc)
+    + "TA"
+    + pl.col("rotated").str.slice(0, 6).apply(rc)
+    + pl.col("splint_end"),
+)
+# %%
 
 # uyu = res["splint_"].apply(lambda x: BsaI.catalyze(Seq.Seq(x)))
 # uyu.filter(uyu.list.lengths() != 1)
@@ -181,7 +187,7 @@ for s, r, ll in zip(out["splintcons"], out["padlockcons"], out["splint_end"].str
 # )
 
 
-assert (out["splintcons"].str.lengths() == 137).all()
+assert (out["padlockcons"].str.lengths().is_between(139, 150)).all()
 # assert (out["padlockcons"].str.lengths() == 150).all()
 
 

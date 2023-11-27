@@ -7,6 +7,7 @@ from typing import Callable, Collection, Final, Iterable, Sequence, cast
 
 import click
 import polars as pl
+from Bio import Restriction, Seq
 from loguru import logger
 
 from fishtools import rc
@@ -42,8 +43,7 @@ def assign_overlap(
 
 
 def stitch(seq: str, codes: Sequence[int], sep: str = "TT") -> str:
-    # A is to prevent the formation of restriction sites.
-    return sep.join(rc(READOUTS[c]).lower() for c in codes) + "A" + seq
+    return sep.join(rc(READOUTS[c]).lower() for c in codes) + seq
 
 
 def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = -1):
@@ -54,24 +54,26 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = -1)
     if any(idx not in READOUTS for idx in idxs):
         raise ValueError(f"Invalid readout indices: {idxs}")
 
-    pairs = cast(Iterable[tuple[int, int]], cycle(permutations(idxs, n)))
+    perms = cast(Iterable[tuple[int, ...]], cycle(permutations(idxs, n)))
 
-    out = dict(name=[], seq=[], spacer=[])
+    out = dict(name=[], seq=[])
     for i in range(n):
         out[f"code{i+1}"] = []
 
     for name, pad, padstart in seq_encoding[["name", "padlock", "padstart"]].iter_rows():
-        for codes, _ in zip(pairs, range(4)):
-            assert padstart > 17
-            for sep in ["TA", "AA", "AT", "AA"]:
-                stitched = stitch(pad, codes, sep=sep)
-                if "AAAAA" in stitched or "TTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
-                    continue
-                out["name"].append(f"{name};;{sep}{','.join(map(str,codes))}")
-                out["spacer"].append("")
-                out["seq"].append(stitched)
-                for i, code in enumerate(codes):
-                    out[f"code{i+1}"].append(code)
+        # for codes, _ in zip(perms, range(4)):
+        assert padstart > 17
+        for sep, codes in zip(["AA", "TA", "AT", "TT"], perms):
+            stitched = stitch(pad, codes, sep=sep)
+            if "AAAAA" in stitched or "TTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
+                continue
+            if Restriction.BamHI.search(s_ := Seq.Seq(stitched)) or Restriction.KpnI.search(s_):
+                continue
+            out["name"].append(name)  # f"{name};;{sep}{','.join(map(str,codes))}")
+            out["seq"].append(stitched)
+            for i, code in enumerate(codes):
+                out[f"code{i+1}"].append(code)
+            break  # only one separator is needed. This is a split design.
 
     return pl.DataFrame(out)
 
@@ -79,17 +81,19 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = -1)
 def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss: list[str]):
     sam = _run_bowtie(dataset, constructed, ignore_revcomp=True)[0]
     acc = sam.agg_tm_offtarget(acceptable_tss)
+    logger.debug(acc)
     df = (
-        acc.filter(
-            pl.col("max_tm_offtarget").lt(37)
-            & ~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x)))
-        )
+        acc  # .filter(
+        # pl.col("max_tm_offtarget").lt(40)
+        #  ~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x)))
+        #
         .drop("seq")
         .join(constructed, on="name", suffix="padlock", how="inner")
         .with_columns(name=pl.col("name").str.split(";;").list.first())
         .sort("match", descending=True)
         .unique("name", keep="first", maintain_order=True)
     )
+    logger.info(f"Padlocks w/o offtarget: {len(df)}")
     return df
 
 
@@ -144,30 +148,39 @@ def construct(
     #     logger.critical(f"Codebook for {transcript} has changed.")
     # exit(1)
 
-    overlap = assign_overlap(output_path, transcript, target_probes=target_probes, restriction=restriction)
+    # assign_overlap(output_path, transcript, target_probes=target_probes, restriction=restriction)
+    overlap = -2
     screened = pl.read_parquet(
         scr_path := output_path / f"{transcript}_screened_ol{overlap}{restriction}.parquet"
     )
     logger.debug(f"Using {scr_path} for {transcript}.")
+    logger.debug(f"Screened probes: {len(screened)}")
 
     assert not screened["seq"].str.contains("N").any()
-    acceptable_tss = pl.read_csv(next(output_path.glob(f"{transcript}_acceptable_tss.csv")))[
-        "transcript_id"
-    ].to_list()
+    # acceptable_tss = pl.read_csv(next(output_path.glob(f"{transcript}_acceptable_tss.csv")))[
+    #     "transcript_id"
+    # ].to_list()
+    # mrna = dataset.ensembl.get_seq(transcript)
 
     screened = (
-        screened.with_columns(splitted=pl.col("seq").apply(lambda x: split_probe(rc(x), 58)))
+        screened.with_columns(splitted=pl.col("seq").apply(lambda pos: split_probe(pos, 58)))
+        # screened.with_columns(splitted=pl.col("pos").apply(lambda pos: split_probe(mrna[pos : pos + 70], 58)))
         .with_columns(
-            splint=pl.col("splitted").list.get(0).apply(rc, return_dtype=pl.Utf8),
-            padlock=pl.col("splitted").list.get(1).apply(rc, return_dtype=pl.Utf8),
+            splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
+            padlock=pl.col("splitted").list.get(0),
             padstart=pl.col("splitted").list.get(2).cast(pl.Int16),
-        )
-        .drop("splitted")
-        .filter(pl.col("padstart") > 0)
+        ).drop("splitted")
     )
 
-    cons = construct_encoding(screened, codebook[transcript])
-    res = check_offtargets(dataset, cons, acceptable_tss=acceptable_tss).join(
+    screened = screened.filter(
+        (pl.col("splint").str.lengths() > 0)
+        # & (pl.col("splint").apply(lambda x: hp(x, "dna")) < 50)
+        # & (pl.col("padlock").apply(lambda x: hp(x, "dna")) < 50)
+    )
+
+    logger.debug(f"With proper padstart: {len(screened)}")
+
+    res = construct_encoding(screened, codebook[transcript]).join(
         screened.rename(dict(seq="seqori")), on="name", how="left"
     )
 

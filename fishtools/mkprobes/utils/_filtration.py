@@ -95,6 +95,7 @@ def the_filter(
             (pl.col("oks") > 3) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget) & pl.col("length").lt(55),
             (pl.col("oks") > 3) & (pl.col("hp") < max_hp + 5) & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
             (pl.col("oks") > 2) & (pl.col("hp") < max_hp + 5) & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
+            (pl.col("oks") > 1) & (pl.col("hp") < max_hp + 5) & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
             # fmt: on
         ],
         overlap=overlap,
