@@ -135,7 +135,7 @@ def construct(
     codebook: dict[str, list[int]],
     target_probes: int = 64,
     restriction: list[str] | str | None = None,
-    construction_function: Callable | None = None,
+    construction_function: Callable[[pl.DataFrame, list[int]], pl.DataFrame] = construct_encoding,
 ):
     output_path = Path(output_path)
     if isinstance(restriction, Collection):
@@ -180,7 +180,7 @@ def construct(
 
     logger.debug(f"With proper padstart: {len(screened)}")
 
-    res = construct_encoding(screened, codebook[transcript]).join(
+    res = construction_function(screened, codebook[transcript]).join(
         screened.rename(dict(seq="seqori")), on="name", how="left"
     )
 
