@@ -2,8 +2,11 @@
 import json
 from pathlib import Path
 from subprocess import run
+from typing import Literal
 
+import click
 import polars as pl
+from loguru import logger
 
 from fishtools.mkprobes.codebook.codebook import CodebookPicker
 from fishtools.mkprobes.ext.external_data import Dataset
@@ -317,6 +320,7 @@ Tle4
 Satb2
 Dcx
 Gad1
+Cd24a
 Pvalb
 Gabrr2
 Hoxb6
@@ -383,60 +387,316 @@ Alyref
 Slc1a3
 Rgs16
 Nts
-Wnt4""".splitlines()
-tenx = pl.read_csv("static/10x.csv")
-# %%
-out = "starwork2/genestar.txt"
-Path(out).write_text("\n".join(res := sorted(list(set(tenx["Genes"]) | set(cs) | set(merfish[:120])))))
+Mef2c
+Unc5d
+Ldb2
+Sox5
+Nes
+Fn1
+Sall4
+Nr2f1
+Ephb1
+Wnt4
+Dll1
+Dll3
+Notch1
+Notch2
+Tgfbr1
+Irf6
+Smad2
+Smad3""".splitlines()
+# tenx = pl.read_csv("static/10x.csv")
 
-run(f"mkprobes chkgenes data/mouse {out}", shell=True, check=True)
 
-# %%
-ds = Dataset("data/mouse")
-corrected = Path(out).with_suffix(".converted.txt").read_text().splitlines()
-
-
-def parse(df: pl.DataFrame) -> pl.DataFrame:
-    if len(res := df.filter(pl.col("tag") == "Ensembl_canonical")):
-        return res[0, "transcript_name"]
-    return df.sort("annotation", descending=False)[0, "transcript_name"]
-
-
-tss = []
-for gene in corrected:
+@click.command()
+@click.argument("data", type=click.Path(exists=True, dir_okay=True, path_type=Path))
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, path_type=Path))
+@click.option("--existing", "-e", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--species", type=click.Choice(["mouse", "human"]), default="mouse")
+@logger.catch
+def main(data: Path, path: Path, existing: Path, species: Literal["mouse", "human"]):
+    if "converted" in path.name:
+        raise ValueError("Path should be to the original file")
+    # if not path.with_suffix(".converted.txt").exists():
+    path.with_suffix(".converted.txt").unlink(missing_ok=True)
+    run(f"mkprobes chkgenes {data} {path} --species {species}", shell=True, check=True)
+    ds = Dataset(data)
     try:
-        tss.append(parse(get_transcripts(ds, gene, mode="appris")))
-    except pl.ComputeError:
-        tss.append(parse(get_transcripts(ds, gene, mode="ensembl")))
-# %%
-Path(out).with_suffix(".tss.txt").write_text("\n".join(tss))
+        corrected = path.with_suffix(".converted.txt").read_text().splitlines()
+    except FileNotFoundError:
+        corrected = path.read_text().splitlines()
+
+    corrected = set(corrected)
+
+    def parse(df: pl.DataFrame) -> pl.DataFrame:
+        if len(res := df.filter(pl.col("tag") == "Ensembl_canonical")):
+            return res[0, "transcript_name"]
+        return df.sort("annotation", descending=False)[0, "transcript_name"]
+
+    if existing:
+        # set(Path("starwork2/genestar.converted.txt").read_text().splitlines())
+        genes = set(ts.split("-")[0] for ts in json.loads(existing.read_text()))
+        old = set(corrected)
+        corrected = old - genes
+        logger.info(f"{len(corrected)} genes remaining after removing {old & set(genes)}")
+
+    tss = []
+    for gene in corrected:
+        try:
+            tss.append(parse(get_transcripts(ds, gene, mode="appris")))
+        except pl.ComputeError:
+            tss.append(parse(get_transcripts(ds, gene, mode="ensembl")))
+
+    path.with_suffix(".tss.txt").write_text("\n".join(sorted(tss)))
 
 
 # %%
+# out = "starwork2/10xhuman.txt"
+# Path(out).write_text("\n".join(res := sorted(list(set(tenx["Genes"]) | set(cs)))))
 
 
-def gen_cb(mode: str):
-    if mode == "tricycle":
-        offset = 5
-        n = 12
-    elif mode == "genestar":
-        offset = 1
-        n = 15
-    else:
-        raise ValueError
+# %%
 
-    mapping = {}
-    for i in range(n):
-        d, m = divmod(i, 4)
-        mapping[i + 1] = 8 * d + offset + m
+# %%
+# out = set(Path("starwork2/zach.tss.txt").read_text().splitlines()) | set(
+#     Path("starwork2/tricycle.tss.txt").read_text().splitlines()
+# ) - set(Path("starwork2/genestar.tss.txt").read_text().splitlines())
+# # %%
+# Path("starwork2/zach.tss.txt").write_text("\n".join(sorted(out)))
+# %%
+# fpkm = pl.read_csv("../oligocheck/data/fpkm/combi99percentile.csv")
+# fpkm = dict(zip(fpkm["gene"], fpkm["value"]))
+# # %%
+# Path("starwork2/tricycleplus.txt").read_text().splitlines()
 
-    genes = Path(f"starwork2/{mode}.tss.txt").read_text().splitlines()
-    cb = CodebookPicker(f"static/{n}bit_on3_dist2.csv", genes=genes)
-    cb.gen_codebook(1)
-    c = cb.export_codebook(1, offset=1)
-    Path(f"{mode}.json").write_text(
-        json.dumps({k: list(map(mapping.get, v)) for k, v in c.items()}, default=int)
-    )
+# %%
+# # %%
+# diff = """Vim
+# Rpsa
+# Grb10
+# Ackr3
+# Ccnd2
+# Chd7
+# Boc
+# Cdon
+# Rpl12
+# H2afz
+# Rps27l
+# Gnb2l1
+# Hes1
+# Plagl1
+# Psat1
+# Hsph1
+# Rbm20
+# Polr2a
+# Nes
+# Ldha
+# Clk2
+# 2410131K14Rik
+# Rapgef6
+# Bcl11b
+# Zfp618
+# Nfia
+# Tanc1
+# Cenpa
+# Acly
+# Cadps
+# Clec11a
+# Rtel1
+# Kcna1
+# Hmga2
+# Qk
+# Etl4
+# Sf3b3
+# Pitrm1
+# Eml5
+# Prkd3
+# Naa16
+# Atg12
+# Xist
+# Akt2
+# Ddx19b
+# Med1
+# Arx
+# Golim4
+# Trps1
+# Unc5d
+# Ube2ql1
+# Aff2
+# Sparcl1
+# Kif26b
+# Enc1
+# Crtc3
+# Osbpl6
+# Syt4
+# Celf2
+# Nlgn3
+# Atp8a1
+# Sox11
+# Ifitm3
+# Dnm3
+# Trim67
+# Nrxn1
+# Zbtb18
+# Ptn
+# Cd24a
+# Mpped1
+# Dkk3
+# Dpysl3
+# A530017D24Rik
+# Mllt11
+# Bcl11a
+# Ptprk
+# Sema3c
+# Cadm2
+# Camk2b
+# Neurod6
+# Satb2
+# Gm17750
+# Dcx
+# Ppfia2
+# Mapt
+# Abca1
+# Clstn2
+# Tuba1a
+# Ttc28
+# Arpp21
+# Gpm6a
+# Smarca2
+# Rtn1
+# Neurod2
+# Zbtb20
+# Gria2
+# Tubb3
+# Prkar1b
+# Mef2c""".splitlines()
 
+# # %%
+# birth = """Hmga2
+# Tbr1
+# Tbc1d16
+# Top2a
+# Cabp1
+# Hsph1
+# Fn1
+# Bcl11b
+# Rpsa
+# Nt5dc3
+# Nusap1
+# Qars
+# H2afz
+# Ina
+# Gadd45g
+# Zfp618
+# Prpf4
+# Ube2c
+# Gria1
+# Rpa1
+# Hes1
+# 6430573F11Rik
+# Siva1
+# RP23-379C24.2
+# Gfm2
+# Lrrc9
+# Chaf1b
+# Stat4
+# Ptpro
+# Map4k2
+# Nat8l
+# Eml5
+# Syt4
+# Prkg2
+# Gm13157
+# Nfia
+# Rangap1
+# Leprel1
+# Ap1g2
+# Shisa6
+# Dgkg
+# Nfatc2
+# Filip1
+# Smim12
+# Fndc3c1
+# Map1b
+# Gabpb2
+# Sox5
+# Tmem108
+# Nrxn1
+# Cd24a
+# Acadvl
+# Cnksr2
+# Vwa5b2
+# Nedd4
+# Ncam1
+# Glt28d2
+# Ptprz1
+# Meis2
+# Osbpl6
+# Stk32a
+# RP23-14P23.9
+# Jakmip3
+# Cttnbp2
+# Sparcl1
+# Crtc3
+# Ddah1
+# Glra2
+# Smim14
+# Dpysl3
+# mt-Nd2
+# Apoe
+# Trim9
+# Clu
+# Nr2f1
+# Smarca2
+# Lgals1
+# Clstn1
+# Bcan
+# Trim2
+# Ttc28
+# Atp1b1
+# Mir99ahg
+# Tnc
+# Chl1
+# Thoc2
+# Ndrg2
+# Dbi
+# Pantr1
+# Ptprk
+# Gm17750
+# Unc5d
+# Ptn
+# Sema3c
+# Slc1a3
+# Mfge8
+# Zbtb20
+# Fabp7
+# Yam1""".splitlines()
+# # %%
+# tricycleplus = set(
+#     {x: fpkm.get(x.split("-")[0], None) for x in diff if (fpkm.get(x, None) or 0) < 40}
+#     | {x: fpkm.get(x.split("-")[0], None) for x in birth if (fpkm.get(x, None) or 0) < 40}
+#     | {x: fpkm.get(x.split("-")[0], None) for x in Path("starwork2/tricycle.txt").read_text().splitlines()}
+# ) - set(Path("starwork2/genestar.txt").read_text().splitlines())
 
-gen_cb("genestar")
+# Path("starwork2/tricycleplus.txt").write_text("\n".join(sorted(list(tricycleplus))))
+# # %%
+if __name__ == "__main__":
+    main()
+
+# %%
+# tricycleplus = set(
+#     # {x: fpkm.get(x.split("-")[0], None) for x in diff if (fpkm.get(x, None) or 0) < 40}
+#     # | {x: fpkm.get(x.split("-")[0], None) for x in birth if (fpkm.get(x, None) or 0) < 40}
+#     {x: fpkm.get(x.split("-")[0], None) for x in Path("starwork2/tricycleplus.txt").read_text().splitlines()}
+# ) - set(Path("starwork2/genestar.txt").read_text().splitlines())
+
+# Path("starwork2/tricycleplus.txt").write_text("\n".join(sorted(list(tricycleplus))))
+
+# # %%
+# tricycleplus = set(Path("starwork2/laiorganoid.converted.txt").read_text().splitlines()) - set(
+#     Path("starwork2/genestar.converted.txt").read_text().splitlines()
+# )
+
+# # %%
+# Path("starwork2/laiorganoid.txt").write_text("\n".join(sorted(list(tricycleplus))))
+# %%

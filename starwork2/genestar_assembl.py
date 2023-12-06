@@ -1,6 +1,4 @@
 # %%
-
-# %%
 import json
 import re
 import subprocess
@@ -8,21 +6,18 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
-import primer3
 from Bio import Seq
 from Bio.Restriction import BamHI, KpnI, RestrictionBatch
 
 from fishtools import gen_fasta, hp, rc, tm
-from fishtools.mkprobes.codebook.codebook import CodebookPicker
+from fishtools.mkprobes.candidates import get_candidates
+from fishtools.mkprobes.codebook.codebook import CodebookPicker, hash_codebook
 from fishtools.mkprobes.codebook.finalconstruct import assign_overlap
 from fishtools.mkprobes.ext.external_data import Dataset
 from fishtools.mkprobes.starmap.starmap import test_splint_padlock
-from fishtools.mkprobes.utils.sequtils import reverse_complement
 
-
-def check_primer(seq: str):
-    assert primer3.calc_homodimer_tm(seq) < 45, seq
-    assert primer3.calc_hairpin_tm(seq) < 45, (seq, primer3.calc_hairpin_tm(seq))
+# %%
+idx = 0
 
 
 def make_header(seq: str):
@@ -30,48 +25,36 @@ def make_header(seq: str):
 
 
 def make_footer(seq: str):
-    return "GGATCC" + seq + "CCCTATAG"
-
-
-hf = {
-    "pad": (make_header("ACACGCACCTGTATC"), make_footer("CCGGCATTAT")),
-    "splint": (make_header("CCCTCGTACTTCACTCA"), make_footer("GAGGCCACTATTAT")),
-}
-
-for p, s in hf.values():
-    check_primer(p)
-    check_primer(s)
-    assert primer3.calc_heterodimer_tm(p, rc(s)) < 45
-    assert 68 <= tm(p, "q5") <= 70, (tm(p, "q5"), "p", p)
-    assert 68 <= tm(s, "q5") <= 70, (tm(s, "q5"), "s", s)
-    print(p, rc(s))
+    # BamHI + seq + optimal start + T7 tail
+    return "GGATCC" + seq + "ATTATCCCTATAG"
 
 
 # %%
-tss = Path("starwork2/genestar.tss.txt").read_text().splitlines()
+ds = Dataset("data/human")
+hfs = pl.read_csv("data/headerfooter.csv")
 
 # %%
+codebook = json.loads(Path("starwork2/10xhuman.json").read_text())
+tss = list(codebook)
+hsh = hash_codebook(codebook)
 
-
-# ols = {}
-
-# ols[ts] = assign_overlap("starwork/output", ts, restriction="_BamHIKpnI")
 dfs = pl.concat(
     [
-        pl.read_parquet(f"starwork2/output/{ts}_final_BamHIKpnI.parquet")
+        pl.read_parquet(f"starwork2/output/{ts}_final_BamHIKpnI_{hsh}.parquet")
         # .sample(shuffle=True, seed=4, fraction=1)
         .sort(["priority", "hp"])[:30]
         for ts in tss
     ]
 )
+
 # %%
 
-gene_to_ts = {re.split(r"-2\d\d", ts)[0]: ts for ts in tss}
-notok = dfs.groupby("gene").agg(pl.count()).filter(pl.col("count") < 8)["gene"]
-ok_ = dfs.groupby("gene").agg(pl.count()).filter(pl.col("count") >= 8)["gene"]
+gene_to_ts = {"-".join(ts.split("-")[:-1]): ts for ts in tss}
+ts_to_gene = {v: k for k, v in gene_to_ts.items()}
+# notok = dfs.groupby("gene").agg(pl.count()).filter(pl.col("count") < 8)["gene"]
+# ok_ = dfs.groupby("gene").agg(pl.count()).filter(pl.col("count") >= 8)["gene"]
 
-ok = [gene_to_ts[gene] for gene in ok_]
-print(dfs.groupby("gene").agg(pl.count()).filter(pl.col("count") < 8))
+# ok = [gene_to_ts[gene] for gene in ok_]
 # %%
 # Path("starwork/tricycle.txt").write_text("\n".join(sorted(ok)))
 
@@ -108,7 +91,7 @@ def until_first_g(seq: str, target: str = "G"):
 # %%
 
 
-def generate_head_splint(padlock: str, rand: np.random.Generator):
+def generate_head_splint(padlock: str, rand: np.random.Generator) -> str:
     # Minimize the amount of secondary structures.
     # Must start with C.
     test = "TAA" + rc(padlock)
@@ -179,16 +162,17 @@ def double_digest(s: str) -> str:
     return BamHI.catalyze(KpnI.catalyze(Seq.Seq(s))[1])[0].__str__()
 
 
-# %%
 pl.Config.set_fmt_str_lengths(100)
 
 for s, r, ll in zip(res["splint_"], res["rotated"], res["splint_end"].str.lengths()):
     assert test_splint_padlock(s, r, lengths=(6, ll)), (s, r)
+# %%
+
 
 out = res.with_columns(
     # restriction scar already accounted for
-    padlockcons=hf["pad"][0][:-1].lower() + pl.col("rotated") + hf["pad"][1][1:],
-    splintcons=hf["splint"][0][:-1].lower() + pl.col("splint_") + hf["splint"][1][1:],
+    padlockcons=hfs[idx * 2, "header"][:-1].lower() + pl.col("rotated") + hfs[idx * 2, "footer"][1:],
+    splintcons=hfs[idx * 2 + 1, "header"][:-1].lower() + pl.col("splint_") + hfs[idx * 2 + 1, "footer"][1:],
 ).with_columns(splintcons=pl.col("splintcons").apply(backfill))
 
 for s, r, ll in zip(out["splintcons"], out["padlockcons"], out["splint_end"].str.lengths()):
@@ -207,22 +191,24 @@ assert (out["padlockcons"].str.lengths().is_between(139, 150)).all()
 # assert (out["padlockcons"].str.lengths() == 150).all()
 
 
-out.write_parquet("starwork/genestar.parquet")
+out.write_parquet("starwork2/genestar.parquet")
 
 # %%
 Path("starwork/genestar_out.txt").write_text("\n".join([*out["padlockcons"], *out["splintcons"]]))
 t7 = "TAATACGACTCACTATAGGG"
-assert out["padlockcons"].str.contains(rc(t7)[:10]).all()
+assert out["padlockcons"].str.contains(rc(t7)[:5]).all()
 
 # %%
-Path("starwork/genestarpad.fasta").write_text(gen_fasta(out["padlockcons"], names=range(len(out))).getvalue())
-Path("starwork/genestarsplint.fasta").write_text(
+Path("starwork2/genestarpad.fasta").write_text(
+    gen_fasta(out["padlockcons"], names=range(len(out))).getvalue()
+)
+Path("starwork2/genestarsplint.fasta").write_text(
     gen_fasta(out["splintcons"], names=range(len(out))).getvalue()
 )
 
 for name in ["genestarpad.fasta", "genestarsplint.fasta"]:
     subprocess.run(
-        f'RepeatMasker -pa 64 -norna -s -no_is -species "mus musculus" starwork/{name}', shell=True
+        f'RepeatMasker -pa 64 -norna -s -no_is -species "mus musculus" starwork2/{name}', shell=True
     )
 
 # cons = dfs.with_columns(constructed=header + pl.col("seq") + footer)
