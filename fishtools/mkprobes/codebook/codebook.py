@@ -1,11 +1,20 @@
 # %%
+import json
+from hashlib import md5
 from pathlib import Path
-from typing import Any, Literal, Sized
+from typing import Any, Collection, Literal, Sized
 
 import numpy as np
 import numpy.typing as npt
 import polars as pl
 from loguru import logger
+
+
+def hash_codebook(cb: dict[str, Collection[int]]) -> str:
+    return md5(
+        json.dumps(cb, sort_keys=True, ensure_ascii=True).encode(),
+        usedforsecurity=False,
+    ).hexdigest()[-6:]
 
 
 class CodebookPicker:

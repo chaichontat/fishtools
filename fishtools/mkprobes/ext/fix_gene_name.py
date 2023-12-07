@@ -1,5 +1,5 @@
 from itertools import chain
-from typing import Iterable, TypedDict, cast
+from typing import Iterable, Literal, TypedDict, cast
 
 import mygene
 import polars as pl
@@ -54,9 +54,10 @@ def find_aliases(gtf: ExternalData, genes: Iterable[str], species: str = "mouse"
 
 def manual_fix(res: ResDict, sel: dict[str, str]):
     dupes = {x[0] for x in res["dup"]}
+    input("Manual fix: press enter to start. Enter the number of the correct gene name.")
     for line in dupes:
-        if line in sel:
-            continue
+        # if line in sel:
+        #     continue
         jprint(choices := {i: x for i, x in enumerate((x for x in res["out"] if x["query"] == line), 1)})
         inp = input()
         if not inp:
@@ -69,7 +70,7 @@ def manual_fix(res: ResDict, sel: dict[str, str]):
             sel[line] = choices[n]["symbol"] if n != 0 else line  # 0 means keep original
 
 
-def check_gene_names(gtf: ExternalData, genes: list[str]):
+def check_gene_names(gtf: ExternalData, genes: list[str], species: Literal["mouse", "human"] = "mouse"):
     notfound = []
     ok: list[str] = []
     for gene in genes:
@@ -78,7 +79,7 @@ def check_gene_names(gtf: ExternalData, genes: list[str]):
             ok.append(gene)
         except ValueError:
             notfound.append(gene)
-    converted, res = find_aliases(gtf, notfound)
+    converted, res = find_aliases(gtf, notfound, species=species)
     mapping = {k: v["symbol"] for k, v in converted.items()}
     no_fix_needed = True
 

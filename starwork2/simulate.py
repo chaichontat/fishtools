@@ -10,14 +10,15 @@ from fishtools.mkprobes.starmap.starmap import test_splint_padlock
 from fishtools.mkprobes.utils.sequtils import is_subsequence
 from fishtools.utils.pretty_print import printc
 
-primers = pl.read_csv("starwork/primer.txt", separator="\t", has_header=False, new_columns=["name", "seq"])
-primers = dict(zip(primers["name"], primers["seq"]))
+primers = pl.read_csv("data/headerfooter.csv")
 t7promoter = "TAATACGACTCACTATAGGG"
 bits = pl.read_csv("data/readout_ref_filtered.csv")
+bits = dict(zip(bits["seq"], bits["id"]))
 
-ds = Dataset("data/mouse")
+ds = Dataset("data/human")
 
-ss = Path("starwork/tricycle_out.txt").read_text().splitlines()
+
+ss = Path("starwork2/generated/humanbase_final.txt").read_text().splitlines()
 
 
 def t7(seq: str):
@@ -41,8 +42,8 @@ def rt(seq: str, primer: str):
     return rc(seq)[res:]
 
 
-def digest(seq: str) -> list[int]:
-    return Restriction.BsaI.catalyze(Seq.Seq(seq))
+def double_digest(s: str) -> str:
+    return Restriction.BamHI.catalyze(Restriction.KpnI.catalyze(Seq.Seq(s))[1])[0].__str__()
 
 
 def anneal(seq: str, primer: str):
@@ -52,7 +53,7 @@ def anneal(seq: str, primer: str):
 
 # %%
 def process(seq: str, rt_primer: str, anneal_primer: tuple[str, str]):
-    t7ed = t7(seq + "TCGTATTA")  # complete T7 promoter with PCR primers
+    t7ed = t7(seq + "TAGTGAGTCGTATTA")  # complete T7 promoter with PCR primers
     rted = rt(t7ed, rt_primer)
 
     # Confirm that the annealed sequences can be cut.
@@ -60,34 +61,30 @@ def process(seq: str, rt_primer: str, anneal_primer: tuple[str, str]):
     frag2 = anneal(rted, anneal_primer[1])
     assert frag1
     assert frag2
-    assert len(digest(rted[frag1[0] : frag1[1]])) == 2
-    assert len(digest(rted[frag2[0] : frag2[1]])) == 2
     print(f"Annealed at {frag1} and {frag2}.")
 
-    digested = digest(rted[frag1[0] : frag2[1]])
-    assert len(digested) == 3  # 2 cuts expected resulting in 3 fragments
-    return str(digested[1])  # middle fragment
+    return double_digest(rted)
 
 
-i = 500
+i = 50
 sp = process(
     ss[2 * i],
-    primers["Splint2-F"],
-    (primers["Splint2-Cleave1"], primers["Splint2-Cleave2"]),
+    primers[0, "header"],
+    (rc(primers[0, "header"]), rc(primers[0, "footer"][:-5])),
 )
-pad = process(ss[2 * i + 1], primers["Pad2-F"], (primers["Pad2-Cleave1"], primers["Pad2-Cleave2"]))
+pad = process(ss[2 * i + 1], primers[1, "header"], (rc(primers[1, "header"]), rc(primers[1, "footer"][:-5])))
 
 # %%
 df = SAMFrame.from_bowtie(
     gen_fasta(
-        # forward handle of splint, last 15 bases of splint are ligation handles
+        # forward handle of splint, last 17 bases of splint are ligation handles
         # first 9 bases of pad are ligation handle
-        [sp.split("TGTTGATGAGGTGTTGATGATAA")[1][:-15], pad[9:29]],
+        [sp[3 : -(2 + 8 + 6)], pad[9:29]],
         names=["splint", "padlock"],
     ).getvalue(),
-    "data/mouse/txome",
+    "data/human/txome",
     seed_length=12,
-    threshold=16,
+    threshold=15,
     n_return=200,
     fasta=True,
     no_forward=True,
@@ -105,7 +102,7 @@ print(filtered[["name", "flag", "transcript", "pos"]])
 idxs = (filtered[0, "pos"] + filtered[0, "match_consec"], filtered[1, "pos"])
 gap = idxs[1] - idxs[0]
 assert 0 <= gap < 3  # distance between end of splint and start of padlock less than 3
-assert test_splint_padlock(sp[-12:], pad)
+assert test_splint_padlock(sp[-14:], pad, lengths=(6, 8))
 
 
 # %%
@@ -116,29 +113,39 @@ transcript = ds.ensembl.get_seq(filtered[0, "transcript"])
 
 start = filtered[0, "pos"]
 startpad = filtered[1, "pos"]
-printc(" " * (len(sp) - 15 - 1) + " " * (gap + 1) + "/---")
-for i in range(3):
-    printc(" " * (len(sp) - 15 - 1) + " " * (gap + 1) + pad[-(9 - i)])
-
-for i in range(15):
-    a, b = sp[-(i + 1)], (pad[-(6 - i)] if i < 6 else pad[i - 6])
-    printc(" " * (len(sp) - 15 - 1) + a + ("-" if rc(a) == b else " ") * gap + b)
-    if i == 5:
-        printc(" " * (len(sp) - 15 - 1) + "|" + " " * gap + "-")
 
 
-combi = sp[:-15] + " " * gap + pad[9:35] + "---"
-template = transcript[idxs[0] - 27 : idxs[1] + len(sp) - 16][::-1]
+def show_starmap(transcript: str, pad: str, splint: str, overhang: int = 16, gap: int = 0):
+    space = " " * (len(splint) - overhang - 1)
+    # extra 3 bases from padlock end
+    printc(space + " " * (gap + 1) + "/---")
+    for i in range(3):
+        printc(space + ("↑" if i == 2 else " ") + (" " * gap) + pad[-(9 - i)])
 
-printc(combi)
-print("".join("|" if rc(a) == b else " " for a, b in zip(combi, template)))
-print(template)
+    # splint-padlock
+    for i in range(overhang):
+        a, b = splint[-(i + 1)], (pad[-(8 - i)] if i < 8 else pad[i - 8])
+        printc(space + a + ("-" if rc(a) == b else " ") * gap + b)
+        if i == 7:  # ligation site
+            printc(space + "|" + " " * gap + "-")
+
+    combi = splint[:-overhang] + " " * gap + pad[9:35] + "---"
+    template = transcript[idxs[0] - 27 : idxs[1] + len(splint) - overhang - 1][::-1]
+
+    # alignment
+    printc(combi)
+    print("".join("|" if rc(a) == b else " " for a, b in zip(combi, template)))
+    print(template)
+
+
+show_starmap(transcript, pad, sp, gap=gap)
+
 # %%
 
 
 def visualize_padlock(splint: str, pad: str):
-    printc("5-" + splint[-12:-6] + "  " + splint[-6:] + "-3")
-    printc("/-" + pad[:6][::-1] + "53" + pad[-6:][::-1] + "-\\")
+    printc("5-" + splint[-14:-8] + "  " + splint[-8:] + "-3")
+    printc("/-" + pad[:6][::-1] + "53" + pad[-8:][::-1] + "-\\")
 
 
 visualize_padlock(sp, pad)
@@ -152,7 +159,7 @@ def rotate(s: str, r: int):
 # rotate 9 bases to the left since first bit is split at the padlock junction
 (de := deque(pad)).rotate(-9)
 rcaed = rc("".join(de))  # reverse complement as a result of RCA
-assert len(bits_ := [bit for bit in bits["seq"] if rc(bit) in rcaed]) == 3
+assert len(bits_ := [bits[bit] for bit in bits if rc(bit) in rcaed]) == 3
 print(bits_)
 
 # %%

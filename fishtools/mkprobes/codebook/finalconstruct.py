@@ -12,6 +12,7 @@ from loguru import logger
 
 from fishtools import rc
 from fishtools.mkprobes.candidates import _run_bowtie
+from fishtools.mkprobes.codebook.codebook import hash_codebook
 from fishtools.mkprobes.ext.external_data import Dataset
 from fishtools.mkprobes.starmap.starmap import split_probe
 
@@ -46,7 +47,7 @@ def stitch(seq: str, codes: Sequence[int], sep: str = "TT") -> str:
     return sep.join(rc(READOUTS[c]).lower() for c in codes) + seq
 
 
-def construct_encoding(seq_encoding: pl.DataFrame, idxs: list[int], n: int = -1):
+def construct_encoding(seq_encoding: pl.DataFrame, idxs: Collection[int], n: int = -1):
     if n == -1:
         n = len(idxs)
     if len(idxs) != n:
@@ -132,17 +133,23 @@ def construct(
     output_path: Path | str,
     *,
     transcript: str,
-    codebook: dict[str, list[int]],
+    codebook: dict[str, Collection[int]],
     target_probes: int = 64,
     restriction: list[str] | str | None = None,
-    construction_function: Callable[[pl.DataFrame, list[int]], pl.DataFrame] = construct_encoding,
+    construction_function: Callable[[pl.DataFrame, Collection[int]], pl.DataFrame] = construct_encoding,
+    overwrite: bool = False,
 ):
     output_path = Path(output_path)
     if isinstance(restriction, Collection):
         restriction = "_" + "".join(restriction)
     restriction = restriction or ""
 
-    # if (final_path := Path(output_path / f"{transcript}_final{restriction}.parquet")).exists() and set(
+    hsh = hash_codebook(codebook)
+
+    if (
+        final_path := Path(output_path / f"{transcript}_final{restriction}_{hsh}.parquet")
+    ).exists() and not overwrite:
+        return
     #     pl.read_parquet(final_path)[["code1", "code2"]].to_numpy().flatten()
     # ) != set(codebook[transcript]):
     #     logger.critical(f"Codebook for {transcript} has changed.")
@@ -186,8 +193,9 @@ def construct(
 
     logger.info(f"Constructed {len(res)} probes for {transcript}.")
     assert res["seq"].is_not_null().all()
-    res.write_parquet(output_path / f"{transcript}_final{restriction}.parquet")
-    logger.info(f"Written to {output_path / f'{transcript}_final{restriction}.parquet'}")
+
+    res.write_parquet(final_path)
+    logger.info(f"Written to {final_path}")
     return res
 
 
@@ -205,7 +213,7 @@ def filter_genes(output_path: Path, genes: Path, min_probes: int, out: Path | No
     def get_probes(gene: str):
         ols = list(output_path.glob(f"{gene}_screened_ol*.parquet"))
         if len(ols) > 0:
-            ol = max([int(re.search(r"_ol(\d+)", f.stem).group(1)) for f in ols])
+            ol = max([int(re.search(r"_ol(\d+)", f.stem).group(1)) for f in ols])  # type: ignore
             return pl.read_parquet(output_path / f"{gene}_screened_ol{ol}.parquet")
         return pl.read_parquet(output_path / f"{gene}_screened.parquet")
 

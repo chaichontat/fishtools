@@ -38,7 +38,8 @@ def find_outdated_ts(ts: str) -> tuple[Annotated[str, "gene_name"], Annotated[st
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("genes", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
-def chkgenes(path: Path, genes: Path):
+@click.option("--species", "-s", type=str, default="mouse")
+def chkgenes(path: Path, genes: Path, species: Literal["mouse", "human"] = "mouse"):
     """Validate/check that gene names are canonical in Ensembl"""
     from ..ext.fix_gene_name import check_gene_names
 
@@ -49,6 +50,10 @@ def chkgenes(path: Path, genes: Path):
         raise ValueError("No genes provided")
 
     gs = list(filter(lambda x: x, gs))
+    for gene in gs:
+        if not gene.isascii():
+            raise ValueError(f"{gene} not ASCII.")
+
     if len(gs) != len(s := set(gs)):
         [gs.remove(x) for x in s]
         log.warning(f"Non-unique genes found: {', '.join(gs)}.\n")
@@ -57,7 +62,7 @@ def chkgenes(path: Path, genes: Path):
         log.critical("Aborting.")
         return
 
-    converted, mapping, no_fixed_needed = check_gene_names(ds.ensembl, gs)
+    converted, mapping, no_fixed_needed = check_gene_names(ds.ensembl, gs, species=species)
     if mapping:
         log.info("Mappings:")
         jprint(mapping)
@@ -69,6 +74,7 @@ def chkgenes(path: Path, genes: Path):
         log.warning("Some genes cannot be found.")
     else:
         log.info(f"{len(s)} genes checked out. No changes needed")
+        genes.with_suffix(".converted.txt").write_text("\n".join(sorted(converted)))
 
 
 def get_transcripts(
@@ -84,7 +90,7 @@ def get_transcripts(
     gene_id = gene if gene.startswith("ENS") else dataset.ensembl.gene_to_eid(gene)
     del gene
 
-    log.info(f"Gene ID: {gene_id}")
+    # log.info(f"Gene ID: {gene_id}")
 
     ensembl = dataset.ensembl.filter(pl.col("gene_id") == gene_id)[
         ["gene_name", "gene_id", "transcript_name", "transcript_id"]
