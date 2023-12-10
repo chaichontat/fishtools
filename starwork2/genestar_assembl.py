@@ -38,7 +38,7 @@ class ProbeSet(BaseModel):
 path = Path("starwork2")
 
 
-def pad(s: str, target: int = 98):
+def pad(s: str, target: int = 101):
     if len(s) > target + 2:
         raise ValueError("Too long")
     if len(s) > target:
@@ -110,7 +110,7 @@ def run(probeset: ProbeSet, n: int = 24):
             # head
             hfs[idx * 2 + 1, "header"][-3:]
             + pl.col("padlock").apply(lambda x: generate_head_splint(x, rand)).str.to_lowercase()
-            + "ta"
+            + "tc"
             + pl.col("seq").apply(rc)
         ).apply(pad)
         + rc(hfs[idx * 2, "footer"][:3])
@@ -132,7 +132,7 @@ def run(probeset: ProbeSet, n: int = 24):
         # )
         res.with_columns(
             splint_=pl.col("splint").apply(rc)
-            + "TA"
+            + "TC"
             + pl.col("rotated").str.slice(0, 6).apply(rc)
             + pl.col("rotated").str.slice(-8, 8).apply(rc)
         ).with_columns(splint_=pl.col("splint_").apply(splint_pad))
@@ -151,10 +151,10 @@ def run(probeset: ProbeSet, n: int = 24):
 
     out = res.with_columns(
         # restriction scar already accounted for
+        splintcons=hfs[idx * 2, "header"] + pl.col("splint_") + hfs[idx * 2, "footer"][3:],
         padlockcons=hfs[idx * 2 + 1, "header"][:-3].lower()
         + pl.col("rotated")
         + hfs[idx * 2 + 1, "footer"][3:],
-        splintcons=hfs[idx * 2, "header"] + pl.col("splint_") + hfs[idx * 2, "footer"][3:],
     ).with_columns(splintcons=pl.col("splintcons").apply(backfill))
 
     for s, r in zip(out["splintcons"], out["padlockcons"]):
@@ -233,5 +233,8 @@ if __name__ == "__main__":
 # # %%
 
 # Path("starwork/genestar_out.txt").write_text("\n".join(out))
+
+
+# %%
 
 # %%

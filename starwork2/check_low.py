@@ -15,7 +15,7 @@ from fishtools.mkprobes.candidates import get_candidates
 from fishtools.mkprobes.codebook.codebook import hash_codebook
 from fishtools.mkprobes.ext.external_data import Dataset
 
-ds = Dataset("data/mouse")
+# ds = Dataset("data/mouse")
 # %%
 path = Path("starwork2/synapse.json")
 codebook = json.loads(path.read_text())

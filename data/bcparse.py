@@ -1,4 +1,6 @@
 # %%
+import io
+from itertools import chain
 from pathlib import Path
 from typing import Callable
 
@@ -58,8 +60,8 @@ def gen_bc(
     return ok, built
 
 
-headers, hb = gen_bc(bcs, slice(0, 10000), make_header, 13)
-footers, fb = gen_bc(bcs, slice(10000, 20000), make_footer, 10)
+headers, hb = gen_bc(bcs, slice(0, 10000), make_header, 12)
+footers, fb = gen_bc(bcs, slice(10000, 20000), make_footer, 9)
 
 res = pl.DataFrame(
     {
@@ -73,5 +75,36 @@ res = pl.DataFrame(
 for row in res.iter_rows(named=True):
     assert primer3.calc_heterodimer_tm(row["header"], rc(row["footer"])) < 50
 
+if (p := Path("data/headerfooter.csv")).exists():
+    res.write_csv(x := io.BytesIO())
+    assert p.read_bytes() == x.getvalue()
+
 res.write_csv("data/headerfooter.csv")
+
+# %%
+
+
+def gen_idt(name: str, seq: str, scale: str):
+    return f"{name}\t{seq}\t\t{scale}\tSTD"
+
+
+t7 = "GAATTTAATACGACTCACTATAGGG"
+
+
+def gen_primer_set(i: int):
+    def oneset(name: str, j: int):
+        assert t7 in (footer := t7[:-5] + rc(res[j, "footer"]))
+        return [
+            gen_idt(f"{name}-{i}-Header", res[j, "header"], "25nm"),
+            gen_idt(f"{name}-{i}-Footer", footer, "25nm"),
+            gen_idt(f"{name}-{i}-Cleave1", rc(res[j, "header"]), "25nm"),
+            gen_idt(f"{name}-{i}-Cleave2", rc(res[j, "footer"][:-3]), "25nm"),
+        ]
+
+    return oneset("Spl", 2 * i) + oneset("Pad", 2 * i + 1)
+
+
+print("\n".join(chain.from_iterable([gen_primer_set(i) for i in range(7)])))
+print(gen_idt("T7Footer-Shared-R", "GAATTTAATACGACTCACTATAGGGAGAGT", "25nm"))
+
 # %%
