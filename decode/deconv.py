@@ -9,7 +9,7 @@ def _matlab_gauss2D(shape: tuple[int, int] = (3, 3), sigma: float = 0.5) -> np.n
     2D gaussian mask - should give the same result as MATLAB's
     fspecial('gaussian',[shape],[sigma])
     """
-    m, n = [(ss - 1.0) / 2.0 for ss in shape]
+    m, n = ((ss - 1.0) / 2.0 for ss in shape)
     y, x = np.ogrid[-m : m + 1, -n : n + 1]
     h = np.exp(-(x**2 + y**2) / (2.0 * sigma**2))
     h[h < np.finfo(h.dtype).eps * h.max()] = 0
