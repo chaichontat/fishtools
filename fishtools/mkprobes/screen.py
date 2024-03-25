@@ -67,8 +67,7 @@ def run_screen(
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
     overwrite: bool = False,
-) -> pl.DataFrame:
-    ...
+) -> pl.DataFrame: ...
 
 
 @overload
@@ -81,8 +80,7 @@ def run_screen(
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
     overwrite: bool = False,
-) -> dict[int, pl.DataFrame]:
-    ...
+) -> dict[int, pl.DataFrame]: ...
 
 
 def run_screen(

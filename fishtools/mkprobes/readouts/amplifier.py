@@ -8,9 +8,9 @@ from expression.collections import Seq
 from Levenshtein import distance
 from loguru import logger
 
-from fishtools.mkprobes.screen_utils._alignment import gen_bowtie_index, gen_fasta
 from fishtools.mkprobes.constants import DT, SP6
 from fishtools.mkprobes.definitions import Filter
+from fishtools.mkprobes.screen_utils._alignment import gen_bowtie_index, gen_fasta
 from fishtools.mkprobes.screen_utils.samframe import SAMFrame
 from fishtools.mkprobes.utils.seqcalc import hp, tm
 from fishtools.mkprobes.utils.sequtils import gc_content, reverse_complement
@@ -30,13 +30,11 @@ def extract_ok(generated: T, ok_keys: list[int] | list[str]) -> T:
 
 
 @overload
-def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[False] = ...) -> pl.DataFrame:
-    ...
+def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[False] = ...) -> pl.DataFrame: ...
 
 
 @overload
-def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[True]) -> tuple[pl.DataFrame, T]:
-    ...
+def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[True]) -> tuple[pl.DataFrame, T]: ...
 
 
 def run_filter(f: Filter, seqs: T, return_ok_seqs: bool = False) -> pl.DataFrame | tuple[pl.DataFrame, T]:

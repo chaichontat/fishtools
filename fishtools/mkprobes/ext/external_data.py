@@ -119,12 +119,10 @@ class ExternalData:
         return self.gtf.filter(pl.col("gene_name") == gene)
 
     @overload
-    def __getitem__(self, eid: str) -> pl.Series:
-        ...
+    def __getitem__(self, eid: str) -> pl.Series: ...
 
     @overload
-    def __getitem__(self, eid: list[str]) -> pl.DataFrame:
-        ...
+    def __getitem__(self, eid: list[str]) -> pl.DataFrame: ...
 
     def __getitem__(self, eid: str | list[str]):
         return self.gtf[eid]
