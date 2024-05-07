@@ -1,25 +1,50 @@
+# %%
+from functools import cache
 from typing import Any
 
 import cv2
 import numpy as np
+import numpy.typing as npt
+from scipy.stats import multivariate_normal
 
 
-def _matlab_gauss2D(shape: tuple[int, int] = (3, 3), sigma: float = 0.5) -> np.ndarray[np.float64, Any]:
+def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32) -> npt.NDArray:
+    """
+    Args:
+        image: the input image to be filtered
+        windowSize: the size of the Gaussian kernel to use.
+        sigma: the sigma of the Gaussian.
+
+    Returns:
+        the high pass filtered image. The returned image is the same type
+        as the input image.
+    """
+    img = img.astype(dtype)
+    window_size = int(2 * np.ceil(2 * σ) + 1)
+    lowpass = cv2.GaussianBlur(img, (window_size, window_size), σ, borderType=cv2.BORDER_REPLICATE)
+    gauss_highpass = img - lowpass
+    gauss_highpass[lowpass > img] = 0
+    return gauss_highpass
+
+
+def _matlab_gauss2D(
+    shape: int = 3, σ: float = 0.5, dtype: npt.DTypeLike = np.float32
+) -> np.ndarray[np.float64, Any]:
     """
     2D gaussian mask - should give the same result as MATLAB's
     fspecial('gaussian',[shape],[sigma])
     """
-    m, n = [(ss - 1.0) / 2.0 for ss in shape]
-    y, x = np.ogrid[-m : m + 1, -n : n + 1]
-    h = np.exp(-(x**2 + y**2) / (2.0 * sigma**2))
+    x = np.linspace(-(shape // 2), shape // 2, shape)
+    x, y = np.meshgrid(x, x)
+    h = multivariate_normal([0, 0], σ**2 * np.eye(2)).pdf(np.dstack((x, y)))
+    h = h.astype(dtype)
     h[h < np.finfo(h.dtype).eps * h.max()] = 0
-    sumh = h.sum()
-    if sumh != 0:
-        h /= sumh
+    h /= h.sum()  # normalize
     return h
 
 
-def _calculate_projectors(windowSize: int, σ_G: float) -> tuple[np.ndarray, np.ndarray]:
+@cache
+def _calculate_projectors(window_size: int, σ_G: float) -> tuple[np.ndarray, np.ndarray]:
     """Calculate forward and backward projectors as described in:
 
     'Accelerating iterative deconvolution and multiview fusion by orders
@@ -34,14 +59,12 @@ def _calculate_projectors(windowSize: int, σ_G: float) -> tuple[np.ndarray, np.
         A list containing the forward and backward projectors to use for
         Lucy-Richardson deconvolution.
     """
-    pf = _matlab_gauss2D(shape=(windowSize, windowSize), sigma=σ_G)
+    pf = _matlab_gauss2D(shape=window_size, σ=σ_G)
     pfFFT = np.fft.fft2(pf)
 
     # Wiener-Butterworth back projector.
-    #
     # These values are from Guo et al.
-    alpha = 0.001
-    beta = 0.001
+    α = β = 0.001
     n = 8
 
     # This is the cut-off frequency.
@@ -49,34 +72,30 @@ def _calculate_projectors(windowSize: int, σ_G: float) -> tuple[np.ndarray, np.
 
     # FFT frequencies
     kv = np.fft.fftfreq(pfFFT.shape[0])
-
-    kx = np.zeros((kv.size, kv.size))
-    for i in range(kv.size):
-        kx[i, :] = np.copy(kv)
-
-    ky = np.transpose(kx)
-    kk = np.sqrt(kx * kx + ky * ky)
+    kk = np.hypot(*np.meshgrid(kv, kv))
 
     # Wiener filter
-    bWiener = pfFFT / (np.abs(pfFFT) * np.abs(pfFFT) + alpha)
-
+    bWiener = pfFFT / (np.abs(pfFFT) ** 2 + α)
     # Buttersworth filter
-    eps = np.sqrt(1.0 / (beta * beta) - 1)
-
-    kkSqr = kk * kk / (kc * kc)
-    bBWorth = 1.0 / np.sqrt(1.0 + eps * eps * np.power(kkSqr, n))
-
+    eps = np.sqrt(1.0 / (β**2) - 1)
+    bBWorth = 1.0 / np.sqrt(1.0 + eps**2 * (kk / kc) ** (2 * n))
     # Weiner-Butterworth back projector
     pbFFT = bWiener * bBWorth
-
     # back projector.
     pb = np.real(np.fft.ifft2(pbFFT))
 
     return pf, pb
 
 
+EPS = 1e-6
+I_MAX = 2**16 - 1
+
+
 def deconvolve_lucyrichardson_guo(
-    image: np.ndarray, windowSize: int, sigmaG: float, iterationCount: int
+    img: np.ndarray[np.float32, Any] | np.ndarray[np.float64, Any],
+    window_size: int = 9,
+    σG: float = 1.4,
+    iters: int = 4,
 ) -> np.ndarray:
     """Performs Lucy-Richardson deconvolution on the provided image using a
     Gaussian point spread function. This version used the optimized
@@ -92,19 +111,29 @@ def deconvolve_lucyrichardson_guo(
     Returns:
         the deconvolved image
     """
-    eps = 1.0e-6
-    i_max = 2**16 - 1
 
-    [pf, pb] = _calculate_projectors(windowSize, sigmaG)
-    pf = pf.astype(image.dtype)
-    pb = pb.astype(image.dtype)
-    ek = np.clip(image.copy(), eps, None)
+    if img.dtype not in (np.float32, np.float64):
+        raise ValueError("Image must be floating point")
 
-    for _ in range(iterationCount):
-        ekf = cv2.filter2D(ek, -1, pf, borderType=cv2.BORDER_REPLICATE)
-        ekf = np.clip(ekf, eps, i_max)
+    forward_projector, backward_projector = _calculate_projectors(window_size, σG)
+    forward_projector = forward_projector.astype(img.dtype)
+    backward_projector = backward_projector.astype(img.dtype)
 
-        ek = ek * cv2.filter2D(image / ekf, -1, pb, borderType=cv2.BORDER_REPLICATE)
-        ek = np.clip(ek, eps, i_max)
+    estimate = np.clip(img.copy(), EPS, None)
 
-    return ek
+    for _ in range(iters):
+        filtered_estimate = np.clip(
+            cv2.filter2D(estimate, -1, forward_projector, borderType=cv2.BORDER_REPLICATE),
+            EPS,
+            I_MAX,
+        )
+
+        ratio = img / filtered_estimate
+        # Correction
+        estimate *= cv2.filter2D(ratio, -1, backward_projector, borderType=cv2.BORDER_REPLICATE)
+        estimate = np.clip(estimate, EPS, I_MAX)
+
+    return estimate
+
+
+# %%
