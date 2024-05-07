@@ -49,6 +49,10 @@ def chkgenes(path: Path, genes: Path):
         raise ValueError("No genes provided")
 
     gs = list(filter(lambda x: x, gs))
+    for gene in gs:
+        if not gene.isascii():
+            raise ValueError(f"{gene} not ASCII.")
+
     if len(gs) != len(s := set(gs)):
         [gs.remove(x) for x in s]
         log.warning(f"Non-unique genes found: {', '.join(gs)}.\n")
@@ -57,7 +61,7 @@ def chkgenes(path: Path, genes: Path):
         log.critical("Aborting.")
         return
 
-    converted, mapping, no_fixed_needed = check_gene_names(ds.ensembl, gs)
+    converted, mapping, no_fixed_needed = check_gene_names(ds.ensembl, gs, species=ds.species)
     if mapping:
         log.info("Mappings:")
         jprint(mapping)
@@ -69,6 +73,7 @@ def chkgenes(path: Path, genes: Path):
         log.warning("Some genes cannot be found.")
     else:
         log.info(f"{len(s)} genes checked out. No changes needed")
+        genes.with_suffix(".converted.txt").write_text("\n".join(sorted(converted)))
 
 
 def get_transcripts(
@@ -84,7 +89,7 @@ def get_transcripts(
     gene_id = gene if gene.startswith("ENS") else dataset.ensembl.gene_to_eid(gene)
     del gene
 
-    log.info(f"Gene ID: {gene_id}")
+    # log.info(f"Gene ID: {gene_id}")
 
     ensembl = dataset.ensembl.filter(pl.col("gene_id") == gene_id)[
         ["gene_name", "gene_id", "transcript_name", "transcript_id"]

@@ -4,7 +4,7 @@ import json
 from functools import cache
 from io import StringIO
 from pathlib import Path
-from typing import Any, Sequence, overload
+from typing import Any, Literal, Sequence, cast, overload
 
 import mygene
 import polars as pl
@@ -40,10 +40,6 @@ class ExternalData:
         regen_cache: bool = False,
     ) -> None:
         self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=lambda x: x.split(" ")[0].split(".")[0])
-        self.fa_masked = pyfastx.Fasta(
-            Path(fasta).with_suffix(Path(fasta).suffix + ".masked").as_posix(),
-            key_func=lambda x: x.split(" ")[0].split(".")[0],
-        )
         self._ts_gene_map: dict[str, str] | None = None
 
         if Path(cache).exists() and not regen_cache:
@@ -94,7 +90,7 @@ class ExternalData:
             raise ValueError("Mapping not bijective.")
         return res
 
-    def convert(self, val: str, *, src: str, dst: str) -> str:
+    def convert(self, val: str, src: str, dst: str) -> str:
         res = self.gtf.filter(pl.col(src) == val)[dst]
         if not len(res):
             raise ValueError(f"Could not find {val} in {src}")
@@ -109,8 +105,11 @@ class ExternalData:
         return self.gtf.filter(pl.col("gene_id") == eid)["transcript_id"]
 
     @cache
-    def get_seq(self, eid: str, *, masked: bool = False) -> str:
-        res = (self.fa if not masked else self.fa_masked)[eid.split(".")[0]].seq
+    def get_seq(self, eid: str) -> str:
+        if "-" in eid:
+            eid = self.convert(eid, "transcript_name", "transcript_id")
+
+        res = self.fa[eid.split(".")[0]].seq
         if not res:
             raise ValueError(f"Could not find {eid}")
         return res
@@ -200,6 +199,9 @@ class ExternalData:
 class Dataset:
     def __init__(self, path: Path | str):
         self.path = Path(path)
+        self.species = cast(Literal["human", "mouse"], self.path.name)
+        if self.species not in ("human", "mouse"):
+            raise ValueError(f"Species must be human or mouse, got {self.species}")
 
         self.gencode = ExternalData(
             cache=self.path / "gencode.parquet",
@@ -237,7 +239,7 @@ class Dataset:
         # fmt: off
         return (
             # any(x in self.kmerset for x in kmers(seq, 18))
-            any(x in self.trna_rna_kmers for x in kmers(seq, 15))
+            any(x in self.trna_rna_kmers for x in kmers(seq, 18))
         )
         # fmt: on
 

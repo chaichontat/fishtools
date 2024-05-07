@@ -26,7 +26,10 @@ pl.Config.set_tbl_rows(30)
 
 
 def get_pseudogenes(
-    gene: str, ensembl: ExternalData, y: SAMFrame, limit: int = -1
+    genes: list[str],
+    ensembl: ExternalData,
+    y: SAMFrame,
+    limit: int = -1,  # allow: list[str] | None = None
 ) -> tuple[pl.Series, pl.DataFrame]:
     counts = (
         y.count("transcript")
@@ -38,9 +41,9 @@ def get_pseudogenes(
         .sort("count", descending=True)
         .with_row_count("i")
         .with_columns(
-            acceptable=pl.col("transcript_name").str.contains(rf"^{gene}.*")
-            | pl.col("transcript_name").str.starts_with("Gm")
-            | pl.col("transcript_name").is_null(),
+            acceptable=pl.col("transcript_name").str.contains(rf"^({'|'.join(genes)})[a-zA-Z]?.*")
+            # | pl.col("transcript").is_in(allow)
+            | pl.col("transcript_name").str.starts_with("Gm") | pl.col("transcript_name").is_null(),
             significant=pl.col("count") > 0.1 * pl.col("count").max(),
         )
     )
@@ -50,7 +53,7 @@ def get_pseudogenes(
     limit = limit if limit > 0 else (not_acceptable[0, "i"] - 1 or 10)
 
     if len(not_acceptable):
-        logger.warning(f"More than 10% of candidates of {gene} bind to other genes.")
+        logger.warning(f"More than 10% of candidates of {genes} bind to other genes.")
         print(not_acceptable[:50])
 
     # Filter based on expression and number of probes aligned.
@@ -98,11 +101,7 @@ def get_candidates(
     )
 
 
-def _run_bowtie(
-    dataset: Dataset,
-    seqs: pl.DataFrame,
-    ignore_revcomp: bool = False,
-):
+def _run_bowtie(dataset: Dataset, seqs: pl.DataFrame, ignore_revcomp: bool = False, **kwargs):
     y = SAMFrame.from_bowtie_split_name(
         gen_fasta(seqs["seq"], names=seqs["name"]).getvalue(),
         dataset.path / "txome",
@@ -111,6 +110,7 @@ def _run_bowtie(
         n_return=200,
         fasta=True,
         no_reverse=ignore_revcomp,
+        **kwargs,
     )
 
     return (
@@ -142,12 +142,12 @@ def _run_transcript(
     realign: bool = False,
     allow: list[str] | None = None,
     disallow: list[str] | None = None,
-    formamide: int = 45,
+    formamide: int = 40,
     pseudogene_limit: int = -1,
 ):
     allow, disallow = allow or [], disallow or []
-    allow = _convert_gene_to_tss(dataset, allow)
-    disallow = _convert_gene_to_tss(dataset, disallow)
+    allow_tss = _convert_gene_to_tss(dataset, allow)
+    disallow_tss = _convert_gene_to_tss(dataset, disallow)
 
     (output := Path(output)).mkdir(exist_ok=True)
 
@@ -194,8 +194,8 @@ def _run_transcript(
         if len(crawled) > 5000:
             logger.warning(f"Transcript {transcript_id} has {len(crawled)} probes. Using only 2000.")
             crawled = crawled.sample(n=2000, shuffle=True, seed=3)
-        if len(crawled) < 50:
-            raise Exception(f"Transcript {transcript_id} has only {len(crawled)} probes.")
+        if len(crawled) < 5:
+            logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
         if len(crawled) < 100:
             logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
 
@@ -220,7 +220,7 @@ def _run_transcript(
     )
 
     tss_pseudo, counts = (
-        get_pseudogenes(gene, dataset.ensembl, y, limit=pseudogene_limit)
+        get_pseudogenes(list(set([gene]) | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
         if pseudogene_limit
         else (pl.Series(), pl.DataFrame())
     )
@@ -229,7 +229,7 @@ def _run_transcript(
         bad_sig.write_csv(output / f"{transcript_name}_offtarget_counts.csv")
 
     # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
-    tss_others = {*tss_pseudo, *allow} - set(disallow)
+    tss_others = {*tss_pseudo, *allow_tss} - set(disallow_tss)
 
     if len(tss_others):
         names_with_pseudo = (
@@ -270,8 +270,8 @@ def _run_transcript(
         .with_columns(
             [
                 (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-                pl.col("seq").apply(lambda s: tm(cast(str, s), "rna", formamide=formamide)).alias("tm"),
-                pl.col("seq").apply(lambda s: hp(cast(str, s), "rna", formamide=formamide)).alias("hp"),
+                pl.col("seq").apply(lambda s: tm(cast(str, s), "hybrid", formamide=formamide)).alias("tm"),
+                pl.col("seq").apply(lambda s: hp(cast(str, s), "hybrid", formamide=formamide)).alias("hp"),
             ]
         )
         .with_columns(oks=pl.sum(pl.col("^ok_.*$")))
@@ -295,8 +295,12 @@ def _run_transcript(
 @click.option("--ignore-revcomp", "-r", is_flag=True)
 @click.option("--realign", is_flag=True)
 @click.option("--pseudogene-limit", type=int, default=-1)
-@click.option("--allow", type=str, multiple=True, help="Don't filter out probes that bind to these genes")
-@click.option("--disallow", type=str, multiple=True, help="DO filter out probes that bind to these genes")
+@click.option(
+    "--allow", type=str, help="Don't filter out probes that bind to these genes, separated by comma."
+)
+@click.option(
+    "--disallow", type=str, help="DO filter out probes that bind to these genes, separated by comma."
+)
 def candidates(
     path: str,
     gene: str | None,
@@ -304,11 +308,13 @@ def candidates(
     output: str | Path = "output/",
     ignore_revcomp: bool = True,
     realign: bool = False,
-    allow: list[str] | None = None,
-    disallow: list[str] | None = None,
+    allow: str | None = None,
+    disallow: str | None = None,
     pseudogene_limit: int = -1,
 ):
     """Initial screening of probes candidates for a gene."""
+    allow_ = allow.split(",") if allow else None
+    disallow_ = disallow.split(",") if disallow else None
     get_candidates(
         Dataset(path),
         gene=gene,
@@ -316,7 +322,7 @@ def candidates(
         output=output,
         ignore_revcomp=ignore_revcomp,
         realign=realign,
-        allow=allow,
-        disallow=disallow,
+        allow=allow_,
+        disallow=disallow_,
         pseudogene_limit=pseudogene_limit,
     )

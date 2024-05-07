@@ -220,7 +220,7 @@ class SAMFrame(pl.DataFrame):
         return SAMFrame(self.filter(~pl.col("name").is_in(nogo["name"])))
 
     @to_samframe
-    def agg_tm_offtarget(self, acceptable_tss: Collection[str], formamide: int = 45):
+    def agg_tm_offtarget(self, acceptable_tss: Collection[str], formamide: int = 10):
         # Filter by maximum offtarget Tms.
         # Only calculate Tm for sequences with >15 consecutive matches
         # to save time.

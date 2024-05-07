@@ -6,9 +6,9 @@ import colorama
 import numpy as np
 import numpy.typing as npt
 import polars as pl
+from Bio.Seq import Seq
 from matplotlib.axes import Axes
 
-table = str.maketrans("ACGTacgt ", "TGCAtgca ")
 name_splitter = re.compile(r"(.+)_(.+):(\d+)-(\d+)")
 
 c = re.compile(r"(\d+)S(\d+)M")
@@ -47,7 +47,7 @@ def printc(seq: str):
 def reverse_complement(seq: str) -> str:
     """Return the reverse complement of a DNA sequence."""
     # https://bioinformatics.stackexchange.com/a/3585
-    return seq.translate(table)[::-1]
+    return Seq(seq).reverse_complement().__str__()
 
 
 def pcr(seq: str, primer: str, primer_rc: str) -> str:
@@ -58,6 +58,40 @@ def pcr(seq: str, primer: str, primer_rc: str) -> str:
     if loc_rc == -1:
         raise ValueError(f"Primer {primer_rc} not found in sequence {seq}")
     return seq[loc : None if loc_rc == 0 else -loc_rc]
+
+
+def is_subsequence(sub_dna: str):
+    iupac_dict = {
+        "R": "[AG]",
+        "Y": "[CT]",
+        "S": "[GC]",
+        "W": "[AT]",
+        "K": "[GT]",
+        "M": "[AC]",
+        "B": "[CGT]",
+        "D": "[AGT]",
+        "H": "[ACT]",
+        "V": "[ACG]",
+        "N": "[ACGT]",
+    }
+
+    # Convert sub_dna to regex
+    sub_dna_regex = ""
+    for base in sub_dna:
+        if base in iupac_dict:
+            sub_dna_regex += iupac_dict[base]
+        else:
+            sub_dna_regex += base
+
+    # Check if sub_dna is in main_dna
+    sub_dna_regex = re.compile(sub_dna_regex)
+
+    def inner(main_dna: str):
+        if match := sub_dna_regex.search(main_dna):
+            return match.span()
+        return None
+
+    return inner
 
 
 def gen_random_base(n: int) -> str:
@@ -100,7 +134,11 @@ def stripplot(**kwargs: Any) -> Axes:
     return sns.stripplot(data=df, x="x", y="y", **(dict(orient="h", alpha=0.6)))  # type: ignore
 
 
-def gen_plate(name: str, seqs: list[str], order: Literal["C", "F"] = "C") -> pl.DataFrame:
+def gen_idt(name: str, seq: str, scale: str = "25nm", purification: str = "STD") -> str:
+    return f"{name}\t{seq}\t\t{scale}\t{purification}"
+
+
+def gen_plate(name: str | list[str], seqs: list[str], order: Literal["C", "F"] = "C") -> pl.DataFrame:
     if order == "C":
         wells = [f"{row}{col:02d}" for row in "ABCDEFGH" for col in range(1, 13)]
     else:

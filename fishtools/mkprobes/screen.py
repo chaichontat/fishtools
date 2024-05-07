@@ -45,14 +45,16 @@ def _screen(
     if restriction:
         logger.info(f"Filtering for probes w/o {', '.join(restriction)} site(s).")
         res = Restriction.RestrictionBatch(restriction)
-        ff = ff.filter(~pl.col("seq").apply(lambda x: any(res.search(Seq(x)).values())))
+        ff = ff.filter(~pl.col("seq").apply(lambda x: any(res.search(Seq("NNNNNN" + x + "NNNNNN")).values())))
 
+    print(ff)
     final = the_filter(ff, overlap=overlap)
     assert not final["seq"].str.contains("N").any(), "N appears out of nowhere."
     final.write_parquet(
         write_path := output_dir
         / f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else '' }.parquet"
     )
+
     logger.debug(f"Written to {write_path}.")
     return final
 
@@ -108,16 +110,14 @@ def run_screen(
         logger.warning(f"File {file} exists. Skipping.")
         return pl.read_parquet(output_dir / file)
 
-    [
-        file.unlink()
-        for file in output_dir.glob(
-            f"{gene}_screened_ol*{'_' + ''.join(restriction) if restriction else '' }.parquet"
-        )
-    ]
+    for file in output_dir.glob(
+        f"{gene}_screened_ol*{'_' + ''.join(restriction) if restriction else '' }.parquet"
+    ):
+        file.unlink(missing_ok=True)
 
     if minimum is not None:
-        if maxoverlap % 5 != 0 or maxoverlap == 0:
-            raise ValueError("maxoverlap must be positive non-zero and a multiple of 5")
+        if maxoverlap % 5 != 0:
+            raise ValueError("maxoverlap must be multiple of 5")
 
         res = {}
         for i in chain((-2,), range(5, maxoverlap + 1, 5)):

@@ -7,15 +7,19 @@ from typing import Any, Callable
 import click
 import numpy as np
 import polars as pl
+import rich
+import rich_click as click
 from astropy.stats import SigmaClip, sigma_clipped_stats
 from astropy.table.table import QTable
 from loguru import logger
 from photutils.background import Background2D, MedianBackground
-from photutils.detection import IRAFStarFinder
+from photutils.detection import DAOStarFinder, IRAFStarFinder
 from scipy.ndimage import shift
 from scipy.spatial import cKDTree
 from skimage.registration import phase_cross_correlation
 from tifffile import TiffFile
+
+console = rich.get_console()
 
 
 def imread_page(path: Path | str, page: int):
@@ -25,9 +29,10 @@ def imread_page(path: Path | str, page: int):
         return tif.pages[page].asarray()
 
 
-def find_spots(data: np.ndarray[np.uint16, Any]) -> QTable:
+def find_spots(data: np.ndarray[np.uint16, Any], threshold_sigma: float = 3, fwhm: float = 4) -> QTable:
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-    iraffind = IRAFStarFinder(threshold=5.0 * std, fwhm=3, exclude_border=True)
+    # iraffind = DAOStarFinder(threshold=3.0 * std, fwhm=4, sharplo=0.2, exclude_border=True)
+    iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
     return iraffind(data - median)
 
 
@@ -36,16 +41,17 @@ def calc_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2):
 
 
 def background(img: np.ndarray):
-    sigma_clip = SigmaClip(sigma=3.0)
+    sigma_clip = SigmaClip(sigma=2.0)
     bkg = Background2D(
         img, (50, 50), filter_size=(3, 3), sigma_clip=sigma_clip, bkg_estimator=MedianBackground()
     )
     return bkg.background
 
 
-def gen_corr(ref: np.ndarray, precision: int = 2):
+def gen_corr(ref: np.ndarray, precision: int = 2, fiducial_corr: bool = True):
     cols = ["xcentroid", "ycentroid"]
     ref = ref - background(ref)
+
     fixed = pl.DataFrame(find_spots(ref).to_pandas()).with_row_count("idx")
     kd = cKDTree(fixed[cols])
 
@@ -56,24 +62,37 @@ def gen_corr(ref: np.ndarray, precision: int = 2):
         # Initial alignment
         initial_px = calc_shift(ref, img)
         initial_px = np.array(initial_px)
-        t1 = shift(img, initial_px, order=1)
+        logger.debug(f"{initial_px=}")
 
+        if not fiducial_corr:
+            return np.round(initial_px, precision)
+
+        t1 = shift(img, initial_px, order=1)
         # Find fiducials
         moving = pl.DataFrame(find_spots(t1)[cols].to_pandas()).with_row_count("idx")
-        dist, idxs = kd.query(moving[cols], distance_upper_bound=10, workers=2)
+        dist, idxs = kd.query(moving[cols], workers=2)
         mapping = pl.concat(
             [pl.DataFrame(dict(fixed_idx=np.array(idxs, dtype=np.uint32), dist=dist)), moving],
             how="horizontal",
         )
 
         # Remove duplicate mapping, priority on closest
-        finite = mapping.filter(pl.col("dist").is_finite()).sort("dist").unique("fixed_idx", keep="first")
+        thresh = np.percentile(dist, 10), np.percentile(dist, 90)
+        finite = (
+            mapping.filter(pl.col("dist").gt(thresh[0]) & pl.col("dist").lt(thresh[1]))
+            .sort("dist")
+            .unique("fixed_idx", keep="first")
+        )
         joined = finite.join(
             fixed[["idx", *cols]], left_on="fixed_idx", right_on="idx", how="left", suffix="_fixed"
         ).with_columns(
             dx=pl.col("xcentroid") - pl.col("xcentroid_fixed"),
             dy=pl.col("ycentroid") - pl.col("ycentroid_fixed"),
         )
+
+        if len(joined) < 6:
+            logger.warning(f"WARNING: not enough fiducials found {len(joined)}. Using initial alignment")
+            return np.round(initial_px, precision)
 
         drift = joined[["dy", "dx"]].median().to_numpy().squeeze()
         if np.hypot(*drift) > 2:
@@ -92,6 +111,7 @@ def align_fiducials(
     reference: str,
     precision: int = 2,
     threads: int = 4,
+    fiducial_corr: bool = True,
 ) -> dict[str, np.ndarray[float, Any]]:
     keys = list(fids.keys())
     for name in keys:
@@ -101,7 +121,7 @@ def align_fiducials(
     else:
         raise ValueError(f"Could not find reference {reference} in {keys}")
 
-    corr = gen_corr(fids[ref], precision)
+    corr = gen_corr(fids[ref], precision, fiducial_corr=fiducial_corr)
     with ThreadPoolExecutor(threads) as exc:
         futs = {k: exc.submit(corr, img) for k, img in fids.items() if k != ref}
 

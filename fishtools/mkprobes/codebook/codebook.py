@@ -1,11 +1,20 @@
 # %%
+import json
+from hashlib import md5
 from pathlib import Path
-from typing import Any, Literal, Sized
+from typing import Any, Collection, Literal, Sized, overload
 
 import numpy as np
 import numpy.typing as npt
 import polars as pl
 from loguru import logger
+
+
+def hash_codebook(cb: dict[str, Collection[int]]) -> str:
+    return md5(
+        json.dumps(cb, sort_keys=True, ensure_ascii=True).encode(),
+        usedforsecurity=False,
+    ).hexdigest()[-6:]
 
 
 class CodebookPicker:
@@ -90,8 +99,18 @@ class CodebookPicker:
 
         return int(best), self._calc_entropy(int(best), fpkm)[1]
 
+    @overload
     def export_codebook(
-        self, seed: int, type: Literal["csv", "json"] = "json"
+        self, seed: int, type: Literal["json"] = ..., offset: int = ...
+    ) -> dict[str, list[int]]:
+        ...
+
+    @overload
+    def export_codebook(self, seed: int, type: Literal["csv"], offset: int = ...) -> pl.DataFrame:
+        ...
+
+    def export_codebook(
+        self, seed: int, type: Literal["csv", "json"] = "json", offset: int = 1
     ) -> pl.DataFrame | dict[str, list[int]]:
         rmhd4 = self.gen_codebook(seed)
         n_blanks = self.mhd4.shape[0] - len(self.genes)
@@ -106,7 +125,8 @@ class CodebookPicker:
                 )
             case "json":
                 return {
-                    gene: list(np.flatnonzero(code) + 1) for gene, code in zip(self.genes, rmhd4.astype(int))
+                    gene: list(np.flatnonzero(code) + offset)
+                    for gene, code in zip(self.genes, rmhd4.astype(int))
                 }
             case _:  # type: ignore
                 raise ValueError(f"Unknown type {type}")

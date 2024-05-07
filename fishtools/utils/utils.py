@@ -4,7 +4,7 @@ from functools import cache, wraps
 from inspect import getcallargs
 from pathlib import Path
 from subprocess import PIPE, Popen
-from typing import Any, Callable, Concatenate, ParamSpec, Sequence, TypeVar, cast
+from typing import Any, Callable, Concatenate, Iterable, ParamSpec, Sequence, TypeVar, cast
 
 import loguru
 from loguru import logger
@@ -61,7 +61,7 @@ def setup_logging():
 
             logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
 
-    logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
+    logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
     logging.getLogger("biothings").setLevel(logging.CRITICAL)
     return logger
 

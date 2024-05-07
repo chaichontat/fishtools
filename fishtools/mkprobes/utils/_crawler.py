@@ -8,13 +8,13 @@ from .sequtils import gc_content
 def crawler(
     seq: str,
     prefix: str,
-    length_limit: tuple[int, int] = (24, 46),
+    length_limit: tuple[int, int] = (45, 52),
     gc_limit: tuple[float, float] = (0.3, 0.7),
-    tm_limit: tuple[float, float] = (50, 60),
-    hairpin_limit: float = 42,
-    tm_model: Model = "rna",
+    tm_limit: tuple[float, float] = (54, 65),
+    hairpin_limit: float = 45,
+    tm_model: Model = "hybrid",
     to_avoid: list[str] | None = None,
-    formamide: float = 45,
+    formamide: float = 40,
 ) -> pl.DataFrame:
     """
     Based on the monotonic relationship between Tm and sequence length.
