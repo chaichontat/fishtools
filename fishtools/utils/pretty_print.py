@@ -1,10 +1,44 @@
 import json
-from typing import Any, Callable, Concatenate, ParamSpec, Protocol, TypeVar
+import threading
+from contextlib import contextmanager
+from typing import Any, Callable, Concatenate, Generator, ParamSpec, Protocol, TypeVar
 
 import colorama
 from loguru import logger
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.syntax import Syntax
+
+
+@contextmanager
+def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ) as p:
+        track = iter(p.track(range(n)))
+
+        def callback(*args: Any, **kwargs: Any):
+            with threading.RLock():
+                return next(track)
+
+        yield callback
+        next(track)
+
 
 console = Console()
 
@@ -14,8 +48,7 @@ R, T = TypeVar("R", covariant=True), TypeVar("T")
 
 # Massive hack to get rid of the first two arguments from the type signature.
 class _JPrint(Protocol[P]):
-    def __call__(self, code: str, lexer: str, *args: P.args, **kwargs: P.kwargs) -> Any:
-        ...
+    def __call__(self, code: str, lexer: str, *args: P.args, **kwargs: P.kwargs) -> Any: ...
 
 
 def _jprint(f: _JPrint[P]) -> Callable[Concatenate[Any, P], None]:
