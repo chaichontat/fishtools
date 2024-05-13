@@ -1,10 +1,11 @@
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
 import click
+import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import rich
@@ -29,14 +30,17 @@ def imread_page(path: Path | str, page: int):
         return tif.pages[page].asarray()
 
 
-def find_spots(data: np.ndarray[np.uint16, Any], threshold_sigma: float = 3, fwhm: float = 4) -> QTable:
-    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+def find_spots(
+    data: np.ndarray[np.uint16, Any], threshold_sigma: float = 3, fwhm: float = 4, sigma_stat: float = 3.0
+):
+    assert np.sum(data) > 0
     # iraffind = DAOStarFinder(threshold=3.0 * std, fwhm=4, sharplo=0.2, exclude_border=True)
+    mean, median, std = sigma_clipped_stats(data, sigma=sigma_stat)
     iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
-    return iraffind(data - median)
+    return pl.DataFrame(iraffind(data - median).to_pandas()).with_row_count("idx")
 
 
-def calc_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2):
+def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2):
     return phase_cross_correlation(ref, img, upsample_factor=int(10**precision))[0]
 
 
@@ -48,70 +52,109 @@ def background(img: np.ndarray):
     return bkg.background
 
 
-def gen_corr(ref: np.ndarray, precision: int = 2, fiducial_corr: bool = True):
+def _calculate_drift(
+    ref_kd: cKDTree,
+    ref_points: pl.DataFrame,
+    target_points: pl.DataFrame,
+    *,
+    initial_drift: np.ndarray | None = None,
+    # subtract_background: bool = False,
+    plot: bool = False,
+    precision: int = 2,
+):
+    """scipy ordering is based on (z, y, x) like the image dimensions."""
+
     cols = ["xcentroid", "ycentroid"]
-    ref = ref - background(ref)
 
-    fixed = pl.DataFrame(find_spots(ref).to_pandas()).with_row_count("idx")
-    kd = cKDTree(fixed[cols])
+    # points = moving[cols].to_numpy()
+    if initial_drift is None:
+        initial_drift = np.zeros(2)
 
-    def correct_fiducial(img: np.ndarray):
-        """scipy ordering is based on (z, y, x) like the image dimensions."""
-        img = img - background(img)
+    target_points = target_points.with_columns(
+        xcentroid=pl.col("xcentroid") + initial_drift[0],
+        ycentroid=pl.col("ycentroid") + initial_drift[1],
+    )
 
-        # Initial alignment
-        initial_px = calc_shift(ref, img)
-        initial_px = np.array(initial_px)
-        logger.debug(f"{initial_px=}")
+    dist, idxs = ref_kd.query(target_points[cols], workers=2)
+    mapping = pl.concat(
+        [pl.DataFrame(dict(fixed_idx=np.array(idxs, dtype=np.uint32), dist=dist)), target_points],
+        how="horizontal",
+    )
 
-        if not fiducial_corr:
-            return np.round(initial_px, precision)
+    # Remove duplicate mapping, priority on closest
+    # thresh = np.percentile(dist, 10), np.percentile(dist, 90)
+    finite = mapping.sort("dist").unique("fixed_idx", keep="first")
+    joined = finite.join(
+        ref_points[["idx", *cols]], left_on="fixed_idx", right_on="idx", how="left", suffix="_fixed"
+    ).with_columns(
+        dx=pl.col("xcentroid_fixed") - pl.col("xcentroid"),
+        dy=pl.col("ycentroid_fixed") - pl.col("ycentroid"),
+    )
 
-        t1 = shift(img, initial_px, order=1)
-        # Find fiducials
-        moving = pl.DataFrame(find_spots(t1)[cols].to_pandas()).with_row_count("idx")
-        dist, idxs = kd.query(moving[cols], workers=2)
-        mapping = pl.concat(
-            [pl.DataFrame(dict(fixed_idx=np.array(idxs, dtype=np.uint32), dist=dist)), moving],
-            how="horizontal",
-        )
+    if len(joined) < 6:
+        logger.warning(f"WARNING: not enough fiducials found {len(joined)}. Using initial alignment")
+        return np.round([0, 0], precision)
 
-        # Remove duplicate mapping, priority on closest
-        thresh = np.percentile(dist, 10), np.percentile(dist, 90)
-        finite = (
-            mapping.filter(pl.col("dist").gt(thresh[0]) & pl.col("dist").lt(thresh[1]))
-            .sort("dist")
-            .unique("fixed_idx", keep="first")
-        )
-        joined = finite.join(
-            fixed[["idx", *cols]], left_on="fixed_idx", right_on="idx", how="left", suffix="_fixed"
-        ).with_columns(
-            dx=pl.col("xcentroid") - pl.col("xcentroid_fixed"),
-            dy=pl.col("ycentroid") - pl.col("ycentroid_fixed"),
-        )
+    def mode(data: np.ndarray):
+        bin_size = 0.5
+        bins = np.arange(min(data), max(data) + bin_size, bin_size)
+        bin_indices = np.digitize(data, bins)
+        bin_counts = np.bincount(bin_indices)
+        i = np.argwhere(bin_counts == np.max(bin_counts)).flatten()[0]
+        return (bins[i] + bins[i + 1]) / 2
 
-        if len(joined) < 6:
-            logger.warning(f"WARNING: not enough fiducials found {len(joined)}. Using initial alignment")
-            return np.round(initial_px, precision)
+    if plot:
+        fig, axs = plt.subplots(ncols=2, nrows=1, figsize=(8, 4), dpi=200)
+        axs = axs.flatten()
+        axs[0].hist(joined["dx"], bins=100)
+        axs[1].hist(joined["dy"], bins=100)
 
-        drift = joined[["dy", "dx"]].median().to_numpy().squeeze()
-        if np.hypot(*drift) > 2:
-            logger.warning("WARNING: drift too large", drift)
+    if np.allclose(initial_drift, np.zeros(2)):
+        res = np.array([mode(joined["dx"]), mode(joined["dy"])])
+    else:
+        drift = joined[["dx", "dy"]].median().to_numpy().squeeze()
+        res = initial_drift + drift
 
-        final = initial_px - drift
-        logger.debug(f"{drift=}")
-        return np.round(final, precision)
+    return np.round(res, precision)
 
-    return correct_fiducial
+
+def run_fiducial(ref: np.ndarray, *, subtract_background: bool = False, debug: bool = False, name: str = ""):
+    if subtract_background:
+        ref = ref - background(ref)
+    fixed = find_spots(ref)
+    logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
+    kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
+
+    def inner(img: np.ndarray, threshold: float = 0.1, *, limit: int = 3, bitname: str = ""):
+        if subtract_background:
+            img = img - background(img)
+        moving = find_spots(img)
+        logger.debug(f"{bitname}: {len(moving)} peaks found on target image.")
+
+        initial_drift = np.zeros(2)
+        assert limit > 0
+        for n in range(limit):
+            drift = _calculate_drift(kd, fixed, moving, initial_drift=initial_drift)
+            residual = np.hypot(*(drift - initial_drift))
+            logger.debug(f"{bitname} - attempt {n}: {drift=}. {residual=:.2f}.")
+            if residual < threshold:
+                return drift
+            initial_drift = drift
+
+        if residual > 0.5:  # type: ignore
+            logger.warning(f"{bitname}: residual drift too large {residual=:2f}.")  # type: ignore
+        return drift  # type: ignore
+
+    return inner
 
 
 def align_fiducials(
     fids: dict[str, np.ndarray[Any, Any]],
     *,
     reference: str,
-    precision: int = 2,
     threads: int = 4,
-    fiducial_corr: bool = True,
+    subtract_background: bool = False,
+    debug: bool = False,
 ) -> dict[str, np.ndarray[float, Any]]:
     keys = list(fids.keys())
     for name in keys:
@@ -121,11 +164,35 @@ def align_fiducials(
     else:
         raise ValueError(f"Could not find reference {reference} in {keys}")
 
-    corr = gen_corr(fids[ref], precision, fiducial_corr=fiducial_corr)
-    with ThreadPoolExecutor(threads) as exc:
-        futs = {k: exc.submit(corr, img) for k, img in fids.items() if k != ref}
+    del reference
+    corr = run_fiducial(fids[ref], subtract_background=subtract_background, debug=debug, name=ref)
+    with ThreadPoolExecutor(threads if not debug else 1) as exc:
+        futs: dict[str, Future] = {}
+        for k, img in fids.items():
+            if k == ref:
+                continue
+            futs[k] = exc.submit(corr, img, bitname=k)
+
+            if debug:
+                futs[k].result()
 
     return {k: v.result() for k, v in futs.items()} | {ref: np.zeros(2)}
+
+
+def plot_alignment(fids: dict[str, np.ndarray[float, Any]], sl: slice = np.s_[500:600]):
+    keys = list(fids.keys())
+    ns = (len(fids) // 3) + 1
+    fig, axs = plt.subplots(ncols=1, nrows=ns, figsize=(3, 9), dpi=200)
+    axs = axs.flatten()
+
+    combi = np.stack([fids[k] for k in keys]).astype(np.float64)
+    combi /= np.percentile(combi, 99, axis=(1, 2))[:, None, None]
+    combi = np.clip(combi, 0, 1)
+
+    for ax, i in zip(axs, range(0, len(fids), 3)):
+        if len(fids) - i < 3:
+            i = len(fids) - 3
+        ax.imshow(np.moveaxis(combi[i : i + 3][:, sl, sl], 0, 2))
 
 
 def align_fiducials_from_file(
@@ -141,7 +208,6 @@ def align_fiducials_from_file(
     return align_fiducials(
         {file.name: imread_page(file, idx) for file in sorted(Path(folder).glob(glob)) if filter_(file.name)},
         reference=reference,
-        precision=precision,
         threads=threads,
     )
 
