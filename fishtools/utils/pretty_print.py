@@ -20,6 +20,7 @@ from rich.syntax import Syntax
 
 @contextmanager
 def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
+    console.log("Starting...")
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
@@ -37,7 +38,11 @@ def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
                 return next(track)
 
         yield callback
-        next(track)
+        try:
+            while True:
+                next(track)
+        except StopIteration:
+            ...
 
 
 console = Console()

@@ -36,8 +36,11 @@ def find_spots(
     assert np.sum(data) > 0
     # iraffind = DAOStarFinder(threshold=3.0 * std, fwhm=4, sharplo=0.2, exclude_border=True)
     mean, median, std = sigma_clipped_stats(data, sigma=sigma_stat)
-    iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
-    return pl.DataFrame(iraffind(data - median).to_pandas()).with_row_count("idx")
+    iraffind = DAOStarFinder(threshold=mean + threshold_sigma * std, fwhm=fwhm, exclude_border=True)
+    try:
+        return pl.DataFrame(iraffind(data - median).to_pandas()).with_row_count("idx")
+    except AttributeError as e:
+        return pl.DataFrame()
 
 
 def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2):
@@ -101,6 +104,8 @@ def _calculate_drift(
         bin_indices = np.digitize(data, bins)
         bin_counts = np.bincount(bin_indices)
         i = np.argwhere(bin_counts == np.max(bin_counts)).flatten()[0]
+        if i == 0 or i == len(bins) - 1:
+            return np.median(data)
         return (bins[i] + bins[i + 1]) / 2
 
     if plot:
@@ -118,17 +123,36 @@ def _calculate_drift(
     return np.round(res, precision)
 
 
-def run_fiducial(ref: np.ndarray, *, subtract_background: bool = False, debug: bool = False, name: str = ""):
+def run_fiducial(
+    ref: np.ndarray,
+    *,
+    subtract_background: bool = False,
+    debug: bool = False,
+    name: str = "",
+    threshold: float = 3,
+    fwhm: float = 4,
+):
     if subtract_background:
         ref = ref - background(ref)
-    fixed = find_spots(ref)
+    try:
+        fixed = find_spots(ref, threshold_sigma=threshold, fwhm=fwhm)
+        if not len(fixed):
+            raise ValueError("No spots found on reference image.")
+    except Exception as e:
+        logger.error(f"Cannot find reference spots. {e}")
+        return lambda *args, **kwargs: np.zeros(2)
+
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
     def inner(img: np.ndarray, threshold: float = 0.1, *, limit: int = 3, bitname: str = ""):
         if subtract_background:
             img = img - background(img)
-        moving = find_spots(img)
+        moving = find_spots(img, threshold_sigma=threshold, fwhm=fwhm)
+        if len(moving) < 6:
+            logger.warning(f"WARNING: not enough fiducials. Setting zero.")
+            return np.round([0, 0])
+
         logger.debug(f"{bitname}: {len(moving)} peaks found on target image.")
 
         initial_drift = np.zeros(2)
@@ -136,7 +160,7 @@ def run_fiducial(ref: np.ndarray, *, subtract_background: bool = False, debug: b
         for n in range(limit):
             drift = _calculate_drift(kd, fixed, moving, initial_drift=initial_drift)
             residual = np.hypot(*(drift - initial_drift))
-            logger.debug(f"{bitname} - attempt {n}: {drift=}. {residual=:.2f}.")
+            logger.debug(f"{bitname} - attempt {n}: {residual=:.2f}. {drift=}.")
             if residual < threshold:
                 return drift
             initial_drift = drift
@@ -148,6 +172,33 @@ def run_fiducial(ref: np.ndarray, *, subtract_background: bool = False, debug: b
     return inner
 
 
+def align_phase(
+    fids: dict[str, np.ndarray[Any, Any]], *, reference: str, threads: int = 4, debug: bool = False
+):
+
+    keys = list(fids.keys())
+    for name in keys:
+        if re.search(reference, name):
+            ref = name
+            break
+    else:
+        raise ValueError(f"Could not find reference {reference} in {keys}")
+
+    del reference
+    with ThreadPoolExecutor(threads if not debug else 1) as exc:
+        futs: dict[str, Future] = {}
+        for k, img in fids.items():
+            if k == ref:
+                continue
+            futs[k] = exc.submit(phase_shift, fids[ref], img)
+
+            if debug:
+                # Force single-thread
+                logger.debug(f"{k}: {futs[k].result()}")
+
+    return {k: v.result().astype(float) for k, v in futs.items()} | {ref: np.zeros(2)}
+
+
 def align_fiducials(
     fids: dict[str, np.ndarray[Any, Any]],
     *,
@@ -155,6 +206,9 @@ def align_fiducials(
     threads: int = 4,
     subtract_background: bool = False,
     debug: bool = False,
+    iterations: int = 3,
+    threshold: float = 3,
+    fwhm: float = 4,
 ) -> dict[str, np.ndarray[float, Any]]:
     keys = list(fids.keys())
     for name in keys:
@@ -165,13 +219,20 @@ def align_fiducials(
         raise ValueError(f"Could not find reference {reference} in {keys}")
 
     del reference
-    corr = run_fiducial(fids[ref], subtract_background=subtract_background, debug=debug, name=ref)
+    corr = run_fiducial(
+        fids[ref],
+        subtract_background=subtract_background,
+        debug=debug,
+        name=ref,
+        threshold=threshold,
+        fwhm=fwhm,
+    )
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
         futs: dict[str, Future] = {}
         for k, img in fids.items():
             if k == ref:
                 continue
-            futs[k] = exc.submit(corr, img, bitname=k)
+            futs[k] = exc.submit(corr, img, bitname=k, limit=iterations)
 
             if debug:
                 futs[k].result()
