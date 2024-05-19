@@ -54,8 +54,10 @@ reportUnknownArgumentType = false
 reportUnknownLambdaType = false
 reportUnknownMemberType = false
 reportUnknownVariableType = false
+reportUnknownParameterType = "none"
 reportUntypedFunctionDecorator = false
 reportUnusedImport = false
+reportMissingTypeArgument = "none"
 reportUnusedVariable = false
 typeCheckingMode = "strict"
 

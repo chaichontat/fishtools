@@ -25,7 +25,7 @@ from tifffile import imread, imwrite
 
 # %%
 
-img = imread("trc.tif")
+img = imread("/fast2/3t3clean/down2/full_1000.tif")
 
 
 class DemoFetchedTile(FetchedTile):
@@ -36,8 +36,8 @@ class DemoFetchedTile(FetchedTile):
     @property
     def shape(self) -> Mapping[Axes, int]:
         return {
-            Axes.Y: 2000,
-            Axes.X: 2000,
+            Axes.Y: img.shape[1],
+            Axes.X: img.shape[2],
         }
 
     @property
@@ -49,9 +49,7 @@ class DemoFetchedTile(FetchedTile):
         }
 
     def tile_data(self) -> np.ndarray:
-        return img[self.c][24:2024, 24:2024] + np.random.randint(
-            0, 1, size=((2000, 2000))
-        )  # [512:1536, 512:1536]
+        return img[self.c]  # [512:1536, 512:1536]
 
 
 class DemoTileFetcher(TileFetcher):
@@ -62,12 +60,12 @@ class DemoTileFetcher(TileFetcher):
 stack = ImageStack.from_tilefetcher(
     DemoTileFetcher(),
     {
-        Axes.X: 2000,
-        Axes.Y: 2000,
+        Axes.X: img.shape[2],
+        Axes.Y: img.shape[1],
     },
     fov=0,
     rounds=range(1),
-    chs=range(24),
+    chs=range(img.shape[0]),
     zplanes=range(1),
     group_by=(Axes.CH, Axes.ZPLANE),
 )

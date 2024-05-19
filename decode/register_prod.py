@@ -1,26 +1,36 @@
 # %%
 
 import json
+import logging
+import pickle
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import click
+import jax
 import numpy as np
 import SimpleITK as sitk
 import tifffile
 import toml
+from basicpy import BaSiC
 from loguru import logger
 from scipy import ndimage
 from scipy.ndimage import shift
 from skimage.measure import block_reduce
-from tifffile import imread
+from tifffile import TiffFile, imread
 
 from fishtools import align_fiducials
 from fishtools.analysis.fiducial import align_phase, phase_shift
 
+logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
+
+jax.config.update("jax_platform_name", "cpu")
 DATA = Path("/home/chaichontat/fishtools/data")
-channels = toml.load("/home/chaichontat/fishtools/decode/channels.toml")
+
+with open(DATA / "basic_all.pkl", "rb") as f:
+    basic: dict[str, BaSiC] = pickle.load(f)
 
 As = {}
 ats = {}
@@ -33,14 +43,6 @@ for λ in ["405", "488", "560", "750"]:
     As[λ] = A
     ats[λ] = t
 
-dark = imread(DATA / "dark.tif").astype(np.float32)
-flats = {}
-
-for λ in ["405", "488", "560", "647", "750"]:
-    flat = (imread(DATA / f"flat_{λ if λ != '750' else '647'}.tif") - dark).astype(np.float32)
-    flat /= np.min(flat)  # so that we don't divide with less than 1.
-    flats[λ] = flat
-
 
 def spillover_correction(spillee: np.ndarray, spiller: np.ndarray, corr: float):
     return np.clip(spillee - spiller * corr, 0, 65535)
@@ -49,7 +51,7 @@ def spillover_correction(spillee: np.ndarray, spiller: np.ndarray, corr: float):
 def parse_nofids(
     nofids: dict[str, np.ndarray],
     shifts: dict[str, np.ndarray],
-    channels: dict[str, int],
+    channels: dict[str, str],
     *,
     z_slice: slice = np.s_[5:15],
     max_proj: bool = True,
@@ -59,6 +61,8 @@ def parse_nofids(
         bits = name.split("-")[0].split("_")
         assert img.shape[1] == len(bits)
         for i, bit in enumerate(bits):
+            if bit == "polyA" and "dapi" in bits:
+                continue
             sliced = img[z_slice, i]
             out[bit] = sliced.max(0, keepdims=True) if max_proj else sliced
 
@@ -72,6 +76,8 @@ def parse_nofids(
     for name, shift in shifts.items():
         bits = name.split("-")[0].split("_")
         for i, bit in enumerate(bits):
+            if bit == "polyA" and "dapi" in bits:
+                continue
             out_shift[bit] = shift
 
     return out, out_shift
@@ -85,7 +91,7 @@ def sort_key(x):
 
 
 def st(ref: sitk.Image, img: np.ndarray[np.float32, Any], transform: sitk.Transform):
-    image = sitk.Cast(sitk.GetImageFromArray(img), sitk.sitkFloat32)
+    image = sitk.GetImageFromArray(img)
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(ref)
     resampler.SetInterpolator(sitk.sitkLinear)
@@ -95,14 +101,14 @@ def st(ref: sitk.Image, img: np.ndarray[np.float32, Any], transform: sitk.Transf
     return sitk.GetArrayFromImage(resampler.Execute(image))
 
 
-def run_image(img: np.ndarray[np.float32, Any], channel: str, shiftpx: np.ndarray, ref: sitk.Image):
+def affine(img: np.ndarray[np.float32, Any], channel: str, shiftpx: np.ndarray, ref: sitk.Image):
     if len(shiftpx) != 2:
         raise ValueError
 
     translate = sitk.TranslationTransform(3)
     translate.SetParameters((float(shiftpx[0]), float(shiftpx[1]), 0.0))
 
-    if channel == "647":
+    if channel == "650":
         return st(ref, img, translate)
 
     affine = sitk.AffineTransform(3)
@@ -117,6 +123,49 @@ def run_image(img: np.ndarray[np.float32, Any], channel: str, shiftpx: np.ndarra
     return st(ref, img, composite)
 
 
+@dataclass
+class Image:
+    name: str
+    idx: int
+    nofid: np.ndarray
+    fid: np.ndarray
+    bits: list[str]
+    powers: dict[str, float]
+    metadata: dict[str, Any]
+
+    CHANNELS = [f"ilm{n}" for n in ["405", "488", "560", "650", "750"]]
+
+    @classmethod
+    def from_file(cls, path: Path):
+        stem = path.stem
+        name, idx = stem.split("-")
+        bits = name.split("_")
+        with TiffFile(path) as tif:
+            img = tif.asarray()
+            metadata = tif.shaped_metadata[0]  # type: ignore
+
+        waveform = json.loads(metadata["waveform"])
+        counts = {key: sum(waveform[key]["sequence"]) for key in cls.CHANNELS}
+        powers = {key[3:]: waveform[key]["power"] for key in cls.CHANNELS if counts[key] > 1}
+        if len(powers) != len(bits):
+            raise ValueError(f"Expected {len(bits)} channels, got {len(powers)}")
+        return cls(
+            name=name,
+            idx=int(idx),
+            nofid=img[:-1].reshape(-1, len(powers), 2048, 2048),
+            fid=cls.log_fids(img[-1]),
+            bits=bits,
+            powers=powers,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def log_fids(fid: np.ndarray):
+        temp = -ndimage.gaussian_laplace(fid.astype(np.float32), sigma=3)  # type: ignore
+        temp -= temp.min()
+        return temp
+
+
 def run(
     path: Path,
     idx: int,
@@ -126,33 +175,30 @@ def run(
     fwhm: float = 4,
     max_proj: bool = True,
 ):
+    # channels = toml.load("/fast2/3t3clean/channels.toml")
     logger.info("Reading files")
-    imgs = {
-        file.name: tifffile.imread(file)
+    imgs: dict[str, Image] = {
+        file.name: Image.from_file(file)
         for file in sorted(Path(path).rglob(f"*-{idx:04d}.tif"))
         if not file.name.startswith("10x")
     }
     logger.debug(f"{len(imgs)} files: {list(imgs)}")
     if not imgs:
         raise FileNotFoundError(f"No files found in {path} with index {idx}")
-    # Fiducials
-    fids = {}
-    for name, img in imgs.items():
-        temp = -ndimage.gaussian_laplace(img[-1].astype(np.float32), sigma=3)
-        temp -= temp.min()
-        fids[name] = temp  # filtered_image
 
     if debug:
         _fids_path = path / f"fids_{idx}.tif"
         tifffile.imwrite(
             _fids_path,
-            np.stack(list(fids.values())),
+            np.stack([i.fid for i in imgs.values()]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX"},
         )
         logger.debug(f"Written fiducials to {_fids_path}.")
 
+    fids = {name: img.fid for name, img in imgs.items()}
+    nofids = {name: img.nofid for name, img in imgs.items()}
     logger.info("Aligning fiducials")
     shifts = align_fiducials(
         fids, reference=reference, debug=debug, iterations=3, threshold=threshold, fwhm=fwhm
@@ -171,71 +217,89 @@ def run(
             metadata={"axes": "CYX"},
         )
 
-    nofids = {name: img[:-1].reshape(-1, len(name.split("_")), 2048, 2048) for name, img in imgs.items()}
+    channels: dict[str, str] = {}
+    for img in imgs.values():
+        channels |= dict(zip(img.bits, img.powers))
+
     del imgs
 
     # Split into individual bits.
     # Spillover correction, max projection
-    bits, bits_shifted = parse_nofids(nofids, shifts, channels, max_proj=max_proj, z_slice=np.s_[3:])
+
+    bits, bits_shifted = parse_nofids(nofids, shifts, channels, max_proj=max_proj, z_slice=np.s_[2:])
     ref = sitk.Cast(sitk.GetImageFromArray(next(iter(bits.values()))), sitk.sitkFloat32)
     transformed = {}
     for i, (name, img) in enumerate(bits.items()):
         c = str(channels[name])
-        img = img.astype(np.float32) / flats[c]
+        img = img.astype(np.float32)
         # Within-tile alignment. Chromatic corrections.
-        t_ = transformed[name] = run_image(img, c, -bits_shifted[name], ref).astype(np.uint16)
+        t_ = affine(img, c, -bits_shifted[name], ref)
+        # Illumination correction
+        transformed[name] = np.stack(basic[c].transform(t_)).astype(np.uint16)
         logger.debug(f"Transformed {name}: max={t_.max()}, min={t_.min()}")
 
+    downsample = 2
+
     out = np.zeros(
-        [*([] if max_proj else [next(iter(nofids.values())).shape[0]]), len(transformed), 994, 994],
+        [
+            *([] if max_proj else [next(iter(nofids.values())).shape[0]]),
+            len(transformed),
+            1988 // downsample,
+            1988 // downsample,
+        ],
         dtype=np.uint16,
     )
 
     # Sort by channel
     for i, (k, v) in enumerate(items := sorted(transformed.items(), key=sort_key)):
         if max_proj:
-            out[i] = v[0, 30:-30:2, 30:-30:2]
+            out[i] = v[0, 30:-30:downsample, 30:-30:downsample]
         else:
-            out[:, i] = v[:, 30:-30:2, 30:-30:2]
+            out[:, i] = v[:, 30:-30:downsample, 30:-30:downsample]
 
     keys: list[str] = [k for k, _ in items]
     logger.debug(str([f"{i}: {k}" for i, k in enumerate(keys, 1)]))
     (path / "down2").mkdir(exist_ok=True)
-    # logger.info(f"Writing to {path / 'down2' / f'full_{idx:03d}.tif'}")
-    # tifffile.imwrite(
-    #     path / "down2" / f"full_{idx:03d}.tif",
-    #     out,
-    #     compression=22610,
-    #     compressionargs={"level": 0.9},
-    #     metadata={"axes": "ZCYX", "channels": ",".join(keys)},
-    #     imagej=True,
-    # )
+    logger.info(f"Writing to {path / 'down2' / f'full_{idx:03d}.tif'}")
+    tifffile.imwrite(
+        path / "down2" / f"full_{idx:03d}.tif",
+        out,
+        compression=22610,
+        compressionargs={"level": 0.9},
+        metadata={"axes": ("" if max_proj else "Z") + "CYX", "channels": ",".join(keys)},
+        imagej=True,
+    )
 
-    for i in range(0, len(out), 3):
-        (path / "down2" / str(i)).mkdir(exist_ok=True)
-        tifffile.imwrite(
-            path / "down2" / str(i) / f"{idx:03d}_{i:03d}.tif",
-            out[i : i + 3],
-            compression=22610,
-            compressionargs={"level": 0.9},
-            metadata={"axes": "CYX", "channels": ",".join(keys[i : i + 3])},
-            imagej=True,
-        )
+    # for i in range(0, len(out), 3):
+    #    (path / "down2" / str(i)).mkdir(exist_ok=True)
+
+
+#     tifffile.imwrite(
+#         path / "down2" / str(i) / f"{idx:03d}_{i:03d}.tif",
+#         out[i : i + 3],
+#         compression=22610,
+#         compressionargs={"level": 0.9},
+#         metadata={"axes": "CYX", "channels": ",".join(keys[i : i + 3])},
+#         imagej=True,
+#     )
 
 
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("idx", type=int)
 @click.option("--debug", is_flag=True)
-@click.option("--threshold", type=float, default=3.0)
+@click.option("--threshold", type=float, default=2.0)
 @click.option("--fwhm", type=float, default=4.0)
-def main(path: Path, idx: int, debug: bool = False, threshold: float = 3, fwhm: float = 4):
+@click.option("--reference", "-r", type=str)
+def main(path: Path, idx: int, reference: str, debug: bool = False, threshold: float = 2, fwhm: float = 4):
     if not debug:
         logger.remove()
         logger.add(sys.stderr, level="WARNING")
 
-    run(path, idx, debug=debug, threshold=threshold, fwhm=fwhm, max_proj=True)
+    run(path, idx, reference=reference, debug=debug, threshold=threshold, fwhm=fwhm, max_proj=True)
 
 
 if __name__ == "__main__":
     main()
+
+# %%
