@@ -11,11 +11,9 @@ import polars as pl
 import rich
 import rich_click as click
 from astropy.stats import SigmaClip, sigma_clipped_stats
-from astropy.table.table import QTable
 from loguru import logger
 from photutils.background import Background2D, MedianBackground
-from photutils.detection import DAOStarFinder, IRAFStarFinder
-from scipy.ndimage import shift
+from photutils.detection import DAOStarFinder
 from scipy.spatial import cKDTree
 from skimage.registration import phase_cross_correlation
 from tifffile import TiffFile
@@ -31,12 +29,15 @@ def imread_page(path: Path | str, page: int):
 
 
 def find_spots(
-    data: np.ndarray[np.uint16, Any], threshold_sigma: float = 3, fwhm: float = 4, sigma_stat: float = 3.0
+    data: np.ndarray[np.uint16, Any],
+    threshold_sigma: float,
+    fwhm: float,
 ):
     assert np.sum(data) > 0
     # iraffind = DAOStarFinder(threshold=3.0 * std, fwhm=4, sharplo=0.2, exclude_border=True)
-    mean, median, std = sigma_clipped_stats(data, sigma=sigma_stat)
-    iraffind = DAOStarFinder(threshold=mean + threshold_sigma * std, fwhm=fwhm, exclude_border=True)
+    mean, median, std = sigma_clipped_stats(data, sigma=threshold_sigma + 5)
+    # You don't want need to subtract the mean here, the median is subtracted in the call three lines below.
+    iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
     try:
         return pl.DataFrame(iraffind(data - median).to_pandas()).with_row_count("idx")
     except AttributeError as e:
@@ -94,6 +95,13 @@ def _calculate_drift(
         dy=pl.col("ycentroid_fixed") - pl.col("ycentroid"),
     )
 
+    if len(joined) > 1000:
+        logger.warning(
+            f"WARNING: a lot ({len(joined)}) of fiducials found. "
+            "This may be noise and is slow. "
+            "Please reduce FWHM or increase threshold."
+        )
+
     if len(joined) < 6:
         logger.warning(f"WARNING: not enough fiducials found {len(joined)}. Using initial alignment")
         return np.round([0, 0], precision)
@@ -115,6 +123,8 @@ def _calculate_drift(
         axs[1].hist(joined["dy"], bins=100)
 
     if np.allclose(initial_drift, np.zeros(2)):
+        if joined["dx"].sum() == 0 and joined["dy"].sum() == 0:
+            raise ValueError("No drift found. Reference passed?")
         res = np.array([mode(joined["dx"]), mode(joined["dy"])])
     else:
         drift = joined[["dx", "dy"]].median().to_numpy().squeeze()
@@ -129,7 +139,7 @@ def run_fiducial(
     subtract_background: bool = False,
     debug: bool = False,
     name: str = "",
-    threshold: float = 3,
+    threshold: float = 5,
     fwhm: float = 4,
 ):
     if subtract_background:
@@ -145,7 +155,7 @@ def run_fiducial(
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
-    def inner(img: np.ndarray, threshold: float = 0.1, *, limit: int = 3, bitname: str = ""):
+    def inner(img: np.ndarray, *, limit: int = 3, bitname: str = ""):
         if subtract_background:
             img = img - background(img)
         moving = find_spots(img, threshold_sigma=threshold, fwhm=fwhm)

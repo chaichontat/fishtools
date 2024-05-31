@@ -6,7 +6,7 @@ import pickle
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 import jax
@@ -23,6 +23,9 @@ from tifffile import TiffFile, imread
 
 from fishtools import align_fiducials
 from fishtools.analysis.fiducial import align_phase, phase_shift
+
+if TYPE_CHECKING:
+    from loguru import Logger
 
 logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
 
@@ -53,7 +56,7 @@ def parse_nofids(
     shifts: dict[str, np.ndarray],
     channels: dict[str, str],
     *,
-    z_slice: slice = np.s_[5:15],
+    z_slice: slice = np.s_[:],
     max_proj: bool = True,
 ):
     out, out_shift = {}, {}
@@ -61,9 +64,9 @@ def parse_nofids(
         bits = name.split("-")[0].split("_")
         assert img.shape[1] == len(bits)
         for i, bit in enumerate(bits):
-            if bit == "polyA" and "dapi" in bits:
-                continue
             sliced = img[z_slice, i]
+            if bit in out:
+                raise ValueError(f"Duplicated bit {bit} in {name}")
             out[bit] = sliced.max(0, keepdims=True) if max_proj else sliced
 
         cs = {str(channels[bit]): bit for bit in bits}
@@ -142,9 +145,15 @@ class Image:
         bits = name.split("_")
         with TiffFile(path) as tif:
             img = tif.asarray()
-            metadata = tif.shaped_metadata[0]  # type: ignore
+            try:
+                metadata = tif.shaped_metadata[0]  # type: ignore
+            except IndexError:
+                metadata = tif.imagej_metadata
+        try:
+            waveform = json.loads(metadata["waveform"])
+        except KeyError:
+            waveform = toml.load(path.with_name(f"{path.name.split('-')[0]}.toml"))
 
-        waveform = json.loads(metadata["waveform"])
         counts = {key: sum(waveform[key]["sequence"]) for key in cls.CHANNELS}
         powers = {key[3:]: waveform[key]["power"] for key in cls.CHANNELS if counts[key] > 1}
         if len(powers) != len(bits):
@@ -170,8 +179,9 @@ def run(
     path: Path,
     idx: int,
     reference: str = "3_11_19",
+    *,
     debug: bool = False,
-    threshold: float = 3,
+    threshold: float = 6,
     fwhm: float = 4,
     max_proj: bool = True,
 ):
@@ -226,7 +236,7 @@ def run(
     # Split into individual bits.
     # Spillover correction, max projection
 
-    bits, bits_shifted = parse_nofids(nofids, shifts, channels, max_proj=max_proj, z_slice=np.s_[2:])
+    bits, bits_shifted = parse_nofids(nofids, shifts, channels, max_proj=max_proj, z_slice=np.s_[:])
     ref = sitk.Cast(sitk.GetImageFromArray(next(iter(bits.values()))), sitk.sitkFloat32)
     transformed = {}
     for i, (name, img) in enumerate(bits.items()):
@@ -259,29 +269,27 @@ def run(
 
     keys: list[str] = [k for k, _ in items]
     logger.debug(str([f"{i}: {k}" for i, k in enumerate(keys, 1)]))
-    (path / "down2").mkdir(exist_ok=True)
-    logger.info(f"Writing to {path / 'down2' / f'full_{idx:03d}.tif'}")
-    tifffile.imwrite(
-        path / "down2" / f"full_{idx:03d}.tif",
-        out,
-        compression=22610,
-        compressionargs={"level": 0.9},
-        metadata={"axes": ("" if max_proj else "Z") + "CYX", "channels": ",".join(keys)},
-        imagej=True,
-    )
+    # (path / "down2").mkdir(exist_ok=True)
+    logger.info(f"Writing to {path / 'down2' / f'full_{idx:04d}.tif'}")
+    # tifffile.imwrite(
+    #     path / f"full_{idx:04d}.tif",
+    #     out,
+    #     compression=22610,
+    #     compressionargs={"level": 0.9},
+    #     metadata={"axes": ("" if max_proj else "Z") + "CYX", "channels": ",".join(keys)},
+    #     imagej=True,
+    # )
 
-    # for i in range(0, len(out), 3):
-    #    (path / "down2" / str(i)).mkdir(exist_ok=True)
-
-
-#     tifffile.imwrite(
-#         path / "down2" / str(i) / f"{idx:03d}_{i:03d}.tif",
-#         out[i : i + 3],
-#         compression=22610,
-#         compressionargs={"level": 0.9},
-#         metadata={"axes": "CYX", "channels": ",".join(keys[i : i + 3])},
-#         imagej=True,
-#     )
+    for i in range(0, len(out), 3):
+        (path / "down2" / str(i)).mkdir(exist_ok=True, parents=True)
+        tifffile.imwrite(
+            path / "down2" / str(i) / f"{idx:03d}_{i:03d}.tif",
+            out[i : i + 3] >> 4,
+            compression=22610,
+            compressionargs={"level": 0.9},
+            metadata={"axes": "CYX", "channels": ",".join(keys[i : i + 3])},
+            imagej=True,
+        )
 
 
 @click.command()
@@ -292,11 +300,25 @@ def run(
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--reference", "-r", type=str)
 def main(path: Path, idx: int, reference: str, debug: bool = False, threshold: float = 2, fwhm: float = 4):
-    if not debug:
-        logger.remove()
-        logger.add(sys.stderr, level="WARNING")
+    logger_format = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{line}</cyan> {extra[idx]} {extra[file]}| "
+        "- <level>{message}</level>"
+    )
+    logger.remove()
+    logger.configure(extra=dict(idx=f"{idx:04d}", file=""))
+    logger.add(sys.stderr, level="DEBUG" if debug else "WARNING", format=logger_format)
 
-    run(path, idx, reference=reference, debug=debug, threshold=threshold, fwhm=fwhm, max_proj=True)
+    run(
+        path,
+        idx,
+        reference=reference,
+        debug=debug,
+        threshold=threshold,
+        fwhm=fwhm,
+        max_proj=True,
+    )
 
 
 if __name__ == "__main__":
