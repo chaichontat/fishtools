@@ -1,3 +1,4 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
@@ -9,7 +10,6 @@ from fishtools.utils.utils import setup_logging
 from .candidates import candidates
 from .codebook.finalconstruct import click_construct, filter_genes
 from .ext.external_data import Dataset
-from .ext.prepare import run_repeatmasker
 from .genes.chkgenes import chkgenes, transcripts
 from .screen import screen
 from .utils._alignment import bowtie_build
@@ -54,6 +54,13 @@ def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
         exc.submit(bowtie_build, path / species / "cdna_ncrna_trna.fasta", "txome")
     Dataset(path / species)  # test all components
 
+@main.command()
+@click.argument("path", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
+def hash(path: Path):
+    """Hash codebook"""
+    from .codebook.codebook import hash_codebook
+
+    print(hash_codebook(json.loads(path.read_text())))
 
 main.add_command(candidates)
 main.add_command(screen)

@@ -155,9 +155,10 @@ class Image:
             waveform = toml.load(path.with_name(f"{path.name.split('-')[0]}.toml"))
 
         counts = {key: sum(waveform[key]["sequence"]) for key in cls.CHANNELS}
+        # To remove ilm from ilm405.
         powers = {key[3:]: waveform[key]["power"] for key in cls.CHANNELS if counts[key] > 1}
         if len(powers) != len(bits):
-            raise ValueError(f"Expected {len(bits)} channels, got {len(powers)}")
+            raise ValueError(f"{path}: Expected {len(bits)} channels, got {len(powers)}")
         return cls(
             name=name,
             idx=int(idx),
@@ -177,6 +178,7 @@ class Image:
 
 def run(
     path: Path,
+    roi: str | None,
     idx: int,
     reference: str = "3_11_19",
     *,
@@ -187,11 +189,20 @@ def run(
 ):
     # channels = toml.load("/fast2/3t3clean/channels.toml")
     logger.info("Reading files")
-    imgs: dict[str, Image] = {
-        file.name: Image.from_file(file)
-        for file in sorted(Path(path).rglob(f"*-{idx:04d}.tif"))
-        if not file.name.startswith("10x")
-    }
+
+    if roi:
+        imgs: dict[str, Image] = {
+            file.name: Image.from_file(file)
+            for file in sorted(Path(path).glob(f"{((roi) + '--') if roi else ''}*/*-{idx:04d}.tif"))
+            if not file.name.startswith("10x")
+        }
+    else:
+        imgs = {
+            file.name: Image.from_file(file)
+            for file in sorted(Path(path).rglob(f"*-{idx:04d}.tif"))
+            if not file.name.startswith("10x")
+        }
+
     logger.debug(f"{len(imgs)} files: {list(imgs)}")
     if not imgs:
         raise FileNotFoundError(f"No files found in {path} with index {idx}")
@@ -295,11 +306,20 @@ def run(
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("idx", type=int)
+@click.option("--roi", type=str)
 @click.option("--debug", is_flag=True)
 @click.option("--threshold", type=float, default=2.0)
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--reference", "-r", type=str)
-def main(path: Path, idx: int, reference: str, debug: bool = False, threshold: float = 2, fwhm: float = 4):
+def main(
+    path: Path,
+    idx: int,
+    reference: str,
+    roi: str | None = None,
+    debug: bool = False,
+    threshold: float = 2,
+    fwhm: float = 4,
+):
     logger_format = (
         "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
         "<level>{level: <8}</level> | "
@@ -312,6 +332,7 @@ def main(path: Path, idx: int, reference: str, debug: bool = False, threshold: f
 
     run(
         path,
+        roi,
         idx,
         reference=reference,
         debug=debug,

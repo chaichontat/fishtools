@@ -1,10 +1,11 @@
 # %%
+import functools
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from itertools import cycle, islice
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryFile
+from tempfile import NamedTemporaryFile
 from typing import Literal
 
 import pandas as pd
@@ -41,7 +42,7 @@ def create_tile_config(
                 f.write(f"{idx:03d}_{sub}.tif; ; ({row['x']}, {row['y']})\n")
 
 
-def run_imagej(path: Path, *, compute_overlap: bool = False):
+def run_imagej(path: Path, *, compute_overlap: bool = False, threshold: float = 0.4):
     options = "subpixel_accuracy"  # compute_overlap
     if compute_overlap:
         options += " compute_overlap"
@@ -51,13 +52,25 @@ def run_imagej(path: Path, *, compute_overlap: bool = False):
     run("Memory & Threads...", "parallel=8");
     run("Grid/Collection stitching", "type=[Positions from file] \
 order=[Defined by TileConfiguration] directory={path.resolve()} \
-layout_file=TileConfiguration{'' if compute_overlap else '.registered'}.txt \
-fusion_method=[{fusion}] regression_threshold=0.5 \
-max/avg_displacement_threshold=0.5 absolute_displacement_threshold=1.5 {options} \
+layout_file=TileConfiguration{"" if compute_overlap else ".registered"}.txt \
+fusion_method=[{fusion}] regression_threshold={threshold} \
+max/avg_displacement_threshold=1.5 absolute_displacement_threshold=2.5 {options} \
 computation_parameters=[Save computation time (but use more RAM)] \
 image_output=[Write to disk] \
 output_directory={path.resolve()}");
     """
+
+    #     macro = f"""
+    #     run("Memory & Threads...", "parallel=8");
+    #     run("Grid/Collection stitching", "type=[Unknown position] \
+    # order=[All files in directory] directory={path.resolve()} \
+    # output_textfile_name=TileConfiguration.txt \
+    # fusion_method=[{fusion}] regression_threshold={threshold} \
+    # max/avg_displacement_threshold=1.50 absolute_displacement_threshold=2.50 subpixel_accuracy \
+    # computation_parameters=[Save computation time (but use more RAM)] \
+    # image_output=[Write to disk] \
+    # output_directory={path.resolve()}");
+    #     """
 
     with NamedTemporaryFile("wt") as f:
         f.write(macro)
@@ -105,29 +118,45 @@ def copy_registered(reference_path: Path, actual_path: Path):
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("position_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--recreate", is_flag=True)
-def main(path: Path, position_file: Path, recreate: bool = False):
-    folders = sorted([p for p in path.iterdir() if p.is_dir()])
-    ref = folders[0]
+@click.option("--reference", type=str)
+@click.option("--threshold", type=float, default=0.4)
+def main(
+    path: Path,
+    position_file: Path,
+    *,
+    reference: str | None = None,
+    recreate: bool = False,
+    threshold: float = 0.4,
+):
+    folders = sorted([p for p in path.iterdir() if p.is_dir()], key=lambda x: int(x.stem))
+    ref = folders[-1] if reference is None else [f for f in folders if f.stem == reference][0]
     logger.info(f"Found {[f.name for f in folders]} at {path}.")
 
-    if recreate or not (ref / "TileConfiguration.txt").exists():
-        files_idx = sorted({int(x.stem.split("_")[0]) for x in ref.glob("*.tif")})
-        df = pd.read_csv(position_file, header=None).iloc[files_idx]
+    def get_idxs(folder: Path):
+        return {int(x.stem.split("_")[0]) for x in folder.glob("*.tif")}
 
-        create_tile_config(path, df, "000", pixel=1024)
+    if recreate or not (ref / "TileConfiguration.txt").exists():
+        files_idx = functools.reduce(lambda x, y: x & y, [get_idxs(f) for f in folders], get_idxs(ref))
+
+        df = pd.read_csv(position_file, header=None).iloc[sorted(files_idx)]
+        print(df)
+
+        create_tile_config(ref, df, f"{int(ref.stem):03d}", pixel=1024)
         logger.info(f"Created TileConfiguration with {len(df)} files at {path}.")
 
-    if not (ref / "TileConfiguration.registered.txt").exists():
+    if recreate or not (ref / "TileConfiguration.registered.txt").exists():
         logger.info("Running first.")
-        run_imagej(ref, compute_overlap=True)
+        run_imagej(ref, compute_overlap=True, threshold=threshold)
 
     assert (ref / "TileConfiguration.registered.txt").exists(), "No registered file found."
-    for f in folders[1:]:
-        copy_registered(ref, f)
+    for f in folders:
+        if f is not ref:
+            copy_registered(ref, f)
 
     with ThreadPoolExecutor(4) as exc:
-        for f in folders[1:]:
-            exc.submit(run_imagej, f)
+        for f in folders:
+            if f is not ref:
+                exc.submit(run_imagej, f)
 
     # Run first
 

@@ -33,7 +33,7 @@ def imread_page(path: Path | str, page: int):
 def find_spots(data: np.ndarray[np.uint16, Any], threshold_sigma: float = 2.5, fwhm: float = 4) -> QTable:
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
     iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
-    return iraffind(data - median)
+    return iraffind(np.clip(data, a_min=median, a_max=65535) - median)
 
 
 # %%
@@ -55,6 +55,7 @@ with ThreadPoolExecutor(4) as exc:
         exc.submit(run, path, 2)
 # %%
 from collections import defaultdict
+
 import pandas as pd
 
 path = Path("/disk/chaichontat/mer/peg/0peg")
