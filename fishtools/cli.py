@@ -56,18 +56,18 @@ def process_path(path: Path, file_types: list[str]):
 @main.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=True, path_type=Path))
 @click.option("--delete", "-d", is_flag=True, help="Delete original files")
-@click.option("--quality", "-q", default=100, type=int, help="Quality level (-inf-100). 100 = lossless (outputs JPEG-XR TIFF)")
+@click.option("--quality", "-q", default=1.0, type=float, help="Quality level (0-1). 1.0 = lossless")
 @click.option("--n-process", "-n", default=16, type=int, help="Number of processes to use")
 # fmt: on
-def compress(path: Path, delete: bool = False, quality: int = 100, n_process: int = 16):
-    """Converts TIFF, JP2, and DAX image files to JPEG XL (JXL) (lossy) or TIFF-JPEG XR (lossless) files."""
+def compress(path: Path, delete: bool = False, quality: int = 1, n_process: int = 16):
+    """Converts TIFF, JP2, and DAX image files to TIFF-JPEG XR files."""
     files = process_path(path, [".tif", ".tiff", ".jp2", ".dax"])
     log.info(f"Found {len(files)} potential file(s).")
     execute(files, lib.compress, level=quality, n_process=n_process)
-    if delete and quality <= 97:
-        log.warning("Not deleting original files because quality is less than 98. Please delete manually.")
+    if delete and quality <= 0.65:
+        log.warning("Not deleting original files because quality is less than 0.65. Please delete manually.")
     for file in files:
-        if delete and 97 < quality < 100:  # .tif output is only possible when quality == 100.
+        if delete and 0.65 < quality < 1:  # .tif output is only possible when quality == 100.
             file.unlink()
 
 
