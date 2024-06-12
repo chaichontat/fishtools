@@ -5,9 +5,9 @@ from pathlib import Path
 
 from fishtools import progress_bar
 
-PATH = Path("/fast2/3t3clean/analysis/deconv")
+PATH = Path("/fast2/3t3clean/analysis/deconv/registered")
 
-idxs = sorted([int(name.stem.split("-")[1]) for name in PATH.rglob("6_14_22*.tif")])
+idxs = sorted([int(name.stem.split("-")[1]) for name in PATH.rglob("reg-*.tif")])
 print(len(idxs))
 # idxs = [i for i in idxs if not (PATH / "down2" / "0" / f"{i:03d}_000.tif").exists()]
 # %%
@@ -22,22 +22,18 @@ print(len(idxs))
 #         )
 # %%
 
-with progress_bar(len(idxs)) as callback, ThreadPoolExecutor(6) as exc:
+with progress_bar(len(idxs)) as callback, ThreadPoolExecutor(8) as exc:
     futs: list[Future] = []
     for i in idxs:
         fut = exc.submit(
             subprocess.run,
             [
                 "python",
-                Path(__file__).parent / "register_prod.py",
-                str(PATH),
-                str(i),
-                # "--fwhm=6",
-                # "--threshold=5",
-                "--reference",
-                "6_14_22",
-                "--roi",
-                "",
+                Path(__file__).parent / "align_prod.py",
+                "run",
+                str(PATH / f"reg-{i:04d}.tif"),
+                "--scale-file",
+                str(PATH / "decode_scale.json"),
             ],
             check=True,
         )

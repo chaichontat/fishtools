@@ -8,6 +8,7 @@ import numpy as np
 import numpy.typing as npt
 import polars as pl
 from loguru import logger
+from pydantic import BaseModel, TypeAdapter
 
 
 def hash_codebook(cb: dict[str, Collection[int]]) -> str:
@@ -102,12 +103,10 @@ class CodebookPicker:
     @overload
     def export_codebook(
         self, seed: int, type: Literal["json"] = ..., offset: int = ...
-    ) -> dict[str, list[int]]:
-        ...
+    ) -> dict[str, list[int]]: ...
 
     @overload
-    def export_codebook(self, seed: int, type: Literal["csv"], offset: int = ...) -> pl.DataFrame:
-        ...
+    def export_codebook(self, seed: int, type: Literal["csv"], offset: int = ...) -> pl.DataFrame: ...
 
     def export_codebook(
         self, seed: int, type: Literal["csv", "json"] = "json", offset: int = 1
@@ -126,7 +125,9 @@ class CodebookPicker:
             case "json":
                 return {
                     gene: list(np.flatnonzero(code) + offset)
-                    for gene, code in zip(self.genes, rmhd4.astype(int))
+                    for gene, code in zip(
+                        self.genes + [f"Blank-{i+1}" for i in range(n_blanks)], rmhd4.astype(int)
+                    )
                 }
             case _:  # type: ignore
                 raise ValueError(f"Unknown type {type}")
@@ -176,3 +177,43 @@ class CodebookPickerSingleCell(CodebookPicker):
         )
 
         return best, _find(int(best))[1]
+
+
+class ProbeSet(BaseModel):
+    name: str
+    species: str
+    codebook: str
+    bcidx: int
+    existing: str | None = None
+    single: bool = False
+    all_bit: int = 29
+    n_probes: Literal["high", "low"] | None = None
+
+    def load_codebook(self, path: Path | str):
+        path = Path(path)
+        return {
+            k: v
+            for k, v in json.loads((path / self.codebook).read_text()).items()
+            if not k.startswith("Blank")
+        }
+
+    def codebook_dfs(self, path: Path | str):
+        codebook = self.load_codebook(path)
+        tss = list(codebook)
+        dfs = pl.concat(
+            [
+                pl.read_parquet(Path(path) / f"output/{ts}_final_BamHIKpnI_{hash_codebook(codebook)}.parquet")
+                # .sample(shuffle=True, seed=4, fraction=1)
+                .sort(["priority", "hp"])
+                for ts in tss
+            ]
+        )
+        return dfs
+
+    @classmethod
+    def from_list_json(cls, path: str | Path):
+        return TypeAdapter(list[cls]).validate_json(Path(path).read_text())
+
+    @classmethod
+    def from_manifest(cls, path: str | Path):
+        return cls.from_list_json(path)

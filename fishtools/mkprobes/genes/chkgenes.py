@@ -1,5 +1,6 @@
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -78,7 +79,7 @@ def chkgenes(path: Path, genes: Path):
 
 def get_transcripts(
     dataset: Dataset,
-    gene: str,
+    genes: list[str],
     mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
 ) -> pl.DataFrame:
     """Get transcript ID from gene name or gene ID
@@ -86,16 +87,15 @@ def get_transcripts(
         pl.DataFrame[[transcript_id, transcript_name, tag]]
         pl.DataFrame[[transcript_id, transcript_name, annotation, tag]] if appris
     """
-    gene_id = gene if gene.startswith("ENS") else dataset.ensembl.gene_to_eid(gene)
-    del gene
+    genes_id = [gene if gene.startswith("ENS") else dataset.ensembl.gene_to_eid(gene) for gene in genes]
 
     # log.info(f"Gene ID: {gene_id}")
 
-    ensembl = dataset.ensembl.filter(pl.col("gene_id") == gene_id)[
+    ensembl = dataset.ensembl.filter(pl.col("gene_id").is_in(genes_id))[
         ["gene_name", "gene_id", "transcript_name", "transcript_id"]
     ]
     ensembl = ensembl.join(
-        dataset.appris.filter(pl.col("gene_id") == gene_id)[["transcript_id", "annotation"]],
+        dataset.appris.filter(pl.col("gene_id").is_in(genes_id))[["transcript_id", "annotation"]],
         on="transcript_id",
         how="left",
     ).sort("transcript_name")
@@ -105,12 +105,17 @@ def get_transcripts(
 
     match mode:
         case "canonical":
-            canonical = get_ensembl("output/", gene_id)["canonical_transcript"].split(".")[0]
-            return dataset.ensembl.filter(pl.col("transcript_id") == canonical)[to_return]
+            with ThreadPoolExecutor(3) as exc:
+                from functools import partial
+
+                res = exc.map(partial(get_ensembl, "output/"), genes_id)
+                canonical = [r["canonical_transcript"].split(".")[0] for r in res]
+
+            return dataset.ensembl.filter(pl.col("transcript_id").is_in(canonical))[to_return]
         case "gencode":
-            return dataset.gencode.filter(pl.col("gene_id") == gene_id)[to_return]
+            return dataset.gencode.filter(pl.col("gene_id").is_in(genes_id))[to_return]
         case "ensembl":
-            return dataset.ensembl.filter(pl.col("gene_id") == gene_id)[to_return]
+            return dataset.ensembl.filter(pl.col("gene_id").is_in(genes_id))[to_return]
         case "appris":
             # if len(principal := appris.filter(pl.col("annotation").str.contains("PRINCIPAL"))):
             #     log.info("Principal transcripts: " + "\n".join(principal["transcript_id"]))
@@ -129,7 +134,8 @@ def get_transcripts(
 # fmt: off
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("gene", type=str)
+@click.option("--gene", type=str)
+@click.option("--genefile", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--canonical", "mode", flag_value="canonical", default=True, help="Outputs canonical transcript only")
 @click.option("--gencode"  , "mode", flag_value="gencode", help="Outputs all transcripts from GENCODE basic")
 @click.option("--ensembl"  , "mode", flag_value="ensembl", help="Outputs all transcripts from Ensembl")
@@ -138,13 +144,21 @@ def get_transcripts(
 # fmt: on
 def transcripts(
     path: Path,
-    gene: str,
+    gene: str | None = None,
+    genefile: Path | None = None,
     mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
     verbose: bool = False,
 ):
     """Get transcript ID from gene name or gene ID"""
-    res = get_transcripts(Dataset(path), gene, mode)
+
+    if genefile:
+        genes = genefile.read_text().splitlines()
+    elif gene:
+        genes = [gene]
+    else:
+        raise ValueError("No gene provided")
+    res = get_transcripts(Dataset(path), genes, mode)
     if verbose:
         click.echo(res)
     else:
-        click.echo("\n".join(res["transcript_id"].to_list()))
+        click.echo("\n".join(sorted(res["transcript_name"].to_list())))

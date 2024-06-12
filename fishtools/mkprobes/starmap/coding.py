@@ -135,7 +135,11 @@ def _generate(path: Path, n: int):
     return out
 
 
-order = list(chain.from_iterable([[i, i + 8, i + 16] for i in range(1, 9)])) + list(range(25, 33))
+order = (
+    list(chain.from_iterable([[i, i + 8, i + 16] for i in range(1, 9)]))
+    + list(range(25, 28))
+    + list(range(31, 34))
+)
 paths = static.glob("*bit_on3_dist2.csv")
 ns = {
     int(re.search(r"(\d+)", path.stem).group(1)): path.read_text().splitlines().__len__()
@@ -165,7 +169,7 @@ def gen_codebook(tss: list[str], offset: int = 0):
     cb.gen_codebook(1)
     c = cb.export_codebook(1, offset=0)
     out = {k: list(map(lambda x: order[x + offset], v)) for k, v in c.items()}
-    logger.info("Bits used: " + str(set(chain.from_iterable(out.values()))))
+    logger.info("Bits used: " + str(sorted(set(chain.from_iterable(out.values())))))
     return out
 
 

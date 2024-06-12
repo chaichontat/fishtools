@@ -313,28 +313,35 @@ def scale(path: Path, name: str):
 @main.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.argument("name", type=str)
-@click.option("--normalize", is_flag=True)
-def run(path: Path, name: str, normalize: bool = False):
+@click.option("--ref", type=click.Path(path_type=Path), default=None)
+@click.option("--limit", type=int, default=None)
+@click.option("--overwrite", is_flag=True)
+def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite: bool):
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
 
     bits = name.split("_")
     files = [f for f in sorted(path.rglob(f"{name}*.tif")) if not "analysis/deconv" in str(f)]
+    if ref is not None:
+        ok_idxs = {
+            int(f.stem.split("-")[1])
+            for f in sorted(path.rglob(f"{ref}*.tif"))
+            if not "analysis/deconv" in str(f)
+        }
+        logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
+        files = [f for f in files if int(f.stem.split("-")[1]) in ok_idxs]
+        if len(files) != len(ok_idxs):
+            logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
 
-    if not normalize:
-        if len(list(out.glob("float_"))):
-            logger.warning("Float files already exist.")
-            return
+    files = files[:limit] if limit is not None else files
+    logger.info(f"Total: {len(files)}. Limit: {limit}")
 
-        files = [files[i] for i in np.random.default_rng(0).choice(range(len(files)), size=50, replace=False)]
-
-    if normalize:
-        _scaling = json.loads((path / "deconv_scale.json").read_text())
-        mins = cp.array([_scaling[x]["min"] for x in bits]).reshape(1, len(bits), 1, 1)
-        scale = cp.array([_scaling[x]["scale"] for x in bits]).reshape(1, len(bits), 1, 1)
+    if not overwrite:
+        files = [f for f in files if not (out / f.parent.name / f.name).exists()]
+        logger.info(f"Not overwriting. Total: {len(files)}")
 
     q_write = queue.Queue(maxsize=3)
-    q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray]]] = queue.Queue(maxsize=1)
+    q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
 
     def f_read(files: list[Path]):
         logger.info("Read thread started.")
@@ -348,32 +355,31 @@ def run(path: Path, name: str, normalize: bool = False):
             img = imread(file)
             fid = img[[-1]]
             nofid = img[:-1].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
+            with tifffile.TiffFile(file) as tif:
+                try:
+                    metadata = tif.shaped_metadata[0]  # type: ignore
+                except (TypeError, IndexError):
+                    metadata = tif.imagej_metadata or {}
+
             logger.debug(f"Finished reading {file.name}")
-            q_img.put((file, nofid, fid))
+            q_img.put((file, nofid, fid, metadata))
 
     def f_write():
         logger.info("Write thread started.")
 
         while True:
-            file, towrite, fid = q_write.get()
+            file, towrite, fid, metadata = q_write.get()
             logger.debug(f"Writing {file.name}")
-            sub = out / file.name.split("-")[0]
+            sub = out / file.parent.name
             sub.mkdir(exist_ok=True, parents=True)
 
-            if fid is None:
-                tifffile.imwrite(
-                    sub / ("float_" + file.name),
-                    towrite,
-                    compression="zstd",
-                    compressionargs={"level": 1},
-                )
-            else:
-                tifffile.imwrite(
-                    sub / file.name,
-                    np.concatenate([towrite, fid], axis=0),
-                    compression=22610,
-                    compressionargs={"level": 0.75},
-                )
+            tifffile.imwrite(
+                sub / file.name,
+                np.concatenate([towrite, fid], axis=0),
+                compression=22610,
+                compressionargs={"level": 0.75},
+                metadata=metadata,
+            )
             logger.debug(f"Finished writing {file.name}")
             q_write.task_done()
 
@@ -384,17 +390,26 @@ def run(path: Path, name: str, normalize: bool = False):
     thread_write.start()
 
     for _ in range(len(files)):
-        start, img, fid = q_img.get()
+        start, img, fid, metadata = q_img.get()
         logger.info(f"Processing {start.name} ({_}/{len(files)})")
         res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors, iters=1)
 
-        if normalize:
-            towrite = cp.clip((res - mins) * scale, 0, 65535).astype(np.uint16).get().reshape(-1, 2048, 2048)
-            q_write.put((start, towrite, fid))
-        else:
-            towrite = res.get()
-            q_write.put((start, towrite, None))
+        mins = res.min(axis=(0, 2, 3), keepdims=True)
+        scale = 65534 / (res.max(axis=(0, 2, 3), keepdims=True) - mins)
 
+        towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
+        q_write.put(
+            (
+                start,
+                towrite,
+                fid,
+                metadata
+                | {
+                    "deconv_min": list(map(float, mins.get().flatten())),
+                    "deconv_scale": list(map(float, scale.get().flatten())),
+                },
+            )
+        )
         q_img.task_done()
 
 

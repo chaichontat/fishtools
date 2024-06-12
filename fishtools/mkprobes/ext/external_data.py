@@ -118,12 +118,10 @@ class ExternalData:
         return self.gtf.filter(pl.col("gene_name") == gene)
 
     @overload
-    def __getitem__(self, eid: str) -> pl.Series:
-        ...
+    def __getitem__(self, eid: str) -> pl.Series: ...
 
     @overload
-    def __getitem__(self, eid: list[str]) -> pl.DataFrame:
-        ...
+    def __getitem__(self, eid: list[str]) -> pl.DataFrame: ...
 
     def __getitem__(self, eid: str | list[str]):
         return self.gtf[eid]
@@ -197,11 +195,11 @@ class ExternalData:
 
 # @dataclass(frozen=True)
 class Dataset:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, weird_organisms: bool = False):
         self.path = Path(path)
         self.species = cast(Literal["human", "mouse"], self.path.name)
         if self.species not in ("human", "mouse"):
-            raise ValueError(f"Species must be human or mouse, got {self.species}")
+            log.warning(f"Species not human or mouse, got {self.species}")
 
         self.gencode = ExternalData(
             cache=self.path / "gencode.parquet",

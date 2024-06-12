@@ -86,7 +86,7 @@ def handle_overlap(
 
 
 def the_filter(
-    df: pl.DataFrame, overlap: int = -1, max_tm_offtarget: float = 40, max_hp: float = 45
+    df: pl.DataFrame, overlap: int = -1, max_tm_offtarget: float = 45, max_hp: float = 45
 ) -> pl.DataFrame:
     return handle_overlap(
         df,

@@ -180,10 +180,11 @@ def construct(
 
     hsh = hash_codebook(codebook)
 
-    if (
-        final_path := Path(output_path / f"{transcript}_final{restriction}_{hsh}.parquet")
-    ).exists():  # and not overwrite:
-        final_path.unlink()
+    if (final_path := Path(output_path / f"{transcript}_final{restriction}_{hsh}.parquet")).exists():
+        if overwrite:
+            final_path.unlink()
+        else:
+            return
     #     pl.read_parquet(final_path)[["code1", "code2"]].to_numpy().flatten()
     # ) != set(codebook[transcript]):
     #     logger.critical(f"Codebook for {transcript} has changed.")

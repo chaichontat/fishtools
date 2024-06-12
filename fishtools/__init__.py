@@ -1,4 +1,5 @@
 from .analysis.fiducial import align_fiducials
+from .analysis.io import fishread, metadata
 from .mkprobes.ext.external_data import Dataset
 from .mkprobes.utils._alignment import gen_fasta, gen_fastq
 from .mkprobes.utils._crawler import crawler
