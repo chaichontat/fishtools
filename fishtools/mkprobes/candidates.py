@@ -67,7 +67,7 @@ def get_candidates(
     output: str | Path = "output/",
     *,
     ignore_revcomp: bool = False,
-    realign: bool = False,
+    overwrite: bool = False,
     allow: list[str] | None = None,
     disallow: list[str] | None = None,
     pseudogene_limit: int = -1,
@@ -77,8 +77,8 @@ def get_candidates(
 
     if fasta is None and gene and not (re.search(r"\-2\d\d", gene) or "ENSMUST" in gene or "ENST" in gene):
         # fmt: off
-        transcript = get_transcripts(dataset, gene, mode="canonical")[0, "transcript_id"]
-        appris = get_transcripts(dataset, gene, mode="appris")
+        transcript = get_transcripts(dataset, [gene], mode="canonical")[0, "transcript_id"]
+        appris = get_transcripts(dataset, [gene], mode="appris")
 
         if not appris.filter(pl.col("transcript_id") == transcript).shape[0]:
             logger.warning(f"Ensembl canonical transcript {transcript} not found in APPRIS.")
@@ -94,7 +94,7 @@ def get_candidates(
         fasta=fasta,
         output=output,
         ignore_revcomp=ignore_revcomp,
-        realign=realign,
+        overwrite=overwrite,
         allow=allow,
         disallow=disallow,
         pseudogene_limit=pseudogene_limit,
@@ -128,7 +128,7 @@ def _convert_gene_to_tss(dataset: Dataset, gtss: list[str]):
         if gts.startswith("ENS"):
             out.append(gts)
             continue
-        out.extend(get_transcripts(dataset, gts, "ensembl")["transcript_id"].to_list())
+        out.extend(get_transcripts(dataset, [gts], "ensembl")["transcript_id"].to_list())
     return out
 
 
@@ -139,7 +139,7 @@ def _run_transcript(
     output: str | Path = "output/",
     *,
     ignore_revcomp: bool = False,
-    realign: bool = False,
+    overwrite: bool = False,
     allow: list[str] | None = None,
     disallow: list[str] | None = None,
     formamide: int = 40,
@@ -181,7 +181,7 @@ def _run_transcript(
     transcript_id: str
     transcript_name: str
 
-    if realign or not (output / f"{transcript_name}_bowtie.parquet").exists():
+    if overwrite or not (output / f"{transcript_name}_bowtie.parquet").exists():
         seq = dataset.gencode.get_seq(transcript_id) if fasta is None else seq
         if len(seq) < 1500:
             logger.warning(
@@ -293,7 +293,7 @@ def _run_transcript(
 @click.option("--fasta", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--output", "-o", type=click.Path(), default="output/")
 @click.option("--ignore-revcomp", "-r", is_flag=True)
-@click.option("--realign", is_flag=True)
+@click.option("--overwrite", is_flag=True)
 @click.option("--pseudogene-limit", type=int, default=-1)
 @click.option(
     "--allow", type=str, help="Don't filter out probes that bind to these genes, separated by comma."
@@ -307,7 +307,7 @@ def candidates(
     fasta: Path | None,
     output: str | Path = "output/",
     ignore_revcomp: bool = True,
-    realign: bool = False,
+    overwrite: bool = False,
     allow: str | None = None,
     disallow: str | None = None,
     pseudogene_limit: int = -1,
@@ -321,7 +321,7 @@ def candidates(
         fasta=fasta,
         output=output,
         ignore_revcomp=ignore_revcomp,
-        realign=realign,
+        overwrite=overwrite,
         allow=allow_,
         disallow=disallow_,
         pseudogene_limit=pseudogene_limit,

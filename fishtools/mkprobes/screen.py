@@ -47,7 +47,6 @@ def _screen(
         res = Restriction.RestrictionBatch(restriction)
         ff = ff.filter(~pl.col("seq").apply(lambda x: any(res.search(Seq("NNNNNN" + x + "NNNNNN")).values())))
 
-    print(ff)
     final = the_filter(ff, overlap=overlap)
     assert not final["seq"].str.contains("N").any(), "N appears out of nowhere."
     final.write_parquet(
@@ -69,8 +68,7 @@ def run_screen(
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
     overwrite: bool = False,
-) -> pl.DataFrame:
-    ...
+) -> pl.DataFrame: ...
 
 
 @overload
@@ -83,8 +81,7 @@ def run_screen(
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
     overwrite: bool = False,
-) -> dict[int, pl.DataFrame]:
-    ...
+) -> dict[int, pl.DataFrame]: ...
 
 
 def run_screen(
@@ -149,7 +146,7 @@ def run_screen(
 @click.option(
     "--maxoverlap", type=int, default=20, help="Maximum sequence overlap between probes if minimum is set."
 )
-@click.option("--restriction", type=str, multiple=True, help="Restriction enzymes to filter probes by.")
+@click.option("--restriction", type=str, help="Restriction enzymes to filter probes by.")
 @click.option("--overwrite", is_flag=True, help="Overwrite existing files.")
 def screen(
     data_dir: str,
@@ -158,7 +155,7 @@ def screen(
     overlap: int = -2,
     minimum: int | None = None,
     maxoverlap: int = 20,
-    restriction: list[str] | None = None,
+    restriction: str | None = None,
     overwrite: bool = False,
 ):
     """Screening of probes candidates for a gene."""
@@ -169,6 +166,6 @@ def screen(
         overlap=overlap,
         minimum=minimum,
         maxoverlap=maxoverlap,
-        restriction=restriction,
+        restriction=restriction.split(",") if restriction else None,
         overwrite=overwrite,
     )
