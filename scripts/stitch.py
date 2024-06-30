@@ -1,20 +1,26 @@
 # %%
-import functools
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from itertools import cycle, islice
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Literal
 
+from tifffile import imread, imwrite
+
+import numpy as np
 import pandas as pd
 import rich_click as click
+
 from loguru import logger
+from fishtools.analysis.tileconfig import TileConfiguration
 
 
 def create_tile_config(
-    path: Path, df: pd.DataFrame, sub: str, *, pixel: int = 1024, flavor: Literal["big", "stitch"] = "stitch"
+    path: Path,
+    df: pd.DataFrame,
+    *,
+    name: str = "TileConfiguration.txt",
+    pixel: int = 1024,
 ):
     scale = 2048 / pixel
     actual = pixel * (0.108 * scale)
@@ -32,45 +38,85 @@ def create_tile_config(
     ats["x"] -= ats["x"].min()
     ats["y"] -= ats["y"].min()
 
-    with open(path / "TileConfiguration.txt", "w") as f:
+    mat = ats[["y", "x"]].to_numpy() @ np.loadtxt("/home/chaichontat/fishtools/data/stage_rotation.txt")
+    ats["x"] = mat[:, 0]
+    ats["y"] = mat[:, 1]
+
+    print(ats)
+
+    with open(path / name, "w") as f:
         f.write("dim=2\n")
-        if flavor == "big":
-            for idx, row in islice(cycle(ats.iterrows()), 27 * len(ats)):
-                f.write(f"{idx}; ; ({row['x']}, {row['y']})\n")
-        else:
-            for idx, row in ats.iterrows():
-                f.write(f"{idx:03d}_{sub}.tif; ; ({row['x']}, {row['y']})\n")
+        for idx, row in ats.iterrows():
+            f.write(f"{idx:04d}.tif; ; ({row['x']}, {row['y']})\n")
 
 
-def run_imagej(path: Path, *, compute_overlap: bool = False, threshold: float = 0.4):
+def run_imagej(
+    path: Path,
+    *,
+    compute_overlap: bool = False,
+    fuse: bool = True,
+    threshold: float = 0.4,
+    name: str = "TileConfiguration.txt",
+):
     options = "subpixel_accuracy"  # compute_overlap
     if compute_overlap:
         options += " compute_overlap"
-    fusion = "Linear Blending"
+    fusion = "Linear Blending" if fuse else "Do not fuse images (only write TileConfiguration)"
+
+    align = f"""
+    run("Calculate pairwise shifts ...", "select={path.resolve()}/dataset.xml \
+    process_angle=[All angles] process_channel=[All channels] process_illumination=[All illuminations] process_tile=[All tiles] \
+    process_timepoint=[All Timepoints] method=[Phase Correlation] \
+    downsample_in_x=1 downsample_in_y=1");
+
+    run("Filter pairwise shifts ...", "select={path.resolve()}/dataset.xml \
+    filter_by_link_quality min_r=0.6 max_r=1 \
+    max_shift_in_x=0 max_shift_in_y=0 max_shift_in_z=0 \
+    max_displacement=0");
+
+    run("Optimize globally and apply shifts ...", "select={path.resolve()}/dataset.xml \
+    process_angle=[All angles] process_channel=[All channels] \
+    process_illumination=[All illuminations] process_tile=[All tiles] \
+    process_timepoint=[All Timepoints] \
+    relative=1.500 absolute=2.500 \
+    global_optimization_strategy=[Two-Round using Metadata to align unconnected Tiles and iterative dropping of bad links] \
+    fix_group_0-0");
+"""
+
+    # run("Define dataset ...", "define_dataset=[Automatic Loader (Bioformats based)] \
+    # project_filename=dataset.xml path={path.resolve()}/*.tif \
+    # exclude=10 pattern_0=Tiles move_tiles_to_grid_(per_angle)?=[Do not move Tiles to Grid (use Metadata if available)] \
+    # how_to_load_images=[Load raw data directly] \
+    # dataset_save_path={path.resolve()}");
+
+    # run("Load TileConfiguration from File...", "select={path.resolve()}/dataset.xml \
+    # tileconfiguration={path.resolve()}/TileConfiguration.registered.txt \
+    # use_pixel_units keep_metadata_rotation");
+
+    # run("Fuse dataset ...", "select={path.resolve()}/dataset.xml \
+    # process_angle=[All angles] process_channel=[All channels] process_illumination=[All illuminations] \
+    # process_tile=[All tiles] process_timepoint=[All Timepoints] bounding_box=[Currently Selected Views] \
+    # downsampling=1 interpolation=[Linear Interpolation] pixel_type=[16-bit unsigned integer] \
+    # interest_points_for_non_rigid=[-= Disable Non-Rigid =-] \
+    # blend produce=[Each timepoint & channel] \
+    # fused_image=[Save as (compressed) TIFF stacks] \
+    # define_input=[Auto-load from input data (values shown below)] \
+    # output_file_directory={path.resolve()}");
 
     macro = f"""
-    run("Memory & Threads...", "parallel=8");
+    run("Memory & Threads...", "parallel=16");
+
     run("Grid/Collection stitching", "type=[Positions from file] \
-order=[Defined by TileConfiguration] directory={path.resolve()} \
-layout_file=TileConfiguration{"" if compute_overlap else ".registered"}.txt \
-fusion_method=[{fusion}] regression_threshold={threshold} \
-max/avg_displacement_threshold=1.5 absolute_displacement_threshold=2.5 {options} \
-computation_parameters=[Save computation time (but use more RAM)] \
-image_output=[Write to disk] \
-output_directory={path.resolve()}");
+    order=[Defined by TileConfiguration] directory={path.resolve()} \
+    layout_file={name}{"" if compute_overlap else ".registered"}.txt \
+    fusion_method=[{fusion}] regression_threshold={threshold} \
+    max/avg_displacement_threshold=1.5 absolute_displacement_threshold=2.5 {options} \
+    computation_parameters=[Save computation time (but use more RAM)] \
+    image_output=[Write to disk] \
+    output_directory={path.resolve()}");
     """
 
-    #     macro = f"""
-    #     run("Memory & Threads...", "parallel=8");
-    #     run("Grid/Collection stitching", "type=[Unknown position] \
-    # order=[All files in directory] directory={path.resolve()} \
-    # output_textfile_name=TileConfiguration.txt \
-    # fusion_method=[{fusion}] regression_threshold={threshold} \
-    # max/avg_displacement_threshold=1.50 absolute_displacement_threshold=2.50 subpixel_accuracy \
-    # computation_parameters=[Save computation time (but use more RAM)] \
-    # image_output=[Write to disk] \
-    # output_directory={path.resolve()}");
-    #     """
+    print(macro)
 
     with NamedTemporaryFile("wt") as f:
         f.write(macro)
@@ -85,119 +131,125 @@ import re
 
 
 def copy_registered(reference_path: Path, actual_path: Path):
-    try:
-        shutil.copy(reference_path / "TileConfiguration.registered.txt", actual_path)
-    except FileNotFoundError:
-        ...
-    tr = actual_path / "TileConfiguration.registered.txt"
-    tr.write_text(
-        "\n".join(
-            map(
-                lambda x: x.replace(
-                    f"_{int(reference_path.stem):03d}.tif", f"_{int(actual_path.stem):03d}.tif"
-                ),
-                tr.read_text().splitlines(),
-            )
-        )
-    )
+    for file in reference_path.glob("*.registered.txt"):
+        shutil.copy(file, actual_path)
+    # tr = actual_path / "TileConfiguration.registered.txt"
+    # tr.write_text(
+    #     "\n".join(
+    #         map(
+    #             lambda x: x.replace(
+    #                 f"_{int(reference_path.stem):03d}.tif", f"_{int(actual_path.stem):03d}.tif"
+    #             ),
+    #             tr.read_text().splitlines(),
+    #         )
+    #     )
+    # )
 
 
-# path = Path("/fast2/thicc/thicc/")
-# reference_path = path / "down2" / "0"
-# actual_path = path / "down2" / "16"
-# prefix = "3_11_19"
-# glob = prefix + "-*.tif"
+@click.group()
+def cli(): ...
 
 
-# @cli.command()
-# @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-# # @click.option("--downsample", type=int, default=2)
-
-
-@click.command()
+@cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("position_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--recreate", is_flag=True)
-@click.option("--reference", type=str)
 @click.option("--threshold", type=float, default=0.4)
-def main(
+def register(
     path: Path,
     position_file: Path,
     *,
-    reference: str | None = None,
     recreate: bool = False,
     threshold: float = 0.4,
 ):
+    def get_idxs(folder: Path):
+        return {int(x.stem) for x in sorted(folder.glob("*.tif"))}
+
+    print((path / "TileConfiguration.registered.txt").exists())
+    # functools.reduce(lambda x, y: x & y, [get_idxs(f) for f in folders]
+    if recreate or not (path / "TileConfiguration.registered.txt").exists():
+        files_idx = get_idxs(path)
+        # pixel = 2**bits
+        tileconfig = TileConfiguration.from_pos(
+            pd.read_csv(position_file, header=None).iloc[sorted(files_idx)], downsample=3
+        )
+        tileconfig.write(path / "TileConfiguration.txt")
+        logger.info(f"Created TileConfiguration at {path}.")
+        logger.info("Running first.")
+        run_imagej(path, compute_overlap=True, fuse=False, threshold=threshold, name="TileConfiguration")
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "tile_config_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path)
+)
+@click.option("--split", type=int, default=1)
+@click.option("--reference", type=str)
+@click.option("--overwrite", is_flag=True)
+@click.option("--downsample", type=int, default=1)
+def fuse(
+    path: Path,
+    tile_config_file: Path,
+    *,
+    split: int = 1,
+    overwrite: bool = False,
+    downsample: int = 1,
+):
     folders = sorted([p for p in path.iterdir() if p.is_dir()], key=lambda x: int(x.stem))
-    ref = folders[-1] if reference is None else [f for f in folders if f.stem == reference][0]
     logger.info(f"Found {[f.name for f in folders]} at {path}.")
 
-    def get_idxs(folder: Path):
-        return {int(x.stem.split("_")[0]) for x in folder.glob("*.tif")}
+    tileconfig = TileConfiguration.from_file(tile_config_file)
+    print(tileconfig.df)
 
-    if recreate or not (ref / "TileConfiguration.txt").exists():
-        files_idx = functools.reduce(lambda x, y: x & y, [get_idxs(f) for f in folders], get_idxs(ref))
+    tileconfig = tileconfig.downsample(downsample)
+    n = len(tileconfig) // split
 
-        df = pd.read_csv(position_file, header=None).iloc[sorted(files_idx)]
-        print(df)
-
-        create_tile_config(ref, df, f"{int(ref.stem):03d}", pixel=1024)
-        logger.info(f"Created TileConfiguration with {len(df)} files at {path}.")
-
-    if recreate or not (ref / "TileConfiguration.registered.txt").exists():
-        logger.info("Running first.")
-        run_imagej(ref, compute_overlap=True, threshold=threshold)
-
-    assert (ref / "TileConfiguration.registered.txt").exists(), "No registered file found."
-    for f in folders:
-        if f is not ref:
-            copy_registered(ref, f)
+    def run_folder(folder: Path):
+        for i in range(split):
+            tileconfig[i * n : (i + 1) * n].write(folder / f"TileConfiguration{i+1}.registered.txt")
+            run_imagej(folder, name=f"TileConfiguration{i+1}")
+            Path(folder / f"img_t1_z1_c1").rename(folder / f"fused_{i+1}.tif")
 
     with ThreadPoolExecutor(4) as exc:
-        for f in folders:
-            if f is not ref:
-                exc.submit(run_imagej, f)
+        for folder in folders:
+            if list(folder.glob("fused*")) and not overwrite:
+                logger.warning("Image already exists. Skipping.")
+                continue
+            exc.submit(run_folder, folder)
 
-    # Run first
+    if split > 1:
+        for folder in folders:
+            final_stitch(folder, split)
 
 
-# df = pl.read_csv(Path("/raid/data/star/sagittal/positions.csv"), has_header=False).to_numpy()
-# df += -df.min(axis=0)
-# df * 2048 / 200 * 0.9
-# os.environ["JAVA_TOOL_OPTIONS"] = "-Djava.net.useSystemProxies=true"
+def final_stitch(path: Path, n: int):
+    logger.info(f"Combining splits of {n} for {path}.")
+    import polars as pl
 
-# scyjava.config.add_option("-Xmx100g")
-# ij = imagej.init("/home/chaichontat/Fiji.app", add_legacy=True)
-# assert ij
+    tcs = [TileConfiguration.from_file(f"{path}/TileConfiguration{i+1}.registered.txt") for i in range(n)]
 
-# %%
+    bmin = pl.concat([tc.df.min() for tc in tcs])
+    bmax = pl.concat([tc.df.max() for tc in tcs])
 
-# %%
+    mins = (bmin.min()[0, "y"], bmin.min()[0, "x"])
+    maxs = (bmax.max()[0, "y"] + 1024, bmax.max()[0, "x"] + 1024)
+
+    out = np.zeros((n, int(maxs[0] - mins[0] + 1), int(maxs[1] - mins[1] + 1)), dtype=np.uint16)
+
+    for i in range(n):
+        img = imread(f"{path}/fused_{i+1}.tif")
+        offsets = (int(bmin[i, "y"] - mins[i]), int(bmin[i, "x"] - mins[i]))
+        out[i, offsets[0] : img.shape[0] + offsets[0], offsets[1] : img.shape[1] + offsets[1]] = img
+
+    out = out.max(axis=0)
+    imwrite(
+        path / "fused.tif", out, compression=22610, compressionargs={"level": 0.8}, metadata={"axes": "YX"}
+    )
+    del out
+
+
 if __name__ == "__main__":
-    main()
+    cli()
 
 # %%
-
-# %%
-
-
-# ImageJ-linux64 --update add-update-site BigStitcher https://sites.imagej.net/BigStitcher/
-# ImageJ-linux64 --update update
-
-# macro = f"""
-# run("Memory & Threads...", "parallel=24");
-# run("Define dataset ...", "define_dataset=[Automatic Loader (Bioformats based)] project_filename=dataset.xml path={path}/{glob} exclude=10 bioformats_channels_are?=Channels pattern_0=Tiles modify_voxel_size? voxel_size_x=0.108 voxel_size_y=0.108 voxel_size_z=1.0000 voxel_size_unit=µm move_tiles_to_grid_(per_angle)?=[Do not move Tiles to Grid (use Metadata if available)] how_to_load_images=[Re-save as multiresolution HDF5] dataset_save_path={path} manual_mipmap_setup subsampling_factors=[{{ {{1,1,1}}, {{2,2,1}} }}] hdf5_chunk_sizes=[{{ {{128,128,1}}, {{128,128,1}} }}] timepoints_per_partition=1 setups_per_partition=0 use_deflate_compression");
-
-# run("Load TileConfiguration from File...", "select={path}/dataset.xml tileconfiguration={path}/TileConfiguration.txt use_pixel_units keep_metadata_rotation");
-
-# run("Calculate pairwise shifts ...", "select={path}/dataset.xml process_angle=[All angles] process_channel=[All channels] process_illumination=[All illuminations] process_tile=[All tiles] process_timepoint=[All Timepoints] method=[Phase Correlation] show_expert_algorithm_parameters downsample_in_x=1 downsample_in_y=1 subpixel_accuracy");//
-
-# run("Optimize globally and apply shifts ...", "select={path}/dataset.xml process_angle=[All angles] process_channel=[All channels] process_illumination=[All illuminations] process_tile=[All tiles] process_timepoint=[All Timepoints] relative=2.500 absolute=3.500 global_optimization_strategy=[Two-Round using Metadata to align unconnected Tiles and iterative dropping of bad links] fix_group_0-0,");
-
-# // run("Fuse dataset ...", "select={path}/dataset.xml process_angle=[All angles] process_channel=[All channels] process_illumination=[All illuminations] process_tile=[All tiles] process_timepoint=[All Timepoints] bounding_box=[Currently Selected Views] downsampling=1 interpolation=[Linear Interpolation] pixel_type=[16-bit unsigned integer] interest_points_for_non_rigid=[-= Disable Non-Rigid =-] produce=[Each timepoint & channel] fused_image=[Save as (compressed) TIFF stacks] define_input=[Auto-load from input data (values shown below)] output_file_directory={path}/ filename_addition=[]");
-
-# // run("Fuse dataset ...", "select={path}/dataset.xml process_angle=[All angles] process_channel=[All channels] process_illumination=[All illuminations] process_tile=[All tiles] process_timepoint=[All Timepoints] bounding_box=[Currently Selected Views] downsampling=2 interpolation=[Linear Interpolation] pixel_type=[16-bit unsigned integer] interest_points_for_non_rigid=[-= Disable Non-Rigid =-] produce=[Each timepoint & channel] fused_image=[ZARR/N5/HDF5 export using N5-API] define_input=[Auto-load from input data (values shown below)] export=HDF5 hdf5_file={path}/fused.h5 hdf5_base_dataset=/ hdf5_dataset_extension=/s0");
-
-# """
-
-# /path/to/fiji/ImageJ-linux64 –headless –console -macro /path/to/macro/bigStitcherBatch.ijm “/path/to/data 2 3”

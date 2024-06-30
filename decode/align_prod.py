@@ -19,6 +19,7 @@ from starfish import Codebook, ImageStack, IntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
 )
+import subprocess
 from starfish.core.spots.DetectPixels.combine_adjacent_features import CombineAdjacentFeatures
 from starfish.core.types import Axes, Coordinates, CoordinateValue
 from starfish.experiment.builder import FetchedTile, TileFetcher
@@ -28,9 +29,6 @@ from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import imread, imwrite
 
 from fishtools.utils.pretty_print import progress_bar
-
-# We use this to cache images across tiles.  To avoid reopening and decoding the TIFF file, we use a
-# single-element cache that maps between file_path and the array data.
 
 
 # %%
@@ -142,7 +140,6 @@ def load_codebook(path: Path):
 
 
 # %%
-import subprocess
 
 
 @click.group()
@@ -228,6 +225,7 @@ def initial(img: ImageStack):
 @click.option("--scale-file", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
 def run(path: Path, scale_file: Path, iters: int = 1, overwrite: bool = False):
     logger.info("Reading files")
+    path, scale_file = Path(path), Path(scale_file)
     stack = make_fetcher(path, np.s_[:, :13])
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
@@ -240,7 +238,7 @@ def run(path: Path, scale_file: Path, iters: int = 1, overwrite: bool = False):
     # Scaling
     imgs: ImageStack = ghp.run(stack)
     # scale_file = path.with_suffix(".scale.json")
-    if overwrite or not scale_file.exists():
+    if not scale_file.exists():
         logger.debug(f"Making scale file.")
         np.savetxt(path.with_suffix(".scale.txt"), initial(imgs))
         return
@@ -256,47 +254,60 @@ def run(path: Path, scale_file: Path, iters: int = 1, overwrite: bool = False):
     )
 
     # Decode
-    for i in range(iters):
-        pixel_intensities = IntensityTable.from_image_stack(imgs)
-        logger.info(f"Iteration {i}: Decoding")
-        decoded_intensities = codebook.decode_metric(
-            pixel_intensities,
-            max_distance=0.25,
-            min_intensity=0.001,
-            norm_order=2,
-            metric="euclidean",
-            return_original_intensities=True,
-        )
+    pixel_intensities = IntensityTable.from_image_stack(imgs)
+    logger.info(f"Decoding")
+    decoded_intensities = codebook.decode_metric(
+        pixel_intensities,
+        max_distance=0.25,
+        min_intensity=0.001,
+        norm_order=2,
+        metric="euclidean",
+        return_original_intensities=True,
+    )
 
-        logger.info(f"Iteration {i}: Combining")
-        caf = CombineAdjacentFeatures(min_area=4, max_area=100, mask_filtered_features=True)
-        decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
-        transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
+    logger.info(f"Combining")
+    caf = CombineAdjacentFeatures(min_area=4, max_area=100, mask_filtered_features=True)
+    decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
+    transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
 
-        spot_intensities = decoded_spots.loc[decoded_spots[Features.PASSES_THRESHOLDS]]
-        genes, counts = np.unique(
-            spot_intensities[Features.AXIS][Features.TARGET],
-            return_counts=True,
-        )
-        gc = dict(zip(genes, counts))
-        percent = sum([v for k, v in gc.items() if k.startswith("Blank")]) / counts.sum()
-        logger.debug(f"{percent} blank, Total: {counts.sum()}")
+    spot_intensities = decoded_spots.loc[decoded_spots[Features.PASSES_THRESHOLDS]]
+    genes, counts = np.unique(
+        spot_intensities[Features.AXIS][Features.TARGET],
+        return_counts=True,
+    )
+    gc = dict(zip(genes, counts))
+    percent = sum([v for k, v in gc.items() if k.startswith("Blank")]) / counts.sum()
+    logger.debug(f"{percent} blank, Total: {counts.sum()}")
 
-        # Deviations
-        if False:
-            names_l = {n: i for i, n in enumerate(names)}
-            idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
+    # Deviations
+    if False:
+        names_l = {n: i for i, n in enumerate(names)}
+        idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
 
-            avgs = np.nanmean(spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0)
-            np.savetxt(path.with_suffix(".scale.txt"), avgs)
+        avgs = np.nanmean(spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0)
+        np.savetxt(path.with_suffix(".scale.txt"), avgs)
 
-        with open(path.with_suffix(".pkl"), "wb") as f:
-            pickle.dump(decoded_spots, f)
+    morph = [
+        {"area": prop.area, "centroid": prop.centroid}
+        for prop in np.array(image_decoding_results.region_properties)[
+            decoded_spots[Features.PASSES_THRESHOLDS]
+        ]
+    ]
+
+    with open(path.with_suffix(".pkl"), "wb") as f:
+        pickle.dump((decoded_spots, morph), f)
+
+    return decoded_spots, image_decoding_results
 
 
 if __name__ == "__main__":
     cli()
+# %%
 
+u = run.callback(
+    "/fast2/3t3clean/analysis/deconv/registered/reg-0000.tif",
+    Path("/fast2/3t3clean/analysis/deconv/registered/decode_scale.json"),
+)
 # %%
 # rand = np.random.default_rng(0)
 # t = rand.normal(10, 1, size=(18))
