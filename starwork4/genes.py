@@ -58,7 +58,7 @@ def main(data: Path, path: Path, existing: Path, single: bool = False):
         if single:
             raise ValueError("Cannot use --single with existing codebook")
         assert existing_cb
-        genes = set(ts.split("-")[0] for ts in existing_cb)
+        genes = {ts.split("-")[0] for ts in existing_cb}
         old = set(corrected)
         corrected = old - genes
         logger.info(f"{len(corrected)} genes remaining after removing {old & set(genes)}")

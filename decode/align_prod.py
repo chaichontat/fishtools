@@ -1,6 +1,7 @@
 # %%
 import json
 import pickle
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
 from pathlib import Path
@@ -19,7 +20,6 @@ from starfish import Codebook, ImageStack, IntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
 )
-import subprocess
 from starfish.core.spots.DetectPixels.combine_adjacent_features import CombineAdjacentFeatures
 from starfish.core.types import Axes, Coordinates, CoordinateValue
 from starfish.experiment.builder import FetchedTile, TileFetcher
@@ -29,7 +29,6 @@ from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import imread, imwrite
 
 from fishtools.utils.pretty_print import progress_bar
-
 
 # %%
 
