@@ -5,13 +5,12 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from tifffile import imread, imwrite
-
 import numpy as np
 import pandas as pd
 import rich_click as click
-
 from loguru import logger
+from tifffile import imread, imwrite
+
 from fishtools.analysis.tileconfig import TileConfiguration
 
 
