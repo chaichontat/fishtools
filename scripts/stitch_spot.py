@@ -19,7 +19,9 @@ sns.set_theme()
 
 files = sorted((path := Path("/fast2/3t3clean/analysis/deconv/registered")).glob("*.pkl"))
 
-coords = TileConfiguration.from_file(Path("/fast2/3t3clean/analysis/dapi/0/TileConfiguration.registered.txt"))
+coords = TileConfiguration.from_file(
+    Path("/fast2/3t3clean/analysis/deconv/registered/dapi/0/TileConfiguration.registered.txt")
+).df
 
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
@@ -117,13 +119,12 @@ for curr in range(len(cells[:])):
     df = load(curr)
 
     def what(row):
-        print(row)
         for name, intersected in this_cross.items():
             if contains(intersected, Point((row["x"], row["y"]))):
                 return False
         return True
 
-    df.filter(pl.struct("x", "y").map(what))
+    df.filter(pl.struct("x", "y").apply(what))
 
     for row in df.iter_rows(named=True):
         for name, intersected in this_cross.items():
@@ -142,7 +143,7 @@ spots = pl.DataFrame(out)
 spots.write_parquet("/fast2/3t3clean/analysis/spots.parquet")
 
 # %%
-plt.scatter(spots["x"], spots["y"], s=0.1, alpha=0.3)
+plt.scatter(spots["x"][::1000], spots["y"][::1000], s=0.1, alpha=0.3)
 # %%
 # sns.scatterplot(
 #     x="x",
@@ -233,6 +234,10 @@ sns.scatterplot(x="count", y="ratio", data=t.to_pandas(), alpha=0.3, s=10, edgec
 # make x log
 plt.xscale("log")
 # %%
+spots.filter(c("norm") > -0.3 / 20 * c("area") + 0.25).write_parquet(
+    "/fast2/3t3clean/analysis/spots_filtered.parquet"
+)
+
 # %%
 from sklearn.inspection import DecisionBoundaryDisplay
 

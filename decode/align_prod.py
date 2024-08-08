@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
 from pathlib import Path
 from typing import Any, Mapping
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -31,7 +32,7 @@ from tifffile import imread, imwrite
 from fishtools.utils.pretty_print import progress_bar
 
 
-# %%
+os.environ["TQDM_DISABLE"] = "1"
 
 
 def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:]):
@@ -304,10 +305,10 @@ if __name__ == "__main__":
     cli()
 # %%
 
-u = run.callback(
-    "/fast2/3t3clean/analysis/deconv/registered/reg-0000.tif",
-    Path("/fast2/3t3clean/analysis/deconv/registered/decode_scale.json"),
-)
+# u = run.callback(
+#     "/fast2/3t3clean/analysis/deconv/registered/reg-0000.tif",
+#     Path("/fast2/3t3clean/analysis/deconv/registered/decode_scale.json"),
+# )
 # %%
 # rand = np.random.default_rng(0)
 # t = rand.normal(10, 1, size=(18))

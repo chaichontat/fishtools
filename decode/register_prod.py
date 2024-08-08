@@ -321,7 +321,7 @@ def run(
     else:
         imgs = {
             file.name: Image.from_file(file)
-            for file in sorted(Path(path).rglob(f"*-{idx:04d}.tif"))
+            for file in sorted(Path(path).glob(f"*/*-{idx:04d}.tif"))
             if not file.parent.name in ["10x", "registered"]
         }
 
@@ -488,7 +488,7 @@ def main(
         config=Config(
             dataPath=str(DATA),
             registration=RegisterConfig(
-                fiducial=Fiducial(fwhm=4, threshold=8),
+                fiducial=Fiducial(fwhm=5, threshold=6),
                 downsample=1,
                 crop=25,
                 slices=[(0, 5), (5, 10)],

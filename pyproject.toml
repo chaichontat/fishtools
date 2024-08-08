@@ -2,7 +2,7 @@
 authors = ["Chaichontat Sriworarat <csriwor1@jh.edu>"]
 description = ""
 include = [{path = 'static/*', format = 'wheel'}]
-license = "MIT"
+license = "GPL-3.0-only"
 name = "fishtools"
 packages = [{include = "fishtools"}]
 readme = "README.md"
