@@ -9,12 +9,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
 import click
-
-logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
-import jax
-
-jax.config.update("jax_platform_name", "cpu")
-
 import numpy as np
 import SimpleITK as sitk
 import tifffile
@@ -29,32 +23,44 @@ from tifffile import TiffFile
 from fishtools import align_fiducials
 from fishtools.analysis.fiducial import align_phase, phase_shift
 
+logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
+import jax
+
+jax.config.update("jax_platform_name", "cpu")
+
+
 if TYPE_CHECKING:
     from loguru import Logger
 
 
 class Fiducial(BaseModel):
     fwhm: float = Field(
-        4.0,
+        default=4.0,
         description="Full width at half maximum for fiducial spot detection. The higher this is, the more spots will be detected.",
     )
     threshold: float = Field(
-        3.0, description="Threshold for fiducial spot detection in standard deviation above the median."
+        default=3.0,
+        description="Threshold for fiducial spot detection in standard deviation above the median.",
+    )
+    priors: dict[str, tuple[float, float]] | None = Field(
+        default=None,
+        description="Shifts to apply before alignment. Name must match round name.",
     )
 
 
 class RegisterConfig(BaseModel):
     fiducial: Fiducial
-    downsample: int = Field(1, description="Downsample factor")
+    downsample: int = Field(default=1, description="Downsample factor")
     reduce_bit_depth: int = Field(
-        0,
+        default=0,
         description="Reduce bit depth by n bits. 0 to disable. This is to assist in compression of output intended for visualization.",
     )
     crop: int = Field(
-        25, description="Pixels to crop from each edge. This is to account for translation during alignment."
+        default=25,
+        description="Pixels to crop from each edge. This is to account for translation during alignment.",
     )
     slices: list[tuple[int | None, int | None]] = Field(
-        [(0, 5)], description="Slice range to use for registration"
+        default=[(0, 5)], description="Slice range to use for registration"
     )
     max_proj: bool = True
     split_channels: bool = False
@@ -80,9 +86,13 @@ DATA = Path("/home/chaichontat/fishtools/data")
 
 As = {}
 ats = {}
-for λ in ["405", "488", "560", "750"]:
-    a_ = np.loadtxt(DATA / f"650to{λ}.txt")
-    A, t = a_[:9].reshape(3, 3), a_[-3:]
+for λ in ["650", "750"]:
+    a_ = np.loadtxt(DATA / f"560to{λ}.txt")
+    A = np.zeros((3, 3), dtype=np.float32)
+    A[:2, :2] = a_[:4].reshape(2, 2)
+    t = np.zeros(3)
+    t[:2] = a_[-2:]
+
     A[2] = [0, 0, 1]
     A[:, 2] = [0, 0, 1]
     t[2] = 0
@@ -204,8 +214,8 @@ def affine(img: np.ndarray[np.float32, Any], channel: str, shiftpx: np.ndarray, 
         return st(ref, img, translate)
 
     affine = sitk.AffineTransform(3)
-    affine.SetMatrix(As[channel].flatten())
-    affine.SetTranslation([*ats[channel], 0])
+    affine.SetMatrix(As.get(channel, As["560"]).flatten())
+    affine.SetTranslation([*ats.get(channel, ats["560"]), 0])
     affine.SetCenter([1023.5 + shiftpx[0], 1023.5 + shiftpx[1], 0])
 
     composite = sitk.CompositeTransform(3)
@@ -221,6 +231,7 @@ class Image:
     idx: int
     nofid: np.ndarray
     fid: np.ndarray
+    fid_raw: np.ndarray
     bits: list[str]
     powers: dict[str, float]
     metadata: dict[str, Any]
@@ -250,7 +261,11 @@ class Image:
         if len(powers) != len(bits):
             raise ValueError(f"{path}: Expected {len(bits)} channels, got {len(powers)}")
 
-        deconv_scaling = np.loadtxt(path.parent / "deconv_scaling.txt").astype(np.float32)
+        if "deconv_scaling" in path.parent.name:
+            deconv_scaling = np.loadtxt(path.parent / "deconv_scaling.txt").astype(np.float32)
+        else:
+            deconv_scaling = np.ones((len(bits), 2))
+
         nofid = img[:-1].reshape(-1, len(powers), 2048, 2048)
         if "dapi" in stem:
             nofid = nofid[::2]
@@ -260,6 +275,7 @@ class Image:
             idx=int(idx),
             nofid=nofid,
             fid=cls.loG_fids(img[-1]),
+            fid_raw=img[-1],
             bits=bits,
             powers=powers,
             metadata=metadata,
@@ -329,20 +345,32 @@ def run(
     if not imgs:
         raise FileNotFoundError(f"No files found in {path} with index {idx}")
 
+    logger.info("Aligning fiducials")
+    nofids = {name: img.nofid for name, img in imgs.items()}
+    fids = {name: img.fid for name, img in imgs.items()}
+
+    prior_mapping: dict[str, str] = {}
+    if config.fiducial.priors is not None:
+        for name, sh in config.fiducial.priors.items():
+            for file in fids:
+                if file.startswith(name):
+                    fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
+                    prior_mapping[name] = file
+                    break
+            else:
+                raise ValueError(f"Could not find file that starts with {name} for prior shift.")
+
     if debug:
         _fids_path = path / f"fids_{idx}.tif"
         tifffile.imwrite(
             _fids_path,
-            np.stack([i.fid for i in imgs.values()]),
+            np.stack([v for v in fids.values()]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX"},
         )
         logger.debug(f"Written fiducials to {_fids_path}.")
 
-    fids = {name: img.fid for name, img in imgs.items()}
-    nofids = {name: img.nofid for name, img in imgs.items()}
-    logger.info("Aligning fiducials")
     shifts = align_fiducials(
         fids,
         reference=reference,
@@ -351,6 +379,11 @@ def run(
         threshold=config.fiducial.threshold,
         fwhm=config.fiducial.fwhm,
     )
+
+    if config.fiducial.priors is not None:
+        for name, sh in config.fiducial.priors.items():
+            shifts[prior_mapping[name]][0] += sh[0]
+            shifts[prior_mapping[name]][1] += sh[1]
 
     (path / "shifts").mkdir(exist_ok=True)
     with open(path / f"shifts/shifts_{idx}.json", "w") as f:
@@ -378,23 +411,24 @@ def run(
     def collapse_z(
         img: np.ndarray, slices: list[tuple[int | None, int | None]], max_proj: bool = True
     ) -> np.ndarray:
-        # return np.stack([img[slice(*sl)].max(axis=0) for sl in slices])
-        return img.reshape(-1, 4, *img.shape[1:]).max(axis=1)
+        return np.stack([img[slice(*sl)].max(axis=0) for sl in slices])
+        # return img.reshape(-1, 4, *img.shape[1:]).max(axis=1)
 
     transformed: dict[str, np.ndarray] = {}
     n_z = -1
     ref = None
 
     for i, (bit, img) in enumerate(bits.items()):
+        logger.debug(f"Processing {bit}")
         c = str(channels[bit])
         img = collapse_z(img, config.slices, config.max_proj).astype(np.float32)
         n_z = img.shape[0]
         # Deconvolution scaling
         orig_name, orig_idx = bit_name_mapping[bit]
-        img = imgs[orig_name].scale_deconv(img, orig_idx)
+        # img = imgs[orig_name].scale_deconv(img, orig_idx)
 
         # Illumination correction
-        img = np.stack(basic[c].transform(img))
+        img = np.stack(basic[c].transform(np.array(img)))
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
@@ -488,10 +522,21 @@ def main(
         config=Config(
             dataPath=str(DATA),
             registration=RegisterConfig(
-                fiducial=Fiducial(fwhm=5, threshold=6),
+                fiducial=Fiducial(
+                    fwhm=fwhm,
+                    threshold=threshold,
+                    # priors={
+                    #     "5_13_21": (-160, -175),
+                    #     "6_14_22": (-160, -175),
+                    #     "7_15_23": (-160, -175),
+                    #     "8_16_24": (-160, -175),
+                    #     "25_26_27": (-160, -175),
+                    #     "dapi_29_polyA": (10, 30),
+                    # },
+                ),
                 downsample=1,
                 crop=25,
-                slices=[(0, 5), (5, 10)],
+                slices=[(0, -1)],
                 reduce_bit_depth=0,
                 max_proj=True,
             ),

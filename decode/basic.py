@@ -8,6 +8,8 @@ from basicpy import BaSiC
 from loguru import logger
 from tifffile import TiffFile
 
+import starfish
+
 channels = [405, 560, 650, 750]
 # %%
 prefix = "wga_2_10_18"
