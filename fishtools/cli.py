@@ -14,8 +14,7 @@ P, R = ParamSpec("P"), TypeVar("R", covariant=True)
 
 
 class PathFirst(Protocol[P, R]):
-    def __call__(self, path: Path, *args: P.args, **kwargs: P.kwargs) -> R:
-        ...
+    def __call__(self, path: Path, *args: P.args, **kwargs: P.kwargs) -> R: ...
 
 
 def execute(
@@ -38,8 +37,7 @@ def execute(
 
 
 @click.group()
-def main():
-    ...
+def main(): ...
 
 
 def process_path(path: Path, file_types: list[str]):
@@ -64,10 +62,10 @@ def compress(path: Path, delete: bool = False, quality: int = 1, n_process: int 
     files = process_path(path, [".tif", ".tiff", ".jp2", ".dax"])
     log.info(f"Found {len(files)} potential file(s).")
     execute(files, lib.compress, level=quality, n_process=n_process)
-    if delete and quality <= 0.65:
+    if delete and quality < 0.65:
         log.warning("Not deleting original files because quality is less than 0.65. Please delete manually.")
     for file in files:
-        if delete and 0.65 < quality < 1:  # .tif output is only possible when quality == 100.
+        if delete and 0.65 <= quality <= 1:
             file.unlink()
 
 
