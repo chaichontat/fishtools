@@ -26,9 +26,9 @@ def execute(
             def submit(file: Path) -> Future[R]:
                 future = pool.submit(run, file, *args, **kwargs)
                 future.add_done_callback(lambda _: progress.update())
-                future.add_done_callback(
-                    lambda x: log.info(f"Finished {file.as_posix()}") if x.result() else None
-                )
+                # future.add_done_callback(
+                #     lambda x: log.info(f"Finished {file.as_posix()}") if x.result() else None
+                # )
                 return future
 
             res = [fut.result() for fut in list(map(submit, files))]
@@ -47,7 +47,7 @@ def process_path(path: Path, file_types: list[str]):
         files = [path]
     else:
         raise ValueError(f"Unknown file type {path.suffix}")
-    return files
+    return sorted(files)
 
 
 # fmt: off
