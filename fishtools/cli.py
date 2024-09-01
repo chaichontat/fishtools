@@ -52,7 +52,7 @@ def process_path(path: Path, file_types: list[str]):
 
 # fmt: off
 @main.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=True, path_type=Path))
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--delete", "-d", is_flag=True, help="Delete original files")
 @click.option("--quality", "-q", default=1.0, type=float, help="Quality level (0-1). 1.0 = lossless")
 @click.option("--n-process", "-n", default=16, type=int, help="Number of processes to use")
@@ -67,6 +67,23 @@ def compress(path: Path, delete: bool = False, quality: int = 1, n_process: int 
     for file in files:
         if delete and 0.65 <= quality <= 1:
             file.unlink()
+            file.with_suffix(".dax").unlink(missing_ok=True)
+
+# fmt: off
+@main.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--delete", "-d", is_flag=True, help="Delete original files")
+@click.option("--quality", "-q", default=1.0, type=float, help="Quality level (0-1). 1.0 = lossless")
+# fmt: on
+def compress_one(path: Path, delete: bool = False, quality: int = 1, n_process: int = 16):
+    """Converts TIFF, JP2, and DAX image files to TIFF-JPEG XR files."""
+    lib.compress(path, level=quality)
+    if delete and quality < 0.65:
+        log.warning("Not deleting original files because quality is less than 0.65. Please delete manually.")
+    if delete and 0.65 <= quality <= 1:
+        path.unlink()
+        path.with_suffix(".dax").unlink(missing_ok=True)
+
 
 
 # fmt: off
