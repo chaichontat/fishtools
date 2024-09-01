@@ -5,7 +5,6 @@ from typing import Literal, TypedDict
 import numpy as np
 import numpy.typing as npt
 import tifffile
-import toml
 from imagecodecs import imread
 from tifffile import TiffFile, imwrite
 
@@ -60,7 +59,7 @@ def compress(path: Path, *, level: int, log: logging.Logger = logging.getLogger(
                 metadata = tif.imagej_metadata
         case ".dax":
             img = dax_reader(path)
-            metadata = toml.loads(path.with_suffix(".inf").read_text())
+            metadata = dict(line.split(" = ") for line in path.with_suffix(".inf").read_text().splitlines())
         case _:
             raise NotImplementedError(f"Unknown file type {path.suffix}")
     try:
