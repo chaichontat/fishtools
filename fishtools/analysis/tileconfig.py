@@ -64,7 +64,7 @@ class TileConfiguration:
 
         # Perform this on extracted file name
         # since we want both the raw file name and the index.
-        filename = integer("index").setParseAction(lambda t: int(t[0])) + pp.Literal(".tif")  # type: ignore
+        filename = pp.Optional(pp.Word(pp.alphanums) + pp.Literal("-")) + integer("index").setParseAction(lambda t: int(t[0])) + pp.Literal(".tif")  # type: ignore
         # Parse the content
         out = []
         for x in parser.parseString(content):

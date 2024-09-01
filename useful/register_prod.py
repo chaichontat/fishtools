@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
 import click
 import numpy as np
-import SimpleITK as sitk
 import tifffile
 import toml
 from basicpy import BaSiC
@@ -21,7 +20,7 @@ from scipy.ndimage import shift
 from tifffile import TiffFile
 
 from fishtools import align_fiducials
-from fishtools.analysis.fiducial import align_phase, phase_shift
+from fishtools.analysis.chromatic import Affine
 
 logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
 import jax
@@ -64,11 +63,13 @@ class RegisterConfig(BaseModel):
     )
     max_proj: bool = True
     split_channels: bool = False
+    chromatic_shifts: dict[str, Annotated[str, "path for 560to{channel}.txt"]]
 
 
 class Config(BaseModel):
     dataPath: str
     registration: RegisterConfig
+    basic_template: dict[str, Annotated[str, "path for basic_{channel}.pkl"]]
 
 
 # print(json.dumps(Config.model_json_schema()))
@@ -88,9 +89,9 @@ As = {}
 ats = {}
 for λ in ["650", "750"]:
     a_ = np.loadtxt(DATA / f"560to{λ}.txt")
-    A = np.zeros((3, 3), dtype=np.float32)
+    A = np.zeros((3, 3), dtype=np.float64)
     A[:2, :2] = a_[:4].reshape(2, 2)
-    t = np.zeros(3)
+    t = np.zeros(3, dtype=np.float64)
     t[:2] = a_[-2:]
 
     A[2] = [0, 0, 1]
@@ -167,64 +168,6 @@ def sort_key(x: tuple[str, np.ndarray]) -> int | str:
         return x[0]
 
 
-def st(ref: sitk.Image, img: np.ndarray[np.float32, Any], transform: sitk.Transform):
-    """Execute a sitk transform on an image.
-
-    Args:
-        ref: Reference image in sitk format.
-        img: Image to transform. Must be in float32 format.
-        transform: sitk transform to apply.
-
-    Returns:
-        Transformed image.
-    """
-    image = sitk.GetImageFromArray(img)
-    resampler = sitk.ResampleImageFilter()
-    resampler.SetReferenceImage(ref)
-    resampler.SetInterpolator(sitk.sitkLinear)
-    resampler.SetDefaultPixelValue(100)
-    resampler.SetTransform(transform)
-
-    return sitk.GetArrayFromImage(resampler.Execute(image))
-
-
-def affine(img: np.ndarray[np.float32, Any], channel: str, shiftpx: np.ndarray, ref: sitk.Image):
-    """Chromatic and shift correction. Repeated 2D operations of zyx image.
-    Assumes 650 is the reference channel.
-
-    Args:
-        img: Single-bit zyx image.
-        channel: channel name. Must be 488, 560, 650, 750.
-        shiftpx: Vector of shift in pixels.
-        ref: Reference image in sitk format.
-
-    Raises:
-        ValueError: Invalid shift vector dimension.
-
-    Returns:
-        Corrected image.
-    """
-    if len(shiftpx) != 2:
-        raise ValueError
-
-    translate = sitk.TranslationTransform(3)
-    translate.SetParameters((float(shiftpx[0]), float(shiftpx[1]), 0.0))
-
-    if channel == "650":
-        return st(ref, img, translate)
-
-    affine = sitk.AffineTransform(3)
-    affine.SetMatrix(As.get(channel, As["560"]).flatten())
-    affine.SetTranslation([*ats.get(channel, ats["560"]), 0])
-    affine.SetCenter([1023.5 + shiftpx[0], 1023.5 + shiftpx[1], 0])
-
-    composite = sitk.CompositeTransform(3)
-    composite.AddTransform(translate)
-    composite.AddTransform(affine)
-
-    return st(ref, img, composite)
-
-
 @dataclass
 class Image:
     name: str
@@ -267,8 +210,6 @@ class Image:
             deconv_scaling = np.ones((len(bits), 2))
 
         nofid = img[:-1].reshape(-1, len(powers), 2048, 2048)
-        if "dapi" in stem:
-            nofid = nofid[::2]
 
         return cls(
             name=name,
@@ -322,8 +263,7 @@ def run(
         }
     except FileNotFoundError:
         basic = {
-            c: pickle.loads((Path("/home/chaichontat/fishtools/data") / f"basic_{c}.pkl").read_bytes())
-            for c in ["405", "560", "650", "750"]
+            c: pickle.loads((DATA / f"basic_{c}.pkl").read_bytes()) for c in ["405", "560", "650", "750"]
         }
 
     basic["488"] = basic["560"]
@@ -332,13 +272,13 @@ def run(
         imgs: dict[str, Image] = {
             file.name: Image.from_file(file)
             for file in sorted(Path(path).glob(f"*--{roi}/*-{idx:04d}.tif"))
-            if not file.parent.name in ["10x", "registered"]
+            if file.parent.name not in ["10x", "registered"]
         }
     else:
         imgs = {
             file.name: Image.from_file(file)
             for file in sorted(Path(path).glob(f"*/*-{idx:04d}.tif"))
-            if not file.parent.name in ["10x", "registered"]
+            if file.parent.name not in ["10x", "registered"]
         }
 
     logger.debug(f"{len(imgs)} files: {list(imgs)}")
@@ -361,7 +301,7 @@ def run(
                 raise ValueError(f"Could not find file that starts with {name} for prior shift.")
 
     if debug:
-        _fids_path = path / f"fids_{idx}.tif"
+        _fids_path = path / f"fids-{idx:04d}.tif"
         tifffile.imwrite(
             _fids_path,
             np.stack([v for v in fids.values()]),
@@ -376,27 +316,30 @@ def run(
         reference=reference,
         debug=debug,
         iterations=3,
-        threshold=config.fiducial.threshold,
+        threshold_sigma=config.fiducial.threshold,
         fwhm=config.fiducial.fwhm,
     )
 
-    if config.fiducial.priors is not None:
-        for name, sh in config.fiducial.priors.items():
-            shifts[prior_mapping[name]][0] += sh[0]
-            shifts[prior_mapping[name]][1] += sh[1]
-
-    (path / "shifts").mkdir(exist_ok=True)
-    with open(path / f"shifts/shifts_{idx}.json", "w") as f:
-        json.dump({k: v.tolist() for k, v in shifts.items()}, f)
-
     if debug:
         tifffile.imwrite(
-            path / f"fids_shifted_{idx}.tif",
+            path / f"fids_shifted-{idx:04d}.tif",
+            # Prior shifts already applied.
             np.stack([shift(img, [shifts[k][1], shifts[k][0]]) for k, img in fids.items()]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX"},
         )
+
+    if config.fiducial.priors is not None:
+        for name, sh in config.fiducial.priors.items():
+            shifts[prior_mapping[name]][0] += sh[0]
+            shifts[prior_mapping[name]][1] += sh[1]
+            print(shifts[prior_mapping[name]])
+
+    (path / "shifts").mkdir(exist_ok=True)
+
+    with open(path / f"shifts/shifts-{idx:04d}.json", "w") as f:
+        json.dump({k: v.tolist() for k, v in shifts.items()}, f)
 
     channels: dict[str, str] = {}
     for img in imgs.values():
@@ -418,6 +361,8 @@ def run(
     n_z = -1
     ref = None
 
+    affine = Affine(As=As, ats=ats)
+
     for i, (bit, img) in enumerate(bits.items()):
         logger.debug(f"Processing {bit}")
         c = str(channels[bit])
@@ -427,15 +372,16 @@ def run(
         orig_name, orig_idx = bit_name_mapping[bit]
         # img = imgs[orig_name].scale_deconv(img, orig_idx)
 
+        print(img.shape)
         # Illumination correction
-        img = np.stack(basic[c].transform(np.array(img)))
+        # img = np.stack(basic[c].transform(np.array(img)))
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
-            ref = sitk.Cast(sitk.GetImageFromArray(img), sitk.sitkFloat32)
+            affine.ref_image = ref = img
 
         # Within-tile alignment. Chromatic corrections.
-        img = affine(img, c, -bits_shifted[bit], ref)
+        img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
         transformed[bit] = np.clip(img, 0, 65535).astype(np.uint16)
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
 
@@ -521,18 +467,29 @@ def main(
         debug=debug,
         config=Config(
             dataPath=str(DATA),
+            basic_template=dict(
+                zip(
+                    ["405", "560", "650", "750"],
+                    [str(DATA / f"basic_{c}.pkl") for c in ["405", "560", "650", "750"]],
+                )
+            ),
             registration=RegisterConfig(
+                chromatic_shifts={
+                    "647": str(DATA / "560to647.txt"),
+                    "750": str(DATA / "560to750.txt"),
+                },
                 fiducial=Fiducial(
                     fwhm=fwhm,
                     threshold=threshold,
-                    # priors={
-                    #     "5_13_21": (-160, -175),
-                    #     "6_14_22": (-160, -175),
-                    #     "7_15_23": (-160, -175),
-                    #     "8_16_24": (-160, -175),
-                    #     "25_26_27": (-160, -175),
-                    #     "dapi_29_polyA": (10, 30),
-                    # },
+                    priors={
+                        "WGAfiducial_fiducial_tdT_29_polyT": (9, 26),
+                        "blank568_blank647_blank750": (-6, -11),
+                        # "6_14_22": (-160, -175),
+                        # "7_15_23": (-160, -175),
+                        # "8_16_24": (-160, -175),
+                        # "25_26_27": (-160, -175),
+                        # "dapi_29_polyA": (10, 30),
+                    },
                 ),
                 downsample=1,
                 crop=25,

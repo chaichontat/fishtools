@@ -139,13 +139,14 @@ def run_fiducial(
     subtract_background: bool = False,
     debug: bool = False,
     name: str = "",
-    threshold: float = 5,
+    threshold_sigma: float = 3,
+    threshold_fiducial: float = 0.5,
     fwhm: float = 4,
 ):
     if subtract_background:
         ref = ref - background(ref)
     try:
-        fixed = find_spots(ref, threshold_sigma=threshold, fwhm=fwhm)
+        fixed = find_spots(ref, threshold_sigma=threshold_sigma, fwhm=fwhm)
         if not len(fixed):
             raise ValueError("No spots found on reference image.")
     except Exception as e:
@@ -158,7 +159,7 @@ def run_fiducial(
     def inner(img: np.ndarray, *, limit: int = 3, bitname: str = ""):
         if subtract_background:
             img = img - background(img)
-        moving = find_spots(img, threshold_sigma=threshold, fwhm=fwhm)
+        moving = find_spots(img, threshold_sigma=threshold_sigma, fwhm=fwhm)
         if len(moving) < 6:
             logger.warning(f"WARNING: not enough fiducials. Setting zero.")
             return np.round([0, 0])
@@ -170,8 +171,11 @@ def run_fiducial(
         for n in range(limit):
             drift = _calculate_drift(kd, fixed, moving, initial_drift=initial_drift)
             residual = np.hypot(*(drift - initial_drift))
-            logger.debug(f"{bitname} - attempt {n}: {residual=:.2f}. {drift=}.")
-            if residual < threshold:
+            if n == 0:
+                logger.debug(f"{bitname} - attempt {n}: starting drift: {drift}.")
+            else:
+                logger.debug(f"{bitname} - attempt {n}: new drift: {drift} Δ from last {residual:.2f}px.")
+            if residual < threshold_fiducial:
                 return drift
             initial_drift = drift
 
@@ -185,7 +189,6 @@ def run_fiducial(
 def align_phase(
     fids: dict[str, np.ndarray[Any, Any]], *, reference: str, threads: int = 4, debug: bool = False
 ):
-
     keys = list(fids.keys())
     for name in keys:
         if re.search(reference, name):
@@ -217,7 +220,8 @@ def align_fiducials(
     subtract_background: bool = False,
     debug: bool = False,
     iterations: int = 3,
-    threshold: float = 3,
+    threshold_sigma: float = 3,
+    threshold_fiducial: float = 0.5,
     fwhm: float = 4,
 ) -> dict[str, np.ndarray[float, Any]]:
     keys = list(fids.keys())
@@ -234,7 +238,8 @@ def align_fiducials(
         subtract_background=subtract_background,
         debug=debug,
         name=ref,
-        threshold=threshold,
+        threshold_sigma=threshold_sigma,
+        threshold_fiducial=threshold_fiducial,
         fwhm=fwhm,
     )
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
