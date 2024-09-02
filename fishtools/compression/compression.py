@@ -64,7 +64,7 @@ def compress(path: Path, *, level: int, log: logging.Logger = logging.getLogger(
             raise NotImplementedError(f"Unknown file type {path.suffix}")
     try:
         imwrite(
-            path.with_suffix(".tif"),
+            path.with_suffix(".compressed.tif"),
             img,
             **JPEG_XR_KWARGS,
             compressionargs={"level": (level / 100) if level > 1 else level},
