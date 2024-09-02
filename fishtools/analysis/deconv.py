@@ -214,7 +214,7 @@ def rescale(img: cp.ndarray, scale: float):
 
 # %%
 DATA = Path("/home/chaichontat/fishtools/data")
-make_projector(Path(DATA / "PSF GL.tif"), step=10, max_z=9)
+make_projector(Path(DATA / "PSF GL.tif"), step=8, max_z=9)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 # %%
@@ -321,12 +321,12 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
     out.mkdir(exist_ok=True, parents=True)
 
     bits = name.split("_")
-    files = [f for f in sorted(path.rglob(f"{name}*.tif")) if not "analysis/deconv" in str(f)]
+    files = [f for f in sorted(path.rglob(f"{name}*.tif")) if "analysis/deconv" not in str(f)]
     if ref is not None:
         ok_idxs = {
             int(f.stem.split("-")[1])
             for f in sorted(path.rglob(f"{ref}*.tif"))
-            if not "analysis/deconv" in str(f)
+            if "analysis/deconv" not in str(f)
         }
         logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
         files = [f for f in files if int(f.stem.split("-")[1]) in ok_idxs]
@@ -334,11 +334,11 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
             logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
 
     files = files[:limit] if limit is not None else files
-    logger.info(f"Total: {len(files)}. Limit: {limit}")
+    logger.info(f"Total: {len(files)} at {path}." + (f" Limited to {limit}" if limit is not None else ""))
 
     if not overwrite:
         files = [f for f in files if not (out / f.parent.name / f.name).exists()]
-        logger.info(f"Not overwriting. Total: {len(files)}")
+        logger.info(f"Not overwriting. Remaining: {len(files)} files.")
 
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
@@ -368,7 +368,10 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
         logger.info("Write thread started.")
 
         while True:
-            file, towrite, fid, metadata = q_write.get()
+            gotten = q_write.get()
+            if gotten is None:
+                break
+            file, towrite, fid, metadata = gotten
             logger.debug(f"Writing {file.name}")
             sub = out / file.parent.name
             sub.mkdir(exist_ok=True, parents=True)
@@ -398,19 +401,23 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
         scale = 65534 / (res.max(axis=(0, 2, 3), keepdims=True) - mins)
 
         towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
-        q_write.put(
-            (
-                start,
-                towrite,
-                fid,
-                metadata
-                | {
-                    "deconv_min": list(map(float, mins.get().flatten())),
-                    "deconv_scale": list(map(float, scale.get().flatten())),
-                },
-            )
-        )
+        del res
+
+        q_write.put((
+            start,
+            towrite,
+            fid,
+            metadata
+            | {
+                "deconv_min": list(map(float, mins.get().flatten())),
+                "deconv_scale": list(map(float, scale.get().flatten())),
+            },
+        ))
         q_img.task_done()
+
+    q_write.put(None)
+    thread_write.join()
+    logger.info("Done.")
 
 
 if __name__ == "__main__":
