@@ -15,7 +15,9 @@ import tifffile
 from cupyx.scipy.ndimage import convolve as cconvolve
 from loguru import logger
 from scipy.stats import multivariate_normal
-from tifffile import imread
+from tifffile import TiffFile, imread
+
+from fishtools.utils.pretty_print import progress_bar
 
 
 def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32) -> npt.NDArray:
@@ -214,7 +216,7 @@ def rescale(img: cp.ndarray, scale: float):
 
 # %%
 DATA = Path("/home/chaichontat/fishtools/data")
-make_projector(Path(DATA / "PSF GL.tif"), step=8, max_z=9)
+make_projector(Path(DATA / "PSF GL.tif"), step=10, max_z=9)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 # %%
@@ -266,42 +268,36 @@ projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 def main(): ...
 
 
-def get_scale(imgs: list[np.ndarray], i: int):
-    mins = np.array([x[:, i].min() for x in imgs])
-    maxs = np.array([x[:, i].max() for x in imgs])
-    sub = mins.min()
-    scale = np.percentile(60000 / (maxs - sub), 0.1)
-    return {"min": float(sub), "scale": float(scale)}
-
-
 @main.command()
-@click.argument("path", type=click.Path(path_type=Path))
-@click.argument("name", type=str)
-def scale(path: Path, name: str):
-    logger.info("Reading images.")
-    bits = name.split("_")
+@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
+@click.option("--perc_min", type=float, default=10, help="Percentile of the min")
+@click.option("--perc_scale", type=float, default=5, help="Percentile of the scale")
+def compute_range(path: Path, perc_min: float = 10, perc_scale: float = 5):
+    """Find the min and scale of the deconvolution for all files in a directory."""
+    files = sorted(path.glob("*.tif"))
+    n_c = len(path.resolve().stem.split("_"))
+    n = len(files)
 
-    imgs = []
-    for f in (path / "analysis" / "deconv" / name).glob(f"float_{name}*.tif"):
-        imgs.append(imread(f))
-        try:
-            assert imgs[-1].shape[1] == len(bits), f"Expected {len(bits)} channels, got {imgs[-1].shape[1]}."
-            assert len(imgs[-1].shape) == 4
-        except Exception as e:
-            logger.error(f"Skipping {f}: {e}")
-            imgs.pop()
+    deconv_min = np.zeros((n, n_c))
+    deconv_scale = np.zeros((n, n_c))
+    logger.info(f"Found {n} files")
+    with progress_bar(len(files)) as pbar:
+        for i, f in enumerate(files):
+            try:
+                with TiffFile(f) as tif:
+                    assert tif.shaped_metadata
+                    deconv_min[i, :] = tif.shaped_metadata[0]["deconv_min"]
+                    deconv_scale[i, :] = tif.shaped_metadata[0]["deconv_scale"]
+            except Exception as e:
+                logger.error(f"Error reading {f}: {e}")
+            pbar()
 
-    scale_file = path / "deconv_scale.json"
-    existing = json.loads(scale_file.read_text()) if scale_file.exists() else {}
-    for i, bit in enumerate(bits):
-        res = get_scale(imgs, int(i))
-        logger.debug(f"Bit {bit}: {res}")
-        if bit in existing and not np.allclose(existing[bit]["min"], res["min"]):
-            raise ValueError(f"Bit {bit} already exists in scale file.")
-        existing[bit] = res
+    logger.info("Calculating percentiles")
+    m_ = np.percentile(deconv_min, perc_min, axis=0)
+    s_ = np.percentile(deconv_scale, perc_scale, axis=0)
 
-    with scale_file.open("w") as f:
-        json.dump(existing, f)
+    np.savetxt(path / "deconv_scaling.txt", np.vstack([m_, s_]))
+    logger.info(f"Saved to {path / 'deconv_scaling.txt'}")
 
 
 # @main.command()

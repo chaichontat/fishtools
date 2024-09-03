@@ -26,7 +26,7 @@ logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
 import jax
 
 jax.config.update("jax_platform_name", "cpu")
-
+FORBIDDEN_PREFIXES = ["10x", "registered", "shifts"]
 
 if TYPE_CHECKING:
     from loguru import Logger
@@ -66,9 +66,16 @@ class RegisterConfig(BaseModel):
     chromatic_shifts: dict[str, Annotated[str, "path for 560to{channel}.txt"]]
 
 
+class ChannelConfig(BaseModel):
+    discards: dict[str, list[str]] = Field(
+        description="In case of duplicated key(s), discard the ones from the file in value."
+    )
+
+
 class Config(BaseModel):
     dataPath: str
     registration: RegisterConfig
+    channels: ChannelConfig | None = None
     basic_template: dict[str, Annotated[str, "path for basic_{channel}.pkl"]]
 
 
@@ -183,10 +190,19 @@ class Image:
     CHANNELS = [f"ilm{n}" for n in ["405", "488", "560", "650", "750"]]
 
     @classmethod
-    def from_file(cls, path: Path):
+    def from_file(cls, path: Path, *, discards: dict[str, list[str]] | None = None):
         stem = path.stem
         name, idx = stem.split("-")
         bits = name.split("_")
+        if discards is None:
+            discards = {}
+
+        to_discard_idxs = []
+        for k, v in discards.items():
+            if k in bits and name in v:
+                logger.debug(f"Discarding {k} (index {bits.index(k)}) from {stem}.")
+                to_discard_idxs.append(bits.index(k))
+
         with TiffFile(path) as tif:
             img = tif.asarray()
             try:
@@ -204,12 +220,26 @@ class Image:
         if len(powers) != len(bits):
             raise ValueError(f"{path}: Expected {len(bits)} channels, got {len(powers)}")
 
-        if "deconv_scaling" in path.parent.name:
-            deconv_scaling = np.loadtxt(path.parent / "deconv_scaling.txt").astype(np.float32)
-        else:
-            deconv_scaling = np.ones((len(bits), 2))
+        try:
+            deconv_scaling = (
+                np.loadtxt(next(path.parent.glob("deconv_scaling.txt"))).astype(np.float32).reshape((2, -1))
+            )
+        except StopIteration:
+            logger.warning("No deconv_scaling found. Using ones.")
+            deconv_scaling = np.ones((2, len(bits)))
 
         nofid = img[:-1].reshape(-1, len(powers), 2048, 2048)
+
+        if to_discard_idxs:
+            _bits = name.split("_")
+            for _idx_d in to_discard_idxs:
+                _bits.pop(_idx_d)
+            name = "_".join(_bits)
+            keeps = list(sorted(set(range(len(bits))) - set(to_discard_idxs)))
+            nofid = nofid[:, keeps]
+            bits = [bits[i] for i in keeps]
+            deconv_scaling = deconv_scaling[:, keeps]
+            assert len(_bits) == nofid.shape[1]
 
         return cls(
             name=name,
@@ -245,41 +275,38 @@ def run(
     idx: int,
     reference: str = "3_11_19",
     *,
-    config: RegisterConfig,
+    config: Config,
     debug: bool = False,
     overwrite: bool = False,
 ):
-    # channels = toml.load("/fast2/3t3clean/channels.toml")
     logger.info("Reading files")
 
-    if not overwrite and (path / "registered" / f"reg-{idx:04d}.tif").exists():
+    if not overwrite and (path / f"registered--{roi}" / f"reg-{idx:04d}.tif").exists():
         logger.info(f"Skipping {idx}")
         return
 
-    try:
-        basic = {
-            c: pickle.loads((path / f"basic_deconv_{c}.pkl").read_bytes())
-            for c in ["405", "560", "650", "750"]
-        }
-    except FileNotFoundError:
-        basic = {
-            c: pickle.loads((DATA / f"basic_{c}.pkl").read_bytes()) for c in ["405", "560", "650", "750"]
-        }
+    basic = {
+        channel: pickle.loads(Path(path).read_bytes()) for channel, path in config.basic_template.items()
+    }
+    # try:
+    #     basic = {
+    #         c: pickle.loads((path / f"basic_deconv_{c}.pkl").read_bytes())
+    #         for c in ["405", "560", "650", "750"]
+    #     }
+    # except FileNotFoundError:
+    #     basic = {
+    #         c: pickle.loads((DATA / f"basic_{c}.pkl").read_bytes()) for c in ["405", "560", "650", "750"]
+    #     }
+    # basic["488"] = basic["560"]
 
-    basic["488"] = basic["560"]
-
-    if roi:
-        imgs: dict[str, Image] = {
-            file.name: Image.from_file(file)
-            for file in sorted(Path(path).glob(f"*--{roi}/*-{idx:04d}.tif"))
-            if file.parent.name not in ["10x", "registered"]
-        }
-    else:
-        imgs = {
-            file.name: Image.from_file(file)
-            for file in sorted(Path(path).glob(f"*/*-{idx:04d}.tif"))
-            if file.parent.name not in ["10x", "registered"]
-        }
+    # Convert file name to bit
+    _imgs: list[Image] = [
+        Image.from_file(file, discards=config.channels and config.channels.discards)
+        for file in sorted(Path(path).glob(f"*--{roi}/*-{idx:04d}.tif" if roi else f"*/*-{idx:04d}.tif"))
+        if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES)
+    ]
+    imgs = {img.name: img for img in _imgs}
+    del _imgs
 
     logger.debug(f"{len(imgs)} files: {list(imgs)}")
     if not imgs:
@@ -290,8 +317,8 @@ def run(
     fids = {name: img.fid for name, img in imgs.items()}
 
     prior_mapping: dict[str, str] = {}
-    if config.fiducial.priors is not None:
-        for name, sh in config.fiducial.priors.items():
+    if config.registration.fiducial.priors is not None:
+        for name, sh in config.registration.fiducial.priors.items():
             for file in fids:
                 if file.startswith(name):
                     fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
@@ -316,8 +343,8 @@ def run(
         reference=reference,
         debug=debug,
         iterations=3,
-        threshold_sigma=config.fiducial.threshold,
-        fwhm=config.fiducial.fwhm,
+        threshold_sigma=config.registration.fiducial.threshold,
+        fwhm=config.registration.fiducial.fwhm,
     )
 
     if debug:
@@ -330,11 +357,10 @@ def run(
             metadata={"axes": "CYX"},
         )
 
-    if config.fiducial.priors is not None:
-        for name, sh in config.fiducial.priors.items():
+    if config.registration.fiducial.priors is not None:
+        for name, sh in config.registration.fiducial.priors.items():
             shifts[prior_mapping[name]][0] += sh[0]
             shifts[prior_mapping[name]][1] += sh[1]
-            print(shifts[prior_mapping[name]])
 
     (path / "shifts").mkdir(exist_ok=True)
 
@@ -366,15 +392,14 @@ def run(
     for i, (bit, img) in enumerate(bits.items()):
         logger.debug(f"Processing {bit}")
         c = str(channels[bit])
-        img = collapse_z(img, config.slices, config.max_proj).astype(np.float32)
+        img = collapse_z(img, config.registration.slices, config.registration.max_proj).astype(np.float32)
         n_z = img.shape[0]
         # Deconvolution scaling
         orig_name, orig_idx = bit_name_mapping[bit]
-        # img = imgs[orig_name].scale_deconv(img, orig_idx)
+        img = imgs[orig_name].scale_deconv(img, orig_idx)
 
-        print(img.shape)
         # Illumination correction
-        # img = np.stack(basic[c].transform(np.array(img)))
+        img = np.stack(basic.get(c, basic["560"]).transform(np.array(img)))
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
@@ -385,7 +410,7 @@ def run(
         transformed[bit] = np.clip(img, 0, 65535).astype(np.uint16)
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
 
-    crop, downsample = config.crop, config.downsample
+    crop, downsample = config.registration.crop, config.registration.downsample
     out = np.zeros(
         [
             n_z,
@@ -403,7 +428,7 @@ def run(
     keys: list[str] = [k for k, _ in items]
     logger.debug(str([f"{i}: {k}" for i, k in enumerate(keys, 1)]))
 
-    (outpath := (path / "registered")).mkdir(exist_ok=True, parents=True)
+    (outpath := (path / f"registered--{roi}")).mkdir(exist_ok=True, parents=True)
     # (path / "down2").mkdir(exist_ok=True)
 
     tifffile.imwrite(
@@ -467,6 +492,7 @@ def main(
         debug=debug,
         config=Config(
             dataPath=str(DATA),
+            channels=ChannelConfig(discards={"polyA": ["polyA_1_9_17"]}),
             basic_template=dict(
                 zip(
                     ["405", "560", "650", "750"],
@@ -482,8 +508,8 @@ def main(
                     fwhm=fwhm,
                     threshold=threshold,
                     priors={
-                        "WGAfiducial_fiducial_tdT_29_polyT": (9, 26),
-                        "blank568_blank647_blank750": (-6, -11),
+                        # "WGAfiducial_fiducial_tdT_29_polyT": (9, 26),
+                        # "blank568_blank647_blank750": (-6, -11),
                         # "6_14_22": (-160, -175),
                         # "7_15_23": (-160, -175),
                         # "8_16_24": (-160, -175),
@@ -497,7 +523,7 @@ def main(
                 reduce_bit_depth=0,
                 max_proj=True,
             ),
-        ).registration,
+        ),
         overwrite=overwrite,
     )
 
