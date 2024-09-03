@@ -61,7 +61,6 @@ class RegisterConfig(BaseModel):
     slices: list[tuple[int | None, int | None]] = Field(
         default=[(0, 5)], description="Slice range to use for registration"
     )
-    max_proj: bool = True
     split_channels: bool = False
     chromatic_shifts: dict[str, Annotated[str, "path for 560to{channel}.txt"]]
 
@@ -225,7 +224,7 @@ class Image:
                 np.loadtxt(next(path.parent.glob("deconv_scaling.txt"))).astype(np.float32).reshape((2, -1))
             )
         except StopIteration:
-            logger.warning("No deconv_scaling found. Using ones.")
+            logger.debug("No deconv_scaling found. Using ones.")
             deconv_scaling = np.ones((2, len(bits)))
 
         nofid = img[:-1].reshape(-1, len(powers), 2048, 2048)
@@ -342,7 +341,7 @@ def run(
         fids,
         reference=reference,
         debug=debug,
-        iterations=3,
+        iterations=4,
         threshold_sigma=config.registration.fiducial.threshold,
         fwhm=config.registration.fiducial.fwhm,
     )
@@ -362,9 +361,9 @@ def run(
             shifts[prior_mapping[name]][0] += sh[0]
             shifts[prior_mapping[name]][1] += sh[1]
 
-    (path / "shifts").mkdir(exist_ok=True)
+    (shift_path := path / f"shifts--{roi}").mkdir(exist_ok=True)
 
-    with open(path / f"shifts/shifts-{idx:04d}.json", "w") as f:
+    with open(shift_path / f"shifts-{idx:04d}.json", "w") as f:
         json.dump({k: v.tolist() for k, v in shifts.items()}, f)
 
     channels: dict[str, str] = {}
@@ -378,7 +377,8 @@ def run(
     bits, bits_shifted, bit_name_mapping = parse_nofids(nofids, shifts, channels)
 
     def collapse_z(
-        img: np.ndarray, slices: list[tuple[int | None, int | None]], max_proj: bool = True
+        img: np.ndarray,
+        slices: list[tuple[int | None, int | None]],
     ) -> np.ndarray:
         return np.stack([img[slice(*sl)].max(axis=0) for sl in slices])
         # return img.reshape(-1, 4, *img.shape[1:]).max(axis=1)
@@ -392,11 +392,11 @@ def run(
     for i, (bit, img) in enumerate(bits.items()):
         logger.debug(f"Processing {bit}")
         c = str(channels[bit])
-        img = collapse_z(img, config.registration.slices, config.registration.max_proj).astype(np.float32)
+        img = collapse_z(img, config.registration.slices).astype(np.float32)
         n_z = img.shape[0]
         # Deconvolution scaling
         orig_name, orig_idx = bit_name_mapping[bit]
-        img = imgs[orig_name].scale_deconv(img, orig_idx)
+        # img = imgs[orig_name].scale_deconv(img, orig_idx)
 
         # Illumination correction
         img = np.stack(basic.get(c, basic["560"]).transform(np.array(img)))
@@ -435,7 +435,7 @@ def run(
         outpath / f"reg-{idx:04d}.tif",
         out,
         compression=22610,
-        compressionargs={"level": 0.8},
+        compressionargs={"level": 0.75},
         metadata={"key": keys, "axes": "ZCYX"},
     )
 
@@ -515,13 +515,21 @@ def main(
                         # "8_16_24": (-160, -175),
                         # "25_26_27": (-160, -175),
                         # "dapi_29_polyA": (10, 30),
+                        "1_9_17": (-21, -18)
                     },
                 ),
                 downsample=1,
-                crop=25,
-                slices=[(0, -1)],
+                crop=30,
+                slices=[
+                    # (0, 12)
+                    (0, 5),
+                    (5, 10),
+                    (10, 15),
+                    # (15, 20),
+                    # (20, 25),
+                    # (25, 30),
+                ],
                 reduce_bit_depth=0,
-                max_proj=True,
             ),
         ),
         overwrite=overwrite,
