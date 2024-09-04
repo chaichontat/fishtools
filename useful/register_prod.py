@@ -82,7 +82,7 @@ class Config(BaseModel):
 
 # %%
 
-DATA = Path("/home/chaichontat/fishtools/data")
+DATA = Path("/fast2/fishtools/data")
 
 
 # %%
@@ -298,6 +298,7 @@ def run(
     #     }
     # basic["488"] = basic["560"]
 
+    print(sorted(Path(path).glob(f"*/*-{idx:04d}.tif")))
     # Convert file name to bit
     _imgs: list[Image] = [
         Image.from_file(file, discards=config.channels and config.channels.discards)
@@ -454,7 +455,7 @@ def run(
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("idx", type=int)
-@click.option("--roi", type=str, default="full")
+@click.option("--roi", type=str, default="")
 @click.option("--debug", is_flag=True)
 @click.option("--reference", "-r", type=str)
 @click.option("--threshold", type=float, default=2.0)
@@ -492,7 +493,7 @@ def main(
         debug=debug,
         config=Config(
             dataPath=str(DATA),
-            channels=ChannelConfig(discards={"polyA": ["polyA_1_9_17"]}),
+            channels=ChannelConfig(discards={"polyA": ["dapi_polyA_28"]}),
             basic_template=dict(
                 zip(
                     ["405", "560", "650", "750"],
@@ -515,16 +516,16 @@ def main(
                         # "8_16_24": (-160, -175),
                         # "25_26_27": (-160, -175),
                         # "dapi_29_polyA": (10, 30),
-                        "1_9_17": (-21, -18)
+                        # "1_9_17": (-21, -18)
                     },
                 ),
                 downsample=1,
                 crop=30,
                 slices=[
                     # (0, 12)
-                    (0, 5),
-                    (5, 10),
-                    (10, 15),
+                    (0, 10),
+                    # (5, 10),
+                    # (10, 15),
                     # (15, 20),
                     # (20, 25),
                     # (25, 30),

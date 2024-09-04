@@ -2,7 +2,7 @@
 import re
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -13,6 +13,7 @@ from loguru import logger
 from tifffile import TiffFile, imread, imwrite
 
 from fishtools.analysis.tileconfig import TileConfiguration
+from fishtools.utils.pretty_print import progress_bar
 
 
 def create_tile_config(
@@ -38,9 +39,9 @@ def create_tile_config(
     ats["x"] -= ats["x"].min()
     ats["y"] -= ats["y"].min()
 
-    mat = ats[["y", "x"]].to_numpy() @ np.loadtxt("/home/chaichontat/fishtools/data/stage_rotation.txt")
-    ats["x"] = mat[:, 0]
-    ats["y"] = mat[:, 1]
+    # mat = ats[["y", "x"]].to_numpy() @ np.loadtxt("/home/chaichontat/fishtools/data/stage_rotation.txt")
+    # ats["x"] = mat[:, 0]
+    # ats["y"] = mat[:, 1]
 
     print(ats)
 
@@ -143,11 +144,20 @@ def copy_registered(reference_path: Path, actual_path: Path):
     # )
 
 
-def extract_fiducial(path: Path, out: Path, trim: int = 25):
+def extract_channel(
+    path: Path, out: Path, idx: int, *, trim: int = 0, downsample: int = 1, reduce_bit_depth: int = 0
+):
     with TiffFile(path) as tif:
-        img = tif.pages[-1][trim:-trim, trim:-trim]
+        if trim < 0:
+            raise ValueError("Trim must be positive")
+        img = (
+            tif.pages[idx].asarray()[trim:-trim:downsample, trim:-trim:downsample]
+            if trim
+            else tif.pages[idx].asarray()[::downsample, ::downsample]
+        )
+        img >>= reduce_bit_depth
         imwrite(
-            out / path.name,
+            out,
             img,
             compression=22610,
             metadata={"axes": "YX"},
@@ -160,76 +170,140 @@ def cli(): ...
 
 
 @cli.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+# "Path to registered images folder. Expects CYX images. Will reshape to CYX if not. Assumes ${name}-${idx}.tif",
+@click.argument(
+    "path",
+    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
+)
 @click.argument("position_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--idx", "-i", type=int, help="Channel (index) to use for registration")
 @click.option("--recreate", is_flag=True)
 @click.option("--threshold", type=float, default=0.4)
+@click.option("--downsample", "-d", type=int, default=2)
+@click.option("--overwrite", is_flag=True)
 def register(
     path: Path,
     position_file: Path,
     *,
+    idx: int,
     recreate: bool = False,
+    overwrite: bool = False,
+    downsample: int = 2,
     threshold: float = 0.4,
 ):
-    def get_idxs(folder: Path):
-        return {int(x.stem) for x in sorted(folder.glob("*.tif"))}
+    imgs = sorted(path.glob("*.tif"))
+    (out_path := path / "stitch").mkdir(exist_ok=True)
 
-    print((path / "TileConfiguration.registered.txt").exists())
-    # functools.reduce(lambda x, y: x & y, [get_idxs(f) for f in folders]
-    if recreate or not (path / "TileConfiguration.registered.txt").exists():
-        files_idx = get_idxs(path)
-        # pixel = 2**bits
+    def get_idx(path: Path):
+        return int(path.stem.split("-")[1])
+
+    logger.info(f"Found {len(imgs)} files. Extracting channel {idx} to {out_path}.")
+    with progress_bar(len(imgs)) as callback, ThreadPoolExecutor(6) as exc:
+        futs = []
+        for path in imgs:
+            out_name = f"{get_idx(path):04d}.tif"
+            if (out_path / out_name).exists() and not overwrite:
+                continue
+            futs.append(exc.submit(extract_channel, path, out_path / out_name, idx, downsample=downsample))
+
+        for f in as_completed(futs):
+            f.result()
+            callback()
+
+    del path
+    if recreate or not (out_path / "TileConfiguration.registered.txt").exists():
+        files_idx = [int(file.stem) for file in sorted(out_path.glob("*.tif"))]
         tileconfig = TileConfiguration.from_pos(
-            pd.read_csv(position_file, header=None).iloc[sorted(files_idx)], downsample=3
+            pd.read_csv(position_file, header=None).iloc[sorted(files_idx)], downsample=downsample
         )
-        tileconfig.write(path / "TileConfiguration.txt")
-        logger.info(f"Created TileConfiguration at {path}.")
+        tileconfig.write(out_path / "TileConfiguration.txt")
+        logger.info(f"Created TileConfiguration at {out_path}.")
         logger.info("Running first.")
-        run_imagej(path, compute_overlap=True, fuse=False, threshold=threshold, name="TileConfiguration")
+        run_imagej(out_path, compute_overlap=True, fuse=False, threshold=threshold, name="TileConfiguration")
+
+
+def extract(path: Path, out_path: Path, *, trim: int = 0, downsample: int = 1, reduce_bit_depth: int = 0):
+    img = imread(path)
+    if len(img.shape) == 4:  # ZCYX
+        img = img.max(axis=0)
+    elif len(img.shape) == 2:  # YX
+        img = img[np.newaxis, ...]
+
+    img = img[:, trim:-trim:downsample, trim:-trim:downsample] if trim else img[:, ::downsample, ::downsample]
+    img >>= reduce_bit_depth
+    for i in range(img.shape[0]):
+        (out_path / f"{i:02d}").mkdir(exist_ok=True)
+        imwrite(
+            out_path / f"{i:02d}" / (path.stem.split("-")[1] + ".tif"),
+            img[i],
+            compression=22610,
+            metadata={"axes": "YX"},
+            compressionargs={"level": 0.7},
+        )
+    del img
 
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument(
-    "tile_config_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path)
+@click.option("--tile_config", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option(
+    "--split",
+    type=int,
+    default=1,
+    help="Split tiles into this many parts. Mainly to avoid overflows in very large images.",
 )
-@click.option("--split", type=int, default=1)
-@click.option("--reference", type=str)
+# @click.option("--reference", type=str)
 @click.option("--overwrite", is_flag=True)
-@click.option("--downsample", type=int, default=1)
+@click.option("--downsample", "-d", type=int, default=2)
 def fuse(
     path: Path,
-    tile_config_file: Path,
     *,
+    tile_config: Path | None = None,
     split: int = 1,
     overwrite: bool = False,
-    downsample: int = 1,
+    downsample: int = 2,
 ):
-    folders = sorted([p for p in path.iterdir() if p.is_dir()], key=lambda x: int(x.stem))
-    logger.info(f"Found {[f.name for f in folders]} at {path}.")
+    files = sorted(path.glob("*.tif"))
+    logger.info(f"Found {len(files)} images at {path}.")
 
-    tileconfig = TileConfiguration.from_file(tile_config_file)
-    print(tileconfig.df)
+    if tile_config is None:
+        tile_config = path / "stitch" / "TileConfiguration.registered.txt"
 
-    tileconfig = tileconfig.downsample(downsample)
+    tileconfig = TileConfiguration.from_file(tile_config)
+
+    # tileconfig = tileconfig.downsample(downsample)
     n = len(tileconfig) // split
+
+    with progress_bar(len(files)) as callback, ThreadPoolExecutor(4) as exc:
+        futs = []
+        for file in files:
+            futs.append(exc.submit(extract, file, path / "stitch", downsample=downsample))
+
+        for f in as_completed(futs):
+            f.result()
+            callback()
 
     def run_folder(folder: Path):
         for i in range(split):
             tileconfig[i * n : (i + 1) * n].write(folder / f"TileConfiguration{i + 1}.registered.txt")
             run_imagej(folder, name=f"TileConfiguration{i + 1}")
-            Path(folder / f"img_t1_z1_c1").rename(folder / f"fused_{i + 1}.tif")
+            Path(folder / "img_t1_z1_c1").rename(folder / f"fused_{folder.name}-{i + 1}.tif")
 
-    with ThreadPoolExecutor(4) as exc:
-        for folder in folders:
+    with ThreadPoolExecutor(6) as exc:
+        for folder in (path / "stitch").iterdir():
+            if not folder.is_dir():
+                continue
+            if not folder.name.isdigit():
+                raise ValueError(f"Invalid folder name {folder.name}. No external folders allowed.")
+
             if list(folder.glob("fused*")) and not overwrite:
                 logger.warning("Image already exists. Skipping.")
                 continue
             exc.submit(run_folder, folder)
 
-    if split > 1:
-        for folder in folders:
-            final_stitch(folder, split)
+    # if split > 1:
+    #     for folder in foldersc:
+    #         final_stitch(folder, split)
 
 
 def final_stitch(path: Path, n: int):
