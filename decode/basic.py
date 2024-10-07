@@ -4,11 +4,10 @@ from pathlib import Path
 
 import jax
 import numpy as np
+import starfish
 from basicpy import BaSiC
 from loguru import logger
 from tifffile import TiffFile
-
-import starfish
 
 channels = [405, 560, 650, 750]
 # %%

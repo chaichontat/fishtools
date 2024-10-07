@@ -54,6 +54,7 @@ def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
         exc.submit(bowtie_build, path / species / "cdna_ncrna_trna.fasta", "txome")
     Dataset(path / species)  # test all components
 
+
 @main.command()
 @click.argument("path", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
 def hash(path: Path):
@@ -61,6 +62,7 @@ def hash(path: Path):
     from .codebook.codebook import hash_codebook
 
     print(hash_codebook(json.loads(path.read_text())))
+
 
 main.add_command(candidates)
 main.add_command(screen)
