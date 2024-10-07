@@ -6,12 +6,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
-from pydantic import BaseModel, TypeAdapter
 import pyparsing as pp
 import seaborn as sns
+from pydantic import BaseModel, TypeAdapter
 from rtree import index
-from tifffile import imread
 from shapely import Point, Polygon, contains, intersection
+from tifffile import imread
 
 from fishtools.analysis.tileconfig import TileConfiguration
 
@@ -42,7 +42,7 @@ u = pca.components_
 # %%
 baddies = []
 for file in Path("/fast2/3t3clean/analysis/deconv/shifts").glob("shifts_*.json"):
-    with open(file, "r") as f:
+    with open(file) as f:
         shifts = json.load(f)
 
     vals = np.array(list(shifts.values()))

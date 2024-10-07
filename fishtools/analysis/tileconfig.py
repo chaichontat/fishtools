@@ -1,8 +1,9 @@
 from pathlib import Path
-import pandas as pd
+
 import numpy as np
-import pyparsing as pp
+import pandas as pd
 import polars as pl
+import pyparsing as pp
 
 
 class TileConfiguration:
