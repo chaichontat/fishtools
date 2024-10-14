@@ -220,7 +220,7 @@ def _run_transcript(
     )
 
     tss_pseudo, counts = (
-        get_pseudogenes(list(set([gene]) | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
+        get_pseudogenes(list({gene} | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
         if pseudogene_limit
         else (pl.Series(), pl.DataFrame())
     )

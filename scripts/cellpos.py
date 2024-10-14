@@ -1,10 +1,11 @@
 # %%
-from cellpose import models
-from cellpose.io import imread
 import logging
 import pickle
+
 import matplotlib.pyplot as plt
 import numpy as np
+from cellpose import models
+from cellpose.io import imread
 from tifffile import imread
 
 plt.imshow = lambda *args, **kwargs: plt.imshow(*args, zorder=1, **kwargs)
