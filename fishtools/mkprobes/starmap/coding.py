@@ -83,7 +83,7 @@ def _gen_mhd(n: int, on: int, min_dist: int = 4, seed: int = 0):
             continue
 
         out[cnt] = i
-        if (((np.array([out[cnt]])[:, None] & (1 << np.arange(n)))) > 0).astype(int).sum() != on:
+        if ((np.array([out[cnt]])[:, None] & (1 << np.arange(n))) > 0).astype(int).sum() != on:
             raise ValueError(i)
         cnt += 1
 
@@ -123,7 +123,7 @@ def _n_to_bit(arr: np.ndarray, n: int, on: int):
     if not isinstance(arr, np.ndarray):  # type: ignore
         raise TypeError("Input array must be a numpy array.")
 
-    arr = (((arr[:, None] & (1 << np.arange(n)))) > 0).astype(int)
+    arr = ((arr[:, None] & (1 << np.arange(n))) > 0).astype(int)
     if not np.all(arr.sum(axis=1) == on):
         raise ValueError(f"Number of 1s is not equal to {on=}.")
     return arr
