@@ -5,6 +5,7 @@ import pickle
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
+from itertools import chain
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -17,6 +18,8 @@ import starfish
 import starfish.data
 import xarray as xr
 from loguru import logger
+from pydantic import BaseModel, TypeAdapter
+from skimage.filters import gaussian
 from starfish import Codebook, ImageStack, IntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
@@ -27,7 +30,7 @@ from starfish.experiment.builder import FetchedTile, TileFetcher
 from starfish.image import Filter
 from starfish.types import Axes, Features, Levels
 from starfish.util.plot import imshow_plane, intensity_histogram
-from tifffile import imread, imwrite
+from tifffile import TiffFile, imread, imwrite
 
 from fishtools.utils.pretty_print import progress_bar
 
@@ -103,37 +106,41 @@ def plot_intensity_histograms(stack: starfish.ImageStack, r: int):
 def scale(img: ImageStack, scale: np.ndarray[np.float32, Any]):
     Filter.ElementWiseMultiply(
         xr.DataArray(
-            (1 / np.nan_to_num(scale, nan=1)).reshape(-1, 1, 1, 1, 1),
+            np.nan_to_num(scale, nan=1).reshape(-1, 1, 1, 1, 1),
             dims=("c", "x", "y", "z", "r"),
         )
     ).run(img, in_place=True)
 
 
-def load_codebook(path: Path):
-    cb = json.loads(path.read_text())
-    bits = reduce(lambda x, y: x | set(y), cb.values(), set())
-    bit_map = np.ones(max(bits) + 1, dtype=int) * 5000
-    for i, bit in enumerate(bits):
+def load_codebook(path: Path, exclude: set[str] | None = None):
+    cb_json: dict[str, list[int]] = json.loads(path.read_text())
+    for k in exclude or set():
+        cb_json.pop(k)
+
+    used_bits = sorted(set(chain.from_iterable(cb_json.values())))
+
+    # mapping from bit name to index
+    bit_map = np.ones(max(used_bits) + 1, dtype=int) * 5000
+    for i, bit in enumerate(used_bits):
         bit_map[bit] = i
 
-    arr = np.zeros((len(cb) - 1, len(bits) - 1), dtype=bool)
-    for i, v in enumerate(cb.values()):
-        if 28 in v:
-            continue
-        for a in v:
-            assert a > 0
-            arr[i, bit_map[a]] = 1
+    arr = np.zeros((len(cb_json), len(used_bits)), dtype=bool)
+    for i, bits_gene in enumerate(cb_json.values()):
+        for bit in bits_gene:
+            assert bit > 0
+            arr[i, bit_map[bit]] = 1
 
-    names = np.array(list(cb.keys()))
-    is_blank = np.array([n.startswith("Blank") for n in names])[:-1, None]
+    names = np.array(list(cb_json.keys()))
+    is_blank = np.array([n.startswith("Blank") for n in names])[:, None]  # [:-1, None]
     arr_zeroblank = arr * ~is_blank
     return (
         Codebook.from_numpy(
-            names[:-1],
+            names,
             n_round=1,
-            n_channel=len(bits) - 1,
+            n_channel=len(used_bits),
             data=arr[:, np.newaxis],
         ),
+        used_bits,
         names,
         arr_zeroblank,
     )
@@ -153,12 +160,14 @@ def cli(): ...
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-def optimize(path: Path):
+@click.option("--round", "round_num", type=int)
+@click.option("--batch-size", "-n", type=int, default=100)
+def optimize(path: Path, round_num: int, batch_size: int = 100):
     paths = list(path.glob("reg*.tif"))
     rand = np.random.default_rng(0)
-    selected = rand.choice(range(len(paths)), size=100, replace=False)
+    selected = sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))
 
-    with progress_bar(len(selected)) as callback, ThreadPoolExecutor(8) as exc:
+    with progress_bar(len(selected)) as callback, ThreadPoolExecutor(12) as exc:
         futs = []
         for i in selected:
             futs.append(
@@ -169,8 +178,9 @@ def optimize(path: Path):
                         __file__,
                         "run",
                         str(paths[i]),
-                        "--scale-file",
-                        str(path / "decode_scale.json"),
+                        "--global-scale",
+                        str(path / "global_scale.txt"),
+                        f"--round={round_num}",
                         # "--overwrite",
                     ],
                     check=True,
@@ -182,51 +192,131 @@ def optimize(path: Path):
             callback()
 
 
+def load_2d(path: Path | str, *args, **kwargs):
+    return np.atleast_2d(np.loadtxt(path, *args, **kwargs))
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.option("--round", type=int)
-@click.option("--overwrite", is_flag=True)
-def combine(path: Path, round: int, overwrite: bool = False):
-    if not overwrite and (path / f"round{round}.tif").exists():
-        curr = pl.read_csv(path / f"decode-round{round}.csv").to_numpy()
-    else:
-        paths = list(path.glob(f"reg*.scale.txt"))
-        curr = []
-        for p in paths:
-            curr.append(np.loadtxt(p, dtype=np.float32))
-        curr = np.array(curr)
-        pl.DataFrame(curr).write_csv(path / f"decode-{round}.csv")
+@click.option("--round", "round_num", type=int)
+def combine(path: Path, round_num: int):
+    # name = f"decode_{round_num:02d}.csv"
 
-    curr = np.nanmean(np.array(curr), axis=0, keepdims=True)
-    out_file = path / "decode_scale.json"
+    paths = list(path.glob("reg*.json"))
+    curr = []
+    n = 0
+    for p in paths:
+        sf = Deviations.validate_json(p.read_text())
+        if (round_num + 1) > len(sf):
+            raise ValueError(f"Round number {round_num} exceeds what's available ({len(sf)}).")
 
-    assert round is not None
+        if round_num == 0:
+            curr.append(sf[round_num].initial_scale)
+        else:
+            curr.append(np.array(sf[round_num].deviation) * sf[round_num].n)
+            n += sf[round_num].n
+    curr = np.array(curr)
+    # pl.DataFrame(curr).write_csv(path / name)
 
-    if not overwrite and out_file.exists():
-        # Rescale
-        out = np.array(json.loads(out_file.read_text()))[:round]
-        curr = out[-1] * (curr / np.nanmean(curr))
+    global_scale_file = path / "global_scale.txt"
+    if round_num == 0:
+        curr = np.nanmean(np.array(curr), axis=0, keepdims=True)
+        np.savetxt(global_scale_file, curr)
+        return
 
-        out = np.concatenate([out, curr], axis=0)
-    else:
-        out = curr
+    if not global_scale_file.exists():
+        raise ValueError("Round > 0 requires global scale file.")
 
-    out_file.write_text(json.dumps(out.tolist()))
+    deviation = curr.sum(axis=0) / n
+    # Normalize per channel
+    deviation = deviation / np.nanmean(deviation)
+    mae = np.mean(np.absolute(deviation - 1))
+    logger.info(f"Round {round_num}. MAE: {mae:04f}.")
+
+    previous = load_2d(global_scale_file)
+    np.savetxt(
+        global_scale_file,
+        np.concatenate(
+            [np.atleast_2d(previous[:round_num]), np.atleast_2d(previous[round_num - 1] / deviation)], axis=0
+        ),
+    )
+    (path / "mae.txt").open("a").write(f"{round_num:02d}\t{mae:04f}\n")
 
 
 def initial(img: ImageStack):
     maxed = img.reduce({Axes.ROUND, Axes.ZPLANE, Axes.Y, Axes.X}, func="max")
-    return np.array(maxed.xarray).reshape(1, -1)
+    res = np.array(maxed.xarray).squeeze()
+    if np.isnan(res).any() or (res == 0).any():
+        raise ValueError("NaNs or zeros found in initial scaling factor.")
+    return res
+
+
+class Deviation(BaseModel):
+    n: int
+    deviation: list[float]
+
+
+class InitialScale(BaseModel):
+    initial_scale: list[float]
+
+
+Deviations = TypeAdapter(list[InitialScale | Deviation])
+
+
+def append_json(
+    path: Path,
+    round_num: int,
+    *,
+    n: int | None = None,
+    deviation: np.ndarray | None = None,
+    initial_scale: np.ndarray | None = None,
+):
+    existing = Deviations.validate_json(path.read_text()) if path.exists() else Deviations.validate_json("[]")
+    if initial_scale is not None:
+        if round_num > 0:
+            raise ValueError("Cannot set initial scale for round > 0")
+        existing.append(InitialScale(initial_scale=initial_scale.tolist()))
+
+    elif deviation is not None and n is not None:
+        if round_num == 0:
+            raise ValueError("Cannot set deviation for round 0")
+        if existing.__len__() < round_num - 1:
+            raise ValueError("Round number exceeds number of existing rounds.")
+
+        existing = existing[:round_num]
+        existing.append(Deviation(n=n, deviation=deviation.tolist()))
+    else:
+        raise ValueError("Must provide either initial_scale or deviation and n.")
+
+    path.write_bytes(Deviations.dump_json(existing))
 
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
-@click.option("--scale-file", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
-def run(path: Path, scale_file: Path, iters: int = 1, overwrite: bool = False):
-    logger.info("Reading files")
-    path, scale_file = Path(path), Path(scale_file)
-    stack = make_fetcher(path, np.s_[:, :13])
+@click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--round", "round_num", type=int, default=0)
+@click.option("--debug", is_flag=True)
+def run(
+    path: Path, global_scale: Path | None, round_num: int = 0, overwrite: bool = False, debug: bool = False
+):
+    logger.info(f"Reading {path.name}.")
+    codebook, used_bits, names, arr_zeroblank = load_codebook(
+        Path.home() / "fishtools/starwork3/ordered/genestar.json", exclude={"Malat1-201"}
+    )
+    used_bits = list(map(str, used_bits))
+
+    # if not path.with_suffix(".highpassed.tif").exists():
+    with TiffFile(path) as tif:
+        img_keys = tif.shaped_metadata[0]["key"]
+
+    bit_mapping = {k: i for i, k in enumerate(img_keys)}
+    # img = tif.asarray()[:, [bit_mapping[k] for k in used_bits]]
+    # blurred = gaussian(path, sigma=8)
+    # blurred = levels(blurred)  # clip negative values to 0.
+    # filtered = image - blurred
+
+    stack = make_fetcher(path, np.s_[:, [bit_mapping[k] for k in used_bits]])
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
     # But it's there as a reference.
@@ -237,36 +327,47 @@ def run(path: Path, scale_file: Path, iters: int = 1, overwrite: bool = False):
 
     # Scaling
     imgs: ImageStack = ghp.run(stack)
-    # scale_file = path.with_suffix(".scale.json")
-    if not scale_file.exists():
-        logger.debug(f"Making scale file.")
-        np.savetxt(path.with_suffix(".scale.txt"), initial(imgs))
+
+    path_out = path.with_suffix(".json")
+
+    if round_num == 0:
+        logger.debug("Making scale file.")
+        path_out.write_bytes(
+            Deviations.dump_json(
+                Deviations.validate_python([{"initial_scale": (1 / initial(imgs)).tolist()}])
+            )
+        )
         return
 
-    scale_factor = np.array(json.loads(scale_file.read_text()), dtype=np.float32)[-1]
+    if not global_scale or not global_scale.exists():
+        raise ValueError("Round > 0 requires global scale file.")
 
-    # scale_factor = np.array(scale_all[-1], copy=True)
-    # logger.debug(f"Round {len(scale_all)}")
-    scale(imgs, scale_factor)
+    scale_all = np.loadtxt(global_scale)
+    if len(scale_all.shape) == 1:
+        scale_all = scale_all[np.newaxis, :]
 
-    codebook, names, arr_zeroblank = load_codebook(
-        Path("/home/chaichontat/fishtools/starwork3/ordered/tricycleplus.json")
-    )
+    scale_factor = np.array(scale_all[round_num - 1], copy=True)
+
+    try:
+        scale(imgs, scale_factor)
+    except ValueError:
+        # global_scale.unlink()
+        raise ValueError("Scale factor dim mismatch. Deleted. Please rerun.")
 
     # Decode
     pixel_intensities = IntensityTable.from_image_stack(imgs)
-    logger.info(f"Decoding")
+    logger.info("Decoding")
     decoded_intensities = codebook.decode_metric(
         pixel_intensities,
-        max_distance=0.25,
-        min_intensity=0.001,
+        max_distance=0.3,
+        min_intensity=0.004,
         norm_order=2,
         metric="euclidean",
         return_original_intensities=True,
     )
 
-    logger.info(f"Combining")
-    caf = CombineAdjacentFeatures(min_area=4, max_area=100, mask_filtered_features=True)
+    logger.info("Combining")
+    caf = CombineAdjacentFeatures(min_area=6, max_area=100, mask_filtered_features=True)
     decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
     transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
 
@@ -280,12 +381,20 @@ def run(path: Path, scale_file: Path, iters: int = 1, overwrite: bool = False):
     logger.debug(f"{percent} blank, Total: {counts.sum()}")
 
     # Deviations
-    if False:
+    if True:
         names_l = {n: i for i, n in enumerate(names)}
         idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
 
-        avgs = np.nanmean(spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0)
-        np.savetxt(path.with_suffix(".scale.txt"), avgs)
+        deviations = np.nanmean(spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0)
+        logger.debug(f"Deviations: {deviations}")
+
+        """Concatenate with previous rounds. Will overwrite rounds beyond the current one."""
+        append_json(path_out, round_num, deviation=deviations, n=len(spot_intensities))
+
+        # np.savetxt(
+        #     path_dev,
+        #     np.vstack([np.atleast_2d(load_2d(path_dev)[:round_num]), np.atleast_2d(deviations)]),
+        # )
 
     morph = [
         {"area": prop.area, "centroid": prop.centroid}
@@ -294,7 +403,7 @@ def run(path: Path, scale_file: Path, iters: int = 1, overwrite: bool = False):
         ]
     ]
 
-    with open(path.with_suffix(".pkl"), "wb") as f:
+    with open(path.with_stem(f"{path.stem}_{round_num:02d}").with_suffix(".pkl"), "wb") as f:
         pickle.dump((decoded_spots, morph), f)
 
     return decoded_spots, image_decoding_results
