@@ -26,7 +26,7 @@ logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
 import jax
 
 jax.config.update("jax_platform_name", "cpu")
-FORBIDDEN_PREFIXES = ["10x", "registered", "shifts"]
+FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
 if TYPE_CHECKING:
     from loguru import Logger
@@ -44,6 +44,10 @@ class Fiducial(BaseModel):
     priors: dict[str, tuple[float, float]] | None = Field(
         default=None,
         description="Shifts to apply before alignment. Name must match round name.",
+    )
+    overrides: dict[str, tuple[float, float]] | None = Field(
+        default=None,
+        description="Overrides for fiducial spot detection. Name must match round name.",
     )
 
 
@@ -75,7 +79,7 @@ class Config(BaseModel):
     dataPath: str
     registration: RegisterConfig
     channels: ChannelConfig | None = None
-    basic_template: dict[str, Annotated[str, "path for basic_{channel}.pkl"]]
+    basic_template: dict[str, Annotated[str, "path for basic_{channel}.pkl"]] | None = None
 
 
 # print(json.dumps(Config.model_json_schema()))
@@ -108,7 +112,8 @@ for λ in ["650", "750"]:
 
 
 def spillover_correction(spillee: np.ndarray, spiller: np.ndarray, corr: float):
-    return np.clip(spillee - spiller * corr, 0, 65535)
+    scaled = spiller * corr
+    return np.where(spillee >= scaled, spillee - scaled, 0)
 
 
 def parse_nofids(nofids: dict[str, np.ndarray], shifts: dict[str, np.ndarray], channels: dict[str, str]):
@@ -231,8 +236,10 @@ class Image:
 
         if to_discard_idxs:
             _bits = name.split("_")
+            power_keys = list(powers.keys())
             for _idx_d in to_discard_idxs:
                 _bits.pop(_idx_d)
+                del powers[power_keys[_idx_d]]
             name = "_".join(_bits)
             keeps = list(sorted(set(range(len(bits))) - set(to_discard_idxs)))
             nofid = nofid[:, keeps]
@@ -284,21 +291,19 @@ def run(
         logger.info(f"Skipping {idx}")
         return
 
-    basic = {
-        channel: pickle.loads(Path(path).read_bytes()) for channel, path in config.basic_template.items()
-    }
-    # try:
-    #     basic = {
-    #         c: pickle.loads((path / f"basic_deconv_{c}.pkl").read_bytes())
-    #         for c in ["405", "560", "650", "750"]
-    #     }
-    # except FileNotFoundError:
-    #     basic = {
-    #         c: pickle.loads((DATA / f"basic_{c}.pkl").read_bytes()) for c in ["405", "560", "650", "750"]
-    #     }
-    # basic["488"] = basic["560"]
+    if config.basic_template:
+        basic = {
+            channel: pickle.loads(Path(path).read_bytes()) for channel, path in config.basic_template.items()
+        }
+        try:
+            basic = {c: pickle.loads((path / f"basic_{c}.pkl").read_bytes()) for c in ["560", "650", "750"]}
+        except FileNotFoundError:
+            basic = {c: pickle.loads((DATA / f"basic_{c}.pkl").read_bytes()) for c in ["560", "650", "750"]}
+        basic["488"] = basic["560"]
+    else:
+        basic = {}
 
-    print(sorted(Path(path).glob(f"*/*-{idx:04d}.tif")))
+    # print(sorted(Path(path).glob(f"*/*-{idx:04d}.tif")))
     # Convert file name to bit
     _imgs: list[Image] = [
         Image.from_file(file, discards=config.channels and config.channels.discards)
@@ -338,6 +343,16 @@ def run(
         )
         logger.debug(f"Written fiducials to {_fids_path}.")
 
+    # Write reference fiducial
+    (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
+    tifffile.imwrite(
+        fid_path / f"fids-{idx:04d}.tif",
+        fids[reference],
+        compression=22610,
+        compressionargs={"level": 0.65},
+        metadata={"axes": "YX"},
+    )
+
     shifts = align_fiducials(
         fids,
         reference=reference,
@@ -362,6 +377,16 @@ def run(
             shifts[prior_mapping[name]][0] += sh[0]
             shifts[prior_mapping[name]][1] += sh[1]
 
+    if config.registration.fiducial.overrides is not None:
+        for name, sh in config.registration.fiducial.overrides.items():
+            for file in fids:
+                if file.startswith(name):
+                    shifts[file][0] = sh[0]
+                    shifts[file][1] = sh[1]
+                    break
+            else:
+                raise ValueError(f"Could not find file that starts with {name} for override shift.")
+
     (shift_path := path / f"shifts--{roi}").mkdir(exist_ok=True)
 
     with open(shift_path / f"shifts-{idx:04d}.json", "w") as f:
@@ -370,12 +395,17 @@ def run(
     channels: dict[str, str] = {}
     for img in imgs.values():
         channels |= dict(zip(img.bits, img.powers))
+    logger.debug(f"Channels: {channels}")
 
     # del imgs
 
     # Split into individual bits.
     # Spillover correction, max projection
     bits, bits_shifted, bit_name_mapping = parse_nofids(nofids, shifts, channels)
+
+    if debug:
+        for name, img in bits.items():
+            logger.info(f"{name}: {img.max()}")
 
     def collapse_z(
         img: np.ndarray,
@@ -400,14 +430,15 @@ def run(
         # img = imgs[orig_name].scale_deconv(img, orig_idx)
 
         # Illumination correction
-        img = np.stack(basic.get(c, basic["560"]).transform(np.array(img)))
+        if config.basic_template:
+            img = np.stack(basic.get(c, basic["560"]).transform(np.array(img)))
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
             affine.ref_image = ref = img
 
         # Within-tile alignment. Chromatic corrections.
-        img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
+        img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=False)
         transformed[bit] = np.clip(img, 0, 65535).astype(np.uint16)
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
 
@@ -425,6 +456,8 @@ def run(
     # Sort by channel
     for i, (k, v) in enumerate(items := sorted(transformed.items(), key=sort_key)):
         out[:, i] = v[:, crop:-crop:downsample, crop:-crop:downsample]
+
+    # out[0, -1] = fids[reference][crop:-crop:downsample, crop:-crop:downsample]
 
     keys: list[str] = [k for k, _ in items]
     logger.debug(str([f"{i}: {k}" for i, k in enumerate(keys, 1)]))
@@ -493,13 +526,13 @@ def main(
         debug=debug,
         config=Config(
             dataPath=str(DATA),
-            channels=ChannelConfig(discards={"polyA": ["dapi_polyA_28"]}),
-            basic_template=dict(
-                zip(
-                    ["405", "560", "650", "750"],
-                    [str(DATA / f"basic_{c}.pkl") for c in ["405", "560", "650", "750"]],
-                )
-            ),
+            channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
+            # basic_template=dict(
+            #     zip(
+            #         ["560", "650", "750"],
+            #         [str(f"/mnt/archive/starmap/e155_trc/basic_{c}.pkl") for c in ["560", "650", "750"]],
+            #     )
+            # ),
             registration=RegisterConfig(
                 chromatic_shifts={
                     "647": str(DATA / "560to647.txt"),
@@ -521,15 +554,7 @@ def main(
                 ),
                 downsample=1,
                 crop=30,
-                slices=[
-                    # (0, 12)
-                    (0, 10),
-                    # (5, 10),
-                    # (10, 15),
-                    # (15, 20),
-                    # (20, 25),
-                    # (25, 30),
-                ],
+                slices=[(i, i + 5) for i in range(0, 55, 5)],
                 reduce_bit_depth=0,
             ),
         ),

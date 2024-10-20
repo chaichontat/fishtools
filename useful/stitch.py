@@ -150,11 +150,13 @@ def extract_channel(
     with TiffFile(path) as tif:
         if trim < 0:
             raise ValueError("Trim must be positive")
-        img = (
-            tif.pages[idx].asarray()[trim:-trim:downsample, trim:-trim:downsample]
-            if trim
-            else tif.pages[idx].asarray()[::downsample, ::downsample]
-        )
+
+        if len(tif.pages) == 1 and tif.pages[0].asarray().ndim == 3:
+            img = tif.pages[0].asarray()[idx]
+        else:
+            img = tif.pages[idx].asarray()
+
+        img = img[trim:-trim:downsample, trim:-trim:downsample] if trim else img[::downsample, ::downsample]
         img >>= reduce_bit_depth
         imwrite(
             out,
@@ -185,34 +187,39 @@ def register(
     path: Path,
     position_file: Path,
     *,
-    idx: int,
+    idx: int | None = None,
     recreate: bool = False,
     overwrite: bool = False,
     downsample: int = 2,
     threshold: float = 0.4,
 ):
     imgs = sorted(path.glob("*.tif"))
-    (out_path := path / "stitch").mkdir(exist_ok=True)
 
     def get_idx(path: Path):
         return int(path.stem.split("-")[1])
 
-    logger.info(f"Found {len(imgs)} files. Extracting channel {idx} to {out_path}.")
-    with progress_bar(len(imgs)) as callback, ThreadPoolExecutor(6) as exc:
-        futs = []
-        for path in imgs:
-            out_name = f"{get_idx(path):04d}.tif"
-            if (out_path / out_name).exists() and not overwrite:
-                continue
-            futs.append(exc.submit(extract_channel, path, out_path / out_name, idx, downsample=downsample))
+    if idx is not None:
+        (out_path := path / "stitch").mkdir(exist_ok=True)
+        logger.info(f"Found {len(imgs)} files. Extracting channel {idx} to {out_path}.")
+        with progress_bar(len(imgs)) as callback, ThreadPoolExecutor(6) as exc:
+            futs = []
+            for path in imgs:
+                out_name = f"{get_idx(path):04d}.tif"
+                if (out_path / out_name).exists() and not overwrite:
+                    continue
+                futs.append(
+                    exc.submit(extract_channel, path, out_path / out_name, idx, downsample=downsample)
+                )
 
-        for f in as_completed(futs):
-            f.result()
-            callback()
+            for f in as_completed(futs):
+                f.result()
+                callback()
+    else:
+        out_path = path
 
     del path
     if recreate or not (out_path / "TileConfiguration.registered.txt").exists():
-        files_idx = [int(file.stem) for file in sorted(out_path.glob("*.tif"))]
+        files_idx = [int(file.stem.split("-")[-1]) for file in sorted(out_path.glob("*.tif"))]
         tileconfig = TileConfiguration.from_pos(
             pd.read_csv(position_file, header=None).iloc[sorted(files_idx)], downsample=downsample
         )
@@ -252,7 +259,6 @@ def extract(path: Path, out_path: Path, *, trim: int = 0, downsample: int = 1, r
     default=1,
     help="Split tiles into this many parts. Mainly to avoid overflows in very large images.",
 )
-# @click.option("--reference", type=str)
 @click.option("--overwrite", is_flag=True)
 @click.option("--downsample", "-d", type=int, default=2)
 def fuse(

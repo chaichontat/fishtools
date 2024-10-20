@@ -3,6 +3,7 @@ import json
 import os
 import pickle
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
 from itertools import chain
@@ -158,31 +159,14 @@ def cli(): ...
 # img /= scale_factors
 
 
-@cli.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.option("--round", "round_num", type=int)
-@click.option("--batch-size", "-n", type=int, default=100)
-def optimize(path: Path, round_num: int, batch_size: int = 100):
-    paths = list(path.glob("reg*.tif"))
-    rand = np.random.default_rng(0)
-    selected = sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))
-
-    with progress_bar(len(selected)) as callback, ThreadPoolExecutor(12) as exc:
+def _batch(paths: list[Path], mode: str, args: list[str]):
+    with progress_bar(len(paths)) as callback, ThreadPoolExecutor(13) as exc:
         futs = []
-        for i in selected:
+        for path in paths:
             futs.append(
                 exc.submit(
                     subprocess.run,
-                    [
-                        "python",
-                        __file__,
-                        "run",
-                        str(paths[i]),
-                        "--global-scale",
-                        str(path / "global_scale.txt"),
-                        f"--round={round_num}",
-                        # "--overwrite",
-                    ],
+                    ["python", __file__, mode, str(path), *args],
                     check=True,
                     capture_output=False,
                 )
@@ -190,6 +174,33 @@ def optimize(path: Path, round_num: int, batch_size: int = 100):
 
         for f in as_completed(futs):
             callback()
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.option("--round", "round_num", type=int)
+@click.option("--batch-size", "-n", type=int, default=100)
+def optimize(path: Path, round_num: int, batch_size: int = 100):
+    paths = list(path.glob("reg*.tif"))
+    rand = np.random.default_rng(0)
+    selected = [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
+
+    return _batch(
+        selected,
+        "optimize",
+        ["--calc-deviations", "--global-scale", str(path / "global_scale.txt"), f"--round={round_num}"],
+    )
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
+def batch(path: Path, global_scale: Path):
+    return _batch(
+        sorted(path.glob("reg*.tif")),
+        "run",
+        ["--global-scale", global_scale.as_posix()],
+    )
 
 
 def load_2d(path: Path | str, *args, **kwargs):
@@ -295,11 +306,31 @@ def append_json(
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
 @click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
-@click.option("--round", "round_num", type=int, default=0)
+@click.option("--round", "round_num", type=int, default=None)
+@click.option("--calc-deviations", is_flag=True)
 @click.option("--debug", is_flag=True)
 def run(
-    path: Path, global_scale: Path | None, round_num: int = 0, overwrite: bool = False, debug: bool = False
+    path: Path,
+    global_scale: Path | None,
+    round_num: int | None = None,
+    overwrite: bool = False,
+    debug: bool = False,
+    calc_deviations: bool = False,
 ):
+    if debug:
+        logger.remove()
+        logger.add(sys.stderr, level="INFO")
+
+    if calc_deviations and round_num is None:
+        raise ValueError("Round must be provided for calculating deviations.")
+
+    path_pickle = (
+        path.with_name(f"{path.stem}_{round_num:02d}.pkl") if calc_deviations else path.with_suffix(".pkl")
+    )
+    if path_pickle.exists() and not overwrite:
+        logger.info(f"Skipping {path.name}. Already exists.")
+        return
+
     logger.info(f"Reading {path.name}.")
     codebook, used_bits, names, arr_zeroblank = load_codebook(
         Path.home() / "fishtools/starwork3/ordered/genestar.json", exclude={"Malat1-201"}
@@ -321,16 +352,11 @@ def run(
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
     # But it's there as a reference.
     ghp = Filter.GaussianHighPass(sigma=8, is_volume=False, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
-    # dpsf = Filter.DeconvolvePSF(num_iter=2, sigma=1.7, level_method=Levels.SCALE_SATURATED_BY_CHUNK)
-    # glp = Filter.GaussianLowPass(sigma=1, is_volume=False, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
-    # dpsf.run(imgs, in_place=True)
-
-    # Scaling
     imgs: ImageStack = ghp.run(stack)
 
     path_out = path.with_suffix(".json")
 
-    if round_num == 0:
+    if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
         path_out.write_bytes(
             Deviations.dump_json(
@@ -340,13 +366,17 @@ def run(
         return
 
     if not global_scale or not global_scale.exists():
-        raise ValueError("Round > 0 requires global scale file.")
+        raise ValueError("Production run or round > 0 requires a global scale file.")
 
     scale_all = np.loadtxt(global_scale)
     if len(scale_all.shape) == 1:
         scale_all = scale_all[np.newaxis, :]
 
-    scale_factor = np.array(scale_all[round_num - 1], copy=True)
+    scale_factor = (
+        np.array(scale_all[round_num - 1], copy=True)
+        if round_num is not None and calc_deviations
+        else np.array(scale_all[-1], copy=True)
+    )
 
     try:
         scale(imgs, scale_factor)
@@ -367,7 +397,7 @@ def run(
     )
 
     logger.info("Combining")
-    caf = CombineAdjacentFeatures(min_area=6, max_area=100, mask_filtered_features=True)
+    caf = CombineAdjacentFeatures(min_area=8, max_area=100, mask_filtered_features=True)
     decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
     transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
 
@@ -381,7 +411,7 @@ def run(
     logger.debug(f"{percent} blank, Total: {counts.sum()}")
 
     # Deviations
-    if True:
+    if calc_deviations and round_num is not None:
         names_l = {n: i for i, n in enumerate(names)}
         idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
 
@@ -391,11 +421,6 @@ def run(
         """Concatenate with previous rounds. Will overwrite rounds beyond the current one."""
         append_json(path_out, round_num, deviation=deviations, n=len(spot_intensities))
 
-        # np.savetxt(
-        #     path_dev,
-        #     np.vstack([np.atleast_2d(load_2d(path_dev)[:round_num]), np.atleast_2d(deviations)]),
-        # )
-
     morph = [
         {"area": prop.area, "centroid": prop.centroid}
         for prop in np.array(image_decoding_results.region_properties)[
@@ -403,7 +428,7 @@ def run(
         ]
     ]
 
-    with open(path.with_stem(f"{path.stem}_{round_num:02d}").with_suffix(".pkl"), "wb") as f:
+    with path_pickle.open("wb") as f:
         pickle.dump((decoded_spots, morph), f)
 
     return decoded_spots, image_decoding_results
