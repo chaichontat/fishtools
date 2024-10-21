@@ -229,6 +229,8 @@ class Image:
                 np.loadtxt(next(path.parent.glob("deconv_scaling.txt"))).astype(np.float32).reshape((2, -1))
             )
         except StopIteration:
+            if "deconv" in path.as_posix():
+                raise ValueError("No deconv_scaling found.")
             logger.debug("No deconv_scaling found. Using ones.")
             deconv_scaling = np.ones((2, len(bits)))
 
