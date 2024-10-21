@@ -399,16 +399,18 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
         towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
         del res
 
-        q_write.put((
-            start,
-            towrite,
-            fid,
-            metadata
-            | {
-                "deconv_min": list(map(float, mins.get().flatten())),
-                "deconv_scale": list(map(float, scale.get().flatten())),
-            },
-        ))
+        q_write.put(
+            (
+                start,
+                towrite,
+                fid,
+                metadata
+                | {
+                    "deconv_min": list(map(float, mins.get().flatten())),
+                    "deconv_scale": list(map(float, scale.get().flatten())),
+                },
+            )
+        )
         q_img.task_done()
 
     q_write.put(None)

@@ -69,6 +69,7 @@ def compress(path: Path, delete: bool = False, quality: int = 1, n_process: int 
             file.unlink()
             file.with_suffix(".dax").unlink(missing_ok=True)
 
+
 # fmt: off
 @main.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
@@ -83,7 +84,6 @@ def compress_one(path: Path, delete: bool = False, quality: int = 1, n_process: 
     if delete and 0.65 <= quality <= 1:
         path.unlink()
         path.with_suffix(".dax").unlink(missing_ok=True)
-
 
 
 # fmt: off
