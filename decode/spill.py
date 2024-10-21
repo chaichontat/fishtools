@@ -36,7 +36,6 @@ plt.axvline(x=1000)
 # %%
 from sklearn.decomposition import PCA
 
-
 # %%
 
 plt.plot(img[5, 0, 300:400, 1500:1600].max(axis=0))
@@ -45,7 +44,7 @@ plt.plot(img[5, 1, 300:400, 1500:1600].max(axis=0))
 
 # %%
 
-plt.plot((img[5, 0, 380, 1500:1600] - 0.22 * img[5, 1, 380, 1500:1600]))
+plt.plot(img[5, 0, 380, 1500:1600] - 0.22 * img[5, 1, 380, 1500:1600])
 
 # %%
 fig, axs = plt.subplots(ncols=3, nrows=2, figsize=(12, 4), dpi=200)

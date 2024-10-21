@@ -215,7 +215,7 @@ def construct(
     )
 
     screened = screened.filter(
-        (pl.col("splint").str.lengths() > 0)
+        pl.col("splint").str.lengths() > 0
         # & (pl.col("splint").apply(lambda x: hp(x, "dna")) < 50)
         # & (pl.col("padlock").apply(lambda x: hp(x, "dna")) < 50)
     )
