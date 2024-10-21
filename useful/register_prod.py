@@ -347,9 +347,10 @@ def run(
 
     # Write reference fiducial
     (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
+    crop, downsample = config.registration.crop, config.registration.downsample
     tifffile.imwrite(
         fid_path / f"fids-{idx:04d}.tif",
-        fids[reference],
+        fids[reference][crop:-crop:downsample, crop:-crop:downsample],
         compression=22610,
         compressionargs={"level": 0.65},
         metadata={"axes": "YX"},

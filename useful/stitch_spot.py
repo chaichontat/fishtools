@@ -1,6 +1,6 @@
 # %%
-from concurrent.futures import ThreadPoolExecutor
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -9,19 +9,25 @@ import pandas as pd
 import polars as pl
 import pyparsing as pp
 import seaborn as sns
+from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 from rtree import index
-from shapely import Point, Polygon, contains, intersection
+from shapely import Point, Polygon, STRtree, contains, intersection
 from tifffile import imread
 
 from fishtools.analysis.tileconfig import TileConfiguration
 
 sns.set_theme()
-path = Path("/mnt/working/e155trcdeconv/registered--left/")
-codebook = "tricycleplus"
+codebook = "genestar"
+roi = "right"
+# registered--{roi}
+path = Path(f"/mnt/working/e155trcdeconv/registered--{roi}")
 files = sorted(file for file in Path(path / codebook).glob("*.pkl") if "opt" not in file.stem)
 
-coords = TileConfiguration.from_file(Path(path.parent / "fids--left" / "TileConfiguration.registered.txt")).df
+coords = TileConfiguration.from_file(
+    # Path(path.parent / f"fids--{roi}" / "TileConfiguration.registered.txt")
+    Path(path / "stitch" / "TileConfiguration.registered.txt")
+).df
 assert len(files) == len(coords)
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
@@ -43,22 +49,25 @@ sns.scatterplot(x="x", y="y", data=coords.to_pandas(), ax=ax, s=10, alpha=0.9)
 # %%
 
 
-def load(i: int):
+def load(i: int, filter_: bool = True):
     d, y = pickle.loads(files[i].read_bytes())
-    d = d[d.coords["passes_thresholds"]]
+    if filter_:
+        y = np.array(y)[d.coords["passes_thresholds"]].tolist()
+        d = d[d.coords["passes_thresholds"]]
     return (
         pl.DataFrame(y)
         .with_columns(pl.col("centroid").list.to_struct())
         .unnest("centroid")
+        .rename({"field_0": "z", "field_1": "y_local", "field_2": "x_local"})
         .with_columns(
-            field_1=pl.col("field_1") + coords[i, "y"],
-            field_2=pl.col("field_2") + coords[i, "x"],
+            y=pl.col("y_local") + coords[i, "y"],
+            x=pl.col("x_local") + coords[i, "x"],
             target=pl.Series(list(d.coords["target"].values)),
             distance=pl.Series(list(d.coords["distance"].values)),
             norm=pl.Series(np.linalg.norm(d.values, axis=(1, 2))),
             tile=pl.lit(str(i)),
+            passes_thresholds=pl.Series(d.coords["passes_thresholds"].values),
         )
-        .rename({"field_0": "z", "field_1": "y", "field_2": "x"})
         .with_row_count("idx")
         # .join(d,)
     )
@@ -87,9 +96,6 @@ idx = index.Index()
 for pos, cell in enumerate(cells):
     idx.insert(pos, cell.bounds)
 
-# %%
-# from collections import defaultdict
-
 crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 
 # %%
@@ -97,33 +103,50 @@ crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 out = []
 
 
-def process(curr: int):
+def process(curr: int, filter_: bool = True):
     this_cross = {j: intersection(cells[curr], cells[j]) for j in crosses[curr] if j > curr}
-    thrown = 0
-    df = load(curr)
+    df = load(curr, filter_=filter_)
 
-    def what(row):
-        for name, intersected in this_cross.items():
-            if contains(intersected, Point((row["x"], row["y"]))):
-                return False
-        return True
+    # def what(row):
+    #     for name, intersected in this_cross.items():
+    #         if contains(intersected, Point((row["x"], row["y"]))):
+    #             return False
+    #     return True
 
-    df.filter(pl.struct("x", "y").apply(what))
+    # df.filter(pl.struct("x", "y").apply(what))
 
-    for row in df.iter_rows(named=True):
-        for name, intersected in this_cross.items():
-            if contains(intersected, Point((row["x"], row["y"]))):
-                thrown += 1
-                # thrownover[name].append(row)
-                # Prevent double-counting
-                break
-        else:
-            out.append(row)
-    print(f"{curr}: thrown {thrown} / {df.__len__()}")
+    geometries = list(this_cross.values())
+    tree = STRtree(geometries)
+
+    def check_point(x, y):
+        point = Point(x, y)
+        return len(tree.query(point)) == 0
+
+    # for row in df.iter_rows(named=True):
+    #     for name, intersected in this_cross.items():
+    #         if contains(intersected, Point((row["x"], row["y"]))):
+    #             thrown += 1
+    #             # thrownover[name].append(row)
+    #             # Prevent double-counting
+    #             break
+    #     else:
+    #         out.append(row)
+
+    # Apply the function to all rows at once
+    mask = df.select([pl.struct(["x", "y"]).apply(lambda row: check_point(row["x"], row["y"])).alias("keep")])
+
+    # Filter the dataframe and count the thrown points
+    filtered_df = df.filter(mask["keep"])
+
+    print(f"{curr}: thrown {len(df) - len(filtered_df)} / {df.__len__()}")
+    out.append(filtered_df)
 
 
+# process(0, filter_=False)
+
+# %%
 with ThreadPoolExecutor(8) as exc:
-    futs = [exc.submit(process, i) for i in range(len(cells[:]))]
+    futs = [exc.submit(process, i, filter_=True) for i in range(len(cells[:]))]
     for fut in futs:
         fut.result()
 # for curr in range(len(cells[:20])):
@@ -131,14 +154,17 @@ with ThreadPoolExecutor(8) as exc:
 
 # del thrownover[curr]
 # %%
-spots = pl.DataFrame(out)
+spots = pl.concat(out)
+# %%
 spots.write_parquet(path / codebook / "spots.parquet")
 
 # %%
 fig, axs = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 
 # ax.set_aspect("equal")
-axs.scatter(spots["x"][::50], spots["y"][::50], s=0.5, alpha=0.3)
+downsample = 1000
+axs.scatter(spots["x"][::downsample], spots["y"][::downsample], s=0.5, alpha=0.3)
+axs.set_aspect("equal")
 
 # %%
 fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
@@ -146,13 +172,17 @@ selected = spots.filter(pl.col("target") == "Gpm6a-201")
 ax.scatter(selected["x"], selected["y"], s=0.5, alpha=0.4)
 # spots = pl.read_parquet(path / "genestar" / "spots.parquet")
 # %%
+spots = pl.read_parquet(path / codebook / "spots.parquet")
 pergene = (
-    spots.groupby("target")
+    spots.filter(pl.col("passes_thresholds"))
+    .groupby("target")
     .count()
     .sort("count", descending=True)
     .with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
     .with_columns(color=pl.when(pl.col("is_blank")).then(pl.lit("red")).otherwise(pl.lit("blue")))
 )
+
+# print(np.sum(pergene["count"].to_list()))
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 6), dpi=200)
 ax.bar(pergene["target"], pergene["count"], color=pergene["color"], width=1, align="edge", linewidth=0)
@@ -165,24 +195,30 @@ plt.tight_layout()
 # %%
 
 # %%
-genes = ["Sox9-201", "Neurod1-201", "Neurog2-201", "Bcl11b-203", "Cldn5-201", "Sst-201"]
+genes = ["Sox9-201", "Neurod1-201", "Neurog2-201", "Bcl11b-203", "Gad2-201", "Sst-201"]
 fig, axs = plt.subplots(ncols=3, nrows=2, figsize=(12, 8), dpi=200)
 axs = axs.flatten()
 for ax, gene in zip(axs, genes):
     selected = spots.filter(pl.col("target") == gene)
-    ax.scatter(selected["x"], selected["y"], s=0.5, alpha=0.2)
-    ax.set_title(gene)
+    ax.set_aspect("equal")
+    ax.set_title(gene, fontsize=16)
+    ax.hexbin(selected["y"], -selected["x"], gridsize=250)
 
     ax.axis("off")
 # %%
 genes = pergene["target"]
-fig, axs = plt.subplots(ncols=8, nrows=12, figsize=(32, 48), dpi=100)
+fig, axs = plt.subplots(ncols=8, nrows=16, figsize=(32, 32), dpi=100, facecolor="black")
 axs = axs.flatten()
 for ax, gene in zip(axs, genes):
     selected = spots.filter(pl.col("target") == gene)
-    ax.scatter(selected["x"], selected["y"], s=0.1, alpha=0.2)
-    ax.set_title(gene, fontsize=16)
+    if not len(selected):
+        logger.warning(f"No spots found for {gene}")
+        continue
+    ax.set_aspect("equal")
+    ax.set_title(gene, fontsize=16, color="white")
     ax.axis("off")
+    ax.hexbin(selected["y"], -selected["x"], gridsize=250)
+    # ax.scatter(selected["y"], -selected["x"], s=5000 / len(selected), alpha=0.2)
 
 
 # %%

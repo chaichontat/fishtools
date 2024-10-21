@@ -2,6 +2,7 @@
 import json
 import os
 import pickle
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -169,7 +170,7 @@ def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13):
             futs.append(
                 exc.submit(
                     subprocess.run,
-                    ["python", __file__, mode, str(path), *args],
+                    ["python", __file__, mode, str(path), *[a for a in args if a]],
                     check=True,
                     capture_output=False,
                 )
@@ -192,6 +193,8 @@ def optimize(path: Path, round_num: int, codebook_path: Path, batch_size: int = 
     paths = list(path.glob("reg*.tif"))
     rand = np.random.default_rng(0)
     selected = [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
+    if not (path / codebook_path.stem / codebook_path.name).exists():
+        shutil.copy(codebook_path, path / codebook_path.stem)
 
     return _batch(
         selected,
@@ -216,11 +219,18 @@ def optimize(path: Path, round_num: int, codebook_path: Path, batch_size: int = 
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
 @click.option("--threads", "-t", type=int, default=13)
-def batch(path: Path, global_scale: Path, codebook_path: Path, threads: int = 13):
+@click.option("--overwrite", is_flag=True)
+def batch(path: Path, global_scale: Path, codebook_path: Path, threads: int = 13, overwrite: bool = False):
     return _batch(
         sorted(path.glob("reg*.tif")),
         "run",
-        ["--global-scale", global_scale.as_posix(), "--codebook", codebook_path.as_posix()],
+        [
+            "--global-scale",
+            global_scale.as_posix(),
+            "--codebook",
+            codebook_path.as_posix(),
+            "--overwrite" if overwrite else "",
+        ],
         threads=threads,
     )
 
@@ -454,9 +464,7 @@ def run(
 
     morph = [
         {"area": prop.area, "centroid": prop.centroid}
-        for prop in np.array(image_decoding_results.region_properties)[
-            decoded_spots[Features.PASSES_THRESHOLDS]
-        ]
+        for prop in np.array(image_decoding_results.region_properties)
     ]
 
     with path_pickle.open("wb") as f:
