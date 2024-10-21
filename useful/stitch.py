@@ -219,11 +219,15 @@ def register(
 
     del path
     if recreate or not (out_path / "TileConfiguration.registered.txt").exists():
-        files_idx = [int(file.stem.split("-")[-1]) for file in sorted(out_path.glob("*.tif"))]
+        files = sorted(out_path.glob("*.tif"))
+        files_idx = [int(file.stem.split("-")[-1]) for file in files]
         tileconfig = TileConfiguration.from_pos(
             pd.read_csv(position_file, header=None).iloc[sorted(files_idx)], downsample=downsample
         )
-        tileconfig.write(out_path / "TileConfiguration.txt")
+        tileconfig.write(
+            out_path / "TileConfiguration.txt",
+            file_names=[file.name for file in files] if idx is None else None,
+        )
         logger.info(f"Created TileConfiguration at {out_path}.")
         logger.info("Running first.")
         run_imagej(out_path, compute_overlap=True, fuse=False, threshold=threshold, name="TileConfiguration")

@@ -86,7 +86,7 @@ class Config(BaseModel):
 
 # %%
 
-DATA = Path("/fast2/fishtools/data")
+DATA = Path("/home/chaichontat/fishtools/data")
 
 
 # %%

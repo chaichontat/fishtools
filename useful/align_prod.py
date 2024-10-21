@@ -116,7 +116,10 @@ def scale(img: ImageStack, scale: np.ndarray[np.float32, Any]):
 def load_codebook(path: Path, exclude: set[str] | None = None):
     cb_json: dict[str, list[int]] = json.loads(path.read_text())
     for k in exclude or set():
-        cb_json.pop(k)
+        try:
+            cb_json.pop(k)
+        except KeyError:
+            logger.warning(f"Codebook does not contain {k}")
 
     used_bits = sorted(set(chain.from_iterable(cb_json.values())))
 
@@ -159,8 +162,8 @@ def cli(): ...
 # img /= scale_factors
 
 
-def _batch(paths: list[Path], mode: str, args: list[str]):
-    with progress_bar(len(paths)) as callback, ThreadPoolExecutor(13) as exc:
+def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13):
+    with progress_bar(len(paths)) as callback, ThreadPoolExecutor(threads) as exc:
         futs = []
         for path in paths:
             futs.append(
@@ -179,27 +182,46 @@ def _batch(paths: list[Path], mode: str, args: list[str]):
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--round", "round_num", type=int)
+@click.option(
+    "--codebook",
+    "codebook_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
 @click.option("--batch-size", "-n", type=int, default=100)
-def optimize(path: Path, round_num: int, batch_size: int = 100):
+def optimize(path: Path, round_num: int, codebook_path: Path, batch_size: int = 100):
     paths = list(path.glob("reg*.tif"))
     rand = np.random.default_rng(0)
     selected = [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
 
     return _batch(
         selected,
-        "optimize",
-        ["--calc-deviations", "--global-scale", str(path / "global_scale.txt"), f"--round={round_num}"],
+        "run",
+        [
+            "--calc-deviations",
+            "--global-scale",
+            str(path / codebook_path.stem / "global_scale.txt"),
+            "--codebook",
+            codebook_path.as_posix(),
+            f"--round={round_num}",
+        ],
     )
 
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
-def batch(path: Path, global_scale: Path):
+@click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, exists=True, path_type=Path))
+@click.option(
+    "--codebook",
+    "codebook_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
+@click.option("--threads", "-t", type=int, default=13)
+def batch(path: Path, global_scale: Path, codebook_path: Path, threads: int = 13):
     return _batch(
         sorted(path.glob("reg*.tif")),
         "run",
-        ["--global-scale", global_scale.as_posix()],
+        ["--global-scale", global_scale.as_posix(), "--codebook", codebook_path.as_posix()],
+        threads=threads,
     )
 
 
@@ -209,11 +231,15 @@ def load_2d(path: Path | str, *args, **kwargs):
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.option(
+    "--codebook",
+    "codebook_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
 @click.option("--round", "round_num", type=int)
-def combine(path: Path, round_num: int):
+def combine(path: Path, codebook_path: Path, round_num: int):
     # name = f"decode_{round_num:02d}.csv"
-
-    paths = list(path.glob("reg*.json"))
+    paths = list((path / codebook_path.stem).glob("reg*.json"))
     curr = []
     n = 0
     for p in paths:
@@ -229,7 +255,7 @@ def combine(path: Path, round_num: int):
     curr = np.array(curr)
     # pl.DataFrame(curr).write_csv(path / name)
 
-    global_scale_file = path / "global_scale.txt"
+    global_scale_file = path / codebook_path.stem / "global_scale.txt"
     if round_num == 0:
         curr = np.nanmean(np.array(curr), axis=0, keepdims=True)
         np.savetxt(global_scale_file, curr)
@@ -251,7 +277,7 @@ def combine(path: Path, round_num: int):
             [np.atleast_2d(previous[:round_num]), np.atleast_2d(previous[round_num - 1] / deviation)], axis=0
         ),
     )
-    (path / "mae.txt").open("a").write(f"{round_num:02d}\t{mae:04f}\n")
+    (path / codebook_path.stem / "mse.txt").open("a").write(f"{round_num:02d}\t{mae:04f}\n")
 
 
 def initial(img: ImageStack):
@@ -309,9 +335,15 @@ def append_json(
 @click.option("--round", "round_num", type=int, default=None)
 @click.option("--calc-deviations", is_flag=True)
 @click.option("--debug", is_flag=True)
+@click.option(
+    "--codebook",
+    "codebook_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
 def run(
     path: Path,
     global_scale: Path | None,
+    codebook_path: Path,
     round_num: int | None = None,
     overwrite: bool = False,
     debug: bool = False,
@@ -324,17 +356,16 @@ def run(
     if calc_deviations and round_num is None:
         raise ValueError("Round must be provided for calculating deviations.")
 
-    path_pickle = (
-        path.with_name(f"{path.stem}_{round_num:02d}.pkl") if calc_deviations else path.with_suffix(".pkl")
+    (path_out := path.parent / codebook_path.stem).mkdir(exist_ok=True)
+    path_pickle = path_out / (
+        f"{path.stem}_opt{round_num:02d}.pkl" if calc_deviations else f"{path.stem}.pkl"
     )
     if path_pickle.exists() and not overwrite:
         logger.info(f"Skipping {path.name}. Already exists.")
         return
 
     logger.info(f"Reading {path.name}.")
-    codebook, used_bits, names, arr_zeroblank = load_codebook(
-        Path.home() / "fishtools/starwork3/ordered/genestar.json", exclude={"Malat1-201"}
-    )
+    codebook, used_bits, names, arr_zeroblank = load_codebook(codebook_path, exclude={"Malat1-201"})
     used_bits = list(map(str, used_bits))
 
     # if not path.with_suffix(".highpassed.tif").exists():
@@ -354,7 +385,7 @@ def run(
     ghp = Filter.GaussianHighPass(sigma=8, is_volume=False, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
     imgs: ImageStack = ghp.run(stack)
 
-    path_out = path.with_suffix(".json")
+    path_out = (path_out) / f"{path.stem}.json"
 
     if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
