@@ -262,13 +262,25 @@ class Image:
         )
 
     def scale_deconv(self, img: np.ndarray, idx: int):
+        """Scale back deconvolved image using global scaling.
+
+        Args:
+            img: Original image, e.g. 1_9_17
+            idx: Channel index in original image e.g. 0, 1, 2, ...
+        """
         m_ = self.deconv_scaling[0, idx]
         s_ = self.deconv_scaling[1, idx]
-        return np.clip(
-            (img * (s_ / self.metadata["deconv_scale"])[0] + (s_ * (self.metadata["deconv_min"] - m_))[0]),
-            0,
-            65535,
-        )
+
+        # Same as:
+        # scaled = s_ * ((img / self.metadata["deconv_scale"][idx] + self.metadata["deconv_min"][idx]) - m_)
+        scale_factor = s_ / self.metadata["deconv_scale"][idx]
+        offset = s_ * (self.metadata["deconv_min"][idx] - m_)
+        scaled = scale_factor * img + offset
+
+        logger.debug(f"Deconvolution scaling: {scale_factor}")
+        if scaled.max() > 65535:
+            logger.warning(f"Scaled image {self.name} has max > 65535.")
+        return scaled
 
     @staticmethod
     def loG_fids(fid: np.ndarray):
@@ -350,7 +362,7 @@ def run(
     crop, downsample = config.registration.crop, config.registration.downsample
     tifffile.imwrite(
         fid_path / f"fids-{idx:04d}.tif",
-        fids[reference][crop:-crop:downsample, crop:-crop:downsample],
+        fids[reference][crop:-crop, crop:-crop],
         compression=22610,
         compressionargs={"level": 0.65},
         metadata={"axes": "YX"},
@@ -415,7 +427,6 @@ def run(
         slices: list[tuple[int | None, int | None]],
     ) -> np.ndarray:
         return np.stack([img[slice(*sl)].max(axis=0) for sl in slices])
-        # return img.reshape(-1, 4, *img.shape[1:]).max(axis=1)
 
     transformed: dict[str, np.ndarray] = {}
     n_z = -1
@@ -430,7 +441,8 @@ def run(
         n_z = img.shape[0]
         # Deconvolution scaling
         orig_name, orig_idx = bit_name_mapping[bit]
-        # img = imgs[orig_name].scale_deconv(img, orig_idx)
+
+        img = imgs[orig_name].scale_deconv(img, orig_idx)
 
         # Illumination correction
         if config.basic_template:
@@ -497,7 +509,6 @@ def run(
 @click.option("--threshold", type=float, default=2.0)
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--overwrite", is_flag=True)
-@click.option("--ignore", type=str)
 def main(
     path: Path,
     idx: int,
@@ -505,12 +516,21 @@ def main(
     roi: str,
     debug: bool = False,
     overwrite: bool = False,
-    threshold: float = 2,
+    threshold: float = 6,
     fwhm: float = 4,
-    downsample: int = 1,
-    crop: int = 30,
-    ignore: str | None = None,
 ):
+    """Preprocess image sets before spot calling.
+
+    Args:
+        path: Workspace path.
+        idx: Index of the image to process.
+        reference: Reference round to use for registration.
+        roi: ROI to work on.
+        debug: More logs and write fids. Defaults to False.
+        overwrite: Defaults to False.
+        threshold: σ above median to call fiducial spots. Defaults to 6.
+        fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
+    """
     logger_format = (
         "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
         "<level>{level: <8}</level> | "
@@ -557,7 +577,7 @@ def main(
                 ),
                 downsample=1,
                 crop=30,
-                slices=[(i, i + 5) for i in range(0, 55, 5)],
+                slices=[(i, i + 3) for i in range(0, 55, 3)],
                 reduce_bit_depth=0,
             ),
         ),

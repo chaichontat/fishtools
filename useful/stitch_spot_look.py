@@ -18,7 +18,8 @@ from tifffile import imread
 
 from fishtools.analysis.tileconfig import TileConfiguration
 
-spots = pl.read_parquet("/mnt/working/e155trcdeconv/registered--right/genestar/spots.parquet")
+path = Path("/mnt/working/e155trcdeconv/registered--right/")
+spots = pl.read_parquet(path / "genestar/spots.parquet")
 sns.set_theme()
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 ax.scatter(spots["x"][::50], spots["y"][::50], s=0.5, alpha=0.3)
@@ -65,5 +66,21 @@ for i, (ax, bit) in enumerate(zip(axs, bits)):
     ax.set_title(f"{bit}")
     ax.hexbin(filtered["x_local"], filtered["y_local"], gridsize=150)
 plt.tight_layout()
+
+# %%
+
+coords = TileConfiguration.from_file(
+    # Path(path.parent / f"fids--{roi}" / "TileConfiguration.registered.txt")
+    Path(path / "stitch" / "TileConfiguration.registered.txt")
+).df
+
+
+fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
+filtered = joined.filter(pl.col("bits").list.contains(1))
+ax.axis("off")
+ax.set_aspect("equal")
+ax.scatter(filtered["x"][::10], filtered["y"][::10], s=0.3, alpha=0.1)
+for c in coords.iter_rows(named=True):
+    ax.text(c["x"] + 1788 / 2, c["y"] + 1788 / 2, c["index"], fontsize=6)
 
 # %%

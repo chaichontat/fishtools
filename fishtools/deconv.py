@@ -1,6 +1,8 @@
 # %%
 
 import json
+import logging
+import pickle
 import queue
 import threading
 from pathlib import Path
@@ -18,6 +20,11 @@ from scipy.stats import multivariate_normal
 from tifffile import TiffFile, imread
 
 from fishtools.utils.pretty_print import progress_bar
+
+logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
+import jax
+
+jax.config.update("jax_platform_name", "cpu")
 
 
 def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32) -> npt.NDArray:
@@ -211,69 +218,34 @@ def make_projector(path: Path | str, *, step: int = 10, max_z: int = 7, size: in
 
 
 def rescale(img: cp.ndarray, scale: float):
+    """Scale from float32 to uint16.
+
+    In order to store as much of the dynamic range as possible,
+    while keeping JPEG-XR compression.
+    """
     return ((img - img.min()) * scale).get().astype(np.uint16)
 
 
 # %%
 DATA = Path("/home/chaichontat/fishtools/data")
-make_projector(Path(DATA / "PSF GL.tif"), step=10, max_z=9)
+make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=9)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
-
-# %%
-# def run():
-# img = (
-#     imread(path := Path("/fast2/brainclean/1_9_17/1_9_17-0123.tif"))[:-1]
-#     .reshape(-1, 3, 2048, 2048)
-#     .astype(np.float32)
-# )
-# %%
-
-# def run():
-#     while True:
-#         start, img, fid = q_img.get()
-#         logger.info(f"Processing {start.name}")
-#         res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors, iters=1)
-
-#         if normalize:
-#             towrite = cp.clip((res - mins) * scale, 0, 65535).astype(np.uint16).get().reshape(-1, 2048, 2048)
-#             q_write.put((start, towrite, fid))
-#         else:
-#             towrite = res.get()
-#             q_write.put((start, towrite, None))
-
-#         q_img.task_done()
-#         if q_img.empty():
-#             break
-
-
-# with ThreadPoolExecutor(2) as executor:
-#     futs = [executor.submit(run) for i in range(2)]
-#     [fut.result() for fut in futs]
-
-
-# %%
-
-
-# %%
-
-# import matplotlib.pyplot as plt
-# import seaborn as sns
-# %%
-# imgs = [imread(f) for f in out.glob("deconv*.tif")]
-# # %%
-# i = 1
 
 
 @click.group()
 def main(): ...
 
 
-@main.command()
-@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
-@click.option("--perc_min", type=float, default=10, help="Percentile of the min")
-@click.option("--perc_scale", type=float, default=5, help="Percentile of the scale")
-def compute_range(path: Path, perc_min: float = 10, perc_scale: float = 5):
-    """Find the min and scale of the deconvolution for all files in a directory."""
+def _compute_range(path: Path, perc_min: float = 99.9, perc_scale: float = 1):
+    """
+    Find the min and scale of the deconvolution for all files in a directory.
+    The reverse scaling equation is:
+                 s_global
+        scaled = -------- * img + s_global * (min - m_global)
+                  scale
+    Hence we want scale_global to be as low as possible
+    and min_global to be as high as possible.
+    """
     files = sorted(path.glob("*.tif"))
     n_c = len(path.resolve().stem.split("_"))
     n = len(files)
@@ -283,13 +255,10 @@ def compute_range(path: Path, perc_min: float = 10, perc_scale: float = 5):
     logger.info(f"Found {n} files")
     with progress_bar(len(files)) as pbar:
         for i, f in enumerate(files):
-            try:
-                with TiffFile(f) as tif:
-                    assert tif.shaped_metadata
-                    deconv_min[i, :] = tif.shaped_metadata[0]["deconv_min"]
-                    deconv_scale[i, :] = tif.shaped_metadata[0]["deconv_scale"]
-            except Exception as e:
-                logger.error(f"Error reading {f}: {e}")
+            with TiffFile(f) as tif:
+                assert tif.shaped_metadata
+                deconv_min[i, :] = tif.shaped_metadata[0]["deconv_min"]
+                deconv_scale[i, :] = tif.shaped_metadata[0]["deconv_scale"]
             pbar()
 
     logger.info("Calculating percentiles")
@@ -300,10 +269,33 @@ def compute_range(path: Path, perc_min: float = 10, perc_scale: float = 5):
     logger.info(f"Saved to {path / 'deconv_scaling.txt'}")
 
 
+@main.command()
+@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
+@click.option("--perc_min", type=float, default=99.9, help="Percentile of the min")
+@click.option("--perc_scale", type=float, default=1, help="Percentile of the scale")
+@click.option("--overwrite", is_flag=True)
+def compute_range(path: Path, perc_min: float = 99.9, perc_scale: float = 1, overwrite: bool = False):
+    """
+    Find the scaling factors of all images in the children sub-folder of `path`.
+    Run this on the entire workspace. See `_compute_range` for more details.
+    """
+    paths = {p.parent for p in path.rglob("*.tif")}
+    for path in paths:
+        if not overwrite and (path / "deconv_scaling.txt").exists():
+            continue
+        try:
+            logger.info(f"Processing {path}")
+            _compute_range(path, perc_min, perc_scale)
+        except Exception as e:
+            ...
+
+
 # @main.command()
 # @click.argument("path", type=click.Path(path_type=Path))
 # @click.argument("name", type=str)
 # def initital
+
+channels = [560, 650, 750]
 
 
 @main.command()
@@ -313,6 +305,20 @@ def compute_range(path: Path, perc_min: float = 10, perc_scale: float = 5):
 @click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
 def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite: bool):
+    """GPU-accelerated very accelerated 3D deconvolution.
+
+    Separate read and write threadsin order to have an image ready for the GPU at all times.
+    Outputs in `path/analysis/deconv`.
+
+    Args:
+        path: Path to the workspace.
+        name: Name of the round to deconvolve. E.g. 1_9_17.
+        ref: Path of folder that have the same image indices as those we want to deconvolve.
+            Used when skipping blank areas in round >1.
+            We don't want to deconvolve the blanks in round 1.
+        limit: Limit the total number of images to deconvolve. Mainly for debugging.
+        overwrite: Overwrite existing deconvolved images.
+    """
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
 
@@ -334,22 +340,24 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
 
     if not overwrite:
         files = [f for f in files if not (out / f.parent.name / f.name).exists()]
-        logger.info(f"Not overwriting. Remaining: {len(files)} files.")
+        logger.info(f"Not overwriting. 2: {len(files)} files.")
 
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
 
+    basic = {c: pickle.loads((path / f"basic_{c}.pkl").read_bytes()) for c in channels}
+
     def f_read(files: list[Path]):
         logger.info("Read thread started.")
-        # for start in range(0, len(files), 3):
-        #     imgs = [imread(file) for file in files[start : start + 3]]
-        #     fid = [img[[-1]] for img in imgs]
-        #     imgs = np.stack([img[:-1].reshape(-1, 3, 2048, 2048) for img in imgs], axis=0)
-        #     q_img.put((start, imgs.astype(np.float16), fid))
         for file in files:
+            if file.name.startswith("fid"):
+                continue
             logger.debug(f"Reading {file.name}")
             img = imread(file)
             fid = img[[-1]]
+            if img.reshape(-1, 2048, 2048).shape[0] < 2:
+                logger.warning(f"Image {file.name} has only 1 channel. Skipping.")
+                continue
             nofid = img[:-1].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
             with tifffile.TiffFile(file) as tif:
                 try:
@@ -358,6 +366,10 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
                     metadata = tif.imagej_metadata or {}
 
             logger.debug(f"Finished reading {file.name}")
+            for i, c in enumerate(channels):
+                if i < nofid.shape[1]:
+                    nofid[:, i] = basic[c].transform(np.array(nofid[:, i]))
+
             q_img.put((file, nofid, fid, metadata))
 
     def f_write():
