@@ -7,9 +7,9 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import reduce
-from itertools import chain
+from itertools import chain, groupby
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -20,7 +20,7 @@ import starfish
 import starfish.data
 import xarray as xr
 from loguru import logger
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, TypeAdapter, field_validator
 from skimage.filters import gaussian
 from starfish import Codebook, ImageStack, IntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
@@ -175,6 +175,12 @@ def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13):
             callback()
 
 
+def sample_imgs(path: Path, round_num: int, *, batch_size: int = 50):
+    rand = np.random.default_rng(round_num)
+    paths = sorted(path.glob("registered--*/reg*.tif"))
+    return [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--round", "round_num", type=int)
@@ -185,10 +191,19 @@ def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13):
 )
 @click.option("--batch-size", "-n", type=int, default=100)
 @click.option("--threads", "-t", type=int, default=8)
-def optimize(path: Path, round_num: int, codebook_path: Path, batch_size: int = 100, threads: int = 8):
-    paths = list(path.glob("reg*.tif"))
-    rand = np.random.default_rng(0)
-    selected = [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
+@click.option("--overwrite", is_flag=True)
+def optimize(
+    path: Path,
+    round_num: int,
+    codebook_path: Path,
+    batch_size: int = 100,
+    threads: int = 8,
+    overwrite: bool = False,
+):
+    selected = sample_imgs(path, round_num, batch_size=batch_size)
+
+    group_counts = {key: len(list(group)) for key, group in groupby(selected, key=lambda x: x.parent.name)}
+    logger.info(f"Group counts: {json.dumps(group_counts, indent=2)}")
 
     # Copy codebook to the same folder as the images for reproducibility.
     (path / codebook_path.stem).mkdir(exist_ok=True)
@@ -201,10 +216,11 @@ def optimize(path: Path, round_num: int, codebook_path: Path, batch_size: int = 
         [
             "--calc-deviations",
             "--global-scale",
-            str(path / codebook_path.stem / "global_scale.txt"),
+            str(path / f"opt_{codebook_path.stem}" / "global_scale.txt"),
             "--codebook",
             codebook_path.as_posix(),
             f"--round={round_num}",
+            "--overwrite" if overwrite else "",
         ],
         threads=threads,
     )
@@ -239,6 +255,38 @@ def load_2d(path: Path | str, *args, **kwargs):
     return np.atleast_2d(np.loadtxt(path, *args, **kwargs))
 
 
+def create_opt_path(
+    *,
+    codebook_path: Path,
+    mode: Literal["json", "pkl", "folder"],
+    round_num: int | None = None,
+    path_img: Path | None = None,
+    path_folder: Path | None = None,
+):
+    if not ((path_img is None) ^ (path_folder is None)):
+        raise ValueError("Must provide only path_img or path_folder")
+
+    if path_img is not None:
+        base = path_img.parent.parent / f"opt_{codebook_path.stem}"
+        name = f"{path_img.stem}--{path_img.parent.name.split('--')[1]}"
+    elif path_folder is not None:
+        base = path_folder / f"opt_{codebook_path.stem}"
+        if mode == "folder":
+            return base
+        raise ValueError("Cannot use path_folder with mode other than folder")
+    else:
+        raise Exception("This should never happen.")
+
+    base.mkdir(exist_ok=True)
+    if mode == "json":
+        return base / f"{name}.json"
+    if mode == "pkl":
+        return base / f"{name}_opt{round_num:02d}.pkl"
+    if mode == "folder":
+        return base
+    raise ValueError(f"Unknown mode {mode}")
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option(
@@ -268,23 +316,33 @@ def combine(path: Path, codebook_path: Path, round_num: int):
         codebook_path
         round_num: starts from 0.
     """
-    paths = list((path / codebook_path.stem).glob("reg*.json"))
+    selected = sample_imgs(path, round_num, batch_size=50)
+    path_opt = create_opt_path(
+        path_folder=path, codebook_path=codebook_path, mode="folder", round_num=round_num
+    )
+    paths = [
+        create_opt_path(path_img=p, codebook_path=codebook_path, mode="json", round_num=round_num)
+        for p in selected
+    ]
+
+    # paths = list((path / codebook_path.stem).glob("reg*.json"))
     curr = []
     n = 0
     for p in paths:
         sf = Deviations.validate_json(p.read_text())
-        if (round_num + 1) > len(sf):
-            raise ValueError(f"Round number {round_num} exceeds what's available ({len(sf)}).")
+        # if (round_num + 1) > len(sf):
+        #     raise ValueError(f"Round number {round_num} exceeds what's available ({len(sf)}).")
 
         if round_num == 0:
-            curr.append(sf[round_num].initial_scale)
+            curr.append([cast(InitialScale, s).initial_scale for s in sf if s.round_num == round_num][0])
         else:
-            curr.append(np.array(sf[round_num].deviation) * sf[round_num].n)
-            n += sf[round_num].n
+            want = cast(Deviation, [s for s in sf if s.round_num == round_num][0])
+            curr.append(np.array(want.deviation) * want.n)
+            n += want.n
     curr = np.array(curr)
     # pl.DataFrame(curr).write_csv(path / name)
 
-    global_scale_file = path / codebook_path.stem / "global_scale.txt"
+    global_scale_file = path_opt / "global_scale.txt"
     if round_num == 0:
         curr = np.nanmean(np.array(curr), axis=0, keepdims=True)
         np.savetxt(global_scale_file, curr)
@@ -296,17 +354,24 @@ def combine(path: Path, codebook_path: Path, round_num: int):
     deviation = curr.sum(axis=0) / n
     # Normalize per channel
     deviation = deviation / np.nanmean(deviation)
-    mae = np.mean(np.absolute(deviation - 1))
-    logger.info(f"Round {round_num}. MAE: {mae:04f}.")
+    cv = np.sqrt(np.mean(np.square(deviation - 1)))
+    logger.info(f"Round {round_num}. CV: {cv:04f}.")
 
-    previous = load_2d(global_scale_file)
+    previouses = load_2d(global_scale_file)
+    old = previouses[round_num - 1]
+    new = old / deviation
+    # if round_num > 1:
+    #     grad = new - old
+    #     β = 0.1
+    #     velocity = old - previouses[round_num - 2]
+    #     velocity = β * velocity + (1 - β) * grad
+    #     new = old + velocity
+
     np.savetxt(
         global_scale_file,
-        np.concatenate(
-            [np.atleast_2d(previous[:round_num]), np.atleast_2d(previous[round_num - 1] / deviation)], axis=0
-        ),
+        np.concatenate([np.atleast_2d(previouses[:round_num]), np.atleast_2d(new)], axis=0),
     )
-    (path / codebook_path.stem / "mse.txt").open("a").write(f"{round_num:02d}\t{mae:04f}\n")
+    (path_opt / "mse.txt").open("a").write(f"{round_num:02d}\t{cv:04f}\n")
 
 
 def initial(img: ImageStack):
@@ -325,10 +390,27 @@ def initial(img: ImageStack):
 class Deviation(BaseModel):
     n: int
     deviation: list[float]
+    percent_blanks: float | None = None
+    round_num: int
+
+    @field_validator("round_num")
+    @classmethod
+    def must_be_positive(cls, v: int) -> int:
+        if v > 0:
+            return v
+        raise ValueError("Round number must be positive for Deviation.")
 
 
 class InitialScale(BaseModel):
     initial_scale: list[float]
+    round_num: int
+
+    @field_validator("round_num")
+    @classmethod
+    def must_be_zero(cls, v: int) -> int:
+        if v == 0:
+            return v
+        raise ValueError("Round number must be zero for InitialScale.")
 
 
 Deviations = TypeAdapter(list[InitialScale | Deviation])
@@ -341,21 +423,24 @@ def append_json(
     n: int | None = None,
     deviation: np.ndarray | None = None,
     initial_scale: np.ndarray | None = None,
+    percent_blanks: float | None = None,
 ):
     existing = Deviations.validate_json(path.read_text()) if path.exists() else Deviations.validate_json("[]")
     if initial_scale is not None:
         if round_num > 0:
             raise ValueError("Cannot set initial scale for round > 0")
-        existing.append(InitialScale(initial_scale=initial_scale.tolist()))
+        existing.append(InitialScale(initial_scale=initial_scale.tolist(), round_num=round_num))
 
     elif deviation is not None and n is not None:
         if round_num == 0:
             raise ValueError("Cannot set deviation for round 0")
-        if existing.__len__() < round_num - 1:
-            raise ValueError("Round number exceeds number of existing rounds.")
+        # if existing.__len__() < round_num - 1:
+        # raise ValueError("Round number exceeds number of existing rounds.")
 
-        existing = existing[:round_num]
-        existing.append(Deviation(n=n, deviation=deviation.tolist()))
+        existing = [e for e in existing if e.round_num < round_num]
+        existing.append(
+            Deviation(n=n, deviation=deviation.tolist(), round_num=round_num, percent_blanks=percent_blanks)
+        )
     else:
         raise ValueError("Must provide either initial_scale or deviation and n.")
 
@@ -405,15 +490,20 @@ def run(
     if calc_deviations and round_num is None:
         raise ValueError("Round must be provided for calculating deviations.")
 
-    (path_out := path.parent / codebook_path.stem).mkdir(exist_ok=True)
-    path_pickle = path_out / (
-        f"{path.stem}_opt{round_num:02d}.pkl" if calc_deviations else f"{path.stem}.pkl"
-    )
+    if calc_deviations:
+        path_pickle = create_opt_path(
+            path_img=path, codebook_path=codebook_path, mode="pkl", round_num=round_num
+        )
+
+    else:
+        (_path_out := path.parent / codebook_path.stem).mkdir(exist_ok=True)
+        path_pickle = _path_out / f"{path.stem}.pkl"
+
     if path_pickle.exists() and not overwrite:
         logger.info(f"Skipping {path.name}. Already exists.")
         return
 
-    logger.info(f"Reading {path.name}.")
+    logger.info(f"Reading {path.parent.name}/{path.name}.")
     codebook, used_bits, names, arr_zeroblank = load_codebook(codebook_path, exclude={"Malat1-201"})
     used_bits = list(map(str, used_bits))
 
@@ -427,20 +517,23 @@ def run(
     # blurred = levels(blurred)  # clip negative values to 0.
     # filtered = image - blurred
 
-    stack = make_fetcher(path, np.s_[:, [bit_mapping[k] for k in used_bits]])
+    # Subsample when optimizing.
+    stack = make_fetcher(
+        path,
+        np.s_[slice(None, None, 3) if calc_deviations else slice(None), [bit_mapping[k] for k in used_bits]],
+    )
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
     # But it's there as a reference.
     ghp = Filter.GaussianHighPass(sigma=8, is_volume=False, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
     imgs: ImageStack = ghp.run(stack)
 
-    path_out = (path_out) / f"{path.stem}.json"
-
+    path_json = create_opt_path(path_img=path, codebook_path=codebook_path, mode="json", round_num=round_num)
     if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
-        path_out.write_bytes(
+        path_json.write_bytes(
             Deviations.dump_json(
-                Deviations.validate_python([{"initial_scale": (1 / initial(imgs)).tolist()}])
+                Deviations.validate_python([{"initial_scale": (1 / initial(imgs)).tolist(), "round_num": 0}])
             )
         )
         return
@@ -487,19 +580,22 @@ def run(
         return_counts=True,
     )
     gc = dict(zip(genes, counts))
-    percent = sum([v for k, v in gc.items() if k.startswith("Blank")]) / counts.sum()
-    logger.debug(f"{percent} blank, Total: {counts.sum()}")
+    percent_blanks = sum([v for k, v in gc.items() if k.startswith("Blank")]) / counts.sum()
+    logger.debug(f"{percent_blanks} blank, Total: {counts.sum()}")
 
     # Deviations
     if calc_deviations and round_num is not None:
+        # Round num already checked above.
         names_l = {n: i for i, n in enumerate(names)}
         idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
 
         deviations = np.nanmean(spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0)
-        logger.debug(f"Deviations: {deviations}")
+        logger.debug(f"Deviations: {np.round(deviations / np.nanmean(deviations), 4)}")
 
         """Concatenate with previous rounds. Will overwrite rounds beyond the current one."""
-        append_json(path_out, round_num, deviation=deviations, n=len(spot_intensities))
+        append_json(
+            path_json, round_num, deviation=deviations, n=len(spot_intensities), percent_blanks=percent_blanks
+        )
 
     morph = [
         {"area": prop.area, "centroid": prop.centroid}

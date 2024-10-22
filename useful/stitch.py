@@ -218,7 +218,7 @@ def register(
         out_path = path
 
     del path
-    if recreate or not (out_path / "TileConfiguration.registered.txt").exists():
+    if overwrite or not (out_path / "TileConfiguration.registered.txt").exists():
         files = sorted(out_path.glob("*.tif"))
         files_idx = [int(file.stem.split("-")[-1]) for file in files]
         tileconfig = TileConfiguration.from_pos(

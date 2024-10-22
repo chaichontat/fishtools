@@ -19,16 +19,16 @@ from fishtools.analysis.tileconfig import TileConfiguration
 
 sns.set_theme()
 codebook = "genestar"
-roi = "right"
+roi = "left"
 # registered--{roi}
 path = Path(f"/mnt/working/e155trcdeconv/registered--{roi}")
 files = sorted(file for file in Path(path / codebook).glob("*.pkl") if "opt" not in file.stem)
 
 coords = TileConfiguration.from_file(
-    # Path(path.parent / f"fids--{roi}" / "TileConfiguration.registered.txt")
-    Path(path / "stitch" / "TileConfiguration.registered.txt")
+    Path(path.parent / f"fids--{roi}" / "TileConfiguration.registered.txt")
+    # Path(path / "stitch" / "TileConfiguration.registered.txt")
 ).df
-assert len(files) == len(coords)
+# assert len(files) == len(coords)
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 sns.scatterplot(x="x", y="y", data=coords.to_pandas(), ax=ax, s=10, alpha=0.9)
@@ -100,10 +100,8 @@ crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 
 # %%
 
-out = []
 
-
-def process(curr: int, filter_: bool = True):
+def process(out: list, curr: int, filter_: bool = True):
     this_cross = {j: intersection(cells[curr], cells[j]) for j in crosses[curr] if j > curr}
     df = load(curr, filter_=filter_)
 
@@ -142,11 +140,9 @@ def process(curr: int, filter_: bool = True):
     out.append(filtered_df)
 
 
-# process(0, filter_=False)
-
-# %%
 with ThreadPoolExecutor(8) as exc:
-    futs = [exc.submit(process, i, filter_=True) for i in range(len(cells[:]))]
+    out = []
+    futs = [exc.submit(process, out, i, filter_=True) for i in range(len(cells[:]))]
     for fut in futs:
         fut.result()
 # for curr in range(len(cells[:20])):
@@ -155,21 +151,20 @@ with ThreadPoolExecutor(8) as exc:
 # del thrownover[curr]
 # %%
 spots = pl.concat(out)
-# %%
 spots.write_parquet(path / codebook / "spots.parquet")
 
 # %%
 fig, axs = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 
 # ax.set_aspect("equal")
-downsample = 1000
+downsample = 100
 axs.scatter(spots["x"][::downsample], spots["y"][::downsample], s=0.5, alpha=0.3)
 axs.set_aspect("equal")
 
 # %%
 fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
-selected = spots.filter(pl.col("target") == "Gpm6a-201")
-ax.scatter(selected["x"], selected["y"], s=0.5, alpha=0.4)
+selected = spots.filter(pl.col("target") == "Eomes-201")
+ax.scatter(selected["x"], selected["y"], s=0.2, alpha=0.4)
 # spots = pl.read_parquet(path / "genestar" / "spots.parquet")
 # %%
 spots = pl.read_parquet(path / codebook / "spots.parquet")
@@ -195,19 +190,25 @@ plt.tight_layout()
 # %%
 
 # %%
-genes = ["Sox9-201", "Neurod1-201", "Neurog2-201", "Bcl11b-203", "Gad2-201", "Sst-201"]
-fig, axs = plt.subplots(ncols=3, nrows=2, figsize=(12, 8), dpi=200)
+if codebook == "tricycleplus":
+    genes = ["Ccnd3", "Mcm5", "Top2a", "Pou3f2", "Cenpa", "Hell"]
+else:
+    genes = ["Sox9", "Pax6", "Eomes", "Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2"]
+fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
 axs = axs.flatten()
 for ax, gene in zip(axs, genes):
-    selected = spots.filter(pl.col("target") == gene)
+    selected = spots.filter(pl.col("target").str.starts_with(gene))
+    if not len(selected):
+        raise ValueError(f"No spots found for {gene}")
     ax.set_aspect("equal")
-    ax.set_title(gene, fontsize=16)
-    ax.hexbin(selected["y"], -selected["x"], gridsize=250)
-
+    ax.set_title(gene, fontsize=16, color="white")
+    ax.hexbin(selected["x"], selected["y"], gridsize=250)
+    # ax.scatter(selected["y"], -selected["x"], s=5000 / len(selected), alpha=0.2)
     ax.axis("off")
 # %%
 genes = pergene["target"]
-fig, axs = plt.subplots(ncols=8, nrows=16, figsize=(32, 32), dpi=100, facecolor="black")
+dark = False
+fig, axs = plt.subplots(ncols=8, nrows=16, figsize=(32, 32), dpi=100, facecolor="black" if dark else "white")
 axs = axs.flatten()
 for ax, gene in zip(axs, genes):
     selected = spots.filter(pl.col("target") == gene)
@@ -215,10 +216,12 @@ for ax, gene in zip(axs, genes):
         logger.warning(f"No spots found for {gene}")
         continue
     ax.set_aspect("equal")
-    ax.set_title(gene, fontsize=16, color="white")
+    ax.set_title(gene, fontsize=16, color="white" if dark else "black")
     ax.axis("off")
-    ax.hexbin(selected["y"], -selected["x"], gridsize=250)
-    # ax.scatter(selected["y"], -selected["x"], s=5000 / len(selected), alpha=0.2)
+    if dark:
+        ax.hexbin(selected["x"], selected["y"], gridsize=250)
+    else:
+        ax.scatter(selected["x"], selected["y"], s=1000 / len(selected), alpha=0.2)
 
 
 # %%

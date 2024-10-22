@@ -21,6 +21,7 @@ from tifffile import TiffFile
 
 from fishtools import align_fiducials
 from fishtools.analysis.chromatic import Affine
+from fishtools.preprocess.deconv import scale_deconv
 
 logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
 import jax
@@ -189,7 +190,8 @@ class Image:
     bits: list[str]
     powers: dict[str, float]
     metadata: dict[str, Any]
-    deconv_scaling: np.ndarray
+    global_deconv_scaling: np.ndarray
+    basic: dict[str, BaSiC] | None
 
     CHANNELS = [f"ilm{n}" for n in ["405", "488", "560", "650", "750"]]
 
@@ -225,14 +227,16 @@ class Image:
             raise ValueError(f"{path}: Expected {len(bits)} channels, got {len(powers)}")
 
         try:
-            deconv_scaling = (
-                np.loadtxt(next(path.parent.glob("deconv_scaling.txt"))).astype(np.float32).reshape((2, -1))
+            global_deconv_scaling = (
+                np.loadtxt((path.parent.parent / "deconv_scaling" / f"{name}.txt"))
+                .astype(np.float32)
+                .reshape((2, -1))
             )
-        except StopIteration:
+        except FileNotFoundError:
             if "deconv" in path.as_posix():
                 raise ValueError("No deconv_scaling found.")
             logger.debug("No deconv_scaling found. Using ones.")
-            deconv_scaling = np.ones((2, len(bits)))
+            global_deconv_scaling = np.ones((2, len(bits)))
 
         nofid = img[:-1].reshape(-1, len(powers), 2048, 2048)
 
@@ -246,8 +250,16 @@ class Image:
             keeps = list(sorted(set(range(len(bits))) - set(to_discard_idxs)))
             nofid = nofid[:, keeps]
             bits = [bits[i] for i in keeps]
-            deconv_scaling = deconv_scaling[:, keeps]
+            global_deconv_scaling = global_deconv_scaling[:, keeps]
             assert len(_bits) == nofid.shape[1]
+
+        path_basic = path.parent.parent / "basic" / f"{name}.pkl"
+        if path_basic.exists():
+            basic = pickle.loads(path_basic.read_bytes())
+            basic = dict(zip(bits, basic.values()))
+        else:
+            raise Exception(f"No basic template found at {path_basic}")
+            basic = None
 
         return cls(
             name=name,
@@ -258,29 +270,9 @@ class Image:
             bits=bits,
             powers=powers,
             metadata=metadata,
-            deconv_scaling=deconv_scaling,
+            global_deconv_scaling=global_deconv_scaling,
+            basic=basic,
         )
-
-    def scale_deconv(self, img: np.ndarray, idx: int):
-        """Scale back deconvolved image using global scaling.
-
-        Args:
-            img: Original image, e.g. 1_9_17
-            idx: Channel index in original image e.g. 0, 1, 2, ...
-        """
-        m_ = self.deconv_scaling[0, idx]
-        s_ = self.deconv_scaling[1, idx]
-
-        # Same as:
-        # scaled = s_ * ((img / self.metadata["deconv_scale"][idx] + self.metadata["deconv_min"][idx]) - m_)
-        scale_factor = s_ / self.metadata["deconv_scale"][idx]
-        offset = s_ * (self.metadata["deconv_min"][idx] - m_)
-        scaled = scale_factor * img + offset
-
-        logger.debug(f"Deconvolution scaling: {scale_factor}")
-        if scaled.max() > 65535:
-            logger.warning(f"Scaled image {self.name} has max > 65535.")
-        return scaled
 
     @staticmethod
     def loG_fids(fid: np.ndarray):
@@ -304,18 +296,6 @@ def run(
     if not overwrite and (path / f"registered--{roi}" / f"reg-{idx:04d}.tif").exists():
         logger.info(f"Skipping {idx}")
         return
-
-    if config.basic_template:
-        basic = {
-            channel: pickle.loads(Path(path).read_bytes()) for channel, path in config.basic_template.items()
-        }
-        try:
-            basic = {c: pickle.loads((path / f"basic_{c}.pkl").read_bytes()) for c in ["560", "650", "750"]}
-        except FileNotFoundError:
-            basic = {c: pickle.loads((DATA / f"basic_{c}.pkl").read_bytes()) for c in ["560", "650", "750"]}
-        basic["488"] = basic["560"]
-    else:
-        basic = {}
 
     # print(sorted(Path(path).glob(f"*/*-{idx:04d}.tif")))
     # Convert file name to bit
@@ -441,12 +421,19 @@ def run(
         n_z = img.shape[0]
         # Deconvolution scaling
         orig_name, orig_idx = bit_name_mapping[bit]
-
-        img = imgs[orig_name].scale_deconv(img, orig_idx)
+        img = scale_deconv(
+            img,
+            orig_idx,
+            name=orig_name,
+            global_deconv_scaling=imgs[orig_name].global_deconv_scaling,
+            metadata=imgs[orig_name].metadata,
+        )
 
         # Illumination correction
-        if config.basic_template:
-            img = np.stack(basic.get(c, basic["560"]).transform(np.array(img)))
+        basic = imgs[orig_name].basic
+        if basic is not None:
+            logger.debug("Running BaSiC")
+            img = np.stack(basic[bit].transform(np.array(img)))
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
