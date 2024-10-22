@@ -158,11 +158,6 @@ def load_codebook(path: Path, exclude: set[str] | None = None):
 def cli(): ...
 
 
-# img = imread("/fast2/3t3clean/analysis/deconv/registered/reg-0056.tif").astype(np.float32)[:, :13]
-# scale_factors = np.max(img, axis=(0, 2, 3), keepdims=True)
-# img /= scale_factors
-
-
 def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13):
     with progress_bar(len(paths)) as callback, ThreadPoolExecutor(threads) as exc:
         futs = []
@@ -189,12 +184,16 @@ def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13):
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
 @click.option("--batch-size", "-n", type=int, default=100)
-def optimize(path: Path, round_num: int, codebook_path: Path, batch_size: int = 100):
+@click.option("--threads", "-t", type=int, default=8)
+def optimize(path: Path, round_num: int, codebook_path: Path, batch_size: int = 100, threads: int = 8):
     paths = list(path.glob("reg*.tif"))
     rand = np.random.default_rng(0)
     selected = [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
-    if not (path / codebook_path.stem / codebook_path.name).exists():
-        shutil.copy(codebook_path, path / codebook_path.stem)
+
+    # Copy codebook to the same folder as the images for reproducibility.
+    (path / codebook_path.stem).mkdir(exist_ok=True)
+    if not (new_cb_path := path / codebook_path.stem / codebook_path.name).exists():
+        shutil.copy(codebook_path, new_cb_path)
 
     return _batch(
         selected,
@@ -207,6 +206,7 @@ def optimize(path: Path, round_num: int, codebook_path: Path, batch_size: int = 
             codebook_path.as_posix(),
             f"--round={round_num}",
         ],
+        threads=threads,
     )
 
 
@@ -248,7 +248,26 @@ def load_2d(path: Path | str, *args, **kwargs):
 )
 @click.option("--round", "round_num", type=int)
 def combine(path: Path, codebook_path: Path, round_num: int):
-    # name = f"decode_{round_num:02d}.csv"
+    """Create global scaling factors from `optimize`.
+
+    Part of the channel optimization process.
+    This is to be run after `optimize` has been run.
+
+    Round 0: Average of all scaling factors.
+    Round n:
+        Balance the scaling factors such that each positive spot
+        has about the same intensity in all bit channels.
+        Get deviations from all images during `optimize` and average them.
+        This average deviation is a vector of length n.
+        Divide this vector by its mean to get a scaling factor for each bit channel.
+        This gets applied to the previous round's scaling factors.
+        Also calculates the variance of the deviations to track the convergence.
+
+    Args:
+        path: registered images folder
+        codebook_path
+        round_num: starts from 0.
+    """
     paths = list((path / codebook_path.stem).glob("reg*.json"))
     curr = []
     n = 0
@@ -291,6 +310,11 @@ def combine(path: Path, codebook_path: Path, round_num: int):
 
 
 def initial(img: ImageStack):
+    """
+    Create initial scaling factors.
+    Returns the max intensity of each channel.
+    Seems to work well enough.
+    """
     maxed = img.reduce({Axes.ROUND, Axes.ZPLANE, Axes.Y, Axes.X}, func="max")
     res = np.array(maxed.xarray).squeeze()
     if np.isnan(res).any() or (res == 0).any():
@@ -359,6 +383,21 @@ def run(
     debug: bool = False,
     calc_deviations: bool = False,
 ):
+    """
+    Run spot calling.
+    Used for actual spot calling and channel optimization.
+
+    For channel optimization, start by calling with `--calc-deviations` and `--round=0`.
+    This will get the initial scaling factors for each bit channel (max).
+    Returns the average intensity of all non-blank spots including the total number of spots.
+    These info from multiple images are used to calculate the scaling factors for each bit channel.
+
+    Intermediate files are saved in path / codebook_path.stem since in the current design,
+    different codebooks use different channels.
+
+    For actual spot calling, call with `--global-scale`.
+    This will use the latest scaling factors calculated from the previous step to decode.
+    """
     if debug:
         logger.remove()
         logger.add(sys.stderr, level="INFO")
