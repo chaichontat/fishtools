@@ -6,7 +6,7 @@ import pickle
 import queue
 import threading
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal, cast
 
 import cupy as cp
 import cv2
@@ -14,6 +14,7 @@ import numpy as np
 import numpy.typing as npt
 import rich_click as click
 import tifffile
+from basicpy import BaSiC
 from cupyx.scipy.ndimage import convolve as cconvolve
 from loguru import logger
 from scipy.stats import multivariate_normal
@@ -227,7 +228,7 @@ def rescale(img: cp.ndarray, scale: float):
 
 
 # %%
-DATA = Path("/home/chaichontat/fishtools/data")
+DATA = Path("/fast2/fishtools/data")
 make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=9)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
@@ -323,11 +324,11 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
     out.mkdir(exist_ok=True, parents=True)
 
     bits = name.split("_")
-    files = [f for f in sorted(path.rglob(f"{name}*.tif")) if "analysis/deconv" not in str(f)]
+    files = [f for f in sorted(path.glob(f"{name}*/{name}-*.tif")) if "analysis/deconv" not in str(f)]
     if ref is not None:
         ok_idxs = {
             int(f.stem.split("-")[1])
-            for f in sorted(path.rglob(f"{ref}*.tif"))
+            for f in sorted(path.rglob(f"{ref}*/{ref}-*.tif"))
             if "analysis/deconv" not in str(f)
         }
         logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
@@ -345,7 +346,9 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
 
-    basic = {c: pickle.loads((path / f"basic_{c}.pkl").read_bytes()) for c in channels}
+    basic = cast(
+        dict[Literal[560, 650, 750], BaSiC], pickle.loads((path / "basic" / f"{name}.pkl").read_bytes())
+    )
 
     def f_read(files: list[Path]):
         logger.info("Read thread started.")
@@ -369,7 +372,6 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
             for i, c in enumerate(channels):
                 if i < nofid.shape[1]:
                     nofid[:, i] = basic[c].transform(np.array(nofid[:, i]))
-
             q_img.put((file, nofid, fid, metadata))
 
     def f_write():
@@ -426,6 +428,17 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
     q_write.put(None)
     thread_write.join()
     logger.info("Done.")
+
+
+@main.command()
+@click.argument("path", type=click.Path(path_type=Path))
+@click.option("--ref", type=click.Path(path_type=Path), default=None)
+@click.option("--limit", type=int, default=None)
+@click.option("--overwrite", is_flag=True)
+def batch(path: Path, *, ref: Path | None, limit: int | None, overwrite: bool):
+    rounds = sorted({p.name.split("--")[0] for p in path.iterdir() if "--" in p.name and p.is_dir()})
+    for r in rounds:
+        run.callback(path, name=r, ref=ref, limit=limit, overwrite=overwrite)  # type: ignore
 
 
 if __name__ == "__main__":
