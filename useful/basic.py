@@ -47,26 +47,28 @@ def _run(path: Path, round_: str, plot: bool = True):
         logger.warning(f"Not enough files ({len(files)}). Result may be unreliable.")
 
     n = min(len(files), 500)
-    zs = [10, 20]
-    c = len(round_.split("_"))
+    zs = [10, 40]
+    nc = len(round_.split("_"))
     deconv_meta = np.loadtxt(path / "deconv_scaling" / f"{round_}.txt")
 
     # This is the extracted z slices from all files.
-    out = np.zeros((n * len(zs), c, 2048, 2048), dtype=np.float32)
+    out = np.zeros((n, len(zs), nc, 2048, 2048), dtype=np.float32)
     for i, file in enumerate(files[:n]):
         if i % 100 / len(channels) == 0:
             logger.info("Loaded {}/{}", i, n)
         with TiffFile(file) as tif:
             meta = tif.shaped_metadata[0]
-            for j in range(c):
+            for c in range(nc):
                 for k, z in enumerate(zs):
-                    img = tif.pages[z * c + j].asarray()
-                    out[i * len(zs) + k, j] = scale_deconv(
-                        img, j, name=file.name, global_deconv_scaling=deconv_meta, metadata=meta
+                    img = tif.pages[z * nc + c].asarray()
+                    out[i, k, c] = scale_deconv(
+                        img, c, name=file.name, global_deconv_scaling=deconv_meta, metadata=meta
                     )
+                    if np.sum(out[i, k, c]) == 0:
+                        print(np.mean(img))
+                        logger.warning(f"All zeros at {file},{i}, {k}, {c}.")
 
-    if np.any(np.sum(out, axis=(1, 2, 3)) == 0):
-        logger.error("Some imgs are all zeros.")
+    out = np.reshape(out, (n * len(zs), nc, 2048, 2048))
 
     logger.info(f"Loaded {len(files)} files. {out.shape}")
 
@@ -105,7 +107,7 @@ def run(path: Path, round_: str, overwrite: bool = False):
         return
 
     logger.info(f"Running {round_}")
-    basics = _run(path, round_)
+    basics = _run(path, round_, plot=False)
     with open(path / "basic" / f"{round_}.pkl", "wb") as f:
         pickle.dump(dict(zip(channels, basics)), f)
 
@@ -127,4 +129,156 @@ if __name__ == "__main__":
 # %%
 
 # %%
+# %%
+path = Path("/mnt/working/e155trcdeconv")
+files = list((path).glob(f"registered--/*.tif"))
+
+if len(files) < 500:
+    logger.warning(f"Not enough files ({len(files)}). Result may be unreliable.")
+
+n = min(len(files), 500)
+zs = [10, 40]
+c = 3
+deconv_meta = np.loadtxt(path / "deconv_scaling" / f"1_9_17.txt")
+
+# This is the extracted z slices from all files.
+out = np.zeros((n, len(zs), c, 2048, 2048), dtype=np.float32)
+for i, file in enumerate(files[:n]):
+    if i % 100 / len(channels) == 0:
+        logger.info("Loaded {}/{}", i, n)
+    with TiffFile(file) as tif:
+        meta = tif.shaped_metadata[0]
+        for j in range(c):
+            for k, z in enumerate(zs):
+                img = tif.pages[z * c + j].asarray()
+                out[i, k, j] = scale_deconv(
+                    img, j, name=file.name, global_deconv_scaling=deconv_meta, metadata=meta
+                )
+out = np.reshape(out, (n * len(zs), c, 2048, 2048))
+
+if np.any(np.sum(out, axis=(1, 2, 3)) == 0):
+    logger.error("Some imgs are all zeros.")
+
+logger.info(f"Loaded {len(files)} files. {out.shape}")
+
+
+def run_basic(c: int):
+    with jax.default_device(jax.devices("cpu")[0]):
+        logger.info("Fitting channel {}", c)
+        basic = BaSiC()
+        basic.fit(out[:, c])
+        return basic
+
+
+with ThreadPoolExecutor() as exc:
+    futs = [exc.submit(run_basic, c) for c in range(3)]
+    basics: list[BaSiC] = []
+    for fut in futs:
+        basics.append(fut.result())
+
+        plot_basic(basics[-1])
+        plt.show()
+
+
+# %%
+u = basics[0].transform(np.array(out[::2, 0]))
+# %%
+with jax.default_device(jax.devices("cpu")[0]):
+    logger.info("Fitting channel {}", c)
+    basic = BaSiC()
+    basic.fit(u)
+
+# %%
+plot_basic(basic)
+# %%
+
+# %%
+p = []
+with TiffFile(file) as tif:
+    for k, z in enumerate(range(0, 50, 10)):
+        img = tif.pages[z * c + 0].asarray()
+        p.append(scale_deconv(img, 0, name=file.name, global_deconv_scaling=deconv_meta, metadata=meta))
+
+# %%
+
+fig, axs = plt.subplots(ncols=2, nrows=3, figsize=(12, 8), dpi=200, facecolor="white")
+axs = axs.flatten()
+for i, ax in enumerate(axs):
+    ax.imshow(p[i], zorder=1, vmax=3000)
+# %%
+from tifffile import imread, imwrite
+
+path = Path("/mnt/working/e155trcdeconv")
+files = list((path).glob(f"registered--left/*.tif"))
+
+if len(files) < 500:
+    logger.warning(f"Not enough files ({len(files)}). Result may be unreliable.")
+
+n = min(len(files), 500)
+zs = [0, 1]
+c = imread(files[0]).shape[1]
+
+# This is the extracted z slices from all files.
+out = np.zeros((n, len(zs), c, 1988, 1988), dtype=np.float32)
+for i, file in enumerate(files[:n]):
+    if i % 100 / len(channels) == 0:
+        logger.info("Loaded {}/{}", i, n)
+    with TiffFile(file) as tif:
+        img = tif.asarray()
+        for j in range(c):
+            for k, z in enumerate(zs):
+                out[i, k, j] = img[k, j]
+
+out = np.reshape(out, (n * len(zs), c, 1988, 1988))
+
+if np.any(np.sum(out, axis=(1, 2, 3)) == 0):
+    logger.error("Some imgs are all zeros.")
+
+logger.info(f"Loaded {len(files)} files. {out.shape}")
+
+
+def run_basic(c: int):
+    with jax.default_device(jax.devices("cpu")[0]):
+        logger.info("Fitting channel {}", c)
+        basic = BaSiC()
+        basic.fit(out[:, c])
+        return basic
+
+
+# %%
+
+with ThreadPoolExecutor(4) as exc:
+    futs = [exc.submit(run_basic, c) for c in range(imread(files[0]).shape[1])]
+    basics: list[BaSiC] = []
+    for fut in futs:
+        basics.append(fut.result())
+        plot_basic(basics[-1])
+        plt.show()
+
+
+# %%
+u = basics[0].transform(np.array(out[::2, 0]))
+# %%
+with jax.default_device(jax.devices("cpu")[0]):
+    logger.info("Fitting channel {}", c)
+    basic = BaSiC()
+    basic.fit(u)
+
+# %%
+plot_basic(basic)
+# %%
+
+# %%
+p = []
+with TiffFile(file) as tif:
+    for k, z in enumerate(range(0, 50, 10)):
+        img = tif.pages[z * c + 0].asarray()
+        p.append(scale_deconv(img, 0, name=file.name, global_deconv_scaling=deconv_meta, metadata=meta))
+
+# %%
+
+fig, axs = plt.subplots(ncols=2, nrows=3, figsize=(12, 8), dpi=200, facecolor="white")
+axs = axs.flatten()
+for i, ax in enumerate(axs):
+    ax.imshow(p[i], zorder=1, vmax=3000)
 # %%

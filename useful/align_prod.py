@@ -520,7 +520,10 @@ def run(
     # Subsample when optimizing.
     stack = make_fetcher(
         path,
-        np.s_[slice(None, None, 3) if calc_deviations else slice(None), [bit_mapping[k] for k in used_bits]],
+        np.s_[
+            slice(None, None, 3) if calc_deviations else slice(None),
+            [bit_mapping[k] for k in used_bits],
+        ],
     )
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
