@@ -409,7 +409,6 @@ def run(
         return np.stack([img[slice(*sl)].max(axis=0) for sl in slices])
 
     transformed: dict[str, np.ndarray] = {}
-    n_z = -1
     ref = None
 
     affine = Affine(As=As, ats=ats)
@@ -417,10 +416,9 @@ def run(
     for i, (bit, img) in enumerate(bits.items()):
         logger.debug(f"Processing {bit}")
         c = str(channels[bit])
-        img = collapse_z(img, config.registration.slices).astype(np.float32)
-        n_z = img.shape[0]
         # Deconvolution scaling
         orig_name, orig_idx = bit_name_mapping[bit]
+        img = collapse_z(img, config.registration.slices).astype(np.float32)
         img = scale_deconv(
             img,
             orig_idx,
@@ -434,6 +432,8 @@ def run(
         if basic is not None:
             logger.debug("Running BaSiC")
             img = np.stack(basic[bit].transform(np.array(img)))
+        else:
+            raise Exception("No basic template found.")
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
@@ -447,7 +447,7 @@ def run(
     crop, downsample = config.registration.crop, config.registration.downsample
     out = np.zeros(
         [
-            n_z,
+            len(config.registration.slices),
             len(transformed),
             (2048 - 2 * crop) // downsample,
             (2048 - 2 * crop) // downsample,
