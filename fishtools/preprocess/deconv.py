@@ -37,10 +37,16 @@ def scale_deconv(
         logger.debug(f"Deconvolution scaling: {scale_factor}")
     if name and scaled.max() > 65535:
         logger.warning(f"Scaled image {name} has max > 65535.")
-    return scaled
+
+    if np.all(scaled < 0):
+        print(img.min(), img.max())
+        logger.warning(f"Scaled image {name} has all negative values.")
+        print(scale_factor, offset, scaled.min(), scaled.max())
+
+    return np.clip(scaled, 0, 65535)
 
 
-def _compute_range(path: Path, round_: str, *, perc_min: float = 99.9, perc_scale: float = 1):
+def _compute_range(path: Path, round_: str, *, perc_min: float = 99.9, perc_scale: float = 0.1):
     """
     Find the min and scale of the deconvolution for all files in a directory.
     The reverse scaling equation is:

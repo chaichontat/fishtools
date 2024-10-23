@@ -20,6 +20,7 @@ from loguru import logger
 from scipy.stats import multivariate_normal
 from tifffile import TiffFile, imread
 
+from fishtools.preprocess.deconv import _compute_range
 from fishtools.utils.pretty_print import progress_bar
 
 logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
@@ -237,58 +238,29 @@ projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 def main(): ...
 
 
-def _compute_range(path: Path, perc_min: float = 99.9, perc_scale: float = 1):
-    """
-    Find the min and scale of the deconvolution for all files in a directory.
-    The reverse scaling equation is:
-                 s_global
-        scaled = -------- * img + s_global * (min - m_global)
-                  scale
-    Hence we want scale_global to be as low as possible
-    and min_global to be as high as possible.
-    """
-    files = sorted(path.glob("*.tif"))
-    n_c = len(path.resolve().stem.split("_"))
-    n = len(files)
-
-    deconv_min = np.zeros((n, n_c))
-    deconv_scale = np.zeros((n, n_c))
-    logger.info(f"Found {n} files")
-    with progress_bar(len(files)) as pbar:
-        for i, f in enumerate(files):
-            with TiffFile(f) as tif:
-                assert tif.shaped_metadata
-                deconv_min[i, :] = tif.shaped_metadata[0]["deconv_min"]
-                deconv_scale[i, :] = tif.shaped_metadata[0]["deconv_scale"]
-            pbar()
-
-    logger.info("Calculating percentiles")
-    m_ = np.percentile(deconv_min, perc_min, axis=0)
-    s_ = np.percentile(deconv_scale, perc_scale, axis=0)
-
-    np.savetxt(path / "deconv_scaling.txt", np.vstack([m_, s_]))
-    logger.info(f"Saved to {path / 'deconv_scaling.txt'}")
-
-
 @main.command()
 @click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
-@click.option("--perc_min", type=float, default=99.9, help="Percentile of the min")
-@click.option("--perc_scale", type=float, default=1, help="Percentile of the scale")
+@click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
+@click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
 @click.option("--overwrite", is_flag=True)
-def compute_range(path: Path, perc_min: float = 99.9, perc_scale: float = 1, overwrite: bool = False):
+def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, overwrite: bool = False):
     """
     Find the scaling factors of all images in the children sub-folder of `path`.
     Run this on the entire workspace. See `_compute_range` for more details.
     """
-    paths = {p.parent for p in path.rglob("*.tif")}
-    for path in paths:
-        if not overwrite and (path / "deconv_scaling.txt").exists():
+    rounds = sorted({
+        p.parent.name.split("--")[0] for p in path.rglob("*.tif") if len(p.parent.name.split("--")) == 2
+    })
+    print(rounds)
+
+    for round_ in rounds:
+        if not overwrite and (path / "deconv_scaling" / f"{round_}.txt").exists():
             continue
         try:
-            logger.info(f"Processing {path}")
-            _compute_range(path, perc_min, perc_scale)
-        except Exception as e:
-            ...
+            logger.info(f"Processing {round_}")
+            _compute_range(path, round_, perc_min=perc_min, perc_scale=perc_scale)
+        except (AttributeError, FileNotFoundError):
+            logger.info("Invalid folder. Skipping.")
 
 
 # @main.command()
