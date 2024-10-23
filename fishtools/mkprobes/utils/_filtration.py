@@ -8,11 +8,12 @@ from ._algorithms import find_overlap, find_overlap_weighted
 
 # fmt: off
 PROBE_CRITERIA: Final = dict(
-    ok_quad_c = pl.col("seq").str.contains("GGGG").is_not(),
-    ok_quad_a = pl.col("seq").str.contains("TTTT").is_not(),
-    ok_stack_c= pl.all([pl.col("seq").str.slice(-6 - i, 6).str.count_match("G").lt(4) for i in range(6)]),
-    ok_comp_a =(pl.col("seq").str.count_match("T") / pl.col("seq").str.n_chars() < 0.28),
-    gc_content=(pl.col("seq").str.count_match("G|C") / (pl.col("seq").str.n_chars()))
+    ok_quad_c = ~pl.col("seq").str.contains("GGGG"),
+    ok_quad_a = ~pl.col("seq").str.contains("TTTT"),
+    # ok_stack_c= pl.all([pl.col("seq").str.slice(-6 - i, 6).str.count_matches("G").lt(4) for i in range(6)]),
+    ok_stack_c= pl.fold(True, (lambda acc, x: acc & x), [pl.col("seq").str.slice(-6 - i, 6).str.count_matches("G").lt(4) for i in range(6)]),
+    ok_comp_a =(pl.col("seq").str.count_matches("T") / pl.col("seq").str.len_chars() < 0.28),
+    gc_content=(pl.col("seq").str.count_matches("G|C") / (pl.col("seq").str.len_chars()))
 )
 # fmt: on
 
@@ -92,12 +93,29 @@ def the_filter(
         df,
         criteria=[
             # fmt: off
-            (pl.col("oks") > 4) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget) & pl.col("length").lt(55) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 3) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget) & pl.col("length").lt(55) & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 3) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget) & pl.col("length").lt(55),
-            (pl.col("oks") > 3) & (pl.col("hp") < max_hp + 5) & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
-            (pl.col("oks") > 2) & (pl.col("hp") < max_hp + 5) & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
-            (pl.col("oks") > 1) & (pl.col("hp") < max_hp + 5) & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
+            (pl.col("oks") > 4)
+            & (pl.col("hp") < max_hp)
+            & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
+            & pl.col("length").lt(55)
+            & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+            (pl.col("oks") > 3)
+            & (pl.col("hp") < max_hp)
+            & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
+            & pl.col("length").lt(55)
+            & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
+            (pl.col("oks") > 3)
+            & (pl.col("hp") < max_hp)
+            & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
+            & pl.col("length").lt(55),
+            (pl.col("oks") > 3)
+            & (pl.col("hp") < max_hp + 5)
+            & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
+            (pl.col("oks") > 2)
+            & (pl.col("hp") < max_hp + 5)
+            & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
+            (pl.col("oks") > 1)
+            & (pl.col("hp") < max_hp + 5)
+            & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
             # fmt: on
         ],
         overlap=overlap,

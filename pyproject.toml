@@ -1,27 +1,26 @@
 [tool.poetry]
 authors = ["Chaichontat Sriworarat <csriwor1@jh.edu>"]
 description = ""
-include = [{path = 'static/*', format = 'wheel'}]
+include = [{ path = 'static/*', format = 'wheel' }]
 license = "GPL-3.0-only"
 name = "fishtools"
-packages = [{include = "fishtools"}]
+packages = [{ include = "fishtools" }]
 readme = "README.md"
 version = "0.1.0"
 
 [tool.poetry.dependencies]
-biopython = "^1.81"
+biopython = "^1.84"
 click = "^8.1.6"
 colorama = "^0.4.6"
-expression = "^4.2.4"
-imagecodecs = "^2023.7.10"
-levenshtein = "^0.23.0"
+imagecodecs = "^2024.9.22"
+levenshtein = "^0.26.0"
 loguru = "^0.7.0"
 mygene = "^3.2.2"
 numpy = "^1.25.1"
-polars = "^0.18.9"
+polars = "^1"
 primer3-py = "^2.0.0"
 pyfastx = "^2.1.0"
-python = "^3.10"
+python = "^3.12"
 rich-click = "^1.6.1"
 tifffile = "^2023.7.18"
 tqdm = "^4.65.0"
@@ -30,8 +29,14 @@ seaborn = "^0.13.2"
 astropy = "^6.1.0"
 photutils = "^1.12.0"
 scikit-image = "^0.23.2"
-scipy = "^1.13.1"
+scipy = "^1.12"
 starfish = { git = "https://github.com/chaichontat/starfish", branch = "master" }
+basicpy = "^1.2.0"
+rtree = "^1.3.0"
+shapely = "^2.0.6"
+toml = "^0.10.2"
+pyarrow = "^17.0.0"
+pydantic = "^2.9.2"
 
 [tool.poetry.scripts]
 fishtools = "fishtools.cli:main"
