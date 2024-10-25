@@ -4,6 +4,7 @@ import json
 import logging
 import pickle
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
@@ -53,6 +54,9 @@ class Fiducial(BaseModel):
 
 
 class RegisterConfig(BaseModel):
+    class Config:
+        arbitrary_types_allowed = True
+
     fiducial: Fiducial
     downsample: int = Field(default=1, description="Downsample factor")
     reduce_bit_depth: int = Field(
@@ -63,8 +67,8 @@ class RegisterConfig(BaseModel):
         default=25,
         description="Pixels to crop from each edge. This is to account for translation during alignment.",
     )
-    slices: list[tuple[int | None, int | None]] = Field(
-        default=[(0, 5)], description="Slice range to use for registration"
+    slices: list[tuple[int | None, int | None]] | slice = Field(
+        default=[slice(None)], description="Slice range to use for registration"
     )
     split_channels: bool = False
     chromatic_shifts: dict[str, Annotated[str, "path for 560to{channel}.txt"]]
@@ -191,7 +195,7 @@ class Image:
     powers: dict[str, float]
     metadata: dict[str, Any]
     global_deconv_scaling: np.ndarray
-    basic: dict[str, BaSiC] | None
+    basic: Callable[[], dict[str, BaSiC] | None]
 
     CHANNELS = [f"ilm{n}" for n in ["405", "488", "560", "650", "750"]]
 
@@ -255,11 +259,15 @@ class Image:
 
         path_basic = path.parent.parent / "basic" / f"{name}.pkl"
         if path_basic.exists():
-            basic = pickle.loads(path_basic.read_bytes())
-            basic = dict(zip(bits, basic.values()))
+
+            def b():
+                basic = pickle.loads(path_basic.read_bytes())
+                return dict(zip(bits, basic.values()))
+
+            basic = b
         else:
             raise Exception(f"No basic template found at {path_basic}")
-            basic = None
+            basic = lambda: None
 
         return cls(
             name=name,
@@ -382,6 +390,9 @@ def run(
             else:
                 raise ValueError(f"Could not find file that starts with {name} for override shift.")
 
+    del fids
+    for _img in imgs.values():
+        del _img.fid, _img.fid_raw
     (shift_path := path / f"shifts--{roi}").mkdir(exist_ok=True)
 
     with open(shift_path / f"shifts-{idx:04d}.json", "w") as f:
@@ -397,6 +408,9 @@ def run(
     # Split into individual bits.
     # Spillover correction, max projection
     bits, bits_shifted, bit_name_mapping = parse_nofids(nofids, shifts, channels)
+    del nofids
+    for _img in imgs.values():
+        del _img.nofid
 
     if debug:
         for name, img in bits.items():
@@ -404,16 +418,20 @@ def run(
 
     def collapse_z(
         img: np.ndarray,
-        slices: list[tuple[int | None, int | None]],
+        slices: list[tuple[int | None, int | None]] | slice,
     ) -> np.ndarray:
-        return np.stack([img[slice(*sl)].max(axis=0) for sl in slices])
+        if isinstance(slices, list):
+            return np.stack([img[slice(*sl)].max(axis=0) for sl in slices])
+        return img[slices]
 
     transformed: dict[str, np.ndarray] = {}
     ref = None
 
     affine = Affine(As=As, ats=ats)
 
-    for i, (bit, img) in enumerate(bits.items()):
+    for i, bit in enumerate(list(bits)):
+        img = bits[bit]
+        del bits[bit]
         logger.debug(f"Processing {bit}")
         c = str(channels[bit])
         # Deconvolution scaling
@@ -428,12 +446,13 @@ def run(
         )
 
         # Illumination correction
-        basic = imgs[orig_name].basic
+        basic = imgs[orig_name].basic()
         if basic is not None:
             logger.debug("Running BaSiC")
             img = np.stack(basic[bit].transform(np.array(img)))
         else:
             raise Exception("No basic template found.")
+        del basic
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
@@ -444,10 +463,15 @@ def run(
         transformed[bit] = np.clip(img, 0, 65535).astype(np.uint16)
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
 
+    if not len({img.shape for img in transformed.values()}) == 1:
+        raise ValueError("Transformed images have different shapes.")
+
     crop, downsample = config.registration.crop, config.registration.downsample
     out = np.zeros(
         [
-            len(config.registration.slices),
+            next(iter(transformed.values())).shape[0],
+            # if isinstance(config.registration.slices, slice)
+            # else len(config.registration.slices),
             len(transformed),
             (2048 - 2 * crop) // downsample,
             (2048 - 2 * crop) // downsample,
@@ -458,6 +482,7 @@ def run(
     # Sort by channel
     for i, (k, v) in enumerate(items := sorted(transformed.items(), key=sort_key)):
         out[:, i] = v[:, crop:-crop:downsample, crop:-crop:downsample]
+    del transformed
 
     # out[0, -1] = fids[reference][crop:-crop:downsample, crop:-crop:downsample]
 
@@ -564,7 +589,8 @@ def main(
                 ),
                 downsample=1,
                 crop=30,
-                slices=[(i, i + 3) for i in range(0, 55, 3)],
+                slices=slice(None),
+                # slices=[(i, i + 3) for i in range(0, 55, 3)],
                 reduce_bit_depth=0,
             ),
         ),

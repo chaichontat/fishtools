@@ -18,7 +18,7 @@ from tifffile import imread
 from fishtools.analysis.tileconfig import TileConfiguration
 
 sns.set_theme()
-codebook = "genestar"
+codebook = "tricycleplus"
 roi = "left"
 # registered--{roi}
 path = Path(f"/mnt/working/e155trcdeconv/registered--{roi}")
@@ -40,6 +40,7 @@ sns.scatterplot(x="x", y="y", data=coords.to_pandas(), ax=ax, s=10, alpha=0.9)
 #         shifts = json.load(f)
 
 #     vals = np.array(list(shifts.values()))
+
 
 #     if len(np.flatnonzero(np.square(vals).sum(axis=1))) < len(shifts) - 1:
 #         print(shifts)
@@ -68,7 +69,7 @@ def load(i: int, filter_: bool = True):
             tile=pl.lit(str(i)),
             passes_thresholds=pl.Series(d.coords["passes_thresholds"].values),
         )
-        .with_row_count("idx")
+        .with_row_index("idx")
         # .join(d,)
     )
 
@@ -131,7 +132,11 @@ def process(out: list, curr: int, filter_: bool = True):
     #         out.append(row)
 
     # Apply the function to all rows at once
-    mask = df.select([pl.struct(["x", "y"]).apply(lambda row: check_point(row["x"], row["y"])).alias("keep")])
+    mask = df.select([
+        pl.struct(["x", "y"])
+        .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
+        .alias("keep")
+    ])
 
     # Filter the dataframe and count the thrown points
     filtered_df = df.filter(mask["keep"])
@@ -142,36 +147,30 @@ def process(out: list, curr: int, filter_: bool = True):
 
 with ThreadPoolExecutor(8) as exc:
     out = []
-    futs = [exc.submit(process, out, i, filter_=True) for i in range(len(cells[:]))]
+    futs = [exc.submit(process, out, i, filter_=False) for i in range(len(files[:]))]
     for fut in futs:
         fut.result()
 # for curr in range(len(cells[:20])):
 #     process(curr)
 
 # del thrownover[curr]
-# %%
 spots = pl.concat(out)
-spots.write_parquet(path / codebook / "spots.parquet")
+spots.write_parquet(path / codebook / "spots_all.parquet")
 
 # %%
 fig, axs = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 
 # ax.set_aspect("equal")
-downsample = 100
+downsample = 50
 axs.scatter(spots["x"][::downsample], spots["y"][::downsample], s=0.5, alpha=0.3)
 axs.set_aspect("equal")
 
 # %%
-fig, ax = plt.subplots(figsize=(6, 4), dpi=200)
-selected = spots.filter(pl.col("target") == "Eomes-201")
-ax.scatter(selected["x"], selected["y"], s=0.2, alpha=0.4)
-# spots = pl.read_parquet(path / "genestar" / "spots.parquet")
-# %%
 spots = pl.read_parquet(path / codebook / "spots.parquet")
 pergene = (
     spots.filter(pl.col("passes_thresholds"))
-    .groupby("target")
-    .count()
+    .group_by("target")
+    .len("count")
     .sort("count", descending=True)
     .with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
     .with_columns(color=pl.when(pl.col("is_blank")).then(pl.lit("red")).otherwise(pl.lit("blue")))
@@ -189,26 +188,27 @@ plt.tight_layout()
 
 # %%
 
+
 # %%
-if codebook == "tricycleplus":
-    genes = ["Ccnd3", "Mcm5", "Top2a", "Pou3f2", "Cenpa", "Hell"]
-else:
-    genes = ["Sox9", "Pax6", "Eomes", "Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2"]
-fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
-axs = axs.flatten()
-for ax, gene in zip(axs, genes):
-    selected = spots.filter(pl.col("target").str.starts_with(gene))
-    if not len(selected):
-        raise ValueError(f"No spots found for {gene}")
-    ax.set_aspect("equal")
-    ax.set_title(gene, fontsize=16, color="white")
-    ax.hexbin(selected["x"], selected["y"], gridsize=250)
-    # ax.scatter(selected["y"], -selected["x"], s=5000 / len(selected), alpha=0.2)
-    ax.axis("off")
+# if codebook == "tricycleplus":
+#     genes = ["Ccnd3", "Mcm5", "Top2a", "Pou3f2", "Cenpa", "Hell"]
+# else:
+#     genes = ["Sox9", "Pax6", "Eomes", "Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2"]
+# fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
+# axs = axs.flatten()
+# for ax, gene in zip(axs, genes):
+#     selected = spots.filter(pl.col("target").str.starts_with(gene))
+#     if not len(selected):
+#         raise ValueError(f"No spots found for {gene}")
+#     ax.set_aspect("equal")
+#     ax.set_title(gene, fontsize=16, color="white")
+#     ax.hexbin(selected["x"], selected["y"], gridsize=250)
+#     # ax.scatter(selected["y"], -selected["x"], s=5000 / len(selected), alpha=0.2)
+#     ax.axis("off")
 # %%
-genes = pergene["target"]
+genes = sorted(pergene["target"])
 dark = False
-fig, axs = plt.subplots(ncols=8, nrows=16, figsize=(32, 32), dpi=100, facecolor="black" if dark else "white")
+fig, axs = plt.subplots(ncols=20, nrows=15, figsize=(72, 36), dpi=100, facecolor="black" if dark else "white")
 axs = axs.flatten()
 for ax, gene in zip(axs, genes):
     selected = spots.filter(pl.col("target") == gene)
@@ -221,8 +221,8 @@ for ax, gene in zip(axs, genes):
     if dark:
         ax.hexbin(selected["x"], selected["y"], gridsize=250)
     else:
-        ax.scatter(selected["x"], selected["y"], s=1000 / len(selected), alpha=0.2)
-
+        ax.scatter(selected["x"], selected["y"], s=2000 / len(selected), alpha=0.1)
+plt.tight_layout()
 
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(6, 12), dpi=200)
@@ -242,7 +242,7 @@ ax.set_xscale("log")
 # plt.axis("equal")
 from polars import col as c
 
-spots = pl.read_parquet("/fast2/3t3clean/analysis/spots.parquet")
+# spots = pl.read_parquet("/fast2/3t3clean/analysis/spots.parquet")
 # %%
 what = spots.groupby("target").agg([
     pl.count(),

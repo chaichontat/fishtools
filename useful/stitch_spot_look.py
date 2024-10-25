@@ -19,21 +19,26 @@ from tifffile import imread
 from fishtools.analysis.tileconfig import TileConfiguration
 
 path = Path("/mnt/working/e155trcdeconv/registered--left/")
-codebook = "tricycleplus"
+codebook = "genestar"
 spots = pl.read_parquet(path / codebook / "spots.parquet")
 sns.set_theme()
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
-ax.scatter(spots["x"][::50], spots["y"][::50], s=0.5, alpha=0.3)
+ax.set_aspect("equal")
+ax.scatter(spots["x"][::500], spots["y"][::500], s=0.5, alpha=0.3)
 
 # %%
 pergene = (
-    spots.groupby("target")
-    .count()
+    spots.group_by("target")
+    .len("count")
     .sort("count", descending=True)
     .with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
     .with_columns(color=pl.when(pl.col("is_blank")).then(pl.lit("red")).otherwise(pl.lit("blue")))
 )
 # %%
+spots = spots.filter(pl.col("norm") > 0.003)
+fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+rand = np.random.default_rng(0)
+ax.scatter(np.sqrt(spots["area"] + rand.normal(0, 1, size=spots.__len__())), np.log10(spots["norm"]))
 
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 6), dpi=200)

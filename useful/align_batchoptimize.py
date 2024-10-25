@@ -1,44 +1,61 @@
 # %%
 import subprocess
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import rich_click as click
 from loguru import logger
 
-# PATH = Path("/fast2/3t3clean")
-PATH = Path("/mnt/working/e155trcdeconv")
-codebook = "/home/chaichontat/fishtools/starwork3/ordered/genestar.json"
+
+@click.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("codebook_path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--rounds", type=int, default=10)
+def run(path: Path, codebook_path: Path, rounds: int = 10):
+    if not len(list(path.glob("registered--*"))):
+        raise ValueError("No registered images found.")
+
+    try:
+        existing = len(Path(path / f"opt_{codebook_path.stem}" / "global_scale.txt").read_text().splitlines())
+        logger.info(f"Found {existing} existing rounds.")
+        if existing == rounds:
+            logger.info("All rounds already exist. Exiting.")
+            return
+    except FileNotFoundError:
+        logger.info("No existing global scale found. Starting from scratch.")
+        existing = 0
+
+    for i in range(existing, rounds):
+        logger.critical(f"Starting round {i}")
+        subprocess.run(
+            [
+                "python",
+                Path(__file__).parent / "align_prod.py",
+                "optimize",
+                str(path),
+                "--codebook",
+                codebook_path,
+                "--batch-size=50",
+                f"--round={i}",
+                "--threads=16",
+                "--overwrite",
+            ],
+            check=True,
+            capture_output=False,
+        )
+        subprocess.run(
+            [
+                "python",
+                Path(__file__).parent / "align_prod.py",
+                "combine",
+                str(path),
+                "--codebook",
+                codebook_path,
+                f"--round={i}",
+            ],
+            check=True,
+            capture_output=False,
+        )
 
 
-for i in range(0, 10):
-    logger.critical(f"Starting round {i}")
-
-    subprocess.run(
-        [
-            "python",
-            Path(__file__).parent / "align_prod.py",
-            "optimize",
-            str(PATH),
-            "--codebook",
-            codebook,
-            "--batch-size=50",
-            f"--round={i}",
-            "--threads=16",
-            "--overwrite",
-        ],
-        check=True,
-        capture_output=False,
-    )
-    subprocess.run(
-        [
-            "python",
-            Path(__file__).parent / "align_prod.py",
-            "combine",
-            str(PATH),
-            "--codebook",
-            codebook,
-            f"--round={i}",
-        ],
-        check=True,
-        capture_output=False,
-    )
+if __name__ == "__main__":
+    run()
