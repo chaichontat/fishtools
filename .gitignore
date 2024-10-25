@@ -165,3 +165,9 @@ temp/
 output/
 *.gz
 output_synapse/
+**fasta**
+*.csv
+*.txt
+*.parquet
+*.json
+squid/
