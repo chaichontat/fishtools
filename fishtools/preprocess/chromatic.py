@@ -1,12 +1,10 @@
 # %%
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import SimpleITK as sitk
 from loguru import logger
-
-if TYPE_CHECKING:
-    from matplotlib.axes import Axes
+from matplotlib.axes import Axes
 
 
 class Affine:
@@ -65,16 +63,18 @@ class Affine:
         translate.SetParameters((float(shiftpx[0]), float(shiftpx[1]), 0.0))
 
         # Don't do chromatic shift if channel is reference
-        if channel == self.ref_channel:
+        if channel == self.ref_channel or channel not in self.As or channel not in self.ats:
+            # if channel != self.ref_channel and (channel not in self.As or channel not in self.ats):
+            #     logger.warning(f"Chromatic: corrections for channel {channel} not found. Ignoring.")
             return self._st(img, translate)
 
         # Scale
         affine = sitk.AffineTransform(3)
-        matrix = self.As.get(channel, np.zeros((3, 3), dtype=np.float64))
+        matrix = self.As[channel]
         affine.SetMatrix(matrix.flatten())
 
         # Translate
-        translation = self.ats.get(channel, np.zeros(3, dtype=np.float64))
+        translation = self.ats[channel]
         affine.SetTranslation(translation)
         affine.SetCenter([1023.5 + shiftpx[0], 1023.5 + shiftpx[1], 0])
 

@@ -1,6 +1,6 @@
 import json
 import re
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -77,7 +77,9 @@ def _calculate_drift(
     target_points = target_points.with_columns(
         xcentroid=pl.col("xcentroid") + initial_drift[0],
         ycentroid=pl.col("ycentroid") + initial_drift[1],
-    )
+    ).sort("mag")
+
+    print(target_points)
 
     dist, idxs = ref_kd.query(target_points[cols], workers=2)
     mapping = pl.concat(
@@ -102,7 +104,7 @@ def _calculate_drift(
             "Please reduce FWHM or increase threshold."
         )
 
-    if len(joined) < 6:
+    if len(joined) < 2:
         logger.warning(f"WARNING: not enough fiducials found {len(joined)}. Using initial alignment")
         return np.round([0, 0], precision)
 
@@ -127,7 +129,10 @@ def _calculate_drift(
             raise ValueError("No drift found. Reference passed?")
         res = np.array([mode(joined["dx"]), mode(joined["dy"])])
     else:
-        drift = joined[["dx", "dy"]].median().to_numpy().squeeze()
+        print(joined)
+        drift = joined.select(dx=pl.col("dx") * pl.col("flux"), dy=pl.col("dy") * pl.col("flux")).sum()
+        print(drift)
+        drift = np.array(drift) / joined["flux"].sum()
         res = initial_drift + drift
 
     return np.round(res, precision)
@@ -140,29 +145,37 @@ def run_fiducial(
     debug: bool = False,
     name: str = "",
     threshold_sigma: float = 3,
-    threshold_fiducial: float = 0.5,
+    threshold_fiducial: float = 0.3,
     fwhm: float = 4,
 ):
     if subtract_background:
         ref = ref - background(ref)
-    try:
-        fixed = find_spots(ref, threshold_sigma=threshold_sigma, fwhm=fwhm)
-        if not len(fixed):
-            raise ValueError("No spots found on reference image.")
-    except Exception as e:
-        logger.error(f"Cannot find reference spots. {e}")
-        return lambda *args, **kwargs: np.zeros(2)
+    # try:
+    fixed = find_spots(ref, threshold_sigma=threshold_sigma, fwhm=fwhm).sort("mag")
+    if not len(fixed):
+        raise ValueError("No spots found on reference image.")
+    if len(fixed) < 2:
+        raise ValueError("Not enough spots found on reference image.")
+    # except Exception as e:
+    #     logger.error(f"Cannot find reference spots. {e}")
+    #     return lambda *args, **kwargs: np.zeros(2)
+
+    print(fixed)
 
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
-    def inner(img: np.ndarray, *, limit: int = 3, bitname: str = ""):
+    def inner(img: np.ndarray, *, limit: int = 4, bitname: str = ""):
         if subtract_background:
             img = img - background(img)
         moving = find_spots(img, threshold_sigma=threshold_sigma, fwhm=fwhm)
-        if len(moving) < 6:
-            logger.warning(f"WARNING: not enough fiducials. Setting zero.")
+        if len(moving) < 3:
+            logger.warning("Not enough fiducials. Setting zero.")
             return np.round([0, 0])
+        # if len(moving) < 0.75 * len(fixed):
+        #     kd_ = cKDTree(fixed[: len(moving)][["xcentroid", "ycentroid"]])
+        # else:
+        #     kd_ = kd
 
         logger.debug(f"{bitname}: {len(moving)} peaks found on target image.")
 
@@ -178,6 +191,9 @@ def run_fiducial(
             if residual < threshold_fiducial:
                 return drift
             initial_drift = drift
+
+        if np.hypot(*drift) > 40:
+            logger.warning(f"{bitname}: drift too large {np.hypot(*drift):.2f}.")
 
         if residual > 0.5:  # type: ignore
             logger.warning(f"{bitname}: residual drift too large {residual=:2f}.")  # type: ignore
@@ -217,11 +233,12 @@ def align_fiducials(
     *,
     reference: str,
     threads: int = 4,
+    overrides: dict[str, tuple[float, float]] | None = None,
     subtract_background: bool = False,
     debug: bool = False,
-    iterations: int = 3,
+    max_iters: int = 4,
     threshold_sigma: float = 3,
-    threshold_fiducial: float = 0.5,
+    threshold_fiducial: float = 0.3,
     fwhm: float = 4,
 ) -> dict[str, np.ndarray[float, Any]]:
     keys = list(fids.keys())
@@ -245,14 +262,21 @@ def align_fiducials(
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
         futs: dict[str, Future] = {}
         for k, img in fids.items():
-            if k == ref:
+            if k == ref or (overrides is not None and k in overrides):
                 continue
-            futs[k] = exc.submit(corr, img, bitname=k, limit=iterations)
+            futs[k] = exc.submit(corr, img, bitname=k, limit=max_iters)
 
             if debug:
                 futs[k].result()
 
-    return {k: v.result() for k, v in futs.items()} | {ref: np.zeros(2)}
+        for fut in as_completed(futs.values()):
+            fut.result()
+
+    return (
+        {k: v.result() for k, v in futs.items()}
+        | {ref: np.zeros(2)}
+        | ({k: np.array(v) for k, v in overrides.items()} if overrides else {})
+    )
 
 
 def plot_alignment(fids: dict[str, np.ndarray[float, Any]], sl: slice = np.s_[500:600]):
@@ -276,7 +300,6 @@ def align_fiducials_from_file(
     glob: str,
     *,
     reference: str,
-    precision: int = 2,
     filter_: Callable[[str], bool] = lambda _: True,
     idx: int = -1,
     threads: int = 4,
@@ -293,7 +316,6 @@ def align_fiducials_from_file(
 @click.argument("glob", type=str)
 @click.option("--output", "-o", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--reference", "-r", type=str)
-@click.option("--precision", "-p", type=int, default=2)
 @click.option("--idx", "-i", type=int, default=-1)
 @click.option("--threads", "-t", type=int, default=4)
 def main(
@@ -301,13 +323,10 @@ def main(
     glob: str,
     output: Path,
     reference: str,
-    precision: int = 2,
     idx: int = -1,
     threads: int = 4,
 ):
-    res = align_fiducials_from_file(
-        folder, glob, reference=reference, precision=precision, idx=idx, threads=threads
-    )
+    res = align_fiducials_from_file(folder, glob, reference=reference, idx=idx, threads=threads)
     output.write_text(json.dumps(res))
 
 

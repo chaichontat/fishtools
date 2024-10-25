@@ -5,39 +5,33 @@ from pathlib import Path
 
 from fishtools import progress_bar
 
-PATH = Path("/fast2/3t3clean/analysis/deconv")
-
-idxs = sorted([int(name.stem.split("-")[1]) for name in PATH.rglob("6_14_22*.tif")])
+PATH = Path("/mnt/archive/starmap/sagittal/analysis/deconv")
+roi = "full"
+chan = "4_12_20"
+idxs = sorted({int(name.stem.split("-")[1]) for name in PATH.rglob(f"{chan}--{roi}/{chan}*.tif")})
 print(len(idxs))
+
 # idxs = [i for i in idxs if not (PATH / "down2" / "0" / f"{i:03d}_000.tif").exists()]
 # %%
 
-# for i in idxs:
-#     if not (PATH / "down2" / "0" / f"{i:03d}_000.tif").exists():
-#         print(i)
-#         subprocess.run(
-#             ["python", "decode/register_prod.py", str(PATH), str(i), "--debug"],
-#             capture_output=False,
-#             check=True,
-#         )
 # %%
 
-with progress_bar(len(idxs)) as callback, ThreadPoolExecutor(6) as exc:
+with progress_bar(len(idxs)) as callback, ThreadPoolExecutor(12) as exc:
     futs: list[Future] = []
     for i in idxs:
         fut = exc.submit(
             subprocess.run,
             [
                 "python",
-                Path(__file__).parent / "register_prod.py",
+                Path(__file__).parent.parent / "useful" / "register_prod.py",
                 str(PATH),
                 str(i),
-                # "--fwhm=6",
-                # "--threshold=5",
+                "--fwhm=4",
+                "--threshold=4",
                 "--reference",
-                "6_14_22",
-                "--roi",
-                "",
+                chan,
+                f"--roi={roi}",
+                "--overwrite",
             ],
             check=True,
         )

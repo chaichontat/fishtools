@@ -1,8 +1,9 @@
 from pathlib import Path
-import pandas as pd
+
 import numpy as np
-import pyparsing as pp
+import pandas as pd
 import polars as pl
+import pyparsing as pp
 
 
 class TileConfiguration:
@@ -33,9 +34,9 @@ class TileConfiguration:
         ats["x"] -= ats["x"].min()
         ats["y"] -= ats["y"].min()
 
-        mat = ats[["y", "x"]].to_numpy() @ np.loadtxt("/home/chaichontat/fishtools/data/stage_rotation.txt")
-        ats["x"] = mat[:, 0]
-        ats["y"] = mat[:, 1]
+        # mat = ats[["y", "x"]].to_numpy() @ np.loadtxt("/home/chaichontat/fishtools/data/stage_rotation.txt")
+        # ats["x"] = mat[:, 0]
+        # ats["y"] = mat[:, 1]
 
         return cls(pl.DataFrame(ats.reset_index()))
 
@@ -64,7 +65,11 @@ class TileConfiguration:
 
         # Perform this on extracted file name
         # since we want both the raw file name and the index.
-        filename = pp.Optional(pp.Word(pp.alphanums) + pp.Literal("-")) + integer("index").setParseAction(lambda t: int(t[0])) + pp.Literal(".tif")  # type: ignore
+        filename = (
+            pp.Optional(pp.Word(pp.alphanums) + pp.Literal("-"))
+            + integer("index").setParseAction(lambda t: int(t[0]))
+            + pp.Literal(".tif")
+        )  # type: ignore
         # Parse the content
         out = []
         for x in parser.parseString(content):

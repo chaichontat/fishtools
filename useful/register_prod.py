@@ -7,7 +7,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any
 
 import click
 import numpy as np
@@ -21,11 +21,12 @@ from scipy.ndimage import shift
 from tifffile import TiffFile
 
 from fishtools import align_fiducials
-from fishtools.analysis.chromatic import Affine
+from fishtools.preprocess.chromatic import Affine
+from fishtools.preprocess.config import ChannelConfig, Config, Fiducial, RegisterConfig
 from fishtools.preprocess.deconv import scale_deconv
 
 logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
-import jax
+import jax  # noqa: E402
 
 jax.config.update("jax_platform_name", "cpu")
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
@@ -91,7 +92,7 @@ class Config(BaseModel):
 
 # %%
 
-DATA = Path("/home/chaichontat/fishtools/data")
+DATA = Path("/fast2/fishtools/data")
 
 
 # %%
@@ -161,10 +162,10 @@ def parse_nofids(nofids: dict[str, np.ndarray], shifts: dict[str, np.ndarray], c
         # if "647" in cs and "750" in cs:
         #     out[cs["647"]] = spillover_correction(out[cs["647"]], out[cs["750"]], 0.05)
 
-    for name, shift in shifts.items():
+    for name, shift_ in shifts.items():
         curr_bits = name.split("-")[0].split("_")
         for i, bit in enumerate(curr_bits):
-            out_shift[bit] = shift
+            out_shift[bit] = shift_
 
     return out, out_shift, bit_name_mapping
 
@@ -266,7 +267,7 @@ class Image:
 
             basic = b
         else:
-            raise Exception(f"No basic template found at {path_basic}")
+            # raise Exception(f"No basic template found at {path_basic}")
             basic = lambda: None
 
         return cls(
@@ -334,6 +335,17 @@ def run(
             else:
                 raise ValueError(f"Could not find file that starts with {name} for prior shift.")
 
+    if config.registration.fiducial.overrides is not None:
+        for name, sh in config.registration.fiducial.overrides.items():
+            for file in fids:
+                if file.startswith(name):
+                    logger.info(f"Overriding shift for {name} to {sh}")
+                    fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
+                    prior_mapping[name] = file
+                    break
+            else:
+                raise ValueError(f"Could not find file that starts with {name} for override shift.")
+
     if debug:
         _fids_path = path / f"fids-{idx:04d}.tif"
         tifffile.imwrite(
@@ -360,7 +372,7 @@ def run(
         fids,
         reference=reference,
         debug=debug,
-        iterations=4,
+        max_iters=5,
         threshold_sigma=config.registration.fiducial.threshold,
         fwhm=config.registration.fiducial.fwhm,
     )
@@ -377,18 +389,22 @@ def run(
 
     if config.registration.fiducial.priors is not None:
         for name, sh in config.registration.fiducial.priors.items():
-            shifts[prior_mapping[name]][0] += sh[0]
-            shifts[prior_mapping[name]][1] += sh[1]
+            if (
+                not config.registration.fiducial.overrides
+                or name not in config.registration.fiducial.overrides
+            ):
+                shifts[prior_mapping[name]][0] += sh[0]
+                shifts[prior_mapping[name]][1] += sh[1]
 
-    if config.registration.fiducial.overrides is not None:
-        for name, sh in config.registration.fiducial.overrides.items():
-            for file in fids:
-                if file.startswith(name):
-                    shifts[file][0] = sh[0]
-                    shifts[file][1] = sh[1]
-                    break
-            else:
-                raise ValueError(f"Could not find file that starts with {name} for override shift.")
+    # if config.registration.fiducial.overrides is not None:
+    #     for name, sh in config.registration.fiducial.overrides.items():
+    #         for file in fids:
+    #             if file.startswith(name):
+    #                 shifts[file][0] = sh[0]
+    #                 shifts[file][1] = sh[1]
+    #                 break
+    #         else:
+    #             raise ValueError(f"Could not find file that starts with {name} for override shift.")
 
     del fids
     for _img in imgs.values():
@@ -412,9 +428,9 @@ def run(
     for _img in imgs.values():
         del _img.nofid
 
-    if debug:
-        for name, img in bits.items():
-            logger.info(f"{name}: {img.max()}")
+    # if debug:
+    #     for name, img in bits.items():
+    #         logger.info(f"{name}: {img.max()}")
 
     def collapse_z(
         img: np.ndarray,
@@ -432,7 +448,6 @@ def run(
     for i, bit in enumerate(list(bits)):
         img = bits[bit]
         del bits[bit]
-        logger.debug(f"Processing {bit}")
         c = str(channels[bit])
         # Deconvolution scaling
         orig_name, orig_idx = bit_name_mapping[bit]
@@ -451,8 +466,8 @@ def run(
             logger.debug("Running BaSiC")
             img = np.stack(basic[bit].transform(np.array(img)))
         else:
-            raise Exception("No basic template found.")
-        del basic
+            ...
+            # raise Exception("No basic template found.")
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
@@ -497,7 +512,12 @@ def run(
         out,
         compression=22610,
         compressionargs={"level": 0.75},
-        metadata={"key": keys, "axes": "ZCYX"},
+        metadata={
+            "key": keys,
+            "axes": "ZCYX",
+            "shifts": shifts,
+            "config": config.model_dump_json(),
+        },
     )
 
     # for i in range(0, len(out), 3):
@@ -562,6 +582,7 @@ def main(
         config=Config(
             dataPath=str(DATA),
             channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
+            basic=None,
             # basic_template=dict(
             #     zip(
             #         ["560", "650", "750"],
@@ -586,11 +607,13 @@ def main(
                         # "dapi_29_polyA": (10, 30),
                         # "1_9_17": (-21, -18)
                     },
+                    overrides={
+                        # "polyA_1_9_17": (12.01, -12.43),
+                    },
                 ),
                 downsample=1,
                 crop=30,
                 slices=slice(None),
-                # slices=[(i, i + 3) for i in range(0, 55, 3)],
                 reduce_bit_depth=0,
             ),
         ),
