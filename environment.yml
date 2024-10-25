@@ -1,0 +1,29 @@
+name: fishtools
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.12
+  - click
+  - cupy
+  - jellyfish
+  - imagecodecs
+  - levenshtein
+  - loguru
+  - matplotlib
+  - numpy
+  - opencv
+  - pandas
+  - pip
+  - pip:
+      - basicpy
+      - biopython
+      - kb-python
+      - pyfastx
+  - polars
+  - pyarrow
+  - pydantic
+  - rich-click
+  - rtree
+  - shapely
+  - toml
