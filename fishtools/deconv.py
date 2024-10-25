@@ -23,11 +23,6 @@ from tifffile import TiffFile, imread
 from fishtools.preprocess.deconv import _compute_range
 from fishtools.utils.pretty_print import progress_bar
 
-logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
-import jax
-
-jax.config.update("jax_platform_name", "cpu")
-
 
 def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32) -> npt.NDArray:
     """
@@ -321,6 +316,7 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
     basic = cast(
         dict[Literal[560, 650, 750], BaSiC], pickle.loads((path / "basic" / f"{name}.pkl").read_bytes())
     )
+    # basic = {c: pickle.loads((path / f"basic_{c}.pkl").read_bytes()) for c in [560, 650, 750]}
 
     def f_read(files: list[Path]):
         logger.info("Read thread started.")
