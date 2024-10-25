@@ -1,5 +1,5 @@
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Literal
 
@@ -50,8 +50,12 @@ def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
 
     download_gtf_fasta(path / species, species)
     with ThreadPoolExecutor() as exc:
-        exc.submit(run_jellyfish, path / species)
-        exc.submit(bowtie_build, path / species / "cdna_ncrna_trna.fasta", "txome")
+        futs = [
+            exc.submit(run_jellyfish, path / species),
+            exc.submit(bowtie_build, path / species / "cdna_ncrna_trna.fasta", "txome")
+        ]
+        for fut in as_completed(futs):
+            fut.result()
     Dataset(path / species)  # test all components
 
 @main.command()

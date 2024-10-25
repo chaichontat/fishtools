@@ -43,10 +43,13 @@ def gen_fasta(seqs: Iterable[str], *, names: Iterable[Any] | None = None) -> io.
 def bowtie_build(fasta_path: Path | str, name: str) -> bytes | None:
     fasta_path = Path(fasta_path)
     logger.info(f"Generating bowtie2 index for {name}")
-    return subprocess.run(
+    res = subprocess.run(
         ["bowtie2-build", fasta_path.as_posix(), (fasta_path.parent / name).as_posix()],
         check=True,
     ).stdout
+    if not Path(fasta_path.parent / f"{name}.1.bt2").exists():
+        raise FileNotFoundError(f"Bowtie2 index not found for {name}. Bowtie2 build failed.")
+    return res
 
 
 def gen_bowtie_index(fasta: str, path: Path | str, name: str) -> bytes | None:
@@ -85,7 +88,7 @@ def run_bowtie(
                 # --score-min L,0,-0.6 f(x) = -0.6*read_length
                 f"bowtie2 -x {reference} -U - "
                 f"--no-hd -t {f'-k {n_return}' if n_return > 0 else '-a'} --local -D 20 -R 3 "
-                f"--score-min L,{threshold*2},0 --mp 1,1 --ignore-quals {'-f ' if fasta else ''}"
+                f"--score-min L,{threshold * 2},0 --mp 1,1 --ignore-quals {'-f ' if fasta else ''}"
                 f"-N 0 -L {seed_length} -i C,2 -p {threads} {'--norc ' if no_reverse else ''} {'--nofw ' if no_forward else ''}"
             ),
             input=stdin,

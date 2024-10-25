@@ -142,6 +142,8 @@ def run_jellyfish(path: Path | str):
             minimum=10,
             counter=4,
         )
+        if not Path("cdna18.jf").exists():
+            raise FileNotFoundError("cdna18.jf not found. Jellyfish run failed.")
 
 
 @check_if_exists(
