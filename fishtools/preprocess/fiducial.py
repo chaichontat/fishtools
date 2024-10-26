@@ -9,7 +9,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import rich
-import rich_click as click
 from astropy.stats import SigmaClip, sigma_clipped_stats
 from loguru import logger
 from photutils.background import Background2D, MedianBackground
@@ -33,15 +32,28 @@ def find_spots(
     threshold_sigma: float,
     fwhm: float,
 ):
+    """Fit Gaussians to the image and find peaks.
+
+    Args:
+        data: np.ndarray of an image.
+        threshold_sigma: fits with > this std.dev over the median of the image are considered spots.
+        fwhm: Full width at half maximum of the Gaussian. Larger values will find more spots.
+
+    Returns:
+        pl.DataFrame: Sorted by magnitude (brightest first).
+    """
     assert np.sum(data) > 0
     # iraffind = DAOStarFinder(threshold=3.0 * std, fwhm=4, sharplo=0.2, exclude_border=True)
-    mean, median, std = sigma_clipped_stats(data, sigma=threshold_sigma + 5)
+    _mean, median, std = sigma_clipped_stats(data, sigma=threshold_sigma + 5)
     # You don't want need to subtract the mean here, the median is subtracted in the call three lines below.
     iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
     try:
-        return pl.DataFrame(iraffind(data - median).to_pandas()).with_row_count("idx")
-    except AttributeError as e:
-        return pl.DataFrame()
+        df = pl.DataFrame(iraffind(data - median).to_pandas()).sort("mag").with_row_count("idx")
+    except AttributeError:
+        df = pl.DataFrame()
+    if len(df) < 4:
+        raise NotEnoughSpots
+    return df
 
 
 def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2):
@@ -62,13 +74,24 @@ def _calculate_drift(
     target_points: pl.DataFrame,
     *,
     initial_drift: np.ndarray | None = None,
+    use_brightest: int = 0,
     # subtract_background: bool = False,
     plot: bool = False,
     precision: int = 2,
 ):
     """scipy ordering is based on (z, y, x) like the image dimensions."""
 
+    if len(target_points) > 1000:
+        logger.warning(
+            f"WARNING: a lot ({len(target_points)}) of fiducials found. "
+            "This may be noise and is slow. "
+            "Please reduce FWHM or increase threshold."
+        )
+
     cols = ["xcentroid", "ycentroid"]
+
+    if use_brightest:
+        target_points = target_points.sort("mag", descending=True)[:use_brightest]
 
     # points = moving[cols].to_numpy()
     if initial_drift is None:
@@ -77,9 +100,7 @@ def _calculate_drift(
     target_points = target_points.with_columns(
         xcentroid=pl.col("xcentroid") + initial_drift[0],
         ycentroid=pl.col("ycentroid") + initial_drift[1],
-    ).sort("mag")
-
-    print(target_points)
+    )
 
     dist, idxs = ref_kd.query(target_points[cols], workers=2)
     mapping = pl.concat(
@@ -97,17 +118,6 @@ def _calculate_drift(
         dy=pl.col("ycentroid_fixed") - pl.col("ycentroid"),
     )
 
-    if len(joined) > 1000:
-        logger.warning(
-            f"WARNING: a lot ({len(joined)}) of fiducials found. "
-            "This may be noise and is slow. "
-            "Please reduce FWHM or increase threshold."
-        )
-
-    if len(joined) < 2:
-        logger.warning(f"WARNING: not enough fiducials found {len(joined)}. Using initial alignment")
-        return np.round([0, 0], precision)
-
     def mode(data: np.ndarray):
         bin_size = 0.5
         bins = np.arange(min(data), max(data) + bin_size, bin_size)
@@ -119,23 +129,28 @@ def _calculate_drift(
         return (bins[i] + bins[i + 1]) / 2
 
     if plot:
-        fig, axs = plt.subplots(ncols=2, nrows=1, figsize=(8, 4), dpi=200)
+        _, axs = plt.subplots(ncols=2, nrows=1, figsize=(8, 4), dpi=200)
         axs = axs.flatten()
         axs[0].hist(joined["dx"], bins=100)
         axs[1].hist(joined["dy"], bins=100)
 
-    if np.allclose(initial_drift, np.zeros(2)):
+    if np.allclose(initial_drift, np.zeros(2)) and len(joined) > 30:
         if joined["dx"].sum() == 0 and joined["dy"].sum() == 0:
             raise ValueError("No drift found. Reference passed?")
-        res = np.array([mode(joined["dx"]), mode(joined["dy"])])
-    else:
-        print(joined)
+        res = np.array([mode(joined["dx"]), mode(joined["dy"])])  # type: ignore
+    elif len(joined) < 8:
+        # use weighted mean
         drift = joined.select(dx=pl.col("dx") * pl.col("flux"), dy=pl.col("dy") * pl.col("flux")).sum()
-        print(drift)
-        drift = np.array(drift) / joined["flux"].sum()
+        drift = np.array(drift).squeeze() / joined["flux"].sum()
+        res = initial_drift + drift
+    else:
+        drift = joined[["dx", "dy"]].median().to_numpy().squeeze()
         res = initial_drift + drift
 
     return np.round(res, precision)
+
+
+class NotEnoughSpots(Exception): ...
 
 
 def run_fiducial(
@@ -145,59 +160,87 @@ def run_fiducial(
     debug: bool = False,
     name: str = "",
     threshold_sigma: float = 3,
-    threshold_fiducial: float = 0.3,
+    threshold_residual: float = 0.3,
     fwhm: float = 4,
 ):
     if subtract_background:
         ref = ref - background(ref)
-    # try:
-    fixed = find_spots(ref, threshold_sigma=threshold_sigma, fwhm=fwhm).sort("mag")
-    if not len(fixed):
-        raise ValueError("No spots found on reference image.")
-    if len(fixed) < 2:
-        raise ValueError("Not enough spots found on reference image.")
-    # except Exception as e:
-    #     logger.error(f"Cannot find reference spots. {e}")
-    #     return lambda *args, **kwargs: np.zeros(2)
 
-    print(fixed)
+    _attempt = 0
+    thr = threshold_sigma
+    while _attempt < 4:
+        try:
+            fixed = find_spots(ref, threshold_sigma=thr, fwhm=fwhm)
+        except NotEnoughSpots:
+            logger.warning(
+                "Not enough spots found on reference image. Trying to find spots with lower threshold."
+            )
+            thr -= 0.5
+            _attempt += 1
+            continue
+        else:
+            if len(fixed) > 1500:
+                raise ValueError(
+                    f"Too many spots ({len(fixed)} > 1500) found on the reference image. Please increase threshold_sigma or reduce FWHM."
+                )
+            # Find steepest slope
+            fixed = fixed[: max(np.argmax(np.diff(fixed["mag"])), 2, len(fixed) // 4)]
+            break
+    else:
+        raise NotEnoughSpots("Could not find spots on reference after 4 attempts.")
 
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
-    def inner(img: np.ndarray, *, limit: int = 4, bitname: str = ""):
+    def inner(img: np.ndarray, *, limit: int = 4, bitname: str = "", local_σ: float = threshold_sigma):
         if subtract_background:
             img = img - background(img)
-        moving = find_spots(img, threshold_sigma=threshold_sigma, fwhm=fwhm)
-        if len(moving) < 3:
-            logger.warning("Not enough fiducials. Setting zero.")
-            return np.round([0, 0])
-        # if len(moving) < 0.75 * len(fixed):
-        #     kd_ = cKDTree(fixed[: len(moving)][["xcentroid", "ycentroid"]])
-        # else:
-        #     kd_ = kd
 
-        logger.debug(f"{bitname}: {len(moving)} peaks found on target image.")
+        _attempt = 0
+        residual = np.inf
+        drift = np.array([0, 0])
 
-        initial_drift = np.zeros(2)
-        assert limit > 0
-        for n in range(limit):
-            drift = _calculate_drift(kd, fixed, moving, initial_drift=initial_drift)
-            residual = np.hypot(*(drift - initial_drift))
-            if n == 0:
-                logger.debug(f"{bitname} - attempt {n}: starting drift: {drift}.")
+        # Iteratively reduce threshold_sigma until we get enough fiducials.
+        while _attempt < 3:
+            try:
+                moving = find_spots(img, threshold_sigma=local_σ, fwhm=fwhm)
+                moving = moving[: max(np.argmax(np.diff(moving["mag"])), 2, len(moving) // 4)]
+
+                logger.debug(f"{bitname}: {len(moving)} peaks found on target image.")
+
+                initial_drift = np.zeros(2)
+                assert limit > 0
+                for n in range(limit):
+                    # Can raise NotEnoughSpots
+                    drift = _calculate_drift(
+                        kd, fixed, moving, initial_drift=initial_drift, use_brightest=1000
+                    )
+                    residual = np.hypot(*(drift - initial_drift))
+                    if n == 0:
+                        logger.debug(f"{bitname} - attempt {n}: starting drift: {drift}.")
+                    else:
+                        logger.debug(
+                            f"{bitname} - attempt {n}: new drift: {drift} Δ from last {residual:.2f}px."
+                        )
+                    if residual < threshold_residual:
+                        return drift
+                    initial_drift = drift
+            except NotEnoughSpots:
+                _attempt += 1
+                local_σ -= 0.5
+                logger.warning(f"Not enough spots. Attempt {_attempt}. σ threshold: {threshold_sigma}")
             else:
-                logger.debug(f"{bitname} - attempt {n}: new drift: {drift} Δ from last {residual:.2f}px.")
-            if residual < threshold_fiducial:
-                return drift
-            initial_drift = drift
+                break
+        else:
+            logger.critical(f"Could not find spots after {_attempt} attempts.")
+            raise NotEnoughSpots
 
         if np.hypot(*drift) > 40:
             logger.warning(f"{bitname}: drift too large {np.hypot(*drift):.2f}.")
 
-        if residual > 0.5:  # type: ignore
-            logger.warning(f"{bitname}: residual drift too large {residual=:2f}.")  # type: ignore
-        return drift  # type: ignore
+        if residual > threshold_residual:
+            logger.warning(f"{bitname}: residual drift too large {residual=:2f}.")
+        return drift
 
     return inner
 
@@ -222,7 +265,7 @@ def align_phase(
             futs[k] = exc.submit(phase_shift, fids[ref], img)
 
             if debug:
-                # Force single-thread
+                # Force print in order
                 logger.debug(f"{k}: {futs[k].result()}")
 
     return {k: v.result().astype(float) for k, v in futs.items()} | {ref: np.zeros(2)}
@@ -238,7 +281,7 @@ def align_fiducials(
     debug: bool = False,
     max_iters: int = 4,
     threshold_sigma: float = 3,
-    threshold_fiducial: float = 0.3,
+    threshold_residual: float = 0.3,
     fwhm: float = 4,
 ) -> dict[str, np.ndarray[float, Any]]:
     keys = list(fids.keys())
@@ -256,7 +299,7 @@ def align_fiducials(
         debug=debug,
         name=ref,
         threshold_sigma=threshold_sigma,
-        threshold_fiducial=threshold_fiducial,
+        threshold_residual=threshold_residual,
         fwhm=fwhm,
     )
     with ThreadPoolExecutor(threads if not debug else 1) as exc:

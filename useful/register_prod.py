@@ -1,7 +1,5 @@
 # %%
-
 import json
-import logging
 import pickle
 import sys
 from collections.abc import Callable
@@ -15,80 +13,20 @@ import tifffile
 import toml
 from basicpy import BaSiC
 from loguru import logger
-from pydantic import BaseModel, Field
 from scipy import ndimage
 from scipy.ndimage import shift
 from tifffile import TiffFile
 
 from fishtools import align_fiducials
 from fishtools.preprocess.chromatic import Affine
-from fishtools.preprocess.config import ChannelConfig, Config, Fiducial, RegisterConfig
+from fishtools.preprocess.config import ChannelConfig, Config, Fiducial, NumpyEncoder, RegisterConfig
 from fishtools.preprocess.deconv import scale_deconv
 
-logging.getLogger("jax._src.xla_bridge").setLevel(logging.WARNING)
-import jax  # noqa: E402
-
-jax.config.update("jax_platform_name", "cpu")
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
 if TYPE_CHECKING:
     from loguru import Logger
 
-
-class Fiducial(BaseModel):
-    fwhm: float = Field(
-        default=4.0,
-        description="Full width at half maximum for fiducial spot detection. The higher this is, the more spots will be detected.",
-    )
-    threshold: float = Field(
-        default=3.0,
-        description="Threshold for fiducial spot detection in standard deviation above the median.",
-    )
-    priors: dict[str, tuple[float, float]] | None = Field(
-        default=None,
-        description="Shifts to apply before alignment. Name must match round name.",
-    )
-    overrides: dict[str, tuple[float, float]] | None = Field(
-        default=None,
-        description="Overrides for fiducial spot detection. Name must match round name.",
-    )
-
-
-class RegisterConfig(BaseModel):
-    class Config:
-        arbitrary_types_allowed = True
-
-    fiducial: Fiducial
-    downsample: int = Field(default=1, description="Downsample factor")
-    reduce_bit_depth: int = Field(
-        default=0,
-        description="Reduce bit depth by n bits. 0 to disable. This is to assist in compression of output intended for visualization.",
-    )
-    crop: int = Field(
-        default=25,
-        description="Pixels to crop from each edge. This is to account for translation during alignment.",
-    )
-    slices: list[tuple[int | None, int | None]] | slice = Field(
-        default=[slice(None)], description="Slice range to use for registration"
-    )
-    split_channels: bool = False
-    chromatic_shifts: dict[str, Annotated[str, "path for 560to{channel}.txt"]]
-
-
-class ChannelConfig(BaseModel):
-    discards: dict[str, list[str]] = Field(
-        description="In case of duplicated key(s), discard the ones from the file in value."
-    )
-
-
-class Config(BaseModel):
-    dataPath: str
-    registration: RegisterConfig
-    channels: ChannelConfig | None = None
-    basic_template: dict[str, Annotated[str, "path for basic_{channel}.pkl"]] | None = None
-
-
-# print(json.dumps(Config.model_json_schema()))
 
 # %%
 
@@ -96,10 +34,6 @@ DATA = Path("/fast2/fishtools/data")
 
 
 # %%
-
-
-# %%
-
 
 As = {}
 ats = {}
@@ -306,7 +240,6 @@ def run(
         logger.info(f"Skipping {idx}")
         return
 
-    # print(sorted(Path(path).glob(f"*/*-{idx:04d}.tif")))
     # Convert file name to bit
     _imgs: list[Image] = [
         Image.from_file(file, discards=config.channels and config.channels.discards)
@@ -396,24 +329,21 @@ def run(
                 shifts[prior_mapping[name]][0] += sh[0]
                 shifts[prior_mapping[name]][1] += sh[1]
 
-    # if config.registration.fiducial.overrides is not None:
-    #     for name, sh in config.registration.fiducial.overrides.items():
-    #         for file in fids:
-    #             if file.startswith(name):
-    #                 shifts[file][0] = sh[0]
-    #                 shifts[file][1] = sh[1]
-    #                 break
-    #         else:
-    #             raise ValueError(f"Could not find file that starts with {name} for override shift.")
-
-    del fids
-    for _img in imgs.values():
-        del _img.fid, _img.fid_raw
     (shift_path := path / f"shifts--{roi}").mkdir(exist_ok=True)
 
+    _fid_ref = fids[reference][::4, ::4].flatten()
     with open(shift_path / f"shifts-{idx:04d}.json", "w") as f:
-        json.dump({k: v.tolist() for k, v in shifts.items()}, f)
+        json.dump(
+            {
+                k: {"shifts": v.tolist(), "corr": np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1]}
+                for k, v in shifts.items()
+            },
+            f,
+        )
 
+    del fids, _fid_ref
+    for _img in imgs.values():
+        del _img.fid, _img.fid_raw
     channels: dict[str, str] = {}
     for img in imgs.values():
         channels |= dict(zip(img.bits, img.powers))
@@ -515,8 +445,8 @@ def run(
         metadata={
             "key": keys,
             "axes": "ZCYX",
-            "shifts": shifts,
-            "config": config.model_dump_json(),
+            "shifts": json.dumps(shifts, cls=NumpyEncoder),
+            "config": json.dumps(config.model_dump(), cls=NumpyEncoder),
         },
     )
 
@@ -605,7 +535,7 @@ def main(
                         # "8_16_24": (-160, -175),
                         # "25_26_27": (-160, -175),
                         # "dapi_29_polyA": (10, 30),
-                        # "1_9_17": (-21, -18)
+                        "polyA_1_9_17": (-21, -18)
                     },
                     overrides={
                         # "polyA_1_9_17": (12.01, -12.43),

@@ -1,6 +1,15 @@
+from json import JSONEncoder
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+import numpy as np
+from pydantic import BaseModel, Field, PlainSerializer
+
+
+class NumpyEncoder(JSONEncoder):
+    def default(self, o):  # type: ignore
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return super().default(o)
 
 
 class Fiducial(BaseModel):
@@ -36,7 +45,7 @@ class RegisterConfig(BaseModel):
         default=30,
         description="Pixels to crop from each edge. This is to account for translation during alignment.",
     )
-    slices: list[tuple[int | None, int | None]] | slice = Field(
+    slices: Annotated[list[tuple[int | None, int | None]] | slice, PlainSerializer(lambda x: str(x))] = Field(
         default=[slice(None)], description="Slice range to use for registration"
     )
     split_channels: bool = False
