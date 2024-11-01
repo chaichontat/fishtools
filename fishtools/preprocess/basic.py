@@ -1,12 +1,10 @@
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+from basicpy import BaSiC
 from loguru import logger
-
-if TYPE_CHECKING:
-    from basicpy import BaSiC
 
 
 def fit_basic(imgs: np.ndarray[np.float32, Any], c: int):
