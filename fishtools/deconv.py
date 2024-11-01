@@ -225,7 +225,7 @@ def rescale(img: cp.ndarray, scale: float):
 
 # %%
 DATA = Path("/fast2/fishtools/data")
-make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=9)
+make_projector(Path(DATA / "PSF GL.tif"), step=4, max_z=9)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 
@@ -272,7 +272,8 @@ channels = [560, 650, 750]
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
-def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite: bool):
+@click.option("--n-fid", type=int, default=1)
+def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite: bool, n_fid: int):
     """GPU-accelerated very accelerated 3D deconvolution.
 
     Separate read and write threadsin order to have an image ready for the GPU at all times.
@@ -286,12 +287,13 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
             We don't want to deconvolve the blanks in round 1.
         limit: Limit the total number of images to deconvolve. Mainly for debugging.
         overwrite: Overwrite existing deconvolved images.
+        n_fid: Number of fiducial frames.
     """
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
 
     bits = name.split("_")
-    files = [f for f in sorted(path.glob(f"{name}*/{name}-*.tif")) if "analysis/deconv" not in str(f)]
+    files = [f for f in sorted(path.glob(f"{name}--*/{name}-*.tif")) if "analysis/deconv" not in str(f)]
     if ref is not None:
         ok_idxs = {
             int(f.stem.split("-")[1])
@@ -308,7 +310,7 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
 
     if not overwrite:
         files = [f for f in files if not (out / f.parent.name / f.name).exists()]
-        logger.info(f"Not overwriting. 2: {len(files)} files.")
+        logger.info(f"Running {len(files)} files.")
 
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
@@ -325,11 +327,8 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
                 continue
             logger.debug(f"Reading {file.name}")
             img = imread(file)
-            fid = img[[-1]]
-            if img.reshape(-1, 2048, 2048).shape[0] < 2:
-                logger.warning(f"Image {file.name} has only 1 channel. Skipping.")
-                continue
-            nofid = img[:-1].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
+            fid = np.atleast_3d(img[-n_fid:])
+            nofid = img[:-n_fid].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
             with tifffile.TiffFile(file) as tif:
                 try:
                     metadata = tif.shaped_metadata[0]  # type: ignore
@@ -339,7 +338,7 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
             logger.debug(f"Finished reading {file.name}")
             for i, c in enumerate(channels):
                 if i < nofid.shape[1]:
-                    nofid[:, i] = basic[c].transform(np.array(nofid[:, i]))
+                    nofid[:, i] = basic[str(c)].transform(np.array(nofid[:, i]))
             q_img.put((file, nofid, fid, metadata))
 
     def f_write():
@@ -403,10 +402,11 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
-def batch(path: Path, *, ref: Path | None, limit: int | None, overwrite: bool):
+@click.option("--n-fid", type=int, default=1)
+def batch(path: Path, *, ref: Path | None, limit: int | None, overwrite: bool, n_fid: int):
     rounds = sorted({p.name.split("--")[0] for p in path.iterdir() if "--" in p.name and p.is_dir()})
     for r in rounds:
-        run.callback(path, name=r, ref=ref, limit=limit, overwrite=overwrite)  # type: ignore
+        run.callback(path, name=r, ref=ref, limit=limit, overwrite=overwrite, n_fid=n_fid)  # type: ignore
 
 
 if __name__ == "__main__":
