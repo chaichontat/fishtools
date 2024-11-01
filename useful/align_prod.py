@@ -236,7 +236,17 @@ def optimize(
 )
 @click.option("--threads", "-t", type=int, default=13)
 @click.option("--overwrite", is_flag=True)
-def batch(path: Path, global_scale: Path, codebook_path: Path, threads: int = 13, overwrite: bool = False):
+@click.option("--subsample-z", type=int, default=3)
+@click.option("--limit-z", type=int, default=None)
+def batch(
+    path: Path,
+    global_scale: Path,
+    codebook_path: Path,
+    threads: int = 13,
+    overwrite: bool = False,
+    subsample_z: int = 1,
+    limit_z: int | None = None,
+):
     return _batch(
         sorted(path.glob("reg*.tif")),
         "run",
@@ -246,6 +256,8 @@ def batch(path: Path, global_scale: Path, codebook_path: Path, threads: int = 13
             "--codebook",
             codebook_path.as_posix(),
             "--overwrite" if overwrite else "",
+            f"--subsample-z={subsample_z}",
+            f"--limit-z={limit_z}",
         ],
         threads=threads,
     )
@@ -453,6 +465,8 @@ def append_json(
 @click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--round", "round_num", type=int, default=None)
 @click.option("--calc-deviations", is_flag=True)
+@click.option("--subsample-z", type=int, default=1)
+@click.option("--limit-z", type=int, default=None)
 @click.option("--debug", is_flag=True)
 @click.option(
     "--codebook",
@@ -461,12 +475,15 @@ def append_json(
 )
 def run(
     path: Path,
+    *,
     global_scale: Path | None,
     codebook_path: Path,
     round_num: int | None = None,
     overwrite: bool = False,
     debug: bool = False,
     calc_deviations: bool = False,
+    subsample_z: int = 1,
+    limit_z: int | None = None,
 ):
     """
     Run spot calling.
@@ -521,7 +538,7 @@ def run(
     stack = make_fetcher(
         path,
         np.s_[
-            slice(None, None, 3) if calc_deviations else slice(None),
+            slice(None, limit_z, subsample_z),
             [bit_mapping[k] for k in used_bits],
         ],
     )

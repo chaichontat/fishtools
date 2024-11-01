@@ -12,7 +12,7 @@ import rich_click as click
 from loguru import logger
 from tifffile import TiffFile, imread, imwrite
 
-from fishtools.analysis.tileconfig import TileConfiguration
+from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.pretty_print import progress_bar
 
 
@@ -145,19 +145,35 @@ def copy_registered(reference_path: Path, actual_path: Path):
 
 
 def extract_channel(
-    path: Path, out: Path, idx: int, *, trim: int = 0, downsample: int = 1, reduce_bit_depth: int = 0
+    path: Path,
+    out: Path,
+    *,
+    idx: int | None = None,
+    trim: int = 0,
+    max_proj: bool = False,
+    downsample: int = 1,
+    reduce_bit_depth: int = 0,
 ):
+    if max_proj and idx is not None:
+        raise ValueError("Cannot use idx with max_proj")
+
     with TiffFile(path) as tif:
         if trim < 0:
             raise ValueError("Trim must be positive")
 
-        if len(tif.pages) == 1 and tif.pages[0].asarray().ndim == 3:
+        if max_proj:
+            img = np.atleast_3d(tif.asarray()).max(axis=0)
+        elif len(tif.pages) == 1 and tif.pages[0].asarray().ndim == 3:
             img = tif.pages[0].asarray()[idx]
         else:
             img = tif.pages[idx].asarray()
 
         img = img[trim:-trim:downsample, trim:-trim:downsample] if trim else img[::downsample, ::downsample]
-        img >>= reduce_bit_depth
+        if reduce_bit_depth:
+            if img.dtype != np.uint16:
+                raise ValueError("Cannot reduce bit depth if image is not uint16")
+            img >>= reduce_bit_depth
+
         imwrite(
             out,
             img,
@@ -183,11 +199,13 @@ def cli(): ...
 @click.option("--threshold", type=float, default=0.4)
 @click.option("--downsample", "-d", type=int, default=2)
 @click.option("--overwrite", is_flag=True)
+@click.option("--max-proj", is_flag=True)
 def register(
     path: Path,
     position_file: Path,
     *,
     idx: int | None = None,
+    max_proj: bool = False,
     recreate: bool = False,
     overwrite: bool = False,
     downsample: int = 2,
@@ -198,7 +216,7 @@ def register(
     def get_idx(path: Path):
         return int(path.stem.split("-")[1])
 
-    if idx is not None:
+    if max_proj or idx is not None:
         (out_path := path / "stitch").mkdir(exist_ok=True)
         logger.info(f"Found {len(imgs)} files. Extracting channel {idx} to {out_path}.")
         with progress_bar(len(imgs)) as callback, ThreadPoolExecutor(6) as exc:
@@ -208,7 +226,14 @@ def register(
                 if (out_path / out_name).exists() and not overwrite:
                     continue
                 futs.append(
-                    exc.submit(extract_channel, path, out_path / out_name, idx, downsample=downsample)
+                    exc.submit(
+                        extract_channel,
+                        path,
+                        out_path / out_name,
+                        idx=idx,
+                        max_proj=max_proj,
+                        downsample=downsample,
+                    )
                 )
 
             for f in as_completed(futs):
@@ -224,10 +249,7 @@ def register(
         tileconfig = TileConfiguration.from_pos(
             pd.read_csv(position_file, header=None).iloc[sorted(files_idx)], downsample=downsample
         )
-        tileconfig.write(
-            out_path / "TileConfiguration.txt",
-            file_names=[file.name for file in files] if idx is None else None,
-        )
+        tileconfig.write(out_path / "TileConfiguration.txt")
         logger.info(f"Created TileConfiguration at {out_path}.")
         logger.info("Running first.")
         run_imagej(out_path, compute_overlap=True, fuse=False, threshold=threshold, name="TileConfiguration")

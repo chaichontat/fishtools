@@ -12,7 +12,9 @@ from loguru import logger
 @click.option("--rounds", type=int, default=10)
 def run(path: Path, codebook_path: Path, rounds: int = 10):
     if not len(list(path.glob("registered--*"))):
-        raise ValueError("No registered images found.")
+        raise ValueError(
+            "No registered images found. Verify that you're in the base working directory, not the registered folder."
+        )
 
     try:
         existing = len(Path(path / f"opt_{codebook_path.stem}" / "global_scale.txt").read_text().splitlines())
@@ -35,6 +37,7 @@ def run(path: Path, codebook_path: Path, rounds: int = 10):
                 "--codebook",
                 codebook_path,
                 "--batch-size=50",
+                "--subsample-z=3",
                 f"--round={i}",
                 "--threads=16",
                 "--overwrite",

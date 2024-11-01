@@ -5,27 +5,23 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import polars as pl
-import pyparsing as pp
 import seaborn as sns
 from loguru import logger
-from pydantic import BaseModel, TypeAdapter
 from rtree import index
-from shapely import Point, Polygon, STRtree, contains, intersection
-from tifffile import imread
+from shapely import Point, Polygon, STRtree, intersection
 
-from fishtools.analysis.tileconfig import TileConfiguration
+from fishtools.preprocess.tileconfig import TileConfiguration
 
 sns.set_theme()
-codebook = "tricycleplus"
-roi = "left"
+codebook = "genestar"
+roi = "whole_embryo"
 # registered--{roi}
-path = Path(f"/mnt/working/e155trcdeconv/registered--{roi}")
+path = Path(f"/mnt/working/lai/registered--{roi}")
 files = sorted(file for file in Path(path / codebook).glob("*.pkl") if "opt" not in file.stem)
 
 coords = TileConfiguration.from_file(
-    Path(path.parent / f"fids--{roi}" / "TileConfiguration.registered.txt")
+    Path(path.parent / f"registered--{roi}" / "stitch/TileConfiguration.registered.txt")
     # Path(path / "stitch" / "TileConfiguration.registered.txt")
 ).df
 # assert len(files) == len(coords)
@@ -147,15 +143,18 @@ def process(out: list, curr: int, filter_: bool = True):
 
 with ThreadPoolExecutor(8) as exc:
     out = []
-    futs = [exc.submit(process, out, i, filter_=False) for i in range(len(files[:]))]
-    for fut in futs:
-        fut.result()
+    futs = [exc.submit(process, out, i, filter_=True) for i in range(len(files[:]))]
+    for i, fut in enumerate(futs):
+        try:
+            fut.result()
+        except Exception as e:
+            logger.error(f"Error in {files[i]}: {e}")
 # for curr in range(len(cells[:20])):
 #     process(curr)
 
 # del thrownover[curr]
 spots = pl.concat(out)
-spots.write_parquet(path / codebook / "spots_all.parquet")
+spots.write_parquet(path / codebook / "spots.parquet")
 
 # %%
 fig, axs = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
@@ -208,7 +207,7 @@ plt.tight_layout()
 # %%
 genes = sorted(pergene["target"])
 dark = False
-fig, axs = plt.subplots(ncols=20, nrows=15, figsize=(72, 36), dpi=100, facecolor="black" if dark else "white")
+fig, axs = plt.subplots(ncols=20, nrows=15, figsize=(72, 36), dpi=160, facecolor="black" if dark else "white")
 axs = axs.flatten()
 for ax, gene in zip(axs, genes):
     selected = spots.filter(pl.col("target") == gene)
