@@ -29,6 +29,7 @@ class Fiducial(BaseModel):
         default=None,
         description="Overrides for fiducial spot detection. Name must match round name.",
     )
+    n_fids: int = Field(default=1, description="Number of fiducial frames in each image.")
 
 
 class RegisterConfig(BaseModel):

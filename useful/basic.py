@@ -18,7 +18,7 @@ from fishtools.preprocess.deconv import scale_deconv
 sns.set_theme()
 
 
-def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4,)):
+def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4,), deconv: bool = False):
     # TODO: Get channel info.
     nc = round_.split("_").__len__()
 
@@ -29,12 +29,16 @@ def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4
 
     files = list((path).glob(f"{round_}*/*.tif"))
 
+    if len(files) < 100:
+        raise ValueError(f"Not enough files ({len(files)}). Need at least 100 to be somewhat reliable.")
+
     if len(files) < 500:
         logger.warning(f"Not enough files ({len(files)}). Result may be unreliable.")
 
     n = min(len(files), 500)
     nc = len(round_.split("_"))
-    deconv_meta = np.loadtxt(path / "deconv_scaling" / f"{round_}.txt")
+    if deconv:
+        deconv_meta = np.loadtxt(path / "deconv_scaling" / f"{round_}.txt")
 
     # This is the extracted z slices from all files.
     out = np.zeros((n, len(zs), nc, 2048, 2048), dtype=np.float32)
@@ -47,12 +51,17 @@ def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4
                 for k, z in enumerate(zs):
                     try:
                         img = tif.pages[z * nc + c].asarray()
-                        out[i, k, c] = scale_deconv(
-                            img, c, name=file.name, global_deconv_scaling=deconv_meta, metadata=meta
+                        out[i, k, c] = (
+                            img
+                            if not deconv
+                            else scale_deconv(
+                                img, c, name=file.name, global_deconv_scaling=deconv_meta, metadata=meta
+                            )
                         )
+
                         if np.sum(out[i, k, c]) == 0:
-                            print(np.mean(img))
                             raise ValueError("All zeros.")
+
                     except Exception as e:
                         raise Exception(f"Error at {file},{i}, {k}, {c}.") from e
 
@@ -93,6 +102,10 @@ def run(path: Path, round_: str, *, overwrite: bool = False, channels: str = "56
     basics = _run(path, round_, plot=False, zs=tuple(map(int, zs.split(","))))
     with open(path / "basic" / f"{round_}.pkl", "wb") as f:
         pickle.dump(dict(zip(channels.split(","), basics)), f)
+    for c, basic in zip(channels.split(","), basics):
+        plot_basic(basic)
+        plt.savefig(path / "basic" / f"{round_}-{c}.png")
+        plt.close()
 
 
 @cli.command()

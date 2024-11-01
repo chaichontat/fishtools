@@ -135,7 +135,7 @@ class Image:
     CHANNELS = [f"ilm{n}" for n in ["405", "488", "560", "650", "750"]]
 
     @classmethod
-    def from_file(cls, path: Path, *, discards: dict[str, list[str]] | None = None):
+    def from_file(cls, path: Path, *, discards: dict[str, list[str]] | None = None, n_fids: int = 1):
         stem = path.stem
         name, idx = stem.split("-")
         bits = name.split("_")
@@ -177,7 +177,7 @@ class Image:
             logger.debug("No deconv_scaling found. Using ones.")
             global_deconv_scaling = np.ones((2, len(bits)))
 
-        nofid = img[:-1].reshape(-1, len(powers), 2048, 2048)
+        nofid = img[:-n_fids].reshape(-1, len(powers), 2048, 2048)
 
         if to_discard_idxs:
             _bits = name.split("_")
@@ -208,8 +208,8 @@ class Image:
             name=name,
             idx=int(idx),
             nofid=nofid,
-            fid=cls.loG_fids(img[-1]),
-            fid_raw=img[-1],
+            fid=cls.loG_fids(img[-n_fids:]),
+            fid_raw=img[-n_fids:],
             bits=bits,
             powers=powers,
             metadata=metadata,
@@ -219,6 +219,8 @@ class Image:
 
     @staticmethod
     def loG_fids(fid: np.ndarray):
+        if len(fid.shape) == 3:
+            temp = fid.max(axis=0)
         temp = -ndimage.gaussian_laplace(fid.astype(np.float32), sigma=3)  # type: ignore
         temp -= temp.min()
         return temp
@@ -242,7 +244,11 @@ def run(
 
     # Convert file name to bit
     _imgs: list[Image] = [
-        Image.from_file(file, discards=config.channels and config.channels.discards)
+        Image.from_file(
+            file,
+            discards=config.channels and config.channels.discards,
+            n_fids=config.registration.fiducial.n_fids,
+        )
         for file in sorted(Path(path).glob(f"*--{roi}/*-{idx:04d}.tif" if roi else f"*/*-{idx:04d}.tif"))
         if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES)
     ]
@@ -305,7 +311,7 @@ def run(
         fids,
         reference=reference,
         debug=debug,
-        max_iters=5,
+        max_iters=6,
         threshold_sigma=config.registration.fiducial.threshold,
         fwhm=config.registration.fiducial.fwhm,
     )
@@ -333,13 +339,15 @@ def run(
 
     _fid_ref = fids[reference][::4, ::4].flatten()
     with open(shift_path / f"shifts-{idx:04d}.json", "w") as f:
-        json.dump(
-            {
-                k: {"shifts": v.tolist(), "corr": np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1]}
-                for k, v in shifts.items()
-            },
-            f,
-        )
+        to_dump = {
+            k: {
+                "shifts": v.tolist(),
+                "corr": 1.0 if reference == k else np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1],
+            }
+            for k, v in shifts.items()
+        }
+        json.dump(to_dump, f)
+        logger.debug(f"Corr: {[x['corr'] for x in to_dump.values()]}")
 
     del fids, _fid_ref
     for _img in imgs.values():
@@ -535,11 +543,12 @@ def main(
                         # "8_16_24": (-160, -175),
                         # "25_26_27": (-160, -175),
                         # "dapi_29_polyA": (10, 30),
-                        "polyA_1_9_17": (-21, -18)
+                        "polyA_1_9_17": (-10, -5)
                     },
                     overrides={
                         # "polyA_1_9_17": (12.01, -12.43),
                     },
+                    n_fids=1,
                 ),
                 downsample=1,
                 crop=30,
