@@ -4,7 +4,10 @@ channels:
   - bioconda
 dependencies:
   - python=3.12
+  - astropy
+  - bowtie2
   - click
+  - colorama
   - cupy
   - jellyfish
   - imagecodecs
@@ -19,6 +22,7 @@ dependencies:
       - basicpy
       - biopython
       - kb-python
+      - primer3-py
       - pyfastx
   - polars
   - pyarrow
