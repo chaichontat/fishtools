@@ -51,7 +51,7 @@ def find_spots(
         df = pl.DataFrame(iraffind(data - median).to_pandas()).sort("mag").with_row_count("idx")
     except AttributeError:
         df = pl.DataFrame()
-    if len(df) < 4:
+    if len(df) < 6:
         raise NotEnoughSpots
     return df
 
@@ -134,23 +134,32 @@ def _calculate_drift(
         axs[0].hist(joined["dx"], bins=100)
         axs[1].hist(joined["dy"], bins=100)
 
-    if np.allclose(initial_drift, np.zeros(2)) and len(joined) > 30:
+    if np.allclose(initial_drift, np.zeros(2)) and len(joined) > 100:
         if joined["dx"].sum() == 0 and joined["dy"].sum() == 0:
             raise ValueError("No drift found. Reference passed?")
         res = np.array([mode(joined["dx"]), mode(joined["dy"])])  # type: ignore
-    elif len(joined) < 8:
-        # use weighted mean
-        drift = joined.select(dx=pl.col("dx") * pl.col("flux"), dy=pl.col("dy") * pl.col("flux")).sum()
-        drift = np.array(drift).squeeze() / joined["flux"].sum()
-        res = initial_drift + drift
-    else:
-        drift = joined[["dx", "dy"]].median().to_numpy().squeeze()
-        res = initial_drift + drift
+        if np.hypot(*res).sum() < 40:
+            return np.round(res, precision)
+
+    # if len(joined) < 8:
+    #     # use weighted mean
+    #     drift = joined.select(dx=pl.col("dx") * pl.col("flux"), dy=pl.col("dy") * pl.col("flux")).sum()
+    #     drift = np.array(drift).squeeze() / joined["flux"].sum()
+    #     res = initial_drift + drift
+    # else:
+    drifts = joined[["dx", "dy"]].to_numpy()
+    drift = np.median(drifts)
+    cv = np.std(drifts, axis=0) / np.mean(drifts, axis=0)
+    logger.debug(f"drift: {drift} CV: {cv:04f}.")
+    res = initial_drift + drift
 
     return np.round(res, precision)
 
 
 class NotEnoughSpots(Exception): ...
+
+
+class ResidualTooLarge(Exception): ...
 
 
 def run_fiducial(
@@ -168,7 +177,7 @@ def run_fiducial(
 
     _attempt = 0
     thr = threshold_sigma
-    while _attempt < 4:
+    while _attempt < 6:
         try:
             fixed = find_spots(ref, threshold_sigma=thr, fwhm=fwhm)
         except NotEnoughSpots:
@@ -184,7 +193,7 @@ def run_fiducial(
                     f"Too many spots ({len(fixed)} > 1500) found on the reference image. Please increase threshold_sigma or reduce FWHM."
                 )
             # Find steepest slope
-            fixed = fixed[: max(np.argmax(np.diff(fixed["mag"])), 2, len(fixed) // 4)]
+            fixed = fixed[: max(np.argmax(np.diff(fixed["mag"])), 10, len(fixed) // 4)]
             break
     else:
         raise NotEnoughSpots("Could not find spots on reference after 4 attempts.")
@@ -201,10 +210,10 @@ def run_fiducial(
         drift = np.array([0, 0])
 
         # Iteratively reduce threshold_sigma until we get enough fiducials.
-        while _attempt < 3:
+        while _attempt < 10:
             try:
                 moving = find_spots(img, threshold_sigma=local_σ, fwhm=fwhm)
-                moving = moving[: max(np.argmax(np.diff(moving["mag"])), 2, len(moving) // 4)]
+                moving = moving[: max(np.argmax(np.diff(moving["mag"])), 10, len(moving) // 4)]
 
                 logger.debug(f"{bitname}: {len(moving)} peaks found on target image.")
 
@@ -223,12 +232,12 @@ def run_fiducial(
                             f"{bitname} - attempt {n}: new drift: {drift} Δ from last {residual:.2f}px."
                         )
                     if residual < threshold_residual:
-                        return drift
+                        break
                     initial_drift = drift
             except NotEnoughSpots:
                 _attempt += 1
                 local_σ -= 0.5
-                logger.warning(f"Not enough spots. Attempt {_attempt}. σ threshold: {threshold_sigma}")
+                logger.warning(f"Not enough spots. Attempt {_attempt}. σ threshold: {local_σ}")
             else:
                 break
         else:
@@ -236,10 +245,12 @@ def run_fiducial(
             raise NotEnoughSpots
 
         if np.hypot(*drift) > 40:
-            logger.warning(f"{bitname}: drift too large {np.hypot(*drift):.2f}.")
+            logger.warning(f"{bitname}: drift very large {np.hypot(*drift):.2f}.")
 
         if residual > threshold_residual:
-            logger.warning(f"{bitname}: residual drift too large {residual=:2f}.")
+            raise ResidualTooLarge(
+                f"{bitname}: residual drift too large {residual=:2f}. Please refine parameters."
+            )
         return drift
 
     return inner
