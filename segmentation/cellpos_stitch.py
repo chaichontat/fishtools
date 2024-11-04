@@ -99,9 +99,6 @@ def _splice(img1: np.ndarray, img2: np.ndarray, axis: Literal["x", "y"]):
     return np.concatenate([img1[sl_overlap_center(pos[0])], img2[sl_overlap_center(pos[1])]], axis=ax)
 
 
-# %%
-
-
 def reg_props(img: np.ndarray, to_remove: Collection[int] | None = None, include_coords: bool = False):
     df = pl.DataFrame(
         regionprops_table(img, properties=["label", "centroid"] + (["coords"] if include_coords else []))
@@ -128,12 +125,14 @@ def purge(img: np.ndarray, mode: Literal["top", "bottom", "left", "right"], tota
 
     df = reg_props(img[sl], to_remove, include_coords=True)
     assert len(df) == len(to_remove)
-    print(df)
 
     if not df.is_empty():
         df = df.with_columns(
             coords=pl.col("coords").map_elements(
-                lambda x: add_col(x, start if start >= 0 else start + img.shape[1], 1), return_dtype=pl.Object
+                lambda x: add_col(
+                    x, start if start >= 0 else start + img.shape[1], 1 if mode in {"top", "left"} else 2
+                ),
+                return_dtype=pl.Object,
             )
         )
         img[sl] = img[sl] * ~np.isin(img[sl], to_remove)
@@ -177,9 +176,10 @@ def splice(
         )
 
     if remove_crossing and add_crossing_back:
+        ax = 1 if axis == "y" else 2
         dfb = dfb.with_columns(
             coords=pl.col("coords").map_elements(
-                lambda x: add_col(x, -imgb.shape[1], column=1 if axis == "y" else 2), return_dtype=pl.Object
+                lambda x: add_col(x, -imgb.shape[ax], column=ax), return_dtype=pl.Object
             )
         )
         for row in dfb.iter_rows(named=True):
