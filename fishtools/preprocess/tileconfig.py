@@ -79,6 +79,8 @@ class TileConfiguration:
         return cls(pl.DataFrame(out))
 
     def downsample(self, factor: int) -> "TileConfiguration":
+        if factor == 1:
+            return self
         return TileConfiguration(self.df.with_columns(x=pl.col("x") / factor, y=pl.col("y") / factor))
 
     def __getitem__(self, sl: slice) -> "TileConfiguration":

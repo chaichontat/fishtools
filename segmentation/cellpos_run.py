@@ -187,13 +187,7 @@ def batch():
             continue
         print(i, x, y)
         subprocess.run(
-            [
-                "python",
-                __file__,
-                "run",
-                str(x),
-                str(y),
-            ],
+            ["python", __file__, "run", str(x), str(y)],
             check=True,
             capture_output=False,
         )

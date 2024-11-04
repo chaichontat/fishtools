@@ -1,5 +1,6 @@
 import json
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from typing import Any, Callable, Concatenate, Generator, ParamSpec, Protocol, TypeVar
 
@@ -45,10 +46,27 @@ def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
             ...
 
 
-console = Console()
-
 P = ParamSpec("P")
 R, T = TypeVar("R", covariant=True), TypeVar("T")
+
+
+@contextmanager
+def progress_bar_threadpool(n: int, *, threads: int):
+    futs: list[Future] = []
+    with progress_bar(n) as callback, ThreadPoolExecutor(threads) as exc:
+
+        def submit(f: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> Future[R]:
+            futs.append(exc.submit(f, *args, **kwargs))
+            return futs[-1]
+
+        yield submit
+
+        for f in as_completed(futs):
+            f.result()
+            callback()
+
+
+console = Console()
 
 
 # Massive hack to get rid of the first two arguments from the type signature.
