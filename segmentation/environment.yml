@@ -1,0 +1,16 @@
+name: torch
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.12
+  - loguru
+  - matplotlib
+  - pytorch
+  - pytorch-cuda=12.4
+  - rich-click
+  - torchvision
+  - tifffile
+  - pip
+  - pip:
+      - cellpose[gui]

@@ -12,9 +12,22 @@ import tifffile
 from skimage.measure import regionprops_table
 
 sns.set_theme()
-BIT = 23
-BIT_MASK = np.array(~((1 << BIT) - 1)).astype(np.uint32)
+MAX_UINT32 = np.iinfo(np.uint32).max
+BIT = 22  # 4194304 max labels per tile
 
+# The resulting image can store:
+# Original labels: 0 to (2^BIT - 1)
+# Image identifiers: up to (2^(32-BIT) - 1) different source images
+
+BIT_MASK = np.array(~((1 << BIT) - 1)).astype(np.uint32)
+assert BIT_MASK == (BIT_MASK & MAX_UINT32)
+
+X = {"left", "right"}
+Y = {"top", "bottom"}
+ANTERIOR = {"top", "left"}
+POSTERIOR = {"bottom", "right"}
+ALL = {"top", "bottom", "left", "right"}
+ALL_TYPE = Literal["top", "bottom", "left", "right"]
 
 # %%
 # %%
@@ -27,49 +40,49 @@ margin = 100
 def get_overlapping(
     img: np.ndarray,
     *,
-    pos_img: Literal["top", "bottom", "left", "right"],
+    pos_img: ALL_TYPE,
     total_overlap: int = 810,
     margin: int = 100,
 ):
-    if pos_img not in {"top", "bottom", "left", "right"}:
+    if pos_img not in ALL:
         raise ValueError(f"Unknown pos_img {pos_img}")
 
     img = np.atleast_3d(img)
-    overlap_slice = slice(-total_overlap, None) if pos_img in {"top", "left"} else slice(total_overlap)
+    overlap_slice = slice(-total_overlap, None) if pos_img in ANTERIOR else slice(total_overlap)
 
     # center = total_overlap // 2
     # slice_center = slice(center-margin, center+margin)
-    if pos_img in {"top", "bottom"}:
+    if pos_img in Y:
         return img[:, overlap_slice, :]  # [:, slice_center, :]
     else:  # mainly to get the alignment right
         return img[:, :, overlap_slice]  # [:, :, slice_center]
 
 
-def overlap_center(mode: Literal["top", "bottom", "left", "right"], total_overlap: int = 810) -> int:
+def overlap_center(mode: ALL_TYPE, total_overlap: int = 810) -> int:
     """Get the center index of the overlapped region."""
-    if mode not in {"top", "bottom", "left", "right"}:
+    if mode not in ALL:
         raise ValueError(f"Unknown pos_img {mode}")
-    if mode in {"top", "left"}:
+    if mode in ANTERIOR:
         return -total_overlap // 2
     return total_overlap // 2
 
 
-def sl_overlap_center(mode: Literal["top", "bottom", "left", "right"], *, total_overlap: int = 810):
+def sl_overlap_center(mode: ALL_TYPE, *, total_overlap: int = 810):
     """Get the center index of the overlapped region."""
-    if mode not in {"top", "bottom", "left", "right"}:
+    if mode not in ALL:
         raise ValueError(f"Unknown pos_img {mode}")
-    if mode in {"top", "left"}:
+    if mode in ANTERIOR:
         sl = slice(None, (overlap_center(mode, total_overlap)))
     else:
         sl = slice((overlap_center(mode, total_overlap)), None)
-    if mode in {"top", "bottom"}:
+    if mode in Y:
         return np.s_[:, sl]
     return np.s_[:, :, sl]
 
 
 def calc_remove_crossing(
     img: np.ndarray,
-    mode: Literal["top", "bottom", "left", "right"],
+    mode: ALL_TYPE,
     total_overlap: int = 810,
     edge_margin: int = 2,
 ):
@@ -82,7 +95,7 @@ def calc_remove_crossing(
     idx = overlap_center(mode, total_overlap)
     sl = (
         np.s_[:, idx - edge_margin : idx + edge_margin]
-        if mode in {"top", "bottom"}
+        if mode in Y
         else np.s_[:, :, idx - edge_margin : idx + edge_margin]
     )
     out = np.unique(img[sl])
@@ -117,24 +130,33 @@ def add_col(x: np.ndarray, val: int, column: int):
     return x
 
 
-def purge(img: np.ndarray, mode: Literal["top", "bottom", "left", "right"], total_overlap: int = 810):
+def purge(img: np.ndarray, mode: ALL_TYPE, total_overlap: int = 810):
     to_remove = calc_remove_crossing(img, mode)
     start = overlap_center(mode) - margin
     end = overlap_center(mode) + margin
-    sl = np.s_[:, start:end] if mode in {"top", "bottom"} else np.s_[:, :, start:end]
+    sl = np.s_[:, start:end] if mode in Y else np.s_[:, :, start:end]
 
     df = reg_props(img[sl], to_remove, include_coords=True)
     assert len(df) == len(to_remove)
+
+    for row in df.iter_rows(named=True):
+        assert np.all(row["coords"].max(axis=0) < img.shape)
 
     if not df.is_empty():
         df = df.with_columns(
             coords=pl.col("coords").map_elements(
                 lambda x: add_col(
-                    x, start if start >= 0 else start + img.shape[1], 1 if mode in {"top", "left"} else 2
+                    x,
+                    start if start >= 0 else start + img.shape[1 if mode in Y else 2],
+                    1 if mode in Y else 2,
                 ),
                 return_dtype=pl.Object,
             )
         )
+
+        for row in df.iter_rows(named=True):
+            assert np.all(row["coords"].max(axis=0) < img.shape)
+
         img[sl] = img[sl] * ~np.isin(img[sl], to_remove)
         #     highest_bit = img.flat[0] & BIT_MASK
         # print(bin(highest_bit))
@@ -145,6 +167,10 @@ def purge(img: np.ndarray, mode: Literal["top", "bottom", "left", "right"], tota
         assert reg_props(img[sl], to_remove).is_empty()
 
     return img, df
+
+
+def add_tile_id(img: np.ndarray, tile_id: int):
+    return np.where(img, img.astype(np.uint32) | np.uint32(tile_id << BIT), 0)
 
 
 def splice(
@@ -169,11 +195,10 @@ def splice(
     if idxb is None:
         img = _splice(imgt, imgb, axis=axis)
     else:
-        img = _splice(
-            imgt.astype(np.uint32),
-            np.where(imgb != 0, imgb.astype(np.uint32), np.uint32(idxb << BIT)),
-            axis=axis,
-        )
+        if np.max(imgb) >= (1 << BIT):
+            raise ValueError("imgb has too many ROIs")
+        img = _splice(imgt.astype(np.uint32), add_tile_id(imgb, idxb), axis=axis)
+        # img = np.where(img & ((1 << 23) - 1), img, 0)
 
     if remove_crossing and add_crossing_back:
         ax = 1 if axis == "y" else 2
@@ -190,20 +215,22 @@ def splice(
 
 
 # %%
-imgt = tifffile.imread("chunks/masks-00000_03982.tif")
-imgb = tifffile.imread("chunks/masks-00000_07964.tif")
+def demonstrate_splice():
+    imgt = tifffile.imread("chunks/masks-00000_03982.tif")
+    imgb = tifffile.imread("chunks/masks-00000_07964.tif")
 
-t = [
-    splice(imgt, imgb, axis="y", remove_crossing=False, add_crossing_back=False, copy=True),
-    splice(imgt, imgb, axis="y", add_crossing_back=False, copy=True),
-    splice(imgt, imgb, axis="y", copy=True),
-]
+    t = [
+        splice(imgt, imgb, axis="y", remove_crossing=False, add_crossing_back=False, copy=True),
+        splice(imgt, imgb, axis="y", add_crossing_back=False, copy=True),
+        splice(imgt, imgb, axis="y", copy=True),
+    ]
 
-fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
-axs = axs.flatten()
-for i, ax in enumerate(axs):
-    ax.axis("off")
-    ax.imshow(t[i][5, 4200:4600, 2500:3000].astype(np.uint16))
+    fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
+    axs = axs.flatten()
+    for i, ax in enumerate(axs):
+        ax.axis("off")
+        ax.imshow(t[i][5, 4200:4600, 2500:3000].astype(np.uint16))
+
 
 # %%
 
@@ -223,9 +250,8 @@ file_names = pl.DataFrame([
 for i, (idx_y, ys) in enumerate(sorted(file_names.group_by("column_1"), key=lambda x: int(x[0][0]))):
     ys = ys.sort("column_1")
 
-    imgt = tifffile.imread(ys[0, "column_0"]).astype(np.uint32) | ((i * len(ys)) << BIT)
+    imgt = add_tile_id(tifffile.imread(ys[0, "column_0"]), i * len(ys))
     for j, row in enumerate(ys[1:].iter_rows(named=True), 1):
-        print(row["column_0"])
         imgb = tifffile.imread(row["column_0"])
         imgt = splice(imgt, imgb, axis="y", idxb=i * len(ys) + j)
     print("writing to file")

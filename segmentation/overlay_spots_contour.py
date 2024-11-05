@@ -28,7 +28,7 @@ from tifffile import imread, imwrite
 
 from fishtools.preprocess.tileconfig import TileConfiguration
 
-DEBUG = True
+DEBUG = False
 sns.set_theme()
 
 
@@ -40,7 +40,7 @@ sns.set_theme()
 
 # %%
 # out = find_objects(img)
-intensity = imread("/mnt/working/lai/registered--whole_embryo/stitch/05/00/fused_00-1.tif")
+# intensity = imread("/mnt/working/lai/registered--whole_embryo/stitch/05/00/fused_00-1.tif")
 # %%
 
 # dapi = imread("/fast2/3t3clean/analysis/deconv/registered/dapi3/0/fused_1.tif").squeeze()
@@ -119,21 +119,36 @@ coords = tc.df
 minimums = (coords["x"].min(), coords["y"].min())
 
 
-idx = 0
-
-
 # # %%
 @click.command()
 @click.argument("idx", type=int)
 def run(idx: int):
     logger.info(f"{idx}: reading image.")
-    with tifffile.TiffFile("chunks/spliced-00000.tif") as tif:
+    with tifffile.TiffFile("chunks/combi.tif") as tif:
         img = tif.pages[idx].asarray()
-        img = np.where(img & ((1 << 23) - 1), img, 0)
+        # img = np.where(img & ((1 << 23) - 1), img, 0)
     # img = imread("chunks/combi_nobg.tif")[idx]
     polygons = []
     regen = np.zeros_like(img)
     cntrs = np.zeros_like(img)
+
+    spots = (
+        pl.read_parquet("/mnt/working/lai/registered--whole_embryo/genestar/spots.parquet")
+        # .filter(pl.col("tile") == "1144")
+        .with_row_index("ii")
+        .with_columns(
+            ii=pl.col("ii").cast(pl.Int64), x=pl.col("x") / 2 - minimums[0], y=pl.col("y") / 2 - minimums[1]
+        )
+    )
+    spots = (
+        spots.filter(pl.col("z").is_between((idx - 0.5) / 3, (idx + 0.5) / 3, closed="left"))
+        if not DEBUG
+        else spots
+    )
+
+    if not len(spots):
+        raise Exception(f"No spots of z={idx} loaded.")
+    logger.info(f"{idx}: {len(spots)} spots found.")
 
     logger.info(f"{idx}: finding regions.")
     props = regionprops(img)
@@ -143,8 +158,8 @@ def run(idx: int):
     @profile
     def loop(i, region):
         nonlocal area
-        if i and i % 1000 == 0:
-            logger.info(f"{idx}: {i} regions processed. Mean area: {area / 1000:.2f} px²")
+        if i and i % 5000 == 0:
+            logger.info(f"{idx}: {i} regions processed. Mean area: {area / 5000:.2f} px²")
             area = 0
 
         area += region.area
@@ -241,16 +256,6 @@ def run(idx: int):
 
     # %%
 
-    spots = (
-        pl.read_parquet("/mnt/working/lai/registered--whole_embryo/genestar/spots.parquet")
-        # .filter(pl.col("tile") == "1144")
-        .with_row_index("ii")
-        .with_columns(
-            ii=pl.col("ii").cast(pl.Int64), x=pl.col("x") / 2 - minimums[0], y=pl.col("y") / 2 - minimums[1]
-        )
-    )
-    spots = spots.filter(pl.col("z").is_between(idx - 0.5, idx + 0.5)) if not DEBUG else spots
-
     # plt.hexbin(spots['x'], spots['y'], gridsize=600)
 
     # img
@@ -305,9 +310,6 @@ def run(idx: int):
 
     ident.write_parquet(f"chunks/ident_{idx}.parquet")
 
-    # if __name__ == "__main__":
-    # run()
-
     # %%
     if DEBUG:
         fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
@@ -324,3 +326,5 @@ def run(idx: int):
 # plt.ylim(-5000, 0)
 
 # %%
+if __name__ == "__main__":
+    run()
