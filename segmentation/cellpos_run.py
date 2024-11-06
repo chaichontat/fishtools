@@ -22,7 +22,7 @@ imshow = partial(plt.imshow, zorder=1)
 
 logging.basicConfig(level=logging.INFO)
 
-path = Path("/mnt/working/lai/segment3d--left")
+# path = Path("/mnt/working/e155trcdeconv/segment3d--left")
 path_models = Path("/mnt/working/lai/segment--left/models")
 
 # name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -59,6 +59,8 @@ normalize_params = {
     "tile_norm_smooth3D": 1,
     "invert": False,
 }
+
+
 # %%
 import tifffile
 
@@ -112,7 +114,7 @@ tiles, length = get_tile_size2(4800, 448)
 print(tiles, length)
 # %%
 size = length  # 896*5
-offset = tiles[-2]  #  448 * 9  # 896*4
+offset = tiles[-1]  #  448 * 9  # 896*4
 x, y = 3, 3
 
 
@@ -142,20 +144,22 @@ def cli(): ...
 @click.argument("x", type=int)
 @click.argument("y", type=int)
 def run(x: int, y: int):
-    img = imread("temporary.tif")
+    img = imread("/mnt/working/lai/stitch--whole_embryo/fused.tif")
     # lower, upper = np.percentile(img, (1, 99.9), axis=(0, 2, 3))
 
-    img = img[:, :, y : y + size, x : x + size]
+    img = img[:25, :, y : y + size, x : x + size]
     bsize = 448
-    model = CellposeModel(gpu=True, pretrained_model=cast(bool, models[0].as_posix()))
+    model = CellposeModel(
+        gpu=True, pretrained_model=cast(bool, "/mnt/working/lai/segment--left/models/2024-11-02_16-30-54")
+    )
     masks, flows, styles = model.eval(
         img,
-        batch_size=64,
-        channels=[1, 2],
+        batch_size=24,
+        channels=[1, 3],
         normalize=cast(bool, {"tile_norm_blocksize": bsize, "norm3D": True, "percentile": (1, 99.9)}),
         anisotropy=4,
-        flow_threshold=0.8,  # 3D segmentation ignores the flow_threshold
-        cellprob_threshold=0,
+        flow_threshold=1,  # 3D segmentation ignores the flow_threshold
+        cellprob_threshold=-1,
         diameter=0,  # In order for rescale to not be ignored, we need to set diameter to 0.
         rescale=1.0,
         do_3D=True,
@@ -179,11 +183,12 @@ def run(x: int, y: int):
 
 
 @cli.command()
-def batch():
+@click.option("--overwrite", is_flag=True)
+def batch(overwrite: bool = False):
     xx, yy = np.meshgrid(np.arange(0, 26070, offset), np.arange(0, 19584, offset), indexing="ij")
     idxs = np.column_stack([xx.flat, yy.flat])
     for i, (x, y) in enumerate(idxs):
-        if (Path.cwd() / f"chunks/masks-{x:05d}_{y:05d}.pkl").exists():
+        if overwrite and (Path.cwd() / f"chunks/masks-{x:05d}_{y:05d}.pkl").exists():
             continue
         print(i, x, y)
         subprocess.run(

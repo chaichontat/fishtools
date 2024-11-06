@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO)
 path = Path("/mnt/working/lai/segment--left")
 
 
-name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "polyA"
 
 
 # %%
@@ -68,26 +68,29 @@ def train(path: Path, name: str | None = None):
         name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     output = load_train_test_data(
-        path.as_posix(), test_dir=(path / "test").as_posix(), mask_filter="_seg.npy"
+        path.as_posix(),
+        test_dir=(path.parent / "segment--test").as_posix(),
+        mask_filter="_seg.npy",
+        look_one_level_down=True,
     )
     images, labels, image_names, test_images, test_labels, image_names_test = output
 
     # e.g. retrain a Cellpose model
-    # model = CellposeModel(model_type="cyto3", gpu=True)
-    model = CellposeModel(gpu=True, pretrained_model=models[0].as_posix())
+    model = CellposeModel(model_type="cyto3", gpu=True)
+    # model = CellposeModel(gpu=True, pretrained_model=models[0].as_posix())
     model_path, train_losses, test_losses = train_seg(
         model.net,
         train_data=images,
         train_labels=labels,
         save_path=path,  # models automatically appended
-        channels=[1, 3],
+        channels=[1, 2],
         batch_size=24,
         channel_axis=0,
         test_data=test_images,
         test_labels=test_labels,
         weight_decay=1e-5,
         SGD=False,
-        learning_rate=0.0002,
+        learning_rate=0.0008,
         n_epochs=1000,
         model_name=name,
         bsize=224,
