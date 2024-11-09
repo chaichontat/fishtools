@@ -29,7 +29,7 @@ def scale_image_2x_optimized(image: np.ndarray):
 
 # %%
 # model_type='cyto' or model_type='nuclei'
-model = models.CellposeModel(gpu=True, pretrained_model="/fast2/3t3clean/CP_3t3dapi")
+model = models.CellposeModel(gpu=True, pretrained_model="/fast2/3t3clean/CP_dapi_polyA")
 # %%
 
 dapi = imread("/fast2/3t3clean/analysis/deconv/registered/dapi3/0/fused_1.tif").squeeze()
@@ -37,14 +37,14 @@ polya = imread("/fast2/3t3clean/analysis/deconv/registered/dapi3/2/fused_1.tif")
 # intensity = scale_image_2x_optimized(img)
 # %%
 res = model.eval(
-    np.array([dapi, polya]),
+    np.array([polya, dapi]),
     batch_size=8,
-    channels=[1, 0],
+    channels=[1, 2],
     # normalize=False,  # CANNOT TURN OFF NORMALIZATION
     # Will run into memory issues if turned off.
     flow_threshold=0.4,
     do_3D=False,
-    diameter=model.diam_labels / 3,
+    # diameter=model.diam_labels,
 )
 
 with open("/fast2/3t3clean/analysis/deconv/registered/dapi3/cellpose_polyA_result.pkl", "wb") as f:

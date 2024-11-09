@@ -247,6 +247,8 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
         p.parent.name.split("--")[0] for p in path.rglob("*.tif") if len(p.parent.name.split("--")) == 2
     })
     print(rounds)
+    if "deconv" not in path.resolve().as_posix():
+        raise ValueError("This command must be run in the deconvolved folder.")
 
     for round_ in rounds:
         if not overwrite and (path / "deconv_scaling" / f"{round_}.txt").exists():
@@ -314,7 +316,8 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
 
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
-
+    if not (path / "basic" / f"{name}.pkl").exists():
+        return
     basic = cast(
         dict[Literal[560, 650, 750], BaSiC], pickle.loads((path / "basic" / f"{name}.pkl").read_bytes())
     )

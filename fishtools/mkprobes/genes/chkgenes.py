@@ -62,7 +62,7 @@ def chkgenes(path: Path, genes: Path):
         log.critical("Aborting.")
         return
 
-    converted, mapping, no_fixed_needed = check_gene_names(ds.ensembl, gs, species=ds.species)
+    converted, mapping, no_fix_needed = check_gene_names(ds.ensembl, gs, species=ds.species)
     if mapping:
         log.info("Mappings:")
         jprint(mapping)
@@ -70,7 +70,7 @@ def chkgenes(path: Path, genes: Path):
         genes.with_suffix(".mapping.json").write_text(json.dumps(mapping))
         log.info(f"Converted genes written to {genes.with_suffix('.converted.txt')}.")
         genes.with_suffix(".converted.txt").write_text("\n".join(sorted(converted)))
-    elif not no_fixed_needed:
+    elif not no_fix_needed:
         log.warning("Some genes cannot be found.")
     else:
         log.info(f"{len(s)} genes checked out. No changes needed")

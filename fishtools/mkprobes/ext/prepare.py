@@ -16,14 +16,14 @@ from fishtools.utils.io import download, get_file_name, set_cwd
 from fishtools.utils.utils import check_if_exists, check_if_posix, run_process
 
 from ..utils._alignment import gen_fasta
-from .external_data import ExternalData
+from .external_data import _ExternalData
 
 url_files = {
     "mouse": Path(__file__).parent / "mouseurls.tsv",
     "human": Path(__file__).parent / "humanurls.tsv",
 }
 
-Gtfs = NamedTuple("gtfs", [("ensembl", ExternalData), ("gencode", ExternalData)])
+Gtfs = NamedTuple("gtfs", [("ensembl", _ExternalData), ("gencode", _ExternalData)])
 
 
 class NecessaryFiles(TypedDict):
@@ -112,7 +112,7 @@ def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]):
             p_.write_bytes(out)
 
 
-def get_rrna_snorna(gtf: ExternalData):
+def get_rrna_snorna(gtf: _ExternalData):
     ids = gtf.gtf.filter(pl.col("gene_biotype").is_in(["rRNA", "snoRNA"]))["transcript_id"]
     return ids, list(map(gtf.get_seq, ids))
 
@@ -124,7 +124,7 @@ def run_jellyfish(path: Path | str):
         urls = _process_tsv("urls.tsv")
         filenames = {k: get_file_name(v) for k, v in urls.items()}  # type: ignore
 
-        gtf = ExternalData("ensembl.parquet", fasta="cdna_ncrna_trna.fasta")
+        gtf = _ExternalData("ensembl.parquet", fasta="cdna_ncrna_trna.fasta")
         log.info("Getting tRNA, rRNA, and snoRNA sequences.")
 
         toexclude = [x.seq for x in pyfastx.Fasta(filenames["trna"].split(".")[0] + ".fa")] + get_rrna_snorna(
@@ -159,7 +159,7 @@ def run_repeatmasker(fasta: Path | str, species: str, threads: int = 16):
 
 # %%
 if __name__ == "__main__":
-    gtf = ExternalData("data/mouse/ensembl.parquet", fasta="data/mouse/cdna_ncrna_trna.fasta")
+    gtf = _ExternalData("data/mouse/ensembl.parquet", fasta="data/mouse/cdna_ncrna_trna.fasta")
 # get("data/mouse")
 
 # GTF https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_32/gencode.v32.annotation.gtf.gz

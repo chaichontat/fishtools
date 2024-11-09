@@ -12,12 +12,10 @@ from starfish.types import Axes, Features, Levels
 sns.set_theme()
 
 decoded_spots, spot_intensities = pickle.loads(
-    Path("/mnt/working/e155trcdeconv/registered--left/reg-0036_01.pkl").read_bytes()
+    Path("/mnt/archive/starmap/e155/e155_working/analysis/deconv/registered--down/reg-0360.pkl").read_bytes()
 )
 
-# decoded_spots = decoded_spots.loc[decoded_spots["passes_thresholds"]]
-
-codebook = json.loads((Path.home() / "fishtools/starwork3/ordered/genestar.json").read_text())
+codebook = json.loads(Path("/fast2/fishtools/starwork3/ordered/genestar.json").read_text())
 # codebook, used_bits, names, arr_zeroblank = load_codebook(
 #     Path("/fast2/fishtools/starwork3/ordered/genestar.json"), exclude={"Malat1-201"}
 # )
@@ -25,10 +23,27 @@ codebook = json.loads((Path.home() / "fishtools/starwork3/ordered/genestar.json"
 rand = np.random.default_rng(0)
 
 # %%
+fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+ax.scatter(
+    decoded_spots.coords["radius"] + rand.normal(0, 0.05, size=decoded_spots.shape[0]),
+    decoded_spots.coords["distance"],
+    # c=decoded_spots.coords["passes_thresholds"],
+    # c=np.linalg.norm(decoded_spots, axis=2),
+    # c=np.where(
+    #     is_blank[list(map(names_l.get, initial_spot_intensities.coords["target"].to_index().values))], 1, 0
+    # ).flatten(),
+    alpha=0.2,
+    cmap="bwr_r",
+    s=2,
+)
+ax.set_xlabel("Radius")
+ax.set_ylabel("Distance")
+plt.legend()
+# %%
 
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
 ax.scatter(
-    decoded_spots.coords["radius"] + rand.normal(0, 0.02, size=decoded_spots.shape[0]),
+    decoded_spots.coords["radius"] + rand.normal(0, 0.05, size=decoded_spots.shape[0]),
     decoded_spots.coords["distance"],
     c=~decoded_spots["target"].str.startswith("Blank"),
     # c=np.linalg.norm(decoded_spots, axis=2),
@@ -42,14 +57,32 @@ ax.scatter(
 ax.set_xlabel("Radius")
 ax.set_ylabel("Distance")
 
-
-# %%
-# spot_intensities = decoded_spots.loc[decoded_spots["radius"] > 1.6]
-# shits = spot_intensities.where(spot_intensities["target"].str.startswith("Blank"), drop=True)
 # %%
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
 ax.scatter(
-    decoded_spots.coords["radius"] + np.random.normal(0, 0.02, size=decoded_spots.shape[0]),
+    np.linalg.norm(np.array(decoded_spots), axis=(1, 2)),
+    decoded_spots.coords["radius"] + rand.normal(0, 0.05, size=decoded_spots.shape[0]),
+    c=~decoded_spots["target"].str.startswith("Blank"),
+    # c=np.linalg.norm(decoded_spots, axis=2),
+    # c=np.where(
+    #     is_blank[list(map(names_l.get, initial_spot_intensities.coords["target"].to_index().values))], 1, 0
+    # ).flatten(),
+    alpha=0.2,
+    cmap="bwr",
+    s=2,
+)
+# set semilogx
+plt.xscale("log")
+plt.legend()
+
+
+# %%
+spot_intensities = decoded_spots.loc[decoded_spots["radius"] > 1.6]
+shits = spot_intensities.where(spot_intensities["target"].str.startswith("Blank"), drop=True)
+# %%
+fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+ax.scatter(
+    decoded_spots.coords["radius"],
     np.linalg.norm(np.array(decoded_spots), axis=(1, 2)),
     c=~decoded_spots["target"].str.startswith("Blank"),
     # c=np.linalg.norm(decoded_spots, axis=2),
@@ -67,7 +100,7 @@ ax.set_yscale("log")
 
 # %%
 plt.scatter(
-    shits.coords["radius"] + np.random.normal(0, 0.01, size=shits.shape[0]),
+    shits.coords["radius"],
     np.linalg.norm(np.array(shits), axis=(1, 2)),
     # c=np.linalg.norm(decoded_spots, axis=2),
     # c=np.where(

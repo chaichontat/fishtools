@@ -155,15 +155,19 @@ def _calculate_drift(
     #     res = initial_drift + drift
     # else:
     drifts = joined[["dx", "dy"]].to_numpy()
-    drift = np.median(drifts)
-    cv = np.std(drifts, axis=0) / np.mean(drifts, axis=0)
-    logger.debug(f"drift: {drift} CV: {cv}.")
+    drift = np.median(drifts, axis=0)
+    hypot = np.hypot(*drifts.T)
+    cv = np.std(hypot) / np.mean(hypot)
+    logger.debug(f"drift: {drift} CV: {cv:04f}.")
     res = initial_drift + drift
 
     return np.round(res, precision)
 
 
 class NotEnoughSpots(Exception): ...
+
+
+class TooManySpots(Exception): ...
 
 
 class ResidualTooLarge(Exception): ...
@@ -188,6 +192,10 @@ def run_fiducial(
     while _attempt < 6:
         try:
             fixed = find_spots(ref, threshold_sigma=thr, fwhm=fwhm)
+            if len(fixed) > 1500:
+                raise TooManySpots(
+                    f"Too many spots ({len(fixed)} > 1500) found on the reference image. Please increase threshold_sigma or reduce FWHM."
+                )
         except NotEnoughSpots:
             logger.warning(
                 "Not enough spots found on reference image. Trying to find spots with lower threshold."
@@ -195,11 +203,13 @@ def run_fiducial(
             thr -= 0.5
             _attempt += 1
             continue
+        except TooManySpots:
+            logger.warning(
+                "Too many spots found on reference image. Trying to find spots with lower threshold."
+            )
+            thr += 0.5
+            _attempt += 1
         else:
-            if len(fixed) > 1500:
-                raise ValueError(
-                    f"Too many spots ({len(fixed)} > 1500) found on the reference image. Please increase threshold_sigma or reduce FWHM."
-                )
             # Find steepest slope
             fixed = fixed[: max(np.argmax(np.diff(fixed["mag"])), 10, len(fixed) // 4)]
             break
@@ -209,7 +219,7 @@ def run_fiducial(
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
-    def inner(img: np.ndarray, *, limit: int = 4, bitname: str = "", local_σ: float = threshold_sigma):
+    def inner(img: np.ndarray, *, limit: int = 4, bitname: str = "", local_σ: float = thr):
         if subtract_background:
             img = img - background(img)
 
@@ -227,6 +237,8 @@ def run_fiducial(
 
                 initial_drift = np.zeros(2)
                 assert limit > 0
+
+                # Actual loop drift loop.
                 for n in range(limit):
                     # Can raise NotEnoughSpots
                     drift = _calculate_drift(
@@ -242,10 +254,15 @@ def run_fiducial(
                     if residual < threshold_residual:
                         break
                     initial_drift = drift
+
             except NotEnoughSpots:
                 _attempt += 1
                 local_σ -= 0.5
                 logger.warning(f"Not enough spots. Attempt {_attempt}. σ threshold: {local_σ}")
+            except TooManySpots:
+                _attempt += 1
+                local_σ += 0.5
+                logger.warning(f"Too many spots. Attempt {_attempt}. σ threshold: {local_σ}")
             else:
                 break
         else:

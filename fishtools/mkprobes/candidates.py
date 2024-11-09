@@ -9,7 +9,7 @@ from loguru import logger
 
 from fishtools.mkprobes.genes.chkgenes import get_transcripts
 
-from .ext.external_data import Dataset, ExternalData
+from .ext.external_data import Dataset, _ExternalData
 from .utils._alignment import gen_fasta
 from .utils._crawler import crawler
 from .utils._filtration import PROBE_CRITERIA
@@ -27,7 +27,7 @@ pl.Config.set_tbl_rows(30)
 
 def get_pseudogenes(
     genes: list[str],
-    ensembl: ExternalData,
+    ensembl: _ExternalData,
     y: SAMFrame,
     limit: int = -1,  # allow: list[str] | None = None
 ) -> tuple[pl.Series, pl.DataFrame]:
@@ -43,7 +43,8 @@ def get_pseudogenes(
         .with_columns(
             acceptable=pl.col("transcript_name").str.contains(rf"^({'|'.join(genes)})[a-zA-Z]?.*")
             # | pl.col("transcript").is_in(allow)
-            | pl.col("transcript_name").str.starts_with("Gm") | pl.col("transcript_name").is_null(),
+            | pl.col("transcript_name").str.starts_with("Gm")
+            | pl.col("transcript_name").is_null(),
             significant=pl.col("count") > 0.1 * pl.col("count").max(),
         )
     )
@@ -267,13 +268,11 @@ def _run_transcript(
             transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
             **PROBE_CRITERIA,
         )
-        .with_columns(
-            [
-                (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-                pl.col("seq").apply(lambda s: tm(cast(str, s), "hybrid", formamide=formamide)).alias("tm"),
-                pl.col("seq").apply(lambda s: hp(cast(str, s), "hybrid", formamide=formamide)).alias("hp"),
-            ]
-        )
+        .with_columns([
+            (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
+            pl.col("seq").apply(lambda s: tm(cast(str, s), "hybrid", formamide=formamide)).alias("tm"),
+            pl.col("seq").apply(lambda s: hp(cast(str, s), "hybrid", formamide=formamide)).alias("hp"),
+        ])
         .with_columns(oks=pl.sum(pl.col("^ok_.*$")))
         # .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
         .filter(~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x))))

@@ -11,11 +11,11 @@ from expression.collections import Seq
 pl.Config.set_fmt_str_lengths(65)
 # %% Codebook
 
-n_bits = 24
-bits_per_channel = 8
-z_pos = str([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5])
+n_bits = 27
+bits_per_channel = 9
+z_pos = str([0.5 + i for i in range(10)])
 
-superset = set(Seq(np.loadtxt("mhd4_24bit.csv", delimiter=",", dtype=int)).map(str))
+superset = set(Seq(np.loadtxt("mhd4_27bit.csv", delimiter=",", dtype=int)).map(str))
 
 
 def gen_inventory(name: str, readoutName: Iterable[str], bits: Iterable[int]):
@@ -27,7 +27,7 @@ def gen_inventory(name: str, readoutName: Iterable[str], bits: Iterable[int]):
     }
 
 
-cb = {k: v for k, v in sorted(json.loads(Path("codebook.json").read_text()).items(), key=lambda x: x[0])}
+cb = {k: v for k, v in sorted(json.loads(Path("zach_old.json").read_text()).items(), key=lambda x: x[0])}
 readoutName = [f"V00{i:02d}T8B1" for i in range(1, n_bits + 1)]
 
 c = []

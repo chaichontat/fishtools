@@ -105,6 +105,8 @@ def run(path: Path, round_: str, *, overwrite: bool = False, channels: str = "56
 
     logger.info(f"Running {round_}")
     basics = _run(path, round_, plot=False, zs=tuple(map(int, zs.split(","))))
+    if not (path / "basic" / f"{round_}.pkl").exists():
+        return
     with open(path / "basic" / f"{round_}.pkl", "wb") as f:
         pickle.dump(dict(zip(channels.split(","), basics)), f)
     for c, basic in zip(channels.split(","), basics):
@@ -118,9 +120,10 @@ def run(path: Path, round_: str, *, overwrite: bool = False, channels: str = "56
 @click.option("--overwrite", is_flag=True)
 @click.option("--threads", "-t", type=int, default=2)
 def batch(path: Path, overwrite: bool = False, threads: int = 2):
-    rounds = sorted((path / "deconv_scaling").glob("*.txt"))
+    rounds = [p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name]
+    # rounds = sorted((path / "deconv_scaling").glob("*.txt"))
     with ThreadPoolExecutor(threads) as exc:
-        futs = [exc.submit(run.callback, path, r.stem, overwrite=overwrite) for r in rounds]  # type: ignore
+        futs = [exc.submit(run.callback, path, r, overwrite=overwrite) for r in rounds]  # type: ignore
         for fut in as_completed(futs):
             fut.result()
 

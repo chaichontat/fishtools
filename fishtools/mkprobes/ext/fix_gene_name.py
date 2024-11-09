@@ -5,7 +5,7 @@ import mygene
 import polars as pl
 from loguru import logger as log
 
-from fishtools.mkprobes.ext.external_data import ExternalData
+from fishtools.mkprobes.ext.external_data import _ExternalData
 from fishtools.utils.pretty_print import jprint
 
 mg = mygene.MyGeneInfo()
@@ -22,7 +22,7 @@ class ResDict(TypedDict):
     missing: list[str]
 
 
-def find_aliases(gtf: ExternalData, genes: Iterable[str], species: str = "mouse"):
+def find_aliases(gtf: _ExternalData, genes: Iterable[str], species: str = "mouse"):
     res = mg.querymany(
         genes, scopes="symbol,alias", fields="symbol,ensembl.gene", species=species, returnall=True
     )
@@ -70,7 +70,7 @@ def manual_fix(res: ResDict, sel: dict[str, str]):
             sel[line] = choices[n]["symbol"] if n != 0 else line  # 0 means keep original
 
 
-def check_gene_names(gtf: ExternalData, genes: list[str], species: Literal["mouse", "human"] = "mouse"):
+def check_gene_names(gtf: _ExternalData, genes: list[str], species: Literal["mouse", "human"] = "mouse"):
     notfound = []
     ok: list[str] = []
     for gene in genes:

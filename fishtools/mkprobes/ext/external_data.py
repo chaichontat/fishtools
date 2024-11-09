@@ -30,7 +30,7 @@ def get_ensembl(path: Path | str, id_: str):
     return res.json()
 
 
-class ExternalData:
+class _ExternalData:
     def __init__(
         self,
         cache: Path | str,
@@ -82,12 +82,23 @@ class ExternalData:
         eid = eid.split(".")[0]
         return self.gtf.filter(pl.col("gene_id") == eid)[0, "transcript_id"]
 
-    def batch_convert(self, val: list[str], src: str, dst: str):
-        res = pl.DataFrame({src: val}).join(self.gtf, on=src, how="left")[dst]
+    def batch_convert(self, val: list[str], src: str, dst: str) -> pl.DataFrame:
+        """Batch convert attributes. See available attributes in `self.gtf.columns`.
+        Will take the first value found for each attribute.
+
+        Args:
+            val: list of values to convert.
+            src: Attribute to convert from.
+            dst: Attribute to convert to.
+
+        Returns:
+            pl.DataFrame[[src, dst]]
+        """
+        res = pl.DataFrame({src: val}).join(self.gtf.group_by(src).first(), on=src, how="left")[[src, dst]]
         if not len(res):
             raise ValueError(f"Could not find {val} in {src}")
         if len(res) != len(val):
-            raise ValueError("Mapping not bijective.")
+            log.warning(f"Mapping not bijective. {len(res)} != {len(val)}")
         return res
 
     def convert(self, val: str, src: str, dst: str) -> str:
@@ -164,32 +175,26 @@ class ExternalData:
             )
             .filter(pl.col("feature").is_in(filters) if filters else pl.col("feature").is_not_null())
             .with_columns(
-                pl.concat_str(
-                    [
-                        pl.lit("{"),
-                        pl.col("attribute")
-                        .str.replace_all(r"; (\w+) ", r', "$1": ')
-                        .str.replace_all(";", ",")
-                        .str.replace(r"(\w+) ", r'"$1": ')
-                        .str.replace(r",$", ""),
-                        pl.lit("}"),
-                    ]
-                ).alias("jsoned")
+                pl.concat_str([
+                    pl.lit("{"),
+                    pl.col("attribute")
+                    .str.replace_all(r"; (\w+) ", r', "$1": ')
+                    .str.replace_all(";", ",")
+                    .str.replace(r"(\w+) ", r'"$1": ')
+                    .str.replace(r",$", ""),
+                    pl.lit("}"),
+                ]).alias("jsoned")
             )
-            .with_columns(
-                [
-                    pl.col("jsoned").str.json_path_match(f"$.{name}").alias(name)
-                    # .cast(pl.Categorical if "type" in name or "tag" == name else pl.Utf8)
-                    for name in attr_keys
-                ]
-            )
+            .with_columns([
+                pl.col("jsoned").str.json_path_match(f"$.{name}").alias(name)
+                # .cast(pl.Categorical if "type" in name or "tag" == name else pl.Utf8)
+                for name in attr_keys
+            ])
             # .drop(["attribute", "jsoned"])
-            .with_columns(
-                [
-                    pl.col("gene_id").str.extract(r"(\w+)(\.\d+)?").alias("gene_id"),
-                    pl.col("transcript_id").str.extract(r"(\w+)(\.\d+)?").alias("transcript_id"),
-                ]
-            )
+            .with_columns([
+                pl.col("gene_id").str.extract(r"(\w+)(\.\d+)?").alias("gene_id"),
+                pl.col("transcript_id").str.extract(r"(\w+)(\.\d+)?").alias("transcript_id"),
+            ])
         )
 
 
@@ -201,13 +206,13 @@ class Dataset:
         if self.species not in ("human", "mouse"):
             log.warning(f"Species not human or mouse, got {self.species}")
 
-        self.gencode = ExternalData(
+        self.gencode = _ExternalData(
             cache=self.path / "gencode.parquet",
             gtf_path=self.path / "gencode.gtf.gz",
             fasta=self.path / "cdna_ncrna_trna.fasta",
         )
 
-        self.ensembl = ExternalData(
+        self.ensembl = _ExternalData(
             cache=self.path / "ensembl.parquet",
             gtf_path=self.path / "ensembl.gtf.gz",
             fasta=self.path / "cdna_ncrna_trna.fasta",
