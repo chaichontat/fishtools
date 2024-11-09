@@ -252,14 +252,7 @@ def register(
                 if (out_path / out_name).exists() and not overwrite:
                     continue
                 futs.append(
-                    exc.submit(
-                        extract_channel,
-                        path,
-                        out_path / out_name,
-                        idx=idx,
-                        max_proj=max_proj,
-                        downsample=downsample,
-                    )
+                    exc.submit(extract_channel, path, out_path / out_name, idx=idx, max_proj=max_proj)
                 )
 
             for f in as_completed(futs):

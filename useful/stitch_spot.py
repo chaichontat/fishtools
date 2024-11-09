@@ -21,9 +21,13 @@ path = Path(f"/mnt/working/lai/registered--{roi}")
 files = sorted(file for file in Path(path / codebook).glob("*.pkl") if "opt" not in file.stem)
 
 coords = TileConfiguration.from_file(
-    Path(path.parent / f"registered--{roi}" / "stitch/TileConfiguration.registered.txt")
+    Path(path.parent / f"stitch--{roi}" / "TileConfiguration.registered.txt")
     # Path(path / "stitch" / "TileConfiguration.registered.txt")
 ).df
+
+oks = [name[:4] + ".pkl" for name in coords["filename"]]
+files = [file for file in files if file.name[4:] in oks]
+files
 # assert len(files) == len(coords)
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)

@@ -158,18 +158,20 @@ def load_codebook(path: Path, exclude: set[str] | None = None):
 def cli(): ...
 
 
-def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13):
+def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13, split: bool = False):
     with progress_bar(len(paths)) as callback, ThreadPoolExecutor(threads) as exc:
         futs = []
         for path in paths:
-            futs.append(
-                exc.submit(
-                    subprocess.run,
-                    ["python", __file__, mode, str(path), *[a for a in args if a]],
-                    check=True,
-                    capture_output=False,
+            for s in range(4) if split else [None]:
+                futs.append(
+                    exc.submit(
+                        subprocess.run,
+                        ["python", __file__, mode, str(path), *[a for a in args if a]]
+                        + (["--split", str(s)] if split else []),
+                        check=True,
+                        capture_output=False,
+                    )
                 )
-            )
 
         for f in as_completed(futs):
             callback()
@@ -189,6 +191,7 @@ def sample_imgs(path: Path, round_num: int, *, batch_size: int = 50):
     "codebook_path",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
+@click.option("--subsample-z", type=int, default=1)
 @click.option("--batch-size", "-n", type=int, default=100)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--overwrite", is_flag=True)
@@ -197,6 +200,7 @@ def optimize(
     round_num: int,
     codebook_path: Path,
     batch_size: int = 100,
+    subsample_z: int = 1,
     threads: int = 8,
     overwrite: bool = False,
 ):
@@ -221,6 +225,7 @@ def optimize(
             codebook_path.as_posix(),
             f"--round={round_num}",
             "--overwrite" if overwrite else "",
+            f"--subsample-z={subsample_z}",
         ],
         threads=threads,
     )
@@ -236,8 +241,9 @@ def optimize(
 )
 @click.option("--threads", "-t", type=int, default=13)
 @click.option("--overwrite", is_flag=True)
-@click.option("--subsample-z", type=int, default=3)
-@click.option("--limit-z", type=int, default=None)
+@click.option("--subsample-z", type=int, default=1)
+@click.option("--limit-z", default=None)
+@click.option("--split", is_flag=True)
 def batch(
     path: Path,
     global_scale: Path,
@@ -246,6 +252,7 @@ def batch(
     overwrite: bool = False,
     subsample_z: int = 1,
     limit_z: int | None = None,
+    split: bool = False,
 ):
     return _batch(
         sorted(path.glob("reg*.tif")),
@@ -260,6 +267,7 @@ def batch(
             f"--limit-z={limit_z}",
         ],
         threads=threads,
+        split=split,
     )
 
 
@@ -466,8 +474,9 @@ def append_json(
 @click.option("--round", "round_num", type=int, default=None)
 @click.option("--calc-deviations", is_flag=True)
 @click.option("--subsample-z", type=int, default=1)
-@click.option("--limit-z", type=int, default=None)
+@click.option("--limit-z", default=None)
 @click.option("--debug", is_flag=True)
+@click.option("--split", default=None)
 @click.option(
     "--codebook",
     "codebook_path",
@@ -484,6 +493,7 @@ def run(
     calc_deviations: bool = False,
     subsample_z: int = 1,
     limit_z: int | None = None,
+    split: int | None = None,
 ):
     """
     Run spot calling.
@@ -514,13 +524,15 @@ def run(
 
     else:
         (_path_out := path.parent / codebook_path.stem).mkdir(exist_ok=True)
-        path_pickle = _path_out / f"{path.stem}.pkl"
+        path_pickle = _path_out / f"{path.stem}{f'-{split}' if split is not None else ''}.pkl"
 
     if path_pickle.exists() and not overwrite:
         logger.info(f"Skipping {path.name}. Already exists.")
         return
 
-    logger.info(f"Reading {path.parent.name}/{path.name}.")
+    logger.info(
+        f"Running {path.parent.name}/{path.name} with {limit_z} z-slices and {subsample_z}x subsampling."
+    )
     codebook, used_bits, names, arr_zeroblank = load_codebook(codebook_path, exclude={"Malat1-201"})
     used_bits = list(map(str, used_bits))
 
@@ -533,14 +545,35 @@ def run(
     # blurred = gaussian(path, sigma=8)
     # blurred = levels(blurred)  # clip negative values to 0.
     # filtered = image - blurred
+    cut = 994 + 30
+    split = int(split) if split is not None else None
+    if split is None:
+        split_slice = np.s_[:, :]
+    elif split == 0:
+        split_slice = np.s_[:cut, :cut]
+    elif split == 1:
+        split_slice = np.s_[cut:, -cut:]
+    elif split == 2:
+        split_slice = np.s_[-cut:, :cut]
+    elif split == 3:
+        split_slice = np.s_[-cut:, -cut:]
+    else:
+        raise ValueError(f"Unknown split {split}")
 
-    # Subsample when optimizing.
+    slc = tuple(
+        np.s_[
+            ::subsample_z,
+            [bit_mapping[k] for k in used_bits],
+        ]
+    ) + tuple(split_slice)
     stack = make_fetcher(
         path,
-        np.s_[
-            slice(None, limit_z, subsample_z),
-            [bit_mapping[k] for k in used_bits],
-        ],
+        slc,
+        # if limit_z is None
+        # else np.s_[
+        #     :limit_z:subsample_z,
+        #     [bit_mapping[k] for k in used_bits],
+        # ],
     )
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.

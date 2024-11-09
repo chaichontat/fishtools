@@ -172,7 +172,7 @@ class Image:
                 .reshape((2, -1))
             )
         except FileNotFoundError:
-            if "deconv" in path.as_posix():
+            if "deconv" in path.resolve().as_posix():
                 raise ValueError("No deconv_scaling found.")
             logger.debug("No deconv_scaling found. Using ones.")
             global_deconv_scaling = np.ones((2, len(bits)))
@@ -301,7 +301,7 @@ def run(
     crop, downsample = config.registration.crop, config.registration.downsample
     tifffile.imwrite(
         fid_path / f"fids-{idx:04d}.tif",
-        fids[reference][crop:-crop, crop:-crop],
+        fids[reference][:, crop:-crop, crop:-crop],
         compression=22610,
         compressionargs={"level": 0.65},
         metadata={"axes": "YX"},
@@ -320,7 +320,7 @@ def run(
         tifffile.imwrite(
             path / f"fids_shifted-{idx:04d}.tif",
             # Prior shifts already applied.
-            np.stack([shift(img, [shifts[k][1], shifts[k][0]]) for k, img in fids.items()]),
+            np.stack([shift(fid.max(axis=0), [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX"},
@@ -543,7 +543,7 @@ def main(
                         # "8_16_24": (-160, -175),
                         # "25_26_27": (-160, -175),
                         # "dapi_29_polyA": (10, 30),
-                        "polyA_1_9_17": (-10, -5)
+                        # "polyA_1_9_17": (-10, -5)
                     },
                     overrides={
                         # "polyA_1_9_17": (12.01, -12.43),

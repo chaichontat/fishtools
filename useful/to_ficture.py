@@ -1,26 +1,28 @@
 # %%
-import gzip
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import polars as pl
 
-path = Path("useful/fic")
+path = Path("/mnt/working/lai/ficture")
 path_ts = path / "transcripts.tsv"
 path_f = path / "features.tsv"
 path_minmax = path / "coordinate_minmax.tsv"
+path.mkdir(exist_ok=True)
 
 dfs = [
-    pl.read_parquet("/mnt/working/e155trcdeconv/registered--leftold/genestar/spots.parquet"),
-    pl.read_parquet("/mnt/working/e155trcdeconv/registered--leftold/tricycleplus/spots.parquet"),
+    pl.read_parquet(path.parent / "registered--whole_embryo/genestar/spots.parquet"),
+    # pl.read_parquet("/mnt/working/e155trcdeconv/registered--leftold/tricycleplus/spots.parquet"),
 ]
 
 
 df = (
     pl.concat(dfs)
+    .filter(pl.col("z") > 1)
     .select(
-        X=pl.col("x") * 0.108,
-        Y=pl.col("y") * 0.108,
+        X=pl.col("x") * 0.216,
+        Y=pl.col("y") * 0.216,
         gene=pl.col("target").str.split("-").list.get(0),
         MoleculeID=pl.col("idx"),
         Count=pl.lit(1),
@@ -75,21 +77,24 @@ path_batch = path / "batched.matrix.tsv"
 # )
 
 # %%
-subprocess.run(
-    f"""ficture run_together \
-    --in-tsv {path_ts.with_suffix(".tsv.gz")} \
-    --in-minmax {path_minmax} \
-    --in-feature {path_f.with_suffix(".tsv.gz")} \
-    --out-dir {path / "output"} \
-    --n-jobs 16 \
-    --gzip "pigz -p 4" \
-    --train-width 7 \
-    --plot-each-factor \
-    --major-axis Y \
-    --n-factor 12,18 \
-    --all""",
-    shell=True,
-    check=True,
-)
+with ThreadPoolExecutor(16) as exc:
+    for i in [24, 30]:
+        exc.submit(
+            subprocess.run,
+            f"""ficture run_together \
+        --in-tsv {path_ts.with_suffix(".tsv.gz")} \
+        --in-minmax {path_minmax} \
+        --in-feature {path_f.with_suffix(".tsv.gz")} \
+        --out-dir {path / "output"} \
+        --n-jobs 16 \
+        --gzip "pigz -p 4" \
+        --train-width 10 \
+        --plot-each-factor \
+        --major-axis Y \
+        --n-factor {i} \
+        --all""",
+            shell=True,
+            check=True,
+        )
 
 # %%

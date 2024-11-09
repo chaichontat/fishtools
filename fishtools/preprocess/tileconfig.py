@@ -17,9 +17,9 @@ class TileConfiguration:
                 f.write(f"{row['index']:04d}.tif; ; ({row['x']}, {row['y']})\n")
 
     @classmethod
-    def from_pos(cls, df: pd.DataFrame, *, downsample: int = 1):
-        pixel = 2048 / downsample
-        actual = pixel * (0.108 * downsample)
+    def from_pos(cls, df: pd.DataFrame):
+        pixel = 2048
+        actual = pixel * 0.108
         scaling = 200 / actual
         adjusted = pd.DataFrame(
             dict(y=(df[0] - df[0].min()), x=(df[1] - df[1].min())),

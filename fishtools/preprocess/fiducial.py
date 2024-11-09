@@ -28,7 +28,7 @@ def imread_page(path: Path | str, page: int):
 
 
 def find_spots(
-    data: np.ndarray[np.uint16, Any],
+    img: np.ndarray[np.uint16, Any],
     threshold_sigma: float,
     fwhm: float,
 ):
@@ -42,13 +42,20 @@ def find_spots(
     Returns:
         pl.DataFrame: Sorted by magnitude (brightest first).
     """
-    assert np.sum(data) > 0
+    img = img.squeeze()
+    if img.ndim != 2:
+        raise ValueError(
+            "Reference image must be 2D for DAOStarFinder. https://github.com/astropy/photutils/issues/1328"
+        )
+    if np.sum(img) == 0:
+        raise ValueError("Reference image must have non-zero sum.")
+
     # iraffind = DAOStarFinder(threshold=3.0 * std, fwhm=4, sharplo=0.2, exclude_border=True)
-    _mean, median, std = sigma_clipped_stats(data, sigma=threshold_sigma + 5)
+    _mean, median, std = sigma_clipped_stats(img, sigma=threshold_sigma + 5)
     # You don't want need to subtract the mean here, the median is subtracted in the call three lines below.
     iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
     try:
-        df = pl.DataFrame(iraffind(data - median).to_pandas()).sort("mag").with_row_count("idx")
+        df = pl.DataFrame(iraffind(img - median).to_pandas()).sort("mag").with_row_count("idx")
     except AttributeError:
         df = pl.DataFrame()
     if len(df) < 6:
@@ -150,7 +157,7 @@ def _calculate_drift(
     drifts = joined[["dx", "dy"]].to_numpy()
     drift = np.median(drifts)
     cv = np.std(drifts, axis=0) / np.mean(drifts, axis=0)
-    logger.debug(f"drift: {drift} CV: {cv:04f}.")
+    logger.debug(f"drift: {drift} CV: {cv}.")
     res = initial_drift + drift
 
     return np.round(res, precision)
@@ -177,6 +184,7 @@ def run_fiducial(
 
     _attempt = 0
     thr = threshold_sigma
+
     while _attempt < 6:
         try:
             fixed = find_spots(ref, threshold_sigma=thr, fwhm=fwhm)

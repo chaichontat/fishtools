@@ -18,7 +18,10 @@ from fishtools.preprocess.deconv import scale_deconv
 sns.set_theme()
 
 
-def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4,), deconv: bool = False):
+def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4, -5)):
+    # if "deconv" in path.resolve().as_posix() and not deconv:
+    #     raise ValueError("deconv in path. Make sure to set deconv=True")
+
     # TODO: Get channel info.
     nc = round_.split("_").__len__()
 
@@ -37,8 +40,10 @@ def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4
 
     n = min(len(files), 500)
     nc = len(round_.split("_"))
-    if deconv:
-        deconv_meta = np.loadtxt(path / "deconv_scaling" / f"{round_}.txt")
+
+    deconv_meta = np.loadtxt(path / "deconv_scaling" / f"{round_}.txt")
+    if deconv_meta is not None:
+        logger.info("Using deconvolution scaling.")
 
     # This is the extracted z slices from all files.
     out = np.zeros((n, len(zs), nc, 2048, 2048), dtype=np.float32)
@@ -53,7 +58,7 @@ def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4
                         img = tif.pages[z * nc + c].asarray()
                         out[i, k, c] = (
                             img
-                            if not deconv
+                            if deconv_meta is None
                             else scale_deconv(
                                 img, c, name=file.name, global_deconv_scaling=deconv_meta, metadata=meta
                             )
