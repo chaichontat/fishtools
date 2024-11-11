@@ -118,8 +118,10 @@ def _run_bowtie(dataset: Dataset, seqs: pl.DataFrame, ignore_revcomp: bool = Fal
         y,
         y["transcript"]
         .value_counts()
-        .sort("counts", descending=True)
-        .with_columns(name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene)),
+        .sort("count", descending=True)
+        .with_columns(
+            name=pl.col("transcript").map_elements(dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8)
+        ),
     )
 
 
@@ -214,9 +216,9 @@ def _run_transcript(
         + str(
             y.count("transcript", descending=True)
             .filter(pl.col("count") > 0.1 * pl.col("count").first())
-            .with_columns(name=pl.col("transcript").apply(dataset.ensembl.ts_to_tsname))[
-                ["name", "transcript", "count"]
-            ]
+            .with_columns(
+                name=pl.col("transcript").map_elements(dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8)
+            )[["name", "transcript", "count"]]
         )
     )
 
@@ -243,8 +245,10 @@ def _run_transcript(
 
     isoforms = (
         y.filter_isin(transcript=tss_allofgene)[["name", "transcript"]]
-        .with_columns(isoforms=pl.col("transcript").apply(dataset.ensembl.ts_to_tsname))[["name", "isoforms"]]
-        .groupby("name")
+        .with_columns(
+            isoforms=pl.col("transcript").map_elements(dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8)
+        )[["name", "isoforms"]]
+        .group_by("name")
         .all()
     )
 
@@ -265,17 +269,25 @@ def _run_transcript(
     ff = SAMFrame(
         ff.agg_tm_offtarget(tss_allacceptable, formamide=formamide)
         .with_columns(
-            transcript_name=pl.col("transcript").apply(dataset.ensembl.ts_to_gene),
+            transcript_name=pl.col("transcript").map_elements(
+                dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8
+            ),
             **PROBE_CRITERIA,
         )
         .with_columns([
             (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-            pl.col("seq").apply(lambda s: tm(cast(str, s), "hybrid", formamide=formamide)).alias("tm"),
-            pl.col("seq").apply(lambda s: hp(cast(str, s), "hybrid", formamide=formamide)).alias("hp"),
+            pl.col("seq")
+            .map_elements(lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .alias("tm"),
+            pl.col("seq")
+            .map_elements(lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .alias("hp"),
         ])
-        .with_columns(oks=pl.sum(pl.col("^ok_.*$")))
-        # .filter(~pl.col("seq").apply(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
-        .filter(~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x))))
+        .with_columns(oks=pl.sum_horizontal(pl.col("^ok_.*$")))
+        # .filter(~pl.col("seq").map_elements(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
+        .filter(
+            ~pl.col("seq").map_elements(lambda x: dataset.check_kmers(cast(str, x)), return_dtype=pl.Boolean)
+        )
         .join(names_with_pseudo, on="name", how="left")
         .join(isoforms, on="name", how="left")
     )

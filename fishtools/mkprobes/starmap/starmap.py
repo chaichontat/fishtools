@@ -58,22 +58,22 @@ def pad(s: str, target: int = 89):
 def gen_rotate(dfs: pl.DataFrame):
     res = dfs.with_columns(
         rotated=pl.col("seq")
-        .apply(rc)
-        .apply(pad)
-        .apply(lambda x: rotate(x, 20 - 6 - 3), return_dtype=pl.Utf8)
+        .map_elements(rc)
+        .map_elements(pad)
+        .map_elements(lambda x: rotate(x, 20 - 6 - 3), return_dtype=pl.Utf8)
     ).with_columns(
         splint_="TGTTGATGAGGTGTTGATGAT"
         + "AA"
-        + pl.col("splint").apply(rc)
+        + pl.col("splint").map_elements(rc)
         + "ATA"  # mismatch
-        + pl.col("rotated").str.slice(0, 6).apply(rc)
-        + pl.col("rotated").str.slice(-6, 6).apply(rc)
+        + pl.col("rotated").str.slice(0, 6).map_elements(rc, return_dtype=pl.Utf8)
+        + pl.col("rotated").str.slice(-6, 6).map_elements(rc, return_dtype=pl.Utf8)
     )
 
-    # uyu = res["splint_"].apply(lambda x: BsaI.catalyze(Seq.Seq(x)))
+    # uyu = res["splint_"].map_elements(lambda x: BsaI.catalyze(Seq.Seq(x)))
     # uyu.filter(uyu.list.lengths() != 1)
 
-    # assert (res["splint_"].apply(lambda x: BsaI.search(Seq.Seq(x))).list.lengths() == 0).all()
+    # assert (res["splint_"].map_elements(lambda x: BsaI.search(Seq.Seq(x))).list.lengths() == 0).all()
 
 
 # def gen_3splint(

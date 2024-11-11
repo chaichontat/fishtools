@@ -93,7 +93,7 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: Sequence[int], n: int =
 
     out = dict(name=[], seq=[])
     for i in range(n):
-        out[f"code{i+1}"] = []
+        out[f"code{i + 1}"] = []
 
     for name, pad, padstart in seq_encoding[["name", "padlock", "padstart"]].iter_rows():
         # for codes, _ in zip(perms, range(4)):
@@ -107,7 +107,7 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: Sequence[int], n: int =
             out["name"].append(name)  # f"{name};;{sep}{','.join(map(str,codes))}")
             out["seq"].append(stitched)
             for i, code in enumerate(codes):
-                out[f"code{i+1}"].append(code)
+                out[f"code{i + 1}"].append(code)
             break  # only one separator is needed. This is a split design.
 
     return pl.DataFrame(out)
@@ -120,7 +120,7 @@ def check_offtargets(dataset: Dataset, constructed: pl.DataFrame, acceptable_tss
     df = (
         acc  # .filter(
         # pl.col("max_tm_offtarget").lt(40)
-        #  ~pl.col("seq").apply(lambda x: dataset.check_kmers(cast(str, x)))
+        #  ~pl.col("seq").map_elements(lambda x: dataset.check_kmers(cast(str, x)))
         #
         .drop("seq")
         .join(constructed, on="name", suffix="padlock", how="inner")
@@ -205,8 +205,8 @@ def construct(
     # mrna = dataset.ensembl.get_seq(transcript)
 
     screened = (
-        screened.with_columns(splitted=pl.col("seq").apply(lambda pos: split_probe(pos, 58)))
-        # screened.with_columns(splitted=pl.col("pos").apply(lambda pos: split_probe(mrna[pos : pos + 70], 58)))
+        screened.with_columns(splitted=pl.col("seq").map_elements(lambda pos: split_probe(pos, 58)))
+        # screened.with_columns(splitted=pl.col("pos").map_elements(lambda pos: split_probe(mrna[pos : pos + 70], 58)))
         .with_columns(
             splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
             padlock=pl.col("splitted").list.get(0),
@@ -216,8 +216,8 @@ def construct(
 
     screened = screened.filter(
         (pl.col("splint").str.lengths() > 0)
-        # & (pl.col("splint").apply(lambda x: hp(x, "dna")) < 50)
-        # & (pl.col("padlock").apply(lambda x: hp(x, "dna")) < 50)
+        # & (pl.col("splint").map_elements(lambda x: hp(x, "dna")) < 50)
+        # & (pl.col("padlock").map_elements(lambda x: hp(x, "dna")) < 50)
     )
 
     logger.debug(f"With proper padstart: {len(screened)}")

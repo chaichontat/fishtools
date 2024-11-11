@@ -8,9 +8,9 @@ from expression.collections import Seq
 from Levenshtein import distance
 from loguru import logger
 
-from fishtools.mkprobes.screen_utils._alignment import gen_bowtie_index, gen_fasta
 from fishtools.mkprobes.constants import DT, SP6
 from fishtools.mkprobes.definitions import Filter
+from fishtools.mkprobes.screen_utils._alignment import gen_bowtie_index, gen_fasta
 from fishtools.mkprobes.screen_utils.samframe import SAMFrame
 from fishtools.mkprobes.utils.seqcalc import hp, tm
 from fishtools.mkprobes.utils.sequtils import gc_content, reverse_complement
@@ -30,20 +30,18 @@ def extract_ok(generated: T, ok_keys: list[int] | list[str]) -> T:
 
 
 @overload
-def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[False] = ...) -> pl.DataFrame:
-    ...
+def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[False] = ...) -> pl.DataFrame: ...
 
 
 @overload
-def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[True]) -> tuple[pl.DataFrame, T]:
-    ...
+def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[True]) -> tuple[pl.DataFrame, T]: ...
 
 
 def run_filter(f: Filter, seqs: T, return_ok_seqs: bool = False) -> pl.DataFrame | tuple[pl.DataFrame, T]:
     idx_mapping = {s: i for i, s in enumerate(seqs)}
     if isinstance(seqs, dict):
         fasta = gen_fasta(seqs.values(), names=map(str, seqs.keys())).getvalue()
-        df = f(fasta).with_columns(idx=pl.col("name").apply(idx_mapping.get))
+        df = f(fasta).with_columns(idx=pl.col("name").map_elements(idx_mapping.get))
     else:
         fasta = gen_fasta(seqs).getvalue()
         df = f(fasta).with_columns(idx=pl.col("name").cast(pl.UInt32))
@@ -65,7 +63,7 @@ class Filters:
         )
 
         return (
-            df.groupby("name")
+            df.group_by("name")
             .agg(pl.col("match_consec").max())
             .filter(pl.col("match_consec").lt(match_consec_thresh | pl.col("match_consec").is_null()))
         )
@@ -84,7 +82,7 @@ class Filters:
 
         inverted = (
             bt.filter(pl.col("name").ne(pl.col("transcript")))
-            .groupby("name")
+            .group_by("name")
             .agg(match_consec=pl.col("match_consec").max(), match=pl.col("match").max())
             .filter(
                 (pl.col("match_consec").lt(match_consec_thresh) & pl.col("match").lt(match_thresh)).is_not()
@@ -127,7 +125,7 @@ class Filters:
 
         inverted = (
             bt.filter(pl.col("name").str.extract(r"(\d+)_\d+").ne(pl.col("transcript")))
-            .groupby("name")
+            .group_by("name")
             .agg(match_consec=pl.col("match_consec").max(), match=pl.col("match").max())
             .filter(
                 (
@@ -276,16 +274,16 @@ assert list(map(splitter(1), seqs)) == zeroth_readouts["seq"].to_list()[:to_gen]
 SP6_F = reverse_complement("ACGTGACTGCTCC" + SP6[:-1])
 
 # %%
-idt = pl.concat(
-    [
-        pl.DataFrame(
-            {"Pool name": "Amp1-Aug23", "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs))}
-        ),
-        pl.DataFrame(
-            {"Pool name": "Amp2-Aug23", "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs_2))}
-        ),
-    ]
-)
+idt = pl.concat([
+    pl.DataFrame({
+        "Pool name": "Amp1-Aug23",
+        "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs)),
+    }),
+    pl.DataFrame({
+        "Pool name": "Amp2-Aug23",
+        "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs_2)),
+    }),
+])
 
 idt == pl.read_excel("amplifiers.xlsx")
 # idt.write_excel("amplifiers2.xlsx")
@@ -319,7 +317,7 @@ for i in range(3):
     for idx in range(8 * i, 8 * (i + 1)):
         print(
             gen_idt(
-                f"Linker{idx+1:02d}-MetaC-{i+2:02d}",
+                f"Linker{idx + 1:02d}-MetaC-{i + 2:02d}",
                 final_readers[idx] + reverse_complement("C" + metas[i + 2]),
             )
         )
@@ -328,7 +326,8 @@ mod = lambda i: i % 3 + 2
 for i in range(24, 30):
     print(
         gen_idt(
-            f"Linker{i+1:02d}-MetaC-{mod(i):02d}", final_readers[i] + reverse_complement("C" + metas[mod(i)])
+            f"Linker{i + 1:02d}-MetaC-{mod(i):02d}",
+            final_readers[i] + reverse_complement("C" + metas[mod(i)]),
         )
     )
 # %%

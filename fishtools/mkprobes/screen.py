@@ -45,13 +45,17 @@ def _screen(
     if restriction:
         logger.info(f"Filtering for probes w/o {', '.join(restriction)} site(s).")
         res = Restriction.RestrictionBatch(restriction)
-        ff = ff.filter(~pl.col("seq").apply(lambda x: any(res.search(Seq("NNNNNN" + x + "NNNNNN")).values())))
+        ff = ff.filter(
+            ~pl.col("seq").map_elements(
+                lambda x: any(res.search(Seq("NNNNNN" + x + "NNNNNN")).values()), return_dtype=pl.Boolean
+            )
+        )
 
     final = the_filter(ff, overlap=overlap)
     assert not final["seq"].str.contains("N").any(), "N appears out of nowhere."
     final.write_parquet(
         write_path := output_dir
-        / f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else '' }.parquet"
+        / f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else ''}.parquet"
     )
 
     logger.debug(f"Written to {write_path}.")
@@ -100,7 +104,8 @@ def run_screen(
         and (
             output_dir
             / (
-                file := f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else '' }.parquet"
+                file
+                := f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else ''}.parquet"
             )
         ).exists()
     ):
@@ -108,7 +113,7 @@ def run_screen(
         return pl.read_parquet(output_dir / file)
 
     for file in output_dir.glob(
-        f"{gene}_screened_ol*{'_' + ''.join(restriction) if restriction else '' }.parquet"
+        f"{gene}_screened_ol*{'_' + ''.join(restriction) if restriction else ''}.parquet"
     ):
         file.unlink(missing_ok=True)
 

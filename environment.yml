@@ -9,8 +9,8 @@ dependencies:
   - click
   - colorama
   - cupy
-  - jellyfish
   - imagecodecs
+  - kmer-jellyfish
   - levenshtein
   - loguru
   - matplotlib

@@ -46,7 +46,7 @@ class SAMFrame(pl.DataFrame):
 
     @to_samframe
     def count(self, col: str = "gene", descending: bool = False):
-        return self.groupby(col).agg(pl.count()).sort("count", descending=descending)
+        return self.group_by(col).agg(pl.count()).sort("count", descending=descending)
 
     @to_samframe
     @copy_signature(pl.DataFrame.join)
@@ -100,7 +100,7 @@ class SAMFrame(pl.DataFrame):
                 .with_columns(mismatched_reference=pl.col("mismatched_reference").str.extract_all(r"(\d+)"))
                 .explode("mismatched_reference")
                 .with_columns(pl.col("mismatched_reference").cast(pl.UInt8))
-                .groupby("id")
+                .group_by("id")
                 .agg(
                     match=pl.col("mismatched_reference").sum(),
                     match_consec=pl.col("mismatched_reference").max(),
@@ -228,12 +228,12 @@ class SAMFrame(pl.DataFrame):
         tm_offtarget = self.filter(
             ~pl.col("transcript").is_in(acceptable_tss) & pl.col("match_consec").gt(18)
         ).with_columns(
-            tm_offtarget=pl.struct(["seq", "cigar", "mismatched_reference"]).apply(
+            tm_offtarget=pl.struct(["seq", "cigar", "mismatched_reference"]).map_elements(
                 lambda x: tm_pairwise(x["seq"], x["cigar"], x["mismatched_reference"], formamide=formamide)  # type: ignore
             )
         )
 
-        unique = tm_offtarget.groupby("name").agg(
+        unique = tm_offtarget.group_by("name").agg(
             pl.max("tm_offtarget").alias("max_tm_offtarget").cast(pl.Float32),
             pl.max("match_consec").alias("match_consec_all"),
         )
