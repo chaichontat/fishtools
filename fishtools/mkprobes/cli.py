@@ -10,7 +10,7 @@ from fishtools.utils.utils import setup_logging
 from .candidates import candidates
 from .codebook.finalconstruct import click_construct, filter_genes
 from .ext.external_data import Dataset
-from .genes.chkgenes import chkgenes, transcripts
+from .genes.chkgenes import chkgenes, convert_to_transcripts, transcripts
 from .screen import screen
 from .utils._alignment import bowtie_build
 
@@ -47,7 +47,7 @@ def main():
 def prepare(path: Path, species: Literal["human", "mouse"], threads: int = 16):
     """Prepare genomic database"""
     from .ext.prepare import download_gtf_fasta, run_jellyfish
-
+    path = path.resolve()
     download_gtf_fasta(path / species, species)
     with ThreadPoolExecutor() as exc:
         futs = [
@@ -71,6 +71,7 @@ main.add_command(screen)
 main.add_command(chkgenes)
 main.add_command(filter_genes)
 main.add_command(transcripts)
+main.add_command(convert_to_transcripts)
 main.add_command(click_construct)
 
 

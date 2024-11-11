@@ -39,9 +39,9 @@ def gen_fasta(seqs: Iterable[str], *, names: Iterable[Any] | None = None) -> io.
     return f
 
 
-@check_if_exists(logger, lambda kwargs: f'{Path(kwargs["fasta_path"]).parent}/{kwargs["name"]}.1.bt2')
+@check_if_exists(logger, lambda kwargs: f"{Path(kwargs['fasta_path']).parent}/{kwargs['name']}.1.bt2")
 def bowtie_build(fasta_path: Path | str, name: str) -> bytes | None:
-    fasta_path = Path(fasta_path)
+    fasta_path = Path(fasta_path).resolve()
     logger.info(f"Generating bowtie2 index for {name}")
     res = subprocess.run(
         ["bowtie2-build", fasta_path.as_posix(), (fasta_path.parent / name).as_posix()],

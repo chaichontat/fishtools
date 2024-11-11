@@ -7,7 +7,7 @@ from typing import Annotated, Literal
 import polars as pl
 import requests
 import rich_click as click
-from loguru import logger as log
+from loguru import logger
 
 from fishtools.utils.pretty_print import jprint
 
@@ -32,7 +32,7 @@ def find_outdated_ts(ts: str) -> tuple[Annotated[str, "gene_name"], Annotated[st
                 out.add((y["name"], y["stable_id"]))
 
     if len(out) != 1:
-        log.error(f"Found {len(out)} genes for {ts}: {out}")
+        logger.error(f"Found {len(out)} genes for {ts}: {out}")
     return list(out)[0]
 
 
@@ -56,24 +56,23 @@ def chkgenes(path: Path, genes: Path):
 
     if len(gs) != len(s := set(gs)):
         [gs.remove(x) for x in s]
-        log.warning(f"Non-unique genes found: {', '.join(gs)}.\n")
+        logger.critical(f"Non-unique genes found: {', '.join(gs)}.\n")
         genes.with_suffix(".unique.txt").write_text("\n".join(sorted(list(s))))
-        log.error(f"Unique genes written to {genes.with_suffix('.unique.txt')}.\n")
-        log.critical("Aborting.")
+        logger.error(f"Unique genes written to {genes.with_suffix('.unique.txt')}.\n")
         return
 
     converted, mapping, no_fix_needed = check_gene_names(ds.ensembl, gs, species=ds.species)
     if mapping:
-        log.info("Mappings:")
+        logger.info("Mappings:")
         jprint(mapping)
-        log.info(f"Mapping written to {genes.with_suffix('.mapping.json')}.")
+        logger.info(f"Mapping written to {genes.with_suffix('.mapping.json')}.")
         genes.with_suffix(".mapping.json").write_text(json.dumps(mapping))
-        log.info(f"Converted genes written to {genes.with_suffix('.converted.txt')}.")
+        logger.info(f"Converted genes written to {genes.with_suffix('.converted.txt')}.")
         genes.with_suffix(".converted.txt").write_text("\n".join(sorted(converted)))
     elif not no_fix_needed:
-        log.warning("Some genes cannot be found.")
+        logger.warning("Some genes cannot be found.")
     else:
-        log.info(f"{len(s)} genes checked out. No changes needed")
+        logger.info(f"{len(s)} genes checked out. No changes needed")
         genes.with_suffix(".converted.txt").write_text("\n".join(sorted(converted)))
 
 
@@ -87,19 +86,19 @@ def get_transcripts(
         pl.DataFrame[[transcript_id, transcript_name, tag]]
         pl.DataFrame[[transcript_id, transcript_name, annotation, tag]] if appris
     """
-    genes_id = [gene if gene.startswith("ENS") else dataset.ensembl.gene_to_eid(gene) for gene in genes]
+    if not genes:
+        raise ValueError("No genes provided")
 
-    # log.info(f"Gene ID: {gene_id}")
-
-    ensembl = dataset.ensembl.filter(pl.col("gene_id").is_in(genes_id))[
+    df_genes = dataset.ensembl.filter(pl.col("gene_name").is_in(genes))[
         ["gene_name", "gene_id", "transcript_name", "transcript_id"]
     ]
-    ensembl = ensembl.join(
-        dataset.appris.filter(pl.col("gene_id").is_in(genes_id))[["transcript_id", "annotation"]],
+
+    df_genes = df_genes.join(
+        dataset.appris.filter(pl.col("gene_id").is_in(df_genes["gene_id"]))[["transcript_id", "annotation"]],
         on="transcript_id",
         how="left",
     ).sort("transcript_name")
-    appris = ensembl.filter(pl.col("annotation").is_not_null())
+    appris = df_genes.filter(pl.col("annotation").is_not_null())
 
     to_return = ["transcript_id", "transcript_name", "tag"]
 
@@ -108,27 +107,61 @@ def get_transcripts(
             with ThreadPoolExecutor(3) as exc:
                 from functools import partial
 
-                res = exc.map(partial(get_ensembl, "output/"), genes_id)
+                res = exc.map(partial(get_ensembl, "output/"), df_genes["gene_id"])
                 canonical = [r["canonical_transcript"].split(".")[0] for r in res]
 
-            return dataset.ensembl.filter(pl.col("transcript_id").is_in(canonical))[to_return]
+            res = dataset.ensembl.filter(pl.col("transcript_id").is_in(canonical))[to_return]
         case "gencode":
-            return dataset.gencode.filter(pl.col("gene_id").is_in(genes_id))[to_return]
+            res = dataset.gencode.filter(pl.col("gene_id").is_in(df_genes["gene_id"]))[to_return]
         case "ensembl":
-            return dataset.ensembl.filter(pl.col("gene_id").is_in(genes_id))[to_return]
+            res = dataset.ensembl.filter(pl.col("gene_id").is_in(df_genes["gene_id"]))[to_return]
         case "appris":
             # if len(principal := appris.filter(pl.col("annotation").str.contains("PRINCIPAL"))):
-            #     log.info("Principal transcripts: " + "\n".join(principal["transcript_id"]))
-            return appris.filter(pl.col("annotation").str.contains("PRINCIPAL")).join(
-                dataset.ensembl[["transcript_id", "tag"]], on="transcript_id", how="left"
-            )
+            #     logger.info("Principal transcripts: " + "\n".join(principal["transcript_id"]))
+            res = appris.join(dataset.ensembl[["transcript_id", "tag"]], on="transcript_id", how="left")
+
+            def handle_transcripts(group: pl.DataFrame):
+                if len(group) > 1:
+                    canonical = group.filter(pl.col("tag") == "Ensembl_canonical")
+                    if len(canonical) == 1:
+                        return canonical
+                    principal = group.filter(pl.col("annotation").str.contains("PRINCIPAL"))
+                    if len(principal) == 1:
+                        return principal
+                return group
+
+            res = res.group_by("gene_name").map_groups(handle_transcripts)
+
         case "apprisalt":
-            return appris.join(dataset.ensembl[["transcript_id", "tag"]], on="transcript_id", how="left")
+            res = appris.join(dataset.ensembl[["transcript_id", "tag"]], on="transcript_id", how="left")
         case _:  # type: ignore
             raise ValueError(f"Unknown mode: {mode}")
 
-    # log.info(ensembl)
-    # log.info(appris)
+    out = []
+    for gene, tss in sorted(res.group_by("gene_name"), key=lambda x: x[0]):
+        if len(tss) > 1:
+            print(
+                f"Multiple transcripts found for {gene[0]}. See https://useast.ensembl.org/Mouse/Search/Results?q={gene[0]};site=ensembl;facet_species=Mouse"
+            )
+            print(f"Please pick one: {tss.with_row_index()}.")
+            picked = input("Enter the number of the correct transcript: ")
+            out.append(tss[int(picked)])
+        else:
+            out.append(tss)
+
+    return pl.concat(out)
+
+
+@click.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("genes", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+def convert_to_transcripts(path: Path, genes: Path):
+    """Validate/check that gene names are canonical in Ensembl"""
+    ds = Dataset(path)
+    del path
+    gene_names = genes.read_text().splitlines()
+    res = get_transcripts(ds, gene_names, mode="canonical")
+    genes.with_suffix(".tss.txt").write_text("\n".join(res["transcript_name"]))
 
 
 # fmt: off

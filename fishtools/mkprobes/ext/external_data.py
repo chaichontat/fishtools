@@ -21,13 +21,17 @@ def get_ensembl(path: Path | str, id_: str):
     path = Path(path)
     path.mkdir(exist_ok=True, parents=True)
     if (p := (path / f"{id_}.json")).exists():
-        return json.loads(p.read_text())
+        try:
+            return json.loads(p.read_text())
+        except json.JSONDecodeError:
+            log.warning(f"Error decoding {p}. Deleting.")
+            p.unlink()
 
     log.info(f"Fetching {id_} on ensembl")
     res = requests.get(f"https://rest.ensembl.org/lookup/id/{id_}?content-type=application/json", timeout=30)
     res.raise_for_status()
-    p.write_text(res.text)
-    return res.json()
+    p.write_text(json.dumps(j := res.json(), indent=2))
+    return j
 
 
 class _ExternalData:
@@ -56,11 +60,11 @@ class _ExternalData:
         return self.gtf.filter(pl.col("gene_name") == gene)
 
     @cache
-    def gene_to_eid(self, gene: str) -> str:
-        try:
-            return self.gene_info(gene)[0, "gene_id"]
-        except pl.ComputeError:
+    def gene_to_eid(self, gene: str) -> pl.Series:
+        ret = self.gene_info(gene)
+        if ret.is_empty():
             raise ValueError(f"Could not find {gene}")
+        return ret[:, "gene_id"]
 
     @cache
     def ts_to_gene(self, ts: str) -> str:
@@ -74,7 +78,7 @@ class _ExternalData:
         eid = eid.split(".")[0]
         try:
             return self.gtf.filter(pl.col("transcript_id") == eid)[0, "transcript_name"]
-        except pl.ComputeError:
+        except pl.exceptions.ComputeError:
             return eid
 
     @cache
@@ -134,7 +138,7 @@ class _ExternalData:
     @overload
     def __getitem__(self, eid: list[str]) -> pl.DataFrame: ...
 
-    def __getitem__(self, eid: str | list[str]):
+    def __getitem__(self, eid: str | list[str]) -> pl.Series | pl.DataFrame:
         return self.gtf[eid]
 
     def filter(self, *args: Any, **kwargs: Any):
@@ -157,7 +161,7 @@ class _ExternalData:
         return (
             pl.read_csv(
                 path,
-                comment_char="#",
+                comment_prefix="#",
                 separator="\t",
                 has_header=False,
                 new_columns=[
@@ -171,7 +175,17 @@ class _ExternalData:
                     "frame",
                     "attribute",
                 ],
-                dtypes=[pl.Utf8, pl.Utf8, pl.Utf8, pl.UInt32, pl.UInt32, pl.Utf8, pl.Utf8, pl.Utf8, pl.Utf8],
+                schema_overrides=[
+                    pl.Utf8,
+                    pl.Utf8,
+                    pl.Utf8,
+                    pl.UInt32,
+                    pl.UInt32,
+                    pl.Utf8,
+                    pl.Utf8,
+                    pl.Utf8,
+                    pl.Utf8,
+                ],
             )
             .filter(pl.col("feature").is_in(filters) if filters else pl.col("feature").is_not_null())
             .with_columns(

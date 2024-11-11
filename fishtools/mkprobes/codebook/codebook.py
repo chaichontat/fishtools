@@ -38,14 +38,10 @@ class CodebookPicker:
         self.existing = existing
 
         if self.existing is not None:
-            self.existing = np.hstack(
-                [
-                    self.existing,
-                    np.zeros(
-                        (self.existing.shape[0], self.mhd4.shape[1] - self.existing.shape[1]), dtype=bool
-                    ),
-                ]
-            )
+            self.existing = np.hstack([
+                self.existing,
+                np.zeros((self.existing.shape[0], self.mhd4.shape[1] - self.existing.shape[1]), dtype=bool),
+            ])
             assert self.existing.shape[1] == self.mhd4.shape[1]
             assert np.all(self.existing.sum(axis=1) == 4)
             self.mhd4 = np.array(
@@ -117,16 +113,16 @@ class CodebookPicker:
             case "csv":
                 return pl.concat(
                     [
-                        pl.DataFrame(dict(genes=self.genes + [f"Blank-{i+1}" for i in range(n_blanks)])),
+                        pl.DataFrame(dict(genes=self.genes + [f"Blank-{i + 1}" for i in range(n_blanks)])),
                         pl.DataFrame(rmhd4.astype(np.uint8)),
                     ],
                     how="horizontal",
                 )
             case "json":
                 return {
-                    gene: list(np.flatnonzero(code) + offset)
+                    gene: sorted(np.flatnonzero(code) + offset)
                     for gene, code in zip(
-                        self.genes + [f"Blank-{i+1}" for i in range(n_blanks)], rmhd4.astype(int)
+                        self.genes + [f"Blank-{i + 1}" for i in range(n_blanks)], rmhd4.astype(int)
                     )
                 }
             case _:  # type: ignore
@@ -200,14 +196,12 @@ class ProbeSet(BaseModel):
     def codebook_dfs(self, path: Path | str):
         codebook = self.load_codebook(path)
         tss = list(codebook)
-        dfs = pl.concat(
-            [
-                pl.read_parquet(Path(path) / f"output/{ts}_final_BamHIKpnI_{hash_codebook(codebook)}.parquet")
-                # .sample(shuffle=True, seed=4, fraction=1)
-                .sort(["priority", "hp"])
-                for ts in tss
-            ]
-        )
+        dfs = pl.concat([
+            pl.read_parquet(Path(path) / f"output/{ts}_final_BamHIKpnI_{hash_codebook(codebook)}.parquet")
+            # .sample(shuffle=True, seed=4, fraction=1)
+            .sort(["priority", "hp"])
+            for ts in tss
+        ])
         return dfs
 
     @classmethod

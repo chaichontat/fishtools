@@ -160,8 +160,13 @@ class Image:
             waveform = toml.load(path.with_name(f"{path.name.split('-')[0]}.toml"))
 
         counts = {key: sum(waveform[key]["sequence"]) for key in cls.CHANNELS}
+
         # To remove ilm from, say, ilm405.
-        powers = {key[3:]: waveform[key]["power"] for key in cls.CHANNELS if counts[key] > 1}
+        powers = {
+            key[3:]: waveform[key]["power"]
+            for key in cls.CHANNELS
+            if (key == "ilm405" and counts[key] > n_fids) or (key != "ilm405" and counts[key])
+        }
         if len(powers) != len(bits):
             raise ValueError(f"{path}: Expected {len(bits)} channels, got {len(powers)}")
 
@@ -204,12 +209,13 @@ class Image:
             # raise Exception(f"No basic template found at {path_basic}")
             basic = lambda: None
 
+        fids_raw = np.atleast_3d(img[-n_fids:])
         return cls(
             name=name,
             idx=int(idx),
             nofid=nofid,
-            fid=cls.loG_fids(img[-n_fids:]),
-            fid_raw=img[-n_fids:],
+            fid=cls.loG_fids(fids_raw),
+            fid_raw=fids_raw,
             bits=bits,
             powers=powers,
             metadata=metadata,
@@ -221,7 +227,7 @@ class Image:
     def loG_fids(fid: np.ndarray):
         if len(fid.shape) == 3:
             temp = fid.max(axis=0)
-        temp = -ndimage.gaussian_laplace(fid.astype(np.float32), sigma=3)  # type: ignore
+        temp = -ndimage.gaussian_laplace(fid.astype(np.float32).copy(), sigma=3)  # type: ignore
         temp -= temp.min()
         return temp
 
@@ -372,10 +378,12 @@ def run(
 
     def collapse_z(
         img: np.ndarray,
-        slices: list[tuple[int | None, int | None]] | slice,
+        slices: list[tuple[int | None, int | None]] | slice | None,
     ) -> np.ndarray:
         if isinstance(slices, list):
             return np.stack([img[slice(*sl)].max(axis=0) for sl in slices])
+        if slices is None:
+            slices = slice(None)
         return img[slices]
 
     transformed: dict[str, np.ndarray] = {}
