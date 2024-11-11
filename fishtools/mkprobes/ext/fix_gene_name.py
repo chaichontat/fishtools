@@ -55,10 +55,24 @@ def find_aliases(gtf: _ExternalData, genes: Iterable[str], species: str = "mouse
 def manual_fix(res: ResDict, sel: dict[str, str]):
     dupes = {x[0] for x in res["dup"]}
     input("Manual fix: press enter to start. Enter the number of the correct gene name.")
+
     for line in dupes:
-        # if line in sel:
-        #     continue
-        jprint(choices := {i: x for i, x in enumerate((x for x in res["out"] if x["query"] == line), 1)})
+        choices = {i: x for i, x in enumerate((x for x in res["out"] if x["query"] == line), 1)}
+        query = choices[1]["query"]
+        symbols = [x["symbol"] for x in choices.values()]
+        if len(set(symbols)) == len(symbols):
+            # No duplicates
+            try:
+                matching = symbols.index(query)
+            except ValueError:
+                ...
+            else:
+                sel[line] = choices[matching + 1]["symbol"]
+                continue
+
+        # Manual fix
+        print(f"\nTarget is {query}. Which one is correct?\n")
+        jprint(choices)
         inp = input()
         if not inp:
             break

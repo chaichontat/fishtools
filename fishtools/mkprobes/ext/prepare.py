@@ -84,8 +84,13 @@ def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]):
     with set_cwd(path):
         todownload = {k: v for k, v in urls.items() if not Path(v).exists()}  # type: ignore
         with ThreadPoolExecutor() as pool:
-            names = [k[:-4] + ".gtf.gz" if "gtf" in k else None for k in todownload]
+            names = [k[:-4] + ".gtf.gz" if "gtf" in k else filenames[k] for k in todownload]
             pool.map(download, todownload.values(), ["."] * len(urls), names)
+
+        for ori, v in zip(todownload.values(), names):
+            print(ori, v)
+            if not Path(v or ori).exists():
+                raise FileNotFoundError(f"Could not download {v or ori}")
 
         if filenames["trna"].endswith(".gz"):
             trna_name = filenames["trna"].split(".")[0] + ".fa"
@@ -124,7 +129,7 @@ def run_jellyfish(path: Path | str):
         urls = _process_tsv("urls.tsv")
         filenames = {k: get_file_name(v) for k, v in urls.items()}  # type: ignore
 
-        gtf = _ExternalData("ensembl.parquet", fasta="cdna_ncrna_trna.fasta")
+        gtf = _ExternalData("ensembl.parquet", fasta="cdna_ncrna_trna.fasta", gtf_path="ensembl.gtf.gz")
         log.info("Getting tRNA, rRNA, and snoRNA sequences.")
 
         toexclude = [x.seq for x in pyfastx.Fasta(filenames["trna"].split(".")[0] + ".fa")] + get_rrna_snorna(

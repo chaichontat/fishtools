@@ -80,6 +80,7 @@ def get_transcripts(
     dataset: Dataset,
     genes: list[str],
     mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
+    output_path: Path | None = None,
 ) -> pl.DataFrame:
     """Get transcript ID from gene name or gene ID
     Returns:
@@ -100,14 +101,14 @@ def get_transcripts(
     ).sort("transcript_name")
     appris = df_genes.filter(pl.col("annotation").is_not_null())
 
-    to_return = ["transcript_id", "transcript_name", "tag"]
+    to_return = ["gene_name", "gene_id", "transcript_id", "transcript_name", "tag"]
 
     match mode:
         case "canonical":
             with ThreadPoolExecutor(3) as exc:
                 from functools import partial
 
-                res = exc.map(partial(get_ensembl, "output/"), df_genes["gene_id"])
+                res = exc.map(partial(get_ensembl, output_path or "output/"), df_genes["gene_id"])
                 canonical = [r["canonical_transcript"].split(".")[0] for r in res]
 
             res = dataset.ensembl.filter(pl.col("transcript_id").is_in(canonical))[to_return]
@@ -144,7 +145,7 @@ def get_transcripts(
                 f"Multiple transcripts found for {gene[0]}. See https://useast.ensembl.org/Mouse/Search/Results?q={gene[0]};site=ensembl;facet_species=Mouse"
             )
             print(f"Please pick one: {tss.with_row_index()}.")
-            picked = input("Enter the number of the correct transcript: ")
+            picked = input("Enter the index of the correct transcript: ")
             out.append(tss[int(picked)])
         else:
             out.append(tss)
@@ -162,6 +163,7 @@ def convert_to_transcripts(path: Path, genes: Path):
     gene_names = genes.read_text().splitlines()
     res = get_transcripts(ds, gene_names, mode="canonical")
     genes.with_suffix(".tss.txt").write_text("\n".join(res["transcript_name"]))
+    logger.info(f"Written to {genes.with_suffix('.tss.txt')}.")
 
 
 # fmt: off
