@@ -40,7 +40,10 @@ def find_aliases(gtf: _ExternalData, genes: Iterable[str], species: str = "mouse
     eids = list(chain.from_iterable(x["gene"] for x in out.values()))
     df = gtf.filter(pl.col("gene_id").is_in(eids))
     for v in out.values():
-        v["symbol"] = df.filter(pl.col("gene_id").is_in(v["gene"]))[0, "gene_name"]
+        _res = df.filter(pl.col("gene_id").is_in(v["gene"]))[0, "gene_name"]
+        if not isinstance(_res, str):
+            continue
+        v["symbol"] = _res
 
     # Simple case of duplication: only keep ensembl name.
     for d, _ in res["dup"].copy():
