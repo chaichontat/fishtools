@@ -30,11 +30,13 @@ def extract_ok(generated: T, ok_keys: list[int] | list[str]) -> T:
 
 
 @overload
-def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[False] = ...) -> pl.DataFrame: ...
+def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[False] = ...) -> pl.DataFrame:
+    ...
 
 
 @overload
-def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[True]) -> tuple[pl.DataFrame, T]: ...
+def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[True]) -> tuple[pl.DataFrame, T]:
+    ...
 
 
 def run_filter(f: Filter, seqs: T, return_ok_seqs: bool = False) -> pl.DataFrame | tuple[pl.DataFrame, T]:
@@ -274,16 +276,22 @@ assert list(map(splitter(1), seqs)) == zeroth_readouts["seq"].to_list()[:to_gen]
 SP6_F = reverse_complement("ACGTGACTGCTCC" + SP6[:-1])
 
 # %%
-idt = pl.concat([
-    pl.DataFrame({
-        "Pool name": "Amp1-Aug23",
-        "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs)),
-    }),
-    pl.DataFrame({
-        "Pool name": "Amp2-Aug23",
-        "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs_2)),
-    }),
-])
+idt = pl.concat(
+    [
+        pl.DataFrame(
+            {
+                "Pool name": "Amp1-Aug23",
+                "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs)),
+            }
+        ),
+        pl.DataFrame(
+            {
+                "Pool name": "Amp2-Aug23",
+                "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs_2)),
+            }
+        ),
+    ]
+)
 
 idt == pl.read_excel("amplifiers.xlsx")
 # idt.write_excel("amplifiers2.xlsx")

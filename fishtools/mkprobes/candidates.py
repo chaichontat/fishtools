@@ -247,7 +247,7 @@ def _run_transcript(
     )
 
     tss_pseudo, counts = (
-        get_pseudogenes(list(set([gene]) | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
+        get_pseudogenes(list({gene} | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
         if pseudogene_limit
         else (pl.Series(), pl.DataFrame())
     )
@@ -300,15 +300,21 @@ def _run_transcript(
             ),
             **PROBE_CRITERIA,
         )
-        .with_columns([
-            (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-            pl.col("seq")
-            .map_elements(lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
-            .alias("tm"),
-            pl.col("seq")
-            .map_elements(lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
-            .alias("hp"),
-        ])
+        .with_columns(
+            [
+                (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
+                pl.col("seq")
+                .map_elements(
+                    lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32
+                )
+                .alias("tm"),
+                pl.col("seq")
+                .map_elements(
+                    lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32
+                )
+                .alias("hp"),
+            ]
+        )
         .with_columns(oks=pl.sum_horizontal(pl.col("^ok_.*$")))
         # .filter(~pl.col("seq").map_elements(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
         .filter(

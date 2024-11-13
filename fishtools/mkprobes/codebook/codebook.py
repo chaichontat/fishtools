@@ -38,10 +38,14 @@ class CodebookPicker:
         self.existing = existing
 
         if self.existing is not None:
-            self.existing = np.hstack([
-                self.existing,
-                np.zeros((self.existing.shape[0], self.mhd4.shape[1] - self.existing.shape[1]), dtype=bool),
-            ])
+            self.existing = np.hstack(
+                [
+                    self.existing,
+                    np.zeros(
+                        (self.existing.shape[0], self.mhd4.shape[1] - self.existing.shape[1]), dtype=bool
+                    ),
+                ]
+            )
             assert self.existing.shape[1] == self.mhd4.shape[1]
             assert np.all(self.existing.sum(axis=1) == 4)
             self.mhd4 = np.array(
@@ -99,10 +103,12 @@ class CodebookPicker:
     @overload
     def export_codebook(
         self, seed: int, type: Literal["json"] = ..., offset: int = ...
-    ) -> dict[str, list[int]]: ...
+    ) -> dict[str, list[int]]:
+        ...
 
     @overload
-    def export_codebook(self, seed: int, type: Literal["csv"], offset: int = ...) -> pl.DataFrame: ...
+    def export_codebook(self, seed: int, type: Literal["csv"], offset: int = ...) -> pl.DataFrame:
+        ...
 
     def export_codebook(
         self, seed: int, type: Literal["csv", "json"] = "json", offset: int = 1
@@ -196,12 +202,14 @@ class ProbeSet(BaseModel):
     def codebook_dfs(self, path: Path | str):
         codebook = self.load_codebook(path)
         tss = list(codebook)
-        dfs = pl.concat([
-            pl.read_parquet(Path(path) / f"output/{ts}_final_BamHIKpnI_{hash_codebook(codebook)}.parquet")
-            # .sample(shuffle=True, seed=4, fraction=1)
-            .sort(["priority", "hp"])
-            for ts in tss
-        ])
+        dfs = pl.concat(
+            [
+                pl.read_parquet(Path(path) / f"output/{ts}_final_BamHIKpnI_{hash_codebook(codebook)}.parquet")
+                # .sample(shuffle=True, seed=4, fraction=1)
+                .sort(["priority", "hp"])
+                for ts in tss
+            ]
+        )
         return dfs
 
     @classmethod

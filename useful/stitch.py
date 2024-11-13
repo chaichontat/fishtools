@@ -183,7 +183,8 @@ def extract_channel(
 
 
 @click.group()
-def cli(): ...
+def cli():
+    ...
 
 
 @cli.command()
