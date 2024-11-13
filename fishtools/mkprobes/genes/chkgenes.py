@@ -138,19 +138,22 @@ def get_transcripts(
         case _:  # type: ignore
             raise ValueError(f"Unknown mode: {mode}")
 
-    out = []
-    for gene, tss in sorted(res.group_by("gene_name"), key=lambda x: x[0]):
-        if len(tss) > 1:
-            print(
-                f"Multiple transcripts found for {gene[0]}. See https://useast.ensembl.org/Mouse/Search/Results?q={gene[0]};site=ensembl;facet_species=Mouse"
-            )
-            print(f"Please pick one: {tss.with_row_index()}.")
-            picked = input("Enter the index of the correct transcript: ")
-            out.append(tss[int(picked)])
-        else:
-            out.append(tss)
-
-    return pl.concat(out)
+    # for gene, tss in sorted(res.group_by("gene_name"), key=lambda x: x[0]):
+    #     if len(tss) > 1:
+    #         print(
+    #             f"Multiple transcripts found for {gene[0]}. See https://useast.ensembl.org/Mouse/Search/Results?q={gene[0]};site=ensembl;facet_species=Mouse"
+    #         )
+    #         print(f"Please pick one: {tss.with_row_index()}.")
+    #         picked = input("Enter the index of the correct transcript: ")
+    #         out.append(tss[int(picked)])
+    #     else:
+    #         out.append(tss)
+    # try:
+    #     out = pl.concat(out)
+    # except ValueError:
+    #     raise ValueError(f"No transcripts found for {genes}")
+    # return out
+    return res
 
 
 @click.command()

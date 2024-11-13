@@ -32,7 +32,8 @@ def get_pseudogenes(
     limit: int = -1,  # allow: list[str] | None = None
 ) -> tuple[pl.Series, pl.DataFrame]:
     counts = (
-        y.count("transcript")
+        SAMFrame(y)
+        .count_group_by("transcript")
         .join(
             ensembl.gtf[["transcript_id", "transcript_name"]],
             left_on="transcript",
@@ -131,7 +132,7 @@ def _convert_gene_to_tss(dataset: Dataset, gtss: list[str]):
         if gts.startswith("ENS"):
             out.append(gts)
             continue
-        out.extend(get_transcripts(dataset, [gts], "ensembl")["transcript_id"].to_list())
+        out.extend(get_transcripts(dataset, [gts], "canonical")["transcript_id"].to_list())
     return out
 
 
@@ -183,8 +184,12 @@ def _run_transcript(
     gene: str
     transcript_id: str
     transcript_name: str
-
-    if overwrite or not (output / f"{transcript_name}_bowtie.parquet").exists():
+    try:
+        if overwrite:
+            raise FileNotFoundError
+        offtargets = pl.read_parquet(output / f"{transcript_name}_bowtie.parquet")
+        y = pl.read_parquet(output / f"{transcript_name}_all.parquet")
+    except (FileNotFoundError, pl.exceptions.ComputeError):
         seq = dataset.gencode.get_seq(transcript_id) if fasta is None else seq
         if len(seq) < 1500:
             logger.warning(
@@ -205,16 +210,13 @@ def _run_transcript(
         y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
         y.write_parquet(output / f"{transcript_name}_all.parquet")
         offtargets.write_parquet(output / f"{transcript_name}_bowtie.parquet")
-    else:
-        logger.warning(f"{transcript_name} reading from cache.")
-        y = SAMFrame.read_parquet(output / f"{transcript_name}_all.parquet")
-        offtargets = pl.read_parquet(output / f"{transcript_name}_bowtie.parquet")
 
     # Print most common offtargets
     logger.info(
         "Most common binders:\n"
         + str(
-            y.count("transcript", descending=True)
+            SAMFrame(y)
+            .count_group_by("transcript", descending=True)
             .filter(pl.col("count") > 0.1 * pl.col("count").first())
             .with_columns(
                 name=pl.col("transcript").map_elements(dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8)
@@ -236,7 +238,8 @@ def _run_transcript(
 
     if len(tss_others):
         names_with_pseudo = (
-            y.filter_isin(transcript=tss_others)
+            SAMFrame(y)
+            .filter_isin(transcript=tss_others)
             .rename(dict(transcript="maps_to_pseudo"))[["name", "maps_to_pseudo"]]
             .unique("name")
         )
@@ -244,7 +247,8 @@ def _run_transcript(
         names_with_pseudo = pl.DataFrame({"name": y["name"].unique(), "maps_to_pseudo": ""})
 
     isoforms = (
-        y.filter_isin(transcript=tss_allofgene)[["name", "transcript"]]
+        SAMFrame(y)
+        .filter_isin(transcript=tss_allofgene)[["name", "transcript"]]
         .with_columns(
             isoforms=pl.col("transcript").map_elements(dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8)
         )[["name", "isoforms"]]
@@ -260,7 +264,7 @@ def _run_transcript(
         )
     ).sort("transcript_name").write_csv(output / f"{transcript_name}_acceptable_tss.csv")
 
-    ff = y.filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
+    ff = SAMFrame(y).filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
     if not len(ff):
         raise Exception(
             f"No probes left after filtering for {transcript_name}. Most likely, there is a homologous gene involved."

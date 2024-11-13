@@ -138,7 +138,7 @@ def _generate(path: Path, n: int):
 
 
 order = (
-    list(chain.from_iterable([[i, i + 8, i + 16] for i in range(1, 9)])) + list(range(25, 34))
+    list(chain.from_iterable([[i, i + 8, i + 16] for i in range(1, 9)])) + list(range(25, 50))
     # + list(range(31, 34))
 )
 paths = static.glob("*bit_on3_dist2.csv")

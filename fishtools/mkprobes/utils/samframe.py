@@ -45,7 +45,7 @@ class SAMFrame(pl.DataFrame):
         return LazySAMFrame(super().lazy())
 
     @to_samframe
-    def count(self, col: str = "gene", descending: bool = False):
+    def count_group_by(self, col: str = "gene", descending: bool = False):
         return self.group_by(col).agg(pl.count()).sort("count", descending=descending)
 
     @to_samframe
@@ -229,7 +229,8 @@ class SAMFrame(pl.DataFrame):
             ~pl.col("transcript").is_in(acceptable_tss) & pl.col("match_consec").gt(18)
         ).with_columns(
             tm_offtarget=pl.struct(["seq", "cigar", "mismatched_reference"]).map_elements(
-                lambda x: tm_pairwise(x["seq"], x["cigar"], x["mismatched_reference"], formamide=formamide)  # type: ignore
+                lambda x: tm_pairwise(x["seq"], x["cigar"], x["mismatched_reference"], formamide=formamide),
+                return_dtype=pl.Float32,
             )
         )
 

@@ -205,7 +205,7 @@ def construct(
     # mrna = dataset.ensembl.get_seq(transcript)
 
     screened = (
-        screened.with_columns(splitted=pl.col("seq").map_elements(lambda pos: split_probe(pos, 58)))
+        screened.with_columns(splitted=pl.col("seq").map_elements(lambda pos: split_probe(pos, 58), return_dtype=pl.List(pl.Utf8)))
         # screened.with_columns(splitted=pl.col("pos").map_elements(lambda pos: split_probe(mrna[pos : pos + 70], 58)))
         .with_columns(
             splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
@@ -215,7 +215,7 @@ def construct(
     )
 
     screened = screened.filter(
-        (pl.col("splint").str.lengths() > 0)
+        (pl.col("splint").str.len_chars() > 0)
         # & (pl.col("splint").map_elements(lambda x: hp(x, "dna")) < 50)
         # & (pl.col("padlock").map_elements(lambda x: hp(x, "dna")) < 50)
     )

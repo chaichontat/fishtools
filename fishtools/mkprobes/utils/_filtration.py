@@ -47,7 +47,8 @@ def handle_overlap(
     # for ts in tss:
     logger.info(f"Number of candidates that match any filter: {len(df)}/{len(ddf)}")
     if not len(df):
-        raise ValueError("No probes passed filters")
+        logger.critical("No probes passed filters")
+        exit(0)
 
     for i in range(1, len(criteria) + 1):
         run = (
