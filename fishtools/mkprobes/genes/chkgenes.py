@@ -62,6 +62,7 @@ def chkgenes(path: Path, genes: Path):
         return
 
     converted, mapping, no_fix_needed = check_gene_names(ds.ensembl, gs, species=ds.species)
+    print(converted)
     if mapping:
         logger.info("Mappings:")
         jprint(mapping)
@@ -159,12 +160,22 @@ def get_transcripts(
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("genes", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
-def convert_to_transcripts(path: Path, genes: Path):
+@click.option(
+    "-m",
+    "--mode",
+    type=click.Choice(["gencode", "ensembl", "canonical", "appris", "apprisalt"]),
+    default="canonical",
+)
+def convert_to_transcripts(
+    path: Path,
+    genes: Path,
+    mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
+):
     """Validate/check that gene names are canonical in Ensembl"""
     ds = Dataset(path)
     del path
     gene_names = genes.read_text().splitlines()
-    res = get_transcripts(ds, gene_names, mode="canonical")
+    res = get_transcripts(ds, gene_names, mode=mode)
     genes.with_suffix(".tss.txt").write_text("\n".join(res["transcript_name"]))
     logger.info(f"Written to {genes.with_suffix('.tss.txt')}.")
 
