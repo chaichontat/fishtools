@@ -8,6 +8,7 @@ import pyfastx
 from loguru import logger
 
 from fishtools.mkprobes.genes.chkgenes import get_transcripts
+from fishtools.mkprobes.starmap.starmap import split_probe
 
 from .ext.external_data import Dataset, _ExternalData
 from .utils._alignment import gen_fasta
@@ -44,7 +45,7 @@ def get_pseudogenes(
         .with_columns(
             acceptable=pl.col("transcript_name").str.contains(rf"^({'|'.join(genes)})[a-zA-Z]?.*")
             # | pl.col("transcript").is_in(allow)
-            | pl.col("transcript_name").str.starts_with("Gm")
+            # | pl.col("transcript_name").str.starts_with("Gm")
             | pl.col("transcript_name").is_null(),
             significant=pl.col("count") > 0.1 * pl.col("count").max(),
         )
@@ -106,7 +107,7 @@ def get_candidates(
 def _run_bowtie(dataset: Dataset, seqs: pl.DataFrame, ignore_revcomp: bool = False, **kwargs):
     y = SAMFrame.from_bowtie_split_name(
         gen_fasta(seqs["seq"], names=seqs["name"]).getvalue(),
-        dataset.path / "txome",
+        dataset.path / "genome",
         seed_length=12,
         threshold=16,
         n_return=200,
@@ -206,6 +207,27 @@ def _run_transcript(
             logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
         if len(crawled) < 100:
             logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
+
+        crawled = (
+            crawled.with_columns(
+                splitted=pl.col("seq").map_elements(
+                    lambda pos: split_probe(pos, 58), return_dtype=pl.List(pl.Utf8)
+                )
+            )
+            .with_columns(
+                splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
+                padlock=pl.col("splitted").list.get(0),
+                padstart=pl.col("splitted").list.get(2).cast(pl.Int16),
+            )
+            .drop("splitted")
+            .filter(pl.col("splint").str.len_chars() > 0)
+            .melt(
+                id_vars=[col for col in crawled.columns if col not in ["splint", "padlock"]],
+                value_vars=["splint", "padlock"],
+            )
+            .with_columns(seq=pl.col("value"), name=pl.col("name") + "_" + pl.col("variable"))
+            .drop(["variable", "value"])
+        )
 
         y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
         y.write_parquet(output / f"{transcript_name}_all.parquet")
