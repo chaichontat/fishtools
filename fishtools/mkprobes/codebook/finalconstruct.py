@@ -180,7 +180,7 @@ def construct(
 
     hsh = hash_codebook(codebook)
 
-    if (final_path := Path(output_path / f"{transcript}_final{restriction}_{hsh}.parquet")).exists():
+    if (final_path := Path(output_path / hsh /f"{transcript}_final{restriction}.parquet")).exists():
         if overwrite:
             final_path.unlink()
         else:
@@ -204,21 +204,20 @@ def construct(
     # ].to_list()
     # mrna = dataset.ensembl.get_seq(transcript)
 
-    screened = (
-        screened.with_columns(splitted=pl.col("seq").map_elements(lambda pos: split_probe(pos, 58), return_dtype=pl.List(pl.Utf8)))
-        # screened.with_columns(splitted=pl.col("pos").map_elements(lambda pos: split_probe(mrna[pos : pos + 70], 58)))
-        .with_columns(
-            splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
-            padlock=pl.col("splitted").list.get(0),
-            padstart=pl.col("splitted").list.get(2).cast(pl.Int16),
-        ).drop("splitted")
-    )
+    # screened = (
+    #     screened.with_columns(splitted=pl.col("seq").map_elements(lambda pos: split_probe(pos, 58), return_dtype=pl.List(pl.Utf8)))
+    #     .with_columns(
+    #         splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
+    #         padlock=pl.col("splitted").list.get(0),
+    #         padstart=pl.col("splitted").list.get(2).cast(pl.Int16),
+    #     ).drop("splitted")
+    # )
 
-    screened = screened.filter(
-        (pl.col("splint").str.len_chars() > 0)
-        # & (pl.col("splint").map_elements(lambda x: hp(x, "dna")) < 50)
-        # & (pl.col("padlock").map_elements(lambda x: hp(x, "dna")) < 50)
-    )
+    # screened = screened.filter(
+    #     (pl.col("splint").str.len_chars() > 0)
+    #     # & (pl.col("splint").map_elements(lambda x: hp(x, "dna")) < 50)
+    #     # & (pl.col("padlock").map_elements(lambda x: hp(x, "dna")) < 50)
+    # )
 
     logger.debug(f"With proper padstart: {len(screened)}")
 
@@ -229,6 +228,7 @@ def construct(
     logger.info(f"Constructed {len(res)} probes for {transcript}.")
     assert res["seq"].is_not_null().all()
 
+    final_path.parent.mkdir(exist_ok=True, parents=True)
     res.write_parquet(final_path)
     # res.write_csv(final_path.with_suffix(".tsv"), separator="\t")  # deal with nested data
     logger.info(f"Written to {final_path}")

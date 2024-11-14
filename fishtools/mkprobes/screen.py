@@ -25,15 +25,6 @@ def _screen(
 ):
     output_dir = Path(output_dir)
 
-    # if re.search("-2\d\d", gene) is None:  # not transcript
-    #     try:
-    #         path = next(output_dir.glob(f"{gene}-_crawled.parquet"))
-    #         gene = path.name.split("_crawled")[0]
-    #         ff = SAMFrame(pl.read_parquet(path))
-    #     except StopIteration:
-    #         logger.critical(f"No crawled data found for {gene}. Aborting.")
-    #         raise Exception
-    # else:
     ff = SAMFrame(pl.read_parquet(output_dir / f"{gene}_crawled.parquet"))
 
     if fpkm_path is not None:
@@ -53,6 +44,28 @@ def _screen(
 
     final = the_filter(ff, overlap=overlap)
     assert not final["seq"].str.contains("N").any(), "N appears out of nowhere."
+
+    final = final.with_columns(
+        full_name=pl.col("name").str.split("_").list.get(0) + "_" + pl.col("name").str.split("_").list.get(1),
+        probe_type=pl.col("name").str.split("_").list.get(2),
+    )
+    final = (
+        final.pivot(
+            on="probe_type",
+            index=[col for col in final.columns if col not in ["probe_type", "seq"]],
+            values="seq",
+        )
+        .group_by("full_name")
+        .agg(pl.all())
+        .with_columns(
+            splint=pl.col("splint").list.drop_nulls().list.join(""),
+            padlock=pl.col("padlock").list.drop_nulls().list.join(""),
+            # pad_start=pl.col("pad_start").list.get(0),
+        )
+        .drop("name")
+        .rename({"full_name": "name"})
+    )
+
     final.write_parquet(
         write_path := output_dir
         / f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else ''}.parquet"

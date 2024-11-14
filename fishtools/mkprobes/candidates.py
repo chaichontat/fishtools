@@ -211,17 +211,21 @@ def _run_transcript(
         crawled = (
             crawled.with_columns(
                 splitted=pl.col("seq").map_elements(
-                    lambda pos: split_probe(pos, 58), return_dtype=pl.List(pl.Utf8)
-                )
+                    lambda pos: split_probe(pos, 60), return_dtype=pl.List(pl.Utf8)
+                ),
+                seq_full=pl.col("seq"),
             )
             .with_columns(
                 splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
                 padlock=pl.col("splitted").list.get(0),
-                padstart=pl.col("splitted").list.get(2).cast(pl.Int16),
+                pad_start=pl.col("splitted").list.get(2).cast(pl.Int16),
             )
             .drop("splitted")
             .filter(pl.col("splint").str.len_chars() > 0)
-            .melt(
+        )
+        # To get pad_start
+        crawled = (
+            crawled.melt(
                 id_vars=[col for col in crawled.columns if col not in ["splint", "padlock"]],
                 value_vars=["splint", "padlock"],
             )
@@ -293,7 +297,7 @@ def _run_transcript(
         )
 
     ff = SAMFrame(
-        ff.agg_tm_offtarget(tss_allacceptable, formamide=formamide)
+        ff.agg_tm_offtarget(tss_allacceptable, formamide=40)
         .with_columns(
             transcript_name=pl.col("transcript").map_elements(
                 dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8
@@ -320,6 +324,7 @@ def _run_transcript(
     logger.info(f"Generated {len(ff)} candidates.")
 
     assert not ff["seq"].str.contains("N").any()
+
     ff.write_parquet(output / f"{transcript_name}_crawled.parquet")
     return ff
 

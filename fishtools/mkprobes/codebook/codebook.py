@@ -197,7 +197,7 @@ class ProbeSet(BaseModel):
         codebook = self.load_codebook(path)
         tss = list(codebook)
         dfs = pl.concat([
-            pl.read_parquet(Path(path) / f"output/{ts}_final_BamHIKpnI_{hash_codebook(codebook)}.parquet")
+            pl.read_parquet(Path(path) / f"{hash_codebook(codebook)}/output/{ts}_final_BamHIKpnI.parquet")
             # .sample(shuffle=True, seed=4, fraction=1)
             .sort(["priority", "hp"])
             for ts in tss
