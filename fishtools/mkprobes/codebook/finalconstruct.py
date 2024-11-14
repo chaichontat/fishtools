@@ -180,7 +180,7 @@ def construct(
 
     hsh = hash_codebook(codebook)
 
-    if (final_path := Path(output_path / hsh /f"{transcript}_final{restriction}.parquet")).exists():
+    if (final_path := Path(output_path / hsh / f"{transcript}_final{restriction}.parquet")).exists():
         if overwrite:
             final_path.unlink()
         else:
