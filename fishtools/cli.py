@@ -14,7 +14,8 @@ P, R = ParamSpec("P"), TypeVar("R", covariant=True)
 
 
 class PathFirst(Protocol[P, R]):
-    def __call__(self, path: Path, *args: P.args, **kwargs: P.kwargs) -> R: ...
+    def __call__(self, path: Path, *args: P.args, **kwargs: P.kwargs) -> R:
+        ...
 
 
 def execute(
@@ -37,7 +38,8 @@ def execute(
 
 
 @click.group()
-def main(): ...
+def main():
+    ...
 
 
 def process_path(path: Path, file_types: list[str]):
@@ -69,6 +71,7 @@ def compress(path: Path, delete: bool = False, quality: int = 1, n_process: int 
             file.unlink()
             file.with_suffix(".dax").unlink(missing_ok=True)
 
+
 # fmt: off
 @main.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
@@ -83,7 +86,6 @@ def compress_one(path: Path, delete: bool = False, quality: int = 1, n_process: 
     if delete and 0.65 <= quality <= 1:
         path.unlink()
         path.with_suffix(".dax").unlink(missing_ok=True)
-
 
 
 # fmt: off

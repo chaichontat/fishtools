@@ -172,7 +172,7 @@ class Image:
 
         try:
             global_deconv_scaling = (
-                np.loadtxt((path.parent.parent / "deconv_scaling" / f"{name}.txt"))
+                np.loadtxt(path.parent.parent / "deconv_scaling" / f"{name}.txt")
                 .astype(np.float32)
                 .reshape((2, -1))
             )

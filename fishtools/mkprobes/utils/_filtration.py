@@ -17,6 +17,13 @@ PROBE_CRITERIA: Final = dict(
 )
 # fmt: on
 
+pair_name = pl.col("name").str.split("_").list.get(1)
+
+
+def filter_have_both(df: pl.DataFrame):
+    have_both = df.group_by(pair_name).count().filter(pl.col("count") == 2)
+    return df.filter(pair_name.is_in(have_both["name"]))
+
 
 def handle_overlap(
     df: pl.DataFrame,
@@ -31,7 +38,9 @@ def handle_overlap(
     df = df.sort(by=["pos_end", "tm"], descending=[False, True])
     criteria = criteria or [pl.col("*")]
 
-    ddf = df.lazy().with_row_count("index").with_columns(priority=pl.lit(0, dtype=pl.UInt8))
+    df_ori = df.with_row_count("index")
+
+    ddf = df_ori.lazy().with_columns(priority=pl.lit(0, dtype=pl.UInt8))
     for priority, criterion in reversed(list(enumerate(criteria, 1))):
         ddf = ddf.update(
             ddf.filter(criterion).with_columns(priority=pl.lit(priority, dtype=pl.UInt8)),
@@ -39,6 +48,9 @@ def handle_overlap(
         )
     ddf = ddf.collect()
     df = ddf.filter(pl.col("priority") > 0)
+    df = filter_have_both(df)
+
+    # breakpoint()
 
     selected_global = set()
     # tss = df["transcript_ori"].unique().to_list()
@@ -49,10 +61,11 @@ def handle_overlap(
     if not len(df):
         logger.critical("No probes passed filters")
         exit(0)
-
+    logger.info(f"Max pos_end: {df['pos_end'].max()}")
     for i in range(1, len(criteria) + 1):
         run = (
             df.filter((pl.col("priority") <= i) & ~pl.col("index").is_in(selected_global))
+            .filter(pl.col("name").str.ends_with("splint"))
             .select(["index", "pos_start", "pos_end", "priority"])
             .sort(["pos_end", "pos_start"])
         )
@@ -83,12 +96,14 @@ def handle_overlap(
             break
 
     selected_global |= sel_local  # type: ignore
-
-    return df.filter(pl.col("index").is_in(selected_global))
+    selected_names = df.filter(pl.col("index").is_in(selected_global)).select(name=pair_name)["name"]
+    df = df.filter(pair_name.is_in(selected_names))
+    logger.info(f"Selected {len(df) // 2} probes.")
+    return df
 
 
 def the_filter(
-    df: pl.DataFrame, overlap: int = -1, max_tm_offtarget: float = 45, max_hp: float = 45
+    df: pl.DataFrame, overlap: int = -1, max_tm_offtarget: float = 30, max_hp: float = 37
 ) -> pl.DataFrame:
     return handle_overlap(
         df,
@@ -97,17 +112,12 @@ def the_filter(
             (pl.col("oks") > 4)
             & (pl.col("hp") < max_hp)
             & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
-            & pl.col("length").lt(55)
             & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
             (pl.col("oks") > 3)
             & (pl.col("hp") < max_hp)
             & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
-            & pl.col("length").lt(55)
             & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 3)
-            & (pl.col("hp") < max_hp)
-            & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
-            & pl.col("length").lt(55),
+            (pl.col("oks") > 3) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget),
             (pl.col("oks") > 3)
             & (pl.col("hp") < max_hp + 5)
             & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),

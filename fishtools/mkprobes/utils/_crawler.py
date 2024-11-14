@@ -14,7 +14,7 @@ def crawler(
     hairpin_limit: float = 50,
     tm_model: Model = "hybrid",
     to_avoid: list[str] | None = None,
-    formamide: float = 40,
+    formamide: float = 50,
 ) -> pl.DataFrame:
     """
     Based on the monotonic relationship between Tm and sequence length.
@@ -71,9 +71,9 @@ def crawler(
             if curr_tm > tm_limit[0]:
                 if (
                     "N" not in seq[start:end]
-                    and hp(seq[start:end], "rna", formamide=formamide) < hairpin_limit
+                    and hp(seq[start:end], tm_model, formamide=formamide) < hairpin_limit
                 ):
-                    names.append(f"{prefix}:{start}-{end-1}")
+                    names.append(f"{prefix}:{start}-{end - 1}")
                     seqs.append(seq[start:end])
                 else:
                     fail_reasons["hairpin"] += 1
@@ -84,7 +84,6 @@ def crawler(
     ret = df.filter(~pl.col("seq").str.contains("|".join(to_avoid)))
     assert not df["seq"].str.contains("N").any()
     fail_reasons["homopolymer"] = len(df) - len(ret)
-    print(fail_reasons)
     logger.debug(str(fail_reasons))
 
     return ret

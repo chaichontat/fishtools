@@ -137,7 +137,8 @@ x, y = 3, 3
 
 
 @click.group()
-def cli(): ...
+def cli():
+    ...
 
 
 @cli.command()

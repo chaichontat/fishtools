@@ -8,6 +8,7 @@ import pyfastx
 from loguru import logger
 
 from fishtools.mkprobes.genes.chkgenes import get_transcripts
+from fishtools.mkprobes.starmap.starmap import split_probe
 
 from .ext.external_data import Dataset, _ExternalData
 from .utils._alignment import gen_fasta
@@ -44,7 +45,7 @@ def get_pseudogenes(
         .with_columns(
             acceptable=pl.col("transcript_name").str.contains(rf"^({'|'.join(genes)})[a-zA-Z]?.*")
             # | pl.col("transcript").is_in(allow)
-            | pl.col("transcript_name").str.starts_with("Gm")
+            # | pl.col("transcript_name").str.starts_with("Gm")
             | pl.col("transcript_name").is_null(),
             significant=pl.col("count") > 0.1 * pl.col("count").max(),
         )
@@ -54,9 +55,9 @@ def get_pseudogenes(
     # cutoff when the probes bind to other genes
     limit = limit if limit > 0 else (not_acceptable[0, "i"] - 1 or 10)
 
-    if len(not_acceptable):
+    if len(not_acceptable) > 0.1 * len(counts):
         logger.warning(f"More than 10% of candidates of {genes} bind to other genes.")
-        print(not_acceptable[:50])
+        # print(not_acceptable[:50])
 
     # Filter based on expression and number of probes aligned.
     return counts.filter(pl.col("significant") & pl.col("acceptable"))[:limit]["transcript"], counts
@@ -106,12 +107,13 @@ def get_candidates(
 def _run_bowtie(dataset: Dataset, seqs: pl.DataFrame, ignore_revcomp: bool = False, **kwargs):
     y = SAMFrame.from_bowtie_split_name(
         gen_fasta(seqs["seq"], names=seqs["name"]).getvalue(),
-        dataset.path / "txome",
+        dataset.path / "genome",
         seed_length=12,
         threshold=16,
         n_return=200,
         fasta=True,
         no_reverse=ignore_revcomp,
+        capture_stderr=True,
         **kwargs,
     )
 
@@ -201,13 +203,41 @@ def _run_transcript(
         crawled = crawler(seq, prefix=f"{gene if fasta is None else ''}_{transcript_id}", formamide=formamide)
         if len(crawled) > 5000:
             logger.warning(f"Transcript {transcript_id} has {len(crawled)} probes. Using only 2000.")
-            crawled = crawled.sample(n=2000, shuffle=True, seed=3)
+            crawled = crawled.sample(n=5000, shuffle=True, seed=3)
         if len(crawled) < 5:
             logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
         if len(crawled) < 100:
             logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
 
-        y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
+        crawled = (
+            crawled.with_columns(
+                splitted=pl.col("seq").map_elements(
+                    lambda pos: split_probe(pos, 60), return_dtype=pl.List(pl.Utf8)
+                ),
+                seq_full=pl.col("seq"),
+            )
+            .with_columns(
+                splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
+                padlock=pl.col("splitted").list.get(0),
+                pad_start=pl.col("splitted").list.get(2).cast(pl.Int16),
+            )
+            .drop("splitted")
+            .filter(pl.col("splint").str.len_chars() > 0)
+        )
+        # To get pad_start
+        crawled = (
+            crawled.melt(
+                id_vars=[col for col in crawled.columns if col not in ["splint", "padlock"]],
+                value_vars=["splint", "padlock"],
+            )
+            .with_columns(seq=pl.col("value"), name=pl.col("name") + "_" + pl.col("variable"))
+            .drop(["variable", "value"])
+        )
+        # crawled.write_parquet(output / f"{transcript_name}_rawcrawled.parquet")
+
+        y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=False)
+        y = y.join(crawled[["name", "seq_full", "pad_start"]], on="name")
+
         y.write_parquet(output / f"{transcript_name}_all.parquet")
         offtargets.write_parquet(output / f"{transcript_name}_bowtie.parquet")
 
@@ -225,7 +255,7 @@ def _run_transcript(
     )
 
     tss_pseudo, counts = (
-        get_pseudogenes(list(set([gene]) | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
+        get_pseudogenes(list({gene} | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
         if pseudogene_limit
         else (pl.Series(), pl.DataFrame())
     )
@@ -234,7 +264,7 @@ def _run_transcript(
         bad_sig.write_csv(output / f"{transcript_name}_offtarget_counts.csv")
 
     # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
-    tss_others = {*tss_pseudo, *allow_tss} - set(disallow_tss)
+    tss_others = {*allow_tss} - set(disallow_tss)
 
     if len(tss_others):
         names_with_pseudo = (
@@ -256,11 +286,11 @@ def _run_transcript(
         .all()
     )
 
-    tss_allacceptable: list[str] = list(tss_allofgene | tss_others)
+    tss_allacceptable: list[str] = list(tss_allofgene | tss_others) + ["*"]
     pl.DataFrame(
         dict(
             transcript_id=tss_allacceptable,
-            transcript_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable],
+            transcript_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable if t != "*"] + ["*"],
         )
     ).sort("transcript_name").write_csv(output / f"{transcript_name}_acceptable_tss.csv")
 
@@ -271,22 +301,28 @@ def _run_transcript(
         )
 
     ff = SAMFrame(
-        ff.agg_tm_offtarget(tss_allacceptable, formamide=formamide)
+        ff.agg_tm_offtarget(tss_allacceptable, formamide=40)
         .with_columns(
             transcript_name=pl.col("transcript").map_elements(
                 dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8
             ),
             **PROBE_CRITERIA,
         )
-        .with_columns([
-            (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-            pl.col("seq")
-            .map_elements(lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
-            .alias("tm"),
-            pl.col("seq")
-            .map_elements(lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
-            .alias("hp"),
-        ])
+        .with_columns(
+            [
+                (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
+                pl.col("seq")
+                .map_elements(
+                    lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32
+                )
+                .alias("tm"),
+                pl.col("seq")
+                .map_elements(
+                    lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32
+                )
+                .alias("hp"),
+            ]
+        )
         .with_columns(oks=pl.sum_horizontal(pl.col("^ok_.*$")))
         # .filter(~pl.col("seq").map_elements(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
         .filter(
@@ -298,6 +334,7 @@ def _run_transcript(
     logger.info(f"Generated {len(ff)} candidates.")
 
     assert not ff["seq"].str.contains("N").any()
+
     ff.write_parquet(output / f"{transcript_name}_crawled.parquet")
     return ff
 
@@ -321,7 +358,7 @@ def candidates(
     gene: str | None,
     fasta: Path | None,
     output: str | Path = "output/",
-    ignore_revcomp: bool = True,
+    ignore_revcomp: bool = False,
     overwrite: bool = False,
     allow: str | None = None,
     disallow: str | None = None,

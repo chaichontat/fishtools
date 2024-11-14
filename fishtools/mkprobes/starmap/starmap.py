@@ -1,10 +1,9 @@
 from dataclasses import dataclass
 
+import numpy as np
 import polars as pl
 import primer3
 from loguru import logger
-
-from fishtools import hp, rc, tm
 
 
 def rotate(s: str, r: int):
@@ -12,6 +11,8 @@ def rotate(s: str, r: int):
 
 
 def test_splint_padlock(splint: str, padlock: str, lengths: tuple[int, int] = (6, 6)):
+    from fishtools import rc
+
     # if not len(splint) & 1 == 0:
     #     raise ValueError("Splint must be even length")
     # mid = len(splint) // 2
@@ -25,6 +26,8 @@ def test_splint_padlock(splint: str, padlock: str, lengths: tuple[int, int] = (6
 
 
 def split_probe(seq: str, target_tm: float) -> tuple[str, str, str] | None:
+    from fishtools import hp, rc, tm
+
     first, last = "", ""
     i = 0
     for start in range(8):
@@ -56,6 +59,8 @@ def pad(s: str, target: int = 89):
 
 
 def gen_rotate(dfs: pl.DataFrame):
+    from fishtools import rc
+
     res = dfs.with_columns(
         rotated=pl.col("seq")
         .map_elements(rc)
@@ -166,6 +171,8 @@ class STARPrimers:
         return self.header + "GGTCTC" + self.bsa_hang
 
     def gen_cleave1(self):
+        from fishtools import rc
+
         return (
             ("DDDDDDDD" if not self.is_splint else "CATCAACA")
             + rc(self.bsa_hang)
@@ -177,4 +184,25 @@ class STARPrimers:
         return self.footer + "GAGACC" + "ATTATCCCTATAGTGAG"
 
     def gen_cleave2(self):
+        from fishtools import rc
+
         return rc(self.make_footer())[-(10 + 5) :] + ("HHHHH" if self.is_splint else "DDDDD")
+
+
+def generate_head_splint(padlock: str, rand: np.random.Generator) -> str:
+    from fishtools import hp, rc
+
+    # Minimize the amount of secondary structures.
+    # Must start with C.
+    test = "TAA" + rc(padlock)
+    # base_hp = hp(test, "dna")
+    out = []
+    for _ in range(10):
+        cand = "".join(rand.choice(["A", "T", "C"], p=[0.125, 0.125, 0.75], size=3))
+        if "CCCCC" in cand:
+            continue
+        out.append((cand, hp(cand + test, "dna")))
+
+    cand, hp_ = min(out, key=lambda x: x[1])
+    assert len(cand) == 3
+    return cand

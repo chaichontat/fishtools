@@ -66,8 +66,8 @@ def construct_idt(seq_encoding: pl.DataFrame, idxs: Sequence[int]):
     assert len(idxs) == 1
     out = dict(name=[], code=[], cons_pad=[], cons_splint=[], seq=[])
 
-    for name, splint, pad, padstart in seq_encoding[["name", "splint", "padlock", "padstart"]].iter_rows():
-        assert padstart > 17
+    for name, splint, pad, pad_start in seq_encoding[["name", "splint", "padlock", "pad_start"]].iter_rows():
+        assert pad_start > 17
 
         out["name"].append(name)  # f"{name};;{sep}{','.join(map(str,codes))}")
         out["code"].append(idxs[0])
@@ -95,9 +95,9 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: Sequence[int], n: int =
     for i in range(n):
         out[f"code{i + 1}"] = []
 
-    for name, pad, padstart in seq_encoding[["name", "padlock", "padstart"]].iter_rows():
+    for name, pad, pad_start in seq_encoding[["name", "padlock", "pad_start"]].iter_rows():
         # for codes, _ in zip(perms, range(4)):
-        assert padstart > 17
+        assert pad_start > 17
         for sep, codes in zip(["AA", "TA", "AT", "TT"], perms):
             stitched = stitch(pad, codes, sep=sep)
             if "AAAAA" in stitched or "TTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
@@ -180,11 +180,12 @@ def construct(
 
     hsh = hash_codebook(codebook)
 
-    if (final_path := Path(output_path / f"{transcript}_final{restriction}_{hsh}.parquet")).exists():
+    if (final_path := Path(output_path / hsh / f"{transcript}_final{restriction}.parquet")).exists():
         if overwrite:
             final_path.unlink()
         else:
             return
+    final_path.parent.mkdir(exist_ok=True, parents=True)
     #     pl.read_parquet(final_path)[["code1", "code2"]].to_numpy().flatten()
     # ) != set(codebook[transcript]):
     #     logger.critical(f"Codebook for {transcript} has changed.")
@@ -204,23 +205,22 @@ def construct(
     # ].to_list()
     # mrna = dataset.ensembl.get_seq(transcript)
 
-    screened = (
-        screened.with_columns(splitted=pl.col("seq").map_elements(lambda pos: split_probe(pos, 58), return_dtype=pl.List(pl.Utf8)))
-        # screened.with_columns(splitted=pl.col("pos").map_elements(lambda pos: split_probe(mrna[pos : pos + 70], 58)))
-        .with_columns(
-            splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
-            padlock=pl.col("splitted").list.get(0),
-            padstart=pl.col("splitted").list.get(2).cast(pl.Int16),
-        ).drop("splitted")
-    )
+    # screened = (
+    #     screened.with_columns(splitted=pl.col("seq").map_elements(lambda pos: split_probe(pos, 58), return_dtype=pl.List(pl.Utf8)))
+    #     .with_columns(
+    #         splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
+    #         padlock=pl.col("splitted").list.get(0),
+    #         padstart=pl.col("splitted").list.get(2).cast(pl.Int16),
+    #     ).drop("splitted")
+    # )
 
-    screened = screened.filter(
-        (pl.col("splint").str.len_chars() > 0)
-        # & (pl.col("splint").map_elements(lambda x: hp(x, "dna")) < 50)
-        # & (pl.col("padlock").map_elements(lambda x: hp(x, "dna")) < 50)
-    )
+    # screened = screened.filter(
+    #     (pl.col("splint").str.len_chars() > 0)
+    #     # & (pl.col("splint").map_elements(lambda x: hp(x, "dna")) < 50)
+    #     # & (pl.col("padlock").map_elements(lambda x: hp(x, "dna")) < 50)
+    # )
 
-    logger.debug(f"With proper padstart: {len(screened)}")
+    logger.debug(f"With proper pad_start: {len(screened)}")
 
     res = construction_function(screened, codebook[transcript]).join(
         screened.rename(dict(seq="seqori")), on="name", how="left"
@@ -229,6 +229,7 @@ def construct(
     logger.info(f"Constructed {len(res)} probes for {transcript}.")
     assert res["seq"].is_not_null().all()
 
+    final_path.parent.mkdir(exist_ok=True, parents=True)
     res.write_parquet(final_path)
     # res.write_csv(final_path.with_suffix(".tsv"), separator="\t")  # deal with nested data
     logger.info(f"Written to {final_path}")
