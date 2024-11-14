@@ -155,7 +155,8 @@ def load_codebook(path: Path, exclude: set[str] | None = None):
 
 
 @click.group()
-def cli(): ...
+def cli():
+    ...
 
 
 def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13, split: bool = False):

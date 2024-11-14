@@ -84,12 +84,14 @@ w = 1988
 assert len(coords) == len(set(coords["index"]))
 
 cells = [
-    Polygon([
-        (row["x"], row["y"]),
-        (row["x"] + w, row["y"]),
-        (row["x"] + w, row["y"] + w),
-        (row["x"], row["y"] + w),
-    ])
+    Polygon(
+        [
+            (row["x"], row["y"]),
+            (row["x"] + w, row["y"]),
+            (row["x"] + w, row["y"] + w),
+            (row["x"], row["y"] + w),
+        ]
+    )
     for row in coords.iter_rows(named=True)
 ]
 
@@ -132,11 +134,13 @@ def process(out: list, curr: int, filter_: bool = True):
     #         out.append(row)
 
     # Apply the function to all rows at once
-    mask = df.select([
-        pl.struct(["x", "y"])
-        .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
-        .alias("keep")
-    ])
+    mask = df.select(
+        [
+            pl.struct(["x", "y"])
+            .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
+            .alias("keep")
+        ]
+    )
 
     # Filter the dataframe and count the thrown points
     filtered_df = df.filter(mask["keep"])
@@ -247,12 +251,14 @@ from polars import col as c
 
 # spots = pl.read_parquet("/fast2/3t3clean/analysis/spots.parquet")
 # %%
-what = spots.groupby("target").agg([
-    pl.count(),
-    pl.mean("distance"),
-    pl.quantile("norm", 0.1),
-    pl.mean("area"),
-])
+what = spots.groupby("target").agg(
+    [
+        pl.count(),
+        pl.mean("distance"),
+        pl.quantile("norm", 0.1),
+        pl.mean("area"),
+    ]
+)
 # %%
 sns.scatterplot(x="norm", y="count", data=what.to_pandas(), alpha=0.3, s=10, edgecolor="none")
 

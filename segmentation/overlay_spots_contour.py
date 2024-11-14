@@ -135,8 +135,7 @@ def run(idx: int):
     spots = (
         pl.read_parquet("/mnt/working/lai/registered--whole_embryo/genestar/spots.parquet")
         # .filter(pl.col("tile") == "1144")
-        .with_row_index("ii")
-        .with_columns(
+        .with_row_index("ii").with_columns(
             ii=pl.col("ii").cast(pl.Int64), x=pl.col("x") / 2 - minimums[0], y=pl.col("y") / 2 - minimums[1]
         )
     )

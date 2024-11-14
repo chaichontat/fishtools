@@ -87,7 +87,8 @@ def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4
 
 
 @click.group()
-def cli(): ...
+def cli():
+    ...
 
 
 @cli.command()

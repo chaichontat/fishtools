@@ -164,13 +164,16 @@ def _calculate_drift(
     return np.round(res, precision)
 
 
-class NotEnoughSpots(Exception): ...
+class NotEnoughSpots(Exception):
+    ...
 
 
-class TooManySpots(Exception): ...
+class TooManySpots(Exception):
+    ...
 
 
-class ResidualTooLarge(Exception): ...
+class ResidualTooLarge(Exception):
+    ...
 
 
 def run_fiducial(

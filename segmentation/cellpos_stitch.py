@@ -243,9 +243,9 @@ def demonstrate_splice():
 base_dim = 19584, 26070
 files = sorted(Path("chunks").glob("masks-*.tif"))
 
-file_names = pl.DataFrame([
-    (x.as_posix(), *re.search(r"masks-(\d+)_(\d+).tif", x.name).groups()) for x in files
-]).transpose()
+file_names = pl.DataFrame(
+    [(x.as_posix(), *re.search(r"masks-(\d+)_(\d+).tif", x.name).groups()) for x in files]
+).transpose()
 
 for i, (idx_y, ys) in enumerate(sorted(file_names.group_by("column_1"), key=lambda x: int(x[0][0]))):
     ys = ys.sort("column_1")
@@ -274,9 +274,9 @@ base_dim = 19584, 26070
 out = np.zeros(base_dim)
 files = sorted(Path("chunks").glob("spliced-*.tif"))
 
-file_names = pl.DataFrame([
-    (x.as_posix(), *re.search(r"spliced-(\d+).tif", x.name).groups()) for x in files
-]).transpose()
+file_names = pl.DataFrame(
+    [(x.as_posix(), *re.search(r"spliced-(\d+).tif", x.name).groups()) for x in files]
+).transpose()
 
 imgt = tifffile.imread(file_names[0, "column_0"])
 

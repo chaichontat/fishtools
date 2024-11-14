@@ -230,7 +230,8 @@ projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 
 @click.group()
-def main(): ...
+def main():
+    ...
 
 
 @main.command()
@@ -243,9 +244,9 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
     Find the scaling factors of all images in the children sub-folder of `path`.
     Run this on the entire workspace. See `_compute_range` for more details.
     """
-    rounds = sorted({
-        p.parent.name.split("--")[0] for p in path.rglob("*.tif") if len(p.parent.name.split("--")) == 2
-    })
+    rounds = sorted(
+        {p.parent.name.split("--")[0] for p in path.rglob("*.tif") if len(p.parent.name.split("--")) == 2}
+    )
     print(rounds)
     if "deconv" not in path.resolve().as_posix():
         raise ValueError("This command must be run in the deconvolved folder.")
@@ -383,16 +384,18 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
         towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
         del res
 
-        q_write.put((
-            start,
-            towrite,
-            fid,
-            metadata
-            | {
-                "deconv_min": list(map(float, mins.get().flatten())),
-                "deconv_scale": list(map(float, scale.get().flatten())),
-            },
-        ))
+        q_write.put(
+            (
+                start,
+                towrite,
+                fid,
+                metadata
+                | {
+                    "deconv_min": list(map(float, mins.get().flatten())),
+                    "deconv_scale": list(map(float, scale.get().flatten())),
+                },
+            )
+        )
         q_img.task_done()
 
     q_write.put(None)

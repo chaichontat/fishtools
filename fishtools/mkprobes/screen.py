@@ -85,7 +85,8 @@ def run_screen(
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
     overwrite: bool = False,
-) -> pl.DataFrame: ...
+) -> pl.DataFrame:
+    ...
 
 
 @overload
@@ -98,7 +99,8 @@ def run_screen(
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
     overwrite: bool = False,
-) -> dict[int, pl.DataFrame]: ...
+) -> dict[int, pl.DataFrame]:
+    ...
 
 
 def run_screen(
@@ -117,8 +119,7 @@ def run_screen(
         and (
             output_dir
             / (
-                file
-                := f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else ''}.parquet"
+                file := f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else ''}.parquet"
             )
         ).exists()
     ):

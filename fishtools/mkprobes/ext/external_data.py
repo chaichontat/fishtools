@@ -133,10 +133,12 @@ class _ExternalData:
         return self.gtf.filter(pl.col("gene_name") == gene)
 
     @overload
-    def __getitem__(self, eid: str) -> pl.Series: ...
+    def __getitem__(self, eid: str) -> pl.Series:
+        ...
 
     @overload
-    def __getitem__(self, eid: list[str]) -> pl.DataFrame: ...
+    def __getitem__(self, eid: list[str]) -> pl.DataFrame:
+        ...
 
     def __getitem__(self, eid: str | list[str]) -> pl.Series | pl.DataFrame:
         return self.gtf[eid]
@@ -189,26 +191,32 @@ class _ExternalData:
             )
             .filter(pl.col("feature").is_in(filters) if filters else pl.col("feature").is_not_null())
             .with_columns(
-                pl.concat_str([
-                    pl.lit("{"),
-                    pl.col("attribute")
-                    .str.replace_all(r"; (\w+) ", r', "$1": ')
-                    .str.replace_all(";", ",")
-                    .str.replace(r"(\w+) ", r'"$1": ')
-                    .str.replace(r",$", ""),
-                    pl.lit("}"),
-                ]).alias("jsoned")
+                pl.concat_str(
+                    [
+                        pl.lit("{"),
+                        pl.col("attribute")
+                        .str.replace_all(r"; (\w+) ", r', "$1": ')
+                        .str.replace_all(";", ",")
+                        .str.replace(r"(\w+) ", r'"$1": ')
+                        .str.replace(r",$", ""),
+                        pl.lit("}"),
+                    ]
+                ).alias("jsoned")
             )
-            .with_columns([
-                pl.col("jsoned").str.json_path_match(f"$.{name}").alias(name)
-                # .cast(pl.Categorical if "type" in name or "tag" == name else pl.Utf8)
-                for name in attr_keys
-            ])
+            .with_columns(
+                [
+                    pl.col("jsoned").str.json_path_match(f"$.{name}").alias(name)
+                    # .cast(pl.Categorical if "type" in name or "tag" == name else pl.Utf8)
+                    for name in attr_keys
+                ]
+            )
             # .drop(["attribute", "jsoned"])
-            .with_columns([
-                pl.col("gene_id").str.extract(r"(\w+)(\.\d+)?").alias("gene_id"),
-                pl.col("transcript_id").str.extract(r"(\w+)(\.\d+)?").alias("transcript_id"),
-            ])
+            .with_columns(
+                [
+                    pl.col("gene_id").str.extract(r"(\w+)(\.\d+)?").alias("gene_id"),
+                    pl.col("transcript_id").str.extract(r"(\w+)(\.\d+)?").alias("transcript_id"),
+                ]
+            )
         )
 
 
