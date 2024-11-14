@@ -71,7 +71,8 @@ console = Console()
 
 # Massive hack to get rid of the first two arguments from the type signature.
 class _JPrint(Protocol[P]):
-    def __call__(self, code: str, lexer: str, *args: P.args, **kwargs: P.kwargs) -> Any: ...
+    def __call__(self, code: str, lexer: str, *args: P.args, **kwargs: P.kwargs) -> Any:
+        ...
 
 
 def _jprint(f: _JPrint[P]) -> Callable[Concatenate[Any, P], None]:
