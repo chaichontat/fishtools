@@ -55,9 +55,9 @@ def get_pseudogenes(
     # cutoff when the probes bind to other genes
     limit = limit if limit > 0 else (not_acceptable[0, "i"] - 1 or 10)
 
-    if len(not_acceptable):
+    if len(not_acceptable) > 0.1 * len(counts):
         logger.warning(f"More than 10% of candidates of {genes} bind to other genes.")
-        print(not_acceptable[:50])
+        # print(not_acceptable[:50])
 
     # Filter based on expression and number of probes aligned.
     return counts.filter(pl.col("significant") & pl.col("acceptable"))[:limit]["transcript"], counts
@@ -113,6 +113,7 @@ def _run_bowtie(dataset: Dataset, seqs: pl.DataFrame, ignore_revcomp: bool = Fal
         n_return=200,
         fasta=True,
         no_reverse=ignore_revcomp,
+        capture_stderr=True,
         **kwargs,
     )
 
@@ -202,7 +203,7 @@ def _run_transcript(
         crawled = crawler(seq, prefix=f"{gene if fasta is None else ''}_{transcript_id}", formamide=formamide)
         if len(crawled) > 5000:
             logger.warning(f"Transcript {transcript_id} has {len(crawled)} probes. Using only 2000.")
-            crawled = crawled.sample(n=2000, shuffle=True, seed=3)
+            crawled = crawled.sample(n=5000, shuffle=True, seed=3)
         if len(crawled) < 5:
             logger.warning(f"Transcript {transcript_id} has only {len(crawled)} probes.")
         if len(crawled) < 100:
@@ -232,8 +233,11 @@ def _run_transcript(
             .with_columns(seq=pl.col("value"), name=pl.col("name") + "_" + pl.col("variable"))
             .drop(["variable", "value"])
         )
+        # crawled.write_parquet(output / f"{transcript_name}_rawcrawled.parquet")
 
-        y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
+        y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=False)
+        y = y.join(crawled[["name", "seq_full", "pad_start"]], on="name")
+
         y.write_parquet(output / f"{transcript_name}_all.parquet")
         offtargets.write_parquet(output / f"{transcript_name}_bowtie.parquet")
 
@@ -260,7 +264,7 @@ def _run_transcript(
         bad_sig.write_csv(output / f"{transcript_name}_offtarget_counts.csv")
 
     # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
-    tss_others = {*tss_pseudo, *allow_tss} - set(disallow_tss)
+    tss_others = {*allow_tss} - set(disallow_tss)
 
     if len(tss_others):
         names_with_pseudo = (
@@ -282,11 +286,11 @@ def _run_transcript(
         .all()
     )
 
-    tss_allacceptable: list[str] = list(tss_allofgene | tss_others)
+    tss_allacceptable: list[str] = list(tss_allofgene | tss_others) + ["*"]
     pl.DataFrame(
         dict(
             transcript_id=tss_allacceptable,
-            transcript_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable],
+            transcript_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable if t != "*"] + ["*"],
         )
     ).sort("transcript_name").write_csv(output / f"{transcript_name}_acceptable_tss.csv")
 
@@ -304,21 +308,15 @@ def _run_transcript(
             ),
             **PROBE_CRITERIA,
         )
-        .with_columns(
-            [
-                (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-                pl.col("seq")
-                .map_elements(
-                    lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32
-                )
-                .alias("tm"),
-                pl.col("seq")
-                .map_elements(
-                    lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32
-                )
-                .alias("hp"),
-            ]
-        )
+        .with_columns([
+            (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
+            pl.col("seq")
+            .map_elements(lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .alias("tm"),
+            pl.col("seq")
+            .map_elements(lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .alias("hp"),
+        ])
         .with_columns(oks=pl.sum_horizontal(pl.col("^ok_.*$")))
         # .filter(~pl.col("seq").map_elements(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
         .filter(
@@ -354,7 +352,7 @@ def candidates(
     gene: str | None,
     fasta: Path | None,
     output: str | Path = "output/",
-    ignore_revcomp: bool = True,
+    ignore_revcomp: bool = False,
     overwrite: bool = False,
     allow: str | None = None,
     disallow: str | None = None,

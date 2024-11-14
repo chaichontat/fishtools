@@ -66,8 +66,8 @@ def construct_idt(seq_encoding: pl.DataFrame, idxs: Sequence[int]):
     assert len(idxs) == 1
     out = dict(name=[], code=[], cons_pad=[], cons_splint=[], seq=[])
 
-    for name, splint, pad, padstart in seq_encoding[["name", "splint", "padlock", "padstart"]].iter_rows():
-        assert padstart > 17
+    for name, splint, pad, pad_start in seq_encoding[["name", "splint", "padlock", "pad_start"]].iter_rows():
+        assert pad_start > 17
 
         out["name"].append(name)  # f"{name};;{sep}{','.join(map(str,codes))}")
         out["code"].append(idxs[0])
@@ -95,9 +95,9 @@ def construct_encoding(seq_encoding: pl.DataFrame, idxs: Sequence[int], n: int =
     for i in range(n):
         out[f"code{i + 1}"] = []
 
-    for name, pad, padstart in seq_encoding[["name", "padlock", "padstart"]].iter_rows():
+    for name, pad, pad_start in seq_encoding[["name", "padlock", "pad_start"]].iter_rows():
         # for codes, _ in zip(perms, range(4)):
-        assert padstart > 17
+        assert pad_start > 17
         for sep, codes in zip(["AA", "TA", "AT", "TT"], perms):
             stitched = stitch(pad, codes, sep=sep)
             if "AAAAA" in stitched or "TTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
@@ -185,6 +185,7 @@ def construct(
             final_path.unlink()
         else:
             return
+    final_path.parent.mkdir(exist_ok=True, parents=True)
     #     pl.read_parquet(final_path)[["code1", "code2"]].to_numpy().flatten()
     # ) != set(codebook[transcript]):
     #     logger.critical(f"Codebook for {transcript} has changed.")
@@ -219,7 +220,7 @@ def construct(
     #     # & (pl.col("padlock").map_elements(lambda x: hp(x, "dna")) < 50)
     # )
 
-    logger.debug(f"With proper padstart: {len(screened)}")
+    logger.debug(f"With proper pad_start: {len(screened)}")
 
     res = construction_function(screened, codebook[transcript]).join(
         screened.rename(dict(seq="seqori")), on="name", how="left"
