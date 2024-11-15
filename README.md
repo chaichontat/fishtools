@@ -67,6 +67,15 @@ Convert all JXL files in a directory to DAX:
 fishtools decompress path/to/directory
 ```
 
+## Probe ordering checklist
+1. Verify simulation
+2. BLAST some probes, make sure orientation is Plus/Minus.
+3. Delete all old final files, both remote and local.
+4. Run the script one last time.
+5. Download said file and open to copy/paste into the Excel order sheet.
+6. Save as a new file with today's date.
+7. In the email, upload and redownload, verify that it's the same file.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
