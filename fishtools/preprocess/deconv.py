@@ -36,12 +36,10 @@ def scale_deconv(
     if debug:
         logger.debug(f"Deconvolution scaling: {scale_factor}")
     if name and scaled.max() > 65535:
-        logger.warning(f"Scaled image {name} has max > 65535.")
+        logger.debug(f"Scaled image {name} has max > 65535.")
 
     if np.all(scaled < 0):
-        print(img.min(), img.max())
         logger.warning(f"Scaled image {name} has all negative values.")
-        print(scale_factor, offset, scaled.min(), scaled.max())
 
     return np.clip(scaled, 0, 65535)
 

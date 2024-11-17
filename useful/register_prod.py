@@ -209,7 +209,7 @@ class Image:
             # raise Exception(f"No basic template found at {path_basic}")
             basic = lambda: None
 
-        fids_raw = np.atleast_3d(img[-n_fids:])
+        fids_raw = np.atleast_3d(img[-n_fids:]).max(axis=0)
         return cls(
             name=name,
             idx=int(idx),
@@ -291,7 +291,29 @@ def run(
             else:
                 raise ValueError(f"Could not find file that starts with {name} for override shift.")
 
-    if debug:
+    # Write reference fiducial
+    (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
+    crop, downsample = config.registration.crop, config.registration.downsample
+    tifffile.imwrite(
+        fid_path / f"fids-{idx:04d}.tif",
+        fids[reference][crop:-crop, crop:-crop],
+        compression=22610,
+        compressionargs={"level": 0.65},
+        metadata={"axes": "YX"},
+    )
+
+    try:
+        shifts = align_fiducials(
+            fids,
+            reference=reference,
+            debug=debug,
+            max_iters=5,
+            threshold_sigma=config.registration.fiducial.threshold,
+            fwhm=config.registration.fiducial.fwhm,
+        )
+        if debug:
+            raise Exception("debugging")
+    except Exception as e:
         _fids_path = path / f"fids-{idx:04d}.tif"
         tifffile.imwrite(
             _fids_path,
@@ -301,32 +323,15 @@ def run(
             metadata={"axes": "CYX"},
         )
         logger.debug(f"Written fiducials to {_fids_path}.")
-
-    # Write reference fiducial
-    (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
-    crop, downsample = config.registration.crop, config.registration.downsample
-    tifffile.imwrite(
-        fid_path / f"fids-{idx:04d}.tif",
-        fids[reference][:, crop:-crop, crop:-crop],
-        compression=22610,
-        compressionargs={"level": 0.65},
-        metadata={"axes": "YX"},
-    )
-
-    shifts = align_fiducials(
-        fids,
-        reference=reference,
-        debug=debug,
-        max_iters=6,
-        threshold_sigma=config.registration.fiducial.threshold,
-        fwhm=config.registration.fiducial.fwhm,
-    )
+        if e.args[0] != "debugging":
+            logger.critical(e)
+            raise e
 
     if debug:
         tifffile.imwrite(
             path / f"fids_shifted-{idx:04d}.tif",
             # Prior shifts already applied.
-            np.stack([shift(fid.max(axis=0), [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()]),
+            np.stack([shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX"},

@@ -14,10 +14,25 @@ from loguru import logger
 from photutils.background import Background2D, MedianBackground
 from photutils.detection import DAOStarFinder
 from scipy.spatial import cKDTree
+from skimage import exposure, filters
+from skimage.measure import ransac
 from skimage.registration import phase_cross_correlation
+from skimage.transform import AffineTransform
 from tifffile import TiffFile
 
 console = rich.get_console()
+
+
+class TranslationTransform(AffineTransform):
+    def estimate(self, src: np.ndarray, dst: np.ndarray) -> bool:  # type: ignore
+        """Estimate the transform parameters from (n×d) points."""
+        if src.shape[0] < 1:
+            return False
+
+        translation = np.median(dst - src, axis=0)
+        self.params = np.eye(3)
+        self.params[0:2, 2] = translation
+        return True
 
 
 def imread_page(path: Path | str, page: int):
@@ -25,6 +40,24 @@ def imread_page(path: Path | str, page: int):
         if page >= len(tif.pages):
             raise ValueError(f"Page {page} does not exist in {path}")
         return tif.pages[page].asarray()
+
+
+def butterworth(
+    image: np.ndarray, cutoff: float = 0.05, squared_butterworth: bool = True, order: int = 3, npad: int = 0
+):
+    res: np.ndarray = filters.butterworth(
+        image,
+        cutoff_frequency_ratio=cutoff,
+        order=order,
+        high_pass=True,
+        squared_butterworth=squared_butterworth,
+        npad=npad,
+    )  # type: ignore
+    return np.clip(res, 0, None)
+
+
+def clahe(img: np.ndarray, clip_limit: float = 0.01, bins: int = 200):
+    return exposure.equalize_adapthist(img, clip_limit=0.02)
 
 
 def find_spots(
@@ -50,7 +83,9 @@ def find_spots(
     if np.sum(img) == 0:
         raise ValueError("Reference image must have non-zero sum.")
 
-    # iraffind = DAOStarFinder(threshold=3.0 * std, fwhm=4, sharplo=0.2, exclude_border=True)
+    # min_ = img.min()
+    # normalized = clahe((img - min_) / (img.max() - min_))
+    img = butterworth(img)
     _mean, median, std = sigma_clipped_stats(img, sigma=threshold_sigma + 5)
     # You don't want need to subtract the mean here, the median is subtracted in the call three lines below.
     iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
@@ -141,6 +176,18 @@ def _calculate_drift(
         axs[0].hist(joined["dx"], bins=100)
         axs[1].hist(joined["dy"], bins=100)
 
+    # model: TranslationTransform = ransac(
+    #     (
+    #         joined[["xcentroid", "ycentroid"]].to_numpy(),
+    #         joined[["xcentroid_fixed", "ycentroid_fixed"]].to_numpy(),
+    #     ),
+    #     TranslationTransform,
+    #     min_samples=10,
+    #     residual_threshold=0.1,
+    #     max_trials=1000,
+    # )[0]  # type: ignore
+    # print(model.translation)
+
     if np.allclose(initial_drift, np.zeros(2)) and len(joined) > 100:
         if joined["dx"].sum() == 0 and joined["dy"].sum() == 0:
             raise ValueError("No drift found. Reference passed?")
@@ -156,6 +203,7 @@ def _calculate_drift(
     # else:
     drifts = joined[["dx", "dy"]].to_numpy()
     drift = np.median(drifts, axis=0)
+
     hypot = np.hypot(*drifts.T)
     cv = np.std(hypot) / np.mean(hypot)
     logger.debug(f"drift: {drift} CV: {cv:04f}.")
@@ -183,7 +231,6 @@ def run_fiducial(
     threshold_residual: float = 0.3,
     fwhm: float = 4,
 ):
-    ref = np.atleast_3d(ref).max(axis=0)
     if subtract_background:
         ref = ref - background(ref)
 
@@ -221,7 +268,6 @@ def run_fiducial(
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
     def inner(img: np.ndarray, *, limit: int = 4, bitname: str = "", local_σ: float = thr):
-        img = np.atleast_3d(img).max(axis=0)
         if subtract_background:
             img = img - background(img)
 
