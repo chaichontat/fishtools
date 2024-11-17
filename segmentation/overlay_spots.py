@@ -40,7 +40,7 @@ sns.set_theme()
 
 # %%
 # out = find_objects(img)
-# intensity = imread("/mnt/working/lai/registered--whole_embryo/stitch/05/00/fused_00-1.tif")[:4000, :4000]
+intensity = imread("/mnt/working/lai/registered--whole_embryo/stitch/05/00/fused_00-1.tif")
 # %%
 
 # dapi = imread("/fast2/3t3clean/analysis/deconv/registered/dapi3/0/fused_1.tif").squeeze()
@@ -61,7 +61,12 @@ sns.set_theme()
 # %%
 
 
-def filter_(spots: pl.DataFrame, lim: tuple[tuple[float, float], tuple[float, float]] | tuple[slice, slice]):
+def filter_(
+    spots: pl.DataFrame,
+    lim: tuple[tuple[float, float], tuple[float, float]] | tuple[slice, slice],
+    *,
+    shift: bool = False,
+):
     """Filter spots within spatial bounds.
 
     Args:
@@ -85,7 +90,11 @@ def filter_(spots: pl.DataFrame, lim: tuple[tuple[float, float], tuple[float, fl
                 & ((pl.col("y") > sl_y.start) if sl_y.start is not None else True)
                 & ((pl.col("x") < sl_x.stop) if sl_x.stop is not None else True)
                 & ((pl.col("y") < sl_y.stop) if sl_y.stop is not None else True)
+            ).with_columns(
+                x=pl.col("x") - ((sl_x.start or 0) if shift else 0),
+                y=pl.col("y") - ((sl_y.start or 0) if shift else 0),
             )
+
         case _:
             raise ValueError(f"Unknown type {type(lim)}")
 
@@ -93,7 +102,7 @@ def filter_(spots: pl.DataFrame, lim: tuple[tuple[float, float], tuple[float, fl
 def filter_imshow(
     spots: pl.DataFrame, lim: tuple[tuple[float, float], tuple[float, float]] | tuple[slice, slice]
 ):
-    filtered = filter_(spots, lim)
+    filtered = filter_(spots, lim, shift=True)
     match lim:
         case (xlim_lo, _), (ylim_lo, _):
             filtered = filtered.with_columns(
@@ -101,10 +110,7 @@ def filter_imshow(
                 y=pl.col("y") - (ylim_lo or 0),
             )
         case (sl_y, sl_x):
-            filtered = filtered.with_columns(
-                x=pl.col("x") - (sl_x.start or 0),
-                y=pl.col("y") - (sl_y.start or 0),
-            )
+            ...
         case _:
             raise ValueError(f"Unknown type {type(lim)}")
     return filtered["x"], filtered["y"]
@@ -119,185 +125,209 @@ coords = tc.df
 minimums = (coords["x"].min(), coords["y"].min())
 
 
+# idx = 0
 # %%
-@click.command()
-@click.argument("idx", type=int)
+# @click.command()
+# @click.argument("idx", type=int)
+# @profile
+# def run(idx: int):
+idx = 0
+logger.info(f"{idx}: reading image.")
+with tifffile.TiffFile("chunks/combi_nobg.tif") as tif:
+    img = tif.pages[idx].asarray()
+
+sl = np.s_[:1000, 3500:4000] if DEBUG else np.s_[:, :]
+
+# img = imread("chunks/combi_nobg.tif")[idx]
+polygons = []
+regen = np.zeros_like(img[sl])
+
+
+logger.info(f"{idx}: finding regions.")
+props = regionprops(img[sl])
+area = 0
+print(idx, f"Found {len(props)} regions.")
+# %%
+spots = (
+    pl.read_parquet("/mnt/working/lai/registered--whole_embryo/genestar/spots.parquet")
+    # .filter(pl.col("tile") == "1144")
+    .with_row_index("ii")
+    .with_columns(x=pl.col("x") / 2 - minimums[0], y=pl.col("y") / 2 - minimums[1])
+    .with_columns(x_int=pl.col("x").cast(pl.Int32), y_int=pl.col("y").cast(pl.Int32))
+    .sort(["y_int", "x_int"])
+)
+
+spots = spots if DEBUG else spots.filter(pl.col("z").is_between(idx - 0.5, idx + 0.5))
+# %%
+out = np.zeros([len(spots), 2], dtype=np.uint32)
+curr_idx = 0
+area = 0
+
+
 @profile
-def run(idx: int):
-    logger.info(f"{idx}: reading image.")
-    with tifffile.TiffFile("chunks/combi_nobg.tif") as tif:
-        img = tif.pages[idx].asarray()[:4000, :4000]
-    # img = imread("chunks/combi_nobg.tif")[idx]
-    polygons = []
-    regen = np.zeros_like(img)
-    cntrs = np.zeros_like(img)
+def loop(i, region):
+    global curr_idx, area
+    if i and i % 100 == 0:
+        logger.info(f"{idx}: {i} regions processed. Mean area: {area / 1000:.2f} px²")
+        area = 0
 
-    logger.info(f"{idx}: finding regions.")
-    props = regionprops(img)
-    area = 0
-    print(idx, f"Found {len(props)} regions.")
-    for i, region in enumerate(props):
-        if i and i % 1000 == 0:
-            logger.info(f"{idx}: {i} regions processed. Mean area: {area / 1000:.2f} px²")
-            area = 0
+    area += region.area
+    # threshold(gaussian(region.image, sigma=1))
+    # cs = measure.find_contours(
+    #     np.pad(binary_erosion(binary_fill_holes(region.image), iterations=1), (1, 1)), 0.5
+    # )
+    sigma = 0
+    pad = sigma
+    # cs = np.pad(region.image, (pad, pad))
+    cs = region.image
+    assert cs.shape[0] == region.image.shape[0] + 2 * pad and cs.shape[1] == region.image.shape[1] + 2 * pad
 
-        area += region.area
-        # threshold(gaussian(region.image, sigma=1))
-        # cs = measure.find_contours(
-        #     np.pad(binary_erosion(binary_fill_holes(region.image), iterations=1), (1, 1)), 0.5
-        # )
-        sigma = 1
-        pad = sigma
-        cs = np.pad(region.image, (pad, pad))
-        cs = np.pad(binary_closing(region.image, iterations=1), (pad, pad))
-        cs = gaussian(cs, sigma=sigma) > 0.2
-        cs = binary_erosion(binary_fill_holes(cs), iterations=sigma)
+    # cs = binary_closing(region.image, iterations=1)  # somehow changes shape?
+    # assert cs.shape[0] == region.image.shape[0] + 2 * pad and cs.shape[1] == region.image.shape[1] + 2 * pad
 
-        # contours, _ = cv2.findContours(cs.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
-        # print(contours)
-        # print(contours)
-        contours = measure.find_contours(cs, 0.5)
-        # print(contours)
-        if not contours:
-            # To maintain indexing
-            polygons.append(Polygon())
-            continue
+    # cs = gaussian(cs, sigma=sigma) > 0.2
+    # cs = binary_dilation(binary_fill_holes(cs))
 
-        # if contours.__len__() > 1:
-        #     raise ValueError(f"Too many contours: {contours}")
+    assert cs.shape[0] == region.image.shape[0] + 2 * pad and cs.shape[1] == region.image.shape[1] + 2 * pad
+    # contours, _ = cv2.findContours(cs.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    # print(contours)
+    # print(contours)
+    # contours = cs ^ binary_erosion(cs, iterations=1)
+    # contours = [np.argwhere(contours)]
 
-        _polygons = [] if len(contours) > 1 else None
+    # contours = measure.find_contours(cs, 0.5)
+    # print(contours)
+    # if not len(contours):
+    #     # To maintain indexing
+    #     polygons.append(Polygon())
+    #     continue
 
-        for c in contours:
-            # The coordinates are relative to the region bounding box,
-            # so we need to shift them to the absolute position
-            bbx, bby, *_ = region.bbox
-            # c = c[0]
-            # if c.shape[0] < 3:
-            # print(c.shape, np.sum(cs))
-            # continue
+    # # if contours.__len__() > 1:
+    # #     raise ValueError(f"Too many contours: {contours}")
+    bbx, bby, *_ = region.bbox
 
-            c[:, 0] += bbx - pad  # - minimums[1] - 1
-            c[:, 1] += bby - pad  # - minimums[0] - 1
+    sp = (spots if not DEBUG else filter_(spots, sl, shift=True)).filter(
+        pl.col("y_int").is_between(bbx, bbx + region.image.shape[0] - 1)
+        & pl.col("x_int").is_between(bby, bby + region.image.shape[1] - 1)
+    )
+    if sp.is_empty():
+        return
 
-            regim = region.image
-            # regen[bbx : bbx + regim.shape[0], bby : bby + regim.shape[1]] = regim
-            if DEBUG:
-                x_start_corr = np.clip(0 - (bbx - pad), 0, None)
-                y_start_corr = np.clip(0 - (bby - pad), 0, None)
+    # assert sp["x_int"].min() >= bbx
+    # assert sp["x_int"].max() < bbx + region.image.shape[0]
+    # assert sp["y_int"].max() < bby + region.image.shape[1]
 
-                x_start = bbx - pad - x_start_corr
-                y_start = bby - pad - y_start_corr
+    _sp = sp.select(x=pl.col("y_int") - bbx + pad, y=pl.col("x_int") - bby + pad)
 
-                x_end_corr = np.clip(x_start + cs.shape[0] - img.shape[0], 0, None)
-                y_end_corr = np.clip(y_start + cs.shape[1] - img.shape[1], 0, None)
+    oks = sp[np.flatnonzero(cs[_sp["x"], _sp["y"]]), "ii"]
+    out[curr_idx : curr_idx + len(oks), 0] = oks
+    out[curr_idx : curr_idx + len(oks), 1] = region.label
+    curr_idx += len(oks)
 
-                regen[
-                    x_start : x_start + cs.shape[0] - x_end_corr,
-                    y_start : y_start + cs.shape[1] - y_end_corr,
-                ] = cs[x_start_corr : -x_end_corr or None, y_start_corr : -y_end_corr or None]
 
-                c_show = c[(c[:, 0] < img.shape[0]) & (c[:, 1] < img.shape[1])].astype(int)
-                cntrs[c_show[:, 0].astype(int), c_show[:, 1].astype(int)] = 1
+for i, region in enumerate(props):
+    loop(i, region)
+    # %%
+    # _polygons = [] if len(contours) > 1 else None
 
-            if _polygons is not None:
-                _polygons.append(Polygon(c))
-            else:
-                polygons.append(Polygon(c))
+    # for c in contours:
+    # The coordinates are relative to the region bounding box,
+    # so we need to shift them to the absolute position
 
-        if _polygons is not None:
-            assert len(_polygons)
-            polygons.append(MultiPolygon(_polygons))
+    # c[:, 0] += bbx - pad  # - minimums[1] - 1
+    # c[:, 1] += bby - pad  # - minimums[0] - 1
 
-    logger.info(f"{idx}: building STRtree.")
-    tree = STRtree(polygons)
-    assert len(tree.geometries) == len(props) == len(polygons)
-
-    # sl = np.s_[3500:4000, 2000:2500]
+    # regim = region.image
+    # regen[bbx : bbx + regim.shape[0], bby : bby + regim.shape[1]] = regim
     if DEBUG:
-        sl = np.s_[500:1000, 3500:4000]
-        fig, axs = plt.subplots(figsize=(8, 4), dpi=200, ncols=3)
-        axs[0].imshow(img[sl], zorder=1)
-        axs[1].imshow(regen[sl], zorder=1)
-        axs[2].imshow(cntrs[sl], zorder=1, vmax=1)
-    # %%
+        regen[bbx : bbx + cs.shape[0] - 2 * pad, bby : bby + cs.shape[1] - 2 * pad] = cs[pad:-pad, pad:-pad]
+        # x_start_corr = np.clip(0 - (bbx - pad), 0, None)
+        # y_start_corr = np.clip(0 - (bby - pad), 0, None)
 
-    # %%
-    # centroids = pl.DataFrame([{"x": p.centroid.x, "y": p.centroid.y} for p in polygons])
+        # x_start = bbx - pad - x_start_corr
+        # y_start = bby - pad - y_start_corr
 
-    # %%
+        # x_end_corr = np.clip(x_start + cs.shape[0] - img.shape[0], 0, None)
+        # y_end_corr = np.clip(y_start + cs.shape[1] - img.shape[1], 0, None)
 
-    spots = (
-        pl.read_parquet("/mnt/working/lai/registered--whole_embryo/genestar/spots.parquet")
-        # .filter(pl.col("tile") == "1144")
-        .with_row_index("ii")
-        .with_columns(
-            ii=pl.col("ii").cast(pl.Int64), x=pl.col("x") / 2 - minimums[0], y=pl.col("y") / 2 - minimums[1]
-        )
-        .filter(pl.col("x").is_between(0, 4000))
-        .filter(pl.col("y").is_between(0, 4000))
+        # regen[
+        #     x_start : x_start + cs.shape[0] - x_end_corr,
+        #     y_start : y_start + cs.shape[1] - y_end_corr,
+        # ] = cs[x_start_corr : -x_end_corr or None, y_start_corr : -y_end_corr or None]
+
+
+# %%
+# sl = np.s_[3500:4000, 2000:2500]
+if DEBUG:
+    fig, axs = plt.subplots(figsize=(8, 4), dpi=200, ncols=3)
+    axs[0].imshow(img[sl], zorder=1, origin="lower")
+    axs[1].imshow(regen, zorder=1, origin="lower")
+    # axs[2].imshow(cntrs[sl], zorder=1, vmax=1, origin="lower")
+
+
+# %%
+
+# plt.hexbin(spots['x'], spots['y'], gridsize=600)
+
+# img
+if DEBUG:
+    # fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
+    # axs = axs.flatten()
+    # # sl = np.s_[500:1000, 3500:4000]
+
+    # axs[0].imshow(intensity[sl], zorder=1, origin="lower")
+    # axs[0].set_aspect("equal")
+    # axs[1].imshow(regen, zorder=1, vmax=1, origin="lower")
+    # axs[1].set_aspect("equal")
+    # axs[2].scatter(*filter_imshow(spots, sl), s=1, alpha=0.1)
+    # axs[2].set_aspect("equal")
+    # plt.tight_layout()
+
+    fig, axs = plt.subplots(ncols=4, nrows=1, figsize=(12, 4), dpi=200)
+    axs = axs.flatten()
+    axs[0].imshow(intensity[sl], zorder=1, origin="lower")
+    axs[1].imshow(img.astype(np.uint16)[sl], zorder=1, vmax=1, origin="lower")
+    axs[2].imshow(regen, zorder=1, vmax=1, origin="lower")
+    for i, ax in enumerate(axs):
+        ax.axis("off")
+        ax.scatter(*filter_imshow(spots, sl), s=1, alpha=0.4)
+        ax.set_aspect("equal")
+    plt.tight_layout()
+
+    fig, axs = plt.subplots(ncols=4, nrows=1, figsize=(12, 4), dpi=200)
+    axs = axs.flatten()
+    axs[0].imshow(intensity[sl], zorder=1, origin="lower")
+    axs[1].imshow(img.astype(np.uint16)[sl], zorder=1, vmax=1, origin="lower")
+    axs[2].imshow(regen, zorder=1, vmax=1, origin="lower")
+    __sp = spots.join(pl.DataFrame(out).with_row_index(), left_on="ii", right_on="index").filter(
+        pl.col("column_0") > 0
     )
+    for i, ax in enumerate(axs):
+        ax.axis("off")
+        ax.scatter(*filter_imshow(__sp, sl), s=1, alpha=0.4)
+        ax.set_aspect("equal")
 
-    # plt.hexbin(spots['x'], spots['y'], gridsize=600)
 
-    # %%
+# %%
+# Process results
+point_assignments = []
+for i, (point_index, polygon_index) in enumerate(matches):
+    point_assignments.append({"point": point_index, "polygon": polygon_index})
 
-    # img
-    if DEBUG:
-        fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
-        axs = axs.flatten()
-        sl = np.s_[500:1000, 3500:4000]
+roi_mapping = pl.DataFrame({"polygon": list(range(len(props))), "label": [p.label for p in props]}).cast(
+    pl.UInt32
+)
 
-        axs[0].imshow(intensity[sl], zorder=1, origin="lower")
-        axs[0].set_aspect("equal")
-        axs[1].imshow(regen[sl], zorder=1, vmax=1, origin="lower")
-        axs[1].set_aspect("equal")
-        axs[2].scatter(*filter_imshow(spots, sl), s=1, alpha=0.1)
-        axs[2].set_aspect("equal")
-        plt.tight_layout()
-        # %%
+ident = (
+    pl.DataFrame(point_assignments)
+    .cast(pl.UInt32)
+    .join(_sp, left_on="point", right_on="ii", how="left")
+    .join(roi_mapping, on="polygon")
+)
 
-        fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
-        axs = axs.flatten()
-        axs[0].imshow(intensity[sl], zorder=1, origin="lower")
-        axs[1].imshow(img.astype(np.uint16)[sl], zorder=1, vmax=1, origin="lower")
-        for i, ax in enumerate(axs):
-            ax.axis("off")
-            ax.scatter(*filter_imshow(spots, sl), s=1, alpha=0.4)
+assert ident["polygon"].max() < len(polygons)
 
-    # %%
-    points = []
-    _sp = spots.drop("ii").with_row_index("ii")
-    for i, (x, y) in enumerate(zip(_sp["x"], _sp["y"])):
-        if i and i % 100000 == 0:
-            logger.debug(f"{idx}: {i} points processed.")
-        points.append(Point((y, x)))
-
-    # %%
-    # Query all points at once
-    matches = tree.query(points, predicate="intersects").T
-    print(f"{idx}: {len(matches)} points found in {len(points)} spots.")
-
-    # %%
-    # Process results
-    point_assignments = []
-    for i, (point_index, polygon_index) in enumerate(matches):
-        point_assignments.append({"point": point_index, "polygon": polygon_index})
-
-    roi_mapping = pl.DataFrame({"polygon": list(range(len(props))), "label": [p.label for p in props]}).cast(
-        pl.UInt32
-    )
-
-    ident = (
-        pl.DataFrame(point_assignments)
-        .cast(pl.UInt32)
-        .join(_sp, left_on="point", right_on="ii", how="left")
-        .join(roi_mapping, on="polygon")
-    )
-
-    assert ident["polygon"].max() < len(polygons)
-
-    ident.write_parquet(f"chunks/ident_{idx}.parquet")
+ident.write_parquet(f"chunks/ident_{idx}.parquet")
 
 
 if __name__ == "__main__":
@@ -306,8 +336,8 @@ if __name__ == "__main__":
 # %%
 # fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
 # axs = axs.flatten()
-# # axs[0].imshow(intensity[sl], zorder=1, origin="lower")
-# # axs[1].imshow(img.astype(np.uint16)[sl], zorder=1, vmax=1, origin="lower")
+# axs[0].imshow(intensity[sl], zorder=1, origin="lower")
+# axs[1].imshow(img.astype(np.uint16)[sl], zorder=1, vmax=1, origin="lower")
 # for i, ax in enumerate(axs):
 #     # ax.axis("off")
 #     ax.scatter(*filter_imshow(ident, sl), s=1, alpha=0.4)

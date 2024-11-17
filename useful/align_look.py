@@ -12,7 +12,7 @@ from starfish.types import Axes, Features, Levels
 sns.set_theme()
 
 decoded_spots, spot_intensities = pickle.loads(
-    Path("/mnt/archive/starmap/e155/e155_working/analysis/deconv/registered--down/reg-0360.pkl").read_bytes()
+    Path("/mnt/working/e155trcdeconv/registered--left/genestar/reg-0036.pkl").read_bytes()
 )
 
 codebook = json.loads(Path("/fast2/fishtools/starwork3/ordered/genestar.json").read_text())

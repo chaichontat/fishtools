@@ -22,6 +22,7 @@ from shapely.strtree import STRtree
 from skimage import feature, filters, measure
 from skimage.filters import gaussian
 from skimage.measure import regionprops
+from skimage.measure._regionprops import RegionProperties
 from skimage.morphology import disk, reconstruction
 from skimage.segmentation import clear_border
 from tifffile import imread, imwrite
@@ -112,7 +113,7 @@ def filter_imshow(
 
 # %%
 tc = TileConfiguration.from_file(
-    Path("/mnt/working/lai/registered--whole_embryo/stitch/TileConfiguration.registered.txt")
+    Path("/mnt/working/lai/stitch--whole_embryo/TileConfiguration.registered.txt")
 ).downsample(2)
 
 coords = tc.df
@@ -122,13 +123,19 @@ minimums = (coords["x"].min(), coords["y"].min())
 # # %%
 @click.command()
 @click.argument("idx", type=int)
-def run(idx: int):
+@click.option("--overwrite", is_flag=True)
+def run(idx: int, overwrite: bool = False):
     logger.info(f"{idx}: reading image.")
+
+    if not overwrite and (Path.cwd() / f"chunks/ident_{idx}.parquet").exists():
+        logger.info(f"{idx}: skipping. Already exists.")
+        return
+
     with tifffile.TiffFile("chunks/combi.tif") as tif:
         img = tif.pages[idx].asarray()
         # img = np.where(img & ((1 << 23) - 1), img, 0)
     # img = imread("chunks/combi_nobg.tif")[idx]
-    polygons = []
+
     regen = np.zeros_like(img)
     cntrs = np.zeros_like(img)
 
@@ -140,9 +147,7 @@ def run(idx: int):
         )
     )
     spots = (
-        spots.filter(pl.col("z").is_between((idx - 0.5) / 3, (idx + 0.5) / 3, closed="left"))
-        if not DEBUG
-        else spots
+        spots.filter(pl.col("z").is_between((idx - 0.5), (idx + 0.5), closed="left")) if not DEBUG else spots
     )
 
     if not len(spots):
@@ -151,11 +156,12 @@ def run(idx: int):
 
     logger.info(f"{idx}: finding regions.")
     props = regionprops(img)
+    polygons = []
     area = 0
     print(idx, f"Found {len(props)} regions.")
 
     @profile
-    def loop(i, region):
+    def loop(i: int, region: RegionProperties):
         nonlocal area
         if i and i % 5000 == 0:
             logger.info(f"{idx}: {i} regions processed. Mean area: {area / 5000:.2f} px²")
@@ -173,20 +179,21 @@ def run(idx: int):
         # cs = np.pad(binary_closing(region.image, iterations=1), (pad, pad))
         cs = gaussian(cs, sigma=sigma) > 0.2
         cs = binary_erosion(binary_fill_holes(cs), iterations=1)
+
         # contours, _ = cv2.findContours(cs.astype(np.uint8), cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         # print(contours)
         # print(contours)
         # contours = cs ^ binary_erosion(cs, iterations=1)
         # contours = [np.argwhere(contours)]
         if cs.shape[0] < 4 or cs.shape[1] < 4:
-            polygons.append(Polygon())
+            polygons.append((Polygon(), {}))
             return
 
         contours = measure.find_contours(cs, 0.5)
         # print(contours)
         if not len(contours):
             # To maintain indexing
-            polygons.append(Polygon())
+            polygons.append((Polygon(), {}))
             return
 
         # if contours.__len__() > 1:
@@ -231,17 +238,23 @@ def run(idx: int):
             _polygons.append(Polygon(c))
 
         if not _polygons:
-            polygons.append(Polygon())
+            polygons.append((Polygon(), {}))
         elif len(_polygons) == 1:
-            polygons.append(_polygons[0])
+            polygons.append((
+                _polygons[0],
+                {"area": region.area, "label": region.label, "centroid": region.centroid},
+            ))
         else:
-            polygons.append(MultiPolygon(_polygons))
+            polygons.append([
+                MultiPolygon(_polygons),
+                {"area": region.area, "label": region.label, "centroid": region.centroid},
+            ])
 
     for i, region in enumerate(props):
         loop(i, region)
 
     logger.info(f"{idx}: building STRtree.")
-    tree = STRtree(polygons)
+    tree = STRtree([p[0] for p in polygons])
     assert len(tree.geometries) == len(props) == len(polygons)
 
     # sl = np.s_[3500:4000, 2000:2500]
@@ -308,6 +321,9 @@ def run(idx: int):
     assert ident["polygon"].max() < len(polygons)
 
     ident.write_parquet(f"chunks/ident_{idx}.parquet")
+
+    df_polygons = pl.DataFrame([p[1] for p in polygons])
+    df_polygons.write_parquet(f"chunks/polygons_{idx}.parquet")
 
     # %%
     if DEBUG:

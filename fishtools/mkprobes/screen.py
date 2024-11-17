@@ -61,6 +61,7 @@ def _screen(
             splint=pl.col("splint").list.drop_nulls().list.join(""),
             padlock=pl.col("padlock").list.drop_nulls().list.join(""),
             pad_start=pl.col("pad_start").list.get(0),
+            gene=pl.col("gene").list.get(0),
             seq=pl.col("seq_full").list.drop_nulls().list.join(""),
         )
         .drop(["name", "seq_full"])
@@ -86,8 +87,7 @@ def run_screen(
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
     overwrite: bool = False,
-) -> pl.DataFrame:
-    ...
+) -> pl.DataFrame: ...
 
 
 @overload
@@ -100,8 +100,7 @@ def run_screen(
     maxoverlap: int = ...,
     restriction: list[str] | None = ...,
     overwrite: bool = False,
-) -> dict[int, pl.DataFrame]:
-    ...
+) -> dict[int, pl.DataFrame]: ...
 
 
 def run_screen(
@@ -120,7 +119,8 @@ def run_screen(
         and (
             output_dir
             / (
-                file := f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else ''}.parquet"
+                file
+                := f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else ''}.parquet"
             )
         ).exists()
     ):

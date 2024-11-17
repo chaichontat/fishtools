@@ -138,8 +138,7 @@ def _generate(path: Path, n: int):
 
 
 order = (
-    list(chain.from_iterable([[i, i + 8, i + 16] for i in range(1, 9)]))
-    + list(range(25, 50))
+    list(chain.from_iterable([[i, i + 8, i + 16] for i in range(1, 9)])) + list(range(25, 50))
     # + list(range(31, 34))
 )
 paths = static.glob("*bit_on3_dist2.csv")
@@ -183,7 +182,7 @@ def gen_codebook(tss: list[str], offset: int = 0, n_bits: int | None = None):
 @click.option("--n-bits")
 def run(path: Path, offset: int = 0, n_bits: int | None = None):
     res = gen_codebook(path.read_text().splitlines(), offset=offset, n_bits=n_bits)
-    (path.parent / "codebook.json").write_text(json.dumps(res, indent=2))
+    (path.with_suffix(".json")).write_text(json.dumps(res, indent=2))
 
 
 # %%

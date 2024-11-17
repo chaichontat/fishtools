@@ -107,7 +107,7 @@ def get_candidates(
 def _run_bowtie(dataset: Dataset, seqs: pl.DataFrame, ignore_revcomp: bool = False, **kwargs):
     y = SAMFrame.from_bowtie_split_name(
         gen_fasta(seqs["seq"], names=seqs["name"]).getvalue(),
-        dataset.path / "genome",
+        dataset.path / "txome",
         seed_length=12,
         threshold=16,
         n_return=200,
@@ -235,7 +235,7 @@ def _run_transcript(
         )
         # crawled.write_parquet(output / f"{transcript_name}_rawcrawled.parquet")
 
-        y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=False)
+        y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
         y = y.join(crawled[["name", "seq_full", "pad_start"]], on="name")
 
         y.write_parquet(output / f"{transcript_name}_all.parquet")
@@ -308,21 +308,15 @@ def _run_transcript(
             ),
             **PROBE_CRITERIA,
         )
-        .with_columns(
-            [
-                (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
-                pl.col("seq")
-                .map_elements(
-                    lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32
-                )
-                .alias("tm"),
-                pl.col("seq")
-                .map_elements(
-                    lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32
-                )
-                .alias("hp"),
-            ]
-        )
+        .with_columns([
+            (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
+            pl.col("seq")
+            .map_elements(lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .alias("tm"),
+            pl.col("seq")
+            .map_elements(lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .alias("hp"),
+        ])
         .with_columns(oks=pl.sum_horizontal(pl.col("^ok_.*$")))
         # .filter(~pl.col("seq").map_elements(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
         .filter(

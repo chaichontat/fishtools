@@ -1,4 +1,5 @@
 import json
+import signal
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -32,16 +33,19 @@ def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
         TextColumn("•"),
         TimeRemainingColumn(),
     ) as p:
+        lock = threading.RLock()
         track = iter(p.track(range(n)))
 
         def callback(*args: Any, **kwargs: Any):
-            with threading.RLock():
+            with lock:
                 return next(track)
 
         yield callback
+
         try:
-            while True:
-                next(track)
+            from collections import deque
+
+            deque(track, maxlen=0)  # Exhaust the iterator
         except StopIteration:
             ...
 
@@ -54,6 +58,13 @@ R, T = TypeVar("R", covariant=True), TypeVar("T")
 def progress_bar_threadpool(n: int, *, threads: int):
     futs: list[Future] = []
     with progress_bar(n) as callback, ThreadPoolExecutor(threads) as exc:
+
+        def signal_handler(signum, frame):
+            logger.info("\nShutting down...")
+            exc.shutdown(wait=False, cancel_futures=True)
+            exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
 
         def submit(f: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> Future[R]:
             futs.append(exc.submit(f, *args, **kwargs))

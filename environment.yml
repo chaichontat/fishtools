@@ -27,7 +27,9 @@ dependencies:
   - polars
   - pyarrow
   - pydantic
+  - repeatmasker
   - rich-click
   - rtree
+  - scanpy
   - shapely
   - toml

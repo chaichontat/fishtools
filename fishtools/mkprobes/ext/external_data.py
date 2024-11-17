@@ -25,7 +25,7 @@ def get_ensembl(path: Path | str, id_: str):
             return json.loads(p.read_text())
         except json.JSONDecodeError:
             log.warning(f"Error decoding {p}. Deleting.")
-            p.unlink()
+            p.unlink(missing_ok=True)
 
     log.info(f"Fetching {id_} on ensembl")
     res = requests.get(f"https://rest.ensembl.org/lookup/id/{id_}?content-type=application/json", timeout=30)
@@ -133,12 +133,10 @@ class _ExternalData:
         return self.gtf.filter(pl.col("gene_name") == gene)
 
     @overload
-    def __getitem__(self, eid: str) -> pl.Series:
-        ...
+    def __getitem__(self, eid: str) -> pl.Series: ...
 
     @overload
-    def __getitem__(self, eid: list[str]) -> pl.DataFrame:
-        ...
+    def __getitem__(self, eid: list[str]) -> pl.DataFrame: ...
 
     def __getitem__(self, eid: str | list[str]) -> pl.Series | pl.DataFrame:
         return self.gtf[eid]

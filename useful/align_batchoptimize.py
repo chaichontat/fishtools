@@ -10,7 +10,8 @@ from loguru import logger
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("codebook_path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--rounds", type=int, default=10)
-def run(path: Path, codebook_path: Path, rounds: int = 10):
+@click.option("--threads", type=int, default=6)
+def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 6):
     if not len(list(path.glob("registered--*"))):
         raise ValueError(
             "No registered images found. Verify that you're in the base working directory, not the registered folder."
@@ -37,10 +38,11 @@ def run(path: Path, codebook_path: Path, rounds: int = 10):
                 "--codebook",
                 codebook_path,
                 "--batch-size=50",
-                "--subsample-z=3",
+                "--subsample-z=1",
                 f"--round={i}",
-                "--threads=16",
+                f"--threads={threads}",
                 "--overwrite",
+                "--split=0",
             ],
             check=True,
             capture_output=False,

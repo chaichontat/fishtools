@@ -183,8 +183,7 @@ def extract_channel(
 
 
 @click.group()
-def cli():
-    ...
+def cli(): ...
 
 
 @cli.command()
@@ -281,6 +280,7 @@ def extract(
     trim: int = 0,
     downsample: int = 2,
     reduce_bit_depth: int = 0,
+    subsample_z: int = 1,
     max_proj: bool = False,
     is_2d: bool = False,
     channels: list[int] | None = None,
@@ -322,14 +322,16 @@ def extract(
         raise ValueError("Image must be at least 3D")
 
     if len(img.shape) == 3:  # ZYX
-        img = img[:, np.newaxis, ...]
+        img = img[::subsample_z, np.newaxis, ...]
     elif len(img.shape) > 4:
         raise ValueError("Image must be 3D or 4D")
 
     img = (
-        img[:, channels if channels else slice(None), trim:-trim:downsample, trim:-trim:downsample]
+        img[
+            ::subsample_z, channels if channels else slice(None), trim:-trim:downsample, trim:-trim:downsample
+        ]
         if trim
-        else img[:, channels if channels else slice(None), ::downsample, ::downsample]
+        else img[::subsample_z, channels if channels else slice(None), ::downsample, ::downsample]
     )
 
     for i in range(img.shape[0]):
@@ -360,6 +362,7 @@ def extract(
 )
 @click.option("--overwrite", is_flag=True)
 @click.option("--downsample", "-d", type=int, default=2)
+@click.option("--subsample-z", type=int, default=1)
 @click.option("--is-2d", is_flag=True)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--channels", type=str, default="-3,-2,-1")
@@ -374,6 +377,7 @@ def fuse(
     is_2d: bool = False,
     threads: int = 8,
     channels: str = "-3,-2,-1",
+    subsample_z: int = 1,
 ):
     if "--" in path.as_posix():
         raise ValueError("Please be in the workspace folder.")
@@ -400,6 +404,7 @@ def fuse(
                 file,
                 path,
                 downsample=downsample,
+                subsample_z=subsample_z,
                 is_2d=is_2d,
                 channels=list(map(int, channels.split(","))),
             )

@@ -195,6 +195,7 @@ def sample_imgs(path: Path, round_num: int, *, batch_size: int = 50):
 @click.option("--batch-size", "-n", type=int, default=100)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--overwrite", is_flag=True)
+@click.option("--split", type=int, default=0)
 def optimize(
     path: Path,
     round_num: int,
@@ -203,6 +204,7 @@ def optimize(
     subsample_z: int = 1,
     threads: int = 8,
     overwrite: bool = False,
+    split: int = 0,
 ):
     selected = sample_imgs(path, round_num, batch_size=batch_size)
 
@@ -226,6 +228,7 @@ def optimize(
             f"--round={round_num}",
             "--overwrite" if overwrite else "",
             f"--subsample-z={subsample_z}",
+            f"--split={split}",
         ],
         threads=threads,
     )
@@ -288,7 +291,7 @@ def create_opt_path(
 
     if path_img is not None:
         base = path_img.parent.parent / f"opt_{codebook_path.stem}"
-        name = f"{path_img.stem}--{path_img.parent.name.split('--')[1]}"
+        name = f"{path_img.stem}--{path_img.resolve().parent.name.split('--')[1]}"
     elif path_folder is not None:
         base = path_folder / f"opt_{codebook_path.stem}"
         if mode == "folder":
@@ -575,11 +578,24 @@ def run(
         #     [bit_mapping[k] for k in used_bits],
         # ],
     )
+
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
     # But it's there as a reference.
-    ghp = Filter.GaussianHighPass(sigma=8, is_volume=False, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
+    ghp = Filter.GaussianHighPass(sigma=8, is_volume=True, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
+    ghp.sigma = (6, 8, 8)  # z,y,x
+    logger.debug(f"Running GHP with sigma {ghp.sigma}")
     imgs: ImageStack = ghp.run(stack)
+
+    ghp = Filter.GaussianLowPass(sigma=1, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
+    imgs = ghp.run(imgs)
+
+    # z_filt = Filter.ZeroByChannelMagnitude(thresh=3e-4, normalize=False)
+    # imgs = z_filt.run(imgs)
+    import tifffile
+
+    tifffile.imwrite("highpassed.tif", imgs.xarray.to_numpy())
+    return
 
     path_json = create_opt_path(path_img=path, codebook_path=codebook_path, mode="json", round_num=round_num)
     if round_num == 0 and calc_deviations:
@@ -622,8 +638,17 @@ def run(
         return_original_intensities=True,
     )
 
+    feature_traces = pixel_intensities.stack(traces=(Axes.CH.value, Axes.ROUND.value))
+    mags = np.linalg.norm(feature_traces.values, axis=1)
+
+    # plt.hist(mags, bins=20)
+    # sns.despine(offset=3)
+    # plt.xlabel("Barcode magnitude")
+    # plt.ylabel("Number of pixels")
+    # plt.yscale("log")
+
     logger.info("Combining")
-    caf = CombineAdjacentFeatures(min_area=8, max_area=100, mask_filtered_features=True)
+    caf = CombineAdjacentFeatures(min_area=12, max_area=200, mask_filtered_features=True)
     decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
     transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
 
@@ -634,7 +659,7 @@ def run(
     )
     gc = dict(zip(genes, counts))
     percent_blanks = sum([v for k, v in gc.items() if k.startswith("Blank")]) / counts.sum()
-    logger.debug(f"{percent_blanks} blank, Total: {counts.sum()}")
+    logger.info(f"{percent_blanks} blank, Total: {counts.sum()}")
 
     # Deviations
     if calc_deviations and round_num is not None:

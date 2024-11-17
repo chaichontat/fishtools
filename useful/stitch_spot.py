@@ -15,9 +15,9 @@ from fishtools.preprocess.tileconfig import TileConfiguration
 
 sns.set_theme()
 codebook = "genestar"
-roi = "whole_embryo"
+roi = "right"
 # registered--{roi}
-path = Path(f"/mnt/working/lai/registered--{roi}")
+path = Path(f"/mnt/working/e155_trc/analysis/deconv/registered--{roi}")
 files = sorted(file for file in Path(path / codebook).glob("*.pkl") if "opt" not in file.stem)
 
 coords = TileConfiguration.from_file(
@@ -69,7 +69,7 @@ def load(i: int, filter_: bool = True):
             tile=pl.lit(str(i)),
             passes_thresholds=pl.Series(d.coords["passes_thresholds"].values),
         )
-        .with_row_index("idx")
+        .with_row_index("idx_local")
         # .join(d,)
     )
 
@@ -84,14 +84,12 @@ w = 1988
 assert len(coords) == len(set(coords["index"]))
 
 cells = [
-    Polygon(
-        [
-            (row["x"], row["y"]),
-            (row["x"] + w, row["y"]),
-            (row["x"] + w, row["y"] + w),
-            (row["x"], row["y"] + w),
-        ]
-    )
+    Polygon([
+        (row["x"], row["y"]),
+        (row["x"] + w, row["y"]),
+        (row["x"] + w, row["y"] + w),
+        (row["x"], row["y"] + w),
+    ])
     for row in coords.iter_rows(named=True)
 ]
 
@@ -134,13 +132,11 @@ def process(out: list, curr: int, filter_: bool = True):
     #         out.append(row)
 
     # Apply the function to all rows at once
-    mask = df.select(
-        [
-            pl.struct(["x", "y"])
-            .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
-            .alias("keep")
-        ]
-    )
+    mask = df.select([
+        pl.struct(["x", "y"])
+        .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
+        .alias("keep")
+    ])
 
     # Filter the dataframe and count the thrown points
     filtered_df = df.filter(mask["keep"])
@@ -175,7 +171,7 @@ axs.set_aspect("equal")
 # %%
 spots = pl.read_parquet(path / codebook / "spots.parquet")
 pergene = (
-    spots.filter(pl.col("passes_thresholds"))
+    spots.filter(pl.col("passes_thresholds") & pl.col("area").is_between(20, 50))
     .group_by("target")
     .len("count")
     .sort("count", descending=True)
@@ -194,7 +190,7 @@ ax.set_ylabel("Count")
 plt.tight_layout()
 
 # %%
-
+pergene.filter(pl.col("target").str.starts_with("Blank")).join()
 
 # %%
 # if codebook == "tricycleplus":
@@ -251,14 +247,12 @@ from polars import col as c
 
 # spots = pl.read_parquet("/fast2/3t3clean/analysis/spots.parquet")
 # %%
-what = spots.groupby("target").agg(
-    [
-        pl.count(),
-        pl.mean("distance"),
-        pl.quantile("norm", 0.1),
-        pl.mean("area"),
-    ]
-)
+what = spots.groupby("target").agg([
+    pl.count(),
+    pl.mean("distance"),
+    pl.quantile("norm", 0.1),
+    pl.mean("area"),
+])
 # %%
 sns.scatterplot(x="norm", y="count", data=what.to_pandas(), alpha=0.3, s=10, edgecolor="none")
 

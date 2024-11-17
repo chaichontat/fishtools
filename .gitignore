@@ -171,3 +171,6 @@ output_synapse/
 *.parquet
 *.json
 squid/
+*.pkl
+*.pdf
+*.h5

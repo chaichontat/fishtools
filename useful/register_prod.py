@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 # %%
 
-DATA = Path("/fast2/fishtools/data")
+DATA = Path("/home/chaichontat/fishtools/data")
 
 
 # %%

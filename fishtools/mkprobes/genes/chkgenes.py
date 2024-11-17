@@ -175,8 +175,15 @@ def convert_to_transcripts(
     ds = Dataset(path)
     del path
     gene_names = genes.read_text().splitlines()
+    assert len(gene_names) == len(set(gene_names))
     res = get_transcripts(ds, gene_names, mode=mode)
-    genes.with_suffix(".tss.txt").write_text("\n".join(res["transcript_name"]))
+
+    res = res.group_by("gene_name", maintain_order=True).agg(pl.all().first())
+
+    genes.with_suffix(".tss.txt").write_text("\n".join(sorted(res["transcript_name"])))
+    assert len(res["transcript_name"]) == len({
+        x["transcript_name"].split("-")[0] for x in res.iter_rows(named=True)
+    })
     logger.info(f"Written to {genes.with_suffix('.tss.txt')}.")
 
 

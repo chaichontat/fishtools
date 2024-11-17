@@ -32,16 +32,17 @@ ALL_TYPE = Literal["top", "bottom", "left", "right"]
 # %%
 # %%
 overlap = 100
-e = 810
-center = e // 2
+
 margin = 100
+TOTAL_OVERLAP = 448
+center = TOTAL_OVERLAP // 2
 
 
 def get_overlapping(
     img: np.ndarray,
     *,
     pos_img: ALL_TYPE,
-    total_overlap: int = 810,
+    total_overlap: int = TOTAL_OVERLAP,
     margin: int = 100,
 ):
     if pos_img not in ALL:
@@ -58,7 +59,7 @@ def get_overlapping(
         return img[:, :, overlap_slice]  # [:, :, slice_center]
 
 
-def overlap_center(mode: ALL_TYPE, total_overlap: int = 810) -> int:
+def overlap_center(mode: ALL_TYPE, total_overlap: int = TOTAL_OVERLAP) -> int:
     """Get the center index of the overlapped region."""
     if mode not in ALL:
         raise ValueError(f"Unknown pos_img {mode}")
@@ -67,7 +68,7 @@ def overlap_center(mode: ALL_TYPE, total_overlap: int = 810) -> int:
     return total_overlap // 2
 
 
-def sl_overlap_center(mode: ALL_TYPE, *, total_overlap: int = 810):
+def sl_overlap_center(mode: ALL_TYPE, *, total_overlap: int = TOTAL_OVERLAP):
     """Get the center index of the overlapped region."""
     if mode not in ALL:
         raise ValueError(f"Unknown pos_img {mode}")
@@ -83,7 +84,7 @@ def sl_overlap_center(mode: ALL_TYPE, *, total_overlap: int = 810):
 def calc_remove_crossing(
     img: np.ndarray,
     mode: ALL_TYPE,
-    total_overlap: int = 810,
+    total_overlap: int = TOTAL_OVERLAP,
     edge_margin: int = 2,
 ):
     """Remove things that crosses the center."""
@@ -130,7 +131,7 @@ def add_col(x: np.ndarray, val: int, column: int):
     return x
 
 
-def purge(img: np.ndarray, mode: ALL_TYPE, total_overlap: int = 810):
+def purge(img: np.ndarray, mode: ALL_TYPE, total_overlap: int = TOTAL_OVERLAP):
     to_remove = calc_remove_crossing(img, mode)
     start = overlap_center(mode) - margin
     end = overlap_center(mode) + margin
@@ -215,23 +216,24 @@ def splice(
 
 
 # %%
-def demonstrate_splice():
-    imgt = tifffile.imread("chunks/masks-00000_03982.tif")
-    imgb = tifffile.imread("chunks/masks-00000_07964.tif")
+# def demonstrate_splice():
+# imgt = tifffile.imread("chunks/masks-00000_04152.tif")
+# imgb = tifffile.imread("chunks/masks-00000_08304.tif")
 
-    t = [
-        splice(imgt, imgb, axis="y", remove_crossing=False, add_crossing_back=False, copy=True),
-        splice(imgt, imgb, axis="y", add_crossing_back=False, copy=True),
-        splice(imgt, imgb, axis="y", copy=True),
-    ]
+# t = [
+#     splice(imgt, imgb, axis="y", remove_crossing=False, add_crossing_back=False, copy=True),
+#     splice(imgt, imgb, axis="y", add_crossing_back=False, copy=True),
+#     splice(imgt, imgb, axis="y", copy=True),
+# ]
 
-    fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
-    axs = axs.flatten()
-    for i, ax in enumerate(axs):
-        ax.axis("off")
-        ax.imshow(t[i][5, 4200:4600, 2500:3000].astype(np.uint16))
+# fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
+# axs = axs.flatten()
+# for i, ax in enumerate(axs):
+#     ax.axis("off")
+#     ax.imshow(t[i][5, 4200:4600, 2500:3000].astype(np.uint16))
 
 
+# demonstrate_splice()
 # %%
 
 
@@ -240,8 +242,9 @@ def demonstrate_splice():
 # %%
 
 
-base_dim = 19584, 26070
-files = sorted(Path("chunks").glob("masks-*.tif"))
+# base_dim = 19584, 26070
+path = Path("/mnt/working/e155_zach/stitch--full/cellpose")
+files = sorted(path.glob("masks-*.tif"))
 
 file_names = pl.DataFrame(
     [(x.as_posix(), *re.search(r"masks-(\d+)_(\d+).tif", x.name).groups()) for x in files]
@@ -255,14 +258,14 @@ for i, (idx_y, ys) in enumerate(sorted(file_names.group_by("column_1"), key=lamb
         imgb = tifffile.imread(row["column_0"])
         imgt = splice(imgt, imgb, axis="y", idxb=i * len(ys) + j)
     print("writing to file")
-    tifffile.imwrite(f"chunks/spliced-{idx_y[0]}.tif", imgt, compression="zlib")
+    tifffile.imwrite(path / f"spliced-{idx_y[0]}.tif", imgt, compression="zlib")
 
 
 # %%
 
 idx = 1
 assert len(files) > 1
-img = tifffile.imread("chunks/spliced-07964.tif")
+img = tifffile.imread("chunks/spliced-08304.tif")
 fig, ax = plt.subplots(figsize=(8, 12), dpi=200)
 ax.imshow(img[5].astype(np.uint16), zorder=1, vmax=1)
 
@@ -270,9 +273,9 @@ ax.imshow(img[5].astype(np.uint16), zorder=1, vmax=1)
 # %%
 import re
 
-base_dim = 19584, 26070
+base_dim = np.loadtxt(path / "shape.txt").astype(int)[2:]
 out = np.zeros(base_dim)
-files = sorted(Path("chunks").glob("spliced-*.tif"))
+files = sorted(path.glob("spliced-*.tif"))
 
 file_names = pl.DataFrame(
     [(x.as_posix(), *re.search(r"spliced-(\d+).tif", x.name).groups()) for x in files]
