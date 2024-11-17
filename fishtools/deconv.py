@@ -224,8 +224,8 @@ def rescale(img: cp.ndarray, scale: float):
 
 
 # %%
-DATA = Path("/home/chaichontat/fishtools/data")
-make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=9)
+DATA = Path("/fast2/fishtools/data")
+make_projector(Path(DATA / "PSF GL.tif"), step=4, max_z=7)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 
@@ -281,12 +281,6 @@ def _run(
 
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
-
-    basic = cast(
-        dict[Literal[560, 650, 750], BaSiC],
-        pickle.loads((path / "basic" / f"{name}.pkl").read_bytes()),
-    )
-    # basic = {c: pickle.loads((path / f"basic_{c}.pkl").read_bytes()) for c in [560, 650, 750]}
 
     def f_read(files: list[Path]):
         logger.info("Read thread started.")
