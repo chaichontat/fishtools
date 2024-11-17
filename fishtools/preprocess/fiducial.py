@@ -183,6 +183,7 @@ def run_fiducial(
     threshold_residual: float = 0.3,
     fwhm: float = 4,
 ):
+    ref = np.atleast_3d(ref).max(axis=0)
     if subtract_background:
         ref = ref - background(ref)
 
@@ -220,6 +221,7 @@ def run_fiducial(
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
     def inner(img: np.ndarray, *, limit: int = 4, bitname: str = "", local_σ: float = thr):
+        img = np.atleast_3d(img).max(axis=0)
         if subtract_background:
             img = img - background(img)
 
