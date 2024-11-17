@@ -18,7 +18,7 @@ from fishtools.preprocess.deconv import scale_deconv
 sns.set_theme()
 
 
-def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4, -5)):
+def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4)):
     # if "deconv" in path.resolve().as_posix() and not deconv:
     #     raise ValueError("deconv in path. Make sure to set deconv=True")
 
@@ -41,9 +41,12 @@ def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4
     n = min(len(files), 500)
     nc = len(round_.split("_"))
 
-    deconv_meta = np.loadtxt(path / "deconv_scaling" / f"{round_}.txt")
-    if deconv_meta is not None:
+    deconv_path = path / "deconv_scaling" / f"{round_}.txt"
+    if deconv_path.exists():
+        deconv_meta = np.loadtxt(deconv_path)
         logger.info("Using deconvolution scaling.")
+    else:
+        deconv_meta = None
 
     # This is the extracted z slices from all files.
     out = np.zeros((n, len(zs), nc, 2048, 2048), dtype=np.float32)
@@ -106,8 +109,6 @@ def run(path: Path, round_: str, *, overwrite: bool = False, channels: str = "56
 
     logger.info(f"Running {round_}")
     basics = _run(path, round_, plot=False, zs=tuple(map(int, zs.split(","))))
-    if not (path / "basic" / f"{round_}.pkl").exists():
-        return
     with open(path / "basic" / f"{round_}.pkl", "wb") as f:
         pickle.dump(dict(zip(channels.split(","), basics)), f)
     for c, basic in zip(channels.split(","), basics):
@@ -121,8 +122,7 @@ def run(path: Path, round_: str, *, overwrite: bool = False, channels: str = "56
 @click.option("--overwrite", is_flag=True)
 @click.option("--threads", "-t", type=int, default=2)
 def batch(path: Path, overwrite: bool = False, threads: int = 2):
-    rounds = [p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name]
-    # rounds = sorted((path / "deconv_scaling").glob("*.txt"))
+    rounds = sorted({p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name})
     with ThreadPoolExecutor(threads) as exc:
         futs = [exc.submit(run.callback, path, r, overwrite=overwrite) for r in rounds]  # type: ignore
         for fut in as_completed(futs):

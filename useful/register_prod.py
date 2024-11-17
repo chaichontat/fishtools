@@ -556,7 +556,7 @@ def main(
                     overrides={
                         # "polyA_1_9_17": (12.01, -12.43),
                     },
-                    n_fids=1,
+                    n_fids=2,
                 ),
                 downsample=1,
                 crop=30,

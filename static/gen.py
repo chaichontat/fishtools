@@ -65,15 +65,17 @@ def n_to_bit(arr, n: int, on: int):
     return arr
 
 
-on = 4
+on = 3
 
-min_dist = 4
+min_dist = 2
 
-for n in range(32, 33):
+for n in range(29, 31):
     for i in range(5):
         print(len(x := gen_mhd(n, on, seed=0, min_dist=min_dist)))
 
     np.savetxt(f"static/{n}bit_on{on}_dist{min_dist}.csv", n_to_bit(x, n, on), fmt="%d", delimiter=",")
+
+# %%
 
 # %%
 # from itertools import product
