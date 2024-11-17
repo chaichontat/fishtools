@@ -5,18 +5,20 @@ from pathlib import Path
 
 from fishtools import progress_bar
 
-PATH = Path("/mnt/archive/starmap/sagittal/analysis/deconv")
-roi = "full"
+PATH = Path("/mnt/archive/starmap/zne172/20241113-ZNE172-Zach/analysis/deconv")
+roi = "right"
 chan = "4_12_20"
 idxs = sorted({int(name.stem.split("-")[1]) for name in PATH.rglob(f"{chan}--{roi}/{chan}*.tif")})
 print(len(idxs))
 
+if not PATH.exists():
+    raise ValueError(f"Path {PATH} does not exist.")
 # idxs = [i for i in idxs if not (PATH / "down2" / "0" / f"{i:03d}_000.tif").exists()]
 # %%
 
 # %%
 
-with progress_bar(len(idxs)) as callback, ThreadPoolExecutor(12) as exc:
+with progress_bar(len(idxs)) as callback, ThreadPoolExecutor(4) as exc:
     futs: list[Future] = []
     for i in idxs:
         fut = exc.submit(
@@ -31,7 +33,7 @@ with progress_bar(len(idxs)) as callback, ThreadPoolExecutor(12) as exc:
                 "--reference",
                 chan,
                 f"--roi={roi}",
-                "--overwrite",
+                # "--overwrite",
             ],
             check=True,
         )
