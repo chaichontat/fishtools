@@ -209,7 +209,7 @@ class Image:
             # raise Exception(f"No basic template found at {path_basic}")
             basic = lambda: None
 
-        fids_raw = np.atleast_3d(img[-n_fids:])
+        fids_raw = np.atleast_3d(img[-n_fids:]).max(axis=0)
         return cls(
             name=name,
             idx=int(idx),
