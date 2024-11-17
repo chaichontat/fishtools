@@ -224,14 +224,13 @@ def rescale(img: cp.ndarray, scale: float):
 
 
 # %%
-DATA = Path("/fast2/fishtools/data")
-make_projector(Path(DATA / "PSF GL.tif"), step=4, max_z=9)
+DATA = Path("/home/chaichontat/fishtools/data")
+make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=9)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 
 @click.group()
-def main():
-    ...
+def main(): ...
 
 
 @main.command()
@@ -244,9 +243,9 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
     Find the scaling factors of all images in the children sub-folder of `path`.
     Run this on the entire workspace. See `_compute_range` for more details.
     """
-    rounds = sorted(
-        {p.parent.name.split("--")[0] for p in path.rglob("*.tif") if len(p.parent.name.split("--")) == 2}
-    )
+    rounds = sorted({
+        p.parent.name.split("--")[0] for p in path.rglob("*.tif") if len(p.parent.name.split("--")) == 2
+    })
     print(rounds)
     if "deconv" not in path.resolve().as_posix():
         raise ValueError("This command must be run in the deconvolved folder.")
@@ -269,64 +268,31 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
 channels = [560, 650, 750]
 
 
-@main.command()
-@click.argument("path", type=click.Path(path_type=Path))
-@click.argument("name", type=str)
-@click.option("--ref", type=click.Path(path_type=Path), default=None)
-@click.option("--limit", type=int, default=None)
-@click.option("--overwrite", is_flag=True)
-@click.option("--n-fid", type=int, default=1)
-def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite: bool, n_fid: int):
-    """GPU-accelerated very accelerated 3D deconvolution.
-
-    Separate read and write threadsin order to have an image ready for the GPU at all times.
-    Outputs in `path/analysis/deconv`.
-
-    Args:
-        path: Path to the workspace.
-        name: Name of the round to deconvolve. E.g. 1_9_17.
-        ref: Path of folder that have the same image indices as those we want to deconvolve.
-            Used when skipping blank areas in round >1.
-            We don't want to deconvolve the blanks in round 1.
-        limit: Limit the total number of images to deconvolve. Mainly for debugging.
-        overwrite: Overwrite existing deconvolved images.
-        n_fid: Number of fiducial frames.
-    """
-    out = path / "analysis" / "deconv"
-    out.mkdir(exist_ok=True, parents=True)
-
-    bits = name.split("_")
-    files = [f for f in sorted(path.glob(f"{name}--*/{name}-*.tif")) if "analysis/deconv" not in str(f)]
-    if ref is not None:
-        ok_idxs = {
-            int(f.stem.split("-")[1])
-            for f in sorted(path.rglob(f"{ref}*/{ref}-*.tif"))
-            if "analysis/deconv" not in str(f)
-        }
-        logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
-        files = [f for f in files if int(f.stem.split("-")[1]) in ok_idxs]
-        if len(files) != len(ok_idxs):
-            logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
-
-    files = files[:limit] if limit is not None else files
-    logger.info(f"Total: {len(files)} at {path}." + (f" Limited to {limit}" if limit is not None else ""))
-
+def _run(
+    paths: list[Path],
+    out: Path,
+    basics: dict[str, list[BaSiC]],
+    overwrite: bool,
+    n_fid: int,
+):
     if not overwrite:
-        files = [f for f in files if not (out / f.parent.name / f.name).exists()]
-        logger.info(f"Running {len(files)} files.")
+        paths = [f for f in paths if not (out / f.parent.name / f.name).exists()]
+        logger.info(f"Running {len(paths)} files.")
 
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
-    if not (path / "basic" / f"{name}.pkl").exists():
-        return
+
     basic = cast(
-        dict[Literal[560, 650, 750], BaSiC], pickle.loads((path / "basic" / f"{name}.pkl").read_bytes())
+        dict[Literal[560, 650, 750], BaSiC],
+        pickle.loads((path / "basic" / f"{name}.pkl").read_bytes()),
     )
     # basic = {c: pickle.loads((path / f"basic_{c}.pkl").read_bytes()) for c in [560, 650, 750]}
 
     def f_read(files: list[Path]):
         logger.info("Read thread started.")
         for file in files:
+            name = file.name.split("-")[0]
+            bits = name.split("_")
             if file.name.startswith("fid"):
                 continue
             logger.debug(f"Reading {file.name}")
@@ -342,7 +308,7 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
             logger.debug(f"Finished reading {file.name}")
             for i, c in enumerate(channels):
                 if i < nofid.shape[1]:
-                    nofid[:, i] = basic[str(c)].transform(np.array(nofid[:, i]))
+                    nofid[:, i] = basics[name][i].transform(np.array(nofid[:, i]))
             q_img.put((file, nofid, fid, metadata))
 
     def f_write():
@@ -367,25 +333,25 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
             logger.debug(f"Finished writing {file.name}")
             q_write.task_done()
 
-    thread = threading.Thread(target=f_read, args=(files,), daemon=True)
-    thread.start()
+    try:
+        thread = threading.Thread(target=f_read, args=(paths,), daemon=True)
+        thread.start()
 
-    thread_write = threading.Thread(target=f_write, args=(), daemon=True)
-    thread_write.start()
+        thread_write = threading.Thread(target=f_write, args=(), daemon=True)
+        thread_write.start()
 
-    for _ in range(len(files)):
-        start, img, fid, metadata = q_img.get()
-        logger.info(f"Processing {start.name} ({_}/{len(files)})")
-        res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors, iters=1)
+        for _ in range(len(paths)):
+            start, img, fid, metadata = q_img.get()
+            logger.info(f"Processing {start.name} ({_}/{len(paths)})")
+            res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors, iters=1)
 
-        mins = res.min(axis=(0, 2, 3), keepdims=True)
-        scale = 65534 / (res.max(axis=(0, 2, 3), keepdims=True) - mins)
+            mins = res.min(axis=(0, 2, 3), keepdims=True)
+            scale = 65534 / (res.max(axis=(0, 2, 3), keepdims=True) - mins)
 
-        towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
-        del res
+            towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
+            del res
 
-        q_write.put(
-            (
+            q_write.put((
                 start,
                 towrite,
                 fid,
@@ -394,25 +360,124 @@ def run(path: Path, name: str, *, ref: Path | None, limit: int | None, overwrite
                     "deconv_min": list(map(float, mins.get().flatten())),
                     "deconv_scale": list(map(float, scale.get().flatten())),
                 },
-            )
-        )
-        q_img.task_done()
+            ))
+            q_img.task_done()
+    except Exception as e:
+        logger.error(f"Error in thread: {e}")
+        q_write.put(None)
+        raise e
 
     q_write.put(None)
+    thread.join()
     thread_write.join()
     logger.info("Done.")
 
 
 @main.command()
 @click.argument("path", type=click.Path(path_type=Path))
+@click.argument("name", type=str)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fid", type=int, default=1)
-def batch(path: Path, *, ref: Path | None, limit: int | None, overwrite: bool, n_fid: int):
+def run(
+    path: Path,
+    name: str,
+    *,
+    ref: Path | None,
+    limit: int | None,
+    overwrite: bool,
+    n_fid: int,
+):
+    """GPU-accelerated very accelerated 3D deconvolution.
+
+    Separate read and write threadsin order to have an image ready for the GPU at all times.
+    Outputs in `path/analysis/deconv`.
+
+    Args:
+        path: Path to the workspace.
+        name: Name of the round to deconvolve. E.g. 1_9_17.
+        ref: Path of folder that have the same image indices as those we want to deconvolve.
+            Used when skipping blank areas in round >1.
+            We don't want to deconvolve the blanks in round 1.
+        limit: Limit the total number of images to deconvolve. Mainly for debugging.
+        overwrite: Overwrite existing deconvolved images.
+        n_fid: Number of fiducial frames.
+    """
+    out = path / "analysis" / "deconv"
+    out.mkdir(exist_ok=True, parents=True)
+
+    files = [f for f in sorted(path.glob(f"{name}--*/{name}-*.tif")) if "analysis/deconv" not in str(f)]
+    if ref is not None:
+        ok_idxs = {
+            int(f.stem.split("-")[1])
+            for f in sorted(path.rglob(f"{ref}*/{ref}-*.tif"))
+            if "analysis/deconv" not in str(f)
+        }
+        logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
+        files = [f for f in files if int(f.stem.split("-")[1]) in ok_idxs]
+        if len(files) != len(ok_idxs):
+            logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
+
+    files = files[:limit] if limit is not None else files
+    logger.info(f"Total: {len(files)} at {path}." + (f" Limited to {limit}" if limit is not None else ""))
+
+    if not overwrite:
+        files = [f for f in files if not (out / f.parent.name / f.name).exists()]
+        logger.info(f"Running {len(files)} files.")
+
+    basics: dict[str, list[BaSiC]] = {
+        name: list(pickle.loads((path / "basic" / f"{name}.pkl").read_bytes()).values())
+    }
+    _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fid=n_fid)
+
+
+@main.command()
+@click.argument("path", type=click.Path(path_type=Path))
+@click.option("--roi", type=str, default=None)
+@click.option("--ref", type=click.Path(path_type=Path), default=None)
+@click.option("--limit", type=int, default=None)
+@click.option("--overwrite", is_flag=True)
+@click.option("--n-fid", type=int, default=1)
+def batch(
+    path: Path,
+    *,
+    roi: str | None,
+    ref: Path | None,
+    limit: int | None,
+    overwrite: bool,
+    n_fid: int,
+):
+    out = path / "analysis" / "deconv"
+    out.mkdir(exist_ok=True, parents=True)
+
     rounds = sorted({p.name.split("--")[0] for p in path.iterdir() if "--" in p.name and p.is_dir()})
     for r in rounds:
-        run.callback(path, name=r, ref=ref, limit=limit, overwrite=overwrite, n_fid=n_fid)  # type: ignore
+        files = [
+            f for f in sorted(path.glob(f"{r}--{roi or '*'}/{r}-*.tif")) if "analysis/deconv" not in str(f)
+        ]
+
+        if ref is not None:
+            ok_idxs = {
+                int(f.stem.split("-")[1])
+                for f in sorted(path.rglob(f"{ref}--{roi or '*'}/{ref}-*.tif"))
+                if "analysis/deconv" not in str(f)
+            }
+            logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
+            files = [f for f in files if int(f.stem.split("-")[1]) in ok_idxs]
+            if len(files) != len(ok_idxs):
+                logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
+
+        basics: dict[str, list[BaSiC]] = {
+            r: list(pickle.loads((path / "basic" / f"{r}.pkl").read_bytes()).values())
+        }
+        _run(
+            files,
+            path / "analysis" / "deconv",
+            basics,
+            overwrite=overwrite,
+            n_fid=n_fid,
+        )
 
 
 if __name__ == "__main__":
