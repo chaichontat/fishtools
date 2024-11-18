@@ -407,7 +407,7 @@ def align_fiducials(
             | {ref: np.zeros(2)}
             | ({k: np.array(v) for k, v in overrides.items()} if overrides else {})
         ),
-        ({k: v.result()[1] for k, v in futs.items()} | {ref: np.zeros(2)}),
+        ({k: v.result()[1] for k, v in futs.items()} | {ref: 0.0}),
     )
 
 
