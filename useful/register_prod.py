@@ -2,6 +2,7 @@
 import json
 import pickle
 import sys
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ import tifffile
 import toml
 from basicpy import BaSiC
 from loguru import logger
+from pydantic import ValidationError
 from scipy import ndimage
 from scipy.ndimage import shift
 from tifffile import TiffFile
@@ -21,6 +23,7 @@ from fishtools import align_fiducials
 from fishtools.preprocess.chromatic import Affine
 from fishtools.preprocess.config import ChannelConfig, Config, Fiducial, NumpyEncoder, RegisterConfig
 from fishtools.preprocess.deconv import scale_deconv
+from fishtools.preprocess.fiducial import Shifts
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
@@ -30,7 +33,7 @@ if TYPE_CHECKING:
 
 # %%
 
-DATA = Path("/home/chaichontat/fishtools/data")
+DATA = Path("/fast2/fishtools/data")
 
 
 # %%
@@ -273,6 +276,24 @@ def run(
     fids = {name: img.fid for name, img in imgs.items()}
 
     prior_mapping: dict[str, str] = {}
+
+    if len(shifts_existing := sorted((path / f"shifts--{roi}").glob("*.json"))) > 10:
+        _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
+        for shift_path in shifts_existing:
+            try:
+                shift_dicts = Shifts.validate_json(shift_path.read_text())
+            except ValidationError as e:
+                logger.warning(f"Error decoding {shift_path} {e}. Skipping.")
+                continue
+            for name, shift_dict in shift_dicts.items():
+                if shift_dict.residual < 0.3:
+                    _priors[name].append(shift_dict.shifts)
+        logger.debug(f"Using priors from {len(shifts_existing)} existing shifts.")
+        config.registration.fiducial.priors = {
+            name: np.median(np.array(shifts), axis=0) for name, shifts in _priors.items()
+        }
+        logger.debug(config.registration.fiducial.priors)
+
     if config.registration.fiducial.priors is not None:
         for name, sh in config.registration.fiducial.priors.items():
             for file in fids:
@@ -355,17 +376,22 @@ def run(
     (shift_path := path / f"shifts--{roi}").mkdir(exist_ok=True)
 
     _fid_ref = fids[reference][::4, ::4].flatten()
-    with open(shift_path / f"shifts-{idx:04d}.json", "w") as f:
-        to_dump = {
-            k: {
-                "shifts": shifts[k].tolist(),
-                "residual": residuals[k],
-                "corr": 1.0 if reference == k else np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1],
-            }
-            for k in shifts
-        }
-        json.dump(to_dump, f)
-        logger.debug(f"Corr: {[x['corr'] for x in to_dump.values()]}")
+    (shift_path / f"shifts-{idx:04d}.json").write_bytes(
+        Shifts.dump_json(
+            Shifts.validate_python({
+                k: {
+                    "shifts": tuple(shifts[k]),
+                    "residual": residuals[k],
+                    "corr": 1.0
+                    if reference == k
+                    else np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1],
+                }
+                for k in shifts
+            })
+        )
+    )
+
+    # logger.debug(f"Corr: {[x['corr'] for x in to_dump.values()]}")
 
     del fids, _fid_ref
     for _img in imgs.values():
@@ -541,6 +567,7 @@ def main(
             dataPath=str(DATA),
             channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
             basic=None,
+            exclude=["cfse"],
             # basic_template=dict(
             #     zip(
             #         ["560", "650", "750"],

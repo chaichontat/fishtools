@@ -13,6 +13,7 @@ from astropy.stats import SigmaClip, sigma_clipped_stats
 from loguru import logger
 from photutils.background import Background2D, MedianBackground
 from photutils.detection import DAOStarFinder
+from pydantic import BaseModel, TypeAdapter
 from scipy.spatial import cKDTree
 from skimage import exposure, filters
 from skimage.measure import ransac
@@ -490,3 +491,12 @@ if __name__ == "__main__":
 # fids = {k: v[-1 for k, v in imgs.items()}
 # imgs = {k: v[:-1] for k, v in imgs.items()}
 # keys = list(imgs.keys())
+
+
+class Shift(BaseModel):
+    shifts: tuple[float, float]
+    corr: float
+    residual: float
+
+
+Shifts = TypeAdapter(dict[str, Shift])
