@@ -61,6 +61,7 @@ class ChannelConfig(BaseModel):
 
 class Config(BaseModel):
     dataPath: str
+    exclude: list[str] | None = Field(None, description="Exclude rounds with these prefixes.")
     registration: RegisterConfig
     channels: ChannelConfig | None = None
     basic: Literal["per_round", "all_round"] | None = Field(

@@ -259,7 +259,7 @@ def run(
             n_fids=config.registration.fiducial.n_fids,
         )
         for file in sorted(Path(path).glob(f"*--{roi}/*-{idx:04d}.tif" if roi else f"*/*-{idx:04d}.tif"))
-        if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES)
+        if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
     ]
     imgs = {img.name: img for img in _imgs}
     del _imgs
@@ -358,11 +358,11 @@ def run(
     with open(shift_path / f"shifts-{idx:04d}.json", "w") as f:
         to_dump = {
             k: {
-                "shifts": v.tolist(),
+                "shifts": shifts[k].tolist(),
                 "residual": residuals[k],
                 "corr": 1.0 if reference == k else np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1],
             }
-            for k, v in shifts.items()
+            for k in shifts
         }
         json.dump(to_dump, f)
         logger.debug(f"Corr: {[x['corr'] for x in to_dump.values()]}")

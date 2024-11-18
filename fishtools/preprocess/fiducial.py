@@ -291,7 +291,7 @@ def run_fiducial(
                 for n in range(limit):
                     # Can raise NotEnoughSpots
                     drift = _calculate_drift(
-                        kd, fixed, moving, initial_drift=initial_drift, use_brightest=100
+                        kd, fixed, moving, initial_drift=initial_drift, use_brightest=use_brightest
                     )
                     residual = np.hypot(*(drift - initial_drift))
                     if n == 0:
@@ -407,7 +407,7 @@ def align_fiducials(
             | {ref: np.zeros(2)}
             | ({k: np.array(v) for k, v in overrides.items()} if overrides else {})
         ),
-        {k: v.result()[1] for k, v in futs.items()},
+        ({k: v.result()[1] for k, v in futs.items()} | {ref: np.zeros(2)}),
     )
 
 
