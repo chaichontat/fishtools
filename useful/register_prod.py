@@ -229,6 +229,9 @@ class Image:
             temp = fid.max(axis=0)
         temp = -ndimage.gaussian_laplace(fid.astype(np.float32).copy(), sigma=3)  # type: ignore
         temp -= temp.min()
+        percs = np.percentile(temp, [1, 99.9])
+        temp = (temp - percs[0]) / (percs[1] - percs[0])
+
         return temp
 
 
@@ -303,7 +306,7 @@ def run(
     )
 
     try:
-        shifts = align_fiducials(
+        shifts, residuals = align_fiducials(
             fids,
             reference=reference,
             debug=debug,
@@ -326,6 +329,9 @@ def run(
         if e.args[0] != "debugging":
             logger.critical(e)
             raise e
+
+    assert shifts  # type: ignore
+    assert residuals  # type: ignore
 
     if debug:
         tifffile.imwrite(
@@ -353,6 +359,7 @@ def run(
         to_dump = {
             k: {
                 "shifts": v.tolist(),
+                "residual": residuals[k],
                 "corr": 1.0 if reference == k else np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1],
             }
             for k, v in shifts.items()

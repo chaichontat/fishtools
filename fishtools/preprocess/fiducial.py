@@ -85,7 +85,7 @@ def find_spots(
 
     # min_ = img.min()
     # normalized = clahe((img - min_) / (img.max() - min_))
-    img = butterworth(img)
+
     _mean, median, std = sigma_clipped_stats(img, sigma=threshold_sigma + 5)
     # You don't want need to subtract the mean here, the median is subtracted in the call three lines below.
     iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
@@ -229,6 +229,7 @@ def run_fiducial(
     name: str = "",
     threshold_sigma: float = 3,
     threshold_residual: float = 0.3,
+    use_brightest: int = 100,
     fwhm: float = 4,
 ):
     if subtract_background:
@@ -290,7 +291,7 @@ def run_fiducial(
                 for n in range(limit):
                     # Can raise NotEnoughSpots
                     drift = _calculate_drift(
-                        kd, fixed, moving, initial_drift=initial_drift, use_brightest=1000
+                        kd, fixed, moving, initial_drift=initial_drift, use_brightest=100
                     )
                     residual = np.hypot(*(drift - initial_drift))
                     if n == 0:
@@ -324,7 +325,7 @@ def run_fiducial(
             raise ResidualTooLarge(
                 f"{bitname}: residual drift too large {residual=:2f}. Please refine parameters."
             )
-        return drift
+        return drift, residual
 
     return inner
 
@@ -367,7 +368,7 @@ def align_fiducials(
     threshold_sigma: float = 3,
     threshold_residual: float = 0.3,
     fwhm: float = 4,
-) -> dict[str, np.ndarray[float, Any]]:
+) -> tuple[dict[str, np.ndarray[float, Any]], dict[str, np.ndarray[float, Any]]]:
     keys = list(fids.keys())
     for name in keys:
         if re.search(reference, name):
@@ -399,10 +400,14 @@ def align_fiducials(
         for fut in as_completed(futs.values()):
             fut.result()
 
+    # Shifts and residuals
     return (
-        {k: v.result() for k, v in futs.items()}
-        | {ref: np.zeros(2)}
-        | ({k: np.array(v) for k, v in overrides.items()} if overrides else {})
+        (
+            {k: v.result()[0] for k, v in futs.items()}
+            | {ref: np.zeros(2)}
+            | ({k: np.array(v) for k, v in overrides.items()} if overrides else {})
+        ),
+        {k: v.result()[1] for k, v in futs.items()},
     )
 
 
