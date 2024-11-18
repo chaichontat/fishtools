@@ -13,20 +13,24 @@ import pyparsing as pp
 import seaborn as sns
 from pydantic import BaseModel, TypeAdapter
 from rtree import index
+from scipy.stats import ecdf
 from shapely import Point, Polygon, contains, intersection
 from tifffile import imread
 
+from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
-path = Path("/mnt/working/e155_trc/analysis/deconv/registered--right/")
+path = Path("/mnt/working/20241113-ZNE172-Zach/analysis/deconv/registered--right/")
 codebook = "genestar"
-spots = pl.read_parquet(path / codebook / "spots.parquet").with_columns(
-    is_blank=pl.col("target").str.starts_with("Blank")
-)
+
+spots = load_spots(path / codebook / "reg-0055.pkl", idx=0)
+# spots = pl.read_parquet(path / codebook / "spots.parquet").with_columns(
+#     is_blank=pl.col("target").str.starts_with("Blank")
+# )
 sns.set_theme()
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 ax.set_aspect("equal")
-ax.scatter(spots["x"][::50], spots["y"][::50], s=0.5, alpha=0.3)
+ax.scatter(spots["x"][::5], spots["y"][::5], s=0.5, alpha=0.3)
 
 # %%
 _sp = spots.filter(pl.col("target") == "Blank-9")
@@ -49,6 +53,47 @@ pergene = count_by_gene(spots)
 
 
 # %%
+
+
+# %%
+spots_ = spots.filter(pl.col("norm") > 0.02)
+fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+rand = np.random.default_rng(0)
+subsample = 1  # max(1, len(spots) // 50000)
+ax.hexbin(
+    (spots_[::subsample]["area"]) ** (1 / 2) + rand.normal(0, 1, size=spots_[::subsample].__len__()),
+    np.log10(spots_[::subsample]["norm"]),
+)
+ax.set_xlabel("Radius")
+ax.set_ylabel("log10(norm)")
+
+# %%
+
+spots_ = spots.filter(pl.col("norm") > 0.02)
+fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+rand = np.random.default_rng(0)
+subsample = 1  # max(1, len(spots) // 50000)
+ax.hexbin(
+    (spots_[::subsample]["area"]) ** (1 / 2) + rand.normal(0, 1, size=spots_[::subsample].__len__()),
+    spots_[::subsample]["distance"],
+)
+ax.set_xlabel("Radius")
+ax.set_ylabel("Distance")
+
+# %%
+# Calculate ECDF
+cdf = ecdf(np.log10(spots_[::subsample]["norm"].to_list())).cdf
+
+# Plot
+plt.plot(cdf.quantiles, cdf.probabilities)
+plt.xlabel("Values")
+plt.ylabel("Cumulative Probability")
+plt.title("Empirical Cumulative Distribution Function")
+plt.grid(True)
+plt.show()
+
+
+# %%
 def plot_scree(pergene: pl.DataFrame):
     fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 6), dpi=200)
     ax.bar(pergene["target"], pergene["count"], color=pergene["color"], width=1, align="edge", linewidth=0)
@@ -59,37 +104,15 @@ def plot_scree(pergene: pl.DataFrame):
     return fig, ax
 
 
-plot_scree(count_by_gene(spots.filter(pl.col("area").is_between(20, 50))))
+plot_scree(count_by_gene(spots.filter(pl.col("area").is_between(12, 50) & pl.col("norm").gt(0.1))))
+
+# %%
+# plot cdf
+
+# %%
+
+
 plt.tight_layout()
-
-# %%
-spots = spots.filter(pl.col("norm") > 0.003)
-fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
-rand = np.random.default_rng(0)
-subsample = 1  # max(1, len(spots) // 50000)
-ax.hexbin(
-    (spots[::subsample]["area"]) ** (1 / 2) + rand.normal(0, 1, size=spots[::subsample].__len__()),
-    np.log10(spots[::subsample]["norm"]),
-)
-ax.set_xlabel("Radius")
-ax.set_ylabel("log10(norm)")
-
-# %%
-
-
-# %%
-
-spots = spots.filter(pl.col("norm") > 0.003)
-fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
-rand = np.random.default_rng(0)
-subsample = 1  # max(1, len(spots) // 50000)
-ax.hexbin(
-    (spots.filter("is_blank")[::subsample]["area"]) ** (1 / 2)
-    + rand.normal(0, 1, size=spots.filter("is_blank")[::subsample].__len__()),
-    np.log10(spots.filter("is_blank")[::subsample]["norm"]),
-)
-ax.set_xlabel("Radius")
-ax.set_ylabel("log10(norm)")
 
 # %%
 cb_raw = json.loads(Path(f"/home/chaichontat/fishtools/starwork3/ordered/{codebook}.json").read_text())

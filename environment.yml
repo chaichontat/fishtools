@@ -9,6 +9,7 @@ dependencies:
   - click
   - colorama
   - cupy
+  - htslib
   - imagecodecs
   - kmer-jellyfish
   - levenshtein
@@ -30,6 +31,7 @@ dependencies:
   - repeatmasker
   - rich-click
   - rtree
+  - samtools
   - scanpy
   - shapely
   - toml

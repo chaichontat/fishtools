@@ -179,7 +179,7 @@ def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13, 
 
 def sample_imgs(path: Path, round_num: int, *, batch_size: int = 50):
     rand = np.random.default_rng(round_num)
-    paths = sorted(path.glob("registered--*/reg*.tif"))
+    paths = sorted((p for p in path.glob("registered--*/reg*.tif") if not p.name.endswith(".hp.tif")))
     return [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
 
 
@@ -226,7 +226,7 @@ def optimize(
             "--codebook",
             codebook_path.as_posix(),
             f"--round={round_num}",
-            "--overwrite" if overwrite else "",
+            *(["--overwrite"] if overwrite else []),
             f"--subsample-z={subsample_z}",
             f"--split={split}",
         ],
@@ -258,7 +258,7 @@ def batch(
     split: bool = False,
 ):
     return _batch(
-        sorted(path.glob("reg*.tif")),
+        sorted(p for p in path.glob("reg*.tif") if not p.name.endswith(".hp.tif")),
         "run",
         [
             "--global-scale",
@@ -367,7 +367,7 @@ def combine(path: Path, codebook_path: Path, round_num: int):
 
     global_scale_file = path_opt / "global_scale.txt"
     if round_num == 0:
-        curr = np.nanmean(np.array(curr), axis=0, keepdims=True)
+        curr = np.percentile(np.array(curr), 90, axis=0, keepdims=True)
         np.savetxt(global_scale_file, curr)
         return
 
@@ -520,10 +520,17 @@ def run(
     if calc_deviations and round_num is None:
         raise ValueError("Round must be provided for calculating deviations.")
 
+    # only for optimize
+    path_json = create_opt_path(path_img=path, codebook_path=codebook_path, mode="json", round_num=round_num)
     if calc_deviations:
         path_pickle = create_opt_path(
             path_img=path, codebook_path=codebook_path, mode="pkl", round_num=round_num
         )
+        if path_json.exists() and any(
+            round_num == v.round_num for v in Deviations.validate_json(path_json.read_text())
+        ):
+            logger.info(f"Skipping {path.name}. Already done.")
+            return
 
     else:
         (_path_out := path.parent / codebook_path.stem).mkdir(exist_ok=True)
@@ -582,22 +589,21 @@ def run(
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
     # But it's there as a reference.
+
     ghp = Filter.GaussianHighPass(sigma=8, is_volume=True, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
     ghp.sigma = (6, 8, 8)  # z,y,x
     logger.debug(f"Running GHP with sigma {ghp.sigma}")
+
     imgs: ImageStack = ghp.run(stack)
 
-    ghp = Filter.GaussianLowPass(sigma=1, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
-    imgs = ghp.run(imgs)
+    # tifffile.imwrite(path.with_suffix(".hp.tif"), imgs.xarray.to_numpy(), compression="zlib")
 
-    # z_filt = Filter.ZeroByChannelMagnitude(thresh=3e-4, normalize=False)
-    # imgs = z_filt.run(imgs)
-    import tifffile
+    # ghp = Filter.GaussianLowPass(sigma=1, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
+    # imgs = ghp.run(imgs)
 
-    tifffile.imwrite("highpassed.tif", imgs.xarray.to_numpy())
-    return
+    z_filt = Filter.ZeroByChannelMagnitude(0.00023893474053693353, normalize=False)
+    imgs = z_filt.run(imgs)
 
-    path_json = create_opt_path(path_img=path, codebook_path=codebook_path, mode="json", round_num=round_num)
     if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
         path_json.write_bytes(
@@ -632,7 +638,7 @@ def run(
     decoded_intensities = codebook.decode_metric(
         pixel_intensities,
         max_distance=0.3,
-        min_intensity=0.004,
+        min_intensity=0.001,
         norm_order=2,
         metric="euclidean",
         return_original_intensities=True,
@@ -648,7 +654,7 @@ def run(
     # plt.yscale("log")
 
     logger.info("Combining")
-    caf = CombineAdjacentFeatures(min_area=12, max_area=200, mask_filtered_features=True)
+    caf = CombineAdjacentFeatures(min_area=15, max_area=200, mask_filtered_features=True)
     decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
     transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
 
