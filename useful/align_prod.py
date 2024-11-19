@@ -255,15 +255,15 @@ def find_threshold(path: Path, codebook: Path, percentile: float = 25):
     SUBFOLDER = "_highpassed"
     paths = sorted(path.glob("registered--*/reg*.tif"))
 
-    # rand = np.random.default_rng(0)
-    # to_sample = rand.choice(paths, size=50, replace=False)  # type: ignore
-    # to_sample = sorted(
-    #     p for p in to_sample if not (p.parent / SUBFOLDER / f"{p.stem}_{codebook.stem}.hp.tif").exists()
-    # )
+    rand = np.random.default_rng(0)
+    to_sample = rand.choice(paths, size=50, replace=False)  # type: ignore
+    to_sample = sorted(
+        p for p in to_sample if not (p.parent / SUBFOLDER / f"{p.stem}_{codebook.stem}.hp.tif").exists()
+    )
 
-    # _batch(to_sample, "run", ["--codebook", str(codebook), "--highpass-only"], threads=4, split=[0])
+    _batch(to_sample, "run", ["--codebook", str(codebook), "--highpass-only"], threads=4, split=[0])
 
-    highpasses = list(path.glob(f"registered--*/{SUBFOLDER}/*.hp.tif"))
+    highpasses = list(path.glob(f"registered--*/{SUBFOLDER}/*_{codebook.stem}.hp.tif"))
     logger.info(f"Found {len(highpasses)} images to get percentiles from.")
     norms = {}
 
@@ -449,8 +449,9 @@ def initial(img: ImageStack):
     Returns the max intensity of each channel.
     Seems to work well enough.
     """
-    maxed = img.reduce({Axes.ROUND, Axes.ZPLANE, Axes.Y, Axes.X}, func="max")
-    res = np.array(maxed.xarray).squeeze()
+    maxed = img.reduce({Axes.ROUND, Axes.ZPLANE}, func="max")
+    res = np.percentile(np.array(maxed.xarray).squeeze(), 96, axis=(1, 2))
+    # res = np.array(maxed.xarray).squeeze()
     if np.isnan(res).any() or (res == 0).any():
         raise ValueError("NaNs or zeros found in initial scaling factor.")
     return res
@@ -656,13 +657,17 @@ def run(
         )
         return
 
-    perc = np.mean(
-        list(
-            json.loads(
-                (path.parent.parent / f"opt_{codebook_path.stem}/percentiles.json").read_text()
-            ).values()
+    try:
+        perc = np.mean(
+            list(
+                json.loads(
+                    (path.parent.parent / f"opt_{codebook_path.stem}/percentiles.json").read_text()
+                ).values()
+            )
         )
-    )
+    except FileNotFoundError as e:
+        raise Exception("Please run `fishtools find-threshold` first.") from e
+
     z_filt = Filter.ZeroByChannelMagnitude(perc, normalize=False)
     imgs = z_filt.run(imgs)
 

@@ -177,19 +177,7 @@ def _calculate_drift(
         axs[0].hist(joined["dx"], bins=100)
         axs[1].hist(joined["dy"], bins=100)
 
-    # model: TranslationTransform = ransac(
-    #     (
-    #         joined[["xcentroid", "ycentroid"]].to_numpy(),
-    #         joined[["xcentroid_fixed", "ycentroid_fixed"]].to_numpy(),
-    #     ),
-    #     TranslationTransform,
-    #     min_samples=10,
-    #     residual_threshold=0.1,
-    #     max_trials=1000,
-    # )[0]  # type: ignore
-    # print(model.translation)
-
-    if np.allclose(initial_drift, np.zeros(2)) and len(joined) > 100:
+    if np.allclose(initial_drift, np.zeros(2)) and len(joined) > 20:
         if joined["dx"].sum() == 0 and joined["dy"].sum() == 0:
             raise ValueError("No drift found. Reference passed?")
         res = np.array([mode(joined["dx"]), mode(joined["dy"])])  # type: ignore
@@ -203,6 +191,20 @@ def _calculate_drift(
     #     res = initial_drift + drift
     # else:
     drifts = joined[["dx", "dy"]].to_numpy()
+    # model: TranslationTransform | None = ransac(
+    #     (
+    #         joined[["xcentroid", "ycentroid"]].to_numpy(),
+    #         joined[["xcentroid_fixed", "ycentroid_fixed"]].to_numpy(),
+    #     ),
+    #     TranslationTransform,
+    #     min_samples=10,
+    #     residual_threshold=0.1,
+    #     max_trials=1000,
+    # )[0]  # type: ignore
+
+    # if model is not None:
+    #     drift = model.translation
+    # else:
     drift = np.median(drifts, axis=0)
 
     hypot = np.hypot(*drifts.T)
@@ -222,6 +224,9 @@ class TooManySpots(Exception): ...
 class ResidualTooLarge(Exception): ...
 
 
+class DriftTooLarge(Exception): ...
+
+
 def run_fiducial(
     ref: np.ndarray,
     *,
@@ -230,7 +235,7 @@ def run_fiducial(
     name: str = "",
     threshold_sigma: float = 3,
     threshold_residual: float = 0.3,
-    use_brightest: int = 100,
+    use_brightest: int = 0,
     fwhm: float = 4,
 ):
     if subtract_background:
@@ -320,7 +325,7 @@ def run_fiducial(
             raise NotEnoughSpots
 
         if np.hypot(*drift) > 40:
-            logger.warning(f"{bitname}: drift very large {np.hypot(*drift):.2f}.")
+            raise DriftTooLarge(f"{bitname}: drift very large {np.hypot(*drift):.2f}.")
 
         if residual > threshold_residual:
             raise ResidualTooLarge(
@@ -367,7 +372,7 @@ def align_fiducials(
     debug: bool = False,
     max_iters: int = 4,
     threshold_sigma: float = 3,
-    threshold_residual: float = 0.3,
+    threshold_residual: float = 0.2,
     fwhm: float = 4,
 ) -> tuple[dict[str, np.ndarray[float, Any]], dict[str, np.ndarray[float, Any]]]:
     keys = list(fids.keys())
@@ -387,6 +392,7 @@ def align_fiducials(
         threshold_sigma=threshold_sigma,
         threshold_residual=threshold_residual,
         fwhm=fwhm,
+        use_brightest=0,
     )
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
         futs: dict[str, Future] = {}
@@ -428,20 +434,20 @@ def plot_alignment(fids: dict[str, np.ndarray[float, Any]], sl: slice = np.s_[50
         ax.imshow(np.moveaxis(combi[i : i + 3][:, sl, sl], 0, 2))
 
 
-def align_fiducials_from_file(
-    folder: Path | str,
-    glob: str,
-    *,
-    reference: str,
-    filter_: Callable[[str], bool] = lambda _: True,
-    idx: int = -1,
-    threads: int = 4,
-) -> dict[str, np.ndarray[float, Any]]:
-    return align_fiducials(
-        {file.name: imread_page(file, idx) for file in sorted(Path(folder).glob(glob)) if filter_(file.name)},
-        reference=reference,
-        threads=threads,
-    )
+# def align_fiducials_from_file(
+#     folder: Path | str,
+#     glob: str,
+#     *,
+#     reference: str,
+#     filter_: Callable[[str], bool] = lambda _: True,
+#     idx: int = -1,
+#     threads: int = 4,
+# ) -> dict[str, np.ndarray[float, Any]]:
+#     return align_fiducials(
+#         {file.name: imread_page(file, idx) for file in sorted(Path(folder).glob(glob)) if filter_(file.name)},
+#         reference=reference,
+#         threads=threads,
+#     )
 
 
 @click.command()
