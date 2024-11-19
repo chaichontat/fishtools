@@ -705,7 +705,7 @@ def run(
     decoded_intensities = codebook.decode_metric(
         pixel_intensities,
         max_distance=0.3,
-        min_intensity=0.001,
+        min_intensity=0.005 if not calc_deviations else 0.02,
         norm_order=2,
         metric="euclidean",
         return_original_intensities=True,
