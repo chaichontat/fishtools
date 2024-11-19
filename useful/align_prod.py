@@ -610,13 +610,13 @@ def run(
     if split is None:
         split_slice = np.s_[:, :]
     elif split == 0:
-        split_slice = np.s_[:cut, :cut]
+        split_slice = np.s_[:cut, :cut]  # top-left
     elif split == 1:
-        split_slice = np.s_[cut:, -cut:]
+        split_slice = np.s_[:cut, -cut:]  # top-right
     elif split == 2:
-        split_slice = np.s_[-cut:, :cut]
+        split_slice = np.s_[-cut:, :cut]  # bottom-left
     elif split == 3:
-        split_slice = np.s_[-cut:, -cut:]
+        split_slice = np.s_[-cut:, -cut:]  # bottom-right
     else:
         raise ValueError(f"Unknown split {split}")
 

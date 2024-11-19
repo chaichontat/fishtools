@@ -1,6 +1,7 @@
 # %%
-import pickle
-from concurrent.futures import ThreadPoolExecutor
+import re
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -9,13 +10,25 @@ import polars as pl
 import seaborn as sns
 from loguru import logger
 from rtree import index
-from shapely import Point, Polygon, STRtree, intersection
+from shapely import MultiPolygon, Point, Polygon, STRtree, intersection
+from shapely.ops import unary_union
 
+from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
 sns.set_theme()
 codebook = "genestar"
 roi = "right"
+split = True
+FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.pkl")
+
+
+def parse_filename(x: str):
+    match = FILENAME.match(x)
+    if not match:
+        raise ValueError(f"Could not parse {x}")
+    return {"idx": int(match.group(1)), "split": int(match.group(2)) if match.group(2) else None}
+
 
 path = Path(f"/mnt/working/20241113-ZNE172-Zach/analysis/deconv/registered--{roi}")
 files = sorted(file for file in Path(path / codebook).glob("*.pkl") if "opt" not in file.stem)
@@ -24,14 +37,22 @@ coords = TileConfiguration.from_file(
     Path(path.parent / f"stitch--{roi}" / "TileConfiguration.registered.txt")
     # Path(path / "stitch" / "TileConfiguration.registered.txt")
 ).df
+if len(coords) != len(coords.unique(subset=["x", "y"], maintain_order=True)):
+    logger.warning("Duplicates found.")
+    coords = coords.unique(subset=["x", "y"], maintain_order=True)
 
-oks = [name[:4] + ".pkl" for name in coords["filename"]]
-files = [file for file in files if file.name[4:] in oks]
+idxs = [name[:4] for name in coords["filename"]]
+# pickles = list(map(lambda x: x + ".pkl", idxs))
+files = (
+    [file for file in files if file.name.rsplit("-", 1)[-1] in idxs]
+    if not split
+    else [file for file in files if file.name.rsplit("-", 2)[1] in idxs]
+)
 
-if len(files) != len(coords) or len(files) != len(coords) * 4:
-    print({int(x.stem.split("-")[-1]) for x in files} - set(coords["index"]))
-    print(set(coords["index"]) - {int(x.stem.split("-")[-1]) for x in files})
-    raise ValueError("Length of files does not match length of coords.")
+# if len(files) != len(coords) or len(files) != len(coords) * 4:
+#     print({int(x.stem.split("-")[-1]) for x in files} - set(coords["index"]))
+#     print(set(coords["index"]) - {int(x.stem.split("-")[-1]) for x in files})
+#     raise ValueError("Length of files does not match length of coords.")
 # assert len(files) == len(coords)
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
@@ -39,62 +60,75 @@ sns.scatterplot(x="x", y="y", data=coords.to_pandas(), ax=ax, s=10, alpha=0.9)
 for row in coords.iter_rows(named=True):
     ax.text(row["x"], row["y"], row["index"], fontsize=10)
 
+
+# %%
+def find_precedence_intersections(polygons):
+    result = []
+    remaining_area = unary_union(polygons)
+
+    for poly in polygons:
+        # Intersect with remaining area
+        intersection = poly.intersection(remaining_area)
+        if not intersection.is_empty:
+            result.append(intersection)
+        # Remove this polygon from remaining area
+        remaining_area = remaining_area.difference(poly)
+
+    return result
+
+
+find_precedence_intersections()
 # %%
 
-
-def load(i: int, filter_: bool = True):
-    d, y = pickle.loads(files[i].read_bytes())
-    c = coords.filter(pl.col("index") == int(files[i].stem.rsplit("-", 1)[-1]))[0]
-    if filter_:
-        y = np.array(y)[d.coords["passes_thresholds"]].tolist()
-        d = d[d.coords["passes_thresholds"]]
-    return (
-        pl.DataFrame(y)
-        .with_columns(pl.col("centroid").list.to_struct())
-        .unnest("centroid")
-        .rename({"field_0": "z", "field_1": "y_local", "field_2": "x_local"})
-        .with_columns(
-            y=pl.col("y_local") + c["y"],
-            x=pl.col("x_local") + c["x"],
-            target=pl.Series(list(d.coords["target"].values)),
-            distance=pl.Series(list(d.coords["distance"].values)),
-            norm=pl.Series(np.linalg.norm(d.values, axis=(1, 2))),
-            tile=pl.lit(str(i)),
-            passes_thresholds=pl.Series(d.coords["passes_thresholds"].values),
-        )
-        .with_row_index("idx_local")
-    )
-
-
-v = load(0)
 
 # %%
 
 
-def gen_splits(coords: tuple[float, float], n: int = 4, width: int = 1024, offset: int = 1998 - 1024):
+def load_pickle(i: int, filter_: bool = True, *, size: int = 1998, cut: int = 1024):
+    idx, split = parse_filename(files[i].name).values()
+    c = coords.filter(pl.col("index") == idx).row(0, named=True)
+
+    logger.debug(f"Loading {files[i]} as split {split}")
+
+    if split == 0:  # top-left
+        pass
+    elif split == 1:  # top-right
+        c["x"] += size - cut
+    elif split == 2:  # bottom-left
+        c["y"] += size - cut  # + to move down
+    elif split == 3:  # bottom-right
+        c["x"] += size - cut
+        c["y"] += size - cut
+
+    return load_spots(files[i], i, filter_=filter_, tile_coords=(c["x"], c["y"]))
+
+
+# v = load_pickle(0)
+
+# %%
+
+
+def gen_splits(coords: tuple[float, float], n: int = 4, size: int = 1988, cut: int = 1024):
+    if size < 1 or cut < 1:
+        raise ValueError("width and offset must be greater than 0")
     x, y = coords
-    if n == 0:
-        return Polygon([(x, y), (x + width, y), (x + width, y + width), (x, y + width)])
-    if n == 1:
+    if n == 0:  # [:cut, :cut] - top-left
         return Polygon([
-            (x, y + offset),
-            (x + width, y + offset),
-            (x + width, y + width + offset),
-            (x, y + width + offset),
+            (x, y),
+            (x + cut, y),
+            (x + cut, y + cut),  # + for y to go down
+            (x, y + cut),
         ])
-    if n == 2:
+    if n == 1:  # [:cut, -cut:] - top-right
+        return Polygon([(x + size - cut, y), (x + size, y), (x + size, y + cut), (x + size - cut, y + cut)])
+    if n == 2:  # [-cut:, :cut] - bottom-left
+        return Polygon([(x, y + size - cut), (x + cut, y + size - cut), (x + cut, y + size), (x, y + size)])
+    if n == 3:  # [-cut:, -cut:] - bottom-right
         return Polygon([
-            (x + offset, y),
-            (x + width + offset, y),
-            (x + width + offset, y + width),
-            (x + offset, y + width),
-        ])
-    if n == 3:
-        return Polygon([
-            (x + offset, y + offset),
-            (x + width + offset, y + offset),
-            (x + width + offset, y + width + offset),
-            (x + offset, y + width + offset),
+            (x + size - cut, y + size - cut),
+            (x + size, y + size - cut),
+            (x + size, y + size),
+            (x + size - cut, y + size),
         ])
     raise ValueError(f"Unknown n={n}")
 
@@ -103,74 +137,85 @@ w = 1988
 assert len(coords) == len(set(coords["index"]))
 
 
-if len(files) == len(coords):
-    cells = [
-        Polygon([
+if split:
+    cells = {
+        f"{row['index']}-{n}": gen_splits((row["x"], row["y"]), n=n)
+        for row in coords.iter_rows(named=True)
+        for n in range(4)
+    }
+else:
+    cells = {
+        row["index"]: Polygon([
             (row["x"], row["y"]),
             (row["x"] + w, row["y"]),
             (row["x"] + w, row["y"] + w),
             (row["x"], row["y"] + w),
         ])
         for row in coords.iter_rows(named=True)
-    ]
-else:
-    cells = [
-        gen_splits((row["x"], row["y"]), n=n, width=1024, offset=1998 - 1024)
-        for n in range(4)
-        for row in coords.iter_rows(named=True)
-    ]
+    }
+
 
 idx = index.Index()
-for pos, cell in enumerate(cells):
+for pos, cell in enumerate(cells.values()):
     idx.insert(pos, cell.bounds)
 
-crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
+# Get the indices of the cells that cross each other
+crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells.values()]
+MultiPolygon([list(cells.values())[idx] for idx in crosses[0]])
+_cells = list(cells.values())
 
 # %%
 
+# MultiPolygon(_cells[:2])
 
-def process(out: list, curr: int, filter_: bool = True):
-    this_cross = {j: intersection(cells[curr], cells[j]) for j in crosses[curr] if j > curr}
-    df = load(curr, filter_=filter_)
+MultiPolygon([_cells[i] for i in crosses[0] if i > 0])
+# %%
+
+
+def process(curr: int, filter_: bool = True):
+    _cells = list(cells.values())
+    current_cell = _cells[curr]
+
+    lower_intersections = {j: intersection(current_cell, _cells[j]) for j in crosses[curr] if j < curr}
+
+    df = load_pickle(curr, filter_=filter_)
     df = df.filter(pl.col("passes_thresholds") & pl.col("area").is_between(15, 80) & pl.col("norm").gt(0.05))
 
-    geometries = list(this_cross.values())
-    tree = STRtree(geometries)
+    # Create the "exclusive" area for this cell
+    exclusive_area = current_cell
+    for intersect in lower_intersections.values():
+        exclusive_area = exclusive_area.difference(intersect)
 
-    def check_point(x, y):
+    # Create STRtree with the exclusive area parts
+    if isinstance(exclusive_area, MultiPolygon):
+        tree_geoms = list(exclusive_area.geoms)
+    else:
+        tree_geoms = [exclusive_area]
+    tree = STRtree(tree_geoms)
+
+    def check_point(x: float, y: float):
         point = Point(x, y)
-        return len(tree.query(point)) == 0
+        return len(tree.query(point, "within")) > 0
 
-    # for row in df.iter_rows(named=True):
-    #     for name, intersected in this_cross.items():
-    #         if contains(intersected, Point((row["x"], row["y"]))):
-    #             thrown += 1
-    #             # thrownover[name].append(row)
-    #             # Prevent double-counting
-    #             break
-    #     else:
-    #         out.append(row)
-
-    # Apply the function to all rows at once
     mask = df.select([
         pl.struct(["x", "y"])
         .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
         .alias("keep")
     ])
 
-    # Filter the dataframe and count the thrown points
     filtered_df = df.filter(mask["keep"])
+    logger.info(f"{files[curr]}: thrown {len(df) - len(filtered_df)} / {df.__len__()}")
+    return filtered_df
 
-    print(f"{curr}: thrown {len(df) - len(filtered_df)} / {df.__len__()}")
-    out.append(filtered_df)
 
-
-with ThreadPoolExecutor(4) as exc:
+# %%
+#  mp_context=get_context("forkserver")
+with ThreadPoolExecutor(8) as exc:
     out = []
-    futs = [exc.submit(process, out, i, filter_=True) for i in range(len(files[:]))]
+    futs = [exc.submit(process, i, filter_=True) for i in range(16, 24)]  # len(spots))]
     for i, fut in enumerate(futs):
         try:
-            fut.result()
+            out.append(fut.result())
         except Exception as e:
             logger.error(f"Error in {files[i]}: {e}")
 # for curr in range(len(cells[:20])):
@@ -184,9 +229,10 @@ spots.write_parquet(path / codebook / "spots.parquet")
 fig, axs = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 
 # ax.set_aspect("equal")
-downsample = 50
+downsample = 5
 axs.scatter(spots["x"][::downsample], spots["y"][::downsample], s=0.5, alpha=0.3)
 axs.set_aspect("equal")
+axs.axis("off")
 
 # %%
 spots = pl.read_parquet(path / codebook / "spots.parquet")
