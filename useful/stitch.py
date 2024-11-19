@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import rich_click as click
 from loguru import logger
-from tifffile import TiffFile, imread, imwrite
+from tifffile import TiffFile, TiffFileError, imread, imwrite
 
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
@@ -156,30 +156,35 @@ def extract_channel(
     downsample: int = 1,
     reduce_bit_depth: int = 0,
 ):
-    with TiffFile(path) as tif:
-        if trim < 0:
-            raise ValueError("Trim must be positive")
+    try:
+        with TiffFile(path) as tif:
+            if trim < 0:
+                raise ValueError("Trim must be positive")
 
-        if max_proj:
-            img = tif.asarray()[:, idx].max(axis=0)
-        elif len(tif.pages) == 1 and tif.pages[0].asarray().ndim == 3:
-            img = tif.pages[0].asarray()[idx]
-        else:
-            img = tif.pages[idx].asarray()
+            if max_proj:
+                img = tif.asarray()[:, idx].max(axis=0)
+            elif len(tif.pages) == 1 and tif.pages[0].asarray().ndim == 3:
+                img = tif.pages[0].asarray()[idx]
+            else:
+                img = tif.pages[idx].asarray()
 
-        img = img[trim:-trim:downsample, trim:-trim:downsample] if trim else img[::downsample, ::downsample]
-        if reduce_bit_depth:
-            if img.dtype != np.uint16:
-                raise ValueError("Cannot reduce bit depth if image is not uint16")
-            img >>= reduce_bit_depth
+    except TiffFileError as e:
+        logger.critical(f"Error reading {path}: {e}")
+        raise e
 
-        imwrite(
-            out,
-            img,
-            compression=22610,
-            metadata={"axes": "YX"},
-            compressionargs={"level": 0.7},
-        )
+    img = img[trim:-trim:downsample, trim:-trim:downsample] if trim else img[::downsample, ::downsample]
+    if reduce_bit_depth:
+        if img.dtype != np.uint16:
+            raise ValueError("Cannot reduce bit depth if image is not uint16")
+        img >>= reduce_bit_depth
+
+    imwrite(
+        out,
+        img,
+        compression=22610,
+        metadata={"axes": "YX"},
+        compressionargs={"level": 0.7},
+    )
 
 
 @click.group()
@@ -214,8 +219,11 @@ def register(
     if not path.exists():
         raise ValueError(f"No registered images at {path.resolve()} found.")
 
-    imgs = sorted(path.glob("*.tif"))
+    imgs = sorted((f for f in path.glob("*.tif") if not f.name.endswith(".hp.tif")))
     (out_path := path.parent / f"stitch--{roi}").mkdir(exist_ok=True)
+
+    if overwrite:
+        [p.unlink() for p in out_path.glob("*.tif")]
 
     def get_idx(path: Path):
         return int(path.stem.split("-")[1])
@@ -232,7 +240,7 @@ def register(
                 futs.append(
                     exc.submit(
                         extract_channel,
-                        path.parent.parent / "fids--left" / f"fids-{_idx}.tif",
+                        path.parent.parent / f"fids--{roi}" / f"fids-{_idx}.tif",
                         out_path / out_name,
                         idx=0,
                         downsample=1,
@@ -261,7 +269,7 @@ def register(
 
     del path
     if overwrite or not (out_path / "TileConfiguration.registered.txt").exists():
-        files = sorted(out_path.glob("*.tif"))
+        files = sorted((f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif")))
         files_idx = [int(file.stem.split("-")[-1]) for file in files if file.stem.split("-")[-1].isdigit()]
         logger.debug(f"Using {files_idx}")
         tileconfig = TileConfiguration.from_pos(

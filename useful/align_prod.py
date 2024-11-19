@@ -6,22 +6,19 @@ import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import reduce
 from itertools import chain, groupby
 from pathlib import Path
 from typing import Any, Literal, Mapping, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import polars as pl
 import rich_click as click
 import starfish
 import starfish.data
+import tifffile
 import xarray as xr
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter, field_validator
-from skimage.filters import gaussian
 from starfish import Codebook, ImageStack, IntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
@@ -158,22 +155,38 @@ def load_codebook(path: Path, exclude: set[str] | None = None):
 def cli(): ...
 
 
-def _batch(paths: list[Path], mode: str, args: list[str], *, threads: int = 13, split: bool = False):
-    with progress_bar(len(paths)) as callback, ThreadPoolExecutor(threads) as exc:
+def _batch(
+    paths: list[Path],
+    mode: str,
+    args: list[str],
+    *,
+    threads: int = 13,
+    split: bool | list[int | None] = False,
+):
+    if isinstance(split, list):
+        split = split
+        if any(x is None for x in split):
+            raise ValueError("Cannot use None in split as list")
+    elif split:
+        split = list(range(4))
+    else:
+        split = [None]
+
+    with progress_bar(len(paths) * len(split)) as callback, ThreadPoolExecutor(threads) as exc:
         futs = []
         for path in paths:
-            for s in range(4) if split else [None]:
+            for s in split:
                 futs.append(
                     exc.submit(
                         subprocess.run,
                         ["python", __file__, mode, str(path), *[a for a in args if a]]
-                        + (["--split", str(s)] if split else []),
+                        + (["--split", str(s)] if s is not None else []),
                         check=True,
                         capture_output=False,
                     )
                 )
 
-        for f in as_completed(futs):
+        for _ in as_completed(futs):
             callback()
 
 
@@ -232,6 +245,39 @@ def optimize(
         ],
         threads=threads,
     )
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--percentile", type=float, default=25)
+def find_threshold(path: Path, codebook: Path, percentile: float = 25):
+    SUBFOLDER = "_highpassed"
+    paths = sorted(path.glob("registered--*/reg*.tif"))
+
+    # rand = np.random.default_rng(0)
+    # to_sample = rand.choice(paths, size=50, replace=False)  # type: ignore
+    # to_sample = sorted(
+    #     p for p in to_sample if not (p.parent / SUBFOLDER / f"{p.stem}_{codebook.stem}.hp.tif").exists()
+    # )
+
+    # _batch(to_sample, "run", ["--codebook", str(codebook), "--highpass-only"], threads=4, split=[0])
+
+    highpasses = list(path.glob(f"registered--*/{SUBFOLDER}/*.hp.tif"))
+    logger.info(f"Found {len(highpasses)} images to get percentiles from.")
+    norms = {}
+
+    for p in sorted(highpasses[:50]):
+        logger.debug(f"Processing {p.parent.name}/{p.name}")
+        img = tifffile.imread(p).squeeze().swapaxes(0, 1)
+        norms[p.parent.parent.name + "-" + p.name] = float(
+            np.percentile(np.linalg.norm(img, axis=1), percentile)
+        )
+
+    path_out = path / f"opt_{codebook.stem}"
+    path_out.mkdir(exist_ok=True)
+    logger.info(f"Writing to {path_out / 'percentiles.json'}")
+    (path_out / "percentiles.json").write_text(json.dumps(norms, indent=2))
 
 
 @cli.command()
@@ -480,6 +526,7 @@ def append_json(
 @click.option("--limit-z", default=None)
 @click.option("--debug", is_flag=True)
 @click.option("--split", default=None)
+@click.option("--highpass-only", is_flag=True)
 @click.option(
     "--codebook",
     "codebook_path",
@@ -497,6 +544,7 @@ def run(
     subsample_z: int = 1,
     limit_z: int | None = None,
     split: int | None = None,
+    highpass_only: bool = False,
 ):
     """
     Run spot calling.
@@ -541,7 +589,7 @@ def run(
         return
 
     logger.info(
-        f"Running {path.parent.name}/{path.name} with {limit_z} z-slices and {subsample_z}x subsampling."
+        f"Running {path.parent.name}/{path.name} {f'split {split}' if split is not None else ''} with {limit_z} z-slices and {subsample_z}x subsampling."
     )
     codebook, used_bits, names, arr_zeroblank = load_codebook(codebook_path, exclude={"Malat1-201"})
     used_bits = list(map(str, used_bits))
@@ -555,7 +603,8 @@ def run(
     # blurred = gaussian(path, sigma=8)
     # blurred = levels(blurred)  # clip negative values to 0.
     # filtered = image - blurred
-    cut = 994 + 30
+    cut = 1024
+    # 1998 - 1024 = 974
     split = int(split) if split is not None else None
     if split is None:
         split_slice = np.s_[:, :]
@@ -596,12 +645,25 @@ def run(
 
     imgs: ImageStack = ghp.run(stack)
 
-    # tifffile.imwrite(path.with_suffix(".hp.tif"), imgs.xarray.to_numpy(), compression="zlib")
+    if highpass_only:
+        (path.parent / "_highpassed").mkdir(exist_ok=True)
 
-    # ghp = Filter.GaussianLowPass(sigma=1, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
-    # imgs = ghp.run(imgs)
+        tifffile.imwrite(
+            path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif",
+            imgs.xarray.to_numpy(),
+            compression="zlib",
+            metadata={"keys": img_keys},
+        )
+        return
 
-    z_filt = Filter.ZeroByChannelMagnitude(0.00023893474053693353, normalize=False)
+    perc = np.mean(
+        list(
+            json.loads(
+                (path.parent.parent / f"opt_{codebook_path.stem}/percentiles.json").read_text()
+            ).values()
+        )
+    )
+    z_filt = Filter.ZeroByChannelMagnitude(perc, normalize=False)
     imgs = z_filt.run(imgs)
 
     if round_num == 0 and calc_deviations:

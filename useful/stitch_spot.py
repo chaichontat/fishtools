@@ -16,8 +16,8 @@ from fishtools.preprocess.tileconfig import TileConfiguration
 sns.set_theme()
 codebook = "genestar"
 roi = "right"
-# registered--{roi}
-path = Path(f"/mnt/working/e155_trc/analysis/deconv/registered--{roi}")
+
+path = Path(f"/mnt/working/20241113-ZNE172-Zach/analysis/deconv/registered--{roi}")
 files = sorted(file for file in Path(path / codebook).glob("*.pkl") if "opt" not in file.stem)
 
 coords = TileConfiguration.from_file(
@@ -27,31 +27,24 @@ coords = TileConfiguration.from_file(
 
 oks = [name[:4] + ".pkl" for name in coords["filename"]]
 files = [file for file in files if file.name[4:] in oks]
-files
+
+if len(files) != len(coords) or len(files) != len(coords) * 4:
+    print({int(x.stem.split("-")[-1]) for x in files} - set(coords["index"]))
+    print(set(coords["index"]) - {int(x.stem.split("-")[-1]) for x in files})
+    raise ValueError("Length of files does not match length of coords.")
 # assert len(files) == len(coords)
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 sns.scatterplot(x="x", y="y", data=coords.to_pandas(), ax=ax, s=10, alpha=0.9)
-# %%
-# %%
-# baddies = []
-# for file in Path("/fast2/3t3clean/analysis/deconv/shifts").glob("shifts_*.json"):
-#     with open(file, "r") as f:
-#         shifts = json.load(f)
-
-#     vals = np.array(list(shifts.values()))
-
-
-#     if len(np.flatnonzero(np.square(vals).sum(axis=1))) < len(shifts) - 1:
-#         print(shifts)
-#         baddies.append(file)
-
+for row in coords.iter_rows(named=True):
+    ax.text(row["x"], row["y"], row["index"], fontsize=10)
 
 # %%
 
 
 def load(i: int, filter_: bool = True):
     d, y = pickle.loads(files[i].read_bytes())
+    c = coords.filter(pl.col("index") == int(files[i].stem.rsplit("-", 1)[-1]))[0]
     if filter_:
         y = np.array(y)[d.coords["passes_thresholds"]].tolist()
         d = d[d.coords["passes_thresholds"]]
@@ -61,8 +54,8 @@ def load(i: int, filter_: bool = True):
         .unnest("centroid")
         .rename({"field_0": "z", "field_1": "y_local", "field_2": "x_local"})
         .with_columns(
-            y=pl.col("y_local") + coords[i, "y"],
-            x=pl.col("x_local") + coords[i, "x"],
+            y=pl.col("y_local") + c["y"],
+            x=pl.col("x_local") + c["x"],
             target=pl.Series(list(d.coords["target"].values)),
             distance=pl.Series(list(d.coords["distance"].values)),
             norm=pl.Series(np.linalg.norm(d.values, axis=(1, 2))),
@@ -70,28 +63,62 @@ def load(i: int, filter_: bool = True):
             passes_thresholds=pl.Series(d.coords["passes_thresholds"].values),
         )
         .with_row_index("idx_local")
-        # .join(d,)
     )
 
 
 v = load(0)
-# u = pl.concat([load(i) for i in range(190, 320)])
 
 # %%
+
+
+def gen_splits(coords: tuple[float, float], n: int = 4, width: int = 1024, offset: int = 1998 - 1024):
+    x, y = coords
+    if n == 0:
+        return Polygon([(x, y), (x + width, y), (x + width, y + width), (x, y + width)])
+    if n == 1:
+        return Polygon([
+            (x, y + offset),
+            (x + width, y + offset),
+            (x + width, y + width + offset),
+            (x, y + width + offset),
+        ])
+    if n == 2:
+        return Polygon([
+            (x + offset, y),
+            (x + width + offset, y),
+            (x + width + offset, y + width),
+            (x + offset, y + width),
+        ])
+    if n == 3:
+        return Polygon([
+            (x + offset, y + offset),
+            (x + width + offset, y + offset),
+            (x + width + offset, y + width + offset),
+            (x + offset, y + width + offset),
+        ])
+    raise ValueError(f"Unknown n={n}")
 
 
 w = 1988
 assert len(coords) == len(set(coords["index"]))
 
-cells = [
-    Polygon([
-        (row["x"], row["y"]),
-        (row["x"] + w, row["y"]),
-        (row["x"] + w, row["y"] + w),
-        (row["x"], row["y"] + w),
-    ])
-    for row in coords.iter_rows(named=True)
-]
+
+if len(files) == len(coords):
+    cells = [
+        Polygon([
+            (row["x"], row["y"]),
+            (row["x"] + w, row["y"]),
+            (row["x"] + w, row["y"] + w),
+            (row["x"], row["y"] + w),
+        ])
+        for row in coords.iter_rows(named=True)
+    ]
+else:
+    cells = [
+        gen_splits((row["x"], row["y"]), n=n, width=1024, offset=1998 - 1024)
+        for n in range(4)
+        for row in coords.iter_rows(named=True)
+    ]
 
 idx = index.Index()
 for pos, cell in enumerate(cells):
@@ -105,14 +132,7 @@ crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 def process(out: list, curr: int, filter_: bool = True):
     this_cross = {j: intersection(cells[curr], cells[j]) for j in crosses[curr] if j > curr}
     df = load(curr, filter_=filter_)
-
-    # def what(row):
-    #     for name, intersected in this_cross.items():
-    #         if contains(intersected, Point((row["x"], row["y"]))):
-    #             return False
-    #     return True
-
-    # df.filter(pl.struct("x", "y").apply(what))
+    df = df.filter(pl.col("passes_thresholds") & pl.col("area").is_between(15, 80) & pl.col("norm").gt(0.05))
 
     geometries = list(this_cross.values())
     tree = STRtree(geometries)
@@ -145,7 +165,7 @@ def process(out: list, curr: int, filter_: bool = True):
     out.append(filtered_df)
 
 
-with ThreadPoolExecutor(8) as exc:
+with ThreadPoolExecutor(4) as exc:
     out = []
     futs = [exc.submit(process, out, i, filter_=True) for i in range(len(files[:]))]
     for i, fut in enumerate(futs):
@@ -171,7 +191,7 @@ axs.set_aspect("equal")
 # %%
 spots = pl.read_parquet(path / codebook / "spots.parquet")
 pergene = (
-    spots.filter(pl.col("passes_thresholds") & pl.col("area").is_between(20, 50))
+    spots.filter(pl.col("passes_thresholds") & pl.col("area").is_between(15, 50) & pl.col("norm").gt(0.05))
     .group_by("target")
     .len("count")
     .sort("count", descending=True)
@@ -190,24 +210,24 @@ ax.set_ylabel("Count")
 plt.tight_layout()
 
 # %%
-pergene.filter(pl.col("target").str.starts_with("Blank")).join()
+# pergene.filter(pl.col("target").str.starts_with("Blank")).join()
 
 # %%
-# if codebook == "tricycleplus":
-#     genes = ["Ccnd3", "Mcm5", "Top2a", "Pou3f2", "Cenpa", "Hell"]
-# else:
-#     genes = ["Sox9", "Pax6", "Eomes", "Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2"]
-# fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
-# axs = axs.flatten()
-# for ax, gene in zip(axs, genes):
-#     selected = spots.filter(pl.col("target").str.starts_with(gene))
-#     if not len(selected):
-#         raise ValueError(f"No spots found for {gene}")
-#     ax.set_aspect("equal")
-#     ax.set_title(gene, fontsize=16, color="white")
-#     ax.hexbin(selected["x"], selected["y"], gridsize=250)
-#     # ax.scatter(selected["y"], -selected["x"], s=5000 / len(selected), alpha=0.2)
-#     ax.axis("off")
+if codebook == "tricycleplus":
+    genes = ["Ccnd3", "Mcm5", "Top2a", "Pou3f2", "Cenpa", "Hell"]
+else:
+    genes = ["Sox9", "Pax6", "Eomes", "Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2"]
+fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
+
+for ax, gene in zip(axs.flat, genes):
+    selected = spots.filter(pl.col("target").str.starts_with(gene))
+    if not len(selected):
+        raise ValueError(f"No spots found for {gene}")
+    ax.set_aspect("equal")
+    ax.set_title(gene, fontsize=16, color="white")
+    ax.hexbin(selected["x"], -selected["y"], gridsize=400, cmap="magma")
+    # ax.scatter(selected["y"], -selected["x"], s=5000 / len(selected), alpha=0.2)
+    ax.axis("off")
 # %%
 genes = sorted(pergene["target"])
 dark = False
@@ -226,6 +246,8 @@ for ax, gene in zip(axs, genes):
     else:
         ax.scatter(selected["x"], selected["y"], s=2000 / len(selected), alpha=0.1)
 plt.tight_layout()
+# %%
+
 
 # %%
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(6, 12), dpi=200)
@@ -247,7 +269,7 @@ from polars import col as c
 
 # spots = pl.read_parquet("/fast2/3t3clean/analysis/spots.parquet")
 # %%
-what = spots.groupby("target").agg([
+what = spots.group_by("target").agg([
     pl.count(),
     pl.mean("distance"),
     pl.quantile("norm", 0.1),
