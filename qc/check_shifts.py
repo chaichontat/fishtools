@@ -50,7 +50,7 @@ nrows = int(np.ceil(len(first) / N_COLS))
 # %% Check for missing files (registering not finished)
 refs = list((path.parent / f"{ref}--{roi}").glob("*.tif"))
 
-if len(paths) != len(refs):
+if len(paths) != len(refs) and len(refs) != 0:
     missing = {r.stem.rsplit("-", 1)[-1] for r in refs} - {p.stem.rsplit("-", 1)[-1] for p in paths}
     raise ValueError(f"Missing {sorted(missing)}")
 

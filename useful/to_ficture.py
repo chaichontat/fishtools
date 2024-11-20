@@ -1,83 +1,75 @@
 # %%
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import polars as pl
 
-path = Path("/mnt/working/lai/ficture")
-path_ts = path / "transcripts.tsv"
-path_f = path / "features.tsv"
-path_minmax = path / "coordinate_minmax.tsv"
-path.mkdir(exist_ok=True)
+path = Path("/mnt/working/20241113-ZNE172-Zach/analysis/deconv/ficture")
 
 dfs = [
-    pl.read_parquet(path.parent / "registered--whole_embryo/genestar/spots.parquet"),
+    pl.read_parquet(path.parent / "registered--right/genestar/spots.parquet").with_row_index("idx"),
     # pl.read_parquet("/mnt/working/e155trcdeconv/registered--leftold/tricycleplus/spots.parquet"),
 ]
+z_ranges = [(i * 5, i * 5 + 10) for i in range(9)]
+
+# %%
 
 
-df = (
-    pl.concat(dfs)
-    .filter(pl.col("z") > 1)
-    .select(
-        X=pl.col("x") * 0.216,
-        Y=pl.col("y") * 0.216,
-        gene=pl.col("target").str.split("-").list.get(0),
-        MoleculeID=pl.col("idx"),
-        Count=pl.lit(1),
+def run(path: Path, df: pl.DataFrame, z_range: tuple[int, int]):
+    path = path / f"z{z_range[0]:02d}_{z_range[1]:02d}"
+    path.mkdir(exist_ok=True)
+
+    path_ts = path / "transcripts.tsv"
+    path_f = path / "features.tsv"
+    path_minmax = path / "coordinate_minmax.tsv"
+
+    df = (
+        pl.concat(dfs)
+        .filter(pl.col("z").is_between(z_range[0], z_range[1]))
+        .select(
+            X=pl.col("x") * 0.108,
+            Y=pl.col("y") * 0.108,
+            gene=pl.col("target").str.split("-").list.get(0),
+            MoleculeID=pl.col("idx"),
+            Count=pl.lit(1),
+        )
+        .with_columns(
+            X=pl.col("X") - pl.col("X").min() + 1,
+            Y=pl.col("Y") - pl.col("Y").min() + 1,
+        )
+        # .filter(pl.col("X").is_between(300, 900) & pl.col("Y").is_between(-1000, -600))
+        .sort("Y")
     )
-    .with_columns(
-        X=pl.col("X") - pl.col("X").min() + 1,
-        Y=pl.col("Y") - pl.col("Y").min() + 1,
+    df.write_csv(path_ts, separator="\t")
+    subprocess.run("pigz -f " + path_ts.as_posix(), shell=True, check=True)
+    # %%
+    # X       Y       gene    MoleculeID      Count
+    # gene    transcript_id   Count
+
+    gb = (
+        df.group_by("gene")
+        .len("Count")
+        .with_columns(gene=pl.col("gene").str.split("-").list.get(0), transcript_id=pl.col("gene"))
+        .select(["gene", "transcript_id", "Count"])
     )
-    # .filter(pl.col("X").is_between(300, 900) & pl.col("Y").is_between(-1000, -600))
-    .sort("Y")
-)
-df.write_csv(path_ts, separator="\t")
-print(len(df))
-subprocess.run("pigz -f " + path_ts.as_posix(), shell=True, check=True)
-# %%
-# X       Y       gene    MoleculeID      Count
-# gene    transcript_id   Count
 
-gb = (
-    df.group_by("gene")
-    .len("Count")
-    .with_columns(gene=pl.col("gene").str.split("-").list.get(0), transcript_id=pl.col("gene"))
-    .select(["gene", "transcript_id", "Count"])
-)
+    gb.write_csv(path_f, separator="\t")
+    subprocess.run("pigz -f " + path_f.as_posix(), shell=True, check=True)
+    # %%
+    with Path(path_minmax).open("w") as f:
+        f.write(f"xmin\t{df['X'].min()}\n")
+        f.write(f"xmax\t{df['X'].max()}\n")
+        f.write(f"ymin\t{df['Y'].min()}\n")
+        f.write(f"ymax\t{df['Y'].max()}\n")
 
-gb.write_csv(path_f, separator="\t")
-subprocess.run("pigz -f " + path_f.as_posix(), shell=True, check=True)
-# %%
-with Path(path_minmax).open("w") as f:
-    f.write(f"xmin\t{df['X'].min()}\n")
-    f.write(f"xmax\t{df['X'].max()}\n")
-    f.write(f"ymin\t{df['Y'].min()}\n")
-    f.write(f"ymax\t{df['Y'].max()}\n")
+    # %%
 
-# %%
+    batch_size = 100
+    batch_buff = 30
+    path_out = path / "batched.matrix.tsv.gz"
+    path_batch = path / "batched.matrix.tsv"
 
-batch_size = 100
-batch_buff = 30
-path_out = path / "batched.matrix.tsv.gz"
-path_batch = path / "batched.matrix.tsv"
-
-# subprocess.run(
-#     f"""ficture make_spatial_minibatch \
-#         --input {path_ts.with_suffix(".tsv.gz")} \
-#         --output {path_batch} \
-#         --mu_scale {1 / 0.108} \
-#         --batch_size ${batch_size} \
-#         --batch_buff ${batch_buff} \
-#         --major_axis Y""",
-#     shell=True,
-#     check=True,
-# )
-
-# %%
-with ThreadPoolExecutor(16) as exc:
     for i in [24, 30]:
         exc.submit(
             subprocess.run,
@@ -87,8 +79,8 @@ with ThreadPoolExecutor(16) as exc:
         --in-feature {path_f.with_suffix(".tsv.gz")} \
         --out-dir {path / "output"} \
         --n-jobs 16 \
-        --gzip "pigz -p 4" \
-        --train-width 10 \
+        --gzip "pigz -k -p 4" \
+        --train-width 12 \
         --plot-each-factor \
         --major-axis Y \
         --n-factor {i} \
@@ -97,4 +89,13 @@ with ThreadPoolExecutor(16) as exc:
             check=True,
         )
 
-# %%
+    # %%
+
+
+with ThreadPoolExecutor(16) as exc:
+    futs = []
+    for z_range in z_ranges:
+        futs.append(exc.submit(run, path, dfs[0], z_range))
+
+    for f in as_completed(futs):
+        f.result()

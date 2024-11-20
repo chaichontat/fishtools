@@ -62,26 +62,6 @@ for row in coords.iter_rows(named=True):
 
 
 # %%
-def find_precedence_intersections(polygons):
-    result = []
-    remaining_area = unary_union(polygons)
-
-    for poly in polygons:
-        # Intersect with remaining area
-        intersection = poly.intersection(remaining_area)
-        if not intersection.is_empty:
-            result.append(intersection)
-        # Remove this polygon from remaining area
-        remaining_area = remaining_area.difference(poly)
-
-    return result
-
-
-find_precedence_intersections()
-# %%
-
-
-# %%
 
 
 def load_pickle(i: int, filter_: bool = True, *, size: int = 1998, cut: int = 1024):
@@ -210,9 +190,9 @@ def process(curr: int, filter_: bool = True):
 
 # %%
 #  mp_context=get_context("forkserver")
-with ThreadPoolExecutor(8) as exc:
+with ThreadPoolExecutor(4) as exc:
     out = []
-    futs = [exc.submit(process, i, filter_=True) for i in range(16, 24)]  # len(spots))]
+    futs = [exc.submit(process, i, filter_=True) for i in range(len(files))]  # len(spots))]
     for i, fut in enumerate(futs):
         try:
             out.append(fut.result())
