@@ -345,15 +345,17 @@ def _run(
             towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
             del res
 
+            scaling = {
+                "deconv_min": list(map(float, mins.get().flatten())),
+                "deconv_scale": list(map(float, scale.get().flatten())),
+            }
+            start.with_suffix(".deconv.json").write_text(json.dumps(scaling, indent=2))
+
             q_write.put((
                 start,
                 towrite,
                 fid,
-                metadata
-                | {
-                    "deconv_min": list(map(float, mins.get().flatten())),
-                    "deconv_scale": list(map(float, scale.get().flatten())),
-                },
+                metadata | scaling,
             ))
             q_img.task_done()
     except Exception as e:
@@ -364,7 +366,6 @@ def _run(
     q_write.put(None)
     thread.join()
     thread_write.join()
-    logger.info("Done.")
 
 
 @main.command()
@@ -462,16 +463,22 @@ def batch(
             if len(files) != len(ok_idxs):
                 logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
 
-        basics: dict[str, list[BaSiC]] = {
-            r: list(pickle.loads((path / "basic" / f"{r}.pkl").read_bytes()).values())
-        }
-        _run(
-            files,
-            path / "analysis" / "deconv",
-            basics,
-            overwrite=overwrite,
-            n_fid=n_fid,
-        )
+        try:
+            basics: dict[str, list[BaSiC]] = {
+                r: list(pickle.loads((path / "basic" / f"{r}.pkl").read_bytes()).values())
+            }
+        except FileNotFoundError:
+            logger.error(
+                f"Could not find {path / 'basic' / f'{r}.pkl'}. Please run basic first. Skipping to rounds with basic."
+            )
+        else:
+            _run(
+                files,
+                path / "analysis" / "deconv",
+                basics,
+                overwrite=overwrite,
+                n_fid=n_fid,
+            )
 
 
 if __name__ == "__main__":
