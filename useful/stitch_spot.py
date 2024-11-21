@@ -17,7 +17,7 @@ from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
 sns.set_theme()
-codebook = "genestar"
+codebook = "zach"
 roi = "right"
 split = True
 FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.pkl")
@@ -217,7 +217,7 @@ axs.axis("off")
 # %%
 spots = pl.read_parquet(path / codebook / "spots.parquet")
 pergene = (
-    spots.filter(pl.col("passes_thresholds") & pl.col("area").is_between(15, 50) & pl.col("norm").gt(0.05))
+    spots.filter(pl.col("passes_thresholds") & pl.col("area").is_between(12, 50) & pl.col("norm").gt(0.1))
     .group_by("target")
     .len("count")
     .sort("count", descending=True)

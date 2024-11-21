@@ -1,13 +1,13 @@
 # %%
 import subprocess
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from fishtools import progress_bar
+from fishtools.utils.pretty_print import progress_bar_threadpool
 
 PATH = Path("/mnt/archive/starmap/zne172/20241113-ZNE172-Zach/analysis/deconv")
 roi = "right"
 chan = "4_12_20"
+assert PATH.exists()
 idxs = sorted({int(name.stem.split("-")[1]) for name in PATH.rglob(f"{chan}--{roi}/{chan}*.tif")})
 print(len(idxs))
 
@@ -18,26 +18,21 @@ if not PATH.exists():
 
 # %%
 
-with progress_bar(len(idxs)) as callback, ThreadPoolExecutor(4) as exc:
-    futs: list[Future] = []
+with progress_bar_threadpool(len(idxs), threads=10) as submit:
     for i in idxs:
-        fut = exc.submit(
+        fut = submit(
             subprocess.run,
             [
                 "python",
                 Path(__file__).parent.parent / "useful" / "register_prod.py",
                 str(PATH),
                 str(i),
-                "--fwhm=4",
-                "--threshold=4",
+                "--fwhm=5",
+                "--threshold=5",
                 "--reference",
                 chan,
                 f"--roi={roi}",
                 # "--overwrite",
             ],
-            check=True,
+            # check=True,
         )
-        fut.add_done_callback(callback)
-
-    for x in as_completed(futs):
-        x.result()

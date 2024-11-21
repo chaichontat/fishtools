@@ -177,7 +177,7 @@ def _batch(
     else:
         split = [None]
 
-    with progress_bar(len(paths) * len(split)) as callback, ThreadPoolExecutor(threads) as ex1c:
+    with progress_bar(len(paths) * len(split)) as callback, ThreadPoolExecutor(threads) as exc:
         futs = []
         for path in paths:
             for s in split:
@@ -213,7 +213,7 @@ def sample_imgs(path: Path, round_num: int, *, batch_size: int = 50):
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
 @click.option("--subsample-z", type=int, default=1)
-@click.option("--batch-size", "-n", type=int, default=100)
+@click.option("--batch-size", "-n", type=int, default=50)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--overwrite", is_flag=True)
 @click.option("--split", type=int, default=0)
@@ -221,12 +221,15 @@ def optimize(
     path: Path,
     round_num: int,
     codebook_path: Path,
-    batch_size: int = 100,
+    batch_size: int = 50,
     subsample_z: int = 1,
     threads: int = 8,
     overwrite: bool = False,
     split: int = 0,
 ):
+    if not (path / f"opt_{codebook_path.stem}" / "percentiles.json").exists():
+        raise Exception("Please run `fishtools find-threshold` first.")
+
     selected = sample_imgs(path, round_num, batch_size=batch_size * (2 if round_num == 0 else 1))
 
     group_counts = {key: len(list(group)) for key, group in groupby(selected, key=lambda x: x.parent.name)}
@@ -286,13 +289,13 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 25)
 
     path_out = path / (f"opt_{codebook.stem}" + f"--{roi}" if roi != "*" else "")
     path_out.mkdir(exist_ok=True)
-    logger.info(f"Writing to {path_out / 'percentiles.json'}")
-    (path_out / "percentiles.json").write_text(json.dumps(norms, indent=2))
+    logger.info(f"Writing to {(path_out / f'opt_{codebook.stem}' / 'percentiles.json')}")
+    (path_out / f"opt_{codebook.stem}" / "percentiles.json").write_text(json.dumps(norms, indent=2))
 
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, exists=True, path_type=Path))
+@click.argument("roi", type=str, default="*")
 @click.option(
     "--codebook",
     "codebook_path",
@@ -305,7 +308,7 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 25)
 @click.option("--split", is_flag=True)
 def batch(
     path: Path,
-    global_scale: Path,
+    roi: str,
     codebook_path: Path,
     threads: int = 13,
     overwrite: bool = False,
@@ -314,11 +317,11 @@ def batch(
     split: bool = False,
 ):
     return _batch(
-        sorted(p for p in path.glob("reg*.tif") if not p.name.endswith(".hp.tif")),
+        sorted(p for p in path.glob(f"registered--{roi}/reg*.tif")),
         "run",
         [
             "--global-scale",
-            global_scale.as_posix(),
+            (path / f"opt_{codebook_path.stem}" / "global_scale.txt").as_posix(),
             "--codebook",
             codebook_path.as_posix(),
             "--overwrite" if overwrite else "",
@@ -373,8 +376,9 @@ def create_opt_path(
     "codebook_path",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
+@click.option("--batch-size", "-n", type=int, default=50)
 @click.option("--round", "round_num", type=int)
-def combine(path: Path, codebook_path: Path, round_num: int):
+def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
     """Create global scaling factors from `optimize`.
 
     Part of the channel optimization process.
@@ -395,7 +399,7 @@ def combine(path: Path, codebook_path: Path, round_num: int):
         codebook_path
         round_num: starts from 0.
     """
-    selected = sample_imgs(path, round_num, batch_size=50)
+    selected = sample_imgs(path, round_num, batch_size=batch_size)
     path_opt = create_opt_path(
         path_folder=path, codebook_path=codebook_path, mode="folder", round_num=round_num
     )
@@ -415,6 +419,7 @@ def combine(path: Path, codebook_path: Path, round_num: int):
         if round_num == 0:
             curr.append([cast(InitialScale, s).initial_scale for s in sf if s.round_num == round_num][0])
         else:
+            print(sf)
             want = cast(Deviation, [s for s in sf if s.round_num == round_num][0])
             curr.append(np.array(want.deviation) * want.n)
             n += want.n
@@ -593,7 +598,7 @@ def run(
             return
 
     else:
-        (_path_out := path.parent / codebook_path.stem).mkdir(exist_ok=True)
+        (_path_out := path.parent / ("decoded-" + codebook_path.stem)).mkdir(exist_ok=True)
         path_pickle = _path_out / f"{path.stem}{f'-{split}' if split is not None else ''}.pkl"
 
     if path_pickle.exists() and not overwrite:

@@ -19,10 +19,11 @@ path = Path(f"/mnt/working/20241113-ZNE172-Zach/analysis/deconv/registered--{roi
 first = next(path.glob("*.tif"))
 with tifffile.TiffFile(first) as tif:
     names = tif.shaped_metadata[0]["key"]
-    print(dict(zip(range(len(names)), names)))
+    mapping = dict(zip(names, range(len(names))))
+
 
 # %%
-idx = slice(-2, None)
+idx = list(map(mapping.get, ["pi", "wga"]))
 
 
 def run_filter(img: np.ndarray, filter_: Callable[[np.ndarray], np.ndarray], *, rescale: bool = False):
@@ -46,12 +47,18 @@ def run_2d(file: Path):
             out = file.parent.parent.parent / f"segment--{roi}" / (file.stem + f"_small{i // 2 + 1:02d}.tif")
             out.parent.mkdir(exist_ok=True)
             imgout = img[i, idx, 500:-500, 500:-500]
+            imgout[-1] = run_filter(
+                img[
+                    (i - 1 if i > 1 else i) : (i + 1 if i < img.shape[0] - 1 else i), -1, 500:-500, 500:-500
+                ].max(axis=0),
+                unsharp_mask,
+            )
+
             if min(imgout.shape) == 0:
                 raise ValueError("Image is all zeros.")
 
             # imgout[-3] = run_filter(imgout[-3], unsharp_mask)
             imgout[-2] = run_filter(imgout[-2], unsharp_mask)
-            imgout[-1] = run_filter(imgout[-1], unsharp_mask)
 
             imwrite(
                 out,
