@@ -152,11 +152,14 @@ class Image:
                 to_discard_idxs.append(bits.index(k))
 
         with TiffFile(path) as tif:
-            img = tif.asarray()
             try:
-                metadata = tif.shaped_metadata[0]  # type: ignore
-            except IndexError:
-                metadata = tif.imagej_metadata
+                img = tif.asarray()
+                try:
+                    metadata = tif.shaped_metadata[0]  # type: ignore
+                except IndexError:
+                    metadata = tif.imagej_metadata
+            except IndexError as e:  # tifffile throws IndexError if the file is truncated
+                raise Exception(f"File {path} is corrupted. Please check the file.") from e
         try:
             waveform = json.loads(metadata["waveform"])
         except KeyError:
@@ -380,7 +383,7 @@ def run(
         Shifts.dump_json(
             Shifts.validate_python({
                 k: {
-                    "shifts": tuple(shifts[k]),
+                    "shifts": (shifts[k][0], shifts[k][1]),
                     "residual": residuals[k],
                     "corr": 1.0
                     if reference == k

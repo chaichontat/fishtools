@@ -177,7 +177,7 @@ def _calculate_drift(
         axs[0].hist(joined["dx"], bins=100)
         axs[1].hist(joined["dy"], bins=100)
 
-    if np.allclose(initial_drift, np.zeros(2)) and len(joined) > 20:
+    if np.allclose(initial_drift, np.zeros(2)) and len(joined) > 100:
         if joined["dx"].sum() == 0 and joined["dy"].sum() == 0:
             raise ValueError("No drift found. Reference passed?")
         res = np.array([mode(joined["dx"]), mode(joined["dy"])])  # type: ignore
@@ -197,13 +197,14 @@ def _calculate_drift(
     #         joined[["xcentroid_fixed", "ycentroid_fixed"]].to_numpy(),
     #     ),
     #     TranslationTransform,
-    #     min_samples=10,
+    #     min_samples=30,
     #     residual_threshold=0.1,
-    #     max_trials=1000,
+    #     max_trials=100,
     # )[0]  # type: ignore
 
     # if model is not None:
     #     drift = model.translation
+    #     print(f"drift: {drift}")
     # else:
     drift = np.median(drifts, axis=0)
 

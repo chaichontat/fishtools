@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 from astropy.modeling import fitting, models
+from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 from scipy.stats import chi2
 from sklearn.covariance import EllipticEnvelope
@@ -36,8 +37,8 @@ class Shift(BaseModel):
 Shifts = TypeAdapter(dict[str, Shift])
 # %%
 ref = "4_12_20"
-roi = "right"
-path = Path(f"/fast2/e155_trc/analysis/deconv/shifts--{roi}")
+roi = "full"
+path = Path(f"/mnt/archive/starmap/e155/e155_zach/analysis/deconv/shifts--{roi}")
 paths = sorted(path.glob("*.json"))
 
 
@@ -52,20 +53,19 @@ refs = list((path.parent / f"{ref}--{roi}").glob("*.tif"))
 
 if len(paths) != len(refs) and len(refs) != 0:
     missing = {r.stem.rsplit("-", 1)[-1] for r in refs} - {p.stem.rsplit("-", 1)[-1] for p in paths}
-    raise ValueError(f"Missing {sorted(missing)}")
+    logger.warning(f"Missing {sorted(missing)}")
 
 
 # %% Shifts
-
+threshold = 0.99
 fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(12, 3 * nrows), dpi=200)
 outliers_list = set()
 
 for ax, round_ in zip(axs.flat, sorted(first.keys())):
     c1 = np.array([s[round_].shifts for s in shifts.values()])
-    ax.set_title(round_)
     lim = max(5, 1.25 * np.abs(c1).max())
     if np.sum(c1) != 0:
-        outliers = mahalanobis_outliers(c1)
+        outliers = mahalanobis_outliers(c1, threshold=threshold)
         # estimator = EllipticEnvelope(random_state=0, contamination=0.02)
         # outliers = estimator.fit_predict(c1)
     else:
@@ -75,6 +75,7 @@ for ax, round_ in zip(axs.flat, sorted(first.keys())):
     ax.set_aspect("equal")
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
+    ax.set_title(f"{round_} σ={c1.std(axis=0).mean():.3f}")
     if outliers is None:
         continue
 
@@ -93,7 +94,7 @@ print(sorted(outliers_list))
 fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(12, 3 * nrows), dpi=200)
 
 for ax, round_ in zip(axs.flat, sorted(first)):
-    c1 = np.array([s[round_].residual for s in shifts.values()])
+    c1 = np.array([s[round_].corr for s in shifts.values()])
     ax.hist(c1, linewidth=0)
     ax.set_title(round_)
     ax.set_xlim(-1, 1)
@@ -119,6 +120,5 @@ print(fitted.y_mean.value)  # y center
 print(fitted.x_stddev.value)  # x width
 print(fitted.y_stddev.value)  # y width
 # %%
-
 
 # %%

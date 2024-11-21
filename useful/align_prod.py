@@ -5,6 +5,7 @@ import pickle
 import shutil
 import subprocess
 import sys
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import chain, groupby
 from pathlib import Path
@@ -37,7 +38,11 @@ os.environ["TQDM_DISABLE"] = "1"
 
 
 def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:]):
-    img = imread(path).astype(np.float32)[sl] / 65535
+    try:
+        with warnings.catch_warnings(action="ignore"):
+            img = imread(path).astype(np.float32)[sl] / 65535
+    except tifffile.TiffFileError:
+        raise Exception(f"{path} is corrupted. Please delete it and try again.")
 
     class DemoFetchedTile(FetchedTile):
         def __init__(self, z, chs, *args, **kwargs):
@@ -418,7 +423,7 @@ def combine(path: Path, codebook_path: Path, round_num: int):
 
     global_scale_file = path_opt / "global_scale.txt"
     if round_num == 0:
-        curr = np.percentile(np.array(curr), 10, axis=0, keepdims=True)
+        curr = np.percentile(np.array(curr), 5, axis=0, keepdims=True)
         np.savetxt(global_scale_file, curr)
         return
 

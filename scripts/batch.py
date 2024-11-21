@@ -90,7 +90,7 @@ for m in tss:
     )
 
 dfs = pl.concat(dfs.values())
-counts = dfs.groupby("gene").agg(pl.count())
+counts = dfs.group_by("gene").agg(pl.count())
 
 ok = counts.filter(pl.col("count").gt(39) | pl.col("gene").eq("HES3"))["gene"]
 dfs = dfs.filter(pl.col("gene").is_in(ok))

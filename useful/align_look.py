@@ -19,7 +19,6 @@ codebook = json.loads(Path("/fast2/fishtools/starwork3/ordered/genestar.json").r
 # codebook, used_bits, names, arr_zeroblank = load_codebook(
 #     Path("/fast2/fishtools/starwork3/ordered/genestar.json"), exclude={"Malat1-201"}
 # )
-
 rand = np.random.default_rng(0)
 
 # %%

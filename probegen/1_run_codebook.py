@@ -123,7 +123,7 @@ def single(
     failed_path = codebook_path.parent / (codebook_path.stem + ".failed.txt")
     failed_path.unlink(missing_ok=True)
 
-    with ProcessPoolExecutor(16, mp_context=context) as exc:
+    with ProcessPoolExecutor(6, mp_context=context) as exc:
         futs = {
             gene: exc.submit(
                 run_gene,

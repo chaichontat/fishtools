@@ -225,7 +225,7 @@ def rescale(img: cp.ndarray, scale: float):
 
 # %%
 DATA = Path("/fast2/fishtools/data")
-make_projector(Path(DATA / "PSF GL.tif"), step=4, max_z=7)
+make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=7)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 
@@ -374,7 +374,7 @@ def _run(
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
-@click.option("--n-fid", type=int, default=1)
+@click.option("--n-fid", type=int, default=2)
 def run(
     path: Path,
     name: str,

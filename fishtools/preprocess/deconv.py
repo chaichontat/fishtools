@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 
@@ -66,12 +67,17 @@ def _compute_range(path: Path, round_: str, *, perc_min: float = 99.9, perc_scal
 
     with progress_bar(len(files)) as pbar:
         for i, f in enumerate(files):
-            with TiffFile(f) as tif:
-                try:
-                    deconv_min[i, :] = tif.shaped_metadata[0]["deconv_min"]
-                    deconv_scale[i, :] = tif.shaped_metadata[0]["deconv_scale"]
-                except KeyError:
-                    raise AttributeError("No deconv metadata found.")
+            try:
+                meta = json.loads(Path(f).with_suffix(".deconv.json").read_text())
+            except FileNotFoundError:
+                with TiffFile(f) as tif:
+                    try:
+                        meta = tif.shaped_metadata[0]
+                    except KeyError:
+                        raise AttributeError("No deconv metadata found.")
+            else:
+                deconv_min[i, :] = meta["deconv_min"]
+                deconv_scale[i, :] = meta["deconv_scale"]
             pbar()
 
     logger.info("Calculating percentiles")
