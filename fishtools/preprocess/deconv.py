@@ -69,20 +69,26 @@ def _compute_range(path: Path, round_: str, *, perc_min: float = 99.9, perc_scal
         for i, f in enumerate(files):
             try:
                 meta = json.loads(Path(f).with_suffix(".deconv.json").read_text())
-            except FileNotFoundError:
+            except FileNotFoundError as e:
                 with TiffFile(f) as tif:
                     try:
                         meta = tif.shaped_metadata[0]
                     except KeyError:
                         raise AttributeError("No deconv metadata found.")
-            else:
+
+            try:
                 deconv_min[i, :] = meta["deconv_min"]
                 deconv_scale[i, :] = meta["deconv_scale"]
+            except KeyError:
+                raise AttributeError("No deconv metadata found.")
             pbar()
 
     logger.info("Calculating percentiles")
     m_ = np.percentile(deconv_min, perc_min, axis=0)
     s_ = np.percentile(deconv_scale, perc_scale, axis=0)
+
+    if np.any(m_ == 0) or np.any(s_ == 0):
+        raise ValueError("Found a channel with min=0. This is not allowed.")
 
     (path / "deconv_scaling").mkdir(exist_ok=True)
     np.savetxt(path / "deconv_scaling" / f"{round_}.txt", np.vstack([m_, s_]))

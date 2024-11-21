@@ -241,46 +241,24 @@ class Image:
         return temp
 
 
-def run(
+def run_fiducial(
     path: Path,
+    fids: dict[str, np.ndarray],
+    config: Config,
+    *,
     roi: str,
     idx: int,
-    reference: str = "3_11_19",
-    *,
-    config: Config,
-    debug: bool = False,
-    overwrite: bool = False,
+    reference: str,
+    debug: bool,
 ):
-    logger.info("Reading files")
-
-    if not overwrite and (path / f"registered--{roi}" / f"reg-{idx:04d}.tif").exists():
-        logger.info(f"Skipping {idx}")
-        return
-
-    # Convert file name to bit
-    _imgs: list[Image] = [
-        Image.from_file(
-            file,
-            discards=config.channels and config.channels.discards,
-            n_fids=config.registration.fiducial.n_fids,
-        )
-        for file in sorted(Path(path).glob(f"*--{roi}/*-{idx:04d}.tif" if roi else f"*/*-{idx:04d}.tif"))
-        if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
-    ]
-    imgs = {img.name: img for img in _imgs}
-    del _imgs
-
-    logger.debug(f"{len(imgs)} files: {list(imgs)}")
-    if not imgs:
-        raise FileNotFoundError(f"No files found in {path} with index {idx}")
-
     logger.info("Aligning fiducials")
-    nofids = {name: img.nofid for name, img in imgs.items()}
-    fids = {name: img.fid for name, img in imgs.items()}
 
     prior_mapping: dict[str, str] = {}
 
-    if len(shifts_existing := sorted((path / f"shifts--{roi}").glob("*.json"))) > 10:
+    if (
+        not config.registration.fiducial.use_fft
+        and len(shifts_existing := sorted((path / f"shifts--{roi}").glob("*.json"))) > 10
+    ):
         _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
         for shift_path in shifts_existing:
             try:
@@ -293,7 +271,7 @@ def run(
                     _priors[name].append(shift_dict.shifts)
         logger.debug(f"Using priors from {len(shifts_existing)} existing shifts.")
         config.registration.fiducial.priors = {
-            name: np.median(np.array(shifts), axis=0) for name, shifts in _priors.items()
+            name: np.median(np.array(shifts), axis=0).tolist() for name, shifts in _priors.items()
         }
         logger.debug(config.registration.fiducial.priors)
 
@@ -329,30 +307,26 @@ def run(
         metadata={"axes": "YX"},
     )
 
-    try:
-        shifts, residuals = align_fiducials(
-            fids,
-            reference=reference,
-            debug=debug,
-            max_iters=5,
-            threshold_sigma=config.registration.fiducial.threshold,
-            fwhm=config.registration.fiducial.fwhm,
-        )
-        if debug:
-            raise Exception("debugging")
-    except Exception as e:
-        _fids_path = path / f"fids-{idx:04d}.tif"
-        tifffile.imwrite(
-            _fids_path,
-            np.stack([v for v in fids.values()]),
-            compression=22610,
-            compressionargs={"level": 0.65},
-            metadata={"axes": "CYX"},
-        )
-        logger.debug(f"Written fiducials to {_fids_path}.")
-        if e.args[0] != "debugging":
-            logger.critical(e)
-            raise e
+    shifts, residuals = align_fiducials(
+        fids,
+        reference=reference,
+        debug=debug,
+        max_iters=5,
+        threshold_sigma=config.registration.fiducial.threshold,
+        fwhm=config.registration.fiducial.fwhm,
+        use_fft=config.registration.fiducial.use_fft,
+    )
+
+    _fids_path = path / f"registered--{roi}" / "_fids"
+    _fids_path.mkdir(exist_ok=True)
+
+    tifffile.imwrite(
+        _fids_path / f"_fids-{idx:04d}.tif",
+        np.stack([v for v in fids.values()]),
+        compression=22610,
+        compressionargs={"level": 0.65},
+        metadata={"axes": "CYX", "key": list(fids.keys())},
+    )
 
     assert shifts  # type: ignore
     assert residuals  # type: ignore
@@ -393,10 +367,66 @@ def run(
             })
         )
     )
+    return shifts
 
     # logger.debug(f"Corr: {[x['corr'] for x in to_dump.values()]}")
 
-    del fids, _fid_ref
+
+def run(
+    path: Path,
+    roi: str,
+    idx: int,
+    reference: str = "4_12_20",
+    *,
+    config: Config,
+    debug: bool = False,
+    overwrite: bool = False,
+):
+    logger.info("Reading files")
+
+    if not overwrite and (path / f"registered--{roi}" / f"reg-{idx:04d}.tif").exists():
+        logger.info(f"Skipping {idx}")
+        return
+
+    path_prevfids = path / f"registered--{roi}" / "_fids" / f"_fids-{idx:04d}.tif"
+    if path_prevfids.exists():
+        with TiffFile(path_prevfids) as tif:
+            _fids = tif.asarray()
+            fids = {k: v for k, v in zip(tif.shaped_metadata[0]["key"], _fids)}
+            del _fids
+        shifts = run_fiducial(path, fids, config, roi=roi, reference=reference, debug=debug, idx=idx)
+        del fids
+    else:
+        shifts = {}
+
+    # Convert file name to bit
+    _imgs: list[Image] = [
+        Image.from_file(
+            file,
+            discards=config.channels and config.channels.discards,
+            n_fids=config.registration.fiducial.n_fids,
+        )
+        for file in sorted(Path(path).glob(f"*--{roi}/*-{idx:04d}.tif" if roi else f"*/*-{idx:04d}.tif"))
+        if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
+    ]
+    imgs = {img.name: img for img in _imgs}
+    del _imgs
+
+    logger.debug(f"{len(imgs)} files: {list(imgs)}")
+    if not imgs:
+        raise FileNotFoundError(f"No files found in {path} with index {idx}")
+
+    if not shifts:
+        shifts = run_fiducial(
+            path,
+            {name: img.fid for name, img in imgs.items()},
+            config,
+            roi=roi,
+            reference=reference,
+            debug=debug,
+            idx=idx,
+        )
+
     for _img in imgs.values():
         del _img.fid, _img.fid_raw
     channels: dict[str, str] = {}
@@ -404,10 +434,9 @@ def run(
         channels |= dict(zip(img.bits, img.powers))
     logger.debug(f"Channels: {channels}")
 
-    # del imgs
-
     # Split into individual bits.
     # Spillover correction, max projection
+    nofids = {name: img.nofid for name, img in imgs.items()}
     bits, bits_shifted, bit_name_mapping = parse_nofids(nofids, shifts, channels)
     del nofids
     for _img in imgs.values():
@@ -583,6 +612,7 @@ def main(
                     "750": str(DATA / "560to750.txt"),
                 },
                 fiducial=Fiducial(
+                    use_fft=False,
                     fwhm=fwhm,
                     threshold=threshold,
                     priors={

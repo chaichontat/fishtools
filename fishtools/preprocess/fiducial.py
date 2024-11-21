@@ -21,6 +21,8 @@ from skimage.registration import phase_cross_correlation
 from skimage.transform import AffineTransform
 from tifffile import TiffFile
 
+from fishtools.preprocess.config import RegisterConfig
+
 console = rich.get_console()
 
 
@@ -197,8 +199,8 @@ def _calculate_drift(
     #         joined[["xcentroid_fixed", "ycentroid_fixed"]].to_numpy(),
     #     ),
     #     TranslationTransform,
-    #     min_samples=30,
-    #     residual_threshold=0.1,
+    #     min_samples=min(len(drifts), 30),
+    #     residual_threshold=0.01,
     #     max_trials=100,
     # )[0]  # type: ignore
 
@@ -242,6 +244,8 @@ def run_fiducial(
     if subtract_background:
         ref = ref - background(ref)
 
+    ref = np.clip(ref, np.percentile(ref, 50), None)
+
     _attempt = 0
     thr = threshold_sigma
 
@@ -276,6 +280,7 @@ def run_fiducial(
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
     def inner(img: np.ndarray, *, limit: int = 4, bitname: str = "", local_σ: float = thr):
+        # img = np.clip(img, np.percentile(ref, 50), None)
         if subtract_background:
             img = img - background(img)
 
@@ -367,6 +372,7 @@ def align_fiducials(
     fids: dict[str, np.ndarray[Any, Any]],
     *,
     reference: str,
+    use_fft: bool = False,
     threads: int = 4,
     overrides: dict[str, tuple[float, float]] | None = None,
     subtract_background: bool = False,
@@ -385,6 +391,7 @@ def align_fiducials(
         raise ValueError(f"Could not find reference {reference} in {keys}")
 
     del reference
+    # returns drift, residual
     corr = run_fiducial(
         fids[ref],
         subtract_background=subtract_background,
@@ -395,12 +402,17 @@ def align_fiducials(
         fwhm=fwhm,
         use_brightest=0,
     )
+
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
         futs: dict[str, Future] = {}
         for k, img in fids.items():
             if k == ref or (overrides is not None and k in overrides):
                 continue
-            futs[k] = exc.submit(corr, img, bitname=k, limit=max_iters)
+            if use_fft:
+                # shifts, residual
+                futs[k] = exc.submit(lambda x: (phase_shift(fids[ref], x), 0.0), img)
+            else:
+                futs[k] = exc.submit(corr, img, bitname=k, limit=max_iters)
 
             if debug:
                 futs[k].result()
@@ -507,3 +519,8 @@ class Shift(BaseModel):
 
 
 Shifts = TypeAdapter(dict[str, Shift])
+
+
+class MultipleShifts(BaseModel):
+    shift: Shift
+    config: RegisterConfig

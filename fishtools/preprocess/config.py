@@ -13,6 +13,9 @@ class NumpyEncoder(JSONEncoder):
 
 
 class Fiducial(BaseModel):
+    use_fft: bool = Field(
+        default=False, description="Use FFT to find fiducial spots. Overrides everything else."
+    )
     fwhm: float = Field(
         default=4.0,
         description="Full width at half maximum for fiducial spot detection. The higher this is, the more spots will be detected.",

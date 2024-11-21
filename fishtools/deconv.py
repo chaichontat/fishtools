@@ -273,7 +273,7 @@ def _run(
     out: Path,
     basics: dict[str, list[BaSiC]],
     overwrite: bool,
-    n_fid: int,
+    n_fids: int,
 ):
     if not overwrite:
         paths = [f for f in paths if not (out / f.parent.name / f.name).exists()]
@@ -291,8 +291,8 @@ def _run(
                 continue
             logger.debug(f"Reading {file.name}")
             img = imread(file)
-            fid = np.atleast_3d(img[-n_fid:])
-            nofid = img[:-n_fid].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
+            fid = np.atleast_3d(img[-n_fids:])
+            nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
             with tifffile.TiffFile(file) as tif:
                 try:
                     metadata = tif.shaped_metadata[0]  # type: ignore
@@ -374,7 +374,7 @@ def _run(
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
-@click.option("--n-fid", type=int, default=2)
+@click.option("--n-fids", type=int, default=2)
 def run(
     path: Path,
     name: str,
@@ -382,7 +382,7 @@ def run(
     ref: Path | None,
     limit: int | None,
     overwrite: bool,
-    n_fid: int,
+    n_fids: int,
 ):
     """GPU-accelerated very accelerated 3D deconvolution.
 
@@ -424,7 +424,7 @@ def run(
     basics: dict[str, list[BaSiC]] = {
         name: list(pickle.loads((path / "basic" / f"{name}.pkl").read_bytes()).values())
     }
-    _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fid=n_fid)
+    _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids)
 
 
 @main.command()
@@ -433,7 +433,7 @@ def run(
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
-@click.option("--n-fid", type=int, default=1)
+@click.option("--n-fids", type=int, default=2)
 def batch(
     path: Path,
     *,
@@ -441,7 +441,7 @@ def batch(
     ref: Path | None,
     limit: int | None,
     overwrite: bool,
-    n_fid: int,
+    n_fids: int,
 ):
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
@@ -477,7 +477,7 @@ def batch(
                 path / "analysis" / "deconv",
                 basics,
                 overwrite=overwrite,
-                n_fid=n_fid,
+                n_fids=n_fids,
             )
 
 
