@@ -172,7 +172,7 @@ def _batch(
     else:
         split = [None]
 
-    with progress_bar(len(paths) * len(split)) as callback, ThreadPoolExecutor(threads) as exc:
+    with progress_bar(len(paths) * len(split)) as callback, ThreadPoolExecutor(threads) as ex1c:
         futs = []
         for path in paths:
             for s in split:
@@ -193,6 +193,9 @@ def _batch(
 def sample_imgs(path: Path, round_num: int, *, batch_size: int = 50):
     rand = np.random.default_rng(round_num)
     paths = sorted((p for p in path.glob("registered--*/reg*.tif") if not p.name.endswith(".hp.tif")))
+    if batch_size > len(paths):
+        logger.info(f"Batch size {batch_size} is larger than {len(paths)}. Returning all images.")
+        return paths
     return [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
 
 
@@ -219,7 +222,7 @@ def optimize(
     overwrite: bool = False,
     split: int = 0,
 ):
-    selected = sample_imgs(path, round_num, batch_size=batch_size)
+    selected = sample_imgs(path, round_num, batch_size=batch_size * (2 if round_num == 0 else 1))
 
     group_counts = {key: len(list(group)) for key, group in groupby(selected, key=lambda x: x.parent.name)}
     logger.info(f"Group counts: {json.dumps(group_counts, indent=2)}")
@@ -250,20 +253,22 @@ def optimize(
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--roi", type=str, default="*")
 @click.option("--percentile", type=float, default=25)
-def find_threshold(path: Path, codebook: Path, percentile: float = 25):
+def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 25):
     SUBFOLDER = "_highpassed"
-    paths = sorted(path.glob("registered--*/reg*.tif"))
+    paths = sorted(path.glob(f"registered--{roi}/reg*.tif"))
 
     rand = np.random.default_rng(0)
-    to_sample = rand.choice(paths, size=50, replace=False)  # type: ignore
-    to_sample = sorted(
-        p for p in to_sample if not (p.parent / SUBFOLDER / f"{p.stem}_{codebook.stem}.hp.tif").exists()
+    if len(paths) > 50:
+        paths = rand.choice(paths, size=50, replace=False)  # type: ignore
+    paths = sorted(
+        p for p in paths if not (p.parent / SUBFOLDER / f"{p.stem}_{codebook.stem}.hp.tif").exists()
     )
 
-    _batch(to_sample, "run", ["--codebook", str(codebook), "--highpass-only"], threads=4, split=[0])
+    _batch(paths, "run", ["--codebook", str(codebook), "--highpass-only"], threads=4, split=[0])
 
-    highpasses = list(path.glob(f"registered--*/{SUBFOLDER}/*_{codebook.stem}.hp.tif"))
+    highpasses = list(path.glob(f"registered--{roi}/{SUBFOLDER}/*_{codebook.stem}.hp.tif"))
     logger.info(f"Found {len(highpasses)} images to get percentiles from.")
     norms = {}
 
@@ -274,7 +279,7 @@ def find_threshold(path: Path, codebook: Path, percentile: float = 25):
             np.percentile(np.linalg.norm(img, axis=1), percentile)
         )
 
-    path_out = path / f"opt_{codebook.stem}"
+    path_out = path / (f"opt_{codebook.stem}" + f"--{roi}" if roi != "*" else "")
     path_out.mkdir(exist_ok=True)
     logger.info(f"Writing to {path_out / 'percentiles.json'}")
     (path_out / "percentiles.json").write_text(json.dumps(norms, indent=2))
@@ -370,7 +375,7 @@ def combine(path: Path, codebook_path: Path, round_num: int):
     Part of the channel optimization process.
     This is to be run after `optimize` has been run.
 
-    Round 0: Average of all scaling factors.
+    Round 0: 5th percentile of all scaling factors (lower indicates brighter spots).
     Round n:
         Balance the scaling factors such that each positive spot
         has about the same intensity in all bit channels.
@@ -413,7 +418,7 @@ def combine(path: Path, codebook_path: Path, round_num: int):
 
     global_scale_file = path_opt / "global_scale.txt"
     if round_num == 0:
-        curr = np.percentile(np.array(curr), 90, axis=0, keepdims=True)
+        curr = np.percentile(np.array(curr), 10, axis=0, keepdims=True)
         np.savetxt(global_scale_file, curr)
         return
 
@@ -450,7 +455,7 @@ def initial(img: ImageStack):
     Seems to work well enough.
     """
     maxed = img.reduce({Axes.ROUND, Axes.ZPLANE}, func="max")
-    res = np.percentile(np.array(maxed.xarray).squeeze(), 96, axis=(1, 2))
+    res = np.percentile(np.array(maxed.xarray).squeeze(), 99.9, axis=(1, 2))
     # res = np.array(maxed.xarray).squeeze()
     if np.isnan(res).any() or (res == 0).any():
         raise ValueError("NaNs or zeros found in initial scaling factor.")
@@ -520,6 +525,7 @@ def append_json(
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
+# @click.option("--roi", type=str, default=None)
 @click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--round", "round_num", type=int, default=None)
 @click.option("--calc-deviations", is_flag=True)
@@ -711,8 +717,8 @@ def run(
         return_original_intensities=True,
     )
 
-    feature_traces = pixel_intensities.stack(traces=(Axes.CH.value, Axes.ROUND.value))
-    mags = np.linalg.norm(feature_traces.values, axis=1)
+    # feature_traces = pixel_intensities.stack(traces=(Axes.CH.value, Axes.ROUND.value))
+    # mags = np.linalg.norm(feature_traces.values, axis=1)
 
     # plt.hist(mags, bins=20)
     # sns.despine(offset=3)
