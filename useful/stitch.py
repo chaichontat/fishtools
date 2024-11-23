@@ -397,6 +397,11 @@ def fuse(
         raise ValueError(f"No images found at {path_img.resolve()}.")
     logger.info(f"Found {len(files)} images at {path_img.resolve()}.")
 
+    if overwrite:
+        for p in path.iterdir():
+            if p.is_dir():
+                shutil.rmtree(p)
+
     if tile_config is None:
         tile_config = path / "TileConfiguration.registered.txt"
 
