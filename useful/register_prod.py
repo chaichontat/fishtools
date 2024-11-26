@@ -161,7 +161,11 @@ class Image:
             except IndexError as e:  # tifffile throws IndexError if the file is truncated
                 raise Exception(f"File {path} is corrupted. Please check the file.") from e
         try:
-            waveform = json.loads(metadata["waveform"])
+            waveform = (
+                metadata["waveform"]
+                if isinstance(metadata["waveform"], dict)
+                else json.loads(metadata["waveform"])
+            )
         except KeyError:
             waveform = toml.load(path.with_name(f"{path.name.split('-')[0]}.toml"))
 
@@ -307,6 +311,17 @@ def run_fiducial(
         metadata={"axes": "YX"},
     )
 
+    _fids_path = path / f"registered--{roi}" / "_fids"
+    _fids_path.mkdir(exist_ok=True, parents=True)
+
+    tifffile.imwrite(
+        _fids_path / f"_fids-{idx:04d}.tif",
+        np.stack([v for v in fids.values()]),
+        compression=22610,
+        compressionargs={"level": 0.65},
+        metadata={"axes": "CYX", "key": list(fids.keys())},
+    )
+
     shifts, residuals = align_fiducials(
         fids,
         reference=reference,
@@ -315,17 +330,6 @@ def run_fiducial(
         threshold_sigma=config.registration.fiducial.threshold,
         fwhm=config.registration.fiducial.fwhm,
         use_fft=config.registration.fiducial.use_fft,
-    )
-
-    _fids_path = path / f"registered--{roi}" / "_fids"
-    _fids_path.mkdir(exist_ok=True)
-
-    tifffile.imwrite(
-        _fids_path / f"_fids-{idx:04d}.tif",
-        np.stack([v for v in fids.values()]),
-        compression=22610,
-        compressionargs={"level": 0.65},
-        metadata={"axes": "CYX", "key": list(fids.keys())},
     )
 
     assert shifts  # type: ignore
@@ -599,7 +603,8 @@ def main(
             dataPath=str(DATA),
             channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
             basic=None,
-            exclude=["cfse"],
+            exclude=None,
+            # exclude=["cfse"],
             # basic_template=dict(
             #     zip(
             #         ["560", "650", "750"],

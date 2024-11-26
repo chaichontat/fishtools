@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -91,7 +92,9 @@ def find_spots(
 
     _mean, median, std = sigma_clipped_stats(img, sigma=threshold_sigma + 5)
     # You don't want need to subtract the mean here, the median is subtracted in the call three lines below.
-    iraffind = DAOStarFinder(threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True)
+    iraffind = DAOStarFinder(
+        threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True, roundhi=0.5, roundlo=-0.5
+    )
     try:
         df = pl.DataFrame(iraffind(img - median).to_pandas()).sort("mag").with_row_count("idx")
     except AttributeError:
@@ -330,7 +333,7 @@ def run_fiducial(
             logger.critical(f"Could not find spots after {_attempt} attempts.")
             raise NotEnoughSpots
 
-        if np.hypot(*drift) > 40:
+        if np.hypot(*drift) > 45:
             raise DriftTooLarge(f"{bitname}: drift very large {np.hypot(*drift):.2f}.")
 
         if residual > threshold_residual:
@@ -513,7 +516,7 @@ if __name__ == "__main__":
 
 
 class Shift(BaseModel):
-    shifts: tuple[float, float]
+    shifts: Sequence[float] | tuple[float, float]
     corr: float
     residual: float
 
