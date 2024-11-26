@@ -11,6 +11,7 @@ import pandas as pd
 import polars as pl
 import pyparsing as pp
 import seaborn as sns
+from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 from rtree import index
 from scipy.stats import ecdf
@@ -20,18 +21,28 @@ from tifffile import imread
 from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
-path = Path("/mnt/working/20241113-ZNE172-Zach/analysis/deconv/registered--leftleft/")
-codebook = "genestar"
-
-spots = load_spots(path / codebook / "reg-0041-1.pkl", idx=0)
-# spots = pl.read_parquet(path / codebook / "spots.parquet").with_columns(
-#     is_blank=pl.col("target").str.starts_with("Blank")
-# )
+path = Path("/home/chaichontat/trc")
+codebook = "tricycleplus"
+roi = "leftcortex"
+# pick = 37
+# path = list((path / f"decoded-{codebook}").glob("*.pkl"))[pick]
+# spots = load_spots(path, idx=0, filter_=True)
+# print(len(spots))
+spots = (
+    pl.scan_parquet([
+        path / f"registered--{roi}" / f"decoded-{codebook}" / "spots.parquet",
+        path / f"registered--{roi}" / f"decoded-genestar" / "spots.parquet",
+    ])
+    .with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
+    # .filter(pl.col("x").gt(7000) & pl.col("y").lt(-7500))
+    .collect()
+)
+print(len(spots))
 sns.set_theme()
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
 ax.set_aspect("equal")
-ax.scatter(spots["x"][::1], spots["y"][::1], s=0.5, alpha=0.3)
-
+ax.scatter(spots["x"][::10], spots["y"][::10], s=0.5, alpha=0.3)
+# %%
 # %%
 # _sp = spots.filter(pl.col("target") == "Blank-9")
 # plt.scatter(_sp["x"], _sp["y"], s=0.5, alpha=0.3)
@@ -53,12 +64,12 @@ pergene = count_by_gene(spots)
 
 
 # %%
-spots_ = spots.filter(pl.col("norm") > 0.02)
+spots_ = spots.filter(pl.col("area").is_between(12, 100))
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
 rand = np.random.default_rng(0)
 subsample = 1  # max(1, len(spots) // 50000)
 ax.hexbin(
-    (spots_[::subsample]["area"]) ** (1 / 2) + rand.normal(0, 1, size=spots_[::subsample].__len__()),
+    (spots_[::subsample]["area"]) ** (1 / 3) + rand.normal(0, 0.10, size=spots_[::subsample].__len__()),
     np.log10(spots_[::subsample]["norm"]),
 )
 ax.set_xlabel("Radius")
@@ -66,16 +77,18 @@ ax.set_ylabel("log10(norm)")
 
 # %%
 
-spots_ = spots.filter(pl.col("norm") > 0.02)
+spots_ = spots.filter(pl.col("norm").gt(0.03) & pl.col("area").is_between(18, 200))
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
 rand = np.random.default_rng(0)
 subsample = 1  # max(1, len(spots) // 50000)
 ax.hexbin(
-    (spots_[::subsample]["area"]) ** (1 / 2) + rand.normal(0, 1, size=spots_[::subsample].__len__()),
+    (spots_[::subsample]["area"]) ** (1 / 2) + rand.normal(0, 0.1, size=spots_[::subsample].__len__()),
     spots_[::subsample]["distance"],
 )
 ax.set_xlabel("Radius")
 ax.set_ylabel("Distance")
+# %%
+
 
 # # %%
 # # Calculate ECDF
@@ -93,6 +106,10 @@ ax.set_ylabel("Distance")
 # %%
 def plot_scree(pergene: pl.DataFrame, limit: int = 10):
     fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 6), dpi=200)
+    print(
+        pergene.filter(pl.col("target").str.starts_with("Blank"))["count"].sum() / pergene["count"].sum(),
+        pergene["count"].sum(),
+    )
     if limit:
         pergene = pergene.filter(pl.col("count") > limit)
     ax.bar(pergene["target"], pergene["count"], color=pergene["color"], width=1, align="edge", linewidth=0)
@@ -103,15 +120,54 @@ def plot_scree(pergene: pl.DataFrame, limit: int = 10):
     return fig, ax
 
 
-plot_scree(count_by_gene(spots.filter(pl.col("area").is_between(12, 50) & pl.col("norm").gt(0.02))))
+plot_scree(
+    count_by_gene(
+        spots.filter(
+            pl.col("area").is_between(18, 50) & pl.col("norm").gt(0.03) & pl.col("z").is_between(20, 34)
+        )
+    )
+)
+
 
 # %%
-# plot cdf
+if codebook == "tricycleplus":
+    genes = ["Ccnd3", "Mcm5", "Top2a", "Pou3f2", "Cenpa", "Hells"]
+else:
+    genes = ["Sox9", "Pax6", "Eomes", "Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2"]
+fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
 
+for ax, gene in zip(axs.flat, genes):
+    selected = spots_.filter(pl.col("target").str.starts_with(gene))
+    if not len(selected):
+        raise ValueError(f"No spots found for {gene}")
+    ax.set_aspect("equal")
+    ax.set_title(gene, fontsize=16, color="white")
+    # ax.hexbin(selected["x"], -selected["y"], gridsize=400, cmap="magma")
+    ax.scatter(selected["x"], selected["y"], s=5000 / len(selected), alpha=0.1)
+    ax.axis("off")
+
+for ax in axs.flat:
+    if not ax.has_data():
+        fig.delaxes(ax)
 # %%
-
-
+genes = sorted(pergene["target"])
+dark = False
+fig, axs = plt.subplots(ncols=20, nrows=15, figsize=(72, 36), dpi=160, facecolor="black" if dark else "white")
+axs = axs.flatten()
+for ax, gene in zip(axs, genes):
+    selected = spots_.filter(pl.col("target") == gene)
+    if not len(selected):
+        logger.warning(f"No spots found for {gene}")
+        continue
+    ax.set_aspect("equal")
+    ax.set_title(gene, fontsize=16, color="white" if dark else "black")
+    ax.axis("off")
+    if dark:
+        ax.hexbin(selected["x"], selected["y"], gridsize=250, cmap="magma")
+    else:
+        ax.scatter(selected["x"], selected["y"], s=2000 / len(selected), alpha=0.1)
 plt.tight_layout()
+
 
 # %%
 cb_raw = json.loads(Path(f"/home/chaichontat/fishtools/starwork3/ordered/{codebook}.json").read_text())

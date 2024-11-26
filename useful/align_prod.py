@@ -33,6 +33,20 @@ from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread, imwrite
 
 from fishtools.utils.pretty_print import progress_bar
+from fishtools.utils.utils import git_hash
+
+
+class DecodeConfig(BaseModel):
+    model_config = {"frozen": True}
+
+    max_distance: float = 0.3
+    min_intensity: float = 0.005
+    min_area: int = 12
+    max_area: int = 200
+
+
+OPTIMIZE_CONFIG = DecodeConfig(min_intensity=0.02, min_area=15, max_area=200)
+
 
 os.environ["TQDM_DISABLE"] = "1"
 
@@ -177,6 +191,9 @@ def _batch(
     else:
         split = [None]
 
+    if not len(paths):
+        raise ValueError("No files found.")
+
     with progress_bar(len(paths) * len(split)) as callback, ThreadPoolExecutor(threads) as exc:
         futs = []
         for path in paths:
@@ -287,10 +304,10 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 25)
             np.percentile(np.linalg.norm(img, axis=1), percentile)
         )
 
-    path_out = path / (f"opt_{codebook.stem}" + f"--{roi}" if roi != "*" else "")
+    path_out = path / (f"opt_{codebook.stem}" + (f"--{roi}" if roi != "*" else ""))
     path_out.mkdir(exist_ok=True)
     logger.info(f"Writing to {(path_out / f'opt_{codebook.stem}' / 'percentiles.json')}")
-    (path_out / f"opt_{codebook.stem}" / "percentiles.json").write_text(json.dumps(norms, indent=2))
+    (path_out / "percentiles.json").write_text(json.dumps(norms, indent=2))
 
 
 @cli.command()
@@ -399,7 +416,7 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
         codebook_path
         round_num: starts from 0.
     """
-    selected = sample_imgs(path, round_num, batch_size=batch_size)
+    selected = sample_imgs(path, round_num, batch_size=batch_size * 2 if round_num == 0 else batch_size)
     path_opt = create_opt_path(
         path_folder=path, codebook_path=codebook_path, mode="folder", round_num=round_num
     )
@@ -562,6 +579,7 @@ def run(
     limit_z: int | None = None,
     split: int | None = None,
     highpass_only: bool = False,
+    config: DecodeConfig = DecodeConfig(),
 ):
     """
     Run spot calling.
@@ -588,6 +606,8 @@ def run(
     # only for optimize
     path_json = create_opt_path(path_img=path, codebook_path=codebook_path, mode="json", round_num=round_num)
     if calc_deviations:
+        config = OPTIMIZE_CONFIG
+        logger.info("Optimizing. Using optimize config.")
         path_pickle = create_opt_path(
             path_img=path, codebook_path=codebook_path, mode="pkl", round_num=round_num
         )
@@ -720,8 +740,8 @@ def run(
     logger.info("Decoding")
     decoded_intensities = codebook.decode_metric(
         pixel_intensities,
-        max_distance=0.3,
-        min_intensity=0.005 if not calc_deviations else 0.02,
+        max_distance=config.max_distance,
+        min_intensity=config.min_intensity,
         norm_order=2,
         metric="euclidean",
         return_original_intensities=True,
@@ -737,7 +757,9 @@ def run(
     # plt.yscale("log")
 
     logger.info("Combining")
-    caf = CombineAdjacentFeatures(min_area=15, max_area=200, mask_filtered_features=True)
+    caf = CombineAdjacentFeatures(
+        min_area=config.min_area, max_area=config.max_area, mask_filtered_features=True
+    )
     decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
     transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
 
@@ -768,9 +790,13 @@ def run(
         {"area": prop.area, "centroid": prop.centroid}
         for prop in np.array(image_decoding_results.region_properties)
     ]
+    meta = {
+        "fishtools_commit": git_hash(),
+        "config": config.model_dump(),
+    }
 
     with path_pickle.open("wb") as f:
-        pickle.dump((decoded_spots, morph), f)
+        pickle.dump((decoded_spots, morph, meta), f)
 
     return decoded_spots, image_decoding_results
 
