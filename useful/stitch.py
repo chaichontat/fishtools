@@ -486,12 +486,17 @@ def combine(path: Path, roi: str, threads: int = 8):
         for folder in folders:
             submit(load, folder)
 
+    first = next((path.parent / f"registered--{roi}").glob("*.tif"))
+    with TiffFile(first) as tif:
+        names = tif.shaped_metadata[0]["key"]
+        mapping = dict(zip(names, range(len(names))))
+
     logger.info(f"Writing to {path.resolve() / 'fused.tif'}")
     imwrite(
         path / "fused.tif",
         out,
         compression="zlib",
-        metadata={"axes": "ZCYX"},
+        metadata={"axes": "ZCYX", "key": mapping},
         # compressionargs={"level": 0.75},
         bigtiff=True,
     )
@@ -502,6 +507,43 @@ def combine(path: Path, roi: str, threads: int = 8):
     # f"fused_{folder.name}-{i + 1}.tif")
 
     # logger.info(f"Combining splits of {n} for {path.resolve()}.")
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str)
+@click.argument("position_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--tile_config", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--overwrite", is_flag=True)
+@click.option("--downsample", "-d", type=int, default=2)
+@click.option("--subsample-z", type=int, default=1)
+@click.option("--threads", "-t", type=int, default=8)
+@click.option("--channels", type=str, default="-3,-2,-1")
+def run(
+    path: Path,
+    roi: str,
+    position_file: Path,
+    *,
+    tile_config: Path | None = None,
+    overwrite: bool = False,
+    downsample: int = 2,
+    threads: int = 8,
+    channels: str = "-3,-2,-1",
+    subsample_z: int = 1,
+):
+    register.callback(path, roi, position_file, fid=True)
+    fuse.callback(
+        path,
+        roi,
+        tile_config=tile_config,
+        split=True,
+        overwrite=overwrite,
+        downsample=downsample,
+        threads=threads,
+        channels=channels,
+        subsample_z=subsample_z,
+    )
+    combine.callback(path, roi, threads=threads)
 
 
 def final_stitch(path: Path, n: int):

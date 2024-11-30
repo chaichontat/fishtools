@@ -16,22 +16,34 @@ from pydantic import BaseModel, TypeAdapter
 from rtree import index
 from scipy.stats import ecdf
 from shapely import Point, Polygon, contains, intersection
-from tifffile import imread
+from tifffile import TiffFile, imread
 
 from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
-path = Path("/home/chaichontat/trc")
-codebook = "tricycleplus"
-roi = "leftcortex"
-# pick = 37
-# path = list((path / f"decoded-{codebook}").glob("*.pkl"))[pick]
-# spots = load_spots(path, idx=0, filter_=True)
-# print(len(spots))
+path = Path("/working/10xhuman")
+codebook = "10xhuman"
+roi = "small"
+
+# Baysor
+# spots.filter(
+#             pl.col("area").is_between(18, 50) & pl.col("norm").gt(0.03)
+#         ).select("x", "y", "z", gene=pl.col("target").str.split("-").list.get(0)).write_csv(path / "leftcortex.csv")
+
+first = next((path / f"registered--{roi}").glob("*.tif"))
+with TiffFile(first) as tif:
+    names = tif.shaped_metadata[0]["key"]
+    mapping = dict(zip(names, range(len(names))))
+
+print(mapping)
+# pick = 100
+# path = list((path / f"registered--{roi}" / f"decoded-{codebook}").glob("*.pkl"))[pick]
+# spots = load_spots(path, idx=0, filter_=True).with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
+
 spots = (
     pl.scan_parquet([
         path / f"registered--{roi}" / f"decoded-{codebook}" / "spots.parquet",
-        path / f"registered--{roi}" / f"decoded-genestar" / "spots.parquet",
+        # path / f"registered--{roi}" / f"decoded-genestar" / "spots.parquet",
     ])
     .with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
     # .filter(pl.col("x").gt(7000) & pl.col("y").lt(-7500))
@@ -40,9 +52,33 @@ spots = (
 print(len(spots))
 sns.set_theme()
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
+ax.scatter(spots["x"][::10], spots["y"][::10], s=0.1, alpha=0.3)
 ax.set_aspect("equal")
-ax.scatter(spots["x"][::10], spots["y"][::10], s=0.5, alpha=0.3)
 # %%
+# %%
+img = imread(path / f"stitch--{roi}" / "fused.tif").max(axis=0)
+# %%
+
+fig, axs = plt.subplots(ncols=4, nrows=1, figsize=(8, 4), dpi=300, facecolor="black")
+for i, ax in enumerate(axs.flat):
+    if i >= 5:
+        break
+    ax.axis("off")
+    ax.imshow(
+        img[-(i + 1), ::-4, ::-4].T,
+        zorder=1,
+        vmin=np.percentile(img[-(i + 1)], 40),
+        vmax=np.percentile(img[-(i + 1)], 99.9),
+        cmap="inferno",
+        origin="lower",
+    )
+for ax in axs.flat:
+    if not ax.has_data():
+        fig.delaxes(ax)
+
+plt.tight_layout()
+
+
 # %%
 # _sp = spots.filter(pl.col("target") == "Blank-9")
 # plt.scatter(_sp["x"], _sp["y"], s=0.5, alpha=0.3)
@@ -60,24 +96,24 @@ def count_by_gene(spots: pl.DataFrame):
     )
 
 
-pergene = count_by_gene(spots)
+# pergene = count_by_gene(spots)
 
 
 # %%
-spots_ = spots.filter(pl.col("area").is_between(12, 100))
+spots_ = spots.filter(pl.col("area").is_between(16, 100))
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
 rand = np.random.default_rng(0)
 subsample = 1  # max(1, len(spots) // 50000)
-ax.hexbin(
-    (spots_[::subsample]["area"]) ** (1 / 3) + rand.normal(0, 0.10, size=spots_[::subsample].__len__()),
-    np.log10(spots_[::subsample]["norm"]),
-)
+x = (spots_[::subsample]["area"]) ** (1 / 3) + rand.normal(0, 0.01, size=spots_[::subsample].__len__())
+y = np.log10(spots_[::subsample]["norm"])
+ax.hexbin(x, y)
 ax.set_xlabel("Radius")
 ax.set_ylabel("log10(norm)")
+# %%
 
 # %%
 
-spots_ = spots.filter(pl.col("norm").gt(0.03) & pl.col("area").is_between(18, 200))
+spots_ = spots.filter(pl.col("norm").gt(0.01) & pl.col("area").is_between(16, 200))
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
 rand = np.random.default_rng(0)
 subsample = 1  # max(1, len(spots) // 50000)
@@ -88,23 +124,78 @@ ax.hexbin(
 ax.set_xlabel("Radius")
 ax.set_ylabel("Distance")
 # %%
+spots_ = spots_.with_columns(
+    x_=(pl.col("area") + np.random.uniform(-1, 1)) ** (1 / 3), y_=pl.col("norm").log10()
+).filter(pl.col("y_") > -2.1)
+bounds = spots_.select([
+    pl.col("x_").min().alias("x_min"),
+    pl.col("x_").max().alias("x_max"),
+    pl.col("y_").min().alias("y_min"),
+    pl.col("y_").max().alias("y_max"),
+]).row(0, named=True)
+# bounds["y_min"] = -2.1
 
+x = np.linspace(bounds["x_min"], bounds["x_max"], 50)
+y = np.linspace(bounds["y_min"], bounds["y_max"], 50)
+step_x = x[1] - x[0]
+step_y = y[1] - y[0]
+X, Y = np.meshgrid(x, y)
+result = (
+    spots_.with_columns([
+        ((pl.col("x_") - bounds["x_min"]) / step_x).floor().alias("i"),
+        ((pl.col("y_") - bounds["y_min"]) / step_y).floor().alias("j"),
+    ])
+    .filter((pl.col("i") >= 0) & (pl.col("i") < 49) & (pl.col("j") >= 0) & (pl.col("j") < 49))
+    .group_by(["i", "j"])
+    .agg([pl.sum("is_blank").alias("blank_count"), pl.count().alias("total_count")])
+    .with_columns((pl.col("blank_count") / (pl.col("total_count") + 1)).alias("proportion"))
+)
 
-# # %%
-# # Calculate ECDF
-# cdf = ecdf(np.log10(spots_[::subsample]["norm"].to_list())).cdf
+# Convert to numpy array
+Z = np.zeros_like(X)
+for row in result.iter_rows(named=True):
+    Z[int(row["j"]), int(row["i"])] = row["proportion"]
+from scipy.ndimage import gaussian_filter
 
-# # Plot
-# plt.plot(cdf.quantiles, cdf.probabilities)
-# plt.xlabel("Values")
-# plt.ylabel("Cumulative Probability")
-# plt.title("Empirical Cumulative Distribution Function")
-# plt.grid(True)
-# plt.show()
+Z_smooth = gaussian_filter(Z, sigma=2)
+# Option 1: Basic colored plot (pcolormesh - recommended)
+plt.pcolormesh(X, Y, Z)
+contours = plt.contour(X, Y, Z_smooth, colors="black", levels=30)  # Add line contours
+plt.colorbar()
 
 
 # %%
-def plot_scree(pergene: pl.DataFrame, limit: int = 10):
+
+from scipy.interpolate import RegularGridInterpolator
+
+interp_func = RegularGridInterpolator((y, x), Z_smooth)
+threshold = contours.levels[4]
+point_densities = interp_func(spots_.select(["y_", "x_"]).to_numpy())
+spots_ = spots_.with_columns(point_density=point_densities).with_columns(
+    ok=pl.col("point_density") < threshold
+)
+spots_ok = spots_.filter(pl.col("ok"))
+# %%
+# density_result = (
+#     spots_.with_columns([
+#         ((pl.col("x_") - bounds["x_min"]) / step_x).floor().alias("i"),
+#         ((pl.col("y_") - bounds["y_min"]) / step_y).floor().alias("j"),
+#     ])
+#     .filter((pl.col("i") >= 0) & (pl.col("i") < 49) & (pl.col("j") >= 0) & (pl.col("j") < 49))
+#     .group_by(["i", "j"])
+#     .agg([pl.count().alias("density")])
+# )
+
+# # Convert to numpy array
+# Z_density = np.zeros_like(X)
+# for row in density_result.iter_rows(named=True):
+#     Z_density[int(row["j"]), int(row["i"])] = row["density"]
+
+# plt.pcolormesh(X, Y, Z_density, norm="linear")
+# plt.colorbar()
+
+
+def plot_scree(pergene: pl.DataFrame, limit: int = 5):
     fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 6), dpi=200)
     print(
         pergene.filter(pl.col("target").str.starts_with("Blank"))["count"].sum() / pergene["count"].sum(),
@@ -122,9 +213,10 @@ def plot_scree(pergene: pl.DataFrame, limit: int = 10):
 
 plot_scree(
     count_by_gene(
-        spots.filter(
-            pl.col("area").is_between(18, 50) & pl.col("norm").gt(0.03) & pl.col("z").is_between(20, 34)
-        )
+        spots_.filter(pl.col("ok"))
+        # spots_ := spots.filter(
+        #     pl.col("area").is_between(18, 100) & pl.col("norm").gt(0.08)  # & pl.col("z").is_between(16, 34)
+        # )
     )
 )
 
@@ -150,9 +242,14 @@ for ax in axs.flat:
     if not ax.has_data():
         fig.delaxes(ax)
 # %%
-genes = sorted(pergene["target"])
+spots_ = spots_.filter(pl.col("ok"))
+genes = spots_.group_by("target").len().sort("len", descending=True)["target"]
+# genes = sorted(set(spots_["target"]))
 dark = False
-fig, axs = plt.subplots(ncols=20, nrows=15, figsize=(72, 36), dpi=160, facecolor="black" if dark else "white")
+nrows = int(np.ceil(len(genes) / 20))
+fig, axs = plt.subplots(
+    ncols=20, nrows=nrows, figsize=(72, int(2.4 * nrows)), dpi=160, facecolor="black" if dark else "white"
+)
 axs = axs.flatten()
 for ax, gene in zip(axs, genes):
     selected = spots_.filter(pl.col("target") == gene)
@@ -166,6 +263,10 @@ for ax, gene in zip(axs, genes):
         ax.hexbin(selected["x"], selected["y"], gridsize=250, cmap="magma")
     else:
         ax.scatter(selected["x"], selected["y"], s=2000 / len(selected), alpha=0.1)
+
+for ax in axs.flat:
+    if not ax.has_data():
+        fig.delaxes(ax)
 plt.tight_layout()
 
 
@@ -183,8 +284,13 @@ cb = (
     .rename({"column": "gene", "concat_list": "bits"})
 )
 
-joined = spots.join(cb, left_on="target", right_on="gene", how="left")
+joined = spots_ok.join(cb, left_on="target", right_on="gene", how="left")
 # %%
+spots_.filter(~pl.col("is_blank")).write_parquet(path / f"{codebook}.parquet")
+
+
+# %%
+
 np.array(np.unique(np.array(cb.filter(pl.col("is_blank"))["bits"].to_list()).flatten(), return_counts=True))
 
 # %%
@@ -222,7 +328,7 @@ plt.tight_layout()
 
 coords = TileConfiguration.from_file(
     # Path(path.parent / f"fids--{roi}" / "TileConfiguration.registered.txt")
-    Path(path.parent / "fids--left" / "TileConfiguration.registered.txt")
+    Path(path / f"stitch--{roi}" / "TileConfiguration.registered.txt")
 ).df
 
 

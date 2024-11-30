@@ -17,8 +17,8 @@ from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
 sns.set_theme()
-codebook = "zach"
-roi = "right"
+codebook = "genestar"
+roi = "half"
 split = True
 FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.pkl")
 
@@ -30,8 +30,9 @@ def parse_filename(x: str):
     return {"idx": int(match.group(1)), "split": int(match.group(2)) if match.group(2) else None}
 
 
-path = Path(f"/mnt/working/20241113-ZNE172-Zach/analysis/deconv/registered--{roi}")
-files = sorted(file for file in Path(path / codebook).glob("*.pkl") if "opt" not in file.stem)
+path = Path(f"/working/20241126-KWLaiOrganoidTest/registered--{roi}")
+# path = Path(f"/working/20241119-ZNE172-Trc/registered--{roi}")
+files = sorted(file for file in Path(path / f"decoded-{codebook}").glob("*.pkl") if "opt" not in file.stem)
 
 coords = TileConfiguration.from_file(
     Path(path.parent / f"stitch--{roi}" / "TileConfiguration.registered.txt")
@@ -48,6 +49,8 @@ files = (
     if not split
     else [file for file in files if file.name.rsplit("-", 2)[1] in idxs]
 )
+coords = coords.filter(pl.col("index").is_in({int(f.stem.rsplit("-", 2)[1]) for f in files}))
+
 
 # if len(files) != len(coords) or len(files) != len(coords) * 4:
 #     print({int(x.stem.split("-")[-1]) for x in files} - set(coords["index"]))
@@ -67,6 +70,7 @@ for row in coords.iter_rows(named=True):
 def load_pickle(i: int, filter_: bool = True, *, size: int = 1998, cut: int = 1024):
     idx, split = parse_filename(files[i].name).values()
     c = coords.filter(pl.col("index") == idx).row(0, named=True)
+    print(c)
 
     logger.debug(f"Loading {files[i]} as split {split}")
 
@@ -134,6 +138,8 @@ else:
         for row in coords.iter_rows(named=True)
     }
 
+assert len(files) == len(cells)
+
 
 idx = index.Index()
 for pos, cell in enumerate(cells.values()):
@@ -146,9 +152,20 @@ _cells = list(cells.values())
 
 # %%
 
+excl = []
 # MultiPolygon(_cells[:2])
+for curr in range(len(cells)):
+    current_cell = _cells[curr]
 
-MultiPolygon([_cells[i] for i in crosses[0] if i > 0])
+    lower_intersections = {j: intersection(current_cell, _cells[j]) for j in crosses[curr] if j < curr}
+
+    MultiPolygon([_cells[i] for i in crosses[0] if i > 0])  # %%
+    exclusive_area = current_cell
+    for intersect in lower_intersections.values():
+        exclusive_area = exclusive_area.difference(intersect)
+    excl.append(exclusive_area)
+
+
 # %%
 
 
@@ -163,8 +180,12 @@ def process(curr: int, filter_: bool = True):
 
     # Create the "exclusive" area for this cell
     exclusive_area = current_cell
+    plt.plot(*exclusive_area.exterior.xy)
     for intersect in lower_intersections.values():
         exclusive_area = exclusive_area.difference(intersect)
+    d = load_pickle(curr, filter_=filter_)
+    plt.plot(*exclusive_area.exterior.xy)
+    plt.scatter(d["x"], d["y"], s=2, alpha=0.3)
 
     # Create STRtree with the exclusive area parts
     if isinstance(exclusive_area, MultiPolygon):
@@ -185,19 +206,16 @@ def process(curr: int, filter_: bool = True):
 
     filtered_df = df.filter(mask["keep"])
     logger.info(f"{files[curr]}: thrown {len(df) - len(filtered_df)} / {df.__len__()}")
-    return filtered_df
+    return exclusive_area.exterior.xy, filtered_df
 
 
+p, d = process(37)
 # %%
 #  mp_context=get_context("forkserver")
-with ThreadPoolExecutor(4) as exc:
-    out = []
-    futs = [exc.submit(process, i, filter_=True) for i in range(len(files))]  # len(spots))]
-    for i, fut in enumerate(futs):
-        try:
-            out.append(fut.result())
-        except Exception as e:
-            logger.error(f"Error in {files[i]}: {e}")
+out = []
+for i in range(len(files)):
+    out.append(process(i, filter_=True))
+
 # for curr in range(len(cells[:20])):
 #     process(curr)
 

@@ -1,5 +1,5 @@
 import re
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -93,7 +93,9 @@ def process(
     lower_intersections = {j: intersection(current_cell, cells[j]) for j in crosses[curr] if j < curr}
 
     df = load_pickle(path_pickle, curr, coords, filter_=filter_)
-    df = df.filter(pl.col("passes_thresholds") & pl.col("area").is_between(15, 80) & pl.col("norm").gt(0.05))
+    df = df.filter(
+        pl.col("passes_thresholds")
+    )  # & pl.col("area").is_between(15, 80) & pl.col("norm").gt(0.05))
 
     # Create the "exclusive" area for this cell
     exclusive_area = current_cell
@@ -123,11 +125,24 @@ def process(
     return filtered_df
 
 
-@click.command()
+@click.group()
+def cli(): ...
+
+
+@cli.command()
 @click.argument("path_wd", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("roi", type=str)
 @click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
-def run(path_wd: Path, roi: str, codebook: Path, split: bool = True):
+@click.option("--no-filter", is_flag=True)
+@click.option("--overwrite", is_flag=True)
+def run(
+    path_wd: Path,
+    roi: str,
+    codebook: Path,
+    split: bool = True,
+    no_filter: bool = False,
+    overwrite: bool = False,
+):
     path = path_wd / f"registered--{roi}"
     path_cb = path / ("decoded-" + codebook.stem)
     coords = load_coords(path, roi)
@@ -143,12 +158,15 @@ def run(path_wd: Path, roi: str, codebook: Path, split: bool = True):
         [file for file in files if file.name.rsplit("-", 1)[-1] in idxs]
         if not split
         else [file for file in files if file.name.rsplit("-", 2)[1] in idxs]
-    )
+    )  # [:1300]
+    coords = coords.filter(pl.col("index").is_in({int(f.stem.rsplit("-", 2)[1]) for f in files}))
 
     if split:
-        cells = [
-            gen_splits((row["x"], row["y"]), n=n) for row in coords.iter_rows(named=True) for n in range(4)
-        ]
+        cells = []
+        for file in files:
+            _, _idx, _n = file.stem.rsplit("-", 2)
+            row = coords.filter(pl.col("index") == int(_idx)).row(0, named=True)
+            cells.append(gen_splits((row["x"], row["y"]), n=int(_n)))
     else:
         cells = [
             Polygon([
@@ -160,6 +178,7 @@ def run(path_wd: Path, roi: str, codebook: Path, split: bool = True):
             for row in coords.iter_rows(named=True)
         ]
 
+    assert len(files) == len(cells)
     idx = index.Index()
     for pos, cell in enumerate(cells):
         idx.insert(pos, cell.bounds)
@@ -167,9 +186,16 @@ def run(path_wd: Path, roi: str, codebook: Path, split: bool = True):
     crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 
     with ProcessPoolExecutor(max_workers=16, mp_context=get_context("spawn")) as exc:
+        futs = []
         for i, file in enumerate(files):
-            if not file.with_suffix(".parquet").exists():
-                exc.submit(process, file, i, coords=coords, cells=cells, crosses=crosses, filter_=True)
+            if overwrite or not file.with_suffix(".parquet").exists():
+                futs.append(
+                    exc.submit(
+                        process, file, i, coords=coords, cells=cells, crosses=crosses, filter_=not no_filter
+                    )
+                )
+        for fut in as_completed(futs):
+            fut.result()
 
     df = pl.scan_parquet(sorted([file.with_suffix(".parquet") for file in files])).collect()
     df.write_parquet(path_cb / "spots.parquet")
@@ -177,4 +203,4 @@ def run(path_wd: Path, roi: str, codebook: Path, split: bool = True):
 
 
 if __name__ == "__main__":
-    run()
+    cli()
