@@ -317,6 +317,8 @@ def _run(
             sub = out / file.parent.name
             sub.mkdir(exist_ok=True, parents=True)
 
+            (sub / file.name).with_suffix(".deconv.json").write_text(json.dumps(scaling, indent=2))
+
             tifffile.imwrite(
                 sub / file.name,
                 np.concatenate([towrite, fid], axis=0),
@@ -349,7 +351,6 @@ def _run(
                 "deconv_min": list(map(float, mins.get().flatten())),
                 "deconv_scale": list(map(float, scale.get().flatten())),
             }
-            start.with_suffix(".deconv.json").write_text(json.dumps(scaling, indent=2))
 
             q_write.put((
                 start,

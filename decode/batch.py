@@ -11,17 +11,19 @@ chan = "4_12_20"
 idxs = None
 if not PATH.exists():
     raise ValueError(f"Path {PATH} does not exist.")
+use_custom_idx = idxs is not None
 # idxs = [i for i in idxs if not (PATH / "down2" / "0" / f"{i:03d}_000.tif").exists()]
 # %%
 
 # %%
 
 for roi in rois:
-    if not idxs:
+    if not use_custom_idx:
         idxs = sorted({int(name.stem.split("-")[1]) for name in PATH.rglob(f"{chan}--{roi}/{chan}*.tif")})
         print(len(idxs))
 
-    with progress_bar_threadpool(len(idxs), threads=10) as submit:
+    assert idxs
+    with progress_bar_threadpool(len(idxs), threads=4) as submit:
         for i in idxs:
             fut = submit(
                 subprocess.run,
