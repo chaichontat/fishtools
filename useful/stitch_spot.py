@@ -97,23 +97,27 @@ def gen_splits(coords: tuple[float, float], n: int = 4, size: int = 1988, cut: i
         raise ValueError("width and offset must be greater than 0")
     x, y = coords
     if n == 0:  # [:cut, :cut] - top-left
-        return Polygon([
-            (x, y),
-            (x + cut, y),
-            (x + cut, y + cut),  # + for y to go down
-            (x, y + cut),
-        ])
+        return Polygon(
+            [
+                (x, y),
+                (x + cut, y),
+                (x + cut, y + cut),  # + for y to go down
+                (x, y + cut),
+            ]
+        )
     if n == 1:  # [:cut, -cut:] - top-right
         return Polygon([(x + size - cut, y), (x + size, y), (x + size, y + cut), (x + size - cut, y + cut)])
     if n == 2:  # [-cut:, :cut] - bottom-left
         return Polygon([(x, y + size - cut), (x + cut, y + size - cut), (x + cut, y + size), (x, y + size)])
     if n == 3:  # [-cut:, -cut:] - bottom-right
-        return Polygon([
-            (x + size - cut, y + size - cut),
-            (x + size, y + size - cut),
-            (x + size, y + size),
-            (x + size - cut, y + size),
-        ])
+        return Polygon(
+            [
+                (x + size - cut, y + size - cut),
+                (x + size, y + size - cut),
+                (x + size, y + size),
+                (x + size - cut, y + size),
+            ]
+        )
     raise ValueError(f"Unknown n={n}")
 
 
@@ -129,12 +133,14 @@ if split:
     }
 else:
     cells = {
-        row["index"]: Polygon([
-            (row["x"], row["y"]),
-            (row["x"] + w, row["y"]),
-            (row["x"] + w, row["y"] + w),
-            (row["x"], row["y"] + w),
-        ])
+        row["index"]: Polygon(
+            [
+                (row["x"], row["y"]),
+                (row["x"] + w, row["y"]),
+                (row["x"] + w, row["y"] + w),
+                (row["x"], row["y"] + w),
+            ]
+        )
         for row in coords.iter_rows(named=True)
     }
 
@@ -198,11 +204,13 @@ def process(curr: int, filter_: bool = True):
         point = Point(x, y)
         return len(tree.query(point, "within")) > 0
 
-    mask = df.select([
-        pl.struct(["x", "y"])
-        .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
-        .alias("keep")
-    ])
+    mask = df.select(
+        [
+            pl.struct(["x", "y"])
+            .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
+            .alias("keep")
+        ]
+    )
 
     filtered_df = df.filter(mask["keep"])
     logger.info(f"{files[curr]}: thrown {len(df) - len(filtered_df)} / {df.__len__()}")
@@ -313,12 +321,14 @@ from polars import col as c
 
 # spots = pl.read_parquet("/fast2/3t3clean/analysis/spots.parquet")
 # %%
-what = spots.group_by("target").agg([
-    pl.count(),
-    pl.mean("distance"),
-    pl.quantile("norm", 0.1),
-    pl.mean("area"),
-])
+what = spots.group_by("target").agg(
+    [
+        pl.count(),
+        pl.mean("distance"),
+        pl.quantile("norm", 0.1),
+        pl.mean("area"),
+    ]
+)
 # %%
 sns.scatterplot(x="norm", y="count", data=what.to_pandas(), alpha=0.3, s=10, edgecolor="none")
 

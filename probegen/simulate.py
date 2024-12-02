@@ -1,7 +1,8 @@
 # %%
+import json
 from collections import deque
 from pathlib import Path
-import json
+
 import polars as pl
 from Bio import Restriction, Seq
 
