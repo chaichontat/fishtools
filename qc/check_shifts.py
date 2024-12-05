@@ -8,7 +8,6 @@ from astropy.modeling import fitting, models
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter
 from scipy.stats import chi2
-from sklearn.covariance import EllipticEnvelope
 
 sns.set_theme()
 
@@ -42,8 +41,8 @@ class Shift(BaseModel):
 Shifts = TypeAdapter(dict[str, Shift])
 # %%
 ref = "4_12_20"
-roi = "centercortex"
-path = Path(f"/mnt/archive/starmap/zne172/20241119-ZNE172-Trc/analysis/deconv/shifts--{roi}")
+roi = "leftleft"
+path = Path(f"/mnt/working/20241113-ZNE172-Zach/analysis/deconv/shifts--{roi}")
 paths = sorted(path.glob("*.json"))
 
 
