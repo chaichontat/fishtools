@@ -89,8 +89,10 @@ spotss = []
 centers = []
 config = json.loads((path / "config.json").read_text())
 rots = config["rots"]
-rots = [7, 157, 122]
+rots = [7, 155, 122]
+ori_dims = []
 
+new_centers = []
 # config["bins"] = bins
 
 for i, roi in enumerate(rois[:3]):
@@ -103,10 +105,20 @@ for i, roi in enumerate(rois[:3]):
 
     center = np.array(imgs[i].shape[1:]) / 2
     centers.append(center)
+    ori_dims.append(imgs[i].shape)
 
     imgs_roted.append(
-        rotate(imgs[i][1], rots[i], center=center[::-1], order=1, preserve_range=True, clip=False)
+        rotate(
+            imgs[i][1],
+            rots[i],
+            center=center[::-1] + 2000,
+            order=1,
+            preserve_range=True,
+            clip=False,
+            resize=True,
+        )
     )
+    new_centers.append(np.array(imgs_roted[i].shape) / 2)
     _spots = (
         pl.scan_parquet(path.parent / f"*--{roi}.parquet")
         .collect()
@@ -120,9 +132,11 @@ for i, roi in enumerate(rois[:3]):
 spots = pl.concat(spotss)
 bins = np.concatenate([[0], np.cumsum(spots.group_by("roi").agg(pl.col("x").max()).sort("roi")["x"])])
 bins += np.arange(0, len(bins)) * 200
+mins_y = spots.group_by("roi").agg(pl.col("y").min()).sort("roi")["y"]
 
 spots = spots.with_columns(
-    x=pl.col("x") + pl.col("roi").map_elements(bins.__getitem__, return_dtype=pl.Float64)
+    x=pl.col("x") + pl.col("roi").map_elements(bins.__getitem__, return_dtype=pl.Float64),
+    y=pl.col("y") - pl.col("roi").map_elements(mins_y.__getitem__, return_dtype=pl.Float64),
 )
 plt.scatter(*spots[::10][["x", "y"]].to_numpy().T, s=0.1, alpha=0.1)
 # %%
@@ -184,13 +198,18 @@ def copy_with_offsets(canvas: np.ndarray, image: np.ndarray, shifts: Collection[
 
 
 img_out = np.zeros(
-    (spots[["y", "x"]].to_numpy().max(axis=0).astype(int) + 1),
+    (
+        spots[["y", "x"]].to_numpy().max(axis=0).astype(int)
+        - spots[["y", "x"]].to_numpy().min(axis=0).astype(int)
+        + 1
+    ),
     dtype=np.uint16,
 )
 print(img_out.shape)
 
+offsets = np.array(new_centers) - np.array(centers)
 for i, img in enumerate(imgs[:3]):
-    img_out = copy_with_offsets(img_out, imgs_roted[i], [0, bins[i]])
+    img_out = copy_with_offsets(img_out, imgs_roted[i], [-offsets[i, 0] - mins_y[i], bins[i] - offsets[i, 1]])
 
 # img_rotated = (img_rotated * preview[1].max() / img_rotated.max()).astype(np.uint16)
 
