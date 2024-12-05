@@ -109,7 +109,7 @@ for i, roi in enumerate(rois[:3]):
 
     imgs_roted.append(
         rotate(
-            imgs[i][1],
+            imgs[i][2],
             rots[i],
             center=center[::-1] + 2000,
             order=1,
@@ -130,7 +130,10 @@ for i, roi in enumerate(rois[:3]):
     spotss.append(rotate_points(_spots, rots[i], center[::-1]))
 
 spots = pl.concat(spotss)
+shifts_from_rotation = np.concatenate([[0], np.cumsum((np.array(new_centers) - np.array(centers))[:, 1])])
+
 bins = np.concatenate([[0], np.cumsum(spots.group_by("roi").agg(pl.col("x").max()).sort("roi")["x"])])
+bins += shifts_from_rotation
 bins += np.arange(0, len(bins)) * 200
 mins_y = spots.group_by("roi").agg(pl.col("y").min()).sort("roi")["y"]
 
@@ -169,6 +172,10 @@ def copy_with_offsets(canvas: np.ndarray, image: np.ndarray, shifts: Collection[
     src_y_end = image.shape[0]
     src_x_end = image.shape[1]
 
+    print(f"Before adjustment:")
+    print(f"Dst coords: y({dst_y_start}:{dst_y_end}), x({dst_x_start}:{dst_x_end})")
+    print(f"Src coords: y({src_y_start}:{src_y_end}), x({src_x_start}:{src_x_end})")
+
     # Adjust if parts of the image would fall outside the canvas
     if dst_y_start < 0:
         src_y_start = -dst_y_start
@@ -182,6 +189,10 @@ def copy_with_offsets(canvas: np.ndarray, image: np.ndarray, shifts: Collection[
     if dst_x_end > canvas.shape[1]:
         src_x_end -= dst_x_end - canvas.shape[1]
         dst_x_end = canvas.shape[1]
+
+    print(f"After adjustment:")
+    print(f"Dst coords: y({dst_y_start}:{dst_y_end}), x({dst_x_start}:{dst_x_end})")
+    print(f"Src coords: y({src_y_start}:{src_y_end}), x({src_x_start}:{src_x_end})")
 
     # Only copy if there's any part of the image that would appear on the canvas
     if (
@@ -209,6 +220,7 @@ print(img_out.shape)
 
 offsets = np.array(new_centers) - np.array(centers)
 for i, img in enumerate(imgs[:3]):
+    print(f"copying {i}")
     img_out = copy_with_offsets(img_out, imgs_roted[i], [-offsets[i, 0] - mins_y[i], bins[i] - offsets[i, 1]])
 
 # img_rotated = (img_rotated * preview[1].max() / img_rotated.max()).astype(np.uint16)
@@ -223,115 +235,32 @@ ax.imshow(
     vmin=np.percentile(img_out, 30),
     vmax=np.percentile(img_out, 99.9),
 )
-# _spots = spots_roted.filter(pl.col("roi") == curr)[::10]
-ax.scatter(*spots[["x", "y"]].to_numpy()[::20].T, s=0.1, alpha=0.8, c="white")
+
+# ax.scatter(*spots[["x", "y"]].to_numpy()[::20].T, s=0.01, alpha=0.8, c="white")
 
 # ax.set_xlim(3000, 3500)
 # ax.set_ylim(1000, 2000)
 
 # %%
+tifffile.imwrite(path / "coords.tif", img_out, compression=22610, compressionargs={"level": 0.75})
 
 # %%
 # ymax.append(float(_spots["y"].max()) + ymax[i] + 200)
 # spotss.append(_spots.with_columns(y=pl.col("y") + ymax[i]))
 
-spots = pl.concat(spotss)
-path.mkdir(exist_ok=True)
-spots.select("x", "y", "z", gene=pl.col("target").str.split("-").list.get(0)).write_csv(path / "spots.csv")
-# %%
-preview = tifffile.imread(path.parent / f"stitch--{rois[1]}" / "fused.tif").max(axis=0)
-# %%
-fig, ax = plt.subplots(figsize=(8, 12), dpi=200)
-ax.imshow(
-    preview[1],
-    zorder=1,
-    origin="lower",
-    vmax=np.percentile(preview[1], 99.9),
-    vmin=np.percentile(preview[1], 30),
-)
-ax.scatter(
-    (spots[::1]["x"] - spots[::1]["x"].min()) / 2,
-    (spots[::1]["y"] - spots[::1]["y"].min()) / 2,
-    c="red",
-    s=0.1,
-    alpha=0.1,
-)
-# ax.set_xlim(3000, 3500)
-# ax.set_ylim(1000, 2000)
-curr = 1
-preview = tifffile.imread(path.parent / f"stitch--{rois[curr]}" / "fused.tif").max(axis=0)
-# %%
-
-s_range = pl.col("roi") == curr
-spots_roi = spots.filter(s_range)
-fig, ax = plt.subplots(figsize=(8, 12), dpi=200)
-ax.imshow(
-    preview[1],
-    zorder=1,
-    origin="lower",
-    vmax=np.percentile(preview[1], 99.9),
-    vmin=np.percentile(preview[1], 30),
-)
-ax.scatter(
-    (spots_roi["x"] - spots_roi["x"].min()) / 2,
-    (spots_roi["y"] - spots_roi["y"].min()) / 2,
-    c="white",
-    s=0.1,
-    alpha=0.8,
-)
-# ax.set_xlim(3000, 3500)
-# ax.set_ylim(1000, 2000)
-# %%
-bins = ymax
-config = json.loads((path / "config.json").read_text())
-config["bins"] = bins
-rots = config["rots"]
-
-yx = spots[["y", "x"]].to_numpy()
-centers = []
-mins = []
-for i in range(len(bins) - 1):
-    points = yx[(bins[i] < yx[:, 0]) & (yx[:, 0] < bins[i + 1])]
-    min_, max_ = np.min(points, axis=0), np.max(points, axis=0)
-    mins.append(min_)
-    centers.append((max_ - min_) // 2)
-centers = np.array(centers, dtype=int)
-
-
-roted = rotate_points(1, 158)
-fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
-ax.imshow(
-    rotate(preview[1], 158, center=((centers // 2)[::-1])[1], order=1, clip=False, preserve_range=True).T,
-    zorder=1,
-    origin="lower",
-)
-ax.set_aspect("equal")
-ax.scatter(*roted[::10].T, s=1, alpha=0.1)
-rots = [7, 158, 125]
-y_offset = 5000
-# %%
-rotated_yx = yx.copy()
-# Rotate each section in-place
-for i in range(len(bins) - 1):
-    mask = (bins[i] < yx[:, 0]) & (yx[:, 0] < bins[i + 1])
-    rotated_yx[mask] = rotate_points(i, rots[i]) + 5000 * i
-plt.scatter(*rotated_yx[::50].T, s=0.1, alpha=0.1)
-# %%
-spots_roted = spots.with_columns(y=rotated_yx[:, 0], x=rotated_yx[:, 1])
 # %% Create coords image to draw ROIs
-out = np.zeros([int(rotated_yx[:, 0].max() + 3), int(rotated_yx[:, 1].max() + 3)], dtype=np.uint8)
-coords = np.round(yx).astype(int)
+# out = np.zeros([int(rotated_yx[:, 0].max() + 3), int(rotated_yx[:, 1].max() + 3)], dtype=np.uint8)
+# coords = np.round(yx).astype(int)
 
-# Create offsets and extend coordinates
-offsets = np.array([(i, j) for i in [-1, 0, 1] for j in [-1, 0, 1]])
-extended_coords = coords[:, None] + offsets[None, :]
-extended_coords = extended_coords.reshape(-1, 2)
-# Vectorized bounds checking
-mask = (extended_coords >= 0).all(axis=1) & (extended_coords < np.array(out.shape)[None, :]).all(axis=1)
-out[extended_coords[mask, 0], extended_coords[mask, 1]] = 255
+# # Create offsets and extend coordinates
+# offsets = np.array([(i, j) for i in [-1, 0, 1] for j in [-1, 0, 1]])
+# extended_coords = coords[:, None] + offsets[None, :]
+# extended_coords = extended_coords.reshape(-1, 2)
+# # Vectorized bounds checking
+# mask = (extended_coords >= 0).all(axis=1) & (extended_coords < np.array(out.shape)[None, :]).all(axis=1)
+# out[extended_coords[mask, 0], extended_coords[mask, 1]] = 255
 
-out[extended_coords[:, 0], extended_coords[:, 1]] = 255
-tifffile.imwrite(path / "coords.tif", out[::2, ::2], compression="zlib")
+# out[extended_coords[:, 0], extended_coords[:, 1]] = 255
 
 # %%spots = spots.with_columns(y=yx[:, 0], x=yx[:, 1]).write_csv(path / "spots.rotated.csv")
 # %%
