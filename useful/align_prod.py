@@ -438,7 +438,10 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
         else:
             print(sf)
             want = cast(Deviation, [s for s in sf if s.round_num == round_num][0])
-            curr.append(np.array(want.deviation) * want.n)
+            if want.n < 500:
+                logger.debug(f"Skipping {p} at round {round_num} because n={want.n} < 500.")
+                continue
+            curr.append(np.nan_to_num(np.array(want.deviation, dtype=float), nan=1) * want.n)
             n += want.n
     curr = np.array(curr)
     # pl.DataFrame(curr).write_csv(path / name)
@@ -491,7 +494,7 @@ def initial(img: ImageStack):
 
 class Deviation(BaseModel):
     n: int
-    deviation: list[float]
+    deviation: list[float | None]
     percent_blanks: float | None = None
     round_num: int
 

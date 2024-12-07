@@ -224,7 +224,7 @@ def rescale(img: cp.ndarray, scale: float):
 
 
 # %%
-DATA = Path("/fast2/fishtools/data")
+DATA = Path(__file__).parent.parent / "data"
 make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=7)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
