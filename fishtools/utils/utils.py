@@ -1,10 +1,11 @@
 import logging
+import subprocess
 import sys
 from functools import cache, wraps
 from inspect import getcallargs
 from pathlib import Path
 from subprocess import PIPE, Popen
-from typing import Any, Callable, Concatenate, Iterable, ParamSpec, Sequence, TypeVar, cast
+from typing import Any, Callable, Concatenate, ParamSpec, Sequence, TypeVar, cast
 
 import loguru
 from loguru import logger
@@ -15,7 +16,9 @@ TType = TypeVar("TType", bound=type)
 TAny = TypeVar("TAny")
 
 
-def copy_signature(kwargs_call: Callable[P, Any]) -> Callable[[Callable[..., R]], Callable[P, R]]:
+def copy_signature(
+    kwargs_call: Callable[P, Any],
+) -> Callable[[Callable[..., R]], Callable[P, R]]:
     """Decorator does nothing but returning the casted original function"""
 
     def return_func(func: Callable[..., R]) -> Callable[P, R]:
@@ -59,7 +62,9 @@ def setup_logging():
                 frame = frame.f_back
                 depth += 1
 
-            logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+            logger.opt(depth=depth, exception=record.exc_info).log(
+                level, record.getMessage()
+            )
 
     logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
     logging.getLogger("biothings").setLevel(logging.CRITICAL)
@@ -94,7 +99,9 @@ def slide(x: str, n: int = 20) -> list[str]:
 
 def check_if_exists(
     logger: "loguru.Logger",
-    name_detector: Callable[[dict[str, Any]], Path | str] = lambda kwargs: str(next(iter(kwargs.values()))),
+    name_detector: Callable[[dict[str, Any]], Path | str] = lambda kwargs: str(
+        next(iter(kwargs.values()))
+    ),
 ):
     """
     A decorator that checks if a file exists before executing a function.
@@ -119,12 +126,33 @@ def check_if_exists(
     def decorator(f: Callable[P, R]) -> Callable[P, R | None]:
         @wraps(f)
         def inner(*args: P.args, **kwargs: P.kwargs) -> R | None:
-            if not (path := Path(name_detector(getcallargs(f, *args, **kwargs)))).exists() or kwargs.get(
-                "overwrite", False
-            ):
+            if not (
+                path := Path(name_detector(getcallargs(f, *args, **kwargs)))
+            ).exists() or kwargs.get("overwrite", False):
                 return f(*args, **kwargs)
             logger.warning(f"{path} already exists. Skipping.")
 
         return inner
 
     return decorator
+
+
+def batchable():
+    def decorator(f: Callable[P, R]) -> Callable[P, R]:
+        @wraps(f)
+        def inner(*args: P.args, **kwargs: P.kwargs) -> R:
+            return f(*args, **kwargs)
+
+        return inner
+
+    return decorator
+
+
+def git_hash() -> str:
+    return (
+        subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).parent.parent
+        )
+        .decode("ascii")
+        .strip()
+    )
