@@ -64,10 +64,14 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
         try:
             df = pl.read_parquet(
                 path / f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
-            ).sort([
-                pl.col("priority").list.max(),
-                pl.col("hp").list.min(),
-            ])[:n]
+            ).sort(
+                [
+                    pl.col("priority").list.max(),
+                    pl.col("hp").list.min(),
+                ]
+            )[
+                :n
+            ]
         except FileNotFoundError as e:
             logger.critical(e)
             continue
@@ -105,11 +109,13 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
                 check=True,
             )
 
-    dfs = dfs.with_columns({
-        col_name: [seq for name, seq in pyfastx.Fastx((outpath / f"{col_name}.fasta.masked").as_posix())]
-        for col_name in ["splint", "padlock"]
-        if (outpath / f"{col_name}.fasta.masked").exists()
-    }).filter(~pl.col("splint").str.contains("N") & ~pl.col("padlock").str.contains("N"))
+    dfs = dfs.with_columns(
+        {
+            col_name: [seq for name, seq in pyfastx.Fastx((outpath / f"{col_name}.fasta.masked").as_posix())]
+            for col_name in ["splint", "padlock"]
+            if (outpath / f"{col_name}.fasta.masked").exists()
+        }
+    ).filter(~pl.col("splint").str.contains("N") & ~pl.col("padlock").str.contains("N"))
 
     counts = dfs.group_by("gene").len(name="count")
     # Since we resample low counting probes, we need to double the threshold.

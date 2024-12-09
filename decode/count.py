@@ -4,12 +4,12 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
-import polars as pl
-import pandas as pd
-import rich_click as click
+
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import polars as pl
+import rich_click as click
 import seaborn as sns
 from astropy.stats import SigmaClip, sigma_clipped_stats
 from astropy.table.table import QTable
