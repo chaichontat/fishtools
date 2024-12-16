@@ -1,6 +1,7 @@
 # %%
-import polars as pl
 from pathlib import Path
+
+import polars as pl
 
 path = Path("/working/10xhuman")
 spots = pl.scan_parquet("/working/10xhuman/*.parquet").collect()
