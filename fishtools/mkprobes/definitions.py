@@ -4,5 +4,4 @@ import polars as pl
 
 
 class Filter(Protocol):
-    def __call__(self, fasta: str) -> pl.DataFrame:
-        ...
+    def __call__(self, fasta: str) -> pl.DataFrame: ...

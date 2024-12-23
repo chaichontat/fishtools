@@ -29,16 +29,20 @@ adata = sc.read_h5ad(path / "pearsonedcortex.h5ad")
 # sc.pl.umap(adata, color="sample")
 
 print(
-    "\n".join([
-        f"Cluster {c}: "
-        + ", ".join([
-            f"{entry['names']}: {np.round(entry['scores'], 2)}"
-            for entry in sc.get.rank_genes_groups_df(adata, group=c)
-            .head(10)[["names", "scores"]]
-            .to_dict(orient="records")
-        ])
-        for c in adata.obs["leiden"].cat.categories
-    ])
+    "\n".join(
+        [
+            f"Cluster {c}: "
+            + ", ".join(
+                [
+                    f"{entry['names']}: {np.round(entry['scores'], 2)}"
+                    for entry in sc.get.rank_genes_groups_df(adata, group=c)
+                    .head(10)[["names", "scores"]]
+                    .to_dict(orient="records")
+                ]
+            )
+            for c in adata.obs["leiden"].cat.categories
+        ]
+    )
 )
 # %%
 with sns.axes_style("darkgrid"):
@@ -65,10 +69,12 @@ palette_spaco = list(color_mapping.values())
 # %%
 genes = sorted(
     set(
-        chain.from_iterable([
-            sc.get.rank_genes_groups_df(adata, group=c).head(6)["names"]
-            for c in adata.obs["leiden"].cat.categories
-        ])
+        chain.from_iterable(
+            [
+                sc.get.rank_genes_groups_df(adata, group=c).head(6)["names"]
+                for c in adata.obs["leiden"].cat.categories
+            ]
+        )
     )
 )
 
