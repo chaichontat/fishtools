@@ -240,15 +240,19 @@ def run(idx: int, overwrite: bool = False):
         if not _polygons:
             polygons.append((Polygon(), {}))
         elif len(_polygons) == 1:
-            polygons.append((
-                _polygons[0],
-                {"area": region.area, "label": region.label, "centroid": region.centroid},
-            ))
+            polygons.append(
+                (
+                    _polygons[0],
+                    {"area": region.area, "label": region.label, "centroid": region.centroid},
+                )
+            )
         else:
-            polygons.append([
-                MultiPolygon(_polygons),
-                {"area": region.area, "label": region.label, "centroid": region.centroid},
-            ])
+            polygons.append(
+                [
+                    MultiPolygon(_polygons),
+                    {"area": region.area, "label": region.label, "centroid": region.centroid},
+                ]
+            )
 
     for i, region in enumerate(props):
         loop(i, region)
