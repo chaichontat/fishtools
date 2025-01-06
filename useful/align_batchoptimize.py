@@ -6,6 +6,9 @@ import rich_click as click
 from loguru import logger
 
 
+# %%
+
+
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("codebook_path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))

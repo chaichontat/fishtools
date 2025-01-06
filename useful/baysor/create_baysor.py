@@ -24,12 +24,13 @@ sns.set_theme()
 # %%
 
 
-path = Path("/working/20241203-KWLaiOrganoidTest_sample1/baysor--all")
+path = Path("/mnt/working/e155_zach/baysor--all")
 rois = sorted({x.stem.split("--")[1] for x in path.parent.glob("*.parquet") if "mid" not in x.name})
+print()
 if not rois:
     raise ValueError("No ROIs found. Check path.")
 try:
-    imgs = [tifffile.imread(path.parent / f"stitch--{roi}" / "fused.tif") for roi in rois]
+    imgs = None  # [tifffile.imread(path.parent / f"stitch--{roi}" / "fused.tif") for roi in rois]
 except FileNotFoundError as e:
     logger.warning(e)
     imgs = None
@@ -51,8 +52,6 @@ def get_new_dimensions(shape: tuple[int, int], angle_degrees: float) -> tuple[in
 
 def rotate_points(spots: pl.DataFrame, deg: float, center: np.ndarray, *, divide: bool = True):
     coords = spots[["x", "y"]].to_numpy()
-    # if divide:
-    #     coords /= 2
 
     θ = np.radians(deg)
     c, s = np.cos(θ), np.sin(θ)
@@ -87,9 +86,9 @@ imgs_roted = defaultdict(list)
 ymax = [0]
 spotss = []
 centers = []
-# config = json.loads((path / "config.json").read_text())
-# rots = config["rots"]
-rots = [54]
+config = json.loads((path / "config.json").read_text())
+rots = config["rots"]
+# rots = [54]
 ori_dims = []
 
 new_centers = []
@@ -104,22 +103,24 @@ for i, roi in enumerate(rois[:3]):
         .min(axis=0)
     )
 
-    # centers.append(center)
-    # ori_dims.append(imgs[i].shape)
-    # for z in range(0):
-    #     imgs_roted[i].append(
-    #         rotate(
-    #             imgs[i][int(3.5 * i) : int(3.5 * (i + 1)), 0].max(axis=0),
-    #             rots[i],
-    #             center=center[::-1],
-    #             order=1,
-    #             preserve_range=True,
-    #             clip=False,
-    #             resize=True,
-    #         )
-    #     )
-    # imgs_roted[i] = np.array(imgs_roted[i])
-    # new_centers.append(np.array(imgs_roted[i].shape[1:]) / 2)
+    center = np.array(imgs[i].shape[-2:]) / 2
+
+    centers.append(center)
+    ori_dims.append(imgs[i].shape)
+    for z in range(10):
+        imgs_roted[i].append(
+            rotate(
+                imgs[i][int(imgs[i].shape[0] / 10 * i) : int(imgs[i].shape[0] / 10 * (i + 1)), 0].max(axis=0),
+                rots[i],
+                center=center[::-1],
+                order=1,
+                preserve_range=True,
+                clip=False,
+                resize=True,
+            )
+        )
+    imgs_roted[i] = np.array(imgs_roted[i])
+    new_centers.append(np.array(imgs_roted[i].shape[1:]) / 2)
     _spots = (
         pl.scan_parquet(path.parent / f"*--{roi}.parquet")
         .collect()
@@ -132,12 +133,11 @@ for i, roi in enumerate(rois[:3]):
             (_spots["y"].max() - _spots["y"].min()) / 2,
             (_spots["x"].max() - _spots["x"].min()) / 2,
         ])
-    # print(_spots['y'].min())
-    # spotss.append(_spots)
+    print(_spots["y"].min())
     spotss.append(rotate_points(_spots, rots[i], center[::-1]))
 # %%
 
-spots = pl.concat(spotss)
+spots = pl.concat(spotss2)
 shifts_from_rotation = np.concatenate([[0], np.cumsum((np.array(new_centers) - np.array(centers))[:, 1])])
 
 bins = np.concatenate([[0], np.cumsum(spots.group_by("roi").agg(pl.col("x").max()).sort("roi")["x"])])
@@ -305,6 +305,7 @@ ax.scatter(spots[res, "x"], spots[res, "y"], s=1, alpha=0.3)
 ax.set_aspect("equal")
 
 # %%
+path.mkdir(exist_ok=True, parents=True)
 spots.select(x="x", y="y", z="z", gene=pl.col("target").str.split("-").list.get(0)).write_csv(
     path / "spots.csv"
 )
@@ -365,11 +366,39 @@ tifffile.imwrite(path / "labels.tif", labels, compression="zlib", metadata={"axe
 cfse = tifffile.imread(path / "cfse.tif")
 
 # %%
+# %%
+
+labels = tifffile.imread(path / "labels.tif")
+# %%
 from skimage.measure import regionprops_table
 
-props = regionprops_table(
-    labels, cfse, properties=["label", "centroid", "area", "intensity_mean", "intensity_max"]
-)
+props = regionprops_table(labels, properties=["label", "centroid", "area", "coords"])
+df_props = pl.DataFrame(props)
+# props = regionprops_table(
+#     labels, cfse, properties=["label", "centroid", "area", "intensity_mean", "intensity_max"]
+# )
+# %%
+
+import numpy as np
+from scipy.spatial import ConvexHull, QhullError
+
+# First store all hulls
+hull_vertices_by_label = {}
+for row in df_props.iter_rows(named=True):
+    coords = row["coords"]
+    if len(coords) >= 4:
+        try:
+            hull = ConvexHull(coords)
+            hull_vertices_by_label[row["label"]] = coords[hull.vertices]
+        except QhullError:
+            ...
+
+# Save to file - choose format based on your needs
+# np.save('hull_vertices.npy', hull_vertices_by_label)
+# or
+# Save as CSV/txt if you prefer
+# for label, vertices in hull_vertices_by_label.items():
+#     np.savetxt(f'hull_vertices_{label}.txt', vertices)
 # %%
 import polars as pl
 
@@ -378,4 +407,16 @@ plt.hist(df["intensity_sum"], log=True)
 
 # %%
 df.write_csv(path / "cfse_stats.csv")
+# %%
+from json import JSONEncoder
+import numpy
+
+
+class NumpyArrayEncoder(JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, numpy.ndarray):
+            return obj.tolist()
+        return JSONEncoder.default(self, obj)
+
+
 # %%

@@ -11,11 +11,13 @@ from starfish.types import Axes, Features, Levels
 
 sns.set_theme()
 
-decoded_spots, spot_intensities = pickle.loads(
-    Path("/mnt/working/e155trcdeconv/registered--left/genestar/reg-0036.pkl").read_bytes()
+decoded_spots, spot_intensities, meta = pickle.loads(
+    Path(
+        "/working/20241201-BigPanel/analysis/deconv/registered--left/decoded-out.converted.tss/reg-0011-1.pkl"
+    ).read_bytes()
 )
 
-codebook = json.loads(Path("/fast2/fishtools/starwork3/ordered/genestar.json").read_text())
+codebook = json.loads(Path("/home/chaichontat/fishtools/starwork5/out.converted.tss.json").read_text())
 # codebook, used_bits, names, arr_zeroblank = load_codebook(
 #     Path("/fast2/fishtools/starwork3/ordered/genestar.json"), exclude={"Malat1-201"}
 # )
@@ -67,7 +69,7 @@ ax.scatter(
     #     is_blank[list(map(names_l.get, initial_spot_intensities.coords["target"].to_index().values))], 1, 0
     # ).flatten(),
     alpha=0.2,
-    cmap="bwr",
+    cmap="bwr_r",
     s=2,
 )
 # set semilogx
@@ -211,7 +213,7 @@ def plot_bits(spots):
     return fig, axs
 
 
-plot_bits(ok.where(ok.target == "Neurod6-201", drop=True))
+plot_bits(ok.where(ok.target == "Dcx-201", drop=True))
 
 # %%
 df = pd.DataFrame({
