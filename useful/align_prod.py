@@ -214,7 +214,7 @@ def _batch(
 
 def sample_imgs(path: Path, round_num: int, *, batch_size: int = 50):
     rand = np.random.default_rng(round_num)
-    paths = sorted((p for p in path.glob("registered--*/reg*.tif") if not p.name.endswith(".hp.tif")))
+    paths = sorted(p for p in path.glob("registered--*/reg*.tif") if not p.name.endswith(".hp.tif"))
     if batch_size > len(paths):
         logger.info(f"Batch size {batch_size} is larger than {len(paths)}. Returning all images.")
         return paths
