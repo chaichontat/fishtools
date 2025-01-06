@@ -181,9 +181,9 @@ def convert_to_transcripts(
     res = res.group_by("gene_name", maintain_order=True).agg(pl.all().first())
 
     genes.with_suffix(".tss.txt").write_text("\n".join(sorted(res["transcript_name"])))
-    assert len(res["transcript_name"]) == len({
-        x["transcript_name"].split("-")[0] for x in res.iter_rows(named=True)
-    })
+    assert len(res["transcript_name"]) == len(
+        {x["transcript_name"].split("-")[0] for x in res.iter_rows(named=True)}
+    )
     logger.info(f"Written to {genes.with_suffix('.tss.txt')}.")
 
 
