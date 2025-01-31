@@ -20,7 +20,7 @@ import tifffile
 import xarray as xr
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter, field_validator
-from starfish import Codebook, ImageStack, IntensityTable
+from starfish import ImageStack, IntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
 )
@@ -32,6 +32,7 @@ from starfish.types import Axes, Features, Levels
 from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread, imwrite
 
+from fishtools.gpu.codebook import Codebook
 from fishtools.utils.pretty_print import progress_bar
 from fishtools.utils.utils import git_hash
 
@@ -334,19 +335,8 @@ def batch(
     limit_z: int | None = None,
     split: bool = False,
 ):
-    paths = {p.stem: p for p in path.glob(f"registered--{roi}/reg*.tif")}
-    # To account for split
-    exists = {
-        p.stem.rsplit("-", 1)[0]
-        for p in path.glob(f"registered--{roi}/decoded-{codebook_path.stem}/reg*.pkl")
-    }
-    if not overwrite:
-        old_len = len(paths)
-        paths = sorted({v for k, v in paths.items() if k not in exists})
-        logger.info(f"Skipping {old_len - len(paths)} files.")
-
     return _batch(
-        paths,
+        sorted(p for p in path.glob(f"registered--{roi}/reg*.tif")),
         "run",
         [
             "--global-scale",
@@ -645,7 +635,7 @@ def run(
     )
     codebook, used_bits, names, arr_zeroblank = load_codebook(
         codebook_path,
-        exclude={"Malat1-201"},  # , "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
+        exclude={"Malat1-201", "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
     )
     used_bits = list(map(str, used_bits))
 

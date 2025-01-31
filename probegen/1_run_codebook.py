@@ -73,7 +73,8 @@ def run_gene(
 
 
 @click.group()
-def cli(): ...
+def cli():
+    ...
 
 
 @cli.command()
