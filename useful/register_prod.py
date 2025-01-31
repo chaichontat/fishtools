@@ -359,16 +359,18 @@ def run_fiducial(
     _fid_ref = fids[reference][::4, ::4].flatten()
     (shift_path / f"shifts-{idx:04d}.json").write_bytes(
         Shifts.dump_json(
-            Shifts.validate_python({
-                k: {
-                    "shifts": (shifts[k][0], shifts[k][1]),
-                    "residual": residuals[k],
-                    "corr": 1.0
-                    if reference == k
-                    else np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1],
+            Shifts.validate_python(
+                {
+                    k: {
+                        "shifts": (shifts[k][0], shifts[k][1]),
+                        "residual": residuals[k],
+                        "corr": 1.0
+                        if reference == k
+                        else np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1],
+                    }
+                    for k in shifts
                 }
-                for k in shifts
-            })
+            )
         )
     )
     return shifts

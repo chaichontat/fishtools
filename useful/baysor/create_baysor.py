@@ -129,10 +129,12 @@ for i, roi in enumerate(rois[:3]):
     )
 
     if imgs is None:
-        center = np.array([
-            (_spots["y"].max() - _spots["y"].min()) / 2,
-            (_spots["x"].max() - _spots["x"].min()) / 2,
-        ])
+        center = np.array(
+            [
+                (_spots["y"].max() - _spots["y"].min()) / 2,
+                (_spots["x"].max() - _spots["x"].min()) / 2,
+            ]
+        )
     print(_spots["y"].min())
     spotss.append(rotate_points(_spots, rots[i], center[::-1]))
 # %%
@@ -217,10 +219,12 @@ def copy_with_offsets(canvas: np.ndarray, image: np.ndarray, shifts: Collection[
         if len(canvas.shape) == 3:
             print("3D")
             canvas[:, dst_y_start:dst_y_end, dst_x_start:dst_x_end] = np.max(
-                np.stack([
-                    image[:, src_y_start:src_y_end, src_x_start:src_x_end].astype(canvas.dtype),
-                    canvas[:, dst_y_start:dst_y_end, dst_x_start:dst_x_end],
-                ]),
+                np.stack(
+                    [
+                        image[:, src_y_start:src_y_end, src_x_start:src_x_end].astype(canvas.dtype),
+                        canvas[:, dst_y_start:dst_y_end, dst_x_start:dst_x_end],
+                    ]
+                ),
                 axis=0,
             )
         elif len(canvas.shape) == 2:

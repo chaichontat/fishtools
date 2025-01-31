@@ -41,11 +41,12 @@ print(mapping)
 # spots = load_spots(path, idx=0, filter_=True).with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
 
 spots = (
-    pl.scan_parquet([
-        path / f"registered--{roi}" / f"decoded-{codebook}" / "spots.parquet",
-        # path / f"registered--{roi}" / f"decoded-genestar" / "spots.parquet",
-    ])
-    .with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
+    pl.scan_parquet(
+        [
+            path / f"registered--{roi}" / f"decoded-{codebook}" / "spots.parquet",
+            # path / f"registered--{roi}" / f"decoded-genestar" / "spots.parquet",
+        ]
+    ).with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
     # .filter(pl.col("x").gt(7000) & pl.col("y").lt(-7500))
     .collect()
 )
@@ -105,12 +106,14 @@ spots_ = spots.filter(pl.col("area").is_between(15, 100))
 spots_ = spots_.with_columns(
     x_=(pl.col("area") + np.random.uniform(-1, 1)) ** (1 / 3), y_=pl.col("norm").log10()
 ).filter(pl.col("y_") > -1.9)
-bounds = spots_.select([
-    pl.col("x_").min().alias("x_min"),
-    pl.col("x_").max().alias("x_max"),
-    pl.col("y_").min().alias("y_min"),
-    pl.col("y_").max().alias("y_max"),
-]).row(0, named=True)
+bounds = spots_.select(
+    [
+        pl.col("x_").min().alias("x_min"),
+        pl.col("x_").max().alias("x_max"),
+        pl.col("y_").min().alias("y_min"),
+        pl.col("y_").max().alias("y_max"),
+    ]
+).row(0, named=True)
 # bounds["y_min"] = -2.1
 n = 50
 x = np.linspace(bounds["x_min"], bounds["x_max"], n)
@@ -119,10 +122,12 @@ step_x = x[1] - x[0]
 step_y = y[1] - y[0]
 X, Y = np.meshgrid(x, y)
 result = (
-    spots_.with_columns([
-        ((pl.col("x_") - bounds["x_min"]) / step_x).floor().alias("i"),
-        ((pl.col("y_") - bounds["y_min"]) / step_y).floor().alias("j"),
-    ])
+    spots_.with_columns(
+        [
+            ((pl.col("x_") - bounds["x_min"]) / step_x).floor().alias("i"),
+            ((pl.col("y_") - bounds["y_min"]) / step_y).floor().alias("j"),
+        ]
+    )
     .filter((pl.col("i") >= 0) & (pl.col("i") < n - 1) & (pl.col("j") >= 0) & (pl.col("j") < n - 1))
     .group_by(["i", "j"])
     .agg([pl.sum("is_blank").alias("blank_count"), pl.count().alias("total_count")])
