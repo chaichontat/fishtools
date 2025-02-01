@@ -1,10 +1,10 @@
 # %%
-
 import json
-import logging
 import pickle
 import queue
+import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterable, Literal, cast
 
@@ -12,16 +12,23 @@ import cupy as cp
 import cv2
 import numpy as np
 import numpy.typing as npt
+import pyfiglet
 import rich_click as click
 import tifffile
 from basicpy import BaSiC
 from cupyx.scipy.ndimage import convolve as cconvolve
 from loguru import logger
+from rich.console import Console
+from rich.logging import RichHandler
 from scipy.stats import multivariate_normal
 from tifffile import TiffFile, imread
 
 from fishtools.preprocess.deconv import _compute_range
 from fishtools.utils.pretty_print import progress_bar
+
+logger.remove()
+logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
+console = Console()
 
 
 def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32) -> npt.NDArray:
@@ -201,7 +208,7 @@ def make_projector(path: Path | str, *, step: int = 10, max_z: int = 7, size: in
     zs = zs[z_crop:-z_crop] if z_crop > 0 else zs
 
     crop = (gen.shape[1] - size) // 2
-    print(gen.shape, zs, z_crop)
+    # print(gen.shape, zs, z_crop)
     psf = gen[zs][::-1, crop:-crop, crop:-crop]
     psf /= psf.sum()
     logger.debug(f"PSF shape: {psf.shape}")
@@ -277,13 +284,12 @@ def _run(
 ):
     if not overwrite:
         paths = [f for f in paths if not (out / f.parent.name / f.name).exists()]
-        logger.info(f"Running {len(paths)} files.")
 
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
 
     def f_read(files: list[Path]):
-        logger.info("Read thread started.")
+        logger.debug("Read thread started.")
         for file in files:
             name = file.name.split("-")[0]
             bits = name.split("_")
@@ -306,7 +312,7 @@ def _run(
             q_img.put((file, nofid, fid, metadata))
 
     def f_write():
-        logger.info("Write thread started.")
+        logger.debug("Write thread started.")
 
         while True:
             gotten = q_write.get()
@@ -336,29 +342,33 @@ def _run(
         thread_write = threading.Thread(target=f_write, args=(), daemon=True)
         thread_write.start()
 
-        for _ in range(len(paths)):
-            start, img, fid, metadata = q_img.get()
-            logger.info(f"Processing {start.name} ({_}/{len(paths)})")
-            res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors, iters=1)
+        with progress_bar(len(paths)) as callback:
+            for _ in range(len(paths)):
+                start, img, fid, metadata = q_img.get()
+                t = time.time()
 
-            mins = res.min(axis=(0, 2, 3), keepdims=True)
-            scale = 65534 / (res.max(axis=(0, 2, 3), keepdims=True) - mins)
+                res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors, iters=1)
+                mins = res.min(axis=(0, 2, 3), keepdims=True)
+                scale = 65534 / (res.max(axis=(0, 2, 3), keepdims=True) - mins)
 
-            towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
-            del res
+                towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
+                del res
 
-            scaling = {
-                "deconv_min": list(map(float, mins.get().flatten())),
-                "deconv_scale": list(map(float, scale.get().flatten())),
-            }
+                scaling = {
+                    "deconv_min": list(map(float, mins.get().flatten())),
+                    "deconv_scale": list(map(float, scale.get().flatten())),
+                }
+                logger.info(f"Finished {start.name}: {time.time() - t:.2f}s")
 
-            q_write.put((
-                start,
-                towrite,
-                fid,
-                metadata | scaling,
-            ))
-            q_img.task_done()
+                q_write.put((
+                    start,
+                    towrite,
+                    fid,
+                    metadata | scaling,
+                ))
+                q_img.task_done()
+                callback()
+
     except Exception as e:
         logger.error(f"Error in thread: {e}")
         q_write.put(None)
@@ -400,10 +410,16 @@ def run(
         overwrite: Overwrite existing deconvolved images.
         n_fid: Number of fiducial frames.
     """
+
+    console.print(f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]")
+
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
-
-    files = [f for f in sorted(path.glob(f"{name}--*/{name}-*.tif")) if "analysis/deconv" not in str(f)]
+    files = [
+        f
+        for f in sorted(path.glob(f"{name}--*/{name}-*.tif"))
+        if "analysis/deconv" not in str(f) and not f.parent.name.endswith("basic")
+    ]
     if ref is not None:
         ok_idxs = {
             int(f.stem.split("-")[1])
@@ -416,11 +432,16 @@ def run(
             logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
 
     files = files[:limit] if limit is not None else files
-    logger.info(f"Total: {len(files)} at {path}." + (f" Limited to {limit}" if limit is not None else ""))
+    logger.info(
+        f"Total: {len(files)} at {path}/{name}*" + (f" Limited to {limit}" if limit is not None else "")
+    )
 
     if not overwrite:
         files = [f for f in files if not (out / f.parent.name / f.name).exists()]
         logger.info(f"Running {len(files)} files.")
+    if not files:
+        logger.warning("No files found. Skipping.")
+        return
 
     basics: dict[str, list[BaSiC]] = {
         name: list(pickle.loads((path / "basic" / f"{name}.pkl").read_bytes()).values())
@@ -450,7 +471,9 @@ def batch(
     rounds = sorted({p.name.split("--")[0] for p in path.iterdir() if "--" in p.name and p.is_dir()})
     for r in rounds:
         files = [
-            f for f in sorted(path.glob(f"{r}--{roi or '*'}/{r}-*.tif")) if "analysis/deconv" not in str(f)
+            f
+            for f in sorted(path.glob(f"{r}--{roi or '*'}/{r}-*.tif"))
+            if "analysis/deconv" not in str(f) and not path.parent.name.endswith("basic")
         ]
 
         if ref is not None:

@@ -151,7 +151,7 @@ for n in range(10, 31):
         ns[n] = len(_generate(static / f"{n}bit_on3_dist2.csv", n))
 
 
-def gen_codebook(tss: list[str], offset: int = 0, n_bits: int | None = None):
+def gen_codebook(tss: list[str], offset: int = 0, n_bits: int | None = None, seed: int = 0):
     if n_bits is not None:
         n = int(n_bits)
         if (ns[n] - len(tss)) / ns[n] < 0.05:
@@ -169,11 +169,28 @@ def gen_codebook(tss: list[str], offset: int = 0, n_bits: int | None = None):
     logger.info(f"Using {n}-bit codebook with capacity {ns[n]}.")
 
     cb = CodebookPicker(f"../static/{n}bit_on3_dist2.csv", genes=tss)
-    cb.gen_codebook(1)
-    c = cb.export_codebook(1, offset=0)
+    cb.gen_codebook(seed)
+    c = cb.export_codebook(seed, offset=0)
     out = {k: sorted(order[x + offset] for x in v) for k, v in c.items()}
+
+    # Remove bits that are perfect confounders of rounds
+    FORBIDDEN = {
+        *[(x, x + 8, x + 16) for x in range(1, 9)],
+        *[(3 * i, 3 * i + 1, 3 * i + 2) for i in range(9, 13)],
+    }
+
+    to_swap = []
+    for i, (k, v) in enumerate(out.items()):
+        if tuple(v) in FORBIDDEN:
+            to_swap.append(k)
+
+    for i, k in enumerate(to_swap):
+        out[f"Blank-{i + 1}"], out[k] = out[k], out[f"Blank-{i + 1}"]
+
     logger.info("Bits used: " + str(sorted(set(chain.from_iterable(out.values())))))
-    return out
+
+    # Sort by gene name
+    return {k: out[k] for k in sorted(out, key=lambda x: (x.startswith("Blank"), x))}
 
 
 @click.command()

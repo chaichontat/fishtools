@@ -157,7 +157,7 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
         res.with_columns(
             spl_cut=(
                 pl.col("splint").map_elements(rc, return_dtype=pl.Utf8)
-                + "ta"
+                + "ca"
                 + pl.col("pad_cut").str.slice(0, 6).map_elements(rc, return_dtype=pl.Utf8)
                 + pl.col("pad_cut").str.slice(-6, 6).map_elements(rc, return_dtype=pl.Utf8)
             ).map_elements(splint_pad, return_dtype=pl.Utf8)

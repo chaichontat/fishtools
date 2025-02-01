@@ -27,9 +27,9 @@ def plot_wheel(
         histy=plt.subplot2grid((6, 6), (1, 5), rowspan=5),
     )
 
-    H, xedges, yedges = np.histogram2d(pcs[:, 0], pcs[:, 1], bins=(100, 100))
-    axs.scatter.axhline(0, color="black", alpha=0.5, markeredgewidth=0, linewidth=0.75)
-    axs.scatter.axvline(0, color="black", alpha=0.5, markeredgewidth=0, linewidth=0.75)
+    H, xedges, yedges = np.histogram2d(pcs[:, 0], pcs[:, 1], bins=(200, 200))
+    axs.scatter.axhline(0, color="black", alpha=0.25, markeredgewidth=0, linewidth=0.75)
+    axs.scatter.axvline(0, color="black", alpha=0.25, markeredgewidth=0, linewidth=0.75)
     scatter_kw = (
         dict(alpha=1, s=5, c=c if c is not None else θ, cmap=scatter_cmap, zorder=2, linewidth=0.2) | kwargs
     )

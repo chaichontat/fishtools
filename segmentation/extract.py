@@ -8,20 +8,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import tifffile
-from skimage import feature, filters
+from skimage import exposure, feature, filters
 from tifffile import imread, imwrite
 
-plt.imshow = lambda *args, **kwargs: plt.imshow(*args, zorder=1, **kwargs)
+# plt.imshow = lambda *args, **kwargs: plt.imshow(*args, zorder=1, **kwargs)
 sns.set_theme()
-roi = "right"
-path = Path(f"/mnt/working/20241113-ZNE172-Zach/analysis/deconv/registered--{roi}/")
+roi = "rightcortex"
+path = Path(f"/working/20241122-ZNE172-Trc3/registered--{roi}/")
 
 first = next(path.glob("*.tif"))
 with tifffile.TiffFile(first) as tif:
     names = tif.shaped_metadata[0]["key"]
     mapping = dict(zip(names, range(len(names))))
 
-
+mapping
 # %%
 idx = list(map(mapping.get, ["pi", "wga"]))
 
@@ -36,29 +36,42 @@ def run_filter(img: np.ndarray, filter_: Callable[[np.ndarray], np.ndarray], *, 
 
 unsharp_mask = partial(filters.unsharp_mask, preserve_range=True, radius=3)
 # %%
+# %%
+img = imread(first)
+plt.imshow(img[1, 30], zorder=1, vmax=np.percentile(img[1, 30], 99.9))
+
+
+# %%
+def clahe(img: np.ndarray):
+    return (exposure.equalize_adapthist(img, clip_limit=0.015) * 65535).astype(np.uint16)
 
 
 def run_2d(file: Path):
     with tifffile.TiffFile(file) as tif:
         img = tif.asarray()
         # (file.parent.parent / "pi--left").mkdir(exist_ok=True)
-        print(img.shape)
         for i in range(1, img.shape[0], 6):
             out = file.parent.parent.parent / f"segment--{roi}" / (file.stem + f"_small{i // 2 + 1:02d}.tif")
             out.parent.mkdir(exist_ok=True)
             imgout = img[i, idx, 500:-500, 500:-500]
-            imgout[-1] = run_filter(
-                img[
-                    (i - 1 if i > 1 else i) : (i + 1 if i < img.shape[0] - 1 else i), -1, 500:-500, 500:-500
-                ].max(axis=0),
-                unsharp_mask,
+            assert imgout.shape[0] == len(idx)
+            imgout[0] = clahe(run_filter(imgout[0], unsharp_mask))
+            imgout[1] = clahe(
+                run_filter(
+                    img[
+                        (i - 1 if i > 1 else i) : (i + 2 if i < img.shape[0] - 1 else i + 1),
+                        idx[1],
+                        500:-500,
+                        500:-500,
+                    ].max(axis=0),
+                    unsharp_mask,
+                )
             )
 
             if min(imgout.shape) == 0:
                 raise ValueError("Image is all zeros.")
 
             # imgout[-3] = run_filter(imgout[-3], unsharp_mask)
-            imgout[-2] = run_filter(imgout[-2], unsharp_mask)
 
             imwrite(
                 out,
@@ -70,7 +83,10 @@ def run_2d(file: Path):
                 # imagej=True,
             )
             print(out)
+    # return imgout
 
+
+# %%
 
 with ThreadPoolExecutor(8) as exc:
     futs = [

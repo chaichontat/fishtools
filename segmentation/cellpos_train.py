@@ -17,10 +17,10 @@ plt.imshow = lambda *args, **kwargs: plt.imshow(*args, zorder=1, **kwargs)
 
 logging.basicConfig(level=logging.INFO)
 
-path = Path("/mnt/working/lai/segment--left")
+path = Path.home() / "segmentation" / "pi-wga"
 
 
-name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "polyA"
+name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # + "polyA"
 
 
 # %%
@@ -51,7 +51,7 @@ LEARNING_RATES = {
 #     Defaults to True.
 normalize_params = {
     "lowhigh": None,
-    "percentile": (0.1, 99.9),
+    "percentile": (1, 99.9),
     "normalize": True,
     "norm3D": True,
     "sharpen_radius": 0,
@@ -61,6 +61,14 @@ normalize_params = {
     "invert": False,
 }
 
+# %%
+for p in path.rglob("*.npy"):
+    try:
+        u = np.load(p, allow_pickle=True)
+    except Exception as e:
+        print(p, e)
+        raise e
+
 
 # %%
 def train(path: Path, name: str | None = None):
@@ -69,11 +77,12 @@ def train(path: Path, name: str | None = None):
 
     output = load_train_test_data(
         path.as_posix(),
-        test_dir=(path.parent / "segment--test").as_posix(),
+        test_dir=(path.parent / "pi-wgatest").as_posix(),
         mask_filter="_seg.npy",
         look_one_level_down=True,
     )
     images, labels, image_names, test_images, test_labels, image_names_test = output
+    # return images, labels, image_names, test_images, test_labels, image_names_test
 
     # e.g. retrain a Cellpose model
     model = CellposeModel(model_type="cyto3", gpu=True)
@@ -82,23 +91,23 @@ def train(path: Path, name: str | None = None):
         model.net,
         train_data=images,
         train_labels=labels,
-        save_path=path,  # models automatically appended
+        save_path=path,  # /models automatically appended
         channels=[1, 2],
-        batch_size=24,
+        batch_size=16,
         channel_axis=0,
         test_data=test_images,
         test_labels=test_labels,
         weight_decay=1e-5,
         SGD=False,
         learning_rate=0.0008,
-        n_epochs=1000,
+        n_epochs=2000,
         model_name=name,
         bsize=224,
         normalize=cast(bool, normalize_params),
     )
 
 
-train(path, name=name)
+what = train(path, name=name)
 
 
 # dapi = imread("/fast2/3t3clean/analysis/deconv/registered/dapi3/0/fused_1.tif").squeeze()
@@ -119,3 +128,5 @@ res = model.eval(
 
 with open("/fast2/3t3clean/analysis/deconv/registered/dapi3/cellpose_polyA_result.pkl", "wb") as f:
     f.write(pickle.dumps(res))
+
+# %%

@@ -117,7 +117,7 @@ sc.pl.umap(
 )
 
 # %%
-sc.tl.leiden(adata, flavor="igraph", n_iterations=2, resolution=1.0)
+sc.tl.leiden(adata, flavor="igraph", resolution=1)
 sc.pl.umap(adata, color=["leiden"])
 # %%
 # Obtain cluster-specific differentially expressed genes
