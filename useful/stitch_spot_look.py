@@ -21,9 +21,9 @@ from tifffile import TiffFile, imread
 from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
-path = Path("/working/10xhuman")
+path = Path("/working/20241213-RPHuman/")
+roi = "full"
 codebook = "10xhuman"
-roi = "small"
 
 # Baysor
 # spots.filter(
@@ -52,31 +52,9 @@ spots = (
 print(len(spots))
 sns.set_theme()
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
-ax.scatter(spots["x"][::10], spots["y"][::10], s=0.1, alpha=0.3)
+ax.scatter(spots["x"][::100], spots["y"][::100], s=0.1, alpha=0.3)
 ax.set_aspect("equal")
 # %%
-# %%
-img = imread(path / f"stitch--{roi}" / "fused.tif").max(axis=0)
-# %%
-
-fig, axs = plt.subplots(ncols=4, nrows=1, figsize=(8, 4), dpi=300, facecolor="black")
-for i, ax in enumerate(axs.flat):
-    if i >= 5:
-        break
-    ax.axis("off")
-    ax.imshow(
-        img[-(i + 1), ::-4, ::-4].T,
-        zorder=1,
-        vmin=np.percentile(img[-(i + 1)], 40),
-        vmax=np.percentile(img[-(i + 1)], 99.9),
-        cmap="inferno",
-        origin="lower",
-    )
-for ax in axs.flat:
-    if not ax.has_data():
-        fig.delaxes(ax)
-
-plt.tight_layout()
 
 
 # %%
@@ -97,36 +75,36 @@ def count_by_gene(spots: pl.DataFrame):
 
 
 # pergene = count_by_gene(spots)
+spots_ = spots.filter(pl.col("area").is_between(15, 100))
 
 
 # %%
-spots_ = spots.filter(pl.col("area").is_between(16, 100))
-fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
-rand = np.random.default_rng(0)
-subsample = 1  # max(1, len(spots) // 50000)
-x = (spots_[::subsample]["area"]) ** (1 / 3) + rand.normal(0, 0.01, size=spots_[::subsample].__len__())
-y = np.log10(spots_[::subsample]["norm"])
-ax.hexbin(x, y)
-ax.set_xlabel("Radius")
-ax.set_ylabel("log10(norm)")
+# fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+# rand = np.random.default_rng(0)
+# subsample = 1  # max(1, len(spots) // 50000)
+# x = (spots_[::subsample]["area"]) ** (1 / 3) + rand.normal(0, 0.05, size=spots_[::subsample].__len__())
+# y = np.log10(spots_[::subsample]["norm"])
+# ax.hexbin(x, y)
+# ax.set_xlabel("Radius")
+# ax.set_ylabel("log10(norm)")
 # %%
 
 # %%
 
-spots_ = spots.filter(pl.col("norm").gt(0.01) & pl.col("area").is_between(16, 200))
-fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
-rand = np.random.default_rng(0)
-subsample = 1  # max(1, len(spots) // 50000)
-ax.hexbin(
-    (spots_[::subsample]["area"]) ** (1 / 2) + rand.normal(0, 0.1, size=spots_[::subsample].__len__()),
-    spots_[::subsample]["distance"],
-)
-ax.set_xlabel("Radius")
-ax.set_ylabel("Distance")
+# spots_ = spots.filter(pl.col("norm").gt(0.01) & pl.col("area").is_between(16, 200))
+# fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+# rand = np.random.default_rng(0)
+# subsample = 1  # max(1, len(spots) // 50000)
+# ax.hexbin(
+#     (spots_[::subsample]["area"]) ** (1 / 2) + rand.normal(0, 0.1, size=spots_[::subsample].__len__()),
+#     spots_[::subsample]["distance"],
+# )
+# ax.set_xlabel("Radius")
+# ax.set_ylabel("Distance")
 # %%
 spots_ = spots_.with_columns(
     x_=(pl.col("area") + np.random.uniform(-1, 1)) ** (1 / 3), y_=pl.col("norm").log10()
-).filter(pl.col("y_") > -2.1)
+).filter(pl.col("y_") > -1.9)
 bounds = spots_.select([
     pl.col("x_").min().alias("x_min"),
     pl.col("x_").max().alias("x_max"),
@@ -134,9 +112,9 @@ bounds = spots_.select([
     pl.col("y_").max().alias("y_max"),
 ]).row(0, named=True)
 # bounds["y_min"] = -2.1
-
-x = np.linspace(bounds["x_min"], bounds["x_max"], 50)
-y = np.linspace(bounds["y_min"], bounds["y_max"], 50)
+n = 50
+x = np.linspace(bounds["x_min"], bounds["x_max"], n)
+y = np.linspace(bounds["y_min"], bounds["y_max"], n)
 step_x = x[1] - x[0]
 step_y = y[1] - y[0]
 X, Y = np.meshgrid(x, y)
@@ -145,7 +123,7 @@ result = (
         ((pl.col("x_") - bounds["x_min"]) / step_x).floor().alias("i"),
         ((pl.col("y_") - bounds["y_min"]) / step_y).floor().alias("j"),
     ])
-    .filter((pl.col("i") >= 0) & (pl.col("i") < 49) & (pl.col("j") >= 0) & (pl.col("j") < 49))
+    .filter((pl.col("i") >= 0) & (pl.col("i") < n - 1) & (pl.col("j") >= 0) & (pl.col("j") < n - 1))
     .group_by(["i", "j"])
     .agg([pl.sum("is_blank").alias("blank_count"), pl.count().alias("total_count")])
     .with_columns((pl.col("blank_count") / (pl.col("total_count") + 1)).alias("proportion"))
@@ -154,13 +132,12 @@ result = (
 # Convert to numpy array
 Z = np.zeros_like(X)
 for row in result.iter_rows(named=True):
-    Z[int(row["j"]), int(row["i"])] = row["proportion"]
+    Z[int(row["j"]), int(row["i"])] = row["proportion"]  # * np.log1p(row["total_count"])
 from scipy.ndimage import gaussian_filter
 
-Z_smooth = gaussian_filter(Z, sigma=2)
-# Option 1: Basic colored plot (pcolormesh - recommended)
+Z_smooth = gaussian_filter(Z, sigma=3)
 plt.pcolormesh(X, Y, Z)
-contours = plt.contour(X, Y, Z_smooth, colors="black", levels=30)  # Add line contours
+contours = plt.contour(X, Y, Z_smooth, colors="black", levels=50)  # Add line contours
 plt.colorbar()
 
 
@@ -169,12 +146,38 @@ plt.colorbar()
 from scipy.interpolate import RegularGridInterpolator
 
 interp_func = RegularGridInterpolator((y, x), Z_smooth)
-threshold = contours.levels[4]
-point_densities = interp_func(spots_.select(["y_", "x_"]).to_numpy())
-spots_ = spots_.with_columns(point_density=point_densities).with_columns(
-    ok=pl.col("point_density") < threshold
-)
-spots_ok = spots_.filter(pl.col("ok"))
+# threshold = contours.levels[5]
+
+
+# %%
+def filter_threshold(thr: int):
+    threshold = contours.levels[thr]
+    point_densities = interp_func(spots_.select(["y_", "x_"]).to_numpy())
+    _sp = spots_.with_columns(point_density=point_densities).with_columns(
+        ok=pl.col("point_density") < threshold
+    )
+    spots_ok = _sp.filter(pl.col("ok"))
+    print(len(spots_ok), len(spots_))
+    return spots_ok
+
+
+# %%
+x, y = [], []
+for i in range(1, 20):
+    print(i, end=" ")
+    sp = filter_threshold(i)
+    x.append(len(sp))
+    y.append(sp.filter(pl.col("is_blank")).__len__() / len(sp))
+
+fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+ax.plot(list(range(1, 20)), x)
+ax2 = ax.twinx()
+ax2.plot(list(range(1, 20)), y)
+ax.set_ylim(0, None)
+# %%
+
+spots_ok = filter_threshold(20)
+# spots_ok = spots.filter(pl.col("area").is_between(18, 100) & pl.col("norm").gt(0.02))
 # %%
 # density_result = (
 #     spots_.with_columns([
@@ -211,14 +214,7 @@ def plot_scree(pergene: pl.DataFrame, limit: int = 5):
     return fig, ax
 
 
-plot_scree(
-    count_by_gene(
-        spots_.filter(pl.col("ok"))
-        # spots_ := spots.filter(
-        #     pl.col("area").is_between(18, 100) & pl.col("norm").gt(0.08)  # & pl.col("z").is_between(16, 34)
-        # )
-    )
-)
+plot_scree(count_by_gene(spots_ok))
 
 
 # %%
@@ -242,9 +238,32 @@ for ax in axs.flat:
     if not ax.has_data():
         fig.delaxes(ax)
 # %%
-spots_ = spots_.filter(pl.col("ok"))
-genes = spots_.group_by("target").len().sort("len", descending=True)["target"]
-# genes = sorted(set(spots_["target"]))
+
+
+# %%
+cb_raw = json.loads(Path(f"/home/chaichontat/fishtools/starwork3/{codebook}.json").read_text())
+
+cb = (
+    pl.DataFrame(cb_raw)
+    .transpose(include_header=True)
+    .with_columns(
+        concat_list=pl.concat_list("column_0", "column_1", "column_2").cast(pl.List(pl.UInt8)),
+        is_blank=pl.col("column").str.starts_with("Blank"),
+    )
+    .drop(["column_0", "column_1", "column_2"])
+    .rename({"column": "gene", "concat_list": "bits"})
+)
+
+joined = spots_ok.join(cb, left_on="target", right_on="gene", how="left")
+
+spots_ok.filter(~pl.col("is_blank")).write_parquet(path / f"{codebook}--{roi}.parquet")
+# %%
+
+
+# %%
+# spots_ = spots_.filter(pl.col("ok"))
+genes = spots_ok.group_by("target").len().sort("len", descending=True)["target"]
+genes = sorted(set(spots_["target"]))
 dark = False
 nrows = int(np.ceil(len(genes) / 20))
 fig, axs = plt.subplots(
@@ -252,7 +271,7 @@ fig, axs = plt.subplots(
 )
 axs = axs.flatten()
 for ax, gene in zip(axs, genes):
-    selected = spots_.filter(pl.col("target") == gene)
+    selected = spots_ok.filter(pl.col("target") == gene)
     if not len(selected):
         logger.warning(f"No spots found for {gene}")
         continue
@@ -269,29 +288,16 @@ for ax in axs.flat:
         fig.delaxes(ax)
 plt.tight_layout()
 
-
-# %%
-cb_raw = json.loads(Path(f"/home/chaichontat/fishtools/starwork3/ordered/{codebook}.json").read_text())
-
-cb = (
-    pl.DataFrame(cb_raw)
-    .transpose(include_header=True)
-    .with_columns(
-        concat_list=pl.concat_list("column_0", "column_1", "column_2").cast(pl.List(pl.UInt8)),
-        is_blank=pl.col("column").str.starts_with("Blank"),
-    )
-    .drop(["column_0", "column_1", "column_2"])
-    .rename({"column": "gene", "concat_list": "bits"})
-)
-
-joined = spots_ok.join(cb, left_on="target", right_on="gene", how="left")
-# %%
-spots_.filter(~pl.col("is_blank")).write_parquet(path / f"{codebook}.parquet")
-
-
 # %%
 
 np.array(np.unique(np.array(cb.filter(pl.col("is_blank"))["bits"].to_list()).flatten(), return_counts=True))
+# %% Blank abundance
+
+joined.group_by("target").len().join(cb, left_on="target", right_on="gene", how="left").filter(
+    pl.col("is_blank")
+).sort("len", descending=True)
+# %%
+
 
 # %%
 bits = sorted(set(chain.from_iterable(cb["bits"])))
@@ -317,11 +323,33 @@ for i, (ax, bit) in enumerate(zip(axs, bits)):
     ax.axis("off")
     ax.set_aspect("equal")
     ax.set_title(f"{bit}")
-    ax.scatter(filtered["x"][::10], filtered["y"][::10], s=0.3, alpha=0.1)
+    ax.scatter(filtered["x"][::50], filtered["y"][::50], s=0.3, alpha=0.1)
 plt.tight_layout()
 
+
+# %%
+# %%
+img = imread(path / f"stitch--{roi}" / "fused.tif").max(axis=0)
 # %%
 
+fig, axs = plt.subplots(ncols=4, nrows=1, figsize=(8, 4), dpi=300, facecolor="black")
+for i, ax in enumerate(axs.flat):
+    if i >= 5:
+        break
+    ax.axis("off")
+    ax.imshow(
+        img[-(i + 1), ::-4, ::-4].T,
+        zorder=1,
+        vmin=np.percentile(img[-(i + 1)], 40),
+        vmax=np.percentile(img[-(i + 1)], 99.9),
+        cmap="inferno",
+        origin="lower",
+    )
+for ax in axs.flat:
+    if not ax.has_data():
+        fig.delaxes(ax)
+
+plt.tight_layout()
 
 # %%
 

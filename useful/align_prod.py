@@ -333,8 +333,19 @@ def batch(
     limit_z: int | None = None,
     split: bool = False,
 ):
+    paths = {p.stem: p for p in path.glob(f"registered--{roi}/reg*.tif")}
+    # To account for split
+    exists = {
+        p.stem.rsplit("-", 1)[0]
+        for p in path.glob(f"registered--{roi}/decoded-{codebook_path.stem}/reg*.pkl")
+    }
+    if not overwrite:
+        old_len = len(paths)
+        paths = sorted({v for k, v in paths.items() if k not in exists})
+        logger.info(f"Skipping {old_len - len(paths)} files.")
+
     return _batch(
-        sorted(p for p in path.glob(f"registered--{roi}/reg*.tif")),
+        paths,
         "run",
         [
             "--global-scale",
@@ -631,7 +642,10 @@ def run(
     logger.info(
         f"Running {path.parent.name}/{path.name} {f'split {split}' if split is not None else ''} with {limit_z} z-slices and {subsample_z}x subsampling."
     )
-    codebook, used_bits, names, arr_zeroblank = load_codebook(codebook_path, exclude={"Malat1-201"})
+    codebook, used_bits, names, arr_zeroblank = load_codebook(
+        codebook_path,
+        exclude={"Malat1-201"},  # , "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
+    )
     used_bits = list(map(str, used_bits))
 
     # if not path.with_suffix(".highpassed.tif").exists():

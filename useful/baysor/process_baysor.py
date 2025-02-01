@@ -6,6 +6,7 @@ import cmocean  # colormap, do not remove
 import colorcet as cc  # colormap, do not remove
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import scanpy as sc
 import seaborn as sns
 import spaco
@@ -14,8 +15,8 @@ from shapely import MultiPolygon, Point, Polygon, STRtree
 
 sns.set_theme()
 plt.rcParams["figure.dpi"] = 200
-path = Path("/working/20241119-ZNE172-Trc/baysor--all")
-adata = sc.read_loom(path / "segmentation.cortex_counts.loom")
+path = Path("/mnt/working/e155_zach/baysor--all")
+adata = sc.read_loom(path / "segmentation_counts.loom")
 adata.var_names = adata.var["Name"]
 # adata = adata[~adata.obs["y"].between(24000, 45000) & adata.obs["x"].gt(2000)]
 # %%
@@ -36,8 +37,8 @@ n_genes = adata.shape[1]
 sc.pp.calculate_qc_metrics(
     adata, inplace=True, percent_top=(n_genes // 10, n_genes // 5, n_genes // 2, n_genes)
 )
-sc.pp.filter_cells(adata, min_counts=10)
-sc.pp.filter_genes(adata, min_cells=100)
+sc.pp.filter_cells(adata, min_counts=20)
+sc.pp.filter_genes(adata, min_cells=10)
 # adata = adata[(adata.obs["y"] < 23189.657075200797) | (adata.obs["y"] > 46211.58630310604)]
 adata.obsm["spatial"] = adata.obs[["x", "y"]].to_numpy()
 adata.write_h5ad(path / "segmentation_counts_filtered.h5ad")
@@ -55,7 +56,7 @@ print(np.median(adata.obs["total_counts"]))
 # sc.pp.log1p(adata)
 # %%
 # %%
-sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=600)
+sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=1000)
 # %%
 # %%
 fig, ax = plt.subplots(figsize=(8, 6))
@@ -96,18 +97,19 @@ sc.tl.pca(adata, n_comps=50)
 sc.pl.pca_variance_ratio(adata, log=True)
 
 # %%
-sc.pp.neighbors(adata, n_neighbors=15, n_pcs=30)
+import rapids_singlecell as rsc
 
-# %%
-sc.tl.umap(adata)
+sc.pp.neighbors(adata, n_neighbors=15, n_pcs=30, metric="cosine")
+sc.tl.leiden(adata, n_iterations=2, resolution=1, flavor="igraph")
+sc.tl.umap(adata, min_dist=0.1, n_components=2)
 # %%
 
 # sc.pl.embedding(adata, basis="spatial", color="total_counts")
 
-sc.tl.leiden(adata, flavor="igraph", n_iterations=2, directed=False, resolution=1)
 sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon")
 
 sc.pl.umap(adata, color="leiden")
+
 # %%
 sc.pl.embedding(adata, color="leiden", basis="spatial")  # type: ignore
 # %%
@@ -152,7 +154,7 @@ adata.write_h5ad(path / "pearsonedcortex.h5ad")
 # %%
 
 # %%
-import pandas as pd
+
 
 edu_stats = pd.read_csv(path / "edu_stats.csv")
 edu_stats["label"] = [f"{x:.1f}" for x in edu_stats["label"]]
@@ -191,7 +193,7 @@ sc.pl.embedding(
     # legend_loc="on data",
     frameon=False,
     # cmap="Blues",
-    cmap="twilight_shifted",
+    cmap="cet_colorwheel",
     # palette=palette_spaco,
     show=False,
 )
@@ -200,7 +202,7 @@ fig.set_size_inches(8, 10)
 for ax in fig.axes:
     ax.set_aspect("equal")
 # %%
-sc.pl.umap(adata, color=["intensity_mean_edu", "tricycle"], frameon=False, cmap="magma")
+sc.pl.umap(adata, color=["intensity_mean", "tricycle"], frameon=False, cmap="magma")
 
 
 # %%

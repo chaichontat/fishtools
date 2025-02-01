@@ -5,12 +5,11 @@ from pathlib import Path
 
 import polars as pl
 
-path = Path("/home/chaichontat/trc/ficture--leftcortex")
+path = Path("/mnt/working/lai/ficture")
 
 dfs = [
-    pl.read_parquet(path.parent / "leftcortex.parquet")
-    .with_row_index("idx")
-    .filter(pl.col("x").gt(7000) & pl.col("y").lt(-7500)),
+    pl.scan_parquet(path.parent.as_posix() + "/*.parquet").collect().with_row_index("idx")
+    # .filter(pl.col("y").is_between(-7500, 0)),
     # pl.read_parquet("/mnt/working/e155trcdeconv/registered--leftold/tricycleplus/spots.parquet"),
 ]
 
@@ -89,16 +88,17 @@ def run(path: Path, df: pl.DataFrame, z_range: tuple[int, int] | None = None):
 --out-dir {path / "output"} \
 --n-jobs 16 \
 --gzip "pigz -p 4" \
---train-width 7 \
+--train-width 12 \
 --plot-each-factor \
 --major-axis Y \
---n-factor {i} \
+--n-factor 24 \
 --all""",
         shell=True,
         check=True,
     )
 
-    # %%
+
+# %%
 
 
 with ThreadPoolExecutor(16) as exc:
@@ -108,3 +108,5 @@ with ThreadPoolExecutor(16) as exc:
 
     for f in as_completed(futs):
         f.result()
+
+# %%
