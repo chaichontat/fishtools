@@ -68,6 +68,7 @@ def find_spots(
     img: np.ndarray[np.uint16, Any],
     threshold_sigma: float,
     fwhm: float,
+    minimum_spots: int = 6,
 ):
     """Fit Gaussians to the image and find peaks.
 
@@ -99,7 +100,7 @@ def find_spots(
         df = pl.DataFrame(iraffind(img - median).to_pandas()).sort("mag").with_row_count("idx")
     except AttributeError:
         df = pl.DataFrame()
-    if len(df) < 6:
+    if len(df) < minimum_spots:
         raise NotEnoughSpots
     return df
 
@@ -203,8 +204,8 @@ def _calculate_drift(
     #     ),
     #     TranslationTransform,
     #     min_samples=min(len(drifts), 30),
-    #     residual_threshold=0.01,
-    #     max_trials=100,
+    #     residual_threshold=0.1,
+    #     max_trials=200,
     # )[0]  # type: ignore
 
     # if model is not None:
@@ -231,6 +232,32 @@ class ResidualTooLarge(Exception): ...
 
 
 class DriftTooLarge(Exception): ...
+
+
+def handle_exception(local_σ, local_fwhm, *, tried: set[tuple[float, float]], exc: Exception, rand):
+    logger.warning(f"{exc.__class__.__name__}. σ threshold: {local_σ} FWHM: {local_fwhm}")
+    if isinstance(exc, NotEnoughSpots):
+        if local_σ > 2:
+            local_σ -= 0.5
+        else:
+            local_fwhm += 0.5
+    elif isinstance(exc, TooManySpots):
+        local_σ += 0.5
+        while (local_σ, local_fwhm) in tried:
+            local_fwhm += 0.5
+            logger.warning(f"Trying with larger FWHM. σ threshold: {local_σ}, FWHM: {local_fwhm}")
+    elif isinstance(exc, DriftTooLarge) or isinstance(exc, ResidualTooLarge):
+        local_σ += 0.5
+        if (local_σ, local_fwhm) in tried and local_fwhm >= 4.0:
+            local_fwhm -= 0.5
+            logger.warning(f"Trying with smaller FWHM. σ threshold: {local_σ}, FWHM: {local_fwhm}")
+        while (local_σ, local_fwhm) in tried:
+            local_fwhm += 0.5
+            logger.warning(f"Trying with smaller FWHM. σ threshold: {local_σ}, FWHM: {local_fwhm}")
+
+    else:
+        raise exc
+    return local_σ, local_fwhm
 
 
 def run_fiducial(
@@ -277,7 +304,7 @@ def run_fiducial(
             fixed = fixed[: max(np.argmax(np.diff(fixed["mag"])), 10, len(fixed) // 4)]
             break
     else:
-        raise NotEnoughSpots("Could not find spots on reference after 4 attempts.")
+        raise NotEnoughSpots("Could not find spots on reference after 6 attempts.")
 
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
@@ -290,11 +317,17 @@ def run_fiducial(
         _attempt = 0
         residual = np.inf
         drift = np.array([0, 0])
+        local_fwhm = fwhm
+        tried: set[tuple[float, float]] = set()
 
         # Iteratively reduce threshold_sigma until we get enough fiducials.
-        while _attempt < 10:
+        while _attempt < 30:
+            rand = np.random.default_rng(0)
+            tried.add((local_σ, local_fwhm))
             try:
-                moving = find_spots(img, threshold_sigma=local_σ, fwhm=fwhm)
+                moving = find_spots(
+                    img, threshold_sigma=local_σ, fwhm=local_fwhm, minimum_spots=max(6, len(fixed) // 2)
+                )
                 moving = moving[: max(np.argmax(np.diff(moving["mag"])), 10, len(moving) // 4)]
 
                 logger.debug(f"{bitname}: {len(moving)} peaks found on target image.")
@@ -319,27 +352,24 @@ def run_fiducial(
                         break
                     initial_drift = drift
 
-            except NotEnoughSpots:
+                if np.max(drift) > 40:
+                    local_σ += 0.5
+                    raise DriftTooLarge(f"{bitname}: drift very large {np.hypot(*drift):.2f}.")
+
+                if residual > threshold_residual:
+                    local_σ += 0.5
+                    raise ResidualTooLarge(
+                        f"{bitname}: residual drift too large {residual=:2f}. Please refine parameters."
+                    )
+            except Exception as e:
                 _attempt += 1
-                local_σ -= 0.5
-                logger.warning(f"Not enough spots. Attempt {_attempt}. σ threshold: {local_σ}")
-            except TooManySpots:
-                _attempt += 1
-                local_σ += 0.5
-                logger.warning(f"Too many spots. Attempt {_attempt}. σ threshold: {local_σ}")
+                local_σ, local_fwhm = handle_exception(local_σ, local_fwhm, tried=tried, exc=e, rand=rand)
             else:
                 break
         else:
-            logger.critical(f"Could not find spots after {_attempt} attempts.")
+            logger.critical(f"Fiducial matching failed after {_attempt} attempts.")
             raise NotEnoughSpots
 
-        if np.hypot(*drift) > 45:
-            raise DriftTooLarge(f"{bitname}: drift very large {np.hypot(*drift):.2f}.")
-
-        if residual > threshold_residual:
-            raise ResidualTooLarge(
-                f"{bitname}: residual drift too large {residual=:2f}. Please refine parameters."
-            )
         return drift, residual
 
     return inner

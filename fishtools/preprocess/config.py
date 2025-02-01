@@ -57,8 +57,8 @@ class RegisterConfig(BaseModel):
 
 
 class ChannelConfig(BaseModel):
-    discards: dict[str, list[str]] = Field(
-        description="In case of duplicated key(s), discard the ones from the file in value."
+    discards: dict[str, list[str]] | None = Field(
+        None, description="In case of duplicated key(s), discard the ones from the file in value."
     )
 
 
