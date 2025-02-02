@@ -1,9 +1,12 @@
 # %%
+import json
 from collections import deque
 from pathlib import Path
-import json
+
 import polars as pl
+import pyfastx
 from Bio import Restriction, Seq
+from loguru import logger
 
 from fishtools import Dataset, SAMFrame, gen_fasta, rc
 from fishtools.mkprobes.starmap.starmap import test_splint_padlock
@@ -14,14 +17,24 @@ hfs = pl.read_csv("data/headerfooter.csv")
 t7promoter = "TAATACGACTCACTATAGGG"
 bits = pl.read_csv("data/readout_ref_filtered.csv")
 bits = dict(zip(bits["seq"], bits["id"]))
-
-manifest = json.loads(Path("starwork5/_manifest.json").read_text())
-idx = 1
-
+# %%
+manifest = json.loads(Path("starwork6/_manifest.json").read_text())
+idx = 3
 species = manifest[idx]["species"]
-ds = Dataset(f"data/{species}")
-ss = Path(f"starwork5/generated/{manifest[idx]['name']}_final.txt").read_text().splitlines()
+# %%
+species = "mouse"
+# %%
+try:
+    ds = Dataset(f"data/{species}")
+except (FileNotFoundError, FileExistsError):
+    logger.warning(f"Could not find {species}.")
+
+ss = Path(f"starwork6/generated/{manifest[idx]['name']}_final.txt").read_text().splitlines()
 assert manifest[idx]["bcidx"] == idx
+# %%
+
+
+# %%
 
 
 def t7(seq: str):
@@ -69,7 +82,7 @@ def process(seq: str, rt_primer: str, anneal_primer: tuple[str, str]):
     return double_digest(rted)
 
 
-i = 60
+i = 5
 sp = process(
     ss[2 * i],
     hfs[2 * idx, "header"],
@@ -83,22 +96,27 @@ pad = process(
 
 # pad = "GTAGACTACACACGGACACATTCATCTCTAACTCACATACACTAAAGATTGGTTC"
 # sp = "GGCTTCCCATAGGTGTATATGCTAGTCTACGAACCA"
+# %%
+sp = "gtgtcgatctttactgtgtggagattgTAGTCTACGAACCA"
+pad = "GTAGACTActggtgtcccgtgaaatcatcaTTATCCATCCCTCTTCCTACATTGGTTC"
+
 
 # %%
+mode = "txome" if species in {"human", "mouse"} else "genome"
 df = SAMFrame.from_bowtie(
     gen_fasta(
         # forward handle of splint, last 17 bases of splint are ligation handles
         # first 9 bases of pad are ligation handle
-        [sp[3:-14], pad[6:27]],
+        [sp[10:-14], pad[9:27]],
         # [sp[3 : -(2 + 8 + 6)], pad[8:29]],
         names=["splint", "padlock"],
     ).getvalue(),
-    f"data/{species}/txome",
+    f"data/{species}/{mode}",
     seed_length=12,
-    threshold=15,
-    n_return=200,
+    threshold=16,
+    n_return=-1,
     fasta=True,
-    no_forward=True,
+    no_forward=mode == "txome",
 )
 # %%
 
@@ -107,20 +125,27 @@ df = SAMFrame.from_bowtie(
 sps = set(df.filter(pl.col("name") == "splint").sort("match_consec")["transcript"])
 pads = set(df.filter(pl.col("name") == "padlock").sort("match_consec")["transcript"])
 filtered = df.filter(pl.col("transcript").is_in(sps & pads)).sort(["transcript", "name"])
-assert filtered.select((pl.col("flag") & 16 != 0).all())[0, "flag"]  # reverse strand
+if mode == "txome":
+    assert filtered.select((pl.col("flag") & 16 != 0).all())[0, "flag"]  # reverse strand
 print(filtered[["name", "flag", "transcript", "pos"]])
 
+if mode == "genome":
+    filtered = filtered.sort("match_consec")[-2:].sort("pos")
 idxs = (filtered[0, "pos"] + filtered[0, "match_consec"], filtered[1, "pos"])
+
 gap = idxs[1] - idxs[0]
 print(gap)
 assert 0 <= gap <= 3  # distance between end of splint and start of padlock less than 3
 # assert test_splint_padlock(sp[-14:], pad, lengths=(6, 8))
 assert test_splint_padlock(sp, pad, lengths=(6, 6))
+# %%
 
 
 # %%
-
 transcript = ds.ensembl.get_seq(filtered[0, "transcript"])
+# transcript = pyfastx.Fasta("data/doryteuthis/GCA_023376005.1_UCB_Dpea_1_genomic.fna")[
+#     filtered[0, "transcript"]
+# ].seq
 
 # %%
 
@@ -130,6 +155,7 @@ startpad = filtered[1, "pos"]
 
 def show_starmap(
     transcript: str,
+    idxs: tuple[int, int],
     pad: str,
     splint: str,
     gap: int = 0,
@@ -156,7 +182,7 @@ def show_starmap(
         printc(space + a + ("-" if rc(a) == b else " ") * gap + b)
 
     combi = splint[:-overhang] + " " * gap + pad[pad_hang + splint_gap : pad_hang + 25] + "---"
-    template = transcript[idxs[0] - 27 : idxs[1] + len(splint) - overhang - 1][::-1]
+    template = rc(transcript[idxs[0] - 27 : idxs[1] + len(splint) - overhang - 1])[::-1]
 
     # alignment
     printc(combi)
@@ -165,9 +191,7 @@ def show_starmap(
 
 
 # show_starmap(transcript, df[10, "cons_pad"], df[10, "cons_splint"], pad_hang=6, pad_tail=6, gap=0)
-show_starmap(transcript, pad, sp, gap=1)
-# assert len(sp) == 45
-# assert 91 <= len(pad) <= 107
+show_starmap(transcript, idxs, pad, sp, gap=1)
 
 # %%
 
