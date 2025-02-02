@@ -3,9 +3,12 @@ import re
 import shutil
 import subprocess
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import ParamSpec, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -107,7 +110,9 @@ def run_imagej(
     # output_file_directory={path.resolve()}");
 
     macro = f"""
-    run("Memory & Threads...", "parallel=16");
+    run("Memory & Threads...", "maximum=102400 parallel=32");
+
+    // run("Memory & Threads...", "parallel=16");
 
     run("Grid/Collection stitching", "type=[Positions from file] \
     order=[Defined by TileConfiguration] directory={path.resolve()} \
@@ -191,6 +196,25 @@ def extract_channel(
 def cli(): ...
 
 
+P, T = ParamSpec("P"), TypeVar("T")
+
+
+def batch_roi(look_for: str = "registered--*"):
+    def decorator(func: Callable[P, T]) -> Callable[P, T | None]:
+        @wraps(func)
+        def inner(**kwargs: P.kwargs) -> T:
+            if kwargs["roi"] == "*":
+                for p in Path(kwargs["path"]).glob(look_for):
+                    print(kwargs | dict(roi=p.name.split("--")[1]))
+                    func(**(kwargs | dict(roi=p.name.split("--")[1])))
+                return
+            return func(**kwargs)
+
+        return inner
+
+    return decorator
+
+
 @cli.command()
 # "Path to registered images folder. Expects CYX images. Will reshape to CYX if not. Assumes ${name}-${idx}.tif",
 @click.argument(
@@ -198,24 +222,26 @@ def cli(): ...
     type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
 )
 @click.argument("roi", type=str)
-@click.argument("position_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--position_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--idx", "-i", type=int, help="Channel (index) to use for registration")
 @click.option("--fid", is_flag=True)
 @click.option("--threshold", type=float, default=0.4)
 @click.option("--overwrite", is_flag=True)
 @click.option("--max-proj", is_flag=True)
+@batch_roi()
 def register(
     path: Path,
     roi: str,
-    position_file: Path,
     *,
+    position_file: Path | None = None,
     idx: int | None = None,
     fid: bool = False,
     max_proj: bool = False,
     overwrite: bool = False,
     threshold: float = 0.4,
 ):
-    path = path / f"registered--{roi}"
+    base_path = path
+    path = next(path.glob(f"registered--{roi}*"))
     if not path.exists():
         raise ValueError(f"No registered images at {path.resolve()} found.")
 
@@ -273,7 +299,15 @@ def register(
         files_idx = [int(file.stem.split("-")[-1]) for file in files if file.stem.split("-")[-1].isdigit()]
         logger.debug(f"Using {files_idx}")
         tileconfig = TileConfiguration.from_pos(
-            pd.read_csv(position_file, header=None).iloc[sorted(files_idx)]
+            pd.read_csv(
+                position_file
+                or (
+                    base_path / f"{roi}.csv"
+                    if (base_path / f"{roi}.csv").exists()
+                    else (base_path.resolve().parent.parent / f"{roi}.csv")
+                ),
+                header=None,
+            ).iloc[sorted(files_idx)]
         )
         tileconfig.write(out_path / "TileConfiguration.txt")
         logger.info(f"Created TileConfiguration at {out_path}.")
@@ -374,6 +408,7 @@ def extract(
 @click.option("--is-2d", is_flag=True)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--channels", type=str, default="-3,-2,-1")
+@batch_roi("stitch--*")
 def fuse(
     path: Path,
     roi: str,
@@ -453,6 +488,7 @@ def fuse(
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("roi", type=str)
 @click.option("--threads", "-t", type=int, default=8)
+@batch_roi("stitch--*")
 def combine(path: Path, roi: str, threads: int = 8):
     path = Path(path / f"stitch--{roi}")
     folders = sorted(folder for folder, subfolders, _ in (path).walk() if not subfolders)
@@ -511,18 +547,17 @@ def combine(path: Path, roi: str, threads: int = 8):
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("roi", type=str)
-@click.argument("position_file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.argument("roi", type=str, default="*")
 @click.option("--tile_config", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
 @click.option("--downsample", "-d", type=int, default=2)
 @click.option("--subsample-z", type=int, default=1)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--channels", type=str, default="-3,-2,-1")
+@batch_roi()
 def run(
     path: Path,
     roi: str,
-    position_file: Path,
     *,
     tile_config: Path | None = None,
     overwrite: bool = False,
@@ -531,7 +566,7 @@ def run(
     channels: str = "-3,-2,-1",
     subsample_z: int = 1,
 ):
-    register.callback(path, roi, position_file, fid=True)
+    register.callback(path, roi, path / f"{roi}.csv", fid=True)
     fuse.callback(
         path,
         roi,

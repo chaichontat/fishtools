@@ -18,19 +18,27 @@ from fishtools.preprocess.deconv import scale_deconv
 sns.set_theme()
 
 
-def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4)):
+def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[float] = (0.5,)):
     # if "deconv" in path.resolve().as_posix() and not deconv:
     #     raise ValueError("deconv in path. Make sure to set deconv=True")
 
+    (path / "basic").mkdir(exist_ok=True)
+
+    logger.info(f"Running {round_}")
+
     # TODO: Get channel info.
     nc = round_.split("_").__len__()
+    if not all(0 <= z <= 1 for z in zs):
+        raise ValueError("zs must be between 0 and 1.")
 
     if nc == 4:
         channels = [488, 560, 650, 750]
     else:
         channels = [560, 650, 750]
 
-    files = list((path).glob(f"{round_}*/*.tif"))
+    files = list((path).glob(f"{round_}--*/*.tif"))
+    # Put --basic files last
+    files.sort(key=lambda x: ("--basic" in str(x), str(x)))
 
     if len(files) < 100:
         raise ValueError(f"Not enough files ({len(files)}). Need at least 100 to be somewhat reliable.")
@@ -48,17 +56,22 @@ def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4
     else:
         deconv_meta = None
 
+    n_zs = {}
+
     # This is the extracted z slices from all files.
     out = np.zeros((n, len(zs), nc, 2048, 2048), dtype=np.float32)
     for i, file in enumerate(files[:n]):
         if i % 100 / len(channels) == 0:
             logger.info("Loaded {}/{}", i, n)
         with TiffFile(file) as tif:
+            if file.parent.name not in n_zs:
+                n_zs[file.parent.name] = len(tif.pages) // nc
+            nz = n_zs[file.parent.name]
             meta = tif.shaped_metadata[0]
             for c in range(nc):
                 for k, z in enumerate(zs):
                     try:
-                        img = tif.pages[z * nc + c].asarray()
+                        img = tif.pages[int(z * nz) * nc + c].asarray()
                         out[i, k, c] = (
                             img
                             if deconv_meta is None
@@ -77,8 +90,18 @@ def _run(path: Path, round_: str, *, plot: bool = True, zs: Collection[int] = (4
 
     logger.info(f"Loaded {len(files)} files. {out.shape}")
 
-    with ThreadPoolExecutor() as exc:
-        futs = [exc.submit(fit_basic, out, c) for c in range(out.shape[1])]
+    def fit_write(c: int):
+        basic = fit_basic(out, c)
+        logger.info(f"Writing {round_}-{c}.pkl")
+        with open(path / "basic" / f"{round_}-{c}.pkl", "wb") as f:
+            pickle.dump(basic, f)
+            plot_basic(basic)
+            plt.savefig(path / "basic" / f"{round_}-{c}.png")
+            plt.close()
+        return basic
+
+    with ThreadPoolExecutor(3) as exc:
+        futs = [exc.submit(fit_write, c) for c in range(out.shape[1])]
         basics: list[BaSiC] = []
         for fut in futs:
             basics.append(fut.result())
@@ -96,31 +119,22 @@ def cli(): ...
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("round_", type=str)
-@click.option("--channels", "-c", type=str, default="560,650,750")
-@click.option("--zs", type=str, default="4")
+@click.option("--zs", type=str, default="0.5")
 @click.option("--overwrite", is_flag=True)
-def run(path: Path, round_: str, *, overwrite: bool = False, channels: str = "560,650,750", zs: str = "4"):
-    (path / "basic").mkdir(exist_ok=True)
-    path_pickle = path / "basic" / f"{round_}.pkl"
-    if path_pickle.exists() and not overwrite:
+def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5"):
+    paths_pickle = [path / "basic" / f"{round_}-{c}.pkl" for c in range(round_.split("_").__len__())]
+    if all(p.exists() for p in paths_pickle) and not overwrite:
         logger.info(f"Skipping {round_}. Already exists.")
         return
 
-    logger.info(f"Running {round_}")
-    basics = _run(path, round_, plot=False, zs=tuple(map(int, zs.split(","))))
-    with open(path / "basic" / f"{round_}.pkl", "wb") as f:
-        pickle.dump(dict(zip(channels.split(","), basics)), f)
-    for c, basic in zip(channels.split(","), basics):
-        plot_basic(basic)
-        plt.savefig(path / "basic" / f"{round_}-{c}.png")
-        plt.close()
+    return _run(path, round_, plot=False, zs=tuple(map(float, zs.split(","))))
 
 
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--overwrite", is_flag=True)
-@click.option("--threads", "-t", type=int, default=2)
-def batch(path: Path, overwrite: bool = False, threads: int = 2):
+@click.option("--threads", "-t", type=int, default=1)
+def batch(path: Path, overwrite: bool = False, threads: int = 1):
     rounds = sorted({p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name})
     with ThreadPoolExecutor(threads) as exc:
         futs = [exc.submit(run.callback, path, r, overwrite=overwrite) for r in rounds]  # type: ignore

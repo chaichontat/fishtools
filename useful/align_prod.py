@@ -212,9 +212,11 @@ def _batch(
             callback()
 
 
-def sample_imgs(path: Path, round_num: int, *, batch_size: int = 50):
+def sample_imgs(path: Path, codebook: str, round_num: int, *, batch_size: int = 50):
     rand = np.random.default_rng(round_num)
-    paths = sorted((p for p in path.glob("registered--*/reg*.tif") if not p.name.endswith(".hp.tif")))
+    paths = sorted(
+        (p for p in path.glob(f"registered--*+{codebook}/reg*.tif") if not p.name.endswith(".hp.tif"))
+    )
     if batch_size > len(paths):
         logger.info(f"Batch size {batch_size} is larger than {len(paths)}. Returning all images.")
         return paths
@@ -247,7 +249,9 @@ def optimize(
     if not (path / f"opt_{codebook_path.stem}" / "percentiles.json").exists():
         raise Exception("Please run `fishtools find-threshold` first.")
 
-    selected = sample_imgs(path, round_num, batch_size=batch_size * (2 if round_num == 0 else 1))
+    selected = sample_imgs(
+        path, codebook_path.stem, round_num, batch_size=batch_size * (2 if round_num == 0 else 1)
+    )
 
     group_counts = {key: len(list(group)) for key, group in groupby(selected, key=lambda x: x.parent.name)}
     logger.info(f"Group counts: {json.dumps(group_counts, indent=2)}")
@@ -282,7 +286,7 @@ def optimize(
 @click.option("--percentile", type=float, default=25)
 def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 25):
     SUBFOLDER = "_highpassed"
-    paths = sorted(path.glob(f"registered--{roi}/reg*.tif"))
+    paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
 
     rand = np.random.default_rng(0)
     if len(paths) > 50:
@@ -293,7 +297,7 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 25)
 
     _batch(paths, "run", ["--codebook", str(codebook), "--highpass-only"], threads=4, split=[0])
 
-    highpasses = list(path.glob(f"registered--{roi}/{SUBFOLDER}/*_{codebook.stem}.hp.tif"))
+    highpasses = list(path.glob(f"registered--{roi}+{codebook.stem}/{SUBFOLDER}/*_{codebook.stem}.hp.tif"))
     logger.info(f"Found {len(highpasses)} images to get percentiles from.")
     norms = {}
 
@@ -333,11 +337,11 @@ def batch(
     limit_z: int | None = None,
     split: bool = False,
 ):
-    paths = {p.stem: p for p in path.glob(f"registered--{roi}/reg*.tif")}
+    paths = {p.stem: p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
     # To account for split
     exists = {
         p.stem.rsplit("-", 1)[0]
-        for p in path.glob(f"registered--{roi}/decoded-{codebook_path.stem}/reg*.pkl")
+        for p in path.glob(f"registered--{roi}+{codebook_path.stem}/decoded-{codebook_path.stem}/reg*.pkl")
     }
     if not overwrite:
         old_len = len(paths)
@@ -427,7 +431,9 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
         codebook_path
         round_num: starts from 0.
     """
-    selected = sample_imgs(path, round_num, batch_size=batch_size * 2 if round_num == 0 else batch_size)
+    selected = sample_imgs(
+        path, codebook_path.stem, round_num, batch_size=batch_size * 2 if round_num == 0 else batch_size
+    )
     path_opt = create_opt_path(
         path_folder=path, codebook_path=codebook_path, mode="folder", round_num=round_num
     )
@@ -652,7 +658,9 @@ def run(
     with TiffFile(path) as tif:
         img_keys = tif.shaped_metadata[0]["key"]
 
-    bit_mapping = {k: i for i, k in enumerate(img_keys)}
+    bit_mapping = {str(k): i for i, k in enumerate(img_keys)}
+
+    print(bit_mapping, path)
     # img = tif.asarray()[:, [bit_mapping[k] for k in used_bits]]
     # blurred = gaussian(path, sigma=8)
     # blurred = levels(blurred)  # clip negative values to 0.

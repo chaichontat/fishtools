@@ -156,9 +156,11 @@ def run(
         path = path_wd / f"registered--{roi}"
         path_cb = path / ("decoded-" + codebook.stem)
         try:
-            coords = load_coords(path, roi)
+            coords = load_coords(path, roi.split("+")[0])
         except FileNotFoundError as e:
-            logger.error(f"Could not find {path / 'coords.parquet'}. Skipping {roi}.")
+            logger.error(
+                f"Could not find {path / f'stitch--{roi}' / 'TileConfiguration.registered.txt'}. Skipping {roi}."
+            )
             continue
 
         assert len(coords) == len(set(coords["index"]))

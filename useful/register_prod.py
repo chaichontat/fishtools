@@ -5,11 +5,12 @@ import sys
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
-import click
 import numpy as np
+import rich_click as click
 import tifffile
 import toml
 from basicpy import BaSiC
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
 # %%
 
-DATA = Path("/fast2/fishtools/data")
+DATA = Path("/home/chaichontat/fishtools/data")
 
 
 # %%
@@ -219,7 +220,7 @@ class Image:
             # raise Exception(f"No basic template found at {path_basic}")
             basic = lambda: None
 
-        fids_raw = np.atleast_3d(img[-n_fids:]).max(axis=0)
+        fids_raw = img[-n_fids]  # np.atleast_3d(img[-n_fids:]).max(axis=0)
         return cls(
             name=name,
             idx=int(idx),
@@ -248,6 +249,7 @@ class Image:
 def run_fiducial(
     path: Path,
     fids: dict[str, np.ndarray],
+    codebook_name: str,
     config: Config,
     *,
     roi: str,
@@ -261,7 +263,7 @@ def run_fiducial(
 
     if (
         not config.registration.fiducial.use_fft
-        and len(shifts_existing := sorted((path / f"shifts--{roi}").glob("*.json"))) > 10
+        and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
     ):
         _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
         for shift_path in shifts_existing:
@@ -311,7 +313,7 @@ def run_fiducial(
         metadata={"axes": "YX"},
     )
 
-    _fids_path = path / f"registered--{roi}" / "_fids"
+    _fids_path = path / f"registered--{roi}+{codebook_name}" / "_fids"
     _fids_path.mkdir(exist_ok=True, parents=True)
 
     tifffile.imwrite(
@@ -382,26 +384,41 @@ def run(
     idx: int,
     reference: str = "4_12_20",
     *,
+    codebook: str | Path,
     config: Config,
     debug: bool = False,
     overwrite: bool = False,
 ):
     logger.info("Reading files")
+    out_path = path / f"registered--{roi}+{Path(codebook).stem}"
+    out_path.mkdir(exist_ok=True, parents=True)
 
-    if not overwrite and (path / f"registered--{roi}" / f"reg-{idx:04d}.tif").exists():
+    if not overwrite and (out_path / f"reg-{idx:04d}.tif").exists():
         logger.info(f"Skipping {idx}")
         return
 
-    path_prevfids = path / f"registered--{roi}" / "_fids" / f"_fids-{idx:04d}.tif"
+    path_prevfids = out_path / "_fids" / f"_fids-{idx:04d}.tif"
     if path_prevfids.exists():
         with TiffFile(path_prevfids) as tif:
             _fids = tif.asarray()
             fids = {k: v for k, v in zip(tif.shaped_metadata[0]["key"], _fids)}
             del _fids
-        shifts = run_fiducial(path, fids, config, roi=roi, reference=reference, debug=debug, idx=idx)
+        shifts = run_fiducial(
+            path, fids, Path(codebook).stem, config, roi=roi, reference=reference, debug=debug, idx=idx
+        )
         del fids
     else:
         shifts = {}
+
+    cb = json.loads(Path(codebook).read_text())
+    bits = set(chain.from_iterable(cb.values()))
+    folders = {
+        p
+        for p in Path(path).glob(f"*--{roi}")
+        if p.is_dir()
+        and not any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
+        and set(p.name.split("--")[0].split("_")) & set(map(str, bits | set(map(int, reference.split("_")))))
+    }
 
     # Convert file name to bit
     _imgs: list[Image] = [
@@ -410,7 +427,7 @@ def run(
             discards=config.channels and config.channels.discards,
             n_fids=config.registration.fiducial.n_fids,
         )
-        for file in sorted(Path(path).glob(f"*--{roi}/*-{idx:04d}.tif" if roi else f"*/*-{idx:04d}.tif"))
+        for file in chain.from_iterable(p.glob(f"*-{idx:04d}.tif") for p in folders)
         if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
     ]
     imgs = {img.name: img for img in _imgs}
@@ -424,6 +441,7 @@ def run(
         shifts = run_fiducial(
             path,
             {name: img.fid for name, img in imgs.items()},
+            Path(codebook).stem,
             config,
             roi=roi,
             reference=reference,
@@ -433,9 +451,15 @@ def run(
 
     for _img in imgs.values():
         del _img.fid, _img.fid_raw
+
+    # Remove reference if not in codebook since we're done with fiducials.
+    if not (set(reference.split("_")) & set(map(str, bits))):
+        del imgs[reference]
+
     channels: dict[str, str] = {}
     for img in imgs.values():
         channels |= dict(zip(img.bits, img.powers))
+
     logger.debug(f"Channels: {channels}")
 
     # Split into individual bits.
@@ -524,11 +548,10 @@ def run(
     keys: list[str] = [k for k, _ in items]
     logger.debug(str([f"{i}: {k}" for i, k in enumerate(keys, 1)]))
 
-    (outpath := (path / f"registered--{roi}")).mkdir(exist_ok=True, parents=True)
     # (path / "down2").mkdir(exist_ok=True)
 
     tifffile.imwrite(
-        outpath / f"reg-{idx:04d}.tif",
+        out_path / f"reg-{idx:04d}.tif",
         out,
         compression=22610,
         compressionargs={"level": 0.75},
@@ -555,6 +578,7 @@ def run(
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("idx", type=int)
+@click.option("--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path))
 @click.option("--roi", type=str, default="")
 @click.option("--debug", is_flag=True)
 @click.option("--reference", "-r", type=str)
@@ -565,6 +589,7 @@ def main(
     path: Path,
     idx: int,
     reference: str,
+    codebook: Path,
     roi: str,
     debug: bool = False,
     overwrite: bool = False,
@@ -598,6 +623,7 @@ def main(
         roi,
         idx,
         reference=reference,
+        codebook=codebook,
         debug=debug,
         config=Config(
             dataPath=str(DATA),
@@ -636,7 +662,7 @@ def main(
                     n_fids=2,
                 ),
                 downsample=1,
-                crop=30,
+                crop=36,
                 slices=slice(None),
                 reduce_bit_depth=0,
             ),

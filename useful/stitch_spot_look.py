@@ -21,9 +21,9 @@ from tifffile import TiffFile, imread
 from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
-path = Path("/working/20241213-RPHuman/")
-roi = "full"
-codebook = "10xhuman"
+path = Path("/working/20250131_bigprobenotmangled/analysis/deconv")
+roi = "full+zachDE"
+codebook = "zachDE"
 
 # Baysor
 # spots.filter(
@@ -75,7 +75,7 @@ def count_by_gene(spots: pl.DataFrame):
 
 
 # pergene = count_by_gene(spots)
-spots_ = spots.filter(pl.col("area").is_between(15, 100))
+spots_ = spots.filter(pl.col("area").is_between(12, 100))
 
 
 # %%
@@ -101,6 +101,7 @@ spots_ = spots.filter(pl.col("area").is_between(15, 100))
 # )
 # ax.set_xlabel("Radius")
 # ax.set_ylabel("Distance")
+
 # %%
 spots_ = spots_.with_columns(
     x_=(pl.col("area") + np.random.uniform(-1, 1)) ** (1 / 3), y_=pl.col("norm").log10()
@@ -163,20 +164,20 @@ def filter_threshold(thr: int):
 
 # %%
 x, y = [], []
-for i in range(1, 20):
+for i in range(1, 15):
     print(i, end=" ")
     sp = filter_threshold(i)
     x.append(len(sp))
     y.append(sp.filter(pl.col("is_blank")).__len__() / len(sp))
 
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
-ax.plot(list(range(1, 20)), x)
+ax.plot(list(range(1, 15)), x)
 ax2 = ax.twinx()
-ax2.plot(list(range(1, 20)), y)
+ax2.plot(list(range(1, 15)), y)
 ax.set_ylim(0, None)
 # %%
 
-spots_ok = filter_threshold(20)
+spots_ok = filter_threshold(4)
 # spots_ok = spots.filter(pl.col("area").is_between(18, 100) & pl.col("norm").gt(0.02))
 # %%
 # density_result = (
@@ -221,7 +222,7 @@ plot_scree(count_by_gene(spots_ok))
 if codebook == "tricycleplus":
     genes = ["Ccnd3", "Mcm5", "Top2a", "Pou3f2", "Cenpa", "Hells"]
 else:
-    genes = ["Sox9", "Pax6", "Eomes", "Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2"]
+    genes = ["Eomes", "Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2"]
 fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
 
 for ax, gene in zip(axs.flat, genes):
@@ -241,7 +242,7 @@ for ax in axs.flat:
 
 
 # %%
-cb_raw = json.loads(Path(f"/home/chaichontat/fishtools/starwork3/{codebook}.json").read_text())
+cb_raw = json.loads(Path(f"/home/chaichontat/fishtools/starwork6/{codebook}.json").read_text())
 
 cb = (
     pl.DataFrame(cb_raw)
@@ -448,5 +449,13 @@ plt.gca().set_yscale("log")
 for i in [8, 10, 15, 20, 30]:
     fed = spots.filter(pl.col("area") >= i)
     print(i, len(fed), fed.filter(pl.col("is_blank")).shape[0] / len(fed))
+
+# %%
+plt.plot(
+    spots_ok.with_columns(z=pl.col("z").cast(pl.UInt16))
+    .group_by("z")
+    .agg(blank=pl.col("is_blank").sum() / pl.len())
+    .sort("z")["blank"]
+)
 
 # %%
