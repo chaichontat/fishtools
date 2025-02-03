@@ -22,8 +22,8 @@ from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
 path = Path("/working/20250131_bigprobenotmangled/analysis/deconv")
-roi = "full+zachDE"
-codebook = "zachDE"
+codebook = "mousecommon"
+roi = f"full+{codebook}"
 
 # Baysor
 # spots.filter(
@@ -52,7 +52,7 @@ spots = (
 print(len(spots))
 sns.set_theme()
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
-ax.scatter(spots["x"][::100], spots["y"][::100], s=0.1, alpha=0.3)
+ax.scatter(spots["x"][::20], spots["y"][::20], s=0.1, alpha=0.3)
 ax.set_aspect("equal")
 # %%
 
@@ -75,7 +75,7 @@ def count_by_gene(spots: pl.DataFrame):
 
 
 # pergene = count_by_gene(spots)
-spots_ = spots.filter(pl.col("area").is_between(12, 100))
+spots_ = spots.filter(pl.col("area").is_between(13, 100))
 
 
 # %%
@@ -177,7 +177,7 @@ ax2.plot(list(range(1, 15)), y)
 ax.set_ylim(0, None)
 # %%
 
-spots_ok = filter_threshold(4)
+spots_ok = filter_threshold(6)
 # spots_ok = spots.filter(pl.col("area").is_between(18, 100) & pl.col("norm").gt(0.02))
 # %%
 # density_result = (
@@ -262,32 +262,34 @@ spots_ok.filter(~pl.col("is_blank")).write_parquet(path / f"{codebook}--{roi}.pa
 
 
 # %%
-# spots_ = spots_.filter(pl.col("ok"))
-genes = spots_ok.group_by("target").len().sort("len", descending=True)["target"]
-genes = sorted(set(spots_["target"]))
-dark = False
-nrows = int(np.ceil(len(genes) / 20))
-fig, axs = plt.subplots(
-    ncols=20, nrows=nrows, figsize=(72, int(2.4 * nrows)), dpi=160, facecolor="black" if dark else "white"
-)
-axs = axs.flatten()
-for ax, gene in zip(axs, genes):
-    selected = spots_ok.filter(pl.col("target") == gene)
-    if not len(selected):
-        logger.warning(f"No spots found for {gene}")
-        continue
-    ax.set_aspect("equal")
-    ax.set_title(gene, fontsize=16, color="white" if dark else "black")
-    ax.axis("off")
-    if dark:
-        ax.hexbin(selected["x"], selected["y"], gridsize=250, cmap="magma")
-    else:
-        ax.scatter(selected["x"], selected["y"], s=2000 / len(selected), alpha=0.1)
+plot = False
+if plot:
+    # spots_ = spots_.filter(pl.col("ok"))
+    genes = spots_ok.group_by("target").len().sort("len", descending=True)["target"]
+    genes = sorted(set(spots_["target"]))
+    dark = False
+    nrows = int(np.ceil(len(genes) / 20))
+    fig, axs = plt.subplots(
+        ncols=20, nrows=nrows, figsize=(72, int(2.4 * nrows)), dpi=160, facecolor="black" if dark else "white"
+    )
+    axs = axs.flatten()
+    for ax, gene in zip(axs, genes):
+        selected = spots_ok.filter(pl.col("target") == gene)
+        if not len(selected):
+            logger.warning(f"No spots found for {gene}")
+            continue
+        ax.set_aspect("equal")
+        ax.set_title(gene, fontsize=16, color="white" if dark else "black")
+        ax.axis("off")
+        if dark:
+            ax.hexbin(selected["x"], selected["y"], gridsize=250, cmap="magma")
+        else:
+            ax.scatter(selected["x"], selected["y"], s=2000 / len(selected), alpha=0.1)
 
-for ax in axs.flat:
-    if not ax.has_data():
-        fig.delaxes(ax)
-plt.tight_layout()
+    for ax in axs.flat:
+        if not ax.has_data():
+            fig.delaxes(ax)
+    plt.tight_layout()
 
 # %%
 
@@ -458,4 +460,18 @@ plt.plot(
     .sort("z")["blank"]
 )
 
+# %%
+
+files = list(
+    Path("/working/20250131_bigprobenotmangled/analysis/deconv/registered--full+zachDE/_highpassed").glob(
+        "*.tif"
+    )
+)
+
+with TiffFile(files[15]) as tif:
+    img = tif.asarray()
+
+from tifffile import imwrite
+
+imwrite("out_goof.tif", img.squeeze()[:, 5], compression=22610)
 # %%

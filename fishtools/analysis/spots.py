@@ -9,7 +9,12 @@ import polars as pl
 def load_spots(
     path: Path | str, idx: int, *, filter_: bool = True, tile_coords: Sequence[float] | None = None
 ):
-    d, y, *_ = pickle.loads(Path(path).read_bytes())
+    try:
+        d, y, *_ = pickle.loads(Path(path).read_bytes())
+    except Exception as e:
+        Path(path).unlink()
+        raise Exception(f"Error reading {path}: {e}. Deleted.") from e
+
     if filter_:
         y = np.array(y)[d.coords["passes_thresholds"]].tolist()
         d = d[d.coords["passes_thresholds"]]

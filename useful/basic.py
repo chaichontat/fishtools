@@ -119,9 +119,9 @@ def cli(): ...
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("round_", type=str)
-@click.option("--zs", type=str, default="0.5")
+@click.option("--zs", type=str, default="0.")
 @click.option("--overwrite", is_flag=True)
-def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5"):
+def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0."):
     paths_pickle = [path / "basic" / f"{round_}-{c}.pkl" for c in range(round_.split("_").__len__())]
     if all(p.exists() for p in paths_pickle) and not overwrite:
         logger.info(f"Skipping {round_}. Already exists.")

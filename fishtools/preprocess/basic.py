@@ -26,8 +26,10 @@ def fit_basic(imgs: np.ndarray[np.float32, Any], c: int):
     from basicpy import BaSiC
 
     with jax.default_device(jax.devices("cpu")[0]):
+        basic = BaSiC(smoothness_flatfield=1.8)  # type: ignore
+        # logger.info("Tuning channel {}", c)
+        # basic.autotune(imgs[:, c])
         logger.info("Fitting channel {}", c)
-        basic = BaSiC()  # type: ignore
         basic.fit(imgs[:, c])
         return basic
 

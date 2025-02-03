@@ -151,7 +151,7 @@ def run(
     if path_wd.name.startswith("registered--"):
         raise ValueError("Path must be the main working directory, not registered.")
 
-    for reg_path in path_wd.glob(f"registered--{_roi}"):
+    for reg_path in path_wd.glob(f"registered--{_roi}+{codebook.stem}"):
         roi = reg_path.name.split("--")[1]
         path = path_wd / f"registered--{roi}"
         path_cb = path / ("decoded-" + codebook.stem)

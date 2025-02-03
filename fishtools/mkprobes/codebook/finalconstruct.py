@@ -3,7 +3,7 @@ import json
 import re
 from itertools import chain, cycle, permutations
 from pathlib import Path
-from typing import Callable, Collection, Final, Iterable, Sequence, cast
+from typing import Annotated, Callable, Collection, Final, Iterable, Sequence, cast
 
 import click
 import polars as pl
@@ -79,7 +79,9 @@ def construct_idt(seq_encoding: pl.DataFrame, idxs: Sequence[int]):
     return pl.DataFrame(out)
 
 
-def construct_encoding(seq_encoding: pl.DataFrame, idxs: Sequence[int], n: int = -1):
+def construct_encoding(
+    seq_encoding: Annotated[pl.DataFrame, ["name", "padlock", "pad_start"]], idxs: Sequence[int], n: int = -1
+):
     if len(idxs) == 1:
         return construct_idt(seq_encoding, idxs)
     if n == -1:

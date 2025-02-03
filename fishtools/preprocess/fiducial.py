@@ -83,7 +83,7 @@ def find_spots(
     img = img.squeeze()
     if img.ndim != 2:
         raise ValueError(
-            "Reference image must be 2D for DAOStarFinder. https://github.com/astropy/photutils/issues/1328"
+            f"Reference image must be 2D for DAOStarFinder (is {img.shape}). https://github.com/astropy/photutils/issues/1328"
         )
     if np.sum(img) == 0:
         raise ValueError("Reference image must have non-zero sum.")
@@ -546,7 +546,7 @@ if __name__ == "__main__":
 
 
 class Shift(BaseModel):
-    shifts: Sequence[float] | tuple[float, float]
+    shifts: list[float] | tuple[float, float]
     corr: float
     residual: float
 

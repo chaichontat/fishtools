@@ -275,6 +275,7 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
 channels = [560, 650, 750]
 
 
+@profile
 def _run(
     paths: list[Path],
     out: Path,
@@ -288,6 +289,7 @@ def _run(
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
 
+    @profile
     def f_read(files: list[Path]):
         logger.debug("Read thread started.")
         for file in files:
@@ -296,9 +298,13 @@ def _run(
             if file.name.startswith("fid"):
                 continue
             logger.debug(f"Reading {file.name}")
-            img = imread(file)
-            fid = np.atleast_3d(img[-n_fids:])
-            nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
+            try:
+                img = imread(file)
+                fid = np.atleast_3d(img[-n_fids:])
+                nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
+            except ValueError as e:
+                raise Exception(f"File {file.resolve()} is corrupted. Please check the file.") from e
+
             with tifffile.TiffFile(file) as tif:
                 try:
                     metadata = tif.shaped_metadata[0]  # type: ignore
@@ -311,6 +317,7 @@ def _run(
                     nofid[:, i] = basics[name][i].transform(np.array(nofid[:, i]))
             q_img.put((file, nofid, fid, metadata))
 
+    @profile
     def f_write():
         logger.debug("Write thread started.")
 
@@ -438,13 +445,18 @@ def run(
 
     if not overwrite:
         files = [f for f in files if not (out / f.parent.name / f.name).exists()]
+
+    if files:
         logger.info(f"Running {len(files)} files.")
-    if not files:
+    else:
         logger.warning("No files found. Skipping.")
         return
 
     basics: dict[str, list[BaSiC]] = {
-        name: list(pickle.loads((path / "basic" / f"{name}.pkl").read_bytes()).values())
+        name: [
+            pickle.loads((path / "basic" / f"{name}-{c}.pkl").read_bytes())
+            for c in range(len(name.split("_")))
+        ]
     }
     _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids)
 
@@ -473,14 +485,18 @@ def batch(
         files = [
             f
             for f in sorted(path.glob(f"{r}--{roi or '*'}/{r}-*.tif"))
-            if "analysis/deconv" not in str(f) and not path.parent.name.endswith("basic")
+            if "analysis/deconv" not in str(f.resolve()) and not f.parent.name.endswith("basic")
         ]
+
+        if not files:
+            logger.info(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
+            continue
 
         if ref is not None:
             ok_idxs = {
                 int(f.stem.split("-")[1])
                 for f in sorted(path.rglob(f"{ref}--{roi or '*'}/{ref}-*.tif"))
-                if "analysis/deconv" not in str(f)
+                if "analysis/deconv" not in str(f) and not f.parent.name.endswith("basic")
             }
             logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
             files = [f for f in files if int(f.stem.split("-")[1]) in ok_idxs]
@@ -489,11 +505,14 @@ def batch(
 
         try:
             basics: dict[str, list[BaSiC]] = {
-                r: list(pickle.loads((path / "basic" / f"{r}.pkl").read_bytes()).values())
+                r: [
+                    pickle.loads((path / "basic" / f"{r}-{c}.pkl").read_bytes())
+                    for c in range(len(r.split("_")))
+                ]
             }
         except FileNotFoundError:
             logger.error(
-                f"Could not find {path / 'basic' / f'{r}.pkl'}. Please run basic first. Skipping to rounds with basic."
+                f"Could not find {path / 'basic' / f'{r}-[n].pkl'}. Please run basic first. Skipping to rounds with basic."
             )
         else:
             _run(
