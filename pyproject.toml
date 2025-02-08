@@ -1,55 +1,58 @@
-[tool.poetry]
-authors = ["Chaichontat Sriworarat <csriwor1@jh.edu>"]
-description = ""
-include = [{ path = 'static/*', format = 'wheel' }]
-license = "GPL-3.0-only"
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
 name = "fishtools"
-packages = [{ include = "fishtools" }]
-readme = "README.md"
 version = "0.1.0"
+description = ""
+authors = [{ name = "Chaichontat Sriworarat", email = "csriwor1@jh.edu" }]
+license = { text = "GPL-3.0-only" }
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "biopython>=1.84",
+    "click>=8.1.6",
+    "colorama>=0.4.6",
+    "imagecodecs==2024.9.22",
+    "levenshtein>=0.26.0",
+    "loguru>=0.7.0",
+    "mygene>=3.2.2",
+    "numpy>=1.25.1",
+    "polars>=1",
+    "primer3-py>=2.0.0",
+    "pyfastx>=2.1.0",
+    "rich-click>=1.6.1",
+    "tifffile==2023.7.18",
+    "tqdm>=4.65.0",
+    "matplotlib",
+    "seaborn>=0.13.2",
+    "astropy>=6.1.0",
+    "photutils>=1.12.0",
+    "scikit-image>=0.23.2",
+    "scipy>=1.12",
+    "basicpy>=1.2.0",
+    "rtree>=1.3.0",
+    "shapely>=2.0.6",
+    "toml>=0.10.2",
+    "pyarrow>=17.0.0",
+    "pydantic>=2.9.2",
+    "starfish @ git+https://github.com/chaichontat/starfish@master",
+]
 
-[tool.poetry.dependencies]
-biopython = "^1.84"
-click = "^8.1.6"
-colorama = "^0.4.6"
-imagecodecs = "^2024.9.22"
-levenshtein = "^0.26.0"
-loguru = "^0.7.0"
-mygene = "^3.2.2"
-numpy = "^1.25.1"
-polars = "^1"
-primer3-py = "^2.0.0"
-pyfastx = "^2.1.0"
-python = "^3.12"
-rich-click = "^1.6.1"
-tifffile = "^2023.7.18"
-tqdm = "^4.65.0"
-matplotlib = "^3.9.0"
-seaborn = "^0.13.2"
-astropy = "^6.1.0"
-photutils = "^1.12.0"
-scikit-image = "^0.23.2"
-scipy = "^1.12"
-starfish = { git = "https://github.com/chaichontat/starfish", branch = "master" }
-basicpy = "^1.2.0"
-rtree = "^1.3.0"
-shapely = "^2.0.6"
-toml = "^0.10.2"
-pyarrow = "^17.0.0"
-pydantic = "^2.9.2"
+[project.optional-dependencies]
+dev = ["pre-commit>=3.3.3", "pytest>=7.4.0", "pytest-cov>=4.1.0"]
 
-[tool.poetry.scripts]
+[project.scripts]
 fishtools = "fishtools.cli:main"
 mkprobes = "fishtools.mkprobes.cli:main"
+preprocess = "fishtools.preprocess.cli:main"
 
-[tool.poetry.group.dev.dependencies]
-pre-commit = "^3.3.3"
-pytest = "^7.4.0"
-pytest-cov = "^4.1.0"
+[tool.uv]
+override-dependencies = ["scikit-image>=0.23.2"]
 
-[build-system]
-build-backend = "poetry.core.masonry.api"
-requires = ["poetry-core"]
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.black]
 line-length = 110
