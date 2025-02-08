@@ -173,11 +173,16 @@ class Image:
         counts = {key: sum(waveform[key]["sequence"]) for key in cls.CHANNELS}
 
         # To remove ilm from, say, ilm405.
+
         powers = {
             key[3:]: waveform[key]["power"]
             for key in cls.CHANNELS
             if (key == "ilm405" and counts[key] > n_fids) or (key != "ilm405" and counts[key])
         }
+
+        if waveform.get("params"):
+            powers = waveform["params"]["powers"]
+
         if len(powers) != len(bits):
             raise ValueError(f"{path}: Expected {len(bits)} channels, got {len(powers)}")
 
@@ -220,7 +225,7 @@ class Image:
             # raise Exception(f"No basic template found at {path_basic}")
             basic = lambda: None
 
-        fids_raw = img[-n_fids]  # np.atleast_3d(img[-n_fids:]).max(axis=0)
+        fids_raw = np.atleast_3d(img[-n_fids:]).max(axis=0)
         return cls(
             name=name,
             idx=int(idx),
@@ -240,7 +245,7 @@ class Image:
             temp = fid.max(axis=0)
         temp = -ndimage.gaussian_laplace(fid.astype(np.float32).copy(), sigma=3)  # type: ignore
         temp -= temp.min()
-        percs = np.percentile(temp, [1, 99.9])
+        percs = np.percentile(temp, [1, 99.99])
         temp = (temp - percs[0]) / (percs[1] - percs[0])
 
         return temp
@@ -256,6 +261,7 @@ def run_fiducial(
     idx: int,
     reference: str,
     debug: bool,
+    no_priors: bool = False,
 ):
     logger.info("Aligning fiducials")
 
@@ -264,6 +270,7 @@ def run_fiducial(
     if (
         not config.registration.fiducial.use_fft
         and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
+        and not no_priors
     ):
         _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
         for shift_path in shifts_existing:
@@ -337,11 +344,13 @@ def run_fiducial(
     assert shifts  # type: ignore
     assert residuals  # type: ignore
 
+    shifted = {k: shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()}
+
     if debug:
         tifffile.imwrite(
             path / f"fids_shifted-{idx:04d}.tif",
             # Prior shifts already applied.
-            np.stack([shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()]),
+            np.stack(list(shifted.values())),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX"},
@@ -356,23 +365,22 @@ def run_fiducial(
                 shifts[prior_mapping[name]][0] += sh[0]
                 shifts[prior_mapping[name]][1] += sh[1]
 
-    (shift_path := path / f"shifts--{roi}").mkdir(exist_ok=True)
+    (shift_path := path / f"shifts--{roi}+{codebook_name}").mkdir(exist_ok=True)
 
-    _fid_ref = fids[reference][::4, ::4].flatten()
-    (shift_path / f"shifts-{idx:04d}.json").write_bytes(
-        Shifts.dump_json(
-            Shifts.validate_python({
-                k: {
-                    "shifts": (shifts[k][0], shifts[k][1]),
-                    "residual": residuals[k],
-                    "corr": 1.0
-                    if reference == k
-                    else np.corrcoef(fids[k][::4, ::4].flatten(), _fid_ref)[0, 1],
-                }
-                for k in shifts
-            })
-        )
-    )
+    _fid_ref = fids[reference][500:-500:2, 500:-500:2].flatten()
+    validated = Shifts.validate_python({
+        k: {
+            "shifts": (shifts[k][0], shifts[k][1]),
+            "residual": residuals[k],
+            "corr": 1.0
+            if reference == k
+            else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1],
+        }
+        for k in fids
+    })
+    jsoned = Shifts.dump_json(validated)
+    (shift_path / f"shifts-{idx:04d}.json").write_bytes(jsoned)
+    logger.debug({k: f"{r.corr:03f}" for k, r in validated.items()})
     return shifts
 
     # logger.debug(f"Corr: {[x['corr'] for x in to_dump.values()]}")
@@ -388,6 +396,7 @@ def run(
     config: Config,
     debug: bool = False,
     overwrite: bool = False,
+    no_priors: bool = False,
 ):
     logger.info("Reading files")
     out_path = path / f"registered--{roi}+{Path(codebook).stem}"
@@ -397,18 +406,26 @@ def run(
         logger.info(f"Skipping {idx}")
         return
 
-    path_prevfids = out_path / "_fids" / f"_fids-{idx:04d}.tif"
-    if path_prevfids.exists():
-        with TiffFile(path_prevfids) as tif:
-            _fids = tif.asarray()
-            fids = {k: v for k, v in zip(tif.shaped_metadata[0]["key"], _fids)}
-            del _fids
-        shifts = run_fiducial(
-            path, fids, Path(codebook).stem, config, roi=roi, reference=reference, debug=debug, idx=idx
-        )
-        del fids
-    else:
-        shifts = {}
+    # path_prevfids = out_path / "_fids" / f"_fids-{idx:04d}.tif"
+    # if path_prevfids.exists():
+    #     with TiffFile(path_prevfids) as tif:
+    #         _fids = tif.asarray()
+    #         fids = {k: v for k, v in zip(tif.shaped_metadata[0]["key"], _fids)}
+    #         del _fids
+    #     shifts = run_fiducial(
+    #         path,
+    #         fids,
+    #         Path(codebook).stem,
+    #         config,
+    #         roi=roi,
+    #         reference=reference,
+    #         debug=debug,
+    #         idx=idx,
+    #         no_priors=no_priors,
+    #     )
+    #     del fids
+    # else:
+    shifts = {}
 
     cb = json.loads(Path(codebook).read_text())
     bits = set(chain.from_iterable(cb.values()))
@@ -447,6 +464,7 @@ def run(
             reference=reference,
             debug=debug,
             idx=idx,
+            no_priors=no_priors,
         )
 
     for _img in imgs.values():
@@ -585,6 +603,7 @@ def run(
 @click.option("--threshold", type=float, default=2.0)
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--overwrite", is_flag=True)
+@click.option("--no-priors", is_flag=True)
 def main(
     path: Path,
     idx: int,
@@ -595,6 +614,7 @@ def main(
     overwrite: bool = False,
     threshold: float = 6,
     fwhm: float = 4,
+    no_priors: bool = False,
 ):
     """Preprocess image sets before spot calling.
 
@@ -625,6 +645,7 @@ def main(
         reference=reference,
         codebook=codebook,
         debug=debug,
+        no_priors=no_priors,
         config=Config(
             dataPath=str(DATA),
             channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
@@ -662,7 +683,7 @@ def main(
                     n_fids=2,
                 ),
                 downsample=1,
-                crop=36,
+                crop=30,
                 slices=slice(None),
                 reduce_bit_depth=0,
             ),

@@ -15,7 +15,7 @@ from shapely import MultiPolygon, Point, Polygon, STRtree
 
 sns.set_theme()
 plt.rcParams["figure.dpi"] = 200
-path = Path("/mnt/working/e155_zach/baysor--all")
+path = Path("/working/20250202_bigprobesamebuffer/analysis/deconv/baysor--full")
 adata = sc.read_loom(path / "segmentation_counts.loom")
 adata.var_names = adata.var["Name"]
 # adata = adata[~adata.obs["y"].between(24000, 45000) & adata.obs["x"].gt(2000)]
@@ -99,7 +99,7 @@ sc.pl.pca_variance_ratio(adata, log=True)
 # %%
 import rapids_singlecell as rsc
 
-sc.pp.neighbors(adata, n_neighbors=15, n_pcs=30, metric="cosine")
+rsc.pp.neighbors(adata, n_neighbors=15, n_pcs=30, metric="cosine")
 sc.tl.leiden(adata, n_iterations=2, resolution=1, flavor="igraph")
 sc.tl.umap(adata, min_dist=0.1, n_components=2)
 # %%
@@ -123,7 +123,7 @@ sc.pl.embedding(adata, color="leiden", basis="spatial")  # type: ignore
 
 # %%
 with sns.axes_style("darkgrid"):
-    sc.pl.rank_genes_groups(adata, n_genes=10, sharey=False, fontsize=9, show=False)
+    sc.pl.rank_genes_groups(adata, n_genes=20, sharey=False, fontsize=9, show=False)
     for ax in plt.gcf().axes:
         for text in ax.texts:
             text.set_rotation(40)
@@ -132,7 +132,9 @@ with sns.axes_style("darkgrid"):
 
 sc.tl.dendrogram(adata, groupby="leiden")
 sc.pl.rank_genes_groups_dotplot(adata, groupby="leiden", standard_scale="var", n_genes=5)
-
+for ax in plt.gcf().axes:
+    for text in ax.texts:
+        text.set_rotation(40)
 # %%
 sc.pl.embedding(
     adata,
@@ -194,7 +196,7 @@ sc.pl.embedding(
     frameon=False,
     # cmap="Blues",
     cmap="cet_colorwheel",
-    # palette=palette_spaco,
+    palette=palette_spaco,
     show=False,
 )
 fig = plt.gcf()

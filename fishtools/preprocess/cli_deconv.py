@@ -1,12 +1,10 @@
-# %%
 import json
 import pickle
 import queue
-import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable, Literal, cast
+from typing import Any, Iterable
 
 import cupy as cp
 import cv2
@@ -23,8 +21,96 @@ from rich.logging import RichHandler
 from scipy.stats import multivariate_normal
 from tifffile import TiffFile, imread
 
-from fishtools.preprocess.deconv import _compute_range
 from fishtools.utils.pretty_print import progress_bar
+
+DATA = Path(__file__).parent.parent.parent / "data"
+
+
+def scale_deconv(
+    img: np.ndarray,
+    idx: int,
+    *,
+    global_deconv_scaling: np.ndarray,
+    metadata: dict[str, Any],
+    name: str | None = None,
+    debug: bool = False,
+):
+    """Scale back deconvolved image using global scaling.
+
+    Args:
+        img: Original image, e.g. 1_9_17
+        idx: Channel index in original image e.g. 0, 1, 2, ...
+    """
+    global_deconv_scaling = global_deconv_scaling.reshape((2, -1))
+    m_ = global_deconv_scaling[0, idx]
+    s_ = global_deconv_scaling[1, idx]
+
+    # Same as:
+    # scaled = s_ * ((img / self.metadata["deconv_scale"][idx] + self.metadata["deconv_min"][idx]) - m_)
+    scale_factor = s_ / metadata["deconv_scale"][idx]
+    offset = s_ * (metadata["deconv_min"][idx] - m_)
+    scaled = scale_factor * img + offset
+
+    if debug:
+        logger.debug(f"Deconvolution scaling: {scale_factor}")
+    if name and scaled.max() > 65535:
+        logger.debug(f"Scaled image {name} has max > 65535.")
+
+    if np.all(scaled < 0):
+        logger.warning(f"Scaled image {name} has all negative values.")
+
+    return np.clip(scaled, 0, 65535)
+
+
+def _compute_range(path: Path, round_: str, *, perc_min: float = 99.9, perc_scale: float = 0.1):
+    """
+    Find the min and scale of the deconvolution for all files in a directory.
+    The reverse scaling equation is:
+                 s_global
+        scaled = -------- * img + s_global * (min - m_global)
+                  scale
+    Hence we want scale_global to be as low as possible
+    and min_global to be as high as possible.
+    """
+    files = sorted(path.glob(f"{round_}*/*.tif"))
+    n_c = len(round_.split("_"))
+    n = len(files)
+
+    deconv_min = np.zeros((n, n_c))
+    deconv_scale = np.zeros((n, n_c))
+    logger.info(f"Found {n} files")
+    if not files:
+        raise FileNotFoundError(f"No files found in {path}")
+
+    with progress_bar(len(files)) as pbar:
+        for i, f in enumerate(files):
+            try:
+                meta = json.loads(Path(f).with_suffix(".deconv.json").read_text())
+            except FileNotFoundError as e:
+                with TiffFile(f) as tif:
+                    try:
+                        meta = tif.shaped_metadata[0]
+                    except KeyError:
+                        raise AttributeError("No deconv metadata found.")
+
+            try:
+                deconv_min[i, :] = meta["deconv_min"]
+                deconv_scale[i, :] = meta["deconv_scale"]
+            except KeyError:
+                raise AttributeError("No deconv metadata found.")
+            pbar()
+
+    logger.info("Calculating percentiles")
+    m_ = np.percentile(deconv_min, perc_min, axis=0)
+    s_ = np.percentile(deconv_scale, perc_scale, axis=0)
+
+    if np.any(m_ == 0) or np.any(s_ == 0):
+        raise ValueError("Found a channel with min=0. This is not allowed.")
+
+    (path / "deconv_scaling").mkdir(exist_ok=True)
+    np.savetxt(path / "deconv_scaling" / f"{round_}.txt", np.vstack([m_, s_]))
+    logger.info(f"Saved to {path / 'deconv_scaling' / f'{round_}.txt'}")
+
 
 logger.remove()
 logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
@@ -230,17 +316,15 @@ def rescale(img: cp.ndarray, scale: float):
     return ((img - img.min()) * scale).get().astype(np.uint16)
 
 
-# %%
-DATA = Path(__file__).parent.parent / "data"
 make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=7)
 projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 
 @click.group()
-def main(): ...
+def deconv(): ...
 
 
-@main.command()
+@deconv.command()
 @click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
 @click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
 @click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
@@ -275,7 +359,6 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
 channels = [560, 650, 750]
 
 
-@profile
 def _run(
     paths: list[Path],
     out: Path,
@@ -289,7 +372,6 @@ def _run(
     q_write = queue.Queue(maxsize=3)
     q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
 
-    @profile
     def f_read(files: list[Path]):
         logger.debug("Read thread started.")
         for file in files:
@@ -317,7 +399,6 @@ def _run(
                     nofid[:, i] = basics[name][i].transform(np.array(nofid[:, i]))
             q_img.put((file, nofid, fid, metadata))
 
-    @profile
     def f_write():
         logger.debug("Write thread started.")
 
@@ -386,7 +467,7 @@ def _run(
     thread_write.join()
 
 
-@main.command()
+@deconv.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.argument("name", type=str)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
@@ -461,11 +542,10 @@ def run(
     _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids)
 
 
-@main.command()
+@deconv.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.option("--roi", type=str, default=None)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
-@click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2)
 def batch(
@@ -473,19 +553,21 @@ def batch(
     *,
     roi: str | None,
     ref: Path | None,
-    limit: int | None,
     overwrite: bool,
     n_fids: int,
 ):
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
 
+    FORBIDDEN = ["10x", "analysis", "shifts", "fid", "registered", "old", "basic"]
+
     rounds = sorted({p.name.split("--")[0] for p in path.iterdir() if "--" in p.name and p.is_dir()})
     for r in rounds:
         files = [
             f
             for f in sorted(path.glob(f"{r}--{roi or '*'}/{r}-*.tif"))
-            if "analysis/deconv" not in str(f.resolve()) and not f.parent.name.endswith("basic")
+            if "analysis/deconv" not in str(f.resolve())
+            and not any(f.parent.name.endswith(x) for x in FORBIDDEN)
         ]
 
         if not files:
@@ -525,71 +607,4 @@ def batch(
 
 
 if __name__ == "__main__":
-    main()
-# %%
-
-
-# out = {bit: get_scale(imgs, i) for i, bit in enumerate(name.split("_"))}
-
-# %%
-# import json
-
-
-# sns.set_theme()
-# fig, axs = plt.subplots(ncols=2, nrows=1, figsize=(8, 4), dpi=200)
-# axs = axs.flatten()
-# for i, ax in enumerate(axs):
-#     ax.axis("off")
-
-# sl = np.s_[200:400, 800:1000]
-# sl = np.s_[1200:1500, 700:1000]
-# axs[0].imshow(img[11, 0][sl])
-# axs[1].imshow(res.get()[11, 0][sl])
-
-
-# %%
-
-
-# def run(i: int):
-#     out[i] = deconvolve_lucyrichardson_guo(img[i, 0], window, iters=1)
-
-
-# for i in range(5):
-#     run(i)
-# from concurrent.futures import ThreadPoolExecutor
-
-# with ThreadPoolExecutor(4) as executor:
-#     executor.map(run, range(img.shape[0]))
-
-
-# %%
-
-
-# %%
-# tifffile.imwrite("ori.tif", img[:, 0].astype(np.uint16), compression=22610)
-# # %%
-# res = res.get()
-# tifffile.imwrite("deconvrl.tif", ((res - res.min()) / res.max() * 65535).astype(np.uint16), compression=22610)
-
-# %%
-
-
-# from clij2fft.richardson_lucy import richardson_lucy_nc
-# from tifffile import imread
-
-# img = imread("/fast2/3t3clean/dapi_edu/dapi_edu-0005.tif")[:-1].reshape(-1, 2, 2048, 2048)
-# # %%
-# import numpy as np
-
-# psf = imread("data/psf_405.tif")
-# psf = np.median(psf, axis=0)
-# import matplotlib.pyplot as plt
-
-# psf = psf[[5, 10, 15, 20, 25, 30, 35]]
-# # %%
-
-# decon_clij2 = richardson_lucy_nc(img[0], psf, 10, 0.0002)
-
-# # %%
-
-# %%
+    deconv()

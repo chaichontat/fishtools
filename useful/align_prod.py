@@ -41,7 +41,7 @@ class DecodeConfig(BaseModel):
 
     max_distance: float = 0.3
     min_intensity: float = 0.005
-    min_area: int = 12
+    min_area: int = 10
     max_area: int = 200
 
 
@@ -283,8 +283,9 @@ def optimize(
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--roi", type=str, default="*")
-@click.option("--percentile", type=float, default=25)
-def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 25):
+@click.option("--percentile", type=float, default=50)
+@click.option("--overwrite", is_flag=True)
+def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 50, overwrite: bool = False):
     SUBFOLDER = "_highpassed"
     paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
 
@@ -295,7 +296,14 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 25)
         p for p in paths if not (p.parent / SUBFOLDER / f"{p.stem}_{codebook.stem}.hp.tif").exists()
     )
 
-    _batch(paths, "run", ["--codebook", str(codebook), "--highpass-only"], threads=4, split=[0])
+    if paths:
+        _batch(
+            paths,
+            "run",
+            ["--codebook", str(codebook), "--highpass-only", *(["--overwrite"] if overwrite else [])],
+            threads=4,
+            split=[0],
+        )
 
     highpasses = list(path.glob(f"registered--{roi}+{codebook.stem}/{SUBFOLDER}/*_{codebook.stem}.hp.tif"))
     logger.info(f"Found {len(highpasses)} images to get percentiles from.")
@@ -453,7 +461,6 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
         if round_num == 0:
             curr.append([cast(InitialScale, s).initial_scale for s in sf if s.round_num == round_num][0])
         else:
-            print(sf)
             want = cast(Deviation, [s for s in sf if s.round_num == round_num][0])
             if want.n < 500:
                 logger.debug(f"Skipping {p} at round {round_num} because n={want.n} < 500.")
@@ -660,7 +667,6 @@ def run(
 
     bit_mapping = {str(k): i for i, k in enumerate(img_keys)}
 
-    print(bit_mapping, path)
     # img = tif.asarray()[:, [bit_mapping[k] for k in used_bits]]
     # blurred = gaussian(path, sigma=8)
     # blurred = levels(blurred)  # clip negative values to 0.

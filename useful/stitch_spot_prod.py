@@ -2,6 +2,7 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
+import sys
 
 import polars as pl
 import rich_click as click
@@ -13,6 +14,7 @@ from fishtools.analysis.spots import load_spots
 from fishtools.preprocess.tileconfig import TileConfiguration
 
 FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.pkl")
+logger.configure(handlers=[{"sink": sys.stderr}])
 
 w = 1988
 
