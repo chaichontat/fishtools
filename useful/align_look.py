@@ -216,11 +216,13 @@ def plot_bits(spots):
 plot_bits(ok.where(ok.target == "Dcx-201", drop=True))
 
 # %%
-df = pd.DataFrame({
-    "target": spot_intensities.coords["target"],
-    "x": spot_intensities.coords["x"],
-    "y": spot_intensities.coords["y"],
-})
+df = pd.DataFrame(
+    {
+        "target": spot_intensities.coords["target"],
+        "x": spot_intensities.coords["x"],
+        "y": spot_intensities.coords["y"],
+    }
+)
 
 
 sns.scatterplot(data=df[df["target"] == "Neurod1-201"], x="x", y="y", hue="target", s=10, legend=True)
