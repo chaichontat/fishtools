@@ -1,9 +1,9 @@
+import signal
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import signal
 import numpy as np
 import rich
 import rich_click as click
