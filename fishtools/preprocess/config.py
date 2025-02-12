@@ -54,6 +54,7 @@ class RegisterConfig(BaseModel):
     )
     split_channels: bool = False
     chromatic_shifts: dict[str, Annotated[str, "path for 560to{channel}.txt"]]
+    reference: str = Field(default="4_12_20", description="Reference round to align others to.")
 
 
 class ChannelConfig(BaseModel):

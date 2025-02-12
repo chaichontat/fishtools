@@ -2,6 +2,8 @@ import rich_click as click
 
 from .cli_basic import basic
 from .cli_deconv import deconv
+from .cli_register import register
+from .cli_stitch import stitch
 
 # log = setup_logging()
 click.rich_click.SHOW_ARGUMENTS = True
@@ -29,7 +31,8 @@ def main():
 
 main.add_command(basic)
 main.add_command(deconv)
-
+main.add_command(register)
+main.add_command(stitch)
 
 if __name__ == "__main__":
     main()

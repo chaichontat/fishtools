@@ -10,11 +10,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import rich
+import tifffile
 from astropy.stats import SigmaClip, sigma_clipped_stats
 from loguru import logger
 from photutils.background import Background2D, MedianBackground
 from photutils.detection import DAOStarFinder
 from pydantic import BaseModel, TypeAdapter
+from scipy.ndimage import shift
 from scipy.spatial import cKDTree
 from skimage import exposure, filters
 from skimage.measure import ransac
@@ -22,7 +24,7 @@ from skimage.registration import phase_cross_correlation
 from skimage.transform import AffineTransform
 from tifffile import TiffFile
 
-from fishtools.preprocess.config import RegisterConfig
+from fishtools.preprocess.config import Config, RegisterConfig
 
 console = rich.get_console()
 
@@ -463,6 +465,8 @@ def align_fiducials(
         ({k: v.result()[1] for k, v in futs.items()} | {ref: 0.0}),
     )
 
+    # logger.debug(f"Corr: {[x['corr'] for x in to_dump.values()]}")
+
 
 def plot_alignment(fids: dict[str, np.ndarray[float, Any]], sl: slice = np.s_[500:600]):
     keys = list(fids.keys())
@@ -478,71 +482,6 @@ def plot_alignment(fids: dict[str, np.ndarray[float, Any]], sl: slice = np.s_[50
         if len(fids) - i < 3:
             i = len(fids) - 3
         ax.imshow(np.moveaxis(combi[i : i + 3][:, sl, sl], 0, 2))
-
-
-# def align_fiducials_from_file(
-#     folder: Path | str,
-#     glob: str,
-#     *,
-#     reference: str,
-#     filter_: Callable[[str], bool] = lambda _: True,
-#     idx: int = -1,
-#     threads: int = 4,
-# ) -> dict[str, np.ndarray[float, Any]]:
-#     return align_fiducials(
-#         {file.name: imread_page(file, idx) for file in sorted(Path(folder).glob(glob)) if filter_(file.name)},
-#         reference=reference,
-#         threads=threads,
-#     )
-
-
-@click.command()
-@click.argument("folder", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("glob", type=str)
-@click.option("--output", "-o", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
-@click.option("--reference", "-r", type=str)
-@click.option("--idx", "-i", type=int, default=-1)
-@click.option("--threads", "-t", type=int, default=4)
-def main(
-    folder: Path | str,
-    glob: str,
-    output: Path,
-    reference: str,
-    idx: int = -1,
-    threads: int = 4,
-):
-    res = align_fiducials_from_file(folder, glob, reference=reference, idx=idx, threads=threads)
-    output.write_text(json.dumps(res))
-
-
-if __name__ == "__main__":
-    main()
-
-
-# idx = 3
-# imgs = {
-#     file.name: imread_page(file, -1)
-#     for file in sorted(Path("/raid/data/raw/tricyclecells2").glob(f"*-{idx:03d}.tif"))
-#     if not file.name.startswith("dapi")
-# }
-
-
-# img = imgs[f"A_1_2-{idx:03d}.tif"]
-# no_a = img[:-1].reshape(16, 3, 2048, 2048)[:, [1, 2], ...].reshape(-1, 2048, 2048)
-# imgs[f"1_2-{idx:03d}.tif"] = np.concatenate([no_a, imgs[f"A_1_2-{idx:03d}.tif"][None, -1]], axis=0)
-# del imgs[f"A_1_2-{idx:03d}.tif"]
-
-
-# dark = imread("/raid/data/analysis/dark.tif")
-# flat = (imread("/raid/data/analysis/flat_647.tif") - dark).astype(np.float32)
-# flat /= np.min(flat)  # Prevents overflow
-# for name in imgs:
-#     img = imgs[name]
-#     imgs[name] = ((img - dark).astype(np.float32) / flat).astype(np.uint16)
-
-# fids = {k: v[-1 for k, v in imgs.items()}
-# imgs = {k: v[:-1] for k, v in imgs.items()}
-# keys = list(imgs.keys())
 
 
 class Shift(BaseModel):

@@ -10,7 +10,7 @@ from loguru import logger
 from rtree import index
 from shapely import MultiPolygon, Point, Polygon, STRtree, intersection
 
-from fishtools.analysis.spots import load_parquet, load_spots
+from fishtools.analysis.spots import load_parquet, load_spots, load_spots_simple
 from fishtools.preprocess.stitching import (
     Cells,
     Crosses,
@@ -98,7 +98,7 @@ def load_splits(
         c["y"] += size - cut
 
     try:
-        return (load_spots if not simple else load_parquet)(
+        return (load_spots if not simple else load_spots_simple)(
             path, i, filter_=filter_, tile_coords=(c["x"], c["y"])
         )
     except Exception as e:
@@ -155,6 +155,7 @@ def cli(): ...
 @click.option("--no-filter", is_flag=True)
 @click.option("--overwrite", is_flag=True)
 @click.option("--simple", is_flag=True)
+@click.option("--no-split", is_flag=True)
 def run(
     path_wd: Path,
     _roi: str,
@@ -162,6 +163,7 @@ def run(
     no_filter: bool = False,
     overwrite: bool = False,
     simple: bool = False,
+    no_split: bool = False,
 ):
     if path_wd.name.startswith("registered--"):
         raise ValueError("Path must be the main working directory, not registered.")
@@ -183,7 +185,7 @@ def run(
             continue
 
         assert len(coords) == len(set(coords["index"]))
-        files = sorted(file for file in path_cb.glob("*.pkl" if not simple else "*.parquet"))
+        files = sorted(file for file in path_cb.glob("*.pkl"))
 
         if not files:
             raise ValueError(f"No files found in {path / codebook.stem}")
@@ -196,14 +198,12 @@ def run(
         files = [
             f
             for f in files
-            if (match := FILENAME.match(f.name))
-            and match.group(1) in idxs
-            and f.suffix == (".pkl" if not simple else ".parquet")
+            if (match := FILENAME.match(f.name)) and match.group(1) in idxs and f.suffix == ".pkl"
         ]
         coords = coords.filter(pl.col("index").is_in({int(f.stem.rsplit("-", 2)[1]) for f in files}))
 
         # Precompute intersections
-        cells = generate_cells(coords, files, split=not simple, size=w)
+        cells = generate_cells(coords, files, split=not simple and not no_split, size=w)
         assert len(files) == len(cells)
         logger.debug(f"Generated {len(cells)} cells.")
         if not len(cells):

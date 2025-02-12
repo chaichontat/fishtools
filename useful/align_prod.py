@@ -21,6 +21,7 @@ import xarray as xr
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter, field_validator
 from starfish import Codebook, ImageStack, IntensityTable
+from starfish.core.intensity_table.decoded_intensity_table import DecodedIntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
 )
@@ -28,7 +29,8 @@ from starfish.core.spots.DetectPixels.combine_adjacent_features import CombineAd
 from starfish.core.types import Axes, Coordinates, CoordinateValue
 from starfish.experiment.builder import FetchedTile, TileFetcher
 from starfish.image import Filter
-from starfish.types import Axes, Features, Levels
+from starfish.spots import DecodeSpots, FindSpots
+from starfish.types import Axes, Features, Levels, TraceBuildingStrategies
 from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread, imwrite
 
@@ -41,7 +43,7 @@ class DecodeConfig(BaseModel):
 
     max_distance: float = 0.3
     min_intensity: float = 0.005
-    min_area: int = 10
+    min_area: int = 12
     max_area: int = 200
 
 
@@ -130,7 +132,12 @@ def scale(img: ImageStack, scale: np.ndarray[np.float32, Any]):
     ).run(img, in_place=True)
 
 
-def load_codebook(path: Path, exclude: set[str] | None = None):
+def load_codebook(
+    path: Path,
+    bit_mapping: dict[str, int],
+    exclude: set[str] | None = None,
+    simple: bool = False,
+):
     cb_json: dict[str, list[int]] = json.loads(path.read_text())
     for k in exclude or set():
         try:
@@ -138,8 +145,15 @@ def load_codebook(path: Path, exclude: set[str] | None = None):
         except KeyError:
             logger.warning(f"Codebook does not contain {k}")
 
-    used_bits = sorted(set(chain.from_iterable(cb_json.values())))
+    # if simple:
+    cb_json = {k: [v[0]] for k, v in cb_json.items()}
 
+    # Remove any genes that are not imaged.
+    available_bits = sorted(bit_mapping)
+    assert len(available_bits) == len(set(available_bits))
+    cb_json = {k: v for k, v in cb_json.items() if all(str(bit) in available_bits for bit in v)}
+
+    used_bits = sorted(set(chain.from_iterable(cb_json.values())))
     # mapping from bit name to index
     bit_map = np.ones(max(used_bits) + 1, dtype=int) * 5000
     for i, bit in enumerate(used_bits):
@@ -335,6 +349,7 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 50,
 @click.option("--subsample-z", type=int, default=1)
 @click.option("--limit-z", default=None)
 @click.option("--split", is_flag=True)
+@click.option("--simple", is_flag=True)
 def batch(
     path: Path,
     roi: str,
@@ -344,8 +359,9 @@ def batch(
     subsample_z: int = 1,
     limit_z: int | None = None,
     split: bool = False,
+    simple: bool = False,
 ):
-    paths = {p.stem: p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
+    paths = {p: p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
     # To account for split
     exists = {
         p.stem.rsplit("-", 1)[0]
@@ -367,6 +383,7 @@ def batch(
             "--overwrite" if overwrite else "",
             f"--subsample-z={subsample_z}",
             f"--limit-z={limit_z}",
+            "--simple" if simple else "",
         ],
         threads=threads,
         split=split,
@@ -576,6 +593,61 @@ def append_json(
     path.write_bytes(Deviations.dump_json(existing))
 
 
+def pixel_decoding(imgs: ImageStack, config: DecodeConfig, codebook: Codebook):
+    pixel_intensities = IntensityTable.from_image_stack(imgs)
+    logger.info("Decoding")
+    decoded_intensities = codebook.decode_metric(
+        pixel_intensities,
+        max_distance=config.max_distance,
+        min_intensity=config.min_intensity,
+        norm_order=2,
+        metric="euclidean",
+        return_original_intensities=True,
+    )
+
+    logger.info("Combining")
+    caf = CombineAdjacentFeatures(
+        min_area=config.min_area, max_area=config.max_area, mask_filtered_features=True
+    )
+    decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
+    transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
+    return decoded_spots, image_decoding_results
+
+
+def spot_decoding(
+    imgs: ImageStack,
+    codebook: Codebook,
+    spot_diameter: int = 7,
+    min_mass: float = 0.1,
+    max_size: int = 2,
+    separation: int = 8,
+    noise_size: float = 0.65,
+    percentile: int = 0,
+) -> DecodedIntensityTable:
+    # z project
+    max_imgs = imgs.reduce({Axes.ZPLANE}, func="max")
+
+    # run LocalMaxPeakFinder on max projected image
+    lmp = FindSpots.LocalMaxPeakFinder(
+        min_distance=6, stringency=0, min_obj_area=6, max_obj_area=600, is_volume=False, verbose=True
+    )
+    # bd = FindSpots.BlobDetector(
+    #     min_sigma=2, max_sigma=5, num_sigma=10, threshold=0.01, is_volume=True, measurement_type="mean"
+    # )
+    spots = lmp.run(max_imgs)
+    # tlmpf = starfish.spots.FindSpots.LocalMaxPeakFinder(
+    #     spot_diameter=spot_diameter,
+    #     min_mass=min_mass,
+    #     max_size=max_size,
+    #     separation=separation,
+    #     noise_size=noise_size,
+    #     percentile=percentile,
+    #     verbose=True,
+    # )
+    decoder = DecodeSpots.SimpleLookupDecoder(codebook=codebook)
+    return decoder.run(spots=spots)
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
@@ -593,6 +665,7 @@ def append_json(
     "codebook_path",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
+@click.option("--simple", is_flag=True)
 def run(
     path: Path,
     *,
@@ -606,6 +679,7 @@ def run(
     limit_z: int | None = None,
     split: int | None = None,
     highpass_only: bool = False,
+    simple: bool = False,
     config: DecodeConfig = DecodeConfig(),
 ):
     """
@@ -655,17 +729,18 @@ def run(
     logger.info(
         f"Running {path.parent.name}/{path.name} {f'split {split}' if split is not None else ''} with {limit_z} z-slices and {subsample_z}x subsampling."
     )
-    codebook, used_bits, names, arr_zeroblank = load_codebook(
-        codebook_path,
-        exclude={"Malat1-201"},  # , "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
-    )
-    used_bits = list(map(str, used_bits))
-
-    # if not path.with_suffix(".highpassed.tif").exists():
     with TiffFile(path) as tif:
         img_keys = tif.shaped_metadata[0]["key"]
 
     bit_mapping = {str(k): i for i, k in enumerate(img_keys)}
+
+    codebook, used_bits, names, arr_zeroblank = load_codebook(
+        codebook_path,
+        exclude={"Malat1-201"},  # , "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
+        simple=simple,
+        bit_mapping=bit_mapping,
+    )
+    used_bits = list(map(str, used_bits))
 
     # img = tif.asarray()[:, [bit_mapping[k] for k in used_bits]]
     # blurred = gaussian(path, sigma=8)
@@ -690,9 +765,10 @@ def run(
     slc = tuple(
         np.s_[
             ::subsample_z,
-            [bit_mapping[k] for k in used_bits],
+            [bit_mapping[k] for k in used_bits if k in bit_mapping],
         ]
     ) + tuple(split_slice)
+    print(bit_mapping, slc)
     stack = make_fetcher(
         path,
         slc,
@@ -767,34 +843,13 @@ def run(
         raise ValueError("Scale factor dim mismatch. Deleted. Please rerun.")
 
     # Decode
-    pixel_intensities = IntensityTable.from_image_stack(imgs)
-    logger.info("Decoding")
-    decoded_intensities = codebook.decode_metric(
-        pixel_intensities,
-        max_distance=config.max_distance,
-        min_intensity=config.min_intensity,
-        norm_order=2,
-        metric="euclidean",
-        return_original_intensities=True,
-    )
+    if not simple:
+        decoded_spots, image_decoding_results = pixel_decoding(imgs, config, codebook)
+        decoded_spots = decoded_spots.loc[decoded_spots[Features.PASSES_THRESHOLDS]]
+    else:
+        decoded_spots, image_decoding_results = spot_decoding(imgs, codebook), None
 
-    # feature_traces = pixel_intensities.stack(traces=(Axes.CH.value, Axes.ROUND.value))
-    # mags = np.linalg.norm(feature_traces.values, axis=1)
-
-    # plt.hist(mags, bins=20)
-    # sns.despine(offset=3)
-    # plt.xlabel("Barcode magnitude")
-    # plt.ylabel("Number of pixels")
-    # plt.yscale("log")
-
-    logger.info("Combining")
-    caf = CombineAdjacentFeatures(
-        min_area=config.min_area, max_area=config.max_area, mask_filtered_features=True
-    )
-    decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
-    transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
-
-    spot_intensities = decoded_spots.loc[decoded_spots[Features.PASSES_THRESHOLDS]]
+    spot_intensities = decoded_spots  # .loc[decoded_spots[Features.PASSES_THRESHOLDS]]
     genes, counts = np.unique(
         spot_intensities[Features.AXIS][Features.TARGET],
         return_counts=True,
@@ -817,10 +872,14 @@ def run(
             path_json, round_num, deviation=deviations, n=len(spot_intensities), percent_blanks=percent_blanks
         )
 
-    morph = [
-        {"area": prop.area, "centroid": prop.centroid}
-        for prop in np.array(image_decoding_results.region_properties)
-    ]
+    morph = (
+        [
+            {"area": prop.area, "centroid": prop.centroid}
+            for prop in np.array(image_decoding_results.region_properties)
+        ]
+        if image_decoding_results
+        else []
+    )
     meta = {
         "fishtools_commit": git_hash(),
         "config": config.model_dump(),

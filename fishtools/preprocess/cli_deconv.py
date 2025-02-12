@@ -1,3 +1,4 @@
+import functools
 import json
 import pickle
 import queue
@@ -316,10 +317,6 @@ def rescale(img: cp.ndarray, scale: float):
     return ((img - img.min()) * scale).get().astype(np.uint16)
 
 
-make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=7)
-projectors = [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
-
-
 @click.group()
 def deconv(): ...
 
@@ -357,6 +354,12 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
 # def initital
 
 channels = [560, 650, 750]
+
+
+@functools.cache
+def projectors():
+    make_projector(Path(DATA / "PSF GL.tif"), step=6, max_z=7)
+    return [x.astype(cp.float32) for x in cp.load(DATA / "PSF GL.npy")]
 
 
 def _run(
@@ -435,7 +438,7 @@ def _run(
                 start, img, fid, metadata = q_img.get()
                 t = time.time()
 
-                res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors, iters=1)
+                res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors(), iters=1)
                 mins = res.min(axis=(0, 2, 3), keepdims=True)
                 scale = 65534 / (res.max(axis=(0, 2, 3), keepdims=True) - mins)
 
