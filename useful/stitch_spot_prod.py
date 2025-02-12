@@ -1,8 +1,8 @@
 import re
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
-import sys
 
 import polars as pl
 import rich_click as click
@@ -10,13 +10,25 @@ from loguru import logger
 from rtree import index
 from shapely import MultiPolygon, Point, Polygon, STRtree, intersection
 
-from fishtools.analysis.spots import load_spots
+from fishtools.analysis.spots import load_parquet, load_spots
+from fishtools.preprocess.stitching import (
+    Cells,
+    Crosses,
+    filter_spots_by_area,
+    generate_cells,
+    get_exclusive_area,
+)
 from fishtools.preprocess.tileconfig import TileConfiguration
 
-FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.pkl")
+FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.(pkl|parquet)")
+OUT_SUFFIX = "_deduped.parquet"
 logger.configure(handlers=[{"sink": sys.stderr}])
 
 w = 1988
+
+
+def gen_out(path: Path):
+    return path.with_name(path.stem + OUT_SUFFIX)
 
 
 def _parse_filename(x: str):
@@ -61,14 +73,20 @@ def gen_splits(coords: tuple[float, float], n: int = 4, size: int = 1988, cut: i
     raise ValueError(f"Unknown n={n}")
 
 
-def load_pickle(
-    path: Path, i: int, coords: pl.DataFrame, *, filter_: bool = True, size: int = 1998, cut: int = 1024
+def load_splits(
+    path: Path,
+    i: int,
+    coords: pl.DataFrame,
+    *,
+    filter_: bool = True,
+    size: int = 1998,
+    cut: int = 1024,
+    simple: bool = False,
 ):
     idx, split = _parse_filename(path.name).values()
     c = coords.filter(pl.col("index") == idx).row(0, named=True)
 
-    logger.debug(f"Loading {path} as split {split}")
-
+    # logger.debug(f"Loading {path} as split {split}")
     if split == 0:  # top-left
         pass
     elif split == 1:  # top-right
@@ -80,56 +98,50 @@ def load_pickle(
         c["y"] += size - cut
 
     try:
-        return load_spots(path, i, filter_=filter_, tile_coords=(c["x"], c["y"]))
+        return (load_spots if not simple else load_parquet)(
+            path, i, filter_=filter_, tile_coords=(c["x"], c["y"])
+        )
     except Exception as e:
         logger.error(f"Error reading {path}: {e.__class__.__name__}. Please rerun.")
         raise e
+
+
+def process_df(
+    df: pl.DataFrame,
+    position: int,
+    coords: pl.DataFrame,  # to maintain type signature with process_pickle
+    cells: Cells,
+    crosses: Crosses,
+) -> pl.DataFrame:
+    """Process a single DataFrame for a specific region/position.
+
+    Args:
+        df: DataFrame containing spot data with x,y coordinates
+        position: Index of the current cell being processed
+        cells: List of all cell Polygons defining region boundaries
+        crosses: Pre-calculated cell intersections. Will calculate if None
+        filter_passes_thresholds: Whether to filter spots that don't pass thresholds
+    """
+    exclusive_area = get_exclusive_area(position, cells[position], cells, crosses)
+    return filter_spots_by_area(df, exclusive_area)
 
 
 def process(
     path_pickle: Path,
     curr: int,
     coords: pl.DataFrame,
-    cells: list[Polygon],
-    crosses: list[list[int]],
+    cells: Cells,
+    crosses: Crosses,
+    *,
     filter_: bool = True,
-):
-    current_cell = cells[curr]
+    simple: bool = False,
+) -> pl.DataFrame:
+    df = load_splits(path_pickle, curr, coords, filter_=filter_, simple=simple)
+    (df_filtered := process_df(df, curr, coords, cells, crosses)).write_parquet(gen_out(path_pickle))
 
-    lower_intersections = {j: intersection(current_cell, cells[j]) for j in crosses[curr] if j < curr}
-
-    df = load_pickle(path_pickle, curr, coords, filter_=filter_)
-    df = df.filter(
-        pl.col("passes_thresholds")
-    )  # & pl.col("area").is_between(15, 80) & pl.col("norm").gt(0.05))
-
-    # Create the "exclusive" area for this cell
-    exclusive_area = current_cell
-    for intersect in lower_intersections.values():
-        exclusive_area = exclusive_area.difference(intersect)
-
-    # Create STRtree with the exclusive area parts
-    if isinstance(exclusive_area, MultiPolygon):
-        tree_geoms = list(exclusive_area.geoms)
-    else:
-        tree_geoms = [exclusive_area]
-    tree = STRtree(tree_geoms)
-
-    def check_point(x: float, y: float):
-        point = Point(x, y)
-        return len(tree.query(point, "within")) > 0
-
-    mask = df.select([
-        pl.struct(["x", "y"])
-        .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
-        .alias("keep")
-    ])
-
-    filtered_df = df.filter(mask["keep"])
-    logger.info(f"{path_pickle}: thrown {len(df) - len(filtered_df)} / {df.__len__()}")
-    filtered_df.write_parquet(path_pickle.with_suffix(".parquet"))
-    logger.info(f"Wrote to {path_pickle.with_suffix('.parquet')}")
-    return filtered_df
+    logger.info(f"{path_pickle.name}: thrown {len(df) - len(df_filtered)} / {len(df)}.")
+    logger.debug(f"Wrote to {gen_out(path_pickle)}")
+    return df_filtered
 
 
 @click.group()
@@ -142,62 +154,61 @@ def cli(): ...
 @click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--no-filter", is_flag=True)
 @click.option("--overwrite", is_flag=True)
+@click.option("--simple", is_flag=True)
 def run(
     path_wd: Path,
     _roi: str,
     codebook: Path,
-    split: bool = True,
     no_filter: bool = False,
     overwrite: bool = False,
+    simple: bool = False,
 ):
     if path_wd.name.startswith("registered--"):
         raise ValueError("Path must be the main working directory, not registered.")
 
-    for reg_path in path_wd.glob(f"registered--{_roi}+{codebook.stem}"):
+    paths_wd = sorted(path_wd.glob(f"registered--{_roi}+{codebook.stem}"))
+    if not paths_wd:
+        raise ValueError(f"No registered--{_roi}+{codebook.stem} found in {path_wd}")
+
+    for reg_path in paths_wd:
         roi = reg_path.name.split("--")[1]
         path = path_wd / f"registered--{roi}"
         path_cb = path / ("decoded-" + codebook.stem)
         try:
             coords = load_coords(path, roi.split("+")[0])
-        except FileNotFoundError as e:
+        except FileNotFoundError:
             logger.error(
                 f"Could not find {path / f'stitch--{roi}' / 'TileConfiguration.registered.txt'}. Skipping {roi}."
             )
             continue
 
         assert len(coords) == len(set(coords["index"]))
+        files = sorted(file for file in path_cb.glob("*.pkl" if not simple else "*.parquet"))
 
-        files = sorted(file for file in path_cb.glob("*.pkl") if "opt" not in file.stem)
         if not files:
             raise ValueError(f"No files found in {path / codebook.stem}")
+        logger.info(f"Found {len(files)} files.")
 
+        # Filter coords to only include files that exist
         idxs = [name[:4] for name in coords["filename"]]
-        # pickles = list(map(lambda x: x + ".pkl", idxs))
-        files = (
-            [file for file in files if file.name.rsplit("-", 1)[-1] in idxs]
-            if not split
-            else [file for file in files if file.name.rsplit("-", 2)[1] in idxs]
-        )  # [:1300]
+        # Non-split mode: extract "1234" from "something-1234.pkl"
+        # Split mode: extract "1234" from "something-1234-0.pkl"
+        files = [
+            f
+            for f in files
+            if (match := FILENAME.match(f.name))
+            and match.group(1) in idxs
+            and f.suffix == (".pkl" if not simple else ".parquet")
+        ]
         coords = coords.filter(pl.col("index").is_in({int(f.stem.rsplit("-", 2)[1]) for f in files}))
 
-        if split:
-            cells = []
-            for file in files:
-                _, _idx, _n = file.stem.rsplit("-", 2)
-                row = coords.filter(pl.col("index") == int(_idx)).row(0, named=True)
-                cells.append(gen_splits((row["x"], row["y"]), n=int(_n)))
-        else:
-            cells = [
-                Polygon([
-                    (row["x"], row["y"]),
-                    (row["x"] + w, row["y"]),
-                    (row["x"] + w, row["y"] + w),
-                    (row["x"], row["y"] + w),
-                ])
-                for row in coords.iter_rows(named=True)
-            ]
-
+        # Precompute intersections
+        cells = generate_cells(coords, files, split=not simple, size=w)
         assert len(files) == len(cells)
+        logger.debug(f"Generated {len(cells)} cells.")
+        if not len(cells):
+            raise ValueError("No tiles left to be processed after filtering.")
+
         idx = index.Index()
         for pos, cell in enumerate(cells):
             idx.insert(pos, cell.bounds)
@@ -207,7 +218,7 @@ def run(
         with ProcessPoolExecutor(max_workers=4, mp_context=get_context("spawn")) as exc:
             futs = []
             for i, file in enumerate(files):
-                if overwrite or not file.with_suffix(".parquet").exists():
+                if overwrite or not gen_out(file).exists():
                     futs.append(
                         exc.submit(
                             process,
@@ -217,12 +228,13 @@ def run(
                             cells=cells,
                             crosses=crosses,
                             filter_=not no_filter,
+                            simple=simple,
                         )
                     )
             for fut in as_completed(futs):
                 fut.result()
 
-        df = pl.scan_parquet(sorted([file.with_suffix(".parquet") for file in files])).collect()
+        df = pl.scan_parquet(sorted([gen_out(file) for file in files])).collect()
         df.write_parquet(path_cb / "spots.parquet")
         logger.info(f"Wrote to {path_cb / 'spots.parquet'}")
 

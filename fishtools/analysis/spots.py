@@ -9,6 +9,8 @@ import polars as pl
 def load_spots(
     path: Path | str, idx: int, *, filter_: bool = True, tile_coords: Sequence[float] | None = None
 ):
+    if Path(path).suffix != ".pkl":
+        raise ValueError(f"Expected .pkl file, got {Path(path).suffix}")
     try:
         d, y, *_ = pickle.loads(Path(path).read_bytes())
     except Exception as e:
@@ -31,6 +33,21 @@ def load_spots(
             norm=pl.Series(np.linalg.norm(d.values, axis=(1, 2))),
             tile=pl.lit(str(idx)),
             passes_thresholds=pl.Series(d.coords["passes_thresholds"].values),
+        )
+        .with_row_index("idx_local")
+    )
+
+
+def load_parquet(
+    path: Path | str, idx: int, *, filter_: bool = True, tile_coords: Sequence[float] | None = None
+):
+    return (
+        pl.read_parquet(path)
+        .rename(dict(y="y_local", x="x_local"))
+        .with_columns(
+            y=pl.col("y_local") + (tile_coords[1] if tile_coords is not None else 0),
+            x=pl.col("x_local") + (tile_coords[0] if tile_coords is not None else 0),
+            tile=pl.lit(str(idx)),
         )
         .with_row_index("idx_local")
     )
