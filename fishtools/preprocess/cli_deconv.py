@@ -477,6 +477,7 @@ def _run(
 @click.option("--limit", type=int, default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2)
+@click.option("--basic-name", type=str, default=None)
 def run(
     path: Path,
     name: str,
@@ -484,6 +485,7 @@ def run(
     ref: Path | None,
     limit: int | None,
     overwrite: bool,
+    basic_name: str | None,
     n_fids: int,
 ):
     """GPU-accelerated very accelerated 3D deconvolution.
@@ -536,9 +538,11 @@ def run(
         logger.warning("No files found. Skipping.")
         return
 
+    basic_name = basic_name or name
+    logger.info(f"Using({path / 'basic'}/{basic_name}-*.pkl for BaSiC")
     basics: dict[str, list[BaSiC]] = {
         name: [
-            pickle.loads((path / "basic" / f"{name}-{c}.pkl").read_bytes())
+            pickle.loads((path / "basic" / f"{basic_name}-{c}.pkl").read_bytes())
             for c in range(len(name.split("_")))
         ]
     }
@@ -551,6 +555,7 @@ def run(
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2)
+@click.option("--basic-name", type=str, default=None)
 def batch(
     path: Path,
     *,
@@ -558,6 +563,7 @@ def batch(
     ref: Path | None,
     overwrite: bool,
     n_fids: int,
+    basic_name: str | None,
 ):
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
@@ -591,13 +597,13 @@ def batch(
         try:
             basics: dict[str, list[BaSiC]] = {
                 r: [
-                    pickle.loads((path / "basic" / f"{r}-{c}.pkl").read_bytes())
+                    pickle.loads((path / "basic" / f"{basic_name or r}-{c}.pkl").read_bytes())
                     for c in range(len(r.split("_")))
                 ]
             }
         except FileNotFoundError:
             logger.error(
-                f"Could not find {path / 'basic' / f'{r}-[n].pkl'}. Please run basic first. Skipping to rounds with basic."
+                f"Could not find {path / 'basic' / f'{basic_name or r}-[n].pkl'}. Please run basic first. Skipping to rounds with basic."
             )
         else:
             _run(

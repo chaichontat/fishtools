@@ -336,9 +336,6 @@ def extract(
         del img
         return
 
-    if max_proj:
-        raise ValueError("Cannot use max_proj with is_3d")
-
     if len(img.shape) < 3:
         raise ValueError("Image must be at least 3D")
 
@@ -362,6 +359,9 @@ def extract(
             ::downsample,
         ]
     )
+
+    if max_proj:
+        img = img.max(axis=0, keepdims=True)
 
     for i in range(img.shape[0]):
         for j in range(img.shape[1]):
@@ -398,6 +398,7 @@ def extract(
 @click.option("--is-2d", is_flag=True)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--channels", type=str, default="-3,-2,-1")
+@click.option("--max-proj", is_flag=True)
 @batch_roi("stitch--*")
 def fuse(
     path: Path,
@@ -411,6 +412,7 @@ def fuse(
     threads: int = 8,
     channels: str = "-3,-2,-1",
     subsample_z: int = 1,
+    max_proj: bool = False,
 ):
     if "--" in path.as_posix():
         raise ValueError("Please be in the workspace folder.")
@@ -419,8 +421,8 @@ def fuse(
     path = path / f"stitch--{roi}"
     files = sorted(path_img.glob("*.tif"))
     if not len(files):
-        raise ValueError(f"No images found at {path_img.resolve()}.")
-    logger.info(f"Found {len(files)} images at {path_img.resolve()}.")
+        raise ValueError(f"No images found at {path_img.resolve()}")
+    logger.info(f"Found {len(files)} images at {path_img.resolve()}")
 
     if overwrite:
         for p in path.iterdir():
@@ -435,23 +437,33 @@ def fuse(
     tileconfig = TileConfiguration.from_file(tile_config).downsample(downsample)
     n = len(tileconfig) // split
 
-    # with progress_bar_threadpool(len(files), threads=threads) as submit:
-    #     for file in files:
-    #         submit(
-    #             extract,
-    #             file,
-    #             path,
-    #             downsample=downsample,
-    #             subsample_z=subsample_z,
-    #             is_2d=is_2d,
-    #             channels=list(map(int, channels.split(","))),
-    #         )
+    if channels == "all":
+        channels = ",".join(map(str, range(imread(files[0]).shape[1])))
+
+    logger.info(f"Found {len(files)} files. Extracting channel {channels} to {path}")
+
+    with progress_bar_threadpool(len(files), threads=threads) as submit:
+        for file in files:
+            submit(
+                extract,
+                file,
+                path,
+                downsample=downsample,
+                subsample_z=subsample_z,
+                is_2d=is_2d,
+                channels=list(map(int, channels.split(","))),
+                max_proj=max_proj,
+            )
 
     def run_folder(folder: Path, capture_output: bool = False):
         for i in range(split):
             tileconfig[i * n : (i + 1) * n].write(folder / f"TileConfiguration{i + 1}.registered.txt")
             try:
-                run_imagej(folder, name=f"TileConfiguration{i + 1}", capture_output=capture_output)
+                run_imagej(
+                    folder,
+                    name=f"TileConfiguration{i + 1}",
+                    capture_output=capture_output,
+                )
             except Exception as e:
                 logger.critical(f"Error running ImageJ for {folder}: {e}")
                 raise e
@@ -460,6 +472,7 @@ def fuse(
     # Get all folders without subfolders
     folders = [folder for folder, subfolders, _ in (path.parent / f"stitch--{roi}").walk() if not subfolders]
 
+    logger.info(f"Calling ImageJ on {len(folders)} folders.")
     with progress_bar_threadpool(len(folders), threads=threads) as submit:
         for folder in folders:
             if not folder.is_dir():
@@ -524,7 +537,7 @@ def combine(path: Path, roi: str, threads: int = 8):
     logger.info(f"Writing to {path.resolve() / 'fused.tif'}")
     imwrite(
         path / "fused.tif",
-        out,
+        out.squeeze(),
         compression="zlib",
         metadata={"axes": "ZCYX", "key": mapping},
         # compressionargs={"level": 0.75},
