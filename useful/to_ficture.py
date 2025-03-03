@@ -8,7 +8,9 @@ import polars as pl
 path = Path("/mnt/working/lai/ficture")
 
 dfs = [
-    pl.scan_parquet(path.parent.as_posix() + "/*.parquet").collect().with_row_index("idx")
+    pl.scan_parquet(path.parent.as_posix() + "/*.parquet")
+    .collect()
+    .with_row_index("idx")
     # .filter(pl.col("y").is_between(-7500, 0)),
     # pl.read_parquet("/mnt/working/e155trcdeconv/registered--leftold/tricycleplus/spots.parquet"),
 ]
