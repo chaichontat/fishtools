@@ -145,8 +145,9 @@ def load_codebook(
         except KeyError:
             logger.warning(f"Codebook does not contain {k}")
 
-    # if simple:
-    cb_json = {k: [v[0]] for k, v in cb_json.items()}
+    if simple:
+        cb_json = {k: [v[0]] for k, v in cb_json.items()}
+        logger.warning("Running in simple mode. Only using the first bit for each gene.")
 
     # Remove any genes that are not imaged.
     available_bits = sorted(bit_mapping)
@@ -168,6 +169,7 @@ def load_codebook(
     names = np.array(list(cb_json.keys()))
     is_blank = np.array([n.startswith("Blank") for n in names])[:, None]  # [:-1, None]
     arr_zeroblank = arr * ~is_blank
+
     return (
         Codebook.from_numpy(
             names,
@@ -479,8 +481,8 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
             curr.append([cast(InitialScale, s).initial_scale for s in sf if s.round_num == round_num][0])
         else:
             want = cast(Deviation, [s for s in sf if s.round_num == round_num][0])
-            if want.n < 500:
-                logger.debug(f"Skipping {p} at round {round_num} because n={want.n} < 500.")
+            if want.n < 200:
+                logger.debug(f"Skipping {p} at round {round_num} because n={want.n} < 200.")
                 continue
             curr.append(np.nan_to_num(np.array(want.deviation, dtype=float), nan=1) * want.n)
             n += want.n
@@ -625,16 +627,7 @@ def spot_decoding(
     percentile: int = 0,
 ) -> DecodedIntensityTable:
     # z project
-    max_imgs = imgs.reduce({Axes.ZPLANE}, func="max")
-
-    # run LocalMaxPeakFinder on max projected image
-    lmp = FindSpots.LocalMaxPeakFinder(
-        min_distance=6, stringency=0, min_obj_area=6, max_obj_area=600, is_volume=False, verbose=True
-    )
-    # bd = FindSpots.BlobDetector(
-    #     min_sigma=2, max_sigma=5, num_sigma=10, threshold=0.01, is_volume=True, measurement_type="mean"
-    # )
-    spots = lmp.run(max_imgs)
+    # max_imgs = imgs.reduce({Axes.ZPLANE}, func="max")
     # tlmpf = starfish.spots.FindSpots.LocalMaxPeakFinder(
     #     spot_diameter=spot_diameter,
     #     min_mass=min_mass,
@@ -644,6 +637,21 @@ def spot_decoding(
     #     percentile=percentile,
     #     verbose=True,
     # )
+
+    # run LocalMaxPeakFinder on max projected image
+    bd = FindSpots.BlobDetector(
+        min_sigma=1,
+        max_sigma=4,
+        num_sigma=10,
+        threshold=0.03,
+        is_volume=True,
+    )
+    # bd = FindSpots.BlobDetector(
+    #     min_sigma=2, max_sigma=5, num_sigma=10, threshold=0.01, is_volume=True, measurement_type="mean"
+    # )
+    spots = bd.run(image_stack=imgs)  # , reference_image=dots)
+    # spots = lmp.run(max_imgs)
+
     decoder = DecodeSpots.SimpleLookupDecoder(codebook=codebook)
     return decoder.run(spots=spots)
 
@@ -740,6 +748,7 @@ def run(
         simple=simple,
         bit_mapping=bit_mapping,
     )
+
     used_bits = list(map(str, used_bits))
 
     # img = tif.asarray()[:, [bit_mapping[k] for k in used_bits]]

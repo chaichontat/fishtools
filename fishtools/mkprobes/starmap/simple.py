@@ -43,12 +43,10 @@ def run_pipeline(codebook_path: Path, cwd: Path, species: str = "mouse"):
 def create_pad(seq: str, readout: str):
     arr = ["GTAGACTA", seq.lower(), readout, "ATTGGTTC"]
     out = "".join(arr)
-    if len(out) > 60:
+    if len(out) > 67:
         raise ValueError("Too long")
-    if len(out) > 57:
-        return out
 
-    arr.insert(2, "TACATA"[: 57 - len(out)])
+    arr.insert(2, "TACATAATCAAAT"[: 67 - len(out)])
     return "".join(arr)
 
 
@@ -56,9 +54,8 @@ def create_spl(seq: str):
     return seq.lower() + "TA GTCTAC GAACCA"
 
 
-def process(codebook: dict[str, list[int]], readouts: pl.DataFrame, cwd: Path, n: int = 16):
+def process(codebook: dict[str, list[int]], cwd: Path, n: int = 16):
     HHP = lambda x: hp(x, "dna")
-    n = 16
     dfs = {k: pl.read_parquet(f"{cwd}/output/{k}_final_{bits[0]}.parquet") for k, bits in codebook.items()}
     res = {}
     for df in dfs:
@@ -88,14 +85,16 @@ def process(codebook: dict[str, list[int]], readouts: pl.DataFrame, cwd: Path, n
         res[df] = df_.sample(min(n, len(df_)), seed=4)
         print(f"{df}: {len(res[df])}")
 
-    df = pl.concat([df.select(next(iter(dfs.values())).columns) for df in res.values()])
+    return pl.concat([df.select(next(iter(dfs.values())).columns) for df in res.values()])
 
+
+def generate_splint_padlock(df: pl.DataFrame, readouts: pl.DataFrame):
     out = []
     for i, row in enumerate(df.iter_rows(named=True)):
         spl = create_spl(rc(row["splint"])).replace(" ", "")
         pad = create_pad(rc(row["padlock"]), readouts[row["code"] - 1, "seq"]).replace(" ", "")
         assert len(spl) < 60, "spl"
-        assert len(pad) < 60, f"pad {len(row['padlock'])}"
+        assert len(pad) == 67
         assert test_splint_padlock(spl, pad)
         out.append({"name": f"Spl-{row['gene']}-{i}-R{row['code']}", "seq": spl})
         out.append({"name": f"Pad-{row['gene']}-{i}-R{row['code']}", "seq": pad})
