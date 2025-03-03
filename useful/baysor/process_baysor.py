@@ -212,28 +212,34 @@ from itertools import chain
 
 sc.set_figure_params(facecolor="black", frameon=False)
 # Set background black and all text elements to white
-plt.rcParams.update({
-    "figure.facecolor": "black",
-    "axes.facecolor": "black",
-    "text.color": "gray",
-    "axes.labelcolor": "white",
-    "xtick.color": "white",
-    "ytick.color": "white",
-})
+plt.rcParams.update(
+    {
+        "figure.facecolor": "black",
+        "axes.facecolor": "black",
+        "text.color": "gray",
+        "axes.labelcolor": "white",
+        "xtick.color": "white",
+        "ytick.color": "white",
+    }
+)
 
 print(
-    "\n".join([
-        f"Group {c}: " + ", ".join(sc.get.rank_genes_groups_df(adata, group=c).head(5)["names"])
-        for c in adata.obs["leiden"].cat.categories
-    ])
+    "\n".join(
+        [
+            f"Group {c}: " + ", ".join(sc.get.rank_genes_groups_df(adata, group=c).head(5)["names"])
+            for c in adata.obs["leiden"].cat.categories
+        ]
+    )
 )
 # %%
 genes = sorted(
     set(
-        chain.from_iterable([
-            sc.get.rank_genes_groups_df(adata, group=c).head(5)["names"]
-            for c in adata.obs["leiden"].cat.categories
-        ])
+        chain.from_iterable(
+            [
+                sc.get.rank_genes_groups_df(adata, group=c).head(5)["names"]
+                for c in adata.obs["leiden"].cat.categories
+            ]
+        )
     )
 )
 
