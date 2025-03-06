@@ -105,21 +105,29 @@ def generate_cells(
         split: Whether to generate split regions
         size: Full tile size
         cut: Overlap size for split regions
-    """
-    if split:
-        cells = []
-        for file in files:
-            _, idx, n = file.stem.rsplit("-", 2)
-            row = coords.filter(pl.col("index") == int(idx)).row(0, named=True)
-            cells.append(gen_splits((row["x"], row["y"]), n=int(n), size=size, cut=cut))
-        return cells
 
-    return [
-        Polygon([
-            (row["x"], row["y"]),
-            (row["x"] + size, row["y"]),
-            (row["x"] + size, row["y"] + size),
-            (row["x"], row["y"] + size),
-        ])
-        for row in coords.iter_rows(named=True)
-    ]
+    Returns:
+        List of polygons representing cells
+    """
+    cells = []
+
+    for file in files:
+        parts = file.stem.rsplit("-", 2 if split else 1)
+        idx = int(parts[-1] if not split else parts[-2])
+
+        row = coords.filter(pl.col("index") == idx).row(0, named=True)
+
+        if split:
+            n = int(parts[-1])
+            cells.append(gen_splits((row["x"], row["y"]), n=n, size=size, cut=cut))
+        else:
+            cells.append(
+                Polygon([
+                    (row["x"], row["y"]),
+                    (row["x"] + size, row["y"]),
+                    (row["x"] + size, row["y"] + size),
+                    (row["x"], row["y"] + size),
+                ])
+            )
+
+    return cells

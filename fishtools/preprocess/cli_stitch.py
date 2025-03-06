@@ -1,14 +1,10 @@
 # %%
-import re
 import shutil
 import subprocess
 import threading
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import wraps
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import ParamSpec, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -18,6 +14,7 @@ from tifffile import TiffFile, TiffFileError, imread, imwrite
 
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
+from fishtools.utils.utils import batch_roi
 
 
 def create_tile_config(
@@ -42,12 +39,6 @@ def create_tile_config(
     ats = adjusted.copy()
     ats["x"] -= ats["x"].min()
     ats["y"] -= ats["y"].min()
-
-    # mat = ats[["y", "x"]].to_numpy() @ np.loadtxt("/home/chaichontat/fishtools/data/stage_rotation.txt")
-    # ats["x"] = mat[:, 0]
-    # ats["y"] = mat[:, 1]
-
-    # print(ats)
 
     with open(path / name, "w") as f:
         f.write("dim=2\n")
@@ -98,17 +89,6 @@ def run_imagej(
 def copy_registered(reference_path: Path, actual_path: Path):
     for file in reference_path.glob("*.registered.txt"):
         shutil.copy(file, actual_path)
-    # tr = actual_path / "TileConfiguration.registered.txt"
-    # tr.write_text(
-    #     "\n".join(
-    #         map(
-    #             lambda x: x.replace(
-    #                 f"_{int(reference_path.stem):03d}.tif", f"_{int(actual_path.stem):03d}.tif"
-    #             ),
-    #             tr.read_text().splitlines(),
-    #         )
-    #     )
-    # )
 
 
 def extract_channel(
@@ -156,23 +136,28 @@ def extract_channel(
 def stitch(): ...
 
 
-P, T = ParamSpec("P"), TypeVar("T")
+@stitch.command()
+@click.argument(
+    "path",
+    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
+)
+@click.option(
+    "--tileconfig",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
+@click.option("--fuse", is_flag=True)
+@click.option("--downsample", type=int, default=2)
+def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int):
+    if downsample > 1:
+        logger.info(f"Downsampling tile config by {downsample}x to {path / 'TileConfiguration.txt'}")
+    TileConfiguration.from_file(tileconfig).downsample(downsample).write(path / "TileConfiguration.txt")
 
-
-def batch_roi(look_for: str = "registered--*"):
-    def decorator(func: Callable[P, T]) -> Callable[P, T | None]:
-        @wraps(func)
-        def inner(**kwargs: P.kwargs) -> T:
-            if kwargs["roi"] == "*":
-                for p in Path(kwargs["path"]).glob(look_for):
-                    print(kwargs | dict(roi=p.name.split("--")[1]))
-                    func(**(kwargs | dict(roi=p.name.split("--")[1])))
-                return
-            return func(**kwargs)
-
-        return inner
-
-    return decorator
+    run_imagej(
+        path,
+        compute_overlap=True,
+        fuse=fuse,
+        name="TileConfiguration",
+    )
 
 
 @stitch.command()

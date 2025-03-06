@@ -1,9 +1,13 @@
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 import polars as pl
 import pyparsing as pp
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 
 class TileConfiguration:
@@ -88,3 +92,13 @@ class TileConfiguration:
 
     def __len__(self) -> int:
         return len(self.df)
+
+    def plot(self, ax: "Axes | None" = None):
+        import matplotlib.pyplot as plt
+
+        if not ax:
+            _, ax = plt.subplots(figsize=(8, 6), dpi=200)
+        for row in self.df.iter_rows(named=True):
+            ax.scatter(row["x"], row["y"], s=0.1)
+            ax.text(row["x"], row["y"], str(row["index"]), fontsize=6, ha="center", va="center")
+        ax.set_aspect("equal")

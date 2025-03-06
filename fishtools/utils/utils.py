@@ -62,9 +62,7 @@ def setup_logging():
                 frame = frame.f_back
                 depth += 1
 
-            logger.opt(depth=depth, exception=record.exc_info).log(
-                level, record.getMessage()
-            )
+            logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
 
     logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
     logging.getLogger("biothings").setLevel(logging.CRITICAL)
@@ -99,9 +97,7 @@ def slide(x: str, n: int = 20) -> list[str]:
 
 def check_if_exists(
     logger: "loguru.Logger",
-    name_detector: Callable[[dict[str, Any]], Path | str] = lambda kwargs: str(
-        next(iter(kwargs.values()))
-    ),
+    name_detector: Callable[[dict[str, Any]], Path | str] = lambda kwargs: str(next(iter(kwargs.values()))),
 ):
     """
     A decorator that checks if a file exists before executing a function.
@@ -126,9 +122,9 @@ def check_if_exists(
     def decorator(f: Callable[P, R]) -> Callable[P, R | None]:
         @wraps(f)
         def inner(*args: P.args, **kwargs: P.kwargs) -> R | None:
-            if not (
-                path := Path(name_detector(getcallargs(f, *args, **kwargs)))
-            ).exists() or kwargs.get("overwrite", False):
+            if not (path := Path(name_detector(getcallargs(f, *args, **kwargs)))).exists() or kwargs.get(
+                "overwrite", False
+            ):
                 return f(*args, **kwargs)
             logger.warning(f"{path} already exists. Skipping.")
 
@@ -150,9 +146,27 @@ def batchable():
 
 def git_hash() -> str:
     return (
-        subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).parent.parent
-        )
+        subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).parent.parent)
         .decode("ascii")
         .strip()
     )
+
+
+_T = TypeVar("_T")
+
+
+def batch_roi(look_for: str = "registered--*"):
+    def decorator(func: Callable[P, _T]) -> Callable[P, _T | None]:
+        @wraps(func)
+        def inner(*args: P.args, **kwargs: P.kwargs) -> _T | None:
+            if kwargs["roi"] == "*":
+                for p in Path(kwargs["path"]).glob(look_for):  # type: ignore
+                    print(kwargs | dict(roi=p.name.split("--")[1]))
+                    kwargs = kwargs | dict(roi=p.name.split("--")[1])  # type: ignore
+                    func(*args, **kwargs)
+                return
+            return func(*args, **kwargs)
+
+        return inner
+
+    return decorator

@@ -3,6 +3,7 @@ import signal
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from types import FrameType
 from typing import Any, Callable, Concatenate, Generator, ParamSpec, Protocol, TypeVar
 
 import colorama
@@ -59,30 +60,82 @@ def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
 
 
 P = ParamSpec("P")
-R, T = TypeVar("R", covariant=True), TypeVar("T")
+_R = TypeVar("_R")
+T = TypeVar("T")
+
+
+class TaskCancelledException(Exception): ...
 
 
 @contextmanager
 def progress_bar_threadpool(n: int, *, threads: int):
+    """Creates a thread pool with a progress bar that handles graceful shutdown.
+
+    Args:
+        n: Total number of tasks to track in the progress bar
+        threads: Number of worker threads in the pool
+
+    Returns:
+        submit: Function to submit tasks to the thread pool. Has signature:
+            submit(func: Callable, *args, **kwargs) -> Future
+            - func: The function to execute
+            - args/kwargs: Arguments to pass to the function
+            - returns a Future object representing the pending task
+
+    Example:
+        # Basic usage
+        with progress_bar_threadpool(len(items), threads=4) as submit:
+            for item in items:
+                submit(process_item, item)
+
+    Notes:
+        - Progress bar advances automatically as tasks complete
+        - If any task raises an exception, all pending tasks are canceled
+        - SIGINT (Ctrl+C) cancels all pending tasks gracefully
+        - TaskCancelledException is raised for canceled tasks
+    """
     futs: list[Future] = []
+    should_terminate = threading.Event()
+
     with progress_bar(n) as callback, ThreadPoolExecutor(threads) as exc:
 
-        def signal_handler(signum, frame):
+        def signal_handler(signum: int, frame: FrameType | None) -> None:
             logger.info("\nShutting down...")
+            should_terminate.set()
+            for fut in futs:
+                fut.cancel()
             exc.shutdown(wait=False, cancel_futures=True)
-            exit(0)
+            raise KeyboardInterrupt
 
-        signal.signal(signal.SIGINT, signal_handler)
+        prior_handler = signal.signal(signal.SIGINT, signal_handler)
 
-        def submit(f: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> Future[R]:
-            futs.append(exc.submit(f, *args, **kwargs))
+        def submit(f: Callable[P, _R], *args: P.args, **kwargs: P.kwargs) -> Future[_R]:
+            def wrapped_f(*args: P.args, **kwargs: P.kwargs) -> _R:
+                if should_terminate.is_set():
+                    raise TaskCancelledException
+                return f(*args, **kwargs)
+
+            futs.append(exc.submit(wrapped_f, *args, **kwargs))
             return futs[-1]
 
-        yield submit
+        try:
+            yield submit
 
-        for f in as_completed(futs):
-            f.result()
-            callback()
+            for f in as_completed(futs):
+                if should_terminate.is_set():
+                    break
+                callback()
+                try:
+                    f.result()
+                except Exception as e:
+                    should_terminate.set()
+                    for fut in futs:
+                        fut.cancel()
+                    if isinstance(e, TaskCancelledException):
+                        continue
+                    raise e
+        finally:
+            signal.signal(signal.SIGINT, prior_handler)
 
 
 console = Console()
