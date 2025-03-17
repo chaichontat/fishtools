@@ -48,16 +48,20 @@ def scale_bar(ax, *, length=100, y_offset=300, text_pos=0.15, text_offset=400, t
 
 
 print(
-    "\n".join([
-        f"Cluster {c}: "
-        + ", ".join([
-            f"{entry['names']}: {np.round(entry['scores'], 2)}"
-            for entry in sc.get.rank_genes_groups_df(adata, group=c)
-            .head(10)[["names", "scores"]]
-            .to_dict(orient="records")
-        ])
-        for c in adata.obs["leiden"].cat.categories
-    ])
+    "\n".join(
+        [
+            f"Cluster {c}: "
+            + ", ".join(
+                [
+                    f"{entry['names']}: {np.round(entry['scores'], 2)}"
+                    for entry in sc.get.rank_genes_groups_df(adata, group=c)
+                    .head(10)[["names", "scores"]]
+                    .to_dict(orient="records")
+                ]
+            )
+            for c in adata.obs["leiden"].cat.categories
+        ]
+    )
 )
 # %%
 from fishtools.utils.plot import plot_wheel
@@ -92,10 +96,12 @@ palette_spaco = list(color_mapping.values())
 # %%
 genes = sorted(
     set(
-        chain.from_iterable([
-            sc.get.rank_genes_groups_df(adata, group=c).head(6)["names"]
-            for c in adata.obs["leiden"].cat.categories
-        ])
+        chain.from_iterable(
+            [
+                sc.get.rank_genes_groups_df(adata, group=c).head(6)["names"]
+                for c in adata.obs["leiden"].cat.categories
+            ]
+        )
     )
 )
 
@@ -956,7 +962,7 @@ corrss = []
 
 for b in range(100):
     print(b)
-    if np.sum((bin_indices == b)) < 5:
+    if np.sum(bin_indices == b) < 5:
         corrss.append(np.zeros(ads.n_vars))
         continue
     correlations = pd.Series(
@@ -1042,11 +1048,13 @@ for i in range(4):
 
     wtf = adata[:, shared].X.toarray() @ loadings.to_numpy() + shift
 
-    df = pd.DataFrame({
-        "theta": (np.arctan2(wtf[:, 1], wtf[:, 0]) + np.pi / 2) % (2 * np.pi) - np.pi,
-        "intensity": np.nan_to_num(adata.obs["intensity_mean"], nan=2000),
-        "gene": adata[:, "Top2a"].X.toarray().squeeze(),
-    })
+    df = pd.DataFrame(
+        {
+            "theta": (np.arctan2(wtf[:, 1], wtf[:, 0]) + np.pi / 2) % (2 * np.pi) - np.pi,
+            "intensity": np.nan_to_num(adata.obs["intensity_mean"], nan=2000),
+            "gene": adata[:, "Top2a"].X.toarray().squeeze(),
+        }
+    )
 
     print(np.sum(df["theta"] > 0))
     print(np.sum(df["intensity"] > 6000))

@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar
 
 import click
+import matplotlib.pyplot as plt
 import numpy as np
+import seaborn as sns
 import tifffile
 import toml
 from basicpy import BaSiC
@@ -21,8 +23,6 @@ from tifffile import TiffFile, imread
 
 from fishtools import align_fiducials
 from fishtools.analysis.chromatic import Affine
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 sns.set_theme()
 

@@ -180,7 +180,12 @@ def construct(
         restriction = "_" + "".join(restriction)
     restriction = restriction or ""
 
-    if (final_path := Path(output_path / f"{transcript}_final{restriction}_{','.join(map(str, sorted(codebook[transcript])))}.parquet")).exists():
+    if (
+        final_path := Path(
+            output_path
+            / f"{transcript}_final{restriction}_{','.join(map(str, sorted(codebook[transcript])))}.parquet"
+        )
+    ).exists():
         if overwrite:
             final_path.unlink()
         else:

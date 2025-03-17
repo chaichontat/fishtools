@@ -26,8 +26,7 @@ def prepend_anchor(s: str):
 
 
 out = df.with_columns(
-    seq=pl.when(pl.col("name").str.starts_with("Spl"))
-    .then(pl.col("seq"))
+    seq=pl.when(pl.col("name").str.starts_with("Spl")).then(pl.col("seq"))
     # .then(pl.col("seq").map_elements(prepend_anchor, return_dtype=pl.Utf8))
     .otherwise("/5Phos/" + pl.col("seq"))
 )

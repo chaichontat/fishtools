@@ -5,7 +5,6 @@ import polars as pl
 import seaborn as sns
 import tifffile
 
-
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
 
 
