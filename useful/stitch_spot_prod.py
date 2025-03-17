@@ -53,23 +53,27 @@ def gen_splits(coords: tuple[float, float], n: int = 4, size: int = 1988, cut: i
         raise ValueError("width and offset must be greater than 0")
     x, y = coords
     if n == 0:  # [:cut, :cut] - top-left
-        return Polygon([
-            (x, y),
-            (x + cut, y),
-            (x + cut, y + cut),  # + for y to go down
-            (x, y + cut),
-        ])
+        return Polygon(
+            [
+                (x, y),
+                (x + cut, y),
+                (x + cut, y + cut),  # + for y to go down
+                (x, y + cut),
+            ]
+        )
     if n == 1:  # [:cut, -cut:] - top-right
         return Polygon([(x + size - cut, y), (x + size, y), (x + size, y + cut), (x + size - cut, y + cut)])
     if n == 2:  # [-cut:, :cut] - bottom-left
         return Polygon([(x, y + size - cut), (x + cut, y + size - cut), (x + cut, y + size), (x, y + size)])
     if n == 3:  # [-cut:, -cut:] - bottom-right
-        return Polygon([
-            (x + size - cut, y + size - cut),
-            (x + size, y + size - cut),
-            (x + size, y + size),
-            (x + size - cut, y + size),
-        ])
+        return Polygon(
+            [
+                (x + size - cut, y + size - cut),
+                (x + size, y + size - cut),
+                (x + size, y + size),
+                (x + size - cut, y + size),
+            ]
+        )
     raise ValueError(f"Unknown n={n}")
 
 

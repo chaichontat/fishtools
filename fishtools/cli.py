@@ -14,8 +14,7 @@ P, R = ParamSpec("P"), TypeVar("R", covariant=True)
 
 
 class PathFirst(Protocol[P, R]):
-    def __call__(self, path: Path, *args: P.args, **kwargs: P.kwargs) -> R:
-        ...
+    def __call__(self, path: Path, *args: P.args, **kwargs: P.kwargs) -> R: ...
 
 
 def execute(
@@ -38,8 +37,7 @@ def execute(
 
 
 @click.group()
-def main():
-    ...
+def main(): ...
 
 
 def process_path(path: Path, file_types: list[str]):

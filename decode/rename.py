@@ -1,6 +1,6 @@
 # %%
-from pathlib import Path
 import re
+from pathlib import Path
 
 name = "/disk/chaichontat/2024/sv101_ACS/WGAfiducial_fiducial_tdT_29_polyT--noRNAse_big"
 files = list(Path(name).glob("*.tif"))
@@ -12,9 +12,10 @@ for file in files:
     file.rename(file.with_name(outname))
 
 
+import json
+
 # %%
 from tifffile import TiffFile, imread, imwrite
-import json
 
 files = list(Path(f"/fast2/jaredtest/{to}").glob("*.tif"))
 for file in files:

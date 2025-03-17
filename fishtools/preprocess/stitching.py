@@ -34,11 +34,13 @@ def filter_spots_by_area(df: pl.DataFrame, area: Polygon) -> pl.DataFrame:
     def check_point(x: float, y: float) -> bool:
         return len(tree.query(Point(x, y), "within")) > 0
 
-    mask = df.select([
-        pl.struct(["x", "y"])
-        .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
-        .alias("keep")
-    ])
+    mask = df.select(
+        [
+            pl.struct(["x", "y"])
+            .map_elements(lambda row: check_point(row["x"], row["y"]), return_dtype=pl.Boolean)
+            .alias("keep")
+        ]
+    )
 
     return df.filter(mask["keep"])
 
@@ -58,33 +60,41 @@ def gen_splits(coords: Coords, n: int = 4, size: int = 1988, cut: int = 1024) ->
 
     match n:
         case 0:  # top-left
-            return Polygon([
-                (x, y),
-                (x + cut, y),
-                (x + cut, y + cut),
-                (x, y + cut),
-            ])
+            return Polygon(
+                [
+                    (x, y),
+                    (x + cut, y),
+                    (x + cut, y + cut),
+                    (x, y + cut),
+                ]
+            )
         case 1:  # top-right
-            return Polygon([
-                (x + size - cut, y),
-                (x + size, y),
-                (x + size, y + cut),
-                (x + size - cut, y + cut),
-            ])
+            return Polygon(
+                [
+                    (x + size - cut, y),
+                    (x + size, y),
+                    (x + size, y + cut),
+                    (x + size - cut, y + cut),
+                ]
+            )
         case 2:  # bottom-left
-            return Polygon([
-                (x, y + size - cut),
-                (x + cut, y + size - cut),
-                (x + cut, y + size),
-                (x, y + size),
-            ])
+            return Polygon(
+                [
+                    (x, y + size - cut),
+                    (x + cut, y + size - cut),
+                    (x + cut, y + size),
+                    (x, y + size),
+                ]
+            )
         case 3:  # bottom-right
-            return Polygon([
-                (x + size - cut, y + size - cut),
-                (x + size, y + size - cut),
-                (x + size, y + size),
-                (x + size - cut, y + size),
-            ])
+            return Polygon(
+                [
+                    (x + size - cut, y + size - cut),
+                    (x + size, y + size - cut),
+                    (x + size, y + size),
+                    (x + size - cut, y + size),
+                ]
+            )
         case _:
             raise ValueError(f"Unknown split index n={n}")
 
@@ -122,12 +132,14 @@ def generate_cells(
             cells.append(gen_splits((row["x"], row["y"]), n=n, size=size, cut=cut))
         else:
             cells.append(
-                Polygon([
-                    (row["x"], row["y"]),
-                    (row["x"] + size, row["y"]),
-                    (row["x"] + size, row["y"] + size),
-                    (row["x"], row["y"] + size),
-                ])
+                Polygon(
+                    [
+                        (row["x"], row["y"]),
+                        (row["x"] + size, row["y"]),
+                        (row["x"] + size, row["y"] + size),
+                        (row["x"], row["y"] + size),
+                    ]
+                )
             )
 
     return cells

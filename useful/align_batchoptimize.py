@@ -5,7 +5,6 @@ from pathlib import Path
 import rich_click as click
 from loguru import logger
 
-
 # %%
 
 

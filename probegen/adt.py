@@ -1,8 +1,8 @@
 # %%
 import polars as pl
 
-from fishtools.mkprobes.utils.sequtils import gen_idt
 from fishtools import rc
+from fishtools.mkprobes.utils.sequtils import gen_idt
 
 df = pl.read_csv("data/readout_ref_filtered.csv")
 # %%

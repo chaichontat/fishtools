@@ -383,16 +383,20 @@ def run_fiducial(
     (shift_path := path / f"shifts--{roi}+{codebook_name}").mkdir(exist_ok=True)
 
     _fid_ref = fids[reference][500:-500:2, 500:-500:2].flatten()
-    validated = Shifts.validate_python({
-        k: {
-            "shifts": (shifts[k][0], shifts[k][1]),
-            "residual": residuals[k],
-            "corr": 1.0
-            if reference == k
-            else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1],
+    validated = Shifts.validate_python(
+        {
+            k: {
+                "shifts": (shifts[k][0], shifts[k][1]),
+                "residual": residuals[k],
+                "corr": (
+                    1.0
+                    if reference == k
+                    else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1]
+                ),
+            }
+            for k in fids
         }
-        for k in fids
-    })
+    )
     jsoned = Shifts.dump_json(validated)
     (shift_path / f"shifts-{idx:04d}.json").write_bytes(jsoned)
     logger.debug({k: f"{r.corr:03f}" for k, r in validated.items()})

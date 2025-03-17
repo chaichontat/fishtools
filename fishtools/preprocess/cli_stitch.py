@@ -193,7 +193,7 @@ def register(
     if not path.exists():
         raise ValueError(f"No registered images at {path.resolve()} found.")
 
-    imgs = sorted((f for f in path.glob("*.tif") if not f.name.endswith(".hp.tif")))
+    imgs = sorted(f for f in path.glob("*.tif") if not f.name.endswith(".hp.tif"))
     (out_path := path.parent / f"stitch--{roi}").mkdir(exist_ok=True)
 
     if overwrite:
@@ -249,7 +249,7 @@ def register(
 
     del path
     if overwrite or not (out_path / "TileConfiguration.registered.txt").exists():
-        files = sorted((f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif")))
+        files = sorted(f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif"))
         files_idx = [int(file.stem.split("-")[-1]) for file in files if file.stem.split("-")[-1].isdigit()]
         logger.debug(f"Using {files_idx}")
         tileconfig = TileConfiguration.from_pos(
