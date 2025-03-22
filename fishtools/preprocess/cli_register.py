@@ -30,6 +30,7 @@ from fishtools.preprocess.config import (
     RegisterConfig,
 )
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
+from fishtools.utils.pretty_print import progress_bar_threadpool
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
@@ -537,13 +538,13 @@ def _run(
         )
 
         # Illumination correction
-        basic = imgs[orig_name].basic()
-        if basic is not None:
-            logger.debug("Running BaSiC")
-            img = np.stack(basic[bit].transform(np.array(img)))
-        else:
-            ...
-            # raise Exception("No basic template found.")
+        # basic = imgs[orig_name].basic()
+        # if basic is not None:
+        # logger.debug("Running BaSiC")
+        # img = np.stack(basic[bit].transform(np.array(img)))
+        # else:
+        # ...
+        # raise Exception("No basic template found.")
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
@@ -554,8 +555,13 @@ def _run(
         transformed[bit] = np.clip(img, 0, 65535).astype(np.uint16)
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
 
+    if not len(transformed):
+        raise ValueError("No images were transformed.")
+
     if not len({img.shape for img in transformed.values()}) == 1:
-        raise ValueError("Transformed images have different shapes.")
+        raise ValueError(
+            f"Transformed images have different shapes: {set(img.shape for img in transformed.values())}"
+        )
 
     crop, downsample = config.registration.crop, config.registration.downsample
     out = np.zeros(
@@ -607,6 +613,15 @@ def _run(
     #     )
 
 
+def get_rois(path: Path, roi: str):
+    rois = (
+        {r.name.split("+")[0].split("--")[1] for r in path.glob("*--*") if r.is_dir()}
+        if roi == "*"
+        else [roi]
+    )
+    return {r for r in rois if r and r != "*"}
+
+
 @click.group()
 def register(): ...
 
@@ -618,7 +633,7 @@ def register(): ...
 @click.option("--roi", type=str, default="*")
 @click.option("--reference", "-r", type=str, default="4_12_20")
 @click.option("--debug", is_flag=True)
-@click.option("--threshold", type=float, default=2.0)
+@click.option("--threshold", type=float, default=5.0)
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--overwrite", is_flag=True)
 @click.option("--no-priors", is_flag=True)
@@ -655,12 +670,7 @@ def run(
     logger.configure(extra=dict(idx=f"{idx:04d}", file=""))
     logger.add(sys.stderr, level="DEBUG" if debug else "WARNING", format=logger_format)
 
-    rois = (
-        {r.name.split("+")[0].split("--")[1] for r in path.glob("*--*") if r.is_dir()}
-        if roi == "*"
-        else [roi]
-    )
-    rois = {r for r in rois if r and r != "*"}
+    rois = get_rois(path, roi)
 
     for roi in rois:
         _run(
@@ -676,13 +686,6 @@ def run(
                 channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
                 basic=None,
                 exclude=None,
-                # exclude=["cfse"],
-                # basic_template=dict(
-                #     zip(
-                #         ["560", "650", "750"],
-                #         [str(f"/mnt/archive/starmap/e155_trc/basic_{c}.pkl") for c in ["560", "650", "750"]],
-                #     )
-                # ),
                 registration=RegisterConfig(
                     chromatic_shifts={
                         "647": str(DATA / "560to647.txt"),
@@ -692,22 +695,11 @@ def run(
                         use_fft=False,
                         fwhm=fwhm,
                         threshold=threshold,
-                        priors={
-                            # "WGAfiducial_fiducial_tdT_29_polyT": (9, 26),
-                            # "blank568_blank647_blank750": (-6, -11),
-                            # "6_14_22": (-160, -175),
-                            # "7_15_23": (-160, -175),
-                            # "8_16_24": (-160, -175),
-                            # "25_26_27": (-160, -175),
-                            # "dapi_29_polyA": (10, 30),
-                            # "polyA_1_9_17": (-10, -5)
-                        },
-                        overrides={
-                            # "polyA_1_9_17": (12.01, -12.43),
-                        },
+                        priors={},
+                        overrides={},
                         n_fids=2,
                     ),
-                    reference="6_14_22",
+                    reference=reference,
                     downsample=1,
                     crop=30,
                     slices=slice(None),
@@ -718,8 +710,119 @@ def run(
         )
 
 
+def make_batch_command(original_command):
+    """Creates a batched version of a click command that processes multiple indices."""
+    # Copy the original command's options and arguments
+    batch_options = original_command.params.copy()
+
+    # Remove the idx argument since batch will handle multiple indices
+    batch_options = [p for p in batch_options if p.name != "idx"]
+
+    # Add threading option
+    thread_option = click.Option(["--threads", "-t"], type=int, default=10, help="Number of parallel threads")
+    batch_options.append(thread_option)
+
+    @click.pass_context
+    def batch_wrapper(ctx: click.Context, threads: int, **kwargs):
+        path = kwargs["path"]
+        reference = kwargs["reference"]
+        roi = kwargs["roi"]
+
+        for curr_roi in get_rois(path, roi):
+            idxs = sorted({
+                int(name.stem.split("-")[1]) for name in path.rglob(f"{reference}--{curr_roi}/*.tif")
+            })
+
+            with progress_bar_threadpool(len(idxs), threads=threads) as submit:
+                for idx in idxs:
+                    cmd_kwargs = {k: v for k, v in kwargs.items() if k != "threads"}
+                    submit(
+                        original_command.callback,
+                        **cmd_kwargs,
+                        idx=idx,
+                    )
+
+    return click.Command(name="batch", params=batch_options, callback=batch_wrapper, help="Batch")
+
+
 # @register.command()
-# def generate_config(path: Path, idx: int, codebook: Path):
+# @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+# @click.option("--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path))
+# @click.option("--roi", type=str, default="*")
+# @click.option("--reference", "-r", type=str, default="4_12_20")
+# @click.option("--debug", is_flag=True)
+# @click.option("--threshold", type=float, default=5.0)
+# @click.option("--fwhm", type=float, default=4.0)
+# @click.option("--overwrite", is_flag=True)
+# @click.option("--no-priors", is_flag=True)
+# @click.option("--threads", "-t", type=int, default=10)
+# def batch(
+#     path: Path,
+#     codebook: Path,
+#     roi: str,
+#     debug: bool = False,
+#     reference: str = "6_14_22",
+#     overwrite: bool = False,
+#     threshold: float = 5,
+#     fwhm: float = 4,
+#     no_priors: bool = False,
+#     threads: int = 10,
+# ):
+#     """Preprocess image sets before spot calling.
+
+#     Args:
+#         path: Workspace path.
+#         idx: Index of the image to process.
+#         roi: ROI to work on.
+#         debug: More logs and write fids. Defaults to False.
+#         overwrite: Defaults to False.
+#         threshold: σ above median to call fiducial spots. Defaults to 6.
+#         fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
+#     """
+#     rois = get_rois(path, roi)
+
+#     for roi in rois:
+#         idxs = sorted({int(name.stem.split("-")[1]) for name in path.rglob(f"{reference}--{roi}/*.tif")})
+
+#         with progress_bar_threadpool(len(idxs), threads=threads) as submit:
+#             for idx in idxs:
+#                 submit(
+#                     _run,
+#                     path,
+#                     roi,
+#                     idx,
+#                     codebook=codebook,
+#                     debug=debug,
+#                     reference=reference,
+#                     no_priors=no_priors,
+#                     config=Config(
+#                         dataPath=str(DATA),
+#                         channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
+#                         basic=None,
+#                         exclude=None,
+#                         registration=RegisterConfig(
+#                             chromatic_shifts={
+#                                 "647": str(DATA / "560to647.txt"),
+#                                 "750": str(DATA / "560to750.txt"),
+#                             },
+#                             fiducial=Fiducial(
+#                                 use_fft=False,
+#                                 fwhm=fwhm,
+#                                 threshold=threshold,
+#                                 priors={},
+#                                 overrides={},
+#                                 n_fids=2,
+#                             ),
+#                             reference=reference,
+#                             downsample=1,
+#                             crop=30,
+#                             slices=slice(None),
+#                             reduce_bit_depth=0,
+#                         ),
+#                     ),
+#                     overwrite=overwrite,
+#                 )
+register.add_command(make_batch_command(run))
 
 if __name__ == "__main__":
     register()

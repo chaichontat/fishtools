@@ -26,7 +26,8 @@ imshow = partial(plt.imshow, zorder=1)
 logging.basicConfig(level=logging.INFO)
 
 # path = Path("/mnt/working/e155trcdeconv/segment3d--left")
-path_models = Path("/mnt/working/lai/segment--left/models")
+custom_models = Path("/mnt/working/lai/segment--left/models")
+
 
 # name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
@@ -34,12 +35,13 @@ path_models = Path("/mnt/working/lai/segment--left/models")
 # %%
 # Yes, the typing is wrong.
 # model = CellposeModel(gpu=True, pretrained_model=cast(bool, models[0].as_posix()))
-models = sorted(
-    (file for file in path_models.glob("*") if "train_losses" not in file.name),
-    key=lambda x: x.stat().st_mtime,
-    reverse=True,
-)
-assert models
+if custom_models:
+    models = sorted(
+        (file for file in custom_models.glob("*") if "train_losses" not in file.name),
+        key=lambda x: x.stat().st_mtime,
+        reverse=True,
+    )
+    assert models
 
 # normalize (bool, optional): if True, normalize data so 0.0=1st percentile and 1.0=99th percentile of image intensities in each channel;
 #     can also pass dictionary of parameters (all keys are optional, default values shown):
@@ -146,13 +148,12 @@ def save_sliced(path: Path, limit_z: int | None, chans: list[int]):
         compressionargs={"level": 0.75},
         bigtiff=True,
     )
-    logger.info(f"Saved working file to {path.with_name(path.stem + "_for_cellpose.tif")}")
+    logger.info(f"Saved working file to {path.with_name(path.stem + '_for_cellpose.tif')}")
     return img
 
 
 @click.group()
-def cli():
-    ...
+def cli(): ...
 
 
 @cli.command()
@@ -197,7 +198,7 @@ def run(
     img = imread(path.with_name(path.stem + "_for_cellpose.tif"))
     logger.info(
         f"Using existing image. Limit-z and channels are ignored. "
-        f"To start over, delete {path.with_name(path.stem + "_for_cellpose.tif")}"
+        f"To start over, delete {path.with_name(path.stem + '_for_cellpose.tif')}"
     )
 
     print(x, y)

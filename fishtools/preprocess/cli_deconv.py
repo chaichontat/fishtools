@@ -2,6 +2,7 @@ import functools
 import json
 import pickle
 import queue
+import sys
 import threading
 import time
 from pathlib import Path
@@ -353,7 +354,7 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
 # @click.argument("name", type=str)
 # def initital
 
-channels = [560, 650, 750]
+# channels = [560, 650, 750]
 
 
 @functools.cache
@@ -378,28 +379,28 @@ def _run(
     def f_read(files: list[Path]):
         logger.debug("Read thread started.")
         for file in files:
-            name = file.name.split("-")[0]
-            bits = name.split("_")
+            round_ = file.name.split("-")[0]
+            bits = round_.split("_")
             if file.name.startswith("fid"):
                 continue
             logger.debug(f"Reading {file.name}")
             try:
-                img = imread(file)
+                with tifffile.TiffFile(file) as tif:
+                    try:
+                        metadata = tif.shaped_metadata[0]  # type: ignore
+                    except (TypeError, IndexError):
+                        metadata = tif.imagej_metadata or {}
+                    img = tif.asarray()
+
                 fid = np.atleast_3d(img[-n_fids:])
                 nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
             except ValueError as e:
                 raise Exception(f"File {file.resolve()} is corrupted. Please check the file.") from e
-
-            with tifffile.TiffFile(file) as tif:
-                try:
-                    metadata = tif.shaped_metadata[0]  # type: ignore
-                except (TypeError, IndexError):
-                    metadata = tif.imagej_metadata or {}
-
             logger.debug(f"Finished reading {file.name}")
-            for i, c in enumerate(channels):
-                if i < nofid.shape[1]:
-                    nofid[:, i] = basics[name][i].transform(np.array(nofid[:, i]))
+
+            for i, basic in enumerate(basics[round_]):
+                logger.debug(f"Running BaSiC on channel {i}")
+                nofid[:, i] = basic.transform(np.array(nofid[:, i]))
             q_img.put((file, nofid, fid, metadata))
 
     def f_write():
@@ -478,6 +479,7 @@ def _run(
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2)
 @click.option("--basic-name", type=str, default=None)
+@click.option("--debug", is_flag=True)
 def run(
     path: Path,
     name: str,
@@ -487,6 +489,7 @@ def run(
     overwrite: bool,
     basic_name: str | None,
     n_fids: int,
+    debug: bool = False,
 ):
     """GPU-accelerated very accelerated 3D deconvolution.
 
@@ -503,6 +506,9 @@ def run(
         overwrite: Overwrite existing deconvolved images.
         n_fid: Number of fiducial frames.
     """
+    if debug:
+        logger.remove()
+        logger.add(sys.stderr, level="DEBUG")
 
     console.print(f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]")
 
@@ -579,6 +585,16 @@ def batch(
             and not any(f.parent.name.endswith(x) for x in FORBIDDEN)
         ]
 
+        with TiffFile(files[0]) as tif:
+            try:
+                meta = tif.shaped_metadata[0]
+                import json
+
+                waveform = json.loads(meta["waveform"])
+                powers = waveform["params"]["powers"]
+            except KeyError:
+                raise AttributeError("No waveform metadata found.")
+
         if not files:
             logger.info(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
             continue
@@ -597,8 +613,8 @@ def batch(
         try:
             basics: dict[str, list[BaSiC]] = {
                 r: [
-                    pickle.loads((path / "basic" / f"{basic_name or r}-{c}.pkl").read_bytes())
-                    for c in range(len(r.split("_")))
+                    pickle.loads((path / "basic" / f"{basic_name or r}-{c[-3:]}.pkl").read_bytes())
+                    for c in powers
                 ]
             }
         except FileNotFoundError:

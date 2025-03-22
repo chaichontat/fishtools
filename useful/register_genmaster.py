@@ -1,4 +1,5 @@
 # %%
+# You need itk-elastix installed to run this.
 from pathlib import Path
 
 import itk
@@ -11,50 +12,6 @@ from scipy.ndimage import shift
 
 sns.set_theme()
 
-
-img = tifffile.imread("/mnt/archive/starmap/sagittal-calibration/3_3--cortexRegion/3_3-0000.tif")[
-    :-1
-].reshape(12, 2, 2048, 2048)
-
-# %%
-registration_method = sitk.ImageRegistrationMethod()
-
-# Similarity metric settings.
-registration_method.SetMetricAsMeanSquares()
-# registration_method.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-registration_method.SetMetricSamplingStrategy(registration_method.RANDOM)
-registration_method.SetMetricSamplingPercentage(0.01)
-
-registration_method.SetInterpolator(sitk.sitkLinear)
-
-# Optimizer settings.
-# registration_method.SetOptimizerAsGradientDescent(
-#     learningRate=1.0, numberOfIterations=1000, convergenceMinimumValue=1e-6, convergenceWindowSize=10
-# )
-registration_method.SetOptimizerAsLBFGS2()
-# registration_method.SetOptimizerAsConjugateGradientLineSearch(learningRate=1.0, numberOfIterations=1000)
-registration_method.SetOptimizerScalesFromPhysicalShift()
-
-# Setup for the multi-resolution framework.
-registration_method.SetShrinkFactorsPerLevel(shrinkFactors=[4, 2, 1])
-registration_method.SetSmoothingSigmasPerLevel(smoothingSigmas=[2, 1, 0])
-registration_method.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
-
-img1 = sitk.Cast(sitk.GetImageFromArray(img[0, 0]), sitk.sitkFloat32)
-img2 = sitk.Cast(sitk.GetImageFromArray(img[0, 1]), sitk.sitkFloat32)
-
-# Don't optimize in-place, we would possibly like to run this cell multiple times.
-registration_method.SetInitialTransform(sitk.AffineTransform(img1.GetDimension()), inPlace=False)
-
-
-fids_itk = []
-ts = []
-# for i in range(1, 5):
-# img1 = sitk.Cast(sitk.GetImageFromArray(img[i, 1]), sitk.sitkFloat32)
-# img2 = sitk.Cast(sitk.GetImageFromArray(img[i, 2]), sitk.sitkFloat32)
-final_transform = registration_method.Execute(img1, img2)
-ts.append(final_transform.GetParameters())
-print(ts[-1])
 
 # %%
 As = []
@@ -70,7 +27,8 @@ result_transform_parameters = parameter_object
 # ts is a 2x1 matrix (translation)
 def calc_shift(path: Path | str):
     global result_transform_parameters
-    cells = tifffile.imread(path)[:-1].reshape(12, 2, 2048, 2048)
+    cells = tifffile.imread(path)[:-2].reshape(-1, 2, 2048, 2048)
+    print(cells.shape)
     result_image, result_transform_parameters = itk.elastix_registration_method(
         cells[5, 0], cells[5, 1], parameter_object=parameter_object, log_to_console=True
     )
@@ -85,9 +43,7 @@ def calc_shift(path: Path | str):
 # Input files here.
 [
     calc_shift(file)
-    for _, file in zip(
-        range(10), Path("/mnt/archive/starmap/sagittal-calibration/3_3--cortexRegion").glob("*.tif")
-    )
+    for _, file in zip(range(10), Path("/working/20250322_cal/cal560_cal650--cere/").glob("*.tif"))
 ]
 # %%
 affine = np.array([*np.median(np.stack(As), axis=0).flatten(), *np.median(np.stack(ts), axis=0)])
