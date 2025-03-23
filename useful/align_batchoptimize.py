@@ -5,7 +5,6 @@ from pathlib import Path
 import rich_click as click
 from loguru import logger
 
-
 # %%
 
 
@@ -13,8 +12,9 @@ from loguru import logger
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("codebook_path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--rounds", type=int, default=10)
-@click.option("--threads", type=int, default=6)
-def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 8):
+@click.option("--threads", type=int, default=10)
+@click.option("--max-proj", is_flag=True)
+def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 10, max_proj: bool = False):
     if not len(list(path.glob("registered--*"))):
         raise ValueError(
             "No registered images found. Verify that you're in the base working directory, not the registered folder."
@@ -23,15 +23,31 @@ def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 8):
     try:
         existing = len(Path(path / f"opt_{codebook_path.stem}" / "global_scale.txt").read_text().splitlines())
         logger.info(f"Found {existing} existing rounds.")
-        if existing == rounds:
-            logger.info("All rounds already exist. Exiting.")
-            return
     except FileNotFoundError:
         logger.info("No existing global scale found. Starting from scratch.")
         existing = 0
 
-    for i in range(existing, rounds):
+    if (path / f"opt_{codebook_path.stem}" / "percentiles.json").exists():
+        existing_perc = len(
+            Path(path / f"opt_{codebook_path.stem}" / "percentiles.json").read_text().splitlines()
+        )
+        logger.info(f"Found {existing_perc} existing percentiles.")
+    else:
+        existing_perc = 0
+
+    if existing_perc == existing == rounds:
+        logger.info("All rounds already exist. Exiting.")
+        return
+
+    if existing < rounds:
+        logger.info(f"Starting from round {existing}")
+
+    if existing_perc < existing:
+        raise Exception("Percentiles count < existing rounds. Should not happen.")
+
+    for i in range(min(existing, existing_perc), rounds):
         logger.critical(f"Starting round {i}")
+        # Increases global scale count
         subprocess.run(
             [
                 "python",
@@ -46,10 +62,12 @@ def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 8):
                 f"--threads={threads}",
                 "--overwrite",
                 "--split=0",
+                *(["--max-proj"] if max_proj else []),
             ],
             check=True,
             capture_output=False,
         )
+
         subprocess.run(
             [
                 "python",
@@ -64,6 +82,22 @@ def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 8):
             check=True,
             capture_output=False,
         )
+
+        # Increases percentiles count
+        subprocess.run(
+            [
+                "python",
+                Path(__file__).parent / "align_prod.py",
+                "find-threshold",
+                str(path),
+                "--codebook",
+                codebook_path,
+                f"--round={i}",
+            ],
+            check=True,
+            capture_output=False,
+        )
+        existing_perc += 1
 
 
 if __name__ == "__main__":

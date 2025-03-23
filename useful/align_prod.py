@@ -43,7 +43,7 @@ class DecodeConfig(BaseModel):
 
     max_distance: float = 0.3
     min_intensity: float = 0.005
-    min_area: int = 12
+    min_area: int = 8
     max_area: int = 200
 
 
@@ -53,7 +53,7 @@ OPTIMIZE_CONFIG = DecodeConfig(min_intensity=0.02, min_area=15, max_area=200)
 os.environ["TQDM_DISABLE"] = "1"
 
 
-def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:]):
+def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = False):
     try:
         with warnings.catch_warnings(action="ignore"):
             img = imread(path).astype(np.float32)[sl] / 65535
@@ -81,7 +81,14 @@ def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:]):
             }
 
         def tile_data(self) -> np.ndarray:
-            return img[self.z, self.c]  # [512:1536, 512:1536]
+            if not max_proj:
+                return img[self.z, self.c]
+            elif max_proj == 1:
+                return img[:, self.c].max(axis=0)
+            else:
+                start = self.z // max_proj
+                end = min(start + max_proj, img.shape[0])
+                return img[start:end, self.c].max(axis=0)
 
     class DemoTileFetcher(TileFetcher):
         def get_tile(self, fov_id: int, round_label: int, ch_label: int, zplane_label: int) -> FetchedTile:
@@ -96,7 +103,11 @@ def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:]):
         fov=0,
         rounds=range(1),
         chs=range(img.shape[1]),
-        zplanes=range(img.shape[0]),
+        zplanes=range(img.shape[0])
+        if not max_proj
+        else [0]
+        if max_proj == 1
+        else range(img.shape[0] // max_proj),
         group_by=(Axes.CH, Axes.ZPLANE),
     )
 
@@ -252,6 +263,7 @@ def sample_imgs(path: Path, codebook: str, round_num: int, *, batch_size: int = 
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--overwrite", is_flag=True)
 @click.option("--split", type=int, default=0)
+@click.option("--max-proj", type=int, default=0)
 def optimize(
     path: Path,
     round_num: int,
@@ -261,8 +273,9 @@ def optimize(
     threads: int = 8,
     overwrite: bool = False,
     split: int = 0,
+    max_proj: int = False,
 ):
-    if not (path / f"opt_{codebook_path.stem}" / "percentiles.json").exists():
+    if round_num > 0 and not (path / f"opt_{codebook_path.stem}" / "percentiles.json").exists():
         raise Exception("Please run `fishtools find-threshold` first.")
 
     selected = sample_imgs(
@@ -290,6 +303,7 @@ def optimize(
             *(["--overwrite"] if overwrite else []),
             f"--subsample-z={subsample_z}",
             f"--split={split}",
+            *(["--max-proj=" + str(max_proj)] if max_proj else []),
         ],
         threads=threads,
     )
@@ -299,11 +313,21 @@ def optimize(
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--roi", type=str, default="*")
-@click.option("--percentile", type=float, default=50)
+@click.option("--percentile", type=float, default=25)
 @click.option("--overwrite", is_flag=True)
-def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 50, overwrite: bool = False):
+@click.option("--round", "round_num", type=int, default=0)
+def find_threshold(
+    path: Path,
+    roi: str,
+    codebook: Path,
+    percentile: float = 25,
+    overwrite: bool = False,
+    round_num: int = 0,
+):
     SUBFOLDER = "_highpassed"
     paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
+    path_out = path / (f"opt_{codebook.stem}" + (f"--{roi}" if roi != "*" else ""))
+    jsonfile = path_out / "percentiles.json"
 
     rand = np.random.default_rng(0)
     if len(paths) > 50:
@@ -311,6 +335,14 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 50,
     paths = sorted(
         p for p in paths if not (p.parent / SUBFOLDER / f"{p.stem}_{codebook.stem}.hp.tif").exists()
     )
+
+    if not (path_out / "global_scale.txt").exists():
+        raise ValueError("Please run align_prod optimize first.")
+
+    if not round_num > 0 and not jsonfile.exists():
+        raise ValueError(
+            "Round_num > 0 but no existing percentiles file found. Please run with round_num=0 first."
+        )
 
     if paths:
         _batch(
@@ -323,19 +355,41 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 50,
 
     highpasses = list(path.glob(f"registered--{roi}+{codebook.stem}/{SUBFOLDER}/*_{codebook.stem}.hp.tif"))
     logger.info(f"Found {len(highpasses)} images to get percentiles from.")
+
     norms = {}
+
+    try:
+        global_scale = np.atleast_3d(np.loadtxt(path_out / "global_scale.txt", dtype=float))[
+            round_num
+        ].reshape(1, -1, 1, 1)
+        logger.info(f"Using global scale from round {round_num}")
+    except IndexError:
+        raise ValueError(
+            f"Round {round_num} not found. Please run align_prod optimize with the round_number first."
+        )
 
     for p in sorted(highpasses[:50]):
         logger.debug(f"Processing {p.parent.name}/{p.name}")
-        img = tifffile.imread(p).squeeze().swapaxes(0, 1)
-        norms[p.parent.parent.name + "-" + p.name] = float(
-            np.percentile(np.linalg.norm(img, axis=1), percentile)
-        )
+        # import cupy as cp
 
-    path_out = path / (f"opt_{codebook.stem}" + (f"--{roi}" if roi != "*" else ""))
+        img = tifffile.imread(p)
+        # img = cp.asarray(img)
+        # img *= cp.asarray(global_scale)
+        img *= global_scale
+
+        norm = np.linalg.norm(img, axis=1)
+        del img
+        norms[p.parent.parent.name + "-" + p.name] = float(np.percentile(norm, percentile))
+
     path_out.mkdir(exist_ok=True)
-    logger.info(f"Writing to {(path_out / f'opt_{codebook.stem}' / 'percentiles.json')}")
-    (path_out / "percentiles.json").write_text(json.dumps(norms, indent=2))
+
+    logger.info(f"Writing to {jsonfile}")
+    if not jsonfile.exists():
+        jsonfile.write_text(json.dumps([norms], indent=2))
+    else:
+        prev_norms = json.loads(jsonfile.read_text())
+        prev_norms.append(norms)
+        jsonfile.write_text(json.dumps(prev_norms, indent=2))
 
 
 @cli.command()
@@ -352,6 +406,7 @@ def find_threshold(path: Path, roi: str, codebook: Path, percentile: float = 50,
 @click.option("--limit-z", default=None)
 @click.option("--split", is_flag=True)
 @click.option("--simple", is_flag=True)
+@click.option("--max-proj", type=int, default=0)
 def batch(
     path: Path,
     roi: str,
@@ -362,8 +417,9 @@ def batch(
     limit_z: int | None = None,
     split: bool = False,
     simple: bool = False,
+    max_proj: bool = False,
 ):
-    paths = {p: p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
+    paths = {p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
     # To account for split
     exists = {
         p.stem.rsplit("-", 1)[0]
@@ -371,11 +427,11 @@ def batch(
     }
     if not overwrite:
         old_len = len(paths)
-        paths = sorted({v for k, v in paths.items() if k not in exists})
+        paths = sorted({v for v in paths if v.stem.rsplit("-", 1)[0] not in exists})
         logger.info(f"Skipping {old_len - len(paths)} files.")
 
     return _batch(
-        paths,
+        sorted(paths),
         "run",
         [
             "--global-scale",
@@ -386,6 +442,7 @@ def batch(
             f"--subsample-z={subsample_z}",
             f"--limit-z={limit_z}",
             "--simple" if simple else "",
+            f"--max-proj={max_proj}" if max_proj else "",
         ],
         threads=threads,
         split=split,
@@ -473,6 +530,9 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
     curr = []
     n = 0
     for p in paths:
+        if not p.exists():
+            logger.warning(f"Path {p} does not exist. Skipping.")
+            continue
         sf = Deviations.validate_json(p.read_text())
         # if (round_num + 1) > len(sf):
         #     raise ValueError(f"Round number {round_num} exceeds what's available ({len(sf)}).")
@@ -668,6 +728,7 @@ def spot_decoding(
 @click.option("--debug", is_flag=True)
 @click.option("--split", default=None)
 @click.option("--highpass-only", is_flag=True)
+@click.option("--max-proj", type=int, default=0)
 @click.option(
     "--codebook",
     "codebook_path",
@@ -688,6 +749,7 @@ def run(
     split: int | None = None,
     highpass_only: bool = False,
     simple: bool = False,
+    max_proj: int = 0,
     config: DecodeConfig = DecodeConfig(),
 ):
     """
@@ -777,10 +839,10 @@ def run(
             [bit_mapping[k] for k in used_bits if k in bit_mapping],
         ]
     ) + tuple(split_slice)
-    print(bit_mapping, slc)
     stack = make_fetcher(
         path,
         slc,
+        max_proj=max_proj,
         # if limit_z is None
         # else np.s_[
         #     :limit_z:subsample_z,
@@ -793,7 +855,7 @@ def run(
     # But it's there as a reference.
 
     ghp = Filter.GaussianHighPass(sigma=8, is_volume=True, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
-    ghp.sigma = (6, 8, 8)  # z,y,x
+    ghp.sigma = (6 / (max_proj or 1), 8, 8)  # z,y,x
     logger.debug(f"Running GHP with sigma {ghp.sigma}")
 
     imgs: ImageStack = ghp.run(stack)
@@ -803,25 +865,11 @@ def run(
 
         tifffile.imwrite(
             path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif",
-            imgs.xarray.to_numpy(),
+            imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
             compression="zlib",
             metadata={"keys": img_keys},
         )
         return
-
-    try:
-        perc = np.mean(
-            list(
-                json.loads(
-                    (path.parent.parent / f"opt_{codebook_path.stem}/percentiles.json").read_text()
-                ).values()
-            )
-        )
-    except FileNotFoundError as e:
-        raise Exception("Please run `fishtools find-threshold` first.") from e
-
-    z_filt = Filter.ZeroByChannelMagnitude(perc, normalize=False)
-    imgs = z_filt.run(imgs)
 
     if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
@@ -835,6 +883,7 @@ def run(
     if not global_scale or not global_scale.exists():
         raise ValueError("Production run or round > 0 requires a global scale file.")
 
+    # Scale factors
     scale_all = np.loadtxt(global_scale)
     if len(scale_all.shape) == 1:
         scale_all = scale_all[np.newaxis, :]
@@ -850,6 +899,29 @@ def run(
     except ValueError:
         # global_scale.unlink()
         raise ValueError("Scale factor dim mismatch. Deleted. Please rerun.")
+
+    # Zero out low norm
+    try:
+        perc = np.mean(
+            list(
+                json.loads((path.parent.parent / f"opt_{codebook_path.stem}/percentiles.json").read_text())[
+                    (round_num - 1) if round_num is not None and calc_deviations else -1
+                ].values()
+            )
+        )
+    except FileNotFoundError as e:
+        raise Exception("Please run `fishtools find-threshold` first.") from e
+
+    z_filt = Filter.ZeroByChannelMagnitude(perc, normalize=False)
+    imgs = z_filt.run(imgs)
+
+    # (path.parent / "_debug").mkdir(exist_ok=True)
+    # tifffile.imwrite(
+    #     path.parent / "_debug" / f"{path.stem}_{codebook_path.stem}-{split}.tif",
+    #     imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+    #     compression="zlib",
+    #     metadata={"keys": img_keys},
+    # )
 
     # Decode
     if not simple:
