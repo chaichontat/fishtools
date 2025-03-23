@@ -1,3 +1,146 @@
+# Input Requirements for MultiFISH Processing Workflow
+
+## Overview
+
+The multiplex FISH processing pipeline requires several input types to function correctly. This document outlines the required formats and organization for successful processing through the deconvolution, registration, and spot detection stages.
+
+## Raw Image Requirements
+
+### File Organization
+
+Raw images should be organized as follows:
+
+- Base workspace directory
+- `[round_name]--[ROI]/` (e.g., `1_9_17--cortex/`)
+  - `[round_name]-[index].tif` (e.g., `1_9_17-0001.tif`)
+
+### Image Format
+
+- **Format**: Multi-page TIFF files
+- **Structure**:
+- Last 1-2 frames: Fiducial marker images (typically Alexa Fluor 405)
+- Earlier frames: Bit channel images arranged sequentially
+- **Dimensions**: Typically 2048×2048 pixels per frame
+- **Bit depth**: 16-bit (uint16)
+
+### Metadata Requirements
+
+Each TIFF file should include metadata with:
+
+- `waveform`: JSON string or dictionary containing:
+- Channel information (e.g., "ilm405", "ilm560", "ilm650", "ilm750")
+- Laser power settings
+- Sequence information
+
+Example:
+
+```json
+{
+ "ilm405": {"power": 0.4, "sequence": [0,0,0,1,1]},
+ "ilm560": {"power": 0.3, "sequence": [1,0,0,0,0]},
+ "ilm650": {"power": 0.5, "sequence": [0,1,0,0,0]},
+ "ilm750": {"power": 0.6, "sequence": [0,0,1,0,0]}
+}
+```
+
+### Codebook Requirements
+
+Codebooks define the bit pattern for each gene target:
+
+- Format: JSON file
+- Structure: Dictionary mapping gene names to bit indices
+- File location: Base workspace directory
+
+Example:
+
+```json
+{
+  "Gene1": [1, 9, 17],
+  "Gene2": [2, 10, 18],
+  "Blank1": [3, 11, 19]
+}
+```
+
+### Calibration Requirements
+
+Point Spread Function (PSF)
+
+- Format: TIFF file with 3D PSF measurements
+- File location: Referenced in DATA path ("PSF GL.tif")
+- Structure: Z-stack of PSF images
+
+### Chromatic Aberration Correction
+
+- Format: Text files with affine transformation matrices
+- File location: Referenced in DATA path (e.g., "560to650.txt")
+- Content: 6 values representing 2×2 matrix and translation vector
+
+Example:
+
+```
+0.998 0.001 -0.001 0.997 1.32 -0.45
+```
+
+### BaSiC Templates
+
+- Format: Pickle (.pkl) files containing BaSiC correction objects
+- Structure: One file per wavelength/channel
+- File location: [workspace]/basic/[round_name]-[wavelength].pkl
+
+### Expected Directory Structure
+
+Before processing:
+
+```
+workspace/
+├── 1_9_17--cortex/
+│   ├── 1_9_17-0001.tif
+│   ├── 1_9_17-0002.tif
+│   └── ...
+├── 4_12_20--cortex/
+│   ├── 4_12_20-0001.tif
+│   └── ...
+├── basic/
+│   ├── 1_9_17-405.pkl
+│   ├── 1_9_17-560.pkl
+│   └── ...
+└── codebook.json
+```
+
+After processing:
+
+```
+workspace/
+├── (raw data as above)
+├── analysis/
+│   └── deconv/
+│       ├── 1_9_17--cortex/
+│       └── ...
+├── deconv_scaling/
+│   ├── 1_9_17.txt
+│   └── ...
+├── fids--cortex/
+│   └── ...
+├── registered--cortex+codebook/
+│   ├── _fids/
+│   ├── reg-0001.tif
+│   └── ...
+├── shifts--cortex+codebook/
+│   └── ...
+└── opt_codebook/
+    ├── global_scale.txt
+    ├── percentiles.json
+    └── ...
+```
+
+### Processing Order
+
+- BaSiC correction generation (if not provided)
+- Deconvolution (cli_deconv.py)
+- Registration (cli_register.py)
+- Channel optimization (align_batchoptimize.py)
+- Spot detection (align_prod.py batch)
+
 # Accelerated 3D Deconvolution Pipeline (cli_deconv.py)
 
 ## Overview and Purpose
