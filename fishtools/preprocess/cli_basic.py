@@ -203,7 +203,7 @@ def extract_data_from_registered(
 
 def run_with_extractor(
     path: Path,
-    round_: str,
+    round_: str | None,
     extractor_func: DataExtractor,
     plot: bool = True,
     zs: Collection[float] = (0.5,),
@@ -231,10 +231,10 @@ def run_with_extractor(
         raise ValueError("zs must be between 0 and 1.")
 
     # Determine number of channels from round string
-    nc = len(round_.split("_"))
 
     # Find and sort files
-    files = list(path.glob(f"{round_}--*/*.tif"))
+    files = sorted(path.glob(f"{round_}--*/*.tif" if round_ else "*_*_*--*/*.tif"))
+    files = [f for f in files if f.parent.name.split("_").__len__() == 3]
     # Put --basic files last. These are extra files taken in random places for BaSiC training.
     files.sort(key=lambda x: ("--basic" in str(x), str(x)))
     # files = [f for f in files if not f.parent.name.startswith("atp")]
@@ -248,6 +248,7 @@ def run_with_extractor(
     waveform = json.loads(meta["waveform"])
     powers = waveform["params"]["powers"]
     channels = [name[-3:] for name in powers]
+    nc = len(channels)
 
     # Validate file count
     if len(files) < 100:
@@ -255,21 +256,21 @@ def run_with_extractor(
 
     if len(files) < 500:
         logger.warning(f"Not enough files ({len(files)}). Result may be unreliable.")
-    # import random
+    import random
 
-    # files = random.sample(files, k=800)
-    # logger.info(
-    #     f"Using {len(files)} files. Min size: {min(f.lstat().st_size for f in files)}. Max size: {max(f.lstat().st_size for f in files)}"
-    # )
+    files = random.sample(files, k=800)
+    logger.info(
+        f"Using {len(files)} files. Min size: {min(f.lstat().st_size for f in files)}. Max size: {max(f.lstat().st_size for f in files)}"
+    )
 
     # Load deconvolution scaling if available
-    deconv_path = path / "deconv_scaling" / f"{round_}.txt"
+    deconv_path = path / "deconv_scaling" / f"{round_ or 'all'}.txt"
     deconv_meta = np.loadtxt(deconv_path) if deconv_path.exists() else None
     if deconv_meta is not None:
         logger.info("Using deconvolution scaling.")
 
     # Extract data using the provided extractor function
-    data = extractor_func(files, zs, deconv_meta, nc=nc)
+    data = extractor_func(files, zs, deconv_meta, nc=nc, max_files=500 if round_ else 800)
 
     # out = np.zeros_like(data).astype(np.float32)
     # for i in range(data.shape[0]):
@@ -284,7 +285,7 @@ def run_with_extractor(
     # )
 
     # Fit and save BaSiC models
-    return fit_and_save_basic(data, basic_dir, round_, channels, plot)
+    return fit_and_save_basic(data, basic_dir, round_ or "all", channels, plot)
 
 
 @click.group()
@@ -297,15 +298,15 @@ def basic(): ...
 @click.option("--zs", type=str, default="0.5")
 @click.option("--overwrite", is_flag=True)
 def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5"):
-    paths_pickle = [path / "basic" / f"{round_}-{c}.pkl" for c in range(len(round_.split("_")))]
-    if all(p.exists() for p in paths_pickle) and not overwrite:
-        logger.info(f"Skipping {round_}. Already exists.")
-        return
+    # paths_pickle = [path / "basic" / f"{round_}-{c}.pkl" for c in range(len(round_.split("_")))]
+    # if all(p.exists() for p in paths_pickle) and not overwrite:
+    # logger.info(f"Skipping {round_}. Already exists.")
+    # return
 
     z_values = tuple(map(float, zs.split(",")))
     extractor = extract_data_from_registered if round_ == "registered" else extract_data_from_tiff
 
-    return run_with_extractor(path, round_, extractor, plot=False, zs=z_values)
+    return run_with_extractor(path, round_ if round_ != "all" else None, extractor, plot=False, zs=z_values)
 
 
 @basic.command()

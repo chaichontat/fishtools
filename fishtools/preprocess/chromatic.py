@@ -8,19 +8,25 @@ from matplotlib.axes import Axes
 
 
 class Affine:
+    IGNORE = {"405", "488", "560"}
+
     def __init__(
         self,
         *,
         ref_img: np.ndarray[np.float32, Any] | None = None,
         As: dict[str, np.ndarray[np.float64, Any]],
         ats: dict[str, np.ndarray[np.float64, Any]],
+        # cg: dict[str, np.ndarray[np.float64, Any]],
         ref: str = "560",
     ):
         self.As: dict[str, np.ndarray[np.float64, Any]] = As
         self.ats: dict[str, np.ndarray[np.float64, Any]] = ats
+        # self.cg: dict[str, np.ndarray[np.float64, Any]] = cg
         self.ref_channel = ref
         self._ref_image = (
-            sitk.Cast(sitk.GetImageFromArray(ref_img), sitk.sitkFloat32) if ref_img is not None else None
+            sitk.Cast(sitk.GetImageFromArray(ref_img), sitk.sitkFloat32)
+            if ref_img is not None
+            else None
         )
 
     @property
@@ -63,10 +69,11 @@ class Affine:
         translate.SetParameters((float(shiftpx[0]), float(shiftpx[1]), 0.0))
 
         # Don't do chromatic shift if channel is reference
-        if channel == self.ref_channel or channel not in self.As or channel not in self.ats:
-            # if channel != self.ref_channel and (channel not in self.As or channel not in self.ats):
-            #     logger.warning(f"Chromatic: corrections for channel {channel} not found. Ignoring.")
+        if channel in self.IGNORE or channel == self.ref_channel:
             return self._st(img, translate)
+
+        if channel not in self.As or channel not in self.ats:
+            raise ValueError(f"Chromatic: corrections for channel {channel} not found.")
 
         # Scale
         affine = sitk.AffineTransform(3)
@@ -133,7 +140,8 @@ def overlay(
 
     def norm(img: np.ndarray[np.float32, Any]):
         return np.clip(
-            (img - np.percentile(img, perc[0])) / (np.percentile(img, perc[1]) - np.percentile(img, perc[0])),
+            (img - np.percentile(img, perc[0]))
+            / (np.percentile(img, perc[1]) - np.percentile(img, perc[0])),
             0,
             1,
         )
@@ -158,7 +166,9 @@ def overlay(
 
     ax.imshow(rgb_image)
     ax.axis("off")
-    ax.set_title(title if title else "Image Comparison (green: ref, red: img)", color="white")
+    ax.set_title(
+        title if title else "Image Comparison (green: ref, red: img)", color="white"
+    )
 
     plt.tight_layout()
     return ax
@@ -174,9 +184,9 @@ if __name__ == "__main__":
 
     sns.set_theme()
 
-    img = imread("/mnt/archive/starmap/sagittal-calibration/4_4--cortexRegion/4_4-0000.tif")[:-1].reshape(
-        -1, 2, 2048, 2048
-    )
+    img = imread(
+        "/mnt/archive/starmap/sagittal-calibration/4_4--cortexRegion/4_4-0000.tif"
+    )[:-1].reshape(-1, 2, 2048, 2048)
 
     DATA = Path("/home/chaichontat/fishtools/data")
 
@@ -202,9 +212,9 @@ if __name__ == "__main__":
     affine = Affine(As=As, ats=ats, ref_img=img[[0], 0])
     fig, axs = plt.subplots(ncols=2, figsize=(12, 6), dpi=200, facecolor="black")
 
-    img = imread("/disk/chaichontat/2024/sv101_ACS/2_10_18--noRNAse_big/2_10_18-0012.tif")[:-1].reshape(
-        -1, 3, 2048, 2048
-    )
+    img = imread(
+        "/disk/chaichontat/2024/sv101_ACS/2_10_18--noRNAse_big/2_10_18-0012.tif"
+    )[:-1].reshape(-1, 3, 2048, 2048)
 
     overlay(img[:, 1][5], img[:, 2][5], ax=axs[0], sl=np.s_[1400:1800, 1400:1800])
     overlay(

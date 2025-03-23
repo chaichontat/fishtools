@@ -175,8 +175,12 @@ class Image:
                     metadata = tif.shaped_metadata[0]  # type: ignore
                 except IndexError:
                     metadata = tif.imagej_metadata
-            except IndexError as e:  # tifffile throws IndexError if the file is truncated
-                raise Exception(f"File {path} is corrupted. Please check the file.") from e
+            except (
+                IndexError
+            ) as e:  # tifffile throws IndexError if the file is truncated
+                raise Exception(
+                    f"File {path} is corrupted. Please check the file."
+                ) from e
         try:
             waveform = (
                 metadata["waveform"]
@@ -193,14 +197,17 @@ class Image:
         powers = {
             key[3:]: waveform[key]["power"]
             for key in cls.CHANNELS
-            if (key == "ilm405" and counts[key] > n_fids) or (key != "ilm405" and counts[key])
+            if (key == "ilm405" and counts[key] > n_fids)
+            or (key != "ilm405" and counts[key])
         }
 
         if waveform.get("params"):
             powers = waveform["params"]["powers"]
 
         if len(powers) != len(bits):
-            raise ValueError(f"{path}: Expected {len(bits)} channels, got {len(powers)}")
+            raise ValueError(
+                f"{path}: Expected {len(bits)} channels, got {len(powers)}"
+            )
 
         try:
             global_deconv_scaling = (
@@ -285,7 +292,12 @@ def run_fiducial(
 
     if (
         not config.registration.fiducial.use_fft
-        and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
+        and len(
+            shifts_existing := sorted(
+                (path / f"shifts--{roi}+{codebook_name}").glob("*.json")
+            )
+        )
+        > 10
         and not no_priors
     ):
         _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
@@ -300,7 +312,8 @@ def run_fiducial(
                     _priors[name].append(shift_dict.shifts)
         logger.debug(f"Using priors from {len(shifts_existing)} existing shifts.")
         config.registration.fiducial.priors = {
-            name: np.median(np.array(shifts), axis=0).tolist() for name, shifts in _priors.items()
+            name: np.median(np.array(shifts), axis=0).tolist()
+            for name, shifts in _priors.items()
         }
         logger.debug(config.registration.fiducial.priors)
 
@@ -312,7 +325,9 @@ def run_fiducial(
                     prior_mapping[name] = file
                     break
             else:
-                raise ValueError(f"Could not find file that starts with {name} for prior shift.")
+                raise ValueError(
+                    f"Could not find file that starts with {name} for prior shift."
+                )
 
     if config.registration.fiducial.overrides is not None:
         for name, sh in config.registration.fiducial.overrides.items():
@@ -323,7 +338,9 @@ def run_fiducial(
                     prior_mapping[name] = file
                     break
             else:
-                raise ValueError(f"Could not find file that starts with {name} for override shift.")
+                raise ValueError(
+                    f"Could not find file that starts with {name} for override shift."
+                )
 
     # Write reference fiducial
     (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
@@ -390,7 +407,9 @@ def run_fiducial(
             "residual": residuals[k],
             "corr": 1.0
             if reference == k
-            else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1],
+            else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[
+                0, 1
+            ],
         }
         for k in fids
     })
@@ -448,8 +467,12 @@ def _run(
         p
         for p in Path(path).glob(f"*--{roi}")
         if p.is_dir()
-        and not any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
-        and set(p.name.split("--")[0].split("_")) & set(map(str, bits | set(map(int, reference.split("_")))))
+        and not any(
+            p.name.startswith(bad)
+            for bad in FORBIDDEN_PREFIXES + (config.exclude or [])
+        )
+        and set(p.name.split("--")[0].split("_"))
+        & set(map(str, bits | set(map(int, reference.split("_")))))
     }
 
     # Convert file name to bit
@@ -460,7 +483,10 @@ def _run(
             n_fids=config.registration.fiducial.n_fids,
         )
         for file in chain.from_iterable(p.glob(f"*-{idx:04d}.tif") for p in folders)
-        if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
+        if not any(
+            file.parent.name.startswith(bad)
+            for bad in FORBIDDEN_PREFIXES + (config.exclude or [])
+        )
     ]
     imgs = {img.name: img for img in _imgs}
     del _imgs
@@ -491,7 +517,9 @@ def _run(
 
     channels: dict[str, str] = {}
     for img in imgs.values():
-        channels |= dict(zip(img.bits, img.powers))
+        channels |= dict(zip(img.bits, [p[-3:] for p in img.powers]))
+
+    assert all(v.isdigit() for v in channels.values())
 
     logger.debug(f"Channels: {channels}")
 
@@ -551,7 +579,8 @@ def _run(
             affine.ref_image = ref = img
 
         # Within-tile alignment. Chromatic corrections.
-        img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=False)
+        logger.debug(f"{bit}: before affine channel={c}, shiftpx={-bits_shifted[bit]}")
+        img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
         transformed[bit] = np.clip(img, 0, 65535).astype(np.uint16)
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
 
@@ -627,9 +656,13 @@ def register(): ...
 
 
 @register.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
+)
 @click.argument("idx", type=int)
-@click.option("--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path))
+@click.option(
+    "--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path)
+)
 @click.option("--roi", type=str, default="*")
 @click.option("--reference", "-r", type=str, default="4_12_20")
 @click.option("--debug", is_flag=True)
@@ -719,7 +752,9 @@ def make_batch_command(original_command):
     batch_options = [p for p in batch_options if p.name != "idx"]
 
     # Add threading option
-    thread_option = click.Option(["--threads", "-t"], type=int, default=10, help="Number of parallel threads")
+    thread_option = click.Option(
+        ["--threads", "-t"], type=int, default=10, help="Number of parallel threads"
+    )
     batch_options.append(thread_option)
 
     @click.pass_context
@@ -730,7 +765,8 @@ def make_batch_command(original_command):
 
         for curr_roi in get_rois(path, roi):
             idxs = sorted({
-                int(name.stem.split("-")[1]) for name in path.rglob(f"{reference}--{curr_roi}/*.tif")
+                int(name.stem.split("-")[1])
+                for name in path.rglob(f"{reference}--{curr_roi}/*.tif")
             })
 
             with progress_bar_threadpool(len(idxs), threads=threads) as submit:
@@ -742,7 +778,9 @@ def make_batch_command(original_command):
                         idx=idx,
                     )
 
-    return click.Command(name="batch", params=batch_options, callback=batch_wrapper, help="Batch")
+    return click.Command(
+        name="batch", params=batch_options, callback=batch_wrapper, help="Batch"
+    )
 
 
 # @register.command()
