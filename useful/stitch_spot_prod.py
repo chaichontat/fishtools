@@ -1,6 +1,6 @@
 import re
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, wait
 from multiprocessing import get_context
 from pathlib import Path
 
@@ -8,9 +8,9 @@ import polars as pl
 import rich_click as click
 from loguru import logger
 from rtree import index
-from shapely import MultiPolygon, Point, Polygon, STRtree, intersection
+from tifffile import imread
 
-from fishtools.analysis.spots import load_parquet, load_spots, load_spots_simple
+from fishtools.analysis.spots import load_spots, load_spots_simple
 from fishtools.preprocess.stitching import (
     Cells,
     Crosses,
@@ -23,8 +23,6 @@ from fishtools.preprocess.tileconfig import TileConfiguration
 FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.(pkl|parquet)")
 OUT_SUFFIX = "_deduped.parquet"
 logger.configure(handlers=[{"sink": sys.stderr}])
-
-w = 1988
 
 
 def gen_out(path: Path):
@@ -46,31 +44,6 @@ def load_coords(path: Path, roi: str):
         logger.warning("Duplicates found in TileConfiguration.registered.txt")
         coords = coords.unique(subset=["x", "y"], maintain_order=True)
     return coords
-
-
-def gen_splits(coords: tuple[float, float], n: int = 4, size: int = 1988, cut: int = 1024):
-    if size < 1 or cut < 1:
-        raise ValueError("width and offset must be greater than 0")
-    x, y = coords
-    if n == 0:  # [:cut, :cut] - top-left
-        return Polygon([
-            (x, y),
-            (x + cut, y),
-            (x + cut, y + cut),  # + for y to go down
-            (x, y + cut),
-        ])
-    if n == 1:  # [:cut, -cut:] - top-right
-        return Polygon([(x + size - cut, y), (x + size, y), (x + size, y + cut), (x + size - cut, y + cut)])
-    if n == 2:  # [-cut:, :cut] - bottom-left
-        return Polygon([(x, y + size - cut), (x + cut, y + size - cut), (x + cut, y + size), (x, y + size)])
-    if n == 3:  # [-cut:, -cut:] - bottom-right
-        return Polygon([
-            (x + size - cut, y + size - cut),
-            (x + size, y + size - cut),
-            (x + size, y + size),
-            (x + size - cut, y + size),
-        ])
-    raise ValueError(f"Unknown n={n}")
 
 
 def load_splits(
@@ -102,8 +75,9 @@ def load_splits(
             path, i, filter_=filter_, tile_coords=(c["x"], c["y"])
         )
     except Exception as e:
-        logger.error(f"Error reading {path}: {e.__class__.__name__}. Please rerun.")
-        raise e
+        msg = f"Error reading {path}: {e.__class__.__name__}. Please rerun."
+        logger.critical(msg)
+        raise Exception(msg) from e
 
 
 def process_df(
@@ -135,8 +109,12 @@ def process(
     *,
     filter_: bool = True,
     simple: bool = False,
-) -> pl.DataFrame:
-    df = load_splits(path_pickle, curr, coords, filter_=filter_, simple=simple)
+) -> pl.DataFrame | None:
+    try:
+        df = load_splits(path_pickle, curr, coords, filter_=filter_, simple=simple)
+    except Exception as e:
+        logger.error(f"{path_pickle.name}: {e}")
+        return None
     (df_filtered := process_df(df, curr, coords, cells, crosses)).write_parquet(gen_out(path_pickle))
 
     logger.info(f"{path_pickle.name}: thrown {len(df) - len(df_filtered)} / {len(df)}.")
@@ -172,6 +150,12 @@ def run(
     if not paths_wd:
         raise ValueError(f"No registered--{_roi}+{codebook.stem} found in {path_wd}")
 
+    # Get size
+    img = imread(next(path_wd.glob(f"registered--{_roi}+{codebook.stem}/*.tif")))
+    size = img.shape[-1]
+    logger.info(f"Size: {size}")
+    del img
+
     for reg_path in paths_wd:
         roi = reg_path.name.split("--")[1]
         path = path_wd / f"registered--{roi}"
@@ -203,7 +187,7 @@ def run(
         coords = coords.filter(pl.col("index").is_in({int(f.stem.rsplit("-", 2)[1]) for f in files}))
 
         # Precompute intersections
-        cells = generate_cells(coords, files, split=not simple and not no_split, size=w)
+        cells = generate_cells(coords, files, split=not simple and not no_split, size=size)
         assert len(files) == len(cells)
         logger.debug(f"Generated {len(cells)} cells.")
         if not len(cells):
@@ -215,7 +199,7 @@ def run(
         # Get the indices of the cells that cross each other
         crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 
-        with ProcessPoolExecutor(max_workers=4, mp_context=get_context("spawn")) as exc:
+        with ProcessPoolExecutor(max_workers=8, mp_context=get_context("spawn")) as exc:
             futs = []
             for i, file in enumerate(files):
                 if overwrite or not gen_out(file).exists():
@@ -231,8 +215,16 @@ def run(
                             simple=simple,
                         )
                     )
-            for fut in as_completed(futs):
-                fut.result()
+
+            # Wait for either all futures to complete or any to raise an exception
+            done, not_done = wait(futs, return_when=FIRST_EXCEPTION)
+
+            # Check if any future raised an exception
+            for fut in done:
+                if fut.exception() is not None:
+                    for f in not_done:
+                        f.cancel()
+                    fut.result()
 
         df = pl.scan_parquet(sorted([gen_out(file) for file in files])).collect()
         df.write_parquet(path_cb / "spots.parquet")

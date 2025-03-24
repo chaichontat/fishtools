@@ -1,4 +1,5 @@
 # %%
+import json
 import subprocess
 from pathlib import Path
 
@@ -28,9 +29,9 @@ def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 10, ma
         existing = 0
 
     if (path / f"opt_{codebook_path.stem}" / "percentiles.json").exists():
-        existing_perc = len(
-            Path(path / f"opt_{codebook_path.stem}" / "percentiles.json").read_text().splitlines()
-        )
+        existing_perc = json.loads(
+            Path(path / f"opt_{codebook_path.stem}" / "percentiles.json").read_text()
+        ).__len__()
         logger.info(f"Found {existing_perc} existing percentiles.")
     else:
         existing_perc = 0
@@ -39,10 +40,10 @@ def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 10, ma
         logger.info("All rounds already exist. Exiting.")
         return
 
-    if existing < rounds:
-        logger.info(f"Starting from round {existing}")
+    if min(existing, existing_perc) < rounds:
+        logger.info(f"Starting from round {min(existing, existing_perc)}")
 
-    if existing_perc < existing:
+    if existing < existing_perc:
         raise Exception("Percentiles count < existing rounds. Should not happen.")
 
     for i in range(min(existing, existing_perc), rounds):
@@ -97,7 +98,6 @@ def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 10, ma
             check=True,
             capture_output=False,
         )
-        existing_perc += 1
 
 
 if __name__ == "__main__":
