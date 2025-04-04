@@ -1,4 +1,3 @@
-# stdlib imports
 import datetime
 import functools
 import getpass
@@ -6,27 +5,26 @@ import glob
 import os
 import pathlib
 import tempfile
+from pathlib import Path
 
 import cellpose.io
 import cellpose.models
-
-# distributed dependencies
 import dask
 import dask_image.ndmeasure
 import dask_jobqueue
 import distributed
 import imagecodecs
-
-# non-stdlib core dependencies
 import numpy as np
 import scipy
 import tifffile
 import yaml
 import zarr
 
+from fishtools.utils.pretty_print import progress_bar
+
 
 ######################## File format functions ################################
-def numpy_array_to_zarr(write_path, array, chunks):
+def numpy_array_to_zarr(write_path: Path | str, array, chunks):
     """
     Store an in memory numpy array to disk as a chunked Zarr array
 
@@ -695,9 +693,11 @@ def distributed_eval(
     # Note: Passing large arrays like input_zarr repeatedly can add overhead,
     # but Dask should handle passing the reference efficiently.
     # Alternatively, scatter input_zarr once if performance is an issue.
+    offset = 0
+    n = None
     check_futures = cluster.client.map(
         check_block_has_data,
-        block_crops[:100],  # Iterate over crops
+        block_crops[offset : None if n is None else offset + n],  # Iterate over crops
         zarr_array=input_zarr,  # Pass input_zarr reference
         threshold=0,  # Pass threshold
     )
@@ -713,46 +713,50 @@ def distributed_eval(
         raise e
 
     # Filter the indices and crops based on the results
-    final_block_indices = []
-    final_block_crops = []
-    for i, is_non_zero in enumerate(non_zero_results):
+    final_block_indices, final_block_crops = [], []
+    for i, is_non_zero in enumerate(non_zero_results, offset):
         if is_non_zero:
             final_block_indices.append(block_indices[i])
             final_block_crops.append(block_crops[i])
+    del block_indices, block_crops
 
     print(f"Selected {len(final_block_indices)} blocks with non-zero input data.")
 
     output_shape = input_zarr.shape[:-1]  # Get ZYX dimensions
     output_blocksize = blocksize[:-1]
 
-    # I hate indenting all that code just for the tempdir
-    # but context manager is the only way to really guarantee that
-    # the tempdir gets cleaned up even after unhandled exceptions
     Path(temporary_directory).mkdir(parents=True, exist_ok=True)
 
     temp_zarr_path = Path(temporary_directory) / "segmentation_unstitched.zarr"
-    if not temp_zarr_path.exists():
-        temp_zarr = zarr.open(
-            temp_zarr_path,
-            "w",
-            shape=output_shape,  # Use 3D shape
-            chunks=output_blocksize,  # Use 3D chunks
-            dtype=np.uint32,
-        )
-        futures = cluster.client.map(
-            process_block,
-            final_block_indices,
-            final_block_crops,
-            input_zarr=input_zarr,
-            preprocessing_steps=preprocessing_steps,
-            model_kwargs=model_kwargs,
-            eval_kwargs=eval_kwargs,
-            blocksize=blocksize,
-            overlap=overlap,
-            output_zarr=temp_zarr,
-            worker_logs_directory=str(worker_logs_dir),
-        )
+    import shutil
+
+    shutil.rmtree(temp_zarr_path)
+
+    temp_zarr = zarr.open(
+        temp_zarr_path,
+        "w",
+        shape=output_shape,  # Use 3D shape
+        chunks=output_blocksize,  # Use 3D chunks
+        dtype=np.uint32,
+    )
+    futures = cluster.client.map(
+        process_block,
+        final_block_indices,
+        final_block_crops,
+        input_zarr=input_zarr,
+        preprocessing_steps=preprocessing_steps,
+        model_kwargs=model_kwargs,
+        eval_kwargs=eval_kwargs,
+        blocksize=blocksize,
+        overlap=overlap,
+        output_zarr=temp_zarr,
+        worker_logs_directory=str(worker_logs_dir),
+    )
+
+    with progress_bar(len(final_block_indices)) as submit:
+        [fut.add_done_callback(submit) for fut in futures]
         results = cluster.client.gather(futures)
+
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
         cluster.scale(0)
 
@@ -760,23 +764,27 @@ def distributed_eval(
     boxes = [box for sublist in boxes_ for box in sublist]
     box_ids = np.concatenate(box_ids_).astype(int)  # unsure how but without cast these are float64
 
-    new_labeling = determine_merge_relabeling(block_indices, faces, box_ids)
-    debug_unique = np.unique(new_labeling)
-    new_labeling_path = Path(temporary_directory) + "/new_labeling.npy"
+    print(f"Box IDs: {len(box_ids)}")
+    new_labeling = determine_merge_relabeling(
+        [(bi[0], bi[1], bi[2]) for bi in final_block_indices], faces, box_ids
+    )
+    new_labeling_path = Path(temporary_directory) / "new_labeling.npy"
     np.save(new_labeling_path, new_labeling)
 
     # stitching step is cheap, we should release gpus and use small workers
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
         cluster.change_worker_attributes(
             min_workers=cluster.locals_store["min_workers"],
-            max_workers=cluster.locals_store["max_workers"],
+            max_workers=12,
             ncpus=1,
             memory="15GB",
             mem=int(15e9),
             queue=None,
             job_extra_directives=[],
         )
+        cluster.scale(32)
 
+    print("Relabeling blocks...")
     segmentation_da = dask.array.from_zarr(temp_zarr)
     relabeled = dask.array.map_blocks(
         lambda block: np.load(new_labeling_path)[block],
@@ -785,6 +793,8 @@ def distributed_eval(
         chunks=segmentation_da.chunks,
     )
     dask.array.to_zarr(relabeled, write_path, overwrite=True)
+
+    print("Merging boxes...")
     merged_boxes = merge_all_boxes(boxes, new_labeling[box_ids])
     return zarr.open(write_path, mode="r"), merged_boxes
 
@@ -927,8 +937,6 @@ def merge_boxes(boxes):
     return box_union
 
 
-from pathlib import Path
-
 # =================== Example Usage ===================
 if __name__ == "__main__":
     # ---- 1. Configuration ----
@@ -943,7 +951,7 @@ if __name__ == "__main__":
 
     # Cellpose Model Configuration
     cellpose_model_kwargs = {
-        "model_type": "cyto3",  # Or 'nuclei', 'cyto', or path to custom model
+        "model_type": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/models/2025-04-03_15-56-37",  # Or 'nuclei', 'cyto', or path to custom model
         "gpu": True,  # Set to False if you don't have a suitable GPU or CUDA installed
     }
 
@@ -951,11 +959,11 @@ if __name__ == "__main__":
     cellpose_eval_kwargs = {
         "diameter": 50,  # <-- SET THIS: Estimated average object diameter in pixels
         "channels": [1, 2],  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
-        "batch_size": 20,  # Adjust based on GPU memory (if using GPU)
+        "batch_size": 16,  # Adjust based on GPU memory (if using GPU)
         # Use Cellpose's internal normalization (or False if pre-normalized)
-        "normalize": {"lowhigh": [1460, 3000]},
+        "normalize": {"lowhigh": [1460, 3800]},
         "flow_threshold": 0.4,  # Default is 0.4, adjust if needed
-        "cellprob_threshold": 0.0,  # Default is 0.0, adjust if needed
+        "cellprob_threshold": 0,  # Default is 0.0, adjust if needed
         "anisotropy": 6.0,
         "resample": False,
         "do_3D": True,
@@ -965,7 +973,7 @@ if __name__ == "__main__":
     # Adjust n_workers and memory_limit based on your system (CPU cores, RAM, GPU)
     # If gpu=True in model_kwargs, often n_workers=1 is best.
     local_cluster_kwargs = {
-        "n_workers": 4 if cellpose_model_kwargs["gpu"] else 4,  # Example: 1 worker for GPU, 4 for CPU
+        "n_workers": 8,  # Example: 1 worker for GPU, 4 for CPU
         "ncpus": 4,  # Physical cores per worker (adjust based on your CPU)
         "memory_limit": "64GB",  # RAM per worker - CRITICAL: Must fit block+model+overhead
         "threads_per_worker": 1,  # Usually 1 for Cellpose

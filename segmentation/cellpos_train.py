@@ -2,6 +2,7 @@
 import logging
 import pickle
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -13,14 +14,34 @@ from cellpose.models import CellposeModel
 from cellpose.train import train_seg
 from tifffile import imread
 
-plt.imshow = lambda *args, **kwargs: plt.imshow(*args, zorder=1, **kwargs)
+_original_imshow = plt.imshow
+plt.imshow = lambda *args, **kwargs: _original_imshow(*args, zorder=1, **kwargs)
 
 logging.basicConfig(level=logging.INFO)
 
-path = Path.home() / "segmentation" / "pi-wga"
-
-
+path = Path("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA")
 name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # + "polyA"
+
+
+def calc_percentile(img: np.ndarray, low: float = 5, high: float = 99):
+    nonzero = img.flatten()[img.flat > 0]
+    lo, hi = np.percentile(nonzero, [low, high])
+    return lo, hi
+
+
+# %%
+out = []
+for i in range(0, 25, 2):
+    print(i)
+    out_ = []
+    img0 = imread(path / f"{i:02d}/00/fused_00-1.tif")
+    out_.append(calc_percentile(img0, 10, 99.9))
+    del img0
+    img1 = imread(path / f"{i:02d}/01/fused_01-1.tif")
+    out_.append(calc_percentile(img1, 10, 99.9))
+    del img1
+    out.append(out_)
+    print(out_)
 
 
 # %%
@@ -32,10 +53,10 @@ models = sorted(
     key=lambda x: x.stat().st_mtime,
     reverse=True,
 )
-assert models
+# assert models
 
 LEARNING_RATES = {
-    "AdamW": 0.001,
+    "AdamW": 0.008,
     "AdamW_fine": 0.0001,
     "SGD": 0.05,
 }
@@ -50,19 +71,21 @@ LEARNING_RATES = {
 #         - "norm3D"=False ; compute normalization across entire z-stack rather than plane-by-plane in stitching mode.
 #     Defaults to True.
 normalize_params = {
-    "lowhigh": None,
-    "percentile": (1, 99.9),
-    "normalize": True,
-    "norm3D": True,
-    "sharpen_radius": 0,
-    "smooth_radius": 0,
-    "tile_norm_blocksize": 0,
-    "tile_norm_smooth3D": 1,
-    "invert": False,
+    "lowhigh": [1520, 5000],
+    # "percentile": (1, 99.9),
+    # "normalize": True,
+    # "norm3D": True,
+    # "sharpen_radius": 0,
+    # "smooth_radius": 0,
+    # "tile_norm_blocksize": 0,
+    # "tile_norm_smooth3D": 1,
+    # "invert": False,
 }
 
 # %%
-for p in path.rglob("*.npy"):
+path_labeled = Path("/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA")
+
+for p in path_labeled.rglob("*.npy"):
     try:
         u = np.load(p, allow_pickle=True)
     except Exception as e:
@@ -71,13 +94,13 @@ for p in path.rglob("*.npy"):
 
 
 # %%
-def train(path: Path, name: str | None = None):
+def train(path: Path, normalize_params: dict, name: str | None = None):
     if name is None:
         name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     output = load_train_test_data(
         path.as_posix(),
-        test_dir=(path.parent / "pi-wgatest").as_posix(),
+        # test_dir=(path.parent / "pi-wgatest").as_posix(),
         mask_filter="_seg.npy",
         look_one_level_down=True,
     )
@@ -93,21 +116,21 @@ def train(path: Path, name: str | None = None):
         train_labels=labels,
         save_path=path,  # /models automatically appended
         channels=[1, 2],
-        batch_size=16,
+        batch_size=24,
         channel_axis=0,
         test_data=test_images,
         test_labels=test_labels,
         weight_decay=1e-5,
         SGD=False,
-        learning_rate=0.0008,
-        n_epochs=2000,
+        learning_rate=0.008,
+        n_epochs=500,
         model_name=name,
         bsize=224,
         normalize=cast(bool, normalize_params),
     )
 
 
-what = train(path, name=name)
+what = train(path_labeled, normalize_params, name=name)
 
 
 # dapi = imread("/fast2/3t3clean/analysis/deconv/registered/dapi3/0/fused_1.tif").squeeze()
