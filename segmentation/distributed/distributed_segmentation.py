@@ -551,7 +551,7 @@ def distributed_eval(
     eval_kwargs={},
     cluster: myLocalCluster = None,
     cluster_kwargs={},
-    temporary_directory=None,
+    temporary_directory: Path = None,
 ):
     """
     Evaluate a cellpose model on overlapping blocks of a big image.
@@ -726,11 +726,8 @@ def distributed_eval(
     output_blocksize = blocksize[:-1]
 
     Path(temporary_directory).mkdir(parents=True, exist_ok=True)
-
+    assert temporary_directory.exists()
     temp_zarr_path = Path(temporary_directory) / "segmentation_unstitched.zarr"
-    import shutil
-
-    shutil.rmtree(temp_zarr_path)
 
     temp_zarr = zarr.open(
         temp_zarr_path,
@@ -940,32 +937,51 @@ def merge_boxes(boxes):
 # =================== Example Usage ===================
 if __name__ == "__main__":
     # ---- 1. Configuration ----
-    path = Path("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA")
+    # path = Path("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA")
+    path = Path("/working/20250407_cs3_2/analysis/deconv/stitch--br+atp")
     tiff_path = path / "fused.tif"  # <-- SET THIS: Path to your input TIFF file
     zarr_input_path = path / "input_image.zarr"  # Path to store intermediate Zarr
     zarr_output_path = path / "output_segmentation.zarr"  # <-- SET THIS: Path for final segmentation Zarr
 
     # Define block size (e.g., for a 3D image Z, Y, X) - ADJUST TO YOUR DATA AND MEMORY
     # Should be large enough for context but small enough for memory per worker
-    processing_blocksize = (25, 512, 512, 2)  # Example for 3D
+    processing_blocksize = (20, 512, 512, 2)  # Example for 3D
 
     # Cellpose Model Configuration
+    # cellpose_model_kwargs = {
+    #     "pretrained_model": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/models/2025-04-16_21-32-16",  # Or 'nuclei', 'cyto', or path to custom model
+    #     "pretrained_model_ortho": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/ortho/models/2025-04-14_18-38-00",
+    #     "gpu": True,
+    # }
+    import json
+
+    config = json.loads((path.parent / "config.json").read_text())
     cellpose_model_kwargs = {
-        "model_type": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/models/2025-04-03_15-56-37",  # Or 'nuclei', 'cyto', or path to custom model
-        "gpu": True,  # Set to False if you don't have a suitable GPU or CUDA installed
+        "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
+        "pretrained_model_ortho": config["pretrained_model_ortho"],
+        "gpu": True,
     }
 
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
-        "diameter": 50,  # <-- SET THIS: Estimated average object diameter in pixels
+        "diameter": 31,  # MUST BE INT <-- SET THIS: Estimated average object diameter in pixels
         "channels": [1, 2],  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
         "batch_size": 16,  # Adjust based on GPU memory (if using GPU)
         # Use Cellpose's internal normalization (or False if pre-normalized)
-        "normalize": {"lowhigh": [1460, 3800]},
-        "flow_threshold": 0.4,  # Default is 0.4, adjust if needed
-        "cellprob_threshold": 0,  # Default is 0.0, adjust if needed
-        "anisotropy": 6.0,
+        # "normalize": {
+        # "lowhigh": config["normalize"]["lowhigh"],
+        # },
+        "normalize": {
+            "lowhigh": [
+                [2094.82608835, 6389.98397762],
+                [1519.15741648, 2441.97173317],
+            ],  # [[1439.001281128774, 6329.462243341022], [1134.1972039273114, 2175.110389829798]]
+        },
+        "flow_threshold": 0,  # Useless in 3D
+        "cellprob_threshold": -2,  # Default is 0.0, adjust if needed
+        "anisotropy": 3.0,
         "resample": False,
+        "flow3D_smooth": 3,
         "do_3D": True,
     }
 
@@ -973,7 +989,7 @@ if __name__ == "__main__":
     # Adjust n_workers and memory_limit based on your system (CPU cores, RAM, GPU)
     # If gpu=True in model_kwargs, often n_workers=1 is best.
     local_cluster_kwargs = {
-        "n_workers": 8,  # Example: 1 worker for GPU, 4 for CPU
+        "n_workers": 4,  # Example: 1 worker for GPU, 4 for CPU
         "ncpus": 4,  # Physical cores per worker (adjust based on your CPU)
         "memory_limit": "64GB",  # RAM per worker - CRITICAL: Must fit block+model+overhead
         "threads_per_worker": 1,  # Usually 1 for Cellpose
@@ -992,7 +1008,10 @@ if __name__ == "__main__":
     # ]
     from skimage.filters import unsharp_mask
 
-    preprocessing_pipeline = [(lambda img, crop: unsharp_mask(img, preserve_range=True, radius=3), {})]
+    def unsharp_all(img: np.ndarray, crop: None = None):
+        return unsharp_mask(img, preserve_range=True, radius=3, channel_axis=3)
+
+    preprocessing_pipeline = [(unsharp_all, {})]
 
     # Optional Mask (set path to a mask file if you have one)
     mask_path = None  # Example: "path/to/foreground_mask.tif"
@@ -1026,7 +1045,7 @@ if __name__ == "__main__":
             print(f"Error during TIFF loading or Zarr conversion: {e}")
             exit()
     else:
-        input_zarr_array = zarr.open(zarr_input_path, mode="r")
+        input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
 
     # ---- 3. Run Distributed Evaluation ----
     print("Starting distributed Cellpose evaluation...")

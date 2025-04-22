@@ -12,6 +12,8 @@ import numpy as np
 from cellpose.io import imread, load_train_test_data
 from cellpose.models import CellposeModel
 from cellpose.train import train_seg
+from loguru import logger
+from skimage.filters import unsharp_mask
 from tifffile import imread
 
 _original_imshow = plt.imshow
@@ -19,30 +21,43 @@ plt.imshow = lambda *args, **kwargs: _original_imshow(*args, zorder=1, **kwargs)
 
 logging.basicConfig(level=logging.INFO)
 
-path = Path("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA")
+# path = Path("/working/20250407_cs3_2/analysis/deconv/stitch--tl+atp")
+
+path = Path("/working/cellpose-training")
+
 name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # + "polyA"
 
 
-def calc_percentile(img: np.ndarray, low: float = 5, high: float = 99):
-    nonzero = img.flatten()[img.flat > 0]
-    lo, hi = np.percentile(nonzero, [low, high])
-    return lo, hi
+# %%
+def calc_percentile(
+    img: np.ndarray, block: tuple[int, int] = (512, 512), n: int = 25, low: float = 10, high: float = 99.5
+):
+    rand = np.random.default_rng(0)
+    x_start = rand.integers(0, img.shape[2] - block[0], n)
+    y_start = rand.integers(0, img.shape[3] - block[1], n)
+    out = []
+    for i, (x, y) in enumerate(zip(x_start, y_start)):
+        logger.info(f"Percentile processing {i + 1}/{n}")
+        out.append(
+            np.percentile(
+                unsharp_mask(
+                    img[:, :, x : x + block[0], y : y + block[1]],
+                    radius=3,
+                    preserve_range=True,
+                    channel_axis=1,
+                ),
+                [low, high],
+                axis=(0, 2, 3),
+            )
+        )
+    out = np.array(out)
+    return np.mean(out, axis=0).T, out
 
+
+# img = imread(path / "fused.tif")
+# percs, _ = calc_percentile(img)
 
 # %%
-out = []
-for i in range(0, 25, 2):
-    print(i)
-    out_ = []
-    img0 = imread(path / f"{i:02d}/00/fused_00-1.tif")
-    out_.append(calc_percentile(img0, 10, 99.9))
-    del img0
-    img1 = imread(path / f"{i:02d}/01/fused_01-1.tif")
-    out_.append(calc_percentile(img1, 10, 99.9))
-    del img1
-    out.append(out_)
-    print(out_)
-
 
 # %%
 # Yes, the typing is wrong.
@@ -71,19 +86,12 @@ LEARNING_RATES = {
 #         - "norm3D"=False ; compute normalization across entire z-stack rather than plane-by-plane in stitching mode.
 #     Defaults to True.
 normalize_params = {
-    "lowhigh": [1520, 5000],
-    # "percentile": (1, 99.9),
-    # "normalize": True,
-    # "norm3D": True,
-    # "sharpen_radius": 0,
-    # "smooth_radius": 0,
-    # "tile_norm_blocksize": 0,
-    # "tile_norm_smooth3D": 1,
-    # "invert": False,
+    "percentile": (1, 99.5),
 }
 
 # %%
-path_labeled = Path("/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA")
+# path_labeled = Path("/working/cellpose-training/embryonic/cs3")
+path_labeled = path  # Path("/working/20250407_cs3_2/analysis/deconv/segment--bl+atp/ortho")
 
 for p in path_labeled.rglob("*.npy"):
     try:
@@ -93,18 +101,34 @@ for p in path_labeled.rglob("*.npy"):
         raise e
 
 
+def concat_output(samples: list[str]) -> tuple[list]:
+    first: tuple = load_train_test_data(
+        (path / samples[0]).as_posix(),
+        # test_dir=(path.parent / "pi-wgatest").as_posix(),
+        mask_filter="_seg.npy",
+        look_one_level_down=True,
+    )
+    for sample in samples[1:]:
+        _out = load_train_test_data(
+            (path / sample).as_posix(),
+            # test_dir=(path.parent / "pi-wgatest").as_posix(),
+            mask_filter="_seg.npy",
+            look_one_level_down=True,
+        )
+        for lis, new in zip(first, _out):
+            if lis is not None and new is not None:
+                lis.extend(new)
+    return first
+
+
 # %%
 def train(path: Path, normalize_params: dict, name: str | None = None):
     if name is None:
         name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-    output = load_train_test_data(
-        path.as_posix(),
-        # test_dir=(path.parent / "pi-wgatest").as_posix(),
-        mask_filter="_seg.npy",
-        look_one_level_down=True,
-    )
-    images, labels, image_names, test_images, test_labels, image_names_test = output
+    images, labels, image_names, test_images, test_labels, image_names_test = concat_output([
+        "20250407_cs3_2"
+    ])
     # return images, labels, image_names, test_images, test_labels, image_names_test
 
     # e.g. retrain a Cellpose model
@@ -115,7 +139,7 @@ def train(path: Path, normalize_params: dict, name: str | None = None):
         train_data=images,
         train_labels=labels,
         save_path=path,  # /models automatically appended
-        channels=[1, 2],
+        channels=[2, 1],
         batch_size=24,
         channel_axis=0,
         test_data=test_images,
@@ -123,33 +147,13 @@ def train(path: Path, normalize_params: dict, name: str | None = None):
         weight_decay=1e-5,
         SGD=False,
         learning_rate=0.008,
-        n_epochs=500,
+        n_epochs=300,
         model_name=name,
         bsize=224,
         normalize=cast(bool, normalize_params),
+        min_train_masks=1,
     )
 
 
-what = train(path_labeled, normalize_params, name=name)
-
-
-# dapi = imread("/fast2/3t3clean/analysis/deconv/registered/dapi3/0/fused_1.tif").squeeze()
-# polya = imread("/fast2/3t3clean/analysis/deconv/registered/dapi3/2/fused_1.tif").squeeze()
-# intensity = scale_image_2x_optimized(img)
-
-# %%
-res = model.eval(
-    np.array([polya, dapi]),
-    batch_size=8,
-    channels=[1, 3],
-    # normalize=False,  # CANNOT TURN OFF NORMALIZATION
-    # Will run into memory issues if turned off.
-    flow_threshold=0.4,
-    do_3D=False,
-    # diameter=model.diam_labels,
-)
-
-with open("/fast2/3t3clean/analysis/deconv/registered/dapi3/cellpose_polyA_result.pkl", "wb") as f:
-    f.write(pickle.dumps(res))
-
+what = train(path_labeled, normalize_params, name="embryonic2")
 # %%
