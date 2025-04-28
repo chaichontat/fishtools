@@ -64,7 +64,9 @@ def scale_deconv(
     return np.clip(scaled, 0, 65535)
 
 
-def _compute_range(path: Path, round_: str, *, perc_min: float = 99.9, perc_scale: float = 0.1):
+def _compute_range(
+    path: Path, round_: str, *, perc_min: float = 0.1, perc_scale: float = 0.1
+):
     """
     Find the min and scale of the deconvolution for all files in a directory.
     The reverse scaling equation is:
@@ -115,11 +117,15 @@ def _compute_range(path: Path, round_: str, *, perc_min: float = 99.9, perc_scal
 
 
 logger.remove()
-logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
+logger.configure(
+    handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}]
+)
 console = Console()
 
 
-def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32) -> npt.NDArray:
+def high_pass_filter(
+    img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32
+) -> npt.NDArray:
     """
     Args:
         image: the input image to be filtered
@@ -132,7 +138,9 @@ def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLik
     """
     img = img.astype(dtype)
     window_size = int(2 * np.ceil(2 * σ) + 1)
-    lowpass = cv2.GaussianBlur(img, (window_size, window_size), σ, borderType=cv2.BORDER_REPLICATE)
+    lowpass = cv2.GaussianBlur(
+        img, (window_size, window_size), σ, borderType=cv2.BORDER_REPLICATE
+    )
     gauss_highpass = img - lowpass
     gauss_highpass[lowpass > img] = 0
     return gauss_highpass
@@ -287,7 +295,14 @@ def deconvolve_lucyrichardson_guo(
     return estimate
 
 
-def make_projector(path: Path | str, *, step: int = 10, max_z: int = 7, size: int = 31, center: int = 50):
+def make_projector(
+    path: Path | str,
+    *,
+    step: int = 10,
+    max_z: int = 7,
+    size: int = 31,
+    center: int = 50,
+):
     gen = imread(path := Path(path))
     assert gen.shape[1] == gen.shape[2]
 
@@ -323,17 +338,23 @@ def deconv(): ...
 
 
 @deconv.command()
-@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
+@click.argument(
+    "path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path)
+)
 @click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
 @click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
 @click.option("--overwrite", is_flag=True)
-def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, overwrite: bool = False):
+def compute_range(
+    path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, overwrite: bool = False
+):
     """
     Find the scaling factors of all images in the children sub-folder of `path`.
     Run this on the entire workspace. See `_compute_range` for more details.
     """
     rounds = sorted({
-        p.parent.name.split("--")[0] for p in path.rglob("*.tif") if len(p.parent.name.split("--")) == 2
+        p.parent.name.split("--")[0]
+        for p in path.rglob("*.tif")
+        if len(p.parent.name.split("--")) == 2
     })
     print(rounds)
     if "deconv" not in path.resolve().as_posix():
@@ -344,7 +365,14 @@ def compute_range(path: Path, perc_min: float = 0.1, perc_scale: float = 0.1, ov
             continue
         try:
             logger.info(f"Processing {round_}")
-            _compute_range(path, round_, perc_min=perc_min, perc_scale=perc_scale)
+            if all(not x.isdigit() for x in round_.split("_")):
+                logger.info(
+                    "Non-integer round name. Setting perc_min=1 and perc_scale=1."
+                )
+                _compute_range(path, round_, perc_min=1, perc_scale=1)
+            else:
+                _compute_range(path, round_, perc_min=perc_min, perc_scale=perc_scale)
+
         except (AttributeError, FileNotFoundError):
             logger.info("Invalid folder. Skipping.")
 
@@ -374,7 +402,9 @@ def _run(
         paths = [f for f in paths if not (out / f.parent.name / f.name).exists()]
 
     q_write = queue.Queue(maxsize=3)
-    q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
+    q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = (
+        queue.Queue(maxsize=1)
+    )
 
     def f_read(files: list[Path]):
         logger.debug("Read thread started.")
@@ -393,9 +423,13 @@ def _run(
                     img = tif.asarray()
 
                 fid = np.atleast_3d(img[-n_fids:])
-                nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
+                nofid = (
+                    img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
+                )
             except ValueError as e:
-                raise Exception(f"File {file.resolve()} is corrupted. Please check the file.") from e
+                raise Exception(
+                    f"File {file.resolve()} is corrupted. Please check the file."
+                ) from e
             logger.debug(f"Finished reading {file.name}")
 
             for i, basic in enumerate(basics[round_]):
@@ -415,7 +449,9 @@ def _run(
             sub = out / file.parent.name
             sub.mkdir(exist_ok=True, parents=True)
 
-            (sub / file.name).with_suffix(".deconv.json").write_text(json.dumps(scaling, indent=2))
+            (sub / file.name).with_suffix(".deconv.json").write_text(
+                json.dumps(scaling, indent=2)
+            )
 
             tifffile.imwrite(
                 sub / file.name,
@@ -439,11 +475,18 @@ def _run(
                 start, img, fid, metadata = q_img.get()
                 t = time.time()
 
-                res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors(), iters=1)
+                res = deconvolve_lucyrichardson_guo(
+                    cp.asarray(img), projectors(), iters=1
+                )
                 mins = res.min(axis=(0, 2, 3), keepdims=True)
                 scale = 65534 / (res.max(axis=(0, 2, 3), keepdims=True) - mins)
 
-                towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
+                towrite = (
+                    ((res - mins) * scale)
+                    .astype(np.uint16)
+                    .get()
+                    .reshape(-1, 2048, 2048)
+                )
                 del res
 
                 scaling = {
@@ -510,29 +553,39 @@ def run(
         logger.remove()
         logger.add(sys.stderr, level="DEBUG")
 
-    console.print(f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]")
+    console.print(
+        f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]"
+    )
 
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
-    files = [
-        f
-        for f in sorted(path.glob(f"{name}--*/{name}-*.tif"))
-        if "analysis/deconv" not in str(f) and not f.parent.name.endswith("basic")
-    ]
     if ref is not None:
-        ok_idxs = {
-            int(f.stem.split("-")[1])
-            for f in sorted(path.rglob(f"{ref}*/{ref}-*.tif"))
-            if "analysis/deconv" not in str(f)
-        }
-        logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
-        files = [f for f in files if int(f.stem.split("-")[1]) in ok_idxs]
-        if len(files) != len(ok_idxs):
-            logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
+        files = []
+        for roi in [r.name.split("--")[1] for r in path.glob(f"{ref}--*")]:
+            ok_idxs = {
+                int(f.stem.split("-")[1])
+                for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))
+            }
+
+            files.extend([
+                f
+                for f in sorted(path.glob(f"{name}--{roi}/{name}-*.tif"))
+                if "analysis/deconv" not in str(f)
+                and not f.parent.name.endswith("basic")
+                and int(f.stem.split("-")[1]) in ok_idxs
+            ])
+
+    else:
+        files = [
+            f
+            for f in sorted(path.glob(f"{name}--*/{name}-*.tif"))
+            if "analysis/deconv" not in str(f) and not f.parent.name.endswith("basic")
+        ]
 
     files = files[:limit] if limit is not None else files
     logger.info(
-        f"Total: {len(files)} at {path}/{name}*" + (f" Limited to {limit}" if limit is not None else "")
+        f"Total: {len(files)} at {path}/{name}*"
+        + (f" Limited to {limit}" if limit is not None else "")
     )
 
     if not overwrite:
@@ -548,11 +601,13 @@ def run(
     logger.info(f"Using({path / 'basic'}/{basic_name}-*.pkl for BaSiC")
     basics: dict[str, list[BaSiC]] = {
         name: [
-            pickle.loads((path / "basic" / f"{basic_name}-{c}.pkl").read_bytes())
+            pickle.loads((path / "basic" / f"{basic_name}-{405}.pkl").read_bytes())
             for c in range(len(name.split("_")))
         ]
     }
-    _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids)
+    _run(
+        files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids
+    )
 
 
 @deconv.command()
@@ -576,14 +631,39 @@ def batch(
 
     FORBIDDEN = ["10x", "analysis", "shifts", "fid", "registered", "old", "basic"]
 
-    rounds = sorted({p.name.split("--")[0] for p in path.iterdir() if "--" in p.name and p.is_dir()})
+    rounds = sorted(
+        {
+            p.name.split("--")[0]
+            for p in path.iterdir()
+            if "--" in p.name and p.is_dir()
+        },
+        key=lambda x: f"{int(x.split('_')[0]):02d}" if x.split("_")[0].isdigit() else x,
+    )
+    logger.info(f"Rounds: {rounds}")
     for r in rounds:
-        files = [
-            f
-            for f in sorted(path.glob(f"{r}--{roi or '*'}/{r}-*.tif"))
-            if "analysis/deconv" not in str(f.resolve())
-            and not any(f.parent.name.endswith(x) for x in FORBIDDEN)
-        ]
+        if ref is not None:
+            files = []
+            for roi in [r.name.split("--")[1] for r in path.glob(f"{ref}--*")]:
+                ok_idxs = {
+                    int(f.stem.split("-")[1])
+                    for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))
+                }
+
+                files.extend([
+                    f
+                    for f in sorted(path.glob(f"{r}--{roi}/{r}-*.tif"))
+                    if "analysis/deconv" not in str(f)
+                    and not f.parent.name.endswith("basic")
+                    and int(f.stem.split("-")[1]) in ok_idxs
+                ])
+
+        else:
+            files = [
+                f
+                for f in sorted(path.glob(f"{r}--*/{r}-*.tif"))
+                if "analysis/deconv" not in str(f)
+                and not f.parent.name.endswith("basic")
+            ]
 
         with TiffFile(files[0]) as tif:
             try:
@@ -596,24 +676,19 @@ def batch(
                 raise AttributeError("No waveform metadata found.")
 
         if not files:
-            logger.info(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
+            logger.info(
+                f"No files found for {r}, skipping. Use --overwrite to reprocess."
+            )
             continue
-
-        if ref is not None:
-            ok_idxs = {
-                int(f.stem.split("-")[1])
-                for f in sorted(path.rglob(f"{ref}--{roi or '*'}/{ref}-*.tif"))
-                if "analysis/deconv" not in str(f) and not f.parent.name.endswith("basic")
-            }
-            logger.info(f"Filtering files to {ref}. Total: {len(ok_idxs)}")
-            files = [f for f in files if int(f.stem.split("-")[1]) in ok_idxs]
-            if len(files) != len(ok_idxs):
-                logger.warning(f"Filtering reduced the number of files to {len(files)} ≠ length of ref.")
 
         try:
             basics: dict[str, list[BaSiC]] = {
                 r: [
-                    pickle.loads((path / "basic" / f"{basic_name or r}-{c[-3:]}.pkl").read_bytes())
+                    pickle.loads(
+                        (
+                            path / "basic" / f"{basic_name or r}-{c[-3:]}.pkl"
+                        ).read_bytes()
+                    )
                     for c in powers
                 ]
             }

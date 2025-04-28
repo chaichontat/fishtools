@@ -1,6 +1,8 @@
 # %%
+from pathlib import Path
 from typing import Any
 
+import itk
 import numpy as np
 import SimpleITK as sitk
 from loguru import logger
@@ -24,9 +26,7 @@ class Affine:
         # self.cg: dict[str, np.ndarray[np.float64, Any]] = cg
         self.ref_channel = ref
         self._ref_image = (
-            sitk.Cast(sitk.GetImageFromArray(ref_img), sitk.sitkFloat32)
-            if ref_img is not None
-            else None
+            sitk.Cast(sitk.GetImageFromArray(ref_img), sitk.sitkFloat32) if ref_img is not None else None
         )
 
     @property
@@ -140,8 +140,7 @@ def overlay(
 
     def norm(img: np.ndarray[np.float32, Any]):
         return np.clip(
-            (img - np.percentile(img, perc[0]))
-            / (np.percentile(img, perc[1]) - np.percentile(img, perc[0])),
+            (img - np.percentile(img, perc[0])) / (np.percentile(img, perc[1]) - np.percentile(img, perc[0])),
             0,
             1,
         )
@@ -166,12 +165,55 @@ def overlay(
 
     ax.imshow(rgb_image)
     ax.axis("off")
-    ax.set_title(
-        title if title else "Image Comparison (green: ref, red: img)", color="white"
-    )
+    ax.set_title(title if title else "Image Comparison (green: ref, red: img)", color="white")
 
     plt.tight_layout()
     return ax
+
+
+class FitAffine:
+    def __init__(self):
+        self.parameter_object = itk.ParameterObject.New()
+        default_rigid_parameter_map = self.parameter_object.GetDefaultParameterMap("affine")
+        default_rigid_parameter_map["AutomaticScalesEstimation"] = ["true"]
+        self.parameter_object.AddParameterMap(default_rigid_parameter_map)
+
+    def fit(self, ref: np.ndarray, target: np.ndarray):
+        # As is a 2x2 matrix
+        # ts is a 2x1 matrix (translation)
+        As = []
+        ts = []
+
+        result_image, self.parameter_object = itk.elastix_registration_method(
+            ref.astype(np.float32),
+            target.astype(np.float32),
+            parameter_object=self.parameter_object,
+            log_to_console=True,
+        )
+
+        params = np.array(
+            list(
+                map(
+                    float,
+                    self.parameter_object.GetParameter(0, "TransformParameters"),
+                )
+            )
+        )
+        As.append(params[:4].reshape(2, 2))
+        ts.append(params[-2:])
+        return As, ts
+
+    @staticmethod
+    def write(
+        path: Path | str,
+        As: list[np.ndarray[np.float64, Any]],
+        ts: list[np.ndarray[np.float64, Any]],
+    ):
+        affined = np.array([
+            *np.median(np.stack(As), axis=0).flatten(),
+            *np.median(np.stack(ts), axis=0),
+        ])
+        Path(path).write_text("\n".join(map(str, affined.flatten())))
 
 
 # %%
@@ -184,9 +226,9 @@ if __name__ == "__main__":
 
     sns.set_theme()
 
-    img = imread(
-        "/mnt/archive/starmap/sagittal-calibration/4_4--cortexRegion/4_4-0000.tif"
-    )[:-1].reshape(-1, 2, 2048, 2048)
+    img = imread("/mnt/archive/starmap/sagittal-calibration/4_4--cortexRegion/4_4-0000.tif")[:-1].reshape(
+        -1, 2, 2048, 2048
+    )
 
     DATA = Path("/home/chaichontat/fishtools/data")
 
@@ -212,9 +254,9 @@ if __name__ == "__main__":
     affine = Affine(As=As, ats=ats, ref_img=img[[0], 0])
     fig, axs = plt.subplots(ncols=2, figsize=(12, 6), dpi=200, facecolor="black")
 
-    img = imread(
-        "/disk/chaichontat/2024/sv101_ACS/2_10_18--noRNAse_big/2_10_18-0012.tif"
-    )[:-1].reshape(-1, 3, 2048, 2048)
+    img = imread("/disk/chaichontat/2024/sv101_ACS/2_10_18--noRNAse_big/2_10_18-0012.tif")[:-1].reshape(
+        -1, 3, 2048, 2048
+    )
 
     overlay(img[:, 1][5], img[:, 2][5], ax=axs[0], sl=np.s_[1400:1800, 1400:1800])
     overlay(

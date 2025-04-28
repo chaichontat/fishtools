@@ -709,7 +709,7 @@ def run_(
     output_dir: Path,
     segmentation_name: str,
     spots: Path,
-    tileconfig_name: str,
+    tile_config_path: Path,
     idx: int,
     opening_radius: float,
     closing_radius: float,
@@ -725,7 +725,6 @@ def run_(
     # --- Prepare Paths and Directories ---
     segmentation_path = input_dir / segmentation_name
     spots_path = spots
-    tile_config_path = input_dir / tileconfig_name if tileconfig_name else None
     output_chunk_dir = output_dir / f"chunks+{spots_path.stem.split('+')[1]}"
 
     try:
@@ -803,13 +802,6 @@ def cli(): ...
     show_default=True,
     help="Relative path to the spots Parquet file within the input directory.",
 )
-@click.option(
-    "--tileconfig-name",
-    type=str,
-    default="../stitch--brain/TileConfiguration.registered.txt",
-    show_default=True,
-    help="Relative path to the TileConfiguration file within input dir (optional). Set to '' to disable.",
-)
 @click.option("-i", "--idx", type=int, required=True, help="The Z-slice index to process.")
 @click.option(
     "--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening."
@@ -831,7 +823,6 @@ def run(
     output_dir: Path,
     segmentation_name: str,
     spots_name: str,
-    tileconfig_name: str,
     idx: int,
     opening_radius: float,
     closing_radius: float,
@@ -839,12 +830,13 @@ def run(
     overwrite: bool,
     debug: bool,
 ):
+    roi, codebook = spots.stem.split("+")
     run_(
         input_dir,
         output_dir,
         segmentation_name,
         spots_name,
-        tileconfig_name,
+        tile_config_path,
         idx,
         opening_radius,
         closing_radius,
@@ -879,16 +871,8 @@ def initialize():
 @click.option(
     "--spots",
     type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
-    default="../zachDE--brain+zachDE.parquet",
     show_default=True,
     help="Relative path to the spots Parquet file within the input directory.",
-)
-@click.option(
-    "--tileconfig-name",
-    type=str,
-    default="../stitch--br/TileConfiguration.registered.txt",
-    show_default=True,
-    help="Relative path to the TileConfiguration file within input dir (optional). Set to '' to disable.",
 )
 @click.option(
     "--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening."
@@ -910,7 +894,6 @@ def batch(
     output_dir: Path,
     segmentation_name: str,
     spots: Path,
-    tileconfig_name: str,
     opening_radius: float,
     closing_radius: float,
     dilation_radius: float,
@@ -922,6 +905,7 @@ def batch(
         mp_context=get_context("spawn"),
     ) as executor:
         futures = []
+        roi, codebook = spots.stem.split("+")
         for i in range(20):
             futures.append(
                 executor.submit(
@@ -930,7 +914,7 @@ def batch(
                     output_dir,
                     segmentation_name,
                     spots,
-                    tileconfig_name,
+                    spots.parent / f"stitch--{roi}/TileConfiguration.registered.txt",
                     i,
                     opening_radius,
                     closing_radius,

@@ -1,9 +1,11 @@
 # %%
 import json
 import pickle
+import subprocess
 import sys
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import as_completed
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -40,7 +42,7 @@ if TYPE_CHECKING:
 
 # %%
 
-DATA = Path("/home/chaichontat/fishtools/data")
+DATA = Path("/working/fishtools/data")
 
 
 # %%
@@ -326,7 +328,7 @@ def run_fiducial(
                     break
             else:
                 raise ValueError(
-                    f"Could not find file that starts with {name} for prior shift."
+                    f"{idx}: Searched {list(fids.keys())}. Could not find file that starts with {name} for prior shift."
                 )
 
     if config.registration.fiducial.overrides is not None:
@@ -461,7 +463,7 @@ def _run(
     shifts = {}
 
     cb = json.loads(Path(codebook).read_text())
-    bits = set(chain.from_iterable(cb.values()))
+    bits_cb = set(chain.from_iterable(cb.values()))
     # reference = config.registration.reference
     folders = {
         p
@@ -472,7 +474,7 @@ def _run(
             for bad in FORBIDDEN_PREFIXES + (config.exclude or [])
         )
         and set(p.name.split("--")[0].split("_"))
-        & set(map(str, bits | set(map(int, reference.split("_")))))
+        & set(map(str, bits_cb | set(map(int, reference.split("_")))))
     }
 
     # Convert file name to bit
@@ -512,7 +514,7 @@ def _run(
         del _img.fid, _img.fid_raw
 
     # Remove reference if not in codebook since we're done with fiducials.
-    if not (set(reference.split("_")) & set(map(str, bits))):
+    if not (set(reference.split("_")) & set(map(str, bits_cb))):
         del imgs[reference]
 
     channels: dict[str, str] = {}
@@ -527,6 +529,7 @@ def _run(
     # Spillover correction, max projection
     nofids = {name: img.nofid for name, img in imgs.items()}
     bits, bits_shifted, bit_name_mapping = parse_nofids(nofids, shifts, channels)
+
     del nofids
     for _img in imgs.values():
         del _img.nofid
@@ -549,8 +552,9 @@ def _run(
     ref = None
 
     affine = Affine(As=As, ats=ats)
-
-    for i, bit in enumerate(list(bits)):
+    bits_cb = sorted(set(map(str, bits_cb)) & set(bits))
+    for i, bit in enumerate(bits_cb):
+        bit = str(bit)
         img = bits[bit]
         del bits[bit]
         c = str(channels[bit])
@@ -564,6 +568,9 @@ def _run(
             global_deconv_scaling=imgs[orig_name].global_deconv_scaling,
             metadata=imgs[orig_name].metadata,
         )
+
+        if bit == "atp":
+            img *= 4
 
         # Illumination correction
         # basic = imgs[orig_name].basic()
@@ -734,7 +741,7 @@ def run(
                     ),
                     reference=reference,
                     downsample=1,
-                    crop=30,
+                    crop=40,
                     slices=slice(None),
                     reduce_bit_depth=0,
                 ),
@@ -743,124 +750,65 @@ def run(
         )
 
 
-def make_batch_command(original_command):
-    """Creates a batched version of a click command that processes multiple indices."""
-    # Copy the original command's options and arguments
-    batch_options = original_command.params.copy()
+@click.command()
+@click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--codebook",
+    help="Path to the codebook file",
+    type=click.Path(exists=True, file_okay=True, path_type=Path),
+)
+@click.option("--ref", default="2_10_18", help="Reference identifier")
+@click.option("--fwhm", type=float, default=4, help="FWHM value")
+@click.option("--threshold", type=float, default=6, help="Threshold value")
+@click.option("--threads", type=int, default=15, help="Number of threads to use")
+def batch(path: Path, ref: str, codebook: str, fwhm: int, threshold: int, threads: int):
+    idxs = None
+    use_custom_idx = idxs is not None
+    rois = sorted({
+        p.name.split("--")[1].split("+")[0]
+        for p in path.iterdir()
+        if p.is_dir() and "--" in p.name
+    })
 
-    # Remove the idx argument since batch will handle multiple indices
-    batch_options = [p for p in batch_options if p.name != "idx"]
-
-    # Add threading option
-    thread_option = click.Option(
-        ["--threads", "-t"], type=int, default=10, help="Number of parallel threads"
-    )
-    batch_options.append(thread_option)
-
-    @click.pass_context
-    def batch_wrapper(ctx: click.Context, threads: int, **kwargs):
-        path = kwargs["path"]
-        reference = kwargs["reference"]
-        roi = kwargs["roi"]
-
-        for curr_roi in get_rois(path, roi):
+    for roi in rois:
+        if not use_custom_idx:
             idxs = sorted({
                 int(name.stem.split("-")[1])
-                for name in path.rglob(f"{reference}--{curr_roi}/*.tif")
+                for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")
             })
+            print(len(idxs))
 
-            with progress_bar_threadpool(len(idxs), threads=threads) as submit:
-                for idx in idxs:
-                    cmd_kwargs = {k: v for k, v in kwargs.items() if k != "threads"}
-                    submit(
-                        original_command.callback,
-                        **cmd_kwargs,
-                        idx=idx,
-                    )
+        if not idxs:
+            raise ValueError(f"No images found for {ref}--{roi}")
 
-    return click.Command(
-        name="batch", params=batch_options, callback=batch_wrapper, help="Batch"
-    )
+        with progress_bar_threadpool(len(idxs), threads=threads) as submit:
+            futs = []
+            for i in idxs:
+                fut = submit(
+                    subprocess.run,
+                    [
+                        "preprocess",
+                        "register",
+                        "run",
+                        str(path),
+                        str(i),
+                        f"--codebook={codebook}",
+                        f"--fwhm={fwhm}",
+                        f"--threshold={threshold}",
+                        "--reference",
+                        ref,
+                        f"--roi={roi}",
+                        # "--overwrite",
+                    ],
+                    check=True,
+                )
+                futs.append(fut)
+
+            for fut in as_completed(futs):
+                fut.result()
 
 
-# @register.command()
-# @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-# @click.option("--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path))
-# @click.option("--roi", type=str, default="*")
-# @click.option("--reference", "-r", type=str, default="4_12_20")
-# @click.option("--debug", is_flag=True)
-# @click.option("--threshold", type=float, default=5.0)
-# @click.option("--fwhm", type=float, default=4.0)
-# @click.option("--overwrite", is_flag=True)
-# @click.option("--no-priors", is_flag=True)
-# @click.option("--threads", "-t", type=int, default=10)
-# def batch(
-#     path: Path,
-#     codebook: Path,
-#     roi: str,
-#     debug: bool = False,
-#     reference: str = "6_14_22",
-#     overwrite: bool = False,
-#     threshold: float = 5,
-#     fwhm: float = 4,
-#     no_priors: bool = False,
-#     threads: int = 10,
-# ):
-#     """Preprocess image sets before spot calling.
-
-#     Args:
-#         path: Workspace path.
-#         idx: Index of the image to process.
-#         roi: ROI to work on.
-#         debug: More logs and write fids. Defaults to False.
-#         overwrite: Defaults to False.
-#         threshold: σ above median to call fiducial spots. Defaults to 6.
-#         fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
-#     """
-#     rois = get_rois(path, roi)
-
-#     for roi in rois:
-#         idxs = sorted({int(name.stem.split("-")[1]) for name in path.rglob(f"{reference}--{roi}/*.tif")})
-
-#         with progress_bar_threadpool(len(idxs), threads=threads) as submit:
-#             for idx in idxs:
-#                 submit(
-#                     _run,
-#                     path,
-#                     roi,
-#                     idx,
-#                     codebook=codebook,
-#                     debug=debug,
-#                     reference=reference,
-#                     no_priors=no_priors,
-#                     config=Config(
-#                         dataPath=str(DATA),
-#                         channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
-#                         basic=None,
-#                         exclude=None,
-#                         registration=RegisterConfig(
-#                             chromatic_shifts={
-#                                 "647": str(DATA / "560to647.txt"),
-#                                 "750": str(DATA / "560to750.txt"),
-#                             },
-#                             fiducial=Fiducial(
-#                                 use_fft=False,
-#                                 fwhm=fwhm,
-#                                 threshold=threshold,
-#                                 priors={},
-#                                 overrides={},
-#                                 n_fids=2,
-#                             ),
-#                             reference=reference,
-#                             downsample=1,
-#                             crop=30,
-#                             slices=slice(None),
-#                             reduce_bit_depth=0,
-#                         ),
-#                     ),
-#                     overwrite=overwrite,
-#                 )
-register.add_command(make_batch_command(run))
+register.add_command(batch)
 
 if __name__ == "__main__":
     register()

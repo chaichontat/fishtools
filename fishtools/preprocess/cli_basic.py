@@ -219,7 +219,9 @@ def run_with_extractor(
         zs: Z-slice positions (between 0 and 1)
     """
     if "deconv" in path.resolve().as_posix() and round_ != "registered":
-        input("deconv in path. This script runs prior to deconvolution. Press Enter to continue.")
+        input(
+            "deconv in path. This script runs prior to deconvolution. Press Enter to continue."
+        )
 
     basic_dir = path / "basic"
     basic_dir.mkdir(exist_ok=True)
@@ -232,9 +234,11 @@ def run_with_extractor(
 
     # Determine number of channels from round string
 
+    if not round_:
+        logger.warning("No round specified. Sampling from all rounds.")
     # Find and sort files
     files = sorted(path.glob(f"{round_}--*/*.tif" if round_ else "*_*_*--*/*.tif"))
-    files = [f for f in files if f.parent.name.split("_").__len__() == 3]
+    # files = [f for f in files if f.parent.name.split("_").__len__() == 3]
     # Put --basic files last. These are extra files taken in random places for BaSiC training.
     files.sort(key=lambda x: ("--basic" in str(x), str(x)))
     # files = [f for f in files if not f.parent.name.startswith("atp")]
@@ -252,13 +256,15 @@ def run_with_extractor(
 
     # Validate file count
     if len(files) < 100:
-        raise ValueError(f"Not enough files ({len(files)}). Need at least 100 to be somewhat reliable.")
+        raise ValueError(
+            f"Not enough files ({len(files)}). Need at least 100 to be somewhat reliable."
+        )
 
     if len(files) < 500:
         logger.warning(f"Not enough files ({len(files)}). Result may be unreliable.")
     import random
 
-    files = random.sample(files, k=800)
+    files = random.sample(files, k=min(1000, len(files)))
     logger.info(
         f"Using {len(files)} files. Min size: {min(f.lstat().st_size for f in files)}. Max size: {max(f.lstat().st_size for f in files)}"
     )
@@ -270,7 +276,9 @@ def run_with_extractor(
         logger.info("Using deconvolution scaling.")
 
     # Extract data using the provided extractor function
-    data = extractor_func(files, zs, deconv_meta, nc=nc, max_files=500 if round_ else 800)
+    data = extractor_func(
+        files, zs, deconv_meta, nc=nc, max_files=1000 if round_ else 1000
+    )
 
     # out = np.zeros_like(data).astype(np.float32)
     # for i in range(data.shape[0]):
@@ -293,7 +301,9 @@ def basic(): ...
 
 
 @basic.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
+)
 @click.argument("round_", type=str)
 @click.option("--zs", type=str, default="0.5")
 @click.option("--overwrite", is_flag=True)
@@ -304,20 +314,33 @@ def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5"):
     # return
 
     z_values = tuple(map(float, zs.split(",")))
-    extractor = extract_data_from_registered if round_ == "registered" else extract_data_from_tiff
+    extractor = (
+        extract_data_from_registered
+        if round_ == "registered"
+        else extract_data_from_tiff
+    )
 
-    return run_with_extractor(path, round_ if round_ != "all" else None, extractor, plot=False, zs=z_values)
+    return run_with_extractor(
+        path, round_ if round_ != "all" else None, extractor, plot=False, zs=z_values
+    )
 
 
 @basic.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
+)
 @click.option("--overwrite", is_flag=True)
 @click.option("--threads", "-t", type=int, default=1)
 @click.option("--zs", type=str, default="0.5")
 def batch(path: Path, overwrite: bool = False, threads: int = 1, zs: str = "0.5"):
-    rounds = sorted({p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name})
+    rounds = sorted({
+        p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name
+    })
     with ThreadPoolExecutor(threads) as exc:
-        futs = [exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs) for r in rounds]  # type: ignore
+        futs = [
+            exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs)
+            for r in rounds
+        ]  # type: ignore
         for fut in as_completed(futs):
             fut.result()
 

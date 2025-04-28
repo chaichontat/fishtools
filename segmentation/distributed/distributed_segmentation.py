@@ -1,11 +1,11 @@
 import datetime
 import functools
 import getpass
-import glob
+import logging
 import os
 import pathlib
-import tempfile
 from pathlib import Path
+from typing import Annotated
 
 import cellpose.io
 import cellpose.models
@@ -19,8 +19,23 @@ import scipy
 import tifffile
 import yaml
 import zarr
+from loguru import logger
+from rich.console import Console
+from rich.logging import RichHandler
 
+from fishtools.preprocess.config import NumpyEncoder
+from fishtools.preprocess.segmentation import calc_percentile, unsharp_all
 from fishtools.utils.pretty_print import progress_bar
+
+# logger.remove()
+# console = Console()
+# logger.add(RichHandler(console=console, rich_tracebacks=True), format="{message}", level="INFO")
+
+
+logging.basicConfig(level="INFO", handlers=[RichHandler(level="INFO")])
+logging.getLogger("cellpose").setLevel(logging.WARNING)
+
+logger = logging.getLogger("rich")
 
 
 ######################## File format functions ################################
@@ -85,7 +100,7 @@ def wrap_folder_of_tiffs(
     filename_pattern : string
         A glob pattern that will match all needed tif files
 
-    block_index_pattern : regular expression string (default: r'_(Z)(\d+)(Y)(\d+)(X)(\d+)')
+    block_index_pattern : regular expression string
         A regular expression pattern that indicates how to parse tiff filenames
         to determine where each tiff file lies in the overall block grid
         The default pattern assumes filenames like the following:
@@ -378,7 +393,7 @@ def process_block(
         box_ids : 1D numpy array, parallel to boxes, the segment IDs of the
                   boxes
     """
-    print("RUNNING BLOCK: ", block_index, "\tREGION: ", crop, flush=True)
+    logger.info(f"RUNNING BLOCK: {block_index}\tREGION: {crop}")
     segmentation_3d = read_preprocess_and_segment(
         input_zarr,
         crop,
@@ -387,13 +402,14 @@ def process_block(
         eval_kwargs,
         worker_logs_directory,
     )
-    print(f"Block {block_index}: Segmentation result shape (3D): {segmentation_3d.shape}")
+    logger.info(f"Block {block_index}: {np.max(segmentation_3d)} masks found.")
+    # print(f"Block {block_index}: Segmentation result shape (3D): {segmentation_3d.shape}")
 
     # --- Define 3D spatial parameters for overlap removal and writing ---
     spatial_crop_slices = crop[:-1]  # Get ZYX slices from the 4D crop
     spatial_blocksize = blocksize[:-1]  # Get ZYX blocksize
-    print(f"Block {block_index}: Spatial crop (3D): {spatial_crop_slices}")
-    print(f"Block {block_index}: Spatial blocksize (3D): {spatial_blocksize}")
+    # print(f"Block {block_index}: Spatial crop (3D): {spatial_crop_slices}")
+    # print(f"Block {block_index}: Spatial blocksize (3D): {spatial_blocksize}")
 
     # --- Remove overlaps on the 3D segmentation ---
     # Pass 3D segmentation, 3D crop slices, 3D blocksize to remove_overlaps
@@ -404,8 +420,8 @@ def process_block(
         spatial_blocksize,  # Use 3D blocksize info
     )
     crop_trimmed_3d = tuple(crop_trimmed_3d)  # Convert to tuple
-    print(f"Block {block_index}: Trimmed segmentation shape (3D): {segmentation_trimmed_3d.shape}")
-    print(f"Block {block_index}: Trimmed crop (3D): {crop_trimmed_3d}")
+    # print(f"Block {block_index}: Trimmed segmentation shape (3D): {segmentation_trimmed_3d.shape}")
+    # print(f"Block {block_index}: Trimmed crop (3D): {crop_trimmed_3d}")
 
     # --- Calculate bounding boxes (3D) ---
     # Pass 3D trimmed segmentation and 3D trimmed crop
@@ -417,7 +433,6 @@ def process_block(
     # Assuming block_index is ZYX index (needs verification how it's generated/used)
     # If block_index is ZYXC, need to adapt. Let's assume it corresponds to ZYX blocks for now.
     # If block_indices were generated using 4D nblocks, adjust here:
-    nblocks_4d = get_nblocks(input_zarr.shape, blocksize)  # Original 4D nblocks
     block_index_3d = block_index[:-1]  # Assume we only need ZYX index part
 
     segmentation_global_3d, remap = global_segment_ids(segmentation_trimmed_3d, block_index_3d, nblocks_3d)
@@ -430,7 +445,7 @@ def process_block(
         return segmentation_global_3d, boxes, box_ids_for_this_block  # Return 3D results
 
     # --- Write 3D results to 3D output Zarr ---
-    print(f"Block {block_index}: Writing to output Zarr at {crop_trimmed_3d}")
+    # print(f"Block {block_index}: Writing to output Zarr at {crop_trimmed_3d}")
     output_zarr[crop_trimmed_3d] = segmentation_global_3d  # 3D[3D_slice] = 3D array (This should work)
 
     # --- Calculate faces (3D) ---
@@ -448,7 +463,7 @@ def read_preprocess_and_segment(
     model_kwargs,
     eval_kwargs,
     worker_logs_directory,
-):
+) -> Annotated[np.ndarray, "Masks"]:
     """Read block from zarr array, run all preprocessing steps, run cellpose"""
     image = input_zarr[crop]
     for pp_step in preprocessing_steps:
@@ -659,7 +674,8 @@ def distributed_eval(
     worker_logs_dir.mkdir()
 
     if "diameter" not in eval_kwargs.keys():
-        eval_kwargs["diameter"] = 30
+        raise ValueError("Diameter must be set in eval_kwargs")
+
     overlap = eval_kwargs["diameter"] * 2
     block_indices, block_crops = get_block_crops(
         input_zarr.shape,
@@ -695,30 +711,43 @@ def distributed_eval(
     # Alternatively, scatter input_zarr once if performance is an issue.
     offset = 0
     n = None
-    check_futures = cluster.client.map(
-        check_block_has_data,
-        block_crops[offset : None if n is None else offset + n],  # Iterate over crops
-        zarr_array=input_zarr,  # Pass input_zarr reference
-        threshold=0,  # Pass threshold
-    )
 
-    # Gather the boolean results from the futures
-    print("Gathering input data check results...")
-    try:
-        non_zero_results = cluster.client.gather(check_futures, errors="raise")
-        print("Input data check results gathered.")
-    except Exception as e:
-        print(f"Error gathering input check results: {e}")
-        print("Skipping zero-input block filtering due to error.")
-        raise e
+    if not (path_nonempty := (temporary_directory.parent / "nonempty.json")).exists():
+        check_futures = cluster.client.map(
+            check_block_has_data,
+            block_crops[offset : None if n is None else offset + n],  # Iterate over crops
+            zarr_array=input_zarr,  # Pass input_zarr reference
+            threshold=0,  # Pass threshold
+        )
 
-    # Filter the indices and crops based on the results
-    final_block_indices, final_block_crops = [], []
-    for i, is_non_zero in enumerate(non_zero_results, offset):
-        if is_non_zero:
-            final_block_indices.append(block_indices[i])
-            final_block_crops.append(block_crops[i])
-    del block_indices, block_crops
+        # Gather the boolean results from the futures
+        logger.info("Gathering input data check results...")
+        try:
+            non_zero_results = cluster.client.gather(check_futures, errors="raise")
+            logger.info("Input data check results gathered.")
+        except Exception as e:
+            logger.critical(f"Error gathering input check results: {e}")
+            logger.critical("Skipping zero-input block filtering due to error.")
+            raise e
+
+        # Filter the indices and crops based on the results
+        final_block_indices, final_block_crops = [], []
+        for i, is_non_zero in enumerate(non_zero_results, offset):
+            if is_non_zero:
+                final_block_indices.append(block_indices[i])
+                final_block_crops.append(block_crops[i])
+        del block_indices, block_crops
+        path_nonempty.write_text(
+            json.dumps(
+                {"final_block_indices": final_block_indices, "final_block_crops": final_block_crops}, indent=2
+            )
+        )
+    else:
+        _nonempty = json.loads(path_nonempty.read_text())
+        final_block_indices, final_block_crops = (
+            _nonempty["final_block_indices"],
+            _nonempty["final_block_crops"],
+        )
 
     print(f"Selected {len(final_block_indices)} blocks with non-zero input data.")
 
@@ -938,20 +967,21 @@ def merge_boxes(boxes):
 if __name__ == "__main__":
     # ---- 1. Configuration ----
     # path = Path("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA")
-    path = Path("/working/20250407_cs3_2/analysis/deconv/stitch--br+atp")
+    path = Path("/working/20250407_cs3_2/analysis/deconv/stitch--tc+atp")
     tiff_path = path / "fused.tif"  # <-- SET THIS: Path to your input TIFF file
     zarr_input_path = path / "input_image.zarr"  # Path to store intermediate Zarr
     zarr_output_path = path / "output_segmentation.zarr"  # <-- SET THIS: Path for final segmentation Zarr
 
     # Define block size (e.g., for a 3D image Z, Y, X) - ADJUST TO YOUR DATA AND MEMORY
     # Should be large enough for context but small enough for memory per worker
+
     processing_blocksize = (20, 512, 512, 2)  # Example for 3D
 
     # Cellpose Model Configuration
     # cellpose_model_kwargs = {
     #     "pretrained_model": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/models/2025-04-16_21-32-16",  # Or 'nuclei', 'cyto', or path to custom model
     #     "pretrained_model_ortho": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/ortho/models/2025-04-14_18-38-00",
-    #     "gpu": True,
+    #     "gpu": True,cls=))
     # }
     import json
 
@@ -960,29 +990,6 @@ if __name__ == "__main__":
         "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
         "pretrained_model_ortho": config["pretrained_model_ortho"],
         "gpu": True,
-    }
-
-    # Cellpose Evaluation Configuration
-    cellpose_eval_kwargs = {
-        "diameter": 31,  # MUST BE INT <-- SET THIS: Estimated average object diameter in pixels
-        "channels": [1, 2],  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
-        "batch_size": 16,  # Adjust based on GPU memory (if using GPU)
-        # Use Cellpose's internal normalization (or False if pre-normalized)
-        # "normalize": {
-        # "lowhigh": config["normalize"]["lowhigh"],
-        # },
-        "normalize": {
-            "lowhigh": [
-                [2094.82608835, 6389.98397762],
-                [1519.15741648, 2441.97173317],
-            ],  # [[1439.001281128774, 6329.462243341022], [1134.1972039273114, 2175.110389829798]]
-        },
-        "flow_threshold": 0,  # Useless in 3D
-        "cellprob_threshold": -2,  # Default is 0.0, adjust if needed
-        "anisotropy": 3.0,
-        "resample": False,
-        "flow3D_smooth": 3,
-        "do_3D": True,
     }
 
     # Dask Cluster Configuration (for local machine)
@@ -995,21 +1002,6 @@ if __name__ == "__main__":
         "threads_per_worker": 1,  # Usually 1 for Cellpose
         # 'config': {'distributed.worker.resources.GPU': 1} # Optional: Explicitly assign GPU resource if needed
     }
-
-    # Optional Preprocessing (Example: Gaussian Blur)
-    # from scipy.ndimage import gaussian_filter
-    # def apply_gaussian(image, sigma=1, crop=None): # Must accept crop kwarg
-    #     print(f"Applying Gaussian blur (sigma={sigma}) to block at {crop}")
-    #     return gaussian_filter(image, sigma=sigma)
-    #
-    # preprocessing_pipeline = [
-    #      (apply_gaussian, {'sigma': 1.5}),
-    #      # Add other steps here if needed
-    # ]
-    from skimage.filters import unsharp_mask
-
-    def unsharp_all(img: np.ndarray, crop: None = None):
-        return unsharp_mask(img, preserve_range=True, radius=3, channel_axis=3)
 
     preprocessing_pipeline = [(unsharp_all, {})]
 
@@ -1037,6 +1029,7 @@ if __name__ == "__main__":
             # Use the processing blocksize as the chunk size for the input Zarr
             input_zarr_array = numpy_array_to_zarr(zarr_input_path, image_data, chunks=processing_blocksize)
             print("Zarr conversion complete.")
+            del image_data
 
         except FileNotFoundError:
             print(f"Error: Input TIFF file not found at {tiff_path}")
@@ -1046,6 +1039,35 @@ if __name__ == "__main__":
             exit()
     else:
         input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
+
+    channels = [2, 1]
+    try:
+        normalization = json.loads((path / "normalization.json").read_text())
+    except FileNotFoundError:
+        logger.info("Existing normalization params not found. Calculating percentiles.")
+        perc, _ = calc_percentile(
+            input_zarr_array, block=(processing_blocksize[1], processing_blocksize[2]), n=30, low=5, high=99.5
+        )
+        normalization = {"lowhigh": perc}
+        logger.info(f"Normalization params: {normalization}")
+        (path / "normalization.json").write_text(json.dumps(normalization, indent=2, cls=NumpyEncoder))
+
+    # Cellpose Evaluation Configuration
+    cellpose_eval_kwargs = {
+        "diameter": 31,  # MUST BE INT <-- SET THIS: Estimated average object diameter in pixels
+        "channels": channels,  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
+        "batch_size": 24,  # Adjust based on GPU memory (if using GPU)
+        # Use Cellpose's internal normalization (or False if pre-normalized)
+        # "normalize": {
+        # },
+        "normalize": {"lowhigh": [normalization["lowhigh"][c - 1] for c in channels]},
+        "flow_threshold": 0,  # Useless in 3D
+        "cellprob_threshold": -2,  # Default is 0.0, adjust if needed
+        "anisotropy": 3.0,
+        "resample": True,
+        "flow3D_smooth": 3,
+        "do_3D": True,
+    }
 
     # ---- 3. Run Distributed Evaluation ----
     print("Starting distributed Cellpose evaluation...")

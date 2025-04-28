@@ -68,6 +68,7 @@ fishtools decompress path/to/directory
 ```
 
 ## Probe ordering checklist
+
 1. Verify simulation
 2. BLAST some probes, make sure orientation is Plus/Minus.
 3. Delete all old final files, both remote and local.

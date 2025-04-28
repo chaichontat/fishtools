@@ -189,6 +189,8 @@ def register(
     threshold: float = 0.4,
 ):
     base_path = path
+    if roi == "*":
+        rois = sorted(path.glob("*"))
     path = next(path.glob(f"registered--{roi}*"))
     if not path.exists():
         raise ValueError(f"No registered images at {path.resolve()} found.")
@@ -218,6 +220,7 @@ def register(
                         out_path / out_name,
                         idx=0,
                         downsample=1,
+                        max_proj=False,  # already max proj
                     )
                 )
 
@@ -476,12 +479,21 @@ def fuse(
             final_stitch(folder, split)
 
 
+def numpy_array_to_zarr[*Ts](write_path: Path | str, array: np.ndarray, chunks: tuple[*Ts]):
+    import zarr
+
+    zarr_array = zarr.open(write_path, mode="w", shape=array.shape, chunks=chunks, dtype=array.dtype)
+    zarr_array[...] = array
+    return zarr_array
+
+
 @stitch.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("roi", type=str)
 @click.option("--threads", "-t", type=int, default=8)
+@click.option("--chunk-size", type=int, default=512)
 @batch_roi("stitch--*")
-def combine(path: Path, roi: str, threads: int = 8):
+def combine(path: Path, roi: str, threads: int = 8, chunk_size: int = 512):
     path = Path(path / f"stitch--{roi}")
     folders = sorted(folder for folder, subfolders, _ in (path).walk() if not subfolders)
     toplevels = [x for x in path.iterdir() if x.is_dir()]
@@ -494,7 +506,7 @@ def combine(path: Path, roi: str, threads: int = 8):
 
     folder = folders[0]
     img = imread(folder / f"fused_{folder.name}-1.tif")
-    out = np.zeros((zs, cs, img.shape[0], img.shape[1]), dtype=np.uint16)
+    out = np.zeros((zs, img.shape[0], img.shape[1], cs), dtype=np.uint16)
     logger.info(f"Out shape: {out.shape}")
     del img
 
@@ -506,8 +518,7 @@ def combine(path: Path, roi: str, threads: int = 8):
         print(f"Processing z={i} c={j}")
         img = imread(folder / f"fused_{folder.name}-1.tif")
         with lock:
-            out[i, j, :, :] = img[:, :]
-            # np.copyto(out[i, j], img)
+            out[i, :, :, j] = img[:, :]
         del img
 
     with progress_bar_threadpool(len(folders), threads=threads) as submit:
@@ -517,24 +528,14 @@ def combine(path: Path, roi: str, threads: int = 8):
     first = next((path.parent / f"registered--{roi}").glob("*.tif"))
     with TiffFile(first) as tif:
         names = tif.shaped_metadata[0]["key"]
-        mapping = dict(zip(names, range(len(names))))
 
-    logger.info(f"Writing to {path.resolve() / 'fused.tif'}")
-    imwrite(
-        path / "fused.tif",
-        out.squeeze(),
-        compression="zlib",
-        metadata={"axes": "ZCYX", "key": mapping},
-        # compressionargs={"level": 0.75},
-        bigtiff=True,
-    )
+    logger.info(f"Writing to {path.resolve() / 'fused.zarr'}")
+    z = numpy_array_to_zarr(path / "fused.zarr", out, (out.shape[0], chunk_size, chunk_size, out.shape[1]))
+    z.attrs["key"] = names
+    logger.info("Deleting folders.")
+    for folder in folders:
+        shutil.rmtree(folder)
     logger.info("Done.")
-
-    # out = np.zeros((zs, cs), dtype=np.uint16)
-
-    # f"fused_{folder.name}-{i + 1}.tif")
-
-    # logger.info(f"Combining splits of {n} for {path.resolve()}.")
 
 
 @stitch.command()
@@ -544,6 +545,7 @@ def combine(path: Path, roi: str, threads: int = 8):
     "--tile_config",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
+@click.option("--codebook", type=str)
 @click.option("--overwrite", is_flag=True)
 @click.option("--downsample", "-d", type=int, default=2)
 @click.option("--subsample-z", type=int, default=1)
@@ -554,6 +556,7 @@ def run(
     path: Path,
     roi: str,
     *,
+    codebook: str,
     tile_config: Path | None = None,
     overwrite: bool = False,
     downsample: int = 2,
@@ -561,10 +564,10 @@ def run(
     channels: str = "-3,-2,-1",
     subsample_z: int = 1,
 ):
-    register.callback(path, roi, path / f"{roi}.csv", fid=True)
+    register.callback(path, roi=roi, position_file=None, fid=True)
     fuse.callback(
         path,
-        roi,
+        roi=f"{roi}+{codebook}",
         tile_config=tile_config,
         split=True,
         overwrite=overwrite,
@@ -573,7 +576,7 @@ def run(
         channels=channels,
         subsample_z=subsample_z,
     )
-    combine.callback(path, roi, threads=threads)
+    combine.callback(path, roi=f"{roi}+{codebook}", threads=threads)
 
 
 def final_stitch(path: Path, n: int):

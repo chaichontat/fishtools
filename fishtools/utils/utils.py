@@ -145,11 +145,15 @@ def batchable():
 
 
 def git_hash() -> str:
-    return (
-        subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).parent.parent)
-        .decode("ascii")
-        .strip()
-    )
+    try:
+        return (
+            subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=Path(__file__).parent)
+            .decode("ascii")
+            .strip()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        ...
+    return "unknown"
 
 
 _T = TypeVar("_T")

@@ -29,17 +29,18 @@ def load_spots(
         except KeyError:
             logger.warning(f"No passes_thresholds in {path}")
 
-    df = (
-        pl.DataFrame(y)
-        .with_columns(pl.col("centroid").list.to_struct())
-        .unnest("centroid")
-    )
+    df = pl.DataFrame(y)
+    n_dims = len(df[0, "centroid"])
 
-    if "field_2" in df.columns:
-        df = df.rename({"field_0": "z", "field_1": "y_local", "field_2": "x_local"})
+    if n_dims == 3:
+        df = df.with_columns(pl.col("centroid").list.to_struct(fields=["z", "y_local", "x_local"])).unnest(
+            "centroid"
+        )
     else:
-        df = df.rename({"field_0": "y_local", "field_1": "x_local"}).with_columns(
-            z=pl.lit(0.0)
+        df = (
+            df.with_columns(pl.col("centroid").list.to_struct(fields=["y_local", "x_local"]))
+            .unnest("centroid")
+            .with_columns(z=pl.lit(0.0))
         )
 
     return df.with_columns(
