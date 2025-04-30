@@ -87,6 +87,22 @@ class Workspace:
         self.path = Path(path).expanduser().resolve()
 
     @property
+    def rounds(self):
+        FORBIDDEN = {"10x", "analysis", "shifts", "stitch", "fid", "registered", "old", "basic"}
+        path = self.path if not self.deconved.exists() else self.deconved
+        res = sorted(
+            {
+                p.name.split("--")[0]
+                for p in path.iterdir()
+                if "--" in p.name and p.is_dir() and not any(p.name.startswith(bad) for bad in FORBIDDEN)
+            },
+            key=lambda x: f"{int(x.split('_')[0]):02d}" if x.split("_")[0].isdigit() else x,
+        )
+        if not res:
+            raise ValueError(f"No round subdirectories found in {path}.")
+        return res
+
+    @property
     def deconved(self):
         return self.path / "analysis" / "deconv"
 

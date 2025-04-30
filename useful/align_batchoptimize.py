@@ -14,8 +14,16 @@ from loguru import logger
 @click.argument("codebook_path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--rounds", type=int, default=10)
 @click.option("--threads", type=int, default=10)
+@click.option("--batch-size", type=int, default=50)
 @click.option("--max-proj", is_flag=True)
-def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 10, max_proj: bool = False):
+def run(
+    path: Path,
+    codebook_path: Path,
+    rounds: int = 10,
+    threads: int = 10,
+    max_proj: bool = False,
+    batch_size: int = 50,
+):
     if not len(list(path.glob("registered--*"))):
         raise ValueError(
             "No registered images found. Verify that you're in the base working directory, not the registered folder."
@@ -57,13 +65,13 @@ def run(path: Path, codebook_path: Path, rounds: int = 10, threads: int = 10, ma
                 str(path),
                 "--codebook",
                 codebook_path,
-                "--batch-size=50",
+                f"--batch-size={batch_size}",
                 "--subsample-z=1",
                 f"--round={i}",
                 f"--threads={threads}",
                 "--overwrite",
                 "--split=0",
-                *(["--max-proj"] if max_proj else []),
+                *(["--max-proj=1"] if max_proj else []),
             ],
             check=True,
             capture_output=False,

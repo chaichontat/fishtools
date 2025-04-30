@@ -906,7 +906,8 @@ def batch(
     ) as executor:
         futures = []
         roi, codebook = spots.stem.split("+")
-        for i in range(20):
+        z = zarr.open_array(input_dir / segmentation_name, mode="r")
+        for i in range(z.shape[0]):
             futures.append(
                 executor.submit(
                     run_,
@@ -927,7 +928,7 @@ def batch(
             try:
                 future.result()
             except Exception as e:
-                logger.error(f"Error processing slice {i}: {e}")
+                logger.error(f"Error processing slice: {e}")
 
 
 if __name__ == "__main__":

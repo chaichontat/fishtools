@@ -3,41 +3,46 @@ from pathlib import Path
 
 import polars as pl
 
-path = Path("/working/20250407_cs3_2/analysis/deconv/stitch--br+atp")
-df = (
-    pl.scan_parquet(
-        path / "chunks+*/ident_*.parquet",
-        include_file_paths="path",
-        allow_missing_columns=True,
+from fishtools.postprocess import normalize_pearson, normalize_total
+
+rois = ["br", "bl"]
+seg_codebook = "atp"
+path = Path("/working/20250407_cs3_2/analysis/deconv")
+
+dfs = {}
+for roi in rois:
+    dfs[roi] = (
+        pl.scan_parquet(
+            path / f"stitch--{roi}+{seg_codebook}" / "chunks+*/ident_*.parquet",
+            include_file_paths="path",
+            allow_missing_columns=True,
+        )
+        .with_columns(
+            z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt8),
+            spot_id=pl.col("spot_id").cast(pl.UInt32),
+            roi=pl.lit(roi),
+        )
+        .with_columns(
+            roilabel=pl.col("roi") + pl.col("label").cast(pl.Utf8),
+        )
+        .sort("z")
+        .collect()
     )
-    .with_columns(
-        z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt8),
-        spot_id=pl.col("spot_id").cast(pl.UInt32),
-    )
-    # .drop("path")
-    .sort("z")
-    .collect()
-)
+df = pl.concat(dfs.values())
 
 # %%
-from pathlib import Path
 
-# Path("/working/20250327_benchmark_coronal2/analysis/deconv/baysor").mkdir(exist_ok=True, parents=True)
 
 spots = {}
-roi = "br"
 codebooks = ["mousecommon", "zachDE"]
-for codebook in codebooks:
-    spots[codebook] = pl.read_parquet(path.parent / f"{roi}+{codebook}.parquet")
-    if "index" not in spots[codebook].columns:
-        spots[codebook] = spots[codebook].with_row_index()
-
-spots["mousecommon"] = spots["mousecommon"].join(
-    df.filter(pl.col("path").str.contains("mousecommon")), left_on="index", right_on="spot_id", how="left"
-)
-spots["zachDE"] = spots["zachDE"].join(
-    df.filter(~pl.col("path").str.contains("mousecommon")), left_on="index", right_on="spot_id", how="left"
-)
+for roi, df in dfs.items():
+    for codebook in codebooks:
+        spots[codebook] = pl.read_parquet(path / f"{roi}+{codebook}.parquet").with_columns(roi=pl.lit(roi))
+        if "index" not in spots[codebook].columns:
+            spots[codebook] = spots[codebook].with_row_index()
+        spots[codebook] = spots[codebook].join(
+            df.filter(pl.col("path").str.contains(codebook)), left_on="index", right_on="spot_id", how="left"
+        )
 # %%
 spots = pl.concat(spots.values())
 
@@ -48,17 +53,61 @@ spots.select(
     x="x", y="y", z="z", gene=pl.col("target").str.split("-").list.get(0), cell=pl.col("label").fill_null(0)
 ).filter(pl.col("gene") != "Blank").write_csv(path.parent / "baysor--br" / "spots.csv")
 
+
 # %%
-polygons = (
-    pl.scan_parquet(
-        path / "chunks+zachDE/polygons_*.parquet",
-        include_file_paths="path",
+def arrange_rois(polygons: pl.DataFrame, max_columns: int = 2, padding: float = 100) -> pl.DataFrame:
+    # Calculate bounding box for each ROI
+    roi_bounds = (
+        polygons.group_by("roi")
+        .agg(
+            min_x=pl.col("centroid_x").min(),
+            max_x=pl.col("centroid_x").max(),
+            min_y=pl.col("centroid_y").min(),
+            max_y=pl.col("centroid_y").max(),
+        )
+        .sort("roi")
     )
-    .with_columns(z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt8))
-    .drop("path")
-    .sort("z")
-    .collect()
-)
+
+    # Calculate offsets for each ROI in a grid layout
+    roi_offsets = {}
+    max_width = 0
+    max_height = 0
+
+    for i, roi_row in enumerate(roi_bounds.iter_rows(named=True)):
+        row = i // max_columns
+        col = i % max_columns
+        width = roi_row["max_x"] - roi_row["min_x"]
+        height = roi_row["max_y"] - roi_row["min_y"]
+
+        x_offset = col * (max_width + padding) - roi_row["min_x"]
+        y_offset = row * (max_height + padding) - roi_row["min_y"]
+
+        roi_offsets[roi_row["roi"]] = (x_offset, y_offset)
+        max_width = max(max_width, width)
+        max_height = max(max_height, height)
+
+    # Apply offsets to polygons
+    return polygons.with_columns([
+        pl.col("centroid_x") + pl.col("roi").map_elements(lambda r: roi_offsets[r][0]),
+        pl.col("centroid_y") + pl.col("roi").map_elements(lambda r: roi_offsets[r][1]),
+    ])
+
+
+polygons = {}
+for roi in rois:
+    polygons[roi] = (
+        pl.scan_parquet(
+            path / f"stitch--{roi}+{seg_codebook}" / "chunks+zachDE/polygons_*.parquet",
+            include_file_paths="path",
+        )
+        .with_columns(z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt8), roi=pl.lit(roi))
+        .with_columns(roilabel=pl.col("roi") + pl.col("label").cast(pl.Utf8))
+        .drop("path")
+        .sort("z")
+        .collect()
+    )
+polygons = pl.concat(polygons.values())
+polygons = arrange_rois(polygons, max_columns=2, padding=100)
 
 
 def pl_weighted_mean(value_col: str, weight_col: str) -> pl.Expr:
@@ -72,32 +121,34 @@ def pl_weighted_mean(value_col: str, weight_col: str) -> pl.Expr:
 
 
 weighted_centroids = (
-    polygons.group_by("label")
+    polygons.group_by(pl.col("roilabel"))
     .agg(
+        area=pl.col("area").sum(),
         x=(pl.col("centroid_x") * pl.col("area")).sum() / pl.col("area").sum(),
         y=(pl.col("centroid_y") * pl.col("area")).sum() / pl.col("area").sum(),
         z=(pl.col("z").cast(pl.Float64) * pl.col("area")).sum() / pl.col("area").sum(),
+        roi=pl.col("roi").first(),
     )
-    .sort("label")
+    .sort("roilabel")
     .to_pandas()
-    .set_index("label")
+    .set_index("roilabel")
 )
 weighted_centroids.index = weighted_centroids.index.astype(str)
 
 # %%
 # ident = df.join(spots[["index", "target"]], left_on="spot_id", right_on="index", how="left")
 # %%
-molten = df.group_by(["label", "target"]).agg(pl.len())
+molten = df.group_by([pl.col("roilabel"), pl.col("target")]).agg(pl.len())
 
 # %%
 cbg = (
     molten.with_columns(gene_name=pl.col("target").str.split("-").list.get(0))
     .drop("target")
-    .pivot("gene_name", index="label", values="len")
+    .pivot("gene_name", index="roilabel", values="len")
     .fill_null(0)
-    .sort("label")
+    .sort("roilabel")
     .to_pandas()
-    .set_index("label")
+    .set_index("roilabel")
 )
 cbg.index = cbg.index.astype(str)
 
@@ -123,7 +174,7 @@ n_genes = adata.shape[1]
 sc.pp.calculate_qc_metrics(
     adata, inplace=True, percent_top=(n_genes // 10, n_genes // 5, n_genes // 2, n_genes)
 )
-sc.pp.filter_cells(adata, min_counts=20)
+sc.pp.filter_cells(adata, min_counts=50)
 sc.pp.filter_cells(adata, max_counts=1200)
 sc.pp.filter_genes(adata, min_cells=10)
 # adata = adata[(adata.obs["y"] < 23189.657075200797) | (adata.obs["y"] > 46211.58630310604)]
@@ -145,57 +196,17 @@ plt.scatter(adata.obs["x"][::1], adata.obs["y"][::1], s=1, alpha=0.3)
 # %%
 # %%
 
-
-def normalize_pearson(adata):
-    sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=2000)
-
-    def plot():
-        fig, ax = plt.subplots(figsize=(8, 6))
-
-        hvgs = adata.var["highly_variable"]
-
-        ax.scatter(adata.var["means"], adata.var["residual_variances"], s=3, edgecolor="none")
-        ax.scatter(
-            adata.var["means"][hvgs],
-            adata.var["residual_variances"][hvgs],
-            c="tab:red",
-            label="selected genes",
-            s=3,
-            edgecolor="none",
-        )
-
-        ax.set_xscale("log")
-        ax.set_xlabel("mean expression")
-        ax.set_yscale("log")
-        ax.set_ylabel("residual variance")
-
-        ax.spines["right"].set_visible(False)
-        ax.spines["top"].set_visible(False)
-        ax.yaxis.set_ticks_position("left")
-        ax.xaxis.set_ticks_position("bottom")
-        plt.legend()
-
-    adata = adata[:, adata.var["highly_variable"]]
-
-    adata.layers["raw"] = adata.X.copy()
-    adata.layers["sqrt_norm"] = np.sqrt(sc.pp.normalize_total(adata, inplace=False)["X"])
-    sc.experimental.pp.normalize_pearson_residuals(adata)
-    return adata, plot
-
-
-def normalize_total(adata):
-    # sc.pp.normalize_total(adata)
-    sc.pp.log1p(adata)
-    return adata, None
-
-
-# adata, plot = normalize_pearson(adata)
+#
+# adata, plot = normalize_total(adata)
 # plot()
-adata, plot = normalize_pearson(adata)
+# adata, plot = normalize_pearson(adata)
 
 # %%
-# %%
 
+adata.X = adata.X / (adata.obs["area"].to_numpy()[:, np.newaxis] / adata.obs["area"].mean())
+sc.pp.log1p(adata)
+# %%
+#  (adata.obs['total_counts'] / adata.obs["area"]) / np.mean(adata.X.sum(axis=1) / adata.obs["area"])
 
 # %%
 
@@ -209,9 +220,10 @@ sc.pl.pca_variance_ratio(adata, log=True)
 # %%
 import rapids_singlecell as rsc
 
-rsc.pp.neighbors(adata, n_neighbors=15, n_pcs=30, metric="cosine")
-sc.tl.leiden(adata, n_iterations=2, resolution=0.8, flavor="igraph")
-rsc.tl.umap(adata, min_dist=0.1, n_components=2)
+rsc.pp.neighbors(adata, n_neighbors=20, n_pcs=30, metric="cosine")
+sc.tl.leiden(adata, n_iterations=2, resolution=1, flavor="igraph")
+# %%
+rsc.tl.umap(adata, min_dist=0.1, n_components=2, random_state=42)
 # sc.tl.umap(adata, min_dist=0.1, n_components=2)
 # %%
 fig, ax = plt.subplots(figsize=(8, 6))
@@ -225,14 +237,14 @@ ax.set_aspect("equal")
 
 # %%
 fig, ax = plt.subplots(figsize=(8, 6))
-gene = "Hes5"
+gene = "Satb2"
 sc.pl.embedding(
     adata,
     color=gene,
     basis="spatial",
     ax=ax,
     cmap="Blues",
-    vmax=np.percentile(adata[:, gene].X, 99.9),
+    vmax=np.percentile(adata[:, gene].X, 99.99),
     vmin=np.percentile(adata[:, gene].X, 50),
 )  # type: ignore
 ax.set_aspect("equal")
@@ -240,7 +252,10 @@ ax.set_aspect("equal")
 # %%
 
 sc.pl.umap(
-    adata, color=["leiden", "Pax6", "Bcl11b", "Tbr1", "Gad1", "Lhx6", "Satb2", "Fezf2"], cmap="Blues", ncols=2
+    adata,
+    color=["leiden", "roi", "Pax6", "Bcl11b", "Tbr1", "Gad1", "Lhx6", "Satb2", "Fezf2"],
+    cmap="Blues",
+    ncols=2,
 )
 
 # %%
@@ -274,7 +289,28 @@ fig.set_size_inches(8, 10)
 for ax in fig.axes:
     ax.set_aspect("equal")
 # %%
-sc.pl.umap(adata, color=["leiden", "tricycle"], frameon=False, cmap="cet_colorwheel")
+sc.pl.umap(
+    adata,
+    color=[
+        "leiden",
+        "tricycle",
+        "Pax6",
+        "Sox2",
+        "Btg2",
+        "Neurog2",
+        "Neurod1",
+        "Eomes",
+        "Dlx1",
+        "Dlx2",
+        "Lhx6",
+        "Nrp1",
+        "Gad1",
+        "Satb2",
+        "Fezf2",
+    ],
+    frameon=False,
+    cmap="Blues",
+)
 
 # %%
 fig, ax = plt.subplots(figsize=(7, 6))
@@ -349,7 +385,7 @@ def compare_genes(adata, genes, ax=None, dark=False, **kwargs):
 sns.set_theme()
 with sns.axes_style("white"):
     # fig, axs = plt.subplots(ncols=2, nrows=2, figsize=(18, 6), dpi=200)
-    compare_genes(adata, ["Cux2", "Gad1"], dark=False)
+    compare_genes(adata, ["Top2a", "Gad2"], dark=False)
 # %%
 
 sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon")

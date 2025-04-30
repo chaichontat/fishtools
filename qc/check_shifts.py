@@ -40,9 +40,10 @@ class Shift(BaseModel):
 
 Shifts = TypeAdapter(dict[str, Shift])
 # %%
-ref = "4_12_20"
-roi = "leftleft"
-path = Path(f"/mnt/working/20241113-ZNE172-Zach/analysis/deconv/shifts--{roi}")
+ref = "2_10_18"
+roi = "hippo"
+codebook = "morris"
+path = Path(f"/working/20250421_2956/analysis/deconv/shifts--{roi}+{codebook}")
 paths = sorted(path.glob("*.json"))
 
 
@@ -52,7 +53,7 @@ N_COLS = 4
 first = next(iter(shifts.values()))
 nrows = int(np.ceil(len(first) / N_COLS))
 
-# %% Check for missing files (registering not finished)
+# Check for missing files (registering not finished)
 refs = list((path.parent / f"{ref}--{roi}").glob("*.tif"))
 
 if len(paths) != len(refs) and len(refs) != 0:
@@ -60,14 +61,14 @@ if len(paths) != len(refs) and len(refs) != 0:
     logger.warning(f"Missing {sorted(missing)}")
 
 
-# %% Shifts
+# Shifts
 threshold = 0.99
 fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(12, 3 * nrows), dpi=200)
 outliers_list = set()
 
 for ax, round_ in zip(axs.flat, sorted(first.keys())):
     c1 = np.array([s[round_].shifts for s in shifts.values()])
-    lim = max(5, 1.25 * np.abs(c1).max())
+    lim = max(10, 1.25 * np.abs(c1).max())
     if np.sum(c1) != 0:
         outliers = mahalanobis_outliers(c1, threshold=threshold)
         # estimator = EllipticEnvelope(random_state=0, contamination=0.02)
@@ -85,38 +86,12 @@ for ax, round_ in zip(axs.flat, sorted(first.keys())):
 
     for is_outlier, (filename, shift) in zip(outliers, shifts.items()):
         if is_outlier:
-            ax.text(shift[round_].shifts[0], shift[round_].shifts[1], filename)
+            ax.text(shift[round_].shifts[0], shift[round_].shifts[1], filename, fontsize=8)
             outliers_list.add(filename)
 plt.tight_layout()
 # %%
-# from tifffile import imread, imwrite
 
-# img = imread(path.parent / f"fids_shifted-0067.tif")
-# ref_channel = 1  # reference channel index
-# sl = np.s_[500:600, 500:600]
-# fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(16, 4 * nrows), dpi=200)
 
-# for i, (ax, round_) in enumerate(zip(axs.flat, sorted(first.keys()))):
-#     # Normalize both channels to 0-1 range
-#     ref_img = img[ref_channel][sl]
-#     round_img = img[i][sl]
-#     ref_norm = (ref_img - ref_img.min()) / (ref_img.max() - ref_img.min())
-#     round_norm = (round_img - round_img.min()) / (round_img.max() - round_img.min())
-
-#     # Create RGB image (R=round, G=reference, B=zeros)
-#     rgb = np.dstack([round_norm, ref_norm, np.zeros_like(ref_norm)])
-
-#     # Display
-#     ax.imshow(rgb)
-#     ax.set_title(f"Channel {round_} vs Reference")
-#     ax.axis("off")
-
-# for ax in axs.flat:
-#     if not ax.has_data():
-#         fig.delaxes(ax)
-
-# plt.tight_layout()
-# print(sorted(outliers_list))
 # %% Correlation
 fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(12, 3 * nrows), dpi=200)
 
@@ -124,7 +99,7 @@ for ax, round_ in zip(axs.flat, sorted(first)):
     c1 = np.array([s[round_].corr for s in shifts.values()])
     ax.hist(c1, linewidth=0)
     ax.set_title(round_)
-    ax.set_xlim(-1, 1)
+    ax.set_xlim(0, 1)
 
 for ax in axs.flat:
     if not ax.has_data():
@@ -156,7 +131,7 @@ for ax, round_ in zip(axs.flat, sorted(first.keys())):
     ax.set_xlabel("Correlation")
     ax.set_ylabel("L2 distance from mean")
     ax.set_title(f"{round_}")
-    ax.set_xlim(min(0.5, np.min(corrs) - 0.1), 1)
+    ax.set_xlim(min(0.0, np.min(corrs) - 0.1), 1)
     ax.set_ylim(0, max(2, np.max(l2_distances) + 1))
 
     # Label outliers
@@ -164,8 +139,8 @@ for ax, round_ in zip(axs.flat, sorted(first.keys())):
         for is_outlier, (filename, shift), l2_dist, corr in zip(
             outliers, shifts.items(), l2_distances, corrs
         ):
-            if is_outlier:
-                ax.text(corr, l2_dist, filename)
+            if corr < 0.8:
+                ax.text(corr + np.random.normal(0, 0.01), l2_dist + np.random.normal(0, 0.5), filename)
 
 
 for ax in axs.flat:
@@ -211,12 +186,12 @@ plt.tight_layout()
 # %%
 from tifffile import imread, imwrite
 
-img = imread(path.parent / "fids_shifted-0067.tif")
+img = imread(path.parent / "fids_shifted-0373.tif")
 
 # Create RGB comparison images
 ref_idx = 1  # assuming first channel is reference, adjust as needed
 
-sl = np.s_[100:600, 100:600]
+sl = np.s_[500:1500:2, 500:1500:2]
 ref_img = img[ref_idx][sl]
 ref_img = np.clip(ref_img, np.percentile(ref_img, 50), None)
 ref_norm = (ref_img - ref_img.min()) / (ref_img.max() - ref_img.min())
@@ -225,12 +200,12 @@ fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(16, 4 * nrows), dpi=
 
 for i, (ax, round_) in enumerate(zip(axs.flat, sorted(first.keys()))):
     round_img = img[i][sl]
-    round_img = np.clip(round_img, np.percentile(round_img, 50), None)
-    correction = optimize_shift(round_img, ref_img).x
+    # round_img = np.clip(round_img, np.percentile(round_img, 50), None)
+    # correction = optimize_shift(round_img, ref_img).x
 
-    from scipy.ndimage import shift as shiftfunc
+    # from scipy.ndimage import shift as shiftfunc
 
-    round_img = shiftfunc(round_img, correction)
+    # round_img = shiftfunc(round_img, correction)
     # Read the image for this round
 
     # Normalize both images to 0-1 range
@@ -240,7 +215,7 @@ for i, (ax, round_) in enumerate(zip(axs.flat, sorted(first.keys()))):
     rgb = np.dstack([round_norm, ref_norm, np.zeros_like(ref_norm)])
 
     # Display
-    ax.imshow(rgb[:100, :100])
+    ax.imshow(rgb, vmax=0.01)
     ax.set_title(f"Round {round_} vs Reference")
     ax.axis("off")
 

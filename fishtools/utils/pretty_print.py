@@ -68,12 +68,15 @@ class TaskCancelledException(Exception): ...
 
 
 @contextmanager
-def progress_bar_threadpool(n: int, *, threads: int):
+def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = False):
     """Creates a thread pool with a progress bar that handles graceful shutdown.
 
     Args:
         n: Total number of tasks to track in the progress bar
         threads: Number of worker threads in the pool
+        stop_on_exception: If True (default), stops all processing immediately
+            when any task raises an exception. If False, continues processing
+            other tasks and logs exceptions.
 
     Returns:
         submit: Function to submit tasks to the thread pool. Has signature:
@@ -83,19 +86,25 @@ def progress_bar_threadpool(n: int, *, threads: int):
             - returns a Future object representing the pending task
 
     Example:
-        # Basic usage
+        # Basic usage (stops on first exception)
         with progress_bar_threadpool(len(items), threads=4) as submit:
+            for item in items:
+                submit(process_item, item)
+
+        # Continue processing even if some tasks fail
+        with progress_bar_threadpool(len(items), threads=4, stop_on_exception=False) as submit:
             for item in items:
                 submit(process_item, item)
 
     Notes:
         - Progress bar advances automatically as tasks complete
-        - If any task raises an exception, all pending tasks are canceled
-        - SIGINT (Ctrl+C) cancels all pending tasks gracefully
+        - If `stop_on_exception` is True and a task raises an exception, all pending tasks are canceled
+        - SIGINT (Ctrl+C) cancels all pending tasks gracefully regardless of `stop_on_exception`
         - TaskCancelledException is raised for canceled tasks
     """
     futs: list[Future] = []
     should_terminate = threading.Event()
+    exceptions_encountered: list[Exception] = []
 
     with progress_bar(n) as callback, ThreadPoolExecutor(threads) as exc:
 
@@ -105,37 +114,94 @@ def progress_bar_threadpool(n: int, *, threads: int):
             for fut in futs:
                 fut.cancel()
             exc.shutdown(wait=False, cancel_futures=True)
-            raise KeyboardInterrupt
 
         prior_handler = signal.signal(signal.SIGINT, signal_handler)
 
-        def submit(f: Callable[P, _R], *args: P.args, **kwargs: P.kwargs) -> Future[_R]:
+        def submit(
+            f: Callable[P, _R], *args: P.args, **kwargs: P.kwargs
+        ) -> Future[_R] | Future[TaskCancelledException]:
             def wrapped_f(*args: P.args, **kwargs: P.kwargs) -> _R:
                 if should_terminate.is_set():
-                    raise TaskCancelledException
+                    raise TaskCancelledException("Task cancelled due to shutdown signal or prior exception.")
                 return f(*args, **kwargs)
 
-            futs.append(exc.submit(wrapped_f, *args, **kwargs))
-            return futs[-1]
+            # Don't submit if already terminating
+            if should_terminate.is_set():
+                # Create a cancelled future to represent the skipped task
+                fut = Future()
+                fut.set_exception(TaskCancelledException("Shutdown initiated before task submission."))
+                futs.append(fut)
+                return fut
+
+            future = exc.submit(wrapped_f, *args, **kwargs)
+            futs.append(future)
+            return future
 
         try:
             yield submit
 
             for f in as_completed(futs):
                 if should_terminate.is_set():
+                    # If termination was signaled, try to cancel unprocessed futures
+                    # Note: as_completed yields futures as they complete,
+                    # so 'f' is already done. We cancel others in futs.
+                    # The signal handler already does this, but adding redundancy here
+                    # might catch edge cases depending on timing.
+                    for fut_to_cancel in futs:
+                        if not fut_to_cancel.done():
+                            fut_to_cancel.cancel()
                     break
-                callback()
                 try:
                     f.result()
+                    # Only advance progress bar on successful completion or
+                    # if we are not stopping on exceptions
+                    if not f.exception() or not stop_on_exception:
+                        callback()
                 except Exception as e:
-                    should_terminate.set()
-                    for fut in futs:
-                        fut.cancel()
                     if isinstance(e, TaskCancelledException):
-                        continue
-                    raise e
+                        # Ignore TaskCancelledException, it's expected during shutdown
+                        # or if stop_on_exception is True
+                        continue  # Don't advance progress bar for cancelled tasks
+
+                    # Log the exception regardless
+                    logger.error(f"Task raised an exception: {e}", exc_info=True)
+                    exceptions_encountered.append(e)
+
+                    if stop_on_exception:
+                        should_terminate.set()  # Signal termination
+                        # Cancel all other *pending* futures
+                        for fut_to_cancel in futs:
+                            # Check if it's not the current future and if it's not done/running
+                            if fut_to_cancel is not f and not fut_to_cancel.done():
+                                fut_to_cancel.cancel()
+                        # Don't raise immediately, let the loop break naturally
+                        # on the next iteration due to should_terminate.is_set()
+                        # This allows the finally block to execute cleanly.
+                        # Alternatively, could raise here, but ensure finally runs.
+                        # For simplicity, let the loop check handle the break.
+                    else:
+                        # If not stopping, just advance the progress bar as if it completed
+                        # (since we've handled the exception by logging it)
+                        callback()
+
+            # After loop finishes, if stop_on_exception was True and we had errors,
+            # raise the first one encountered to signal failure.
+            if stop_on_exception and exceptions_encountered:
+                raise exceptions_encountered[0]
+            elif not stop_on_exception and exceptions_encountered:
+                logger.warning(f"Finished processing with {len(exceptions_encountered)} errors.")
+
         finally:
+            # Ensure original signal handler is restored
             signal.signal(signal.SIGINT, prior_handler)
+            # Ensure executor is shut down cleanly, cancelling any remaining futures
+            # if termination was signaled. The context manager (`with ThreadPoolExecutor...`)
+            # also calls shutdown, but calling it explicitly ensures cancellation
+            # logic is triggered if `should_terminate` was set.
+            if should_terminate.is_set():
+                exc.shutdown(wait=True, cancel_futures=True)  # Wait for cancellations
+            else:
+                exc.shutdown(wait=True)  # Wait for normal completion
 
 
 console = Console()

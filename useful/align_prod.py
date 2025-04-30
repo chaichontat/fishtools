@@ -2,11 +2,15 @@
 import json
 import os
 import pickle
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 from itertools import chain, groupby
 from pathlib import Path
 from typing import Any, Literal, Mapping, cast
@@ -20,7 +24,7 @@ import tifffile
 import xarray as xr
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter, field_validator
-from starfish import Codebook, ImageStack, IntensityTable
+from starfish import ImageStack, IntensityTable
 from starfish.core.intensity_table.decoded_intensity_table import DecodedIntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
@@ -30,24 +34,36 @@ from starfish.core.types import Axes, Coordinates, CoordinateValue
 from starfish.experiment.builder import FetchedTile, TileFetcher
 from starfish.image import Filter
 from starfish.spots import DecodeSpots, FindSpots
-from starfish.types import Axes, Features, Levels, TraceBuildingStrategies
+from starfish.types import Axes, Features, Levels
 from starfish.util.plot import imshow_plane, intensity_histogram
-from tifffile import TiffFile, imread, imwrite
+from tifffile import TiffFile, imread
 
+from fishtools.preprocess.addition import ElementWiseAddition
 from fishtools.utils.pretty_print import progress_bar
 from fishtools.utils.utils import git_hash
+
+GPU = os.environ.get("GPU", 0) == "1"
+if GPU:
+    logger.info("Using GPU")
+    from fishtools.gpu.codebook import Codebook
+else:
+    from starfish import Codebook
+# from fishtools.gpu.codebook import Codebook
 
 
 class DecodeConfig(BaseModel):
     model_config = {"frozen": True}
 
     max_distance: float = 0.3
-    min_intensity: float = 0.005
+    min_intensity: float = 0.00125
     min_area: int = 8
     max_area: int = 200
+    use_correct_direction: bool = True
 
 
-OPTIMIZE_CONFIG = DecodeConfig(min_intensity=0.02, min_area=15, max_area=200)
+OPTIMIZE_CONFIG = DecodeConfig(
+    min_intensity=0.0075, max_distance=0.3, min_area=15, max_area=200, use_correct_direction=True
+)
 
 
 os.environ["TQDM_DISABLE"] = "1"
@@ -56,6 +72,7 @@ os.environ["TQDM_DISABLE"] = "1"
 def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = False):
     try:
         with warnings.catch_warnings(action="ignore"):
+            # ! Normalize to 1. Any operations done after this WILL be clipped in [0, 1].
             img = imread(path).astype(np.float32)[sl] / 65535
     except tifffile.TiffFileError:
         raise Exception(f"{path} is corrupted. Please delete it and try again.")
@@ -134,7 +151,14 @@ def plot_intensity_histograms(stack: starfish.ImageStack, r: int):
     fig.tight_layout()
 
 
-def scale(img: ImageStack, scale: np.ndarray[np.float32, Any]):
+def scale(
+    img: ImageStack, scale: np.ndarray[np.float32, Any], mins: np.ndarray[np.float32, Any] | None = None
+):
+    if mins is not None:
+        ElementWiseAddition(
+            xr.DataArray(np.nan_to_num(-mins, nan=1).reshape(-1, 1, 1, 1, 1), dims=("c", "x", "y", "z", "r"))
+        ).run(img, in_place=True)
+
     Filter.ElementWiseMultiply(
         xr.DataArray(
             np.nan_to_num(scale, nan=1).reshape(-1, 1, 1, 1, 1),
@@ -278,9 +302,7 @@ def optimize(
     if round_num > 0 and not (path / f"opt_{codebook_path.stem}" / "percentiles.json").exists():
         raise Exception("Please run `fishtools find-threshold` first.")
 
-    selected = sample_imgs(
-        path, codebook_path.stem, round_num, batch_size=batch_size * (2 if round_num == 0 else 1)
-    )
+    selected = sample_imgs(path, codebook_path.stem, round_num, batch_size=batch_size)
 
     group_counts = {key: len(list(group)) for key, group in groupby(selected, key=lambda x: x.parent.name)}
     logger.info(f"Group counts: {json.dumps(group_counts, indent=2)}")
@@ -303,7 +325,7 @@ def optimize(
             *(["--overwrite"] if overwrite else []),
             f"--subsample-z={subsample_z}",
             f"--split={split}",
-            *(["--max-proj=" + str(max_proj)] if max_proj else []),
+            *([f"--max-proj={max_proj}"] if max_proj else []),
         ],
         threads=threads,
     )
@@ -313,16 +335,18 @@ def optimize(
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--roi", type=str, default="*")
-@click.option("--percentile", type=float, default=25)
+@click.option("--percentile", type=float, default=40)
 @click.option("--overwrite", is_flag=True)
 @click.option("--round", "round_num", type=int, default=0)
+@click.option("--max-proj", type=int, default=0)
 def find_threshold(
     path: Path,
     roi: str,
     codebook: Path,
-    percentile: float = 25,
+    percentile: float = 40,
     overwrite: bool = False,
     round_num: int = 0,
+    max_proj: int = 0,
 ):
     SUBFOLDER = "_highpassed"
     paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
@@ -339,7 +363,7 @@ def find_threshold(
     if not (path_out / "global_scale.txt").exists():
         raise ValueError("Please run align_prod optimize first.")
 
-    if not round_num > 0 and not jsonfile.exists():
+    if round_num > 0 and not jsonfile.exists():
         raise ValueError(
             "Round_num > 0 but no existing percentiles file found. Please run with round_num=0 first."
         )
@@ -359,6 +383,7 @@ def find_threshold(
     norms = {}
 
     try:
+        mins = np.loadtxt(path_out / "global_min.txt", dtype=float).reshape(1, -1, 1, 1)
         global_scale = np.atleast_3d(np.loadtxt(path_out / "global_scale.txt", dtype=float))[
             round_num
         ].reshape(1, -1, 1, 1)
@@ -372,9 +397,12 @@ def find_threshold(
         logger.debug(f"Processing {p.parent.name}/{p.name}")
         # import cupy as cp
 
-        img = tifffile.imread(p)
+        img = tifffile.imread(p)[:, :, :1024, :1024]  # type: ignore
+        if max_proj:
+            img = img.max(axis=0)
         # img = cp.asarray(img)
         # img *= cp.asarray(global_scale)
+        img -= mins
         img *= global_scale
 
         norm = np.linalg.norm(img, axis=1)
@@ -390,63 +418,6 @@ def find_threshold(
         prev_norms = json.loads(jsonfile.read_text())
         prev_norms.append(norms)
         jsonfile.write_text(json.dumps(prev_norms, indent=2))
-
-
-@cli.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("roi", type=str, default="*")
-@click.option(
-    "--codebook",
-    "codebook_path",
-    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
-)
-@click.option("--threads", "-t", type=int, default=13)
-@click.option("--overwrite", is_flag=True)
-@click.option("--subsample-z", type=int, default=1)
-@click.option("--limit-z", default=None)
-@click.option("--split", is_flag=True)
-@click.option("--simple", is_flag=True)
-@click.option("--max-proj", type=int, default=0)
-def batch(
-    path: Path,
-    roi: str,
-    codebook_path: Path,
-    threads: int = 13,
-    overwrite: bool = False,
-    subsample_z: int = 1,
-    limit_z: int | None = None,
-    split: bool = False,
-    simple: bool = False,
-    max_proj: bool = False,
-):
-    paths = {p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
-    # To account for split
-    exists = {
-        p.stem.rsplit("-", 1)[0]
-        for p in path.glob(f"registered--{roi}+{codebook_path.stem}/decoded-{codebook_path.stem}/reg*.pkl")
-    }
-    if not overwrite:
-        old_len = len(paths)
-        paths = sorted({v for v in paths if v.stem.rsplit("-", 1)[0] not in exists})
-        logger.info(f"Skipping {old_len - len(paths)} files.")
-
-    return _batch(
-        sorted(paths),
-        "run",
-        [
-            "--global-scale",
-            (path / f"opt_{codebook_path.stem}" / "global_scale.txt").as_posix(),
-            "--codebook",
-            codebook_path.as_posix(),
-            "--overwrite" if overwrite else "",
-            f"--subsample-z={subsample_z}",
-            f"--limit-z={limit_z}",
-            "--simple" if simple else "",
-            f"--max-proj={max_proj}" if max_proj else "",
-        ],
-        threads=threads,
-        split=split,
-    )
 
 
 def load_2d(path: Path | str, *args, **kwargs):
@@ -528,6 +499,7 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
 
     # paths = list((path / codebook_path.stem).glob("reg*.json"))
     curr = []
+    mins = []
     n = 0
     for p in paths:
         if not p.exists():
@@ -538,25 +510,40 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
         #     raise ValueError(f"Round number {round_num} exceeds what's available ({len(sf)}).")
 
         if round_num == 0:
-            curr.append([cast(InitialScale, s).initial_scale for s in sf if s.round_num == round_num][0])
+            curr.append([cast(InitialScale, s).initial_scale for s in sf if s.round_num == 0][0])
+            mins.append([cast(InitialScale, s).mins for s in sf if s.round_num == 0][0])
         else:
-            want = cast(Deviation, [s for s in sf if s.round_num == round_num][0])
+            try:
+                want = cast(Deviation, [s for s in sf if s.round_num == round_num][0])
+            except IndexError:
+                logger.warning(f"No deviation for round {round_num} in {p}. Skipping.")
+                continue
             if want.n < 200:
                 logger.debug(f"Skipping {p} at round {round_num} because n={want.n} < 200.")
                 continue
             curr.append(np.nan_to_num(np.array(want.deviation, dtype=float), nan=1) * want.n)
             n += want.n
-    curr = np.array(curr)
+    curr, mins = np.array(curr), np.array(mins)
     # pl.DataFrame(curr).write_csv(path / name)
 
     global_scale_file = path_opt / "global_scale.txt"
+    global_min_file = path_opt / "global_min.txt"
     if round_num == 0:
-        curr = np.percentile(np.array(curr), 5, axis=0, keepdims=True)
+        # ! The result after scaling must be in [0, 1].
+        curr = np.mean(np.array(curr), axis=0, keepdims=True)
+        overallmean = np.nanmean(curr)
+        curr /= overallmean
+        curr = np.clip(curr, 0, 2)
+        curr /= np.nanmean(curr)
+        curr = np.clip(curr, 0.5, None)
+        curr /= np.nanmean(curr)
         np.savetxt(global_scale_file, curr)
+
+        np.savetxt(global_min_file, np.mean(mins, axis=0))
         return
 
-    if not global_scale_file.exists():
-        raise ValueError("Round > 0 requires global scale file.")
+    if not global_scale_file.exists() or not global_min_file.exists():
+        raise ValueError("Round > 0 requires global scale file and global min file.")
 
     deviation = curr.sum(axis=0) / n
     # Normalize per channel
@@ -567,12 +554,12 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
     previouses = load_2d(global_scale_file)
     old = previouses[round_num - 1]
     new = old / deviation
-    # if round_num > 1:
-    #     grad = new - old
-    #     β = 0.1
-    #     velocity = old - previouses[round_num - 2]
-    #     velocity = β * velocity + (1 - β) * grad
-    #     new = old + velocity
+    # if round_num > 3:
+    #     new = (old + new) / 2
+    # β = 0.1
+    # velocity = old - previouses[round_num - 2]
+    # velocity = β * velocity + (1 - β) * grad
+    # new = old + velocity
 
     np.savetxt(
         global_scale_file,
@@ -581,14 +568,14 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
     (path_opt / "mse.txt").open("a").write(f"{round_num:02d}\t{cv:04f}\n")
 
 
-def initial(img: ImageStack):
+def initial(img: ImageStack, percentiles: tuple[float, float] = (1, 99.99)):
     """
     Create initial scaling factors.
     Returns the max intensity of each channel.
     Seems to work well enough.
     """
     maxed = img.reduce({Axes.ROUND, Axes.ZPLANE}, func="max")
-    res = np.percentile(np.array(maxed.xarray).squeeze(), 99.9, axis=(1, 2))
+    res = np.percentile(np.array(maxed.xarray).squeeze(), percentiles, axis=(1, 2))
     # res = np.array(maxed.xarray).squeeze()
     if np.isnan(res).any() or (res == 0).any():
         raise ValueError("NaNs or zeros found in initial scaling factor.")
@@ -612,6 +599,7 @@ class Deviation(BaseModel):
 class InitialScale(BaseModel):
     initial_scale: list[float]
     round_num: int
+    mins: list[float]
 
     @field_validator("round_num")
     @classmethod
@@ -631,14 +619,18 @@ def append_json(
     n: int | None = None,
     deviation: np.ndarray | None = None,
     initial_scale: np.ndarray | None = None,
+    mins: np.ndarray | None = None,
     percent_blanks: float | None = None,
 ):
     existing = Deviations.validate_json(path.read_text()) if path.exists() else Deviations.validate_json("[]")
-    if initial_scale is not None:
+    if initial_scale is not None and mins is not None:
         if round_num > 0:
             raise ValueError("Cannot set initial scale for round > 0")
-        existing.append(InitialScale(initial_scale=initial_scale.tolist(), round_num=round_num))
-
+        existing.append(
+            InitialScale(initial_scale=initial_scale.tolist(), round_num=round_num, mins=mins.tolist())
+        )
+    elif (initial_scale is None) ^ (mins is None):
+        raise ValueError("Must provide both initial_scale and mins or not")
     elif deviation is not None and n is not None:
         if round_num == 0:
             raise ValueError("Cannot set deviation for round 0")
@@ -655,7 +647,7 @@ def append_json(
     path.write_bytes(Deviations.dump_json(existing))
 
 
-def pixel_decoding(imgs: ImageStack, config: DecodeConfig, codebook: Codebook):
+def pixel_decoding(imgs: ImageStack, config: DecodeConfig, codebook: Codebook, *, gpu: bool = False):
     pixel_intensities = IntensityTable.from_image_stack(imgs)
     logger.info("Decoding")
     decoded_intensities = codebook.decode_metric(
@@ -665,6 +657,31 @@ def pixel_decoding(imgs: ImageStack, config: DecodeConfig, codebook: Codebook):
         norm_order=2,
         metric="euclidean",
         return_original_intensities=True,
+    )
+
+    logger.info("Combining")
+    caf = CombineAdjacentFeatures(
+        min_area=config.min_area, max_area=config.max_area, mask_filtered_features=True
+    )
+    decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
+    transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
+    return decoded_spots, image_decoding_results
+
+
+def pixel_decoding_gpu(imgs: ImageStack, config: DecodeConfig, codebook: Codebook, lock: threading.Lock):
+    pixel_intensities = IntensityTable.from_image_stack(imgs)
+    shape = imgs.xarray.squeeze().shape  # CZYX
+    shape = (shape[1], shape[0], *shape[2:])
+    logger.info("Decoding")
+    decoded_intensities = codebook.decode_metric(
+        pixel_intensities,
+        max_distance=config.max_distance,
+        min_intensity=config.min_intensity,
+        norm_order=2,
+        metric="euclidean",
+        return_original_intensities=True,
+        shape=shape,
+        lock=lock,
     )
 
     logger.info("Combining")
@@ -751,6 +768,7 @@ def run(
     simple: bool = False,
     max_proj: int = 0,
     config: DecodeConfig = DecodeConfig(),
+    lock: None = None,
 ):
     """
     Run spot calling.
@@ -873,9 +891,12 @@ def run(
 
     if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
+        mins, base = initial(imgs, (1, 99.99))
         path_json.write_bytes(
             Deviations.dump_json(
-                Deviations.validate_python([{"initial_scale": (1 / initial(imgs)).tolist(), "round_num": 0}])
+                Deviations.validate_python([
+                    {"initial_scale": (1 / (base - mins)).tolist(), "mins": mins.tolist(), "round_num": 0}
+                ])
             )
         )
         return
@@ -894,8 +915,10 @@ def run(
         else np.array(scale_all[-1], copy=True)
     )
 
+    mins = np.loadtxt(global_scale.parent / "global_min.txt")
+
     try:
-        scale(imgs, scale_factor)
+        scale(imgs, scale_factor, mins=mins)
     except ValueError:
         # global_scale.unlink()
         raise ValueError("Scale factor dim mismatch. Deleted. Please rerun.")
@@ -924,8 +947,15 @@ def run(
     # )
 
     # Decode
+    # if GPU and lock is None:
+    #     raise Exception("GPU and lock are both None.")
+    lock = threading.Lock()
     if not simple:
-        decoded_spots, image_decoding_results = pixel_decoding(imgs, config, codebook)
+        decoded_spots, image_decoding_results = (
+            pixel_decoding(imgs, config, codebook)
+            if not GPU
+            else pixel_decoding_gpu(imgs, config, codebook, lock)
+        )
         decoded_spots = decoded_spots.loc[decoded_spots[Features.PASSES_THRESHOLDS]]
     else:
         decoded_spots, image_decoding_results = spot_decoding(imgs, codebook), None
@@ -943,6 +973,10 @@ def run(
     if calc_deviations and round_num is not None:
         # Round num already checked above.
         names_l = {n: i for i, n in enumerate(names)}
+        spot_intensities = spot_intensities[
+            (np.linalg.norm(spot_intensities.squeeze(), axis=1) * (1 - spot_intensities.coords["distance"]))
+            > config.min_intensity
+        ]
         idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
 
         deviations = np.nanmean(spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0)
@@ -970,6 +1004,127 @@ def run(
         pickle.dump((decoded_spots, morph, meta), f)
 
     return decoded_spots, image_decoding_results
+
+
+def parse_duration(duration_str: str) -> timedelta:
+    """Parses a duration string like '30m', '2h', '5d' into a timedelta."""
+    match = re.fullmatch(r"(\d+)([mhd])", duration_str)
+    if not match:
+        raise ValueError(f"Invalid duration format: {duration_str}. Use 'Nm', 'Nh', or 'Nd'.")
+    value, unit = match.groups()
+    value = int(value)
+    if unit == "m":
+        return timedelta(minutes=value)
+    elif unit == "h":
+        return timedelta(hours=value)
+    elif unit == "d":
+        return timedelta(days=value)
+    else:
+        # This should not happen due to regex matching
+        raise ValueError(f"Unknown time unit: {unit}")
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str, default="*")
+@click.option(
+    "--codebook",
+    "codebook_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
+@click.option("--threads", "-t", type=int, default=13)
+@click.option("--overwrite", is_flag=True)
+@click.option("--subsample-z", type=int, default=1)
+@click.option("--limit-z", default=None)
+@click.option("--split", is_flag=True)
+@click.option("--simple", is_flag=True)
+@click.option("--max-proj", type=int, default=0)
+@click.option(
+    "--since",
+    type=str,
+    default=None,
+    help="Only process files modified since this duration (e.g., '30m', '2h', '1d').",
+)
+def batch(
+    path: Path,
+    roi: str,
+    codebook_path: Path,
+    threads: int = 13,
+    overwrite: bool = False,
+    subsample_z: int = 1,
+    limit_z: int | None = None,
+    split: bool = False,
+    simple: bool = False,
+    max_proj: bool = False,
+    since: str | None = None,
+):
+    all_paths = {p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
+    paths_in_scope = all_paths  # Start with all paths
+
+    # Filter by modification time if --since is provided
+    if since:
+        try:
+            duration = parse_duration(since)
+        except ValueError as e:
+            logger.error(f"Error parsing --since value: {e}")
+            return  # Or raise click.BadParameter
+
+        current_time = time.time()
+        cutoff_time = current_time - duration.total_seconds()
+        recent_paths = {p for p in all_paths if p.stat().st_mtime > cutoff_time}
+        logger.info(
+            f"Found {len(recent_paths)} files modified since {since} (out of {len(all_paths)} total)."
+        )
+        paths_in_scope = recent_paths  # Update paths_in_scope to only include recent ones
+    else:
+        logger.info(f"Found {len(paths_in_scope)} files matching pattern (no --since filter).")
+
+    already_done = set()
+    # Check which of the files *in scope* are already done
+    for p in paths_in_scope:
+        # Check if 4 corresponding pkl files exist for this tif file if split is True
+        num_expected_pkl = 4 if split else 1
+        glob_pattern = f"decoded-{codebook_path.stem}/{p.stem}{'-*' if split else ''}.pkl"
+        # Use parent.parent because the decoded files are one level up
+        if len(list(p.parent.parent.glob(glob_pattern))) >= num_expected_pkl:
+            already_done.add(p)
+
+    if overwrite:
+        # Overwrite only applies to files within the scope (all or recent)
+        paths_to_process = sorted(list(paths_in_scope))
+        logger.info(f"Processing {len(paths_to_process)} files in scope (overwrite enabled).")
+        # Log how many of these were already done but will be overwritten
+        overwritten_count = len(already_done)
+        if overwritten_count > 0:
+            logger.info(f"Overwriting {overwritten_count} already processed files within the scope.")
+    else:
+        # Process only files in scope that are not already done
+        paths_to_process = sorted(list(paths_in_scope - already_done))
+        skipped_count = len(paths_in_scope) - len(paths_to_process)
+        logger.info(f"Skipping {skipped_count} already processed files within the scope.")
+        logger.info(f"Processing {len(paths_to_process)} new files in scope.")
+
+    if not paths_to_process:
+        logger.warning("No files found to process based on current filters and overwrite status.")
+        return
+
+    return _batch(
+        paths_to_process,
+        "run",
+        [
+            "--global-scale",
+            (path / f"opt_{codebook_path.stem}" / "global_scale.txt").as_posix(),
+            "--codebook",
+            codebook_path.as_posix(),
+            "--overwrite" if overwrite else "",
+            f"--subsample-z={subsample_z}",
+            f"--limit-z={limit_z}",
+            "--simple" if simple else "",
+            f"--max-proj={max_proj}" if max_proj else "",
+        ],
+        threads=threads,
+        split=split,
+    )
 
 
 if __name__ == "__main__":
