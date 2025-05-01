@@ -163,6 +163,20 @@ def _remove_config_file(
         os.remove(config_path)
 
 
+def format_slice(s: slice) -> str:
+    if not isinstance(s, slice):  # type: ignore
+        return str(s)
+
+    start, stop, step = s.start, s.stop, s.step
+    parts = [
+        "" if start in (None, 0) else str(start),
+        "" if stop is None else str(stop),
+        "" if step in (None, 1) else str(step),
+    ]
+
+    return ":".join(parts).rstrip(":")
+
+
 # ----------------------- clusters --------------------------------------------#
 class myLocalCluster(distributed.LocalCluster):
     """
@@ -393,7 +407,7 @@ def process_block(
         box_ids : 1D numpy array, parallel to boxes, the segment IDs of the
                   boxes
     """
-    logger.info(f"RUNNING BLOCK: {block_index}\tREGION: {crop}")
+    logger.info(f"RUNNING BLOCK: {block_index}\tREGION: [{format_slice(crop)}]")
     segmentation_3d = read_preprocess_and_segment(
         input_zarr,
         crop,
@@ -731,23 +745,21 @@ def distributed_eval(
             raise e
 
         # Filter the indices and crops based on the results
-        final_block_indices, final_block_crops = [], []
+        idxs = []
         for i, is_non_zero in enumerate(non_zero_results, offset):
             if is_non_zero:
-                final_block_indices.append(block_indices[i])
-                final_block_crops.append(block_crops[i])
-        del block_indices, block_crops
-        path_nonempty.write_text(
-            json.dumps(
-                {"final_block_indices": final_block_indices, "final_block_crops": final_block_crops}, indent=2
-            )
-        )
+                idxs.append(i)
+
+        path_nonempty.write_text(json.dumps({"idxs": idxs}, indent=2))
     else:
-        _nonempty = json.loads(path_nonempty.read_text())
-        final_block_indices, final_block_crops = (
-            _nonempty["final_block_indices"],
-            _nonempty["final_block_crops"],
-        )
+        idxs = json.loads(path_nonempty.read_text())["idxs"]
+
+    # final_block_indices, final_block_crops = [], []
+    final_block_indices, final_block_crops = (
+        [block_indices[i] for i in idxs],
+        [block_crops[i] for i in idxs],
+    )
+    del block_indices, block_crops
 
     print(f"Selected {len(final_block_indices)} blocks with non-zero input data.")
 
@@ -760,7 +772,7 @@ def distributed_eval(
 
     temp_zarr = zarr.open(
         temp_zarr_path,
-        "w",
+        mode="w",
         shape=output_shape,  # Use 3D shape
         chunks=output_blocksize,  # Use 3D chunks
         dtype=np.uint32,
@@ -967,15 +979,15 @@ def merge_boxes(boxes):
 if __name__ == "__main__":
     # ---- 1. Configuration ----
     # path = Path("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA")
-    path = Path("/working/20250407_cs3_2/analysis/deconv/stitch--tc+atp")
+    path = Path("/working/20250421_2956/analysis/deconv/stitch--hippo+polyA")
     tiff_path = path / "fused.tif"  # <-- SET THIS: Path to your input TIFF file
-    zarr_input_path = path / "input_image.zarr"  # Path to store intermediate Zarr
+    zarr_input_path = path / "fused.zarr"  # Path to store intermediate Zarr
     zarr_output_path = path / "output_segmentation.zarr"  # <-- SET THIS: Path for final segmentation Zarr
 
     # Define block size (e.g., for a 3D image Z, Y, X) - ADJUST TO YOUR DATA AND MEMORY
     # Should be large enough for context but small enough for memory per worker
 
-    processing_blocksize = (20, 512, 512, 2)  # Example for 3D
+    processing_blocksize = (30, 512, 512, 2)  # Example for 3D
 
     # Cellpose Model Configuration
     # cellpose_model_kwargs = {
@@ -1040,7 +1052,7 @@ if __name__ == "__main__":
     else:
         input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
 
-    channels = [2, 1]
+    channels = [1, 1]
     try:
         normalization = json.loads((path / "normalization.json").read_text())
     except FileNotFoundError:
@@ -1054,7 +1066,7 @@ if __name__ == "__main__":
 
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
-        "diameter": 31,  # MUST BE INT <-- SET THIS: Estimated average object diameter in pixels
+        "diameter": 37,  # MUST BE INT <-- SET THIS: Estimated average object diameter in pixels
         "channels": channels,  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
         "batch_size": 24,  # Adjust based on GPU memory (if using GPU)
         # Use Cellpose's internal normalization (or False if pre-normalized)
@@ -1067,6 +1079,8 @@ if __name__ == "__main__":
         "resample": True,
         "flow3D_smooth": 3,
         "do_3D": True,
+        "z_axis": 0,
+        "channel_axis": 3,
     }
 
     # ---- 3. Run Distributed Evaluation ----
