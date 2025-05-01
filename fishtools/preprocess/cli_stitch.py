@@ -1,7 +1,6 @@
 # %%
 import shutil
 import subprocess
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -58,7 +57,11 @@ def run_imagej(
     options = "subpixel_accuracy"  # compute_overlap
     if compute_overlap:
         options += " compute_overlap"
-    fusion = "Linear Blending" if fuse else "Do not fuse images (only write TileConfiguration)"
+    fusion = (
+        "Linear Blending"
+        if fuse
+        else "Do not fuse images (only write TileConfiguration)"
+    )
 
     macro = f"""
     run("Memory & Threads...", "maximum=102400 parallel=32");
@@ -107,7 +110,7 @@ def extract_channel(
                 raise ValueError("Trim must be positive")
 
             if max_proj:
-                img = tif.asarray()[:, idx].max(axis=0)
+                img = tif.asarray().max(axis=(0, 1))
             elif len(tif.pages) == 1 and tif.pages[0].asarray().ndim == 3:
                 img = tif.pages[0].asarray()[idx]
             else:
@@ -117,7 +120,11 @@ def extract_channel(
         logger.critical(f"Error reading {path}: {e}")
         raise e
 
-    img = img[trim:-trim:downsample, trim:-trim:downsample] if trim else img[::downsample, ::downsample]
+    img = (
+        img[trim:-trim:downsample, trim:-trim:downsample]
+        if trim
+        else img[::downsample, ::downsample]
+    )
     if reduce_bit_depth:
         if img.dtype != np.uint16:
             raise ValueError("Cannot reduce bit depth if image is not uint16")
@@ -149,8 +156,12 @@ def stitch(): ...
 @click.option("--downsample", type=int, default=2)
 def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int):
     if downsample > 1:
-        logger.info(f"Downsampling tile config by {downsample}x to {path / 'TileConfiguration.txt'}")
-    TileConfiguration.from_file(tileconfig).downsample(downsample).write(path / "TileConfiguration.txt")
+        logger.info(
+            f"Downsampling tile config by {downsample}x to {path / 'TileConfiguration.txt'}"
+        )
+    TileConfiguration.from_file(tileconfig).downsample(downsample).write(
+        path / "TileConfiguration.txt"
+    )
 
     run_imagej(
         path,
@@ -196,7 +207,7 @@ def register(
         raise ValueError(f"No registered images at {path.resolve()} found.")
 
     imgs = sorted((f for f in path.glob("*.tif") if not f.name.endswith(".hp.tif")))
-    (out_path := path.parent / f"stitch--{roi}").mkdir(exist_ok=True)
+    (out_path := path.parent / f"stitch--{roi.split('+')[0]}").mkdir(exist_ok=True)
 
     if overwrite:
         [p.unlink() for p in out_path.glob("*.tif")]
@@ -252,8 +263,14 @@ def register(
 
     del path
     if overwrite or not (out_path / "TileConfiguration.registered.txt").exists():
-        files = sorted((f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif")))
-        files_idx = [int(file.stem.split("-")[-1]) for file in files if file.stem.split("-")[-1].isdigit()]
+        files = sorted(
+            (f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif"))
+        )
+        files_idx = [
+            int(file.stem.split("-")[-1])
+            for file in files
+            if file.stem.split("-")[-1].isdigit()
+        ]
         logger.debug(f"Using {files_idx}")
         tileconfig = TileConfiguration.from_pos(
             pd.read_csv(
@@ -290,85 +307,92 @@ def extract(
     is_2d: bool = False,
     channels: list[int] | None = None,
 ):
-    img = imread(path)
+    try:
+        img = imread(path)
 
-    if is_2d:
-        if len(img.shape) == 4:  # ZCYX
-            if not max_proj:
-                raise ValueError(
-                    "Please set is_3d to True if you want to segment 3D images or max_proj to True for max projection."
+        if is_2d:
+            if len(img.shape) == 4:  # ZCYX
+                if not max_proj:
+                    raise ValueError(
+                        "Please set is_3d to True if you want to segment 3D images or max_proj to True for max projection."
+                    )
+                img = img.max(axis=0)
+
+            img = np.atleast_3d(img)
+            img = (
+                img[
+                    channels if channels else slice(None),
+                    trim:-trim:downsample,
+                    trim:-trim:downsample,
+                ]
+                if trim
+                else img[
+                    channels if channels else slice(None), ::downsample, ::downsample
+                ]
+            )
+            if reduce_bit_depth:
+                img >>= reduce_bit_depth
+            for i in range(img.shape[0]):
+                (out_path / f"{i:02d}").mkdir(exist_ok=True)
+                imwrite(
+                    out_path / f"{i:02d}" / (path.stem.split("-")[1] + ".tif"),
+                    img[i],
+                    compression=22610,
+                    metadata={"axes": "YX"},
+                    compressionargs={"level": 0.7},
                 )
-            img = img.max(axis=0)
+            del img
+            return
 
-        img = np.atleast_3d(img)
+        if len(img.shape) < 3:
+            raise ValueError("Image must be at least 3D")
+
+        if len(img.shape) == 3:  # ZYX
+            img = img[::subsample_z, np.newaxis, ...]
+        elif len(img.shape) > 4:
+            raise ValueError("Image must be 3D or 4D")
+
         img = (
             img[
+                ::subsample_z,
                 channels if channels else slice(None),
                 trim:-trim:downsample,
                 trim:-trim:downsample,
             ]
             if trim
-            else img[channels if channels else slice(None), ::downsample, ::downsample]
+            else img[
+                ::subsample_z,
+                channels if channels else slice(None),
+                ::downsample,
+                ::downsample,
+            ]
         )
-        if reduce_bit_depth:
-            img >>= reduce_bit_depth
+
+        if max_proj:
+            img = img.max(axis=0, keepdims=True)
+
         for i in range(img.shape[0]):
-            (out_path / f"{i:02d}").mkdir(exist_ok=True)
-            imwrite(
-                out_path / f"{i:02d}" / (path.stem.split("-")[1] + ".tif"),
-                img[i],
-                compression=22610,
-                metadata={"axes": "YX"},
-                compressionargs={"level": 0.7},
-            )
+            for j in range(img.shape[1]):
+                p = out_path / f"{i:02d}" / f"{j:02d}"
+                p.mkdir(exist_ok=True, parents=True)
+                imwrite(
+                    p / (path.stem.split("-")[1] + ".tif"),
+                    img[i, j],
+                    compression=22610,
+                    metadata={"axes": "YX"},
+                    compressionargs={"level": 0.75},
+                )
+
         del img
         return
-
-    if len(img.shape) < 3:
-        raise ValueError("Image must be at least 3D")
-
-    if len(img.shape) == 3:  # ZYX
-        img = img[::subsample_z, np.newaxis, ...]
-    elif len(img.shape) > 4:
-        raise ValueError("Image must be 3D or 4D")
-
-    img = (
-        img[
-            ::subsample_z,
-            channels if channels else slice(None),
-            trim:-trim:downsample,
-            trim:-trim:downsample,
-        ]
-        if trim
-        else img[
-            ::subsample_z,
-            channels if channels else slice(None),
-            ::downsample,
-            ::downsample,
-        ]
-    )
-
-    if max_proj:
-        img = img.max(axis=0, keepdims=True)
-
-    for i in range(img.shape[0]):
-        for j in range(img.shape[1]):
-            p = out_path / f"{i:02d}" / f"{j:02d}"
-            p.mkdir(exist_ok=True, parents=True)
-            imwrite(
-                p / (path.stem.split("-")[1] + ".tif"),
-                img[i, j],
-                compression=22610,
-                metadata={"axes": "YX"},
-                compressionargs={"level": 0.75},
-            )
-
-    del img
-    return
+    except Exception as e:
+        raise Exception(f"Error reading {path}") from e
 
 
 @stitch.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
+)
 @click.argument("roi", type=str)
 @click.option(
     "--tile_config",
@@ -385,8 +409,10 @@ def extract(
 @click.option("--subsample-z", type=int, default=1)
 @click.option("--is-2d", is_flag=True)
 @click.option("--threads", "-t", type=int, default=8)
-@click.option("--channels", type=str, default="-3,-2,-1")
+@click.option("--channels", type=str, default="all")
 @click.option("--max-proj", is_flag=True)
+@click.option("--debug", is_flag=True)
+@click.option("--skip-extract", is_flag=True)
 @batch_roi("stitch--*")
 def fuse(
     path: Path,
@@ -398,9 +424,11 @@ def fuse(
     downsample: int = 2,
     is_2d: bool = False,
     threads: int = 8,
-    channels: str = "-3,-2,-1",
+    channels: str = "all",
     subsample_z: int = 1,
     max_proj: bool = False,
+    debug: bool = False,
+    skip_extract: bool = False,
 ):
     if "--" in path.as_posix():
         raise ValueError("Please be in the workspace folder.")
@@ -418,34 +446,49 @@ def fuse(
                 shutil.rmtree(p)
 
     if tile_config is None:
-        tile_config = path.parent / path.name.split("+")[0] / "TileConfiguration.registered.txt"
+        tile_config = (
+            path.parent / path.name.split("+")[0] / "TileConfiguration.registered.txt"
+        )
 
-    print(tile_config.resolve())
-
+    logger.info(f"Getting tile configuration from {tile_config.resolve()}")
     tileconfig = TileConfiguration.from_file(tile_config).downsample(downsample)
     n = len(tileconfig) // split
 
     if channels == "all":
         channels = ",".join(map(str, range(imread(files[0]).shape[1])))
 
-    logger.info(f"Found {len(files)} files. Extracting channel {channels} to {path}")
+    imgs = {int(p.stem.split("-")[1]) for p in path_img.glob("*.tif")}
+    needed = set(tileconfig.df["index"])
 
-    with progress_bar_threadpool(len(files), threads=threads) as submit:
-        for file in files:
-            submit(
-                extract,
-                file,
-                path,
-                downsample=downsample,
-                subsample_z=subsample_z,
-                is_2d=is_2d,
-                channels=list(map(int, channels.split(","))),
-                max_proj=max_proj,
-            )
+    if len(needed & imgs) != len(needed):
+        raise ValueError(
+            f"Not all images are present in {path_img}. Missing: {needed - imgs}"
+        )
+
+    if not skip_extract:
+        logger.info(
+            f"Found {len(files)} files. Extracting channel {channels} to {path}"
+        )
+        with progress_bar_threadpool(
+            len(files), threads=threads, stop_on_exception=True
+        ) as submit:
+            for file in files:
+                submit(
+                    extract,
+                    file,
+                    path,
+                    downsample=downsample,
+                    subsample_z=subsample_z,
+                    is_2d=is_2d,
+                    channels=list(map(int, channels.split(","))),
+                    max_proj=max_proj,
+                )
 
     def run_folder(folder: Path, capture_output: bool = False):
         for i in range(split):
-            tileconfig[i * n : (i + 1) * n].write(folder / f"TileConfiguration{i + 1}.registered.txt")
+            tileconfig[i * n : (i + 1) * n].write(
+                folder / f"TileConfiguration{i + 1}.registered.txt"
+            )
             try:
                 run_imagej(
                     folder,
@@ -455,91 +498,194 @@ def fuse(
             except Exception as e:
                 logger.critical(f"Error running ImageJ for {folder}: {e}")
                 raise e
-            Path(folder / "img_t1_z1_c1").rename(folder / f"fused_{folder.name}-{i + 1}.tif")
+            Path(folder / "img_t1_z1_c1").rename(
+                folder / f"fused_{folder.name}-{i + 1}.tif"
+            )
 
     # Get all folders without subfolders
-    folders = [folder for folder, subfolders, _ in (path.parent / f"stitch--{roi}").walk() if not subfolders]
+    folders = [
+        folder
+        for folder, subfolders, _ in (path.parent / f"stitch--{roi}").walk()
+        if not subfolders
+        and not folder.name.endswith(".zarr")
+        and not ".zarr" in folder.resolve().as_posix()
+    ]
 
     logger.info(f"Calling ImageJ on {len(folders)} folders.")
-    with progress_bar_threadpool(len(folders), threads=threads) as submit:
+    with progress_bar_threadpool(
+        len(folders), threads=threads, stop_on_exception=True
+    ) as submit:
         for folder in folders:
             if not folder.is_dir():
                 raise Exception("Invalid folder")
             if not folder.name.isdigit():
-                raise ValueError(f"Invalid folder name {folder.name}. No external folders allowed.")
+                raise ValueError(
+                    f"Invalid folder name {folder.name}. No external folders allowed."
+                )
 
             existings = list(folder.glob("fused*"))
             if existings and not overwrite:
                 logger.warning(f"{existings} already exists. Skipping this folder.")
                 continue
-            submit(run_folder, folder, capture_output=True)
+            submit(run_folder, folder, capture_output=not debug)
 
     if split > 1:
         for folder in folders:
             final_stitch(folder, split)
 
 
-def numpy_array_to_zarr[*Ts](write_path: Path | str, array: np.ndarray, chunks: tuple[*Ts]):
+def numpy_array_to_zarr[*Ts](
+    write_path: Path | str, array: np.ndarray, chunks: tuple[*Ts]
+):
     import zarr
+    # from numcodecs import Blosc
 
-    zarr_array = zarr.open(write_path, mode="w", shape=array.shape, chunks=chunks, dtype=array.dtype)
+    # codec = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+
+    zarr_array = zarr.create_array(
+        write_path,
+        shape=array.shape,
+        chunks=chunks,
+        dtype=array.dtype,
+        # codecs=[codec],
+    )
     zarr_array[...] = array
     return zarr_array
 
 
 @stitch.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
+)
 @click.argument("roi", type=str)
-@click.option("--threads", "-t", type=int, default=8)
-@click.option("--chunk-size", type=int, default=512)
+@click.option("--chunk-size", type=int, default=2048)
 @batch_roi("stitch--*")
-def combine(path: Path, roi: str, threads: int = 8, chunk_size: int = 512):
+def combine(path: Path, roi: str, chunk_size: int = 2048):
+    import zarr
+
     path = Path(path / f"stitch--{roi}")
-    folders = sorted(folder for folder, subfolders, _ in (path).walk() if not subfolders)
-    toplevels = [x for x in path.iterdir() if x.is_dir()]
-    zs = max(int(x.name) for x in toplevels) + 1
-    cs = max(int(x.name) for x in toplevels[0].iterdir() if x.is_dir()) + 1
+    # Group folders by Z index (parent directory name)
+    folders_by_z = {}
+    for folder, subfolders, _ in path.walk():
+        if (
+            not subfolders
+            and folder.name.isdigit()
+            and folder.parent.name.isdigit()
+            and not ".zarr" in folder.resolve().as_posix()
+        ):
+            z_idx = int(folder.parent.name)
+            if z_idx not in folders_by_z:
+                folders_by_z[z_idx] = []
+            folders_by_z[z_idx].append(folder)
 
-    for folder in folders:
+    if not folders_by_z:
+        raise ValueError(f"No valid Z/C folders found in {path}")
+
+    # Sort folders within each Z index by C index (folder name)
+    for z_idx in folders_by_z:
+        folders_by_z[z_idx].sort(key=lambda f: int(f.name))
+
+    zs = max(folders_by_z.keys()) + 1
+    cs = (
+        max(int(f.name) for f in folders_by_z[0]) + 1
+    )  # Assume C count is same for all Z
+
+    # Check for fused images in the first Z plane to get dimensions
+    first_z_folders = folders_by_z[0]
+    for folder in first_z_folders:
         if not (folder / f"fused_{folder.name}-1.tif").exists():
-            raise ValueError(f"No fused image found for {folder.name}")
+            raise ValueError(f"No fused image found for {folder.name} in Z=0")
 
-    folder = folders[0]
-    img = imread(folder / f"fused_{folder.name}-1.tif")
-    out = np.zeros((zs, img.shape[0], img.shape[1], cs), dtype=np.uint16)
-    logger.info(f"Out shape: {out.shape}")
-    del img
+    # Get shape from the first image of the first Z plane
+    first_folder = first_z_folders[0]
+    first_img = imread(first_folder / f"fused_{first_folder.name}-1.tif")
+    img_shape = first_img.shape
+    dtype = first_img.dtype
+    final_shape = (zs, img_shape[0], img_shape[1], cs)
+    logger.info(f"Final Zarr shape: {final_shape}, dtype: {dtype}")
 
-    lock = threading.Lock()
+    # Initialize the Zarr array
+    zarr_path = path / "fused.zarr"
+    logger.info(f"Writing to {zarr_path.resolve()}")
+    # Define chunks: chunk along Z=1, use user chunk_size for Y/X, full chunk for C
+    zarr_chunks = (1, chunk_size, chunk_size, cs)
+    z_array = zarr.create_array(
+        zarr_path,
+        shape=final_shape,
+        chunks=zarr_chunks,
+        dtype=dtype,
+        overwrite=True,
+    )
 
-    def load(folder: Path):
-        i = int(folder.parent.name)
-        j = int(folder.name)
-        print(f"Processing z={i} c={j}")
-        img = imread(folder / f"fused_{folder.name}-1.tif")
-        with lock:
-            out[i, :, :, j] = img[:, :]
-        del img
+    z_plane_data = np.zeros((img_shape[0], img_shape[1], cs), dtype=dtype)
 
-    with progress_bar_threadpool(len(folders), threads=threads) as submit:
-        for folder in folders:
-            submit(load, folder)
+    with progress_bar(len(folders_by_z)) as progress:
+        for i in sorted(folders_by_z.keys()):
+            logger.info(f"Processing Z-plane {i + 1}/{zs}")
+            z_plane_folders = folders_by_z[i]
 
-    first = next((path.parent / f"registered--{roi}").glob("*.tif"))
-    with TiffFile(first) as tif:
-        names = tif.shaped_metadata[0]["key"]
+            for folder in z_plane_folders:
+                j = int(folder.name)
+                try:
+                    img = imread(folder / f"fused_{folder.name}-1.tif")
+                    # Write into the C dimension of the current Z-plane array
+                    z_plane_data[:, :, j] = img[:, :]
+                    del img
+                except FileNotFoundError:
+                    raise FileNotFoundError(
+                        f"File not found: {folder / f'fused_{folder.name}-1.tif'}"
+                    )
+                except Exception as e:
+                    raise Exception(
+                        f"Error reading {folder / f'fused_{folder.name}-1.tif'}"
+                    ) from e
 
-    logger.info(f"Writing to {path.resolve() / 'fused.zarr'}")
-    z = numpy_array_to_zarr(path / "fused.zarr", out, (out.shape[0], chunk_size, chunk_size, out.shape[1]))
-    z.attrs["key"] = names
-    logger.info("Deleting folders.")
-    for folder in folders:
-        shutil.rmtree(folder)
+            logger.info(f"Writing Z-plane {i} to Zarr array")
+            z_array[i, :, :, :] = z_plane_data
+            progress()
+
+    # Add metadata (channel names)
+    try:
+        first_reg_file = next((path.parent / f"registered--{roi}").glob("*.tif"))
+        with TiffFile(first_reg_file) as tif:
+            # Attempt to get channel names, handle potential errors
+            names = tif.shaped_metadata[0].get("key") if tif.shaped_metadata else None
+            if names:
+                z_array.attrs["key"] = names
+                logger.info(f"Added channel names: {names}")
+            else:
+                logger.warning("Could not find channel names ('key') in TIF metadata.")
+    except StopIteration:
+        logger.warning(
+            f"No registered TIF file found in {path.parent / f'registered--{roi}'} to read channel names."
+        )
+    except Exception as e:
+        logger.warning(f"Error reading metadata from TIF file: {e}")
+
+    logger.info("Deleting source folders.")
+    all_folders = [f for z_folders in folders_by_z.values() for f in z_folders]
+
+    for folder in all_folders:
+        shutil.rmtree(folder.parent)  # Remove the Z-level parent folder
+
+    # Remove empty Z directories if necessary (walk might not list them if empty)
+    for z_idx in sorted(folders_by_z.keys()):
+        z_dir = path / str(z_idx)
+        if z_dir.exists() and z_dir.is_dir():
+            try:
+                z_dir.rmdir()  # Remove empty directory
+            except OSError:
+                logger.warning(
+                    f"Could not remove directory {z_dir}, might not be empty."
+                )
+
     logger.info("Done.")
 
 
 @stitch.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
+)
 @click.argument("roi", type=str, default="*")
 @click.option(
     "--tile_config",
@@ -583,7 +729,10 @@ def final_stitch(path: Path, n: int):
     logger.info(f"Combining splits of {n} for {path}.")
     import polars as pl
 
-    tcs = [TileConfiguration.from_file(f"{path}/TileConfiguration{i + 1}.registered.txt") for i in range(n)]
+    tcs = [
+        TileConfiguration.from_file(f"{path}/TileConfiguration{i + 1}.registered.txt")
+        for i in range(n)
+    ]
 
     bmin = pl.concat([tc.df.min() for tc in tcs])
     bmax = pl.concat([tc.df.max() for tc in tcs])
@@ -591,7 +740,9 @@ def final_stitch(path: Path, n: int):
     mins = (bmin.min()[0, "y"], bmin.min()[0, "x"])
     maxs = (bmax.max()[0, "y"] + 1024, bmax.max()[0, "x"] + 1024)
 
-    out = np.zeros((n, int(maxs[0] - mins[0] + 1), int(maxs[1] - mins[1] + 1)), dtype=np.uint16)
+    out = np.zeros(
+        (n, int(maxs[0] - mins[0] + 1), int(maxs[1] - mins[1] + 1)), dtype=np.uint16
+    )
 
     for i in range(n):
         img = imread(f"{path}/fused_{i + 1}.tif")
