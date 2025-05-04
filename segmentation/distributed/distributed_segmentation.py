@@ -1,6 +1,7 @@
 import datetime
 import functools
 import getpass
+import json
 import logging
 import os
 import pathlib
@@ -17,6 +18,7 @@ import imagecodecs
 import numpy as np
 import scipy
 import tifffile
+import typer
 import yaml
 import zarr
 from loguru import logger
@@ -975,19 +977,19 @@ def merge_boxes(boxes):
     return box_union
 
 
-# =================== Example Usage ===================
-if __name__ == "__main__":
+app = typer.Typer()
+
+
+@app.command()
+def main(path: Path = typer.Argument(..., help="Path to the folder containing the zarr file.")):
     # ---- 1. Configuration ----
     # path = Path("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA")
-    path = Path("/working/20250421_2956/analysis/deconv/stitch--hippo+polyA")
-    tiff_path = path / "fused.tif"  # <-- SET THIS: Path to your input TIFF file
+    path = Path(path)
     zarr_input_path = path / "fused.zarr"  # Path to store intermediate Zarr
     zarr_output_path = path / "output_segmentation.zarr"  # <-- SET THIS: Path for final segmentation Zarr
 
     # Define block size (e.g., for a 3D image Z, Y, X) - ADJUST TO YOUR DATA AND MEMORY
     # Should be large enough for context but small enough for memory per worker
-
-    processing_blocksize = (30, 512, 512, 2)  # Example for 3D
 
     # Cellpose Model Configuration
     # cellpose_model_kwargs = {
@@ -995,7 +997,6 @@ if __name__ == "__main__":
     #     "pretrained_model_ortho": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/ortho/models/2025-04-14_18-38-00",
     #     "gpu": True,cls=))
     # }
-    import json
 
     config = json.loads((path.parent / "config.json").read_text())
     cellpose_model_kwargs = {
@@ -1025,34 +1026,41 @@ if __name__ == "__main__":
         foreground_mask = tifffile.imread(mask_path) > 0  # Assuming mask is binary or thresholded
 
     # ---- 2. Convert TIFF to Zarr ----
-    print(f"Loading TIFF: {tiff_path}")
-    if not os.path.exists(zarr_input_path):
-        try:
-            image_data = tifffile.imread(tiff_path).transpose(0, 2, 3, 1)
-            print(f"Image loaded. Shape: {image_data.shape}, dtype: {image_data.dtype}")
+    # print(f"Loading TIFF: {tiff_path}")
+    # if not os.path.exists(zarr_input_path):
+    #     try:
+    #         image_data = tifffile.imread(tiff_path).transpose(0, 2, 3, 1)
+    #         print(f"Image loaded. Shape: {image_data.shape}, dtype: {image_data.dtype}")
 
-            # Ensure blocksize matches image dimensions
-            if len(processing_blocksize) != image_data.ndim:
-                raise ValueError(
-                    f"Blocksize dimension {len(processing_blocksize)} != Image dimension {image_data.ndim}"
-                )
+    #         # Ensure blocksize matches image dimensions
+    #         if len(processing_blocksize) != image_data.ndim:
+    #             raise ValueError(
+    #                 f"Blocksize dimension {len(processing_blocksize)} != Image dimension {image_data.ndim}"
+    #             )
 
-            print(f"Converting to Zarr: {zarr_input_path} with chunks={processing_blocksize}")
-            # Use the processing blocksize as the chunk size for the input Zarr
-            input_zarr_array = numpy_array_to_zarr(zarr_input_path, image_data, chunks=processing_blocksize)
-            print("Zarr conversion complete.")
-            del image_data
+    #         print(f"Converting to Zarr: {zarr_input_path} with chunks={processing_blocksize}")
+    #         # Use the processing blocksize as the chunk size for the input Zarr
+    #         input_zarr_array = numpy_array_to_zarr(zarr_input_path, image_data, chunks=processing_blocksize)
+    #         print("Zarr conversion complete.")
+    #         del image_data
 
-        except FileNotFoundError:
-            print(f"Error: Input TIFF file not found at {tiff_path}")
-            exit()
-        except Exception as e:
-            print(f"Error during TIFF loading or Zarr conversion: {e}")
-            exit()
-    else:
-        input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
+    #     except FileNotFoundError:
+    #         print(f"Error: Input TIFF file not found at {tiff_path}")
+    #         exit()
+    #     except Exception as e:
+    #         print(f"Error during TIFF loading or Zarr conversion: {e}")
+    #         exit()
+    # else:
+    input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
 
-    channels = [1, 1]
+    channel_names = ["reddot", "atp"]
+    key = input_zarr_array.attrs["key"]
+    try:
+        channels = [key.index(c) for c in channel_names]
+    except ValueError as e:
+        raise ValueError(f"Channel names {channel_names} not found in {key}")
+
+    processing_blocksize = (input_zarr_array.shape[0], 512, 512, len(channels))  # Example for 3D
     try:
         normalization = json.loads((path / "normalization.json").read_text())
     except FileNotFoundError:
@@ -1066,7 +1074,7 @@ if __name__ == "__main__":
 
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
-        "diameter": 37,  # MUST BE INT <-- SET THIS: Estimated average object diameter in pixels
+        "diameter": 31,  # MUST BE INT <-- SET THIS: Estimated average object diameter in pixels
         "channels": channels,  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
         "batch_size": 24,  # Adjust based on GPU memory (if using GPU)
         # Use Cellpose's internal normalization (or False if pre-normalized)
@@ -1123,3 +1131,7 @@ if __name__ == "__main__":
         #     print(f"Removing intermediate Zarr: {zarr_input_path}")
         #     shutil.rmtree(zarr_input_path)
         print("Script finished.")
+
+
+if __name__ == "__main__":
+    main()
