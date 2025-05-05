@@ -2,6 +2,7 @@
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import chain
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
@@ -9,6 +10,7 @@ import numpy as np
 import pandas as pd
 import rich_click as click
 from loguru import logger
+from PIL import Image
 from tifffile import TiffFile, TiffFileError, imread, imwrite
 
 from fishtools.preprocess.tileconfig import TileConfiguration
@@ -81,7 +83,7 @@ def run_imagej(
     with NamedTemporaryFile("wt") as f:
         f.write(macro)
         f.flush()
-        subprocess.run(
+        proc = subprocess.run(
             f"/home/chaichontat/Fiji.app/ImageJ-linux64 --headless --console -macro {f.name}",
             capture_output=capture_output,
             check=True,
@@ -200,8 +202,6 @@ def register(
     threshold: float = 0.4,
 ):
     base_path = path
-    if roi == "*":
-        rois = sorted(path.glob("*"))
     path = next(path.glob(f"registered--{roi}*"))
     if not path.exists():
         raise ValueError(f"No registered images at {path.resolve()} found.")
@@ -389,6 +389,25 @@ def extract(
         raise Exception(f"Error reading {path}") from e
 
 
+def walk_fused(path: Path):
+    folders_by_z: dict[int, list[Path]] = {}
+    for folder, subfolders, _ in path.walk():
+        if (
+            not subfolders
+            and folder.name.isdigit()
+            and folder.parent.name.isdigit()
+            and not ".zarr" in folder.resolve().as_posix()
+        ):
+            z_idx = int(folder.parent.name)
+            if z_idx not in folders_by_z:
+                folders_by_z[z_idx] = []
+            folders_by_z[z_idx].append(folder)
+
+    if not folders_by_z:
+        raise ValueError(f"No valid Z/C folders found in {path}")
+    return folders_by_z
+
+
 @stitch.command()
 @click.argument(
     "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
@@ -398,6 +417,7 @@ def extract(
     "--tile_config",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
+@click.option("--codebook", type=str)
 @click.option(
     "--split",
     type=int,
@@ -412,11 +432,12 @@ def extract(
 @click.option("--channels", type=str, default="all")
 @click.option("--max-proj", is_flag=True)
 @click.option("--debug", is_flag=True)
-@click.option("--skip-extract", is_flag=True)
-@batch_roi("stitch--*")
+# @click.option("--skip-extract", is_flag=True)
+@batch_roi("registered--*", include_codebook=True, split_codebook=True)
 def fuse(
     path: Path,
     roi: str,
+    codebook: str,
     *,
     tile_config: Path | None = None,
     split: int = 1,
@@ -428,13 +449,13 @@ def fuse(
     subsample_z: int = 1,
     max_proj: bool = False,
     debug: bool = False,
-    skip_extract: bool = False,
+    # skip_extract: bool = False,
 ):
     if "--" in path.as_posix():
         raise ValueError("Please be in the workspace folder.")
 
-    path_img = path / f"registered--{roi}"
-    path = path / f"stitch--{roi}"
+    path_img = path / f"registered--{roi}+{codebook}"
+    path = path / f"stitch--{roi}+{codebook}"
     files = sorted(path_img.glob("*.tif"))
     if not len(files):
         raise ValueError(f"No images found at {path_img.resolve()}")
@@ -461,11 +482,31 @@ def fuse(
     needed = set(tileconfig.df["index"])
 
     if len(needed & imgs) != len(needed):
-        raise ValueError(
-            f"Not all images are present in {path_img}. Missing: {needed - imgs}"
+        tileconfig = tileconfig.drop(list(needed - imgs))
+        logger.warning(
+            f"Not all images are present in {path_img}. Missing: {needed - imgs}. Dropping."
         )
+        # raise ValueError(f"Not all images are present in {path_img}. Missing: {needed - imgs}")
 
-    if not skip_extract:
+    skip_extract = True
+    correct_count = len(list(path_img.glob("reg*.tif")))
+    print(correct_count)
+    try:
+        folders = list(chain.from_iterable(walk_fused(path).values()))
+    except ValueError:
+        skip_extract = False
+    else:
+        for folder in folders:
+            if (
+                _cnt := len([p for p in folder.glob("*.tif") if p.stem.isdigit()])
+            ) != correct_count:
+                logger.info(
+                    f"Incorrect number of files in {folder} ({_cnt} != {correct_count}). Running extract."
+                )
+                skip_extract = False
+                break
+
+    if overwrite or not skip_extract:
         logger.info(
             f"Found {len(files)} files. Extracting channel {channels} to {path}"
         )
@@ -503,13 +544,7 @@ def fuse(
             )
 
     # Get all folders without subfolders
-    folders = [
-        folder
-        for folder, subfolders, _ in (path.parent / f"stitch--{roi}").walk()
-        if not subfolders
-        and not folder.name.endswith(".zarr")
-        and not ".zarr" in folder.resolve().as_posix()
-    ]
+    folders = list(chain.from_iterable(walk_fused(path).values()))
 
     logger.info(f"Calling ImageJ on {len(folders)} folders.")
     with progress_bar_threadpool(
@@ -558,29 +593,15 @@ def numpy_array_to_zarr[*Ts](
     "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
 )
 @click.argument("roi", type=str)
+@click.option("--codebook", type=str)
 @click.option("--chunk-size", type=int, default=2048)
-@batch_roi("stitch--*")
-def combine(path: Path, roi: str, chunk_size: int = 2048):
+@batch_roi("stitch--*", include_codebook=True, split_codebook=True)
+def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048):
     import zarr
 
-    path = Path(path / f"stitch--{roi}")
+    path = Path(path / f"stitch--{roi}+{codebook}")
     # Group folders by Z index (parent directory name)
-    folders_by_z = {}
-    for folder, subfolders, _ in path.walk():
-        if (
-            not subfolders
-            and folder.name.isdigit()
-            and folder.parent.name.isdigit()
-            and not ".zarr" in folder.resolve().as_posix()
-        ):
-            z_idx = int(folder.parent.name)
-            if z_idx not in folders_by_z:
-                folders_by_z[z_idx] = []
-            folders_by_z[z_idx].append(folder)
-
-    if not folders_by_z:
-        raise ValueError(f"No valid Z/C folders found in {path}")
-
+    folders_by_z = walk_fused(path)
     # Sort folders within each Z index by C index (folder name)
     for z_idx in folders_by_z:
         folders_by_z[z_idx].sort(key=lambda f: int(f.name))
@@ -619,17 +640,25 @@ def combine(path: Path, roi: str, chunk_size: int = 2048):
 
     z_plane_data = np.zeros((img_shape[0], img_shape[1], cs), dtype=dtype)
 
+    # Create thumbnail directory
+    thumbnail_dir = path / "thumbnails"
+    thumbnail_dir.mkdir(exist_ok=True)
+
     with progress_bar(len(folders_by_z)) as progress:
         for i in sorted(folders_by_z.keys()):
-            logger.info(f"Processing Z-plane {i + 1}/{zs}")
             z_plane_folders = folders_by_z[i]
-
+            thumbnail_data = None
             for folder in z_plane_folders:
                 j = int(folder.name)
                 try:
                     img = imread(folder / f"fused_{folder.name}-1.tif")
                     # Write into the C dimension of the current Z-plane array
                     z_plane_data[:, :, j] = img[:, :]
+                    if thumbnail_data is None:
+                        thumbnail_data = np.zeros(
+                            (img.shape[0], img.shape[1], 3), dtype=np.uint16
+                        )
+                    thumbnail_data[:, :, j] = img[:, :]
                     del img
                 except FileNotFoundError:
                     raise FileNotFoundError(
@@ -640,13 +669,27 @@ def combine(path: Path, roi: str, chunk_size: int = 2048):
                         f"Error reading {folder / f'fused_{folder.name}-1.tif'}"
                     ) from e
 
-            logger.info(f"Writing Z-plane {i} to Zarr array")
+            logger.info(f"Writing Z-plane {i}/{zs - 1} to Zarr array")
             z_array[i, :, :, :] = z_plane_data
+
+            if i % 8 == 0:
+                assert thumbnail_data is not None
+
+                # Save as PNG
+                thumbnail_img = Image.fromarray(
+                    (thumbnail_data[::8, ::8] >> 10).astype(np.uint8), mode="RGB"
+                )
+                thumbnail_path = thumbnail_dir / f"thumbnail_z{i:03d}.png"
+                thumbnail_img.save(thumbnail_path)
+                logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
+
             progress()
 
     # Add metadata (channel names)
     try:
-        first_reg_file = next((path.parent / f"registered--{roi}").glob("*.tif"))
+        first_reg_file = next(
+            (path.parent / f"registered--{roi}+{codebook}").glob("*.tif")
+        )
         with TiffFile(first_reg_file) as tif:
             # Attempt to get channel names, handle potential errors
             names = tif.shaped_metadata[0].get("key") if tif.shaped_metadata else None
@@ -666,19 +709,11 @@ def combine(path: Path, roi: str, chunk_size: int = 2048):
     all_folders = [f for z_folders in folders_by_z.values() for f in z_folders]
 
     for folder in all_folders:
-        shutil.rmtree(folder.parent)  # Remove the Z-level parent folder
-
-    # Remove empty Z directories if necessary (walk might not list them if empty)
-    for z_idx in sorted(folders_by_z.keys()):
-        z_dir = path / str(z_idx)
-        if z_dir.exists() and z_dir.is_dir():
-            try:
-                z_dir.rmdir()  # Remove empty directory
-            except OSError:
-                logger.warning(
-                    f"Could not remove directory {z_dir}, might not be empty."
-                )
-
+        try:
+            shutil.rmtree(folder.parent)  # Remove the Z-level parent folder
+        except FileNotFoundError:
+            # Can happen since some folder in all_folders are subdirectories of others
+            ...
     logger.info("Done.")
 
 

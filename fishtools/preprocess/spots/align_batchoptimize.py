@@ -16,7 +16,7 @@ from loguru import logger
 @click.option("--threads", type=int, default=10)
 @click.option("--batch-size", type=int, default=50)
 @click.option("--max-proj", is_flag=True)
-def run(
+def optimize(
     path: Path,
     codebook_path: Path,
     rounds: int = 10,
@@ -59,9 +59,9 @@ def run(
         # Increases global scale count
         subprocess.run(
             [
-                "python",
-                Path(__file__).parent / "align_prod.py",
-                "optimize",
+                "preprocess",
+                "spots",
+                "step-optimize",
                 str(path),
                 "--codebook",
                 codebook_path,
@@ -79,8 +79,8 @@ def run(
 
         subprocess.run(
             [
-                "python",
-                Path(__file__).parent / "align_prod.py",
+                "preprocess",
+                "spots",
                 "combine",
                 str(path),
                 "--codebook",
@@ -95,8 +95,8 @@ def run(
         # Increases percentiles count
         subprocess.run(
             [
-                "python",
-                Path(__file__).parent / "align_prod.py",
+                "preprocess",
+                "spots",
                 "find-threshold",
                 str(path),
                 "--codebook",

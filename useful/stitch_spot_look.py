@@ -13,6 +13,7 @@ from loguru import logger
 from tifffile import TiffFile, imread
 
 from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.utils.io import Workspace
 
 # path = Path("/working/20250229_2242_2/analysis/deconv")
 # codebook = "morris"
@@ -21,32 +22,38 @@ from fishtools.preprocess.tileconfig import TileConfiguration
 
 path = Path("/working/20250317_benchmark_mousecommon/analysis/deconv")
 codebook = "mousecommon"
-roi = f"left+{codebook}"
+ws = Workspace(path)
+ROIS = ws.rois
 
 # Baysor
 # spots.filter(
 #             pl.col("area").is_between(18, 50) & pl.col("norm").gt(0.03)
 #         ).select("x", "y", "z", gene=pl.col("target").str.split("-").list.get(0)).write_csv(path / "leftcortex.csv")
 
-first = next((path / f"registered--{roi}").glob("*.tif"))
-with TiffFile(first) as tif:
-    names = tif.shaped_metadata[0]["key"]
-    mapping = dict(zip(names, range(len(names))))
+spots = []
+for roi in ROIS:
+    first = next((path / f"registered--{roi}+{codebook}").glob("*.tif"))
+    with TiffFile(first) as tif:
+        names = tif.shaped_metadata[0]["key"]
+        mapping = dict(zip(names, range(len(names))))
 
-print(mapping)
-# pick = 100
-# path = list((path / f"registered--{roi}" / f"decoded-{codebook}").glob("*.pkl"))[pick]
-# spots = load_spots(path, idx=0, filter_=True).with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
-spots_path = path / f"registered--{roi}" / f"decoded-{codebook}" / "spots.parquet"
-spots = (
-    pl.scan_parquet([spots_path])
-    .with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
-    # .filter(pl.col("x").gt(7000) & pl.col("y").lt(-7500))
-    .collect()
-)
-print(datetime.fromtimestamp(spots_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"))
-sns.set_theme()
-print(len(spots))
+    print(mapping)
+    # pick = 100
+    # path = list((path / f"registered--{roi}" / f"decoded-{codebook}").glob("*.pkl"))[pick]
+    # spots = load_spots(path, idx=0, filter_=True).with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
+    spots_path = path / f"registered--{roi}+{codebook}" / f"decoded-{codebook}" / "spots.parquet"
+    spots.append(
+        (
+            pl.scan_parquet([spots_path])
+            .with_columns(is_blank=pl.col("target").str.starts_with("Blank"), roi=pl.lit(roi))
+            # .filter(pl.col("x").gt(7000) & pl.col("y").lt(-7500))
+            .collect()
+        )
+    )
+    print(datetime.fromtimestamp(spots_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"))
+    sns.set_theme()
+    print(len(spots[-1]))
+spots = pl.concat(spots)
 # %%
 # spots = spots_ok
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
@@ -66,7 +73,7 @@ def count_by_gene(spots: pl.DataFrame):
 
 
 # pergene = count_by_gene(spots)
-spots_ = spots.filter(pl.col("area").is_between(8, 100))
+spots_ = spots.filter(pl.col("area").is_between(10, 200))
 
 
 # %%
@@ -97,9 +104,9 @@ spots_ = spots.filter(pl.col("area").is_between(8, 100))
 spots_ = (
     spots_.with_columns(
         x_=(pl.col("area")) ** (1 / 3) + np.random.uniform(-0.75, 0.75, size=len(spots_)),
-        y_=pl.col("norm").log10(),
-    ).filter(pl.col("y_").gt(-1.8))  # & pl.col("x_").lt(3))
-    # .filter(pl.col("z") < 5)
+        y_=(pl.col("norm") * (1 - pl.col("distance"))).log10(),
+    )
+    # .filter(pl.col("y") > -1.8)
 )
 # sns.catplot(
 #     data=spots_.group_by(pl.col("z").round(), pl.col("is_blank")).len(),
@@ -109,6 +116,87 @@ spots_ = (
 #     kind="bar",
 #     log_scale=True,
 # )
+
+# %%
+# with TiffFile(path / f"stitch--br+atp/fused.tif") as tif:
+#     img = tif.asarray()
+#     meta = tif.shaped_metadata[0]
+#     print(meta)
+# %%
+# # spots_ok.filter(pl.col("target").eq("Blank-14")).group_by("tile").len().sort("len")
+# fig, axs = plt.subplots(ncols=2, figsize=(8, 4), dpi=200)
+# axs[0].imshow(img[:, int(meta["key"].index("17"))][4:8].max(axis=0)[:1024, :1024], zorder=1)
+
+# assert len(selected)
+# axs[0].scatter(selected["x_local"], selected["y_local"], s=20, alpha=1)
+
+# axs[1].imshow(img[:, int(meta["key"].index("17"))][4:8].max(axis=0)[:1024, :1024], zorder=1)
+# # %%
+
+
+# def plot_blank(img, selected, name, cb, margin=51):
+#     bits = sorted(cb[name])
+#     n_spots = len(selected)
+
+#     # Calculate grid dimensions
+#     n_cols = len(bits)
+#     n_rows = n_spots
+
+#     fig, axs = plt.subplots(
+#         ncols=n_cols, nrows=n_rows, figsize=(4 * n_cols, 4 * n_rows), dpi=200, facecolor="black"
+#     )
+
+#     # Handle single row case
+#     if n_rows == 1:
+#         axs = axs.reshape(1, -1)
+
+#     windows = []
+#     for spot_idx, spot in enumerate(selected):
+#         z, y, x = spot
+#         spot_windows = []
+
+#         for bit_idx, u in enumerate(bits):
+#             ax = axs[spot_idx, bit_idx]
+#             ax.axis("off")
+#             raw_bit = int(meta["key"].index(str(u)))
+
+#             window = img[
+#                 int(z), raw_bit, int(y) - margin : int(y) + margin, int(x) - margin : int(x) + margin
+#             ]
+#             spot_windows.append(window)
+
+#             ax.imshow(window, zorder=1, vmax=np.percentile(img[int(z), raw_bit], 99.99))
+#             ax.axhline(margin, color="red", alpha=0.5)
+#             ax.axvline(margin, color="red", alpha=0.5)
+#             ax.set_title(f"Spot {spot_idx + 1}, Bit {u}", color="white")
+
+#         windows.append(spot_windows)
+
+#     # Remove empty axes
+#     for ax in axs.flat:
+#         if not ax.has_data():
+#             fig.delaxes(ax)
+
+#     plt.tight_layout()
+#     return windows
+
+
+# selected = spots_ok.filter(
+#     pl.col("target").str.starts_with("Clu") & pl.col("z").is_between(4, 8) & pl.col("tile").eq("0043")
+# )
+# assert len(selected)
+
+# windows = plot_blank(
+#     img,
+#     selected[["z", "y_local", "x_local"]][:8].to_numpy(),  # Pass all selected rows
+#     selected[0, "target"],  # Pass target name
+#     cb_raw,
+#     margin=21,
+# )
+# print(f"dist={want.coords['distance'].item():.3f}, norm={norm:.4f}")
+# want_bits = sorted(cb[want.coords["target"].item()])
+# print(want.coords["target"].item(), want_bits)
+
 
 # %%
 
@@ -131,7 +219,7 @@ result = (
         ((pl.col("y_") - bounds["y_min"]) / step_y).floor().alias("j"),
     ])
     .filter((pl.col("i") >= 0) & (pl.col("i") < n - 1) & (pl.col("j") >= 0) & (pl.col("j") < n - 1))
-    .filter(pl.col("target").is_in(["Blank-1"]).not_())
+    # .filter(pl.col("target").is_in(["Blank-1"]).not_())
     .group_by(["i", "j"])
     .agg([pl.sum("is_blank").alias("blank_count"), pl.len().alias("total_count")])
     .with_columns((pl.col("blank_count") / (pl.col("total_count") + 1)).alias("proportion"))
@@ -143,34 +231,15 @@ for row in result.iter_rows(named=True):
     Z[int(row["j"]), int(row["i"])] = row["proportion"]  # * np.log1p(row["total_count"])
 from scipy.ndimage import gaussian_filter
 
-Z_smooth = gaussian_filter(Z, sigma=3)
-plt.pcolormesh(X, Y, Z)
-contours = plt.contour(X, Y, Z_smooth, colors="white", levels=50)  # Add line contours
-plt.colorbar()
+Z_smooth = gaussian_filter(Z, sigma=4)
+fig, axs = plt.subplots(ncols=2, nrows=1, figsize=(8, 4), dpi=200)
+for ax in axs.flat:
+    ax.pcolormesh(X, Y, Z_smooth)
+contours = axs[1].contour(X, Y, Z_smooth, colors="white", levels=50, alpha=0.8)  # Add line contours
+plt.colorbar(axs[1].get_children()[0])
 
 # %%
 
-# result = (
-#     spots_.with_columns([
-#         ((pl.col("x_") - bounds["x_min"]) / step_x).floor().alias("i"),
-#         ((pl.col("y_") - bounds["y_min"]) / step_y).floor().alias("j"),
-#     ])
-#     .filter((pl.col("i") >= 0) & (pl.col("i") < n - 1) & (pl.col("j") >= 0) & (pl.col("j") < n - 1))
-#     .group_by(["i", "j"])
-#     .agg([pl.count().alias("total_count")])
-#     .with_columns((pl.col("total_count") + 1).alias("proportion"))
-# )
-
-# # Convert to numpy array
-# Z = np.zeros_like(X)
-# for row in result.iter_rows(named=True):
-#     Z[int(row["j"]), int(row["i"])] = row["proportion"]  # * np.log1p(row["total_count"])
-# from scipy.ndimage import gaussian_filter
-
-# Z_smooth = gaussian_filter(Z, sigma=3)
-# plt.pcolormesh(X, Y, Z)
-# contours = plt.contour(X, Y, Z_smooth, colors="black", levels=50)  # Add line contours
-# plt.colorbar()
 
 # %%
 
@@ -194,34 +263,43 @@ def filter_threshold(thr: int):
 
 # %%
 x, y = [], []
-for i in range(1, 15):
+max_calc = 15
+for i in range(1, max_calc, 2):
     print(i, end=" ")
     sp = filter_threshold(i)
     x.append(len(sp))
     y.append(sp.filter(pl.col("is_blank")).__len__() / len(sp))
 
 fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
-ax.plot(list(range(1, 15)), x, "g", label="spots")
+ax.plot(list(range(1, max_calc, 2)), x, "g", label="spots")
 ax2 = ax.twinx()
-ax2.plot(list(range(1, 15)), y, "r", label="blank")
+ax2.plot(list(range(1, max_calc, 2)), y, "r", label="blank")
 ax.set_ylim(0, None)
 ax.legend()
 # %%
 
-spots_ok = filter_threshold(4)  # .filter(pl.col("norm").gt(-1) & pl.col("z").lt(6))
-# spots_ok = spots.filter(pl.col("area").is_between(15, 60) & pl.col("norm").gt(0.1))
-fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
+spots_ok = filter_threshold(3)  # .filter(pl.col("norm").gt(-1) & pl.col("z").lt(6))
+# spots_ok = spots.filter(pl.col("area").is_between(9, 60) & pl.col("norm").gt(0.08))
+fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(10, 10), dpi=200)
 filtered = spots_ok  # .filter(pl.col("z").is_between(12, 18))
 ax.scatter(filtered["x"][::20], filtered["y"][::20], s=0.1, alpha=0.3)
 ax.set_aspect("equal")
 ax.axis("off")
-tf = TileConfiguration.from_file(path / f"stitch--{roi.split('+')[0]}" / "TileConfiguration.registered.txt")
+tf = TileConfiguration.from_file(path / f"stitch--{ROIS[0]}" / "TileConfiguration.registered.txt")
 
-# fig, ax = plt.subplots(dpi=300, figsize=(6, 6))
+# Set axis limits based on filtered data
+x_min, x_max = filtered["x"].min(), filtered["x"].max()
+y_min, y_max = filtered["y"].min(), filtered["y"].max()
+ax.set_xlim(x_min, x_max)
+ax.set_ylim(y_min, y_max)
+
 for row in tf.df.iter_rows(named=True):
-    # ax.scatter(row["x"], row["y"], s=0.1)
-    ax.text(row["x"] + 1988 / 2, row["y"] + 1988 / 2, str(row["index"]), fontsize=8, ha="center", va="center")
+    text_x = row["x"] + 1968 / 2
+    text_y = row["y"] + 1968 / 2
+    if x_min <= text_x <= x_max and y_min <= text_y <= y_max:
+        ax.text(text_x, text_y, str(row["index"]), fontsize=5, ha="center", va="center")
 ax.set_aspect("equal")
+
 # %%
 # density_result = (
 #     spots_.with_columns([
@@ -275,14 +353,28 @@ cb = (
 )
 
 joined = spots_ok.join(cb, left_on="target", right_on="gene", how="left")
+for roi in ROIS:
+    print(f"Saving {roi}")
+    spots_ok.filter(pl.col("roi").eq(roi)).with_row_index().write_parquet(path / f"{roi}+{codebook}.parquet")
+# %%
+# %% Blank abundance
 
-spots_ok.filter(~pl.col("is_blank")).write_parquet(path / f"{codebook}--{roi}.parquet")
+joined.group_by("target").len().join(cb, left_on="target", right_on="gene", how="left").filter(
+    pl.col("is_blank")
+).sort("len", descending=True)
+
+# %%
+
+joined.join(cb, left_on="target", right_on="gene", how="left").group_by(pl.col("z").round()).agg(
+    n=pl.col("is_blank").sum(), blank=pl.col("is_blank").sum() / pl.len()
+).sort("z")
+
 
 # %%
 if codebook == "tricycleplus":
     genes = ["Ccnd3", "Cdc45", "Top2a", "Pou3f2", "Cenpa", "Hells"]
 else:
-    genes = ["Tbr1", "Bcl11b", "Fezf2", "Neurod6", "Notch1", "Notch2", "Gad2", "Hes5"]
+    genes = ["Tbr1", "Bcl11b", "Fezf2", "Cux2", "Notch1", "Notch2", "Gad2", "Hes5"]
 fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
 
 for ax, gene in zip(axs.flat, genes):
@@ -299,8 +391,19 @@ for ax in axs.flat:
     if not ax.has_data():
         fig.delaxes(ax)
 # %%
-
-
+fig, ax = plt.subplots(figsize=(4, 6), dpi=200)
+colors = ["red", "green", "blue", "orange", "gray", "yellow", "brown", "pink", "gray", "cyan", "black"]
+genes = ["Drd1", "Gad2", "Pdgfra", "Gad1"]
+for gene, c in zip(genes, colors):
+    selected = spots_.filter(pl.col("target").str.starts_with(gene))
+    if not len(selected):
+        raise ValueError(f"No spots found for {gene}")
+    # ax.set_title(gene, fontsize=16, color="white")
+    # ax.hexbin(selected["x"], -selected["y"], gridsize=400, cmap="magma")
+    # ax.scatter(selected["x"], selected["y"], s=3000 / len(selected), alpha=0.3, color=c)
+    ax.scatter(selected["y"], selected["x"], s=20000 / len(selected), alpha=0.2, color=c, linewidths=0)
+ax.set_aspect("equal")
+ax.axis("off")
 # %%
 
 # %%
@@ -350,14 +453,13 @@ def plot_target_locations(
     if figsize is None:
         figsize = (6 * ncols, 6 * nrows)
 
-    with sns.axes_style("white"):
         fig, axs = plt.subplots(ncols=ncols, nrows=nrows, figsize=figsize, dpi=dpi)
         if n_plots == 1:
             axs = np.array([axs])
         axs = axs.flatten()
 
         for i, target in enumerate(targets):
-            filtered = spots_ok.filter(pl.col("target") == target)
+            filtered = spots_ok.filter(pl.col("target").str.starts_with(target))
             axs[i].scatter(
                 spots_ok["x"][::downsample],
                 spots_ok["y"][::downsample],
@@ -366,7 +468,7 @@ def plot_target_locations(
                 color="gray",
             )
             axs[i].scatter(filtered["x"], filtered["y"], s=target_size, alpha=target_alpha, color="magenta")
-            axs[i].set_title(target, fontsize=16)
+            axs[i].set_title(target, fontsize=18)
             axs[i].set_aspect("equal")
 
             axs[i].set_frame_on(False)
@@ -383,20 +485,24 @@ def plot_target_locations(
 
 plot_target_locations(
     spots_ok,  # .filter(pl.col("x").gt(-22000)),
-    ["Btg2-201"],
+    # ["O"],
+    ["HSPA1A", "CALM1", "PPIA", "SLC17A7", "GAD1"],
     target_size=2,
-    target_alpha=0.4,
-    # ["Och.9014.1", "Och.22255.1", "Och.17984.1", "Och.13692.1", "Och.622.1"],
+    background_alpha=0.1,
+    target_alpha=0.1,
 )
 
 
 # %%
 plot = 1
 dark = True
+only_blank = False
 if plot:
     # spots_ = spots_.filter(pl.col("ok"))
-    genes = spots_ok.group_by("target").len().sort("len", descending=True)["target"]
-    genes = sorted(set(spots_["target"]))
+    # genes = spots_ok.group_by("target").len().sort("len", descending=True)["target"]
+
+    genes = filter(lambda x: x.startswith("Blank"), genes) if only_blank else spots_["target"]
+    genes = sorted(set(genes))
     dark = False
     nrows = int(np.ceil(len(genes) / 20))
     fig, axs = plt.subplots(
@@ -424,11 +530,7 @@ if plot:
 # %%
 
 np.array(np.unique(np.array(cb.filter(pl.col("is_blank"))["bits"].to_list()).flatten(), return_counts=True))
-# %% Blank abundance
 
-joined.group_by("target").len().join(cb, left_on="target", right_on="gene", how="left").filter(
-    pl.col("is_blank")
-).sort("len", descending=True)
 # %%
 
 
@@ -461,25 +563,15 @@ plt.tight_layout()
 
 
 # %%
-# Check for spot distribution in each bit across the whole image.
-fig, axs = plt.subplots(ncols=3, nrows=5, figsize=(12, 16), dpi=100)
-axs = axs.flatten()
-for i, (ax, bit) in enumerate(zip(axs, bits)):
-    filtered = joined.filter(pl.col("bits").list.contains(bit))
-    ax.axis("off")
-    ax.set_aspect("equal")
-    ax.set_title(f"{bit}")
-    ax.scatter(filtered["x"][::50], filtered["y"][::50], s=0.3, alpha=0.1)
-plt.tight_layout()
 
 # Check for spot distribution in each channel across the whole image.
 fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200)
 axs = axs.flatten()
-for i, (ax) in enumerate(axs):
+for i, (ax, chan) in enumerate(zip(axs, ["560", "650", "750"])):
     filtered = joined.filter(pl.col("bits").list.eval(pl.element().is_between(8 * i, 8 * (i + 1))).list.all())
     ax.axis("off")
     ax.set_aspect("equal")
-    ax.set_title(f"{i}")
+    ax.set_title(chan)
     ax.scatter(filtered["x"], filtered["y"], s=0.2, alpha=0.1)
 plt.tight_layout()
 # %%
@@ -511,7 +603,7 @@ plt.tight_layout()
 
 # %%
 # %%
-img = imread(path / f"stitch--{roi}" / "fused.tif").max(axis=0)
+img = imread(path / f"stitch--{ROI}" / "fused.tif").max(axis=0)
 # %%
 
 fig, axs = plt.subplots(ncols=4, nrows=1, figsize=(8, 4), dpi=300, facecolor="black")
@@ -538,7 +630,7 @@ fig, ax = plt.subplots(figsize=(12, 8), dpi=200)
 
 coords = TileConfiguration.from_file(
     # Path(path.parent / f"fids--{roi}" / "TileConfiguration.registered.txt")
-    Path(path / f"stitch--{roi.split('+')[0]}" / "TileConfiguration.registered.txt")
+    Path(path / f"stitch--{ROI.split('+')[0]}" / "TileConfiguration.registered.txt")
 )
 coords.plot(ax=ax)
 

@@ -20,8 +20,7 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 import xarray as xr
-from cupy_backends.cuda.api.runtime import CUDARuntimeError
-from cuvs.neighbors import brute_force
+
 from loguru import logger
 from semantic_version import Version
 from slicedimage.io import resolve_path_or_url
@@ -539,45 +538,48 @@ class Codebook(xr.DataArray):
         This function does not verify that the intensities have been normalized.
 
         """
+        from cupy_backends.cuda.api.runtime import CUDARuntimeError
+        from cuvs.neighbors import brute_force
+
         linear_codes = norm_codes.stack(traces=(Axes.CH.value, Axes.ROUND.value)).values
         linear_features = norm_intensities.stack(traces=(Axes.CH.value, Axes.ROUND.value)).values
         cp.cuda.set_allocator(None)  # Disable memory pooling, saves some memory
 
         dataset_norm_cp = cp.asarray(linear_codes, dtype=cp.float32)
-        while True:
-            try:
-                index = brute_force.build(dataset_norm_cp, metric=metric)
-                all_distances = np.empty(linear_features.shape[0], dtype=np.float32)
-                all_neighbors = np.empty(linear_features.shape[0], dtype=np.uint32)
-                SPLIT = 4
-                batch_size = linear_features.shape[0] // SPLIT
-                frame_cp = cp.empty(
-                    (batch_size, linear_features.shape[1]),
-                    dtype=cp.float32,
-                )
-                for i in range(SPLIT):
-                    start_idx = i * batch_size
-                    end_idx = (i + 1) * batch_size
+        # while True:
+        # try:
+        index = brute_force.build(dataset_norm_cp, metric=metric)
+        all_distances = np.empty(linear_features.shape[0], dtype=np.float32)
+        all_neighbors = np.empty(linear_features.shape[0], dtype=np.uint32)
+        SPLIT = 4
+        batch_size = linear_features.shape[0] // SPLIT
+        frame_cp = cp.empty(
+            (batch_size, linear_features.shape[1]),
+            dtype=cp.float32,
+        )
+        for i in range(SPLIT):
+            start_idx = i * batch_size
+            end_idx = (i + 1) * batch_size
 
-                    # Convert current frame to cupy array
-                    frame_cp[:] = cp.asarray(linear_features[start_idx:end_idx], dtype=cp.float32)
+            # Convert current frame to cupy array
+            frame_cp[:] = cp.asarray(linear_features[start_idx:end_idx], dtype=cp.float32)
 
-                    # Perform search for current frame
-                    distances_cp, neighbors_cp = brute_force.search(index, frame_cp, 1)
+            # Perform search for current frame
+            distances_cp, neighbors_cp = brute_force.search(index, frame_cp, 1)
 
-                    # Store results directly in pre-allocated arrays
-                    all_distances[start_idx:end_idx] = cp.asnumpy(distances_cp).ravel()
-                    all_neighbors[start_idx:end_idx] = cp.asnumpy(neighbors_cp).ravel()
+            # Store results directly in pre-allocated arrays
+            all_distances[start_idx:end_idx] = cp.asnumpy(distances_cp).ravel()
+            all_neighbors[start_idx:end_idx] = cp.asnumpy(neighbors_cp).ravel()
 
-                del frame_cp, distances_cp, neighbors_cp  # type: ignore
+        del frame_cp, distances_cp, neighbors_cp  # type: ignore
 
-                metric_output = all_distances.reshape(-1, 1)
-                gene_ids = np.ravel(norm_codes.indexes[Features.TARGET].values[all_neighbors])
+        metric_output = all_distances.reshape(-1, 1)
+        gene_ids = np.ravel(norm_codes.indexes[Features.TARGET].values[all_neighbors])
 
-                return np.ravel(metric_output), gene_ids
-            except (cp.cuda.memory.OutOfMemoryError, CUDARuntimeError):
-                logger.warning("MemoryError: Retrying")
-                time.sleep(1)
+        return np.ravel(metric_output), gene_ids
+        # except (cp.cuda.memory.OutOfMemoryError, CUDARuntimeError):
+        #     logger.warning("MemoryError: Retrying")
+        #     time.sleep(1)
 
     def _validate_decode_intensity_input_matches_codebook_shape(
         self,

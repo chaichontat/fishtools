@@ -32,6 +32,7 @@ from fishtools.preprocess.config import (
     RegisterConfig,
 )
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
+from fishtools.utils.io import Workspace
 from fishtools.utils.pretty_print import progress_bar_threadpool
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
@@ -735,25 +736,31 @@ def run(
 @click.option("--fwhm", type=float, default=4, help="FWHM value")
 @click.option("--threshold", type=float, default=6, help="Threshold value")
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
-def batch(path: Path, ref: str, codebook: str, fwhm: int, threshold: int, threads: int):
+@click.option("--overwrite", is_flag=True)
+def batch(path: Path, ref: str, codebook: Path, fwhm: int, threshold: int, threads: int, overwrite: bool):
     idxs = None
     use_custom_idx = idxs is not None
-    rois = sorted({
-        p.name.split("--")[1].split("+")[0] for p in path.iterdir() if p.is_dir() and "--" in p.name
-    })
+    ws = Workspace(path.parent.parent)
+    print(ws.rois)
 
-    for roi in rois:
+    for roi in ws.rois:
         if not use_custom_idx:
-            idxs = sorted({int(name.stem.split("-")[1]) for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")})
+            idxs = sorted({
+                int(name.stem.split("-")[1])
+                for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")
+                if overwrite
+                or not (
+                    path / f"registered--{roi}+{codebook.stem}/reg-{name.stem.split('-')[1]}.tif"
+                ).exists()
+            })
             print(len(idxs))
 
         if not idxs:
             raise ValueError(f"No images found for {ref}--{roi}")
 
         with progress_bar_threadpool(len(idxs), threads=threads) as submit:
-            futs = []
             for i in idxs:
-                fut = submit(
+                submit(
                     subprocess.run,
                     [
                         "preprocess",
@@ -767,14 +774,10 @@ def batch(path: Path, ref: str, codebook: str, fwhm: int, threshold: int, thread
                         "--reference",
                         ref,
                         f"--roi={roi}",
-                        # "--overwrite",
+                        *(["--overwrite"] if overwrite else []),
                     ],
                     check=True,
                 )
-                futs.append(fut)
-
-            for fut in as_completed(futs):
-                fut.result()
 
 
 register.add_command(batch)

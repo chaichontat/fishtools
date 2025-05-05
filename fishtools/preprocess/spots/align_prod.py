@@ -9,7 +9,6 @@ import sys
 import threading
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from itertools import chain, groupby
 from pathlib import Path
@@ -39,10 +38,13 @@ from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread
 
 from fishtools.preprocess.addition import ElementWiseAddition
-from fishtools.utils.pretty_print import progress_bar
+from fishtools.utils.pretty_print import progress_bar_threadpool
 from fishtools.utils.utils import git_hash
 
-GPU = os.environ.get("GPU", 0) == "1"
+from .align_batchoptimize import optimize
+from .stitch_spot_prod import stitch
+
+GPU = os.environ.get("GPU", "1") == "1"
 if GPU:
     logger.info("Using GPU")
     from fishtools.gpu.codebook import Codebook
@@ -55,14 +57,14 @@ class DecodeConfig(BaseModel):
     model_config = {"frozen": True}
 
     max_distance: float = 0.3
-    min_intensity: float = 0.00125
-    min_area: int = 8
+    min_intensity: float = 0.0012
+    min_area: int = 10
     max_area: int = 200
     use_correct_direction: bool = True
 
 
 OPTIMIZE_CONFIG = DecodeConfig(
-    min_intensity=0.0075, max_distance=0.3, min_area=15, max_area=200, use_correct_direction=True
+    min_intensity=0.012, max_distance=0.3, min_area=20, max_area=200, use_correct_direction=True
 )
 
 
@@ -75,7 +77,8 @@ def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = F
             # ! Normalize to 1. Any operations done after this WILL be clipped in [0, 1].
             img = imread(path).astype(np.float32)[sl] / 65535
     except tifffile.TiffFileError:
-        raise Exception(f"{path} is corrupted. Please delete it and try again.")
+        path.unlink()
+        raise Exception(f"{path} is corrupted. Deleted. Please rerun register")
 
     class DemoFetchedTile(FetchedTile):
         def __init__(self, z, chs, *args, **kwargs):
@@ -222,7 +225,7 @@ def load_codebook(
 
 
 @click.group()
-def cli(): ...
+def spots(): ...
 
 
 def _batch(
@@ -245,22 +248,16 @@ def _batch(
     if not len(paths):
         raise ValueError("No files found.")
 
-    with progress_bar(len(paths) * len(split)) as callback, ThreadPoolExecutor(threads) as exc:
-        futs = []
+    with progress_bar_threadpool(len(paths) * len(split), threads=threads, stop_on_exception=False) as submit:
         for path in paths:
             for s in split:
-                futs.append(
-                    exc.submit(
-                        subprocess.run,
-                        ["python", __file__, mode, str(path), *[a for a in args if a]]
-                        + (["--split", str(s)] if s is not None else []),
-                        check=True,
-                        capture_output=False,
-                    )
+                submit(
+                    subprocess.run,
+                    ["python", __file__, mode, str(path), *[a for a in args if a]]
+                    + (["--split", str(s)] if s is not None else []),
+                    check=True,
+                    capture_output=False,
                 )
-
-        for _ in as_completed(futs):
-            callback()
 
 
 def sample_imgs(path: Path, codebook: str, round_num: int, *, batch_size: int = 50):
@@ -274,7 +271,7 @@ def sample_imgs(path: Path, codebook: str, round_num: int, *, batch_size: int = 
     return [paths[i] for i in sorted(rand.choice(range(len(paths)), size=batch_size, replace=False))]
 
 
-@cli.command()
+@spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--round", "round_num", type=int)
 @click.option(
@@ -288,7 +285,7 @@ def sample_imgs(path: Path, codebook: str, round_num: int, *, batch_size: int = 
 @click.option("--overwrite", is_flag=True)
 @click.option("--split", type=int, default=0)
 @click.option("--max-proj", type=int, default=0)
-def optimize(
+def step_optimize(
     path: Path,
     round_num: int,
     codebook_path: Path,
@@ -331,7 +328,7 @@ def optimize(
     )
 
 
-@cli.command()
+@spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--roi", type=str, default="*")
@@ -456,7 +453,7 @@ def create_opt_path(
     raise ValueError(f"Unknown mode {mode}")
 
 
-@cli.command()
+@spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option(
     "--codebook",
@@ -733,7 +730,7 @@ def spot_decoding(
     return decoder.run(spots=spots)
 
 
-@cli.command()
+@spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
 # @click.option("--roi", type=str, default=None)
@@ -891,7 +888,7 @@ def run(
 
     if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
-        mins, base = initial(imgs, (1, 99.99))
+        mins, base = initial(imgs, (1, 99.9))
         path_json.write_bytes(
             Deviations.dump_json(
                 Deviations.validate_python([
@@ -973,19 +970,36 @@ def run(
     if calc_deviations and round_num is not None:
         # Round num already checked above.
         names_l = {n: i for i, n in enumerate(names)}
-        spot_intensities = spot_intensities[
-            (np.linalg.norm(spot_intensities.squeeze(), axis=1) * (1 - spot_intensities.coords["distance"]))
-            > config.min_intensity
-        ]
-        idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
+        try:
+            if not len(spot_intensities):
+                logger.warning("No spots found. Skipping.")
+                append_json(path_json, round_num, deviation=np.ones(len(scale_all)), n=0, percent_blanks=0)
+                return
 
-        deviations = np.nanmean(spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0)
-        logger.debug(f"Deviations: {np.round(deviations / np.nanmean(deviations), 4)}")
+            spot_intensities = spot_intensities[
+                (
+                    np.linalg.norm(spot_intensities.squeeze(), axis=1)
+                    * (1 - spot_intensities.coords["distance"])
+                )
+                > config.min_intensity
+            ]
+            idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
 
-        """Concatenate with previous rounds. Will overwrite rounds beyond the current one."""
-        append_json(
-            path_json, round_num, deviation=deviations, n=len(spot_intensities), percent_blanks=percent_blanks
-        )
+            deviations = np.nanmean(
+                spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0
+            )
+            logger.debug(f"Deviations: {np.round(deviations / np.nanmean(deviations), 4)}")
+        except (np.exceptions.AxisError, ValueError):
+            append_json(path_json, round_num, deviation=np.ones(len(scale_factor)), n=0, percent_blanks=0)
+        else:
+            """Concatenate with previous rounds. Will overwrite rounds beyond the current one."""
+            append_json(
+                path_json,
+                round_num,
+                deviation=deviations,
+                n=len(spot_intensities),
+                percent_blanks=percent_blanks,
+            )
 
     morph = (
         [
@@ -1024,7 +1038,7 @@ def parse_duration(duration_str: str) -> timedelta:
         raise ValueError(f"Unknown time unit: {unit}")
 
 
-@cli.command()
+@spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("roi", type=str, default="*")
 @click.option(
@@ -1045,6 +1059,7 @@ def parse_duration(duration_str: str) -> timedelta:
     default=None,
     help="Only process files modified since this duration (e.g., '30m', '2h', '1d').",
 )
+@click.option("--delete-corrupted", is_flag=True)
 def batch(
     path: Path,
     roi: str,
@@ -1057,9 +1072,22 @@ def batch(
     simple: bool = False,
     max_proj: bool = False,
     since: str | None = None,
+    delete_corrupted: bool = False,
 ):
     all_paths = {p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
     paths_in_scope = all_paths  # Start with all paths
+
+    if delete_corrupted:
+        logger.info(f"Checking all files for corruption.")
+        for i, p in enumerate(sorted(all_paths)):
+            if i % 100 == 0:
+                logger.info(f"Checked {i}/{len(all_paths)} files.")
+            try:
+                imread(p)
+            except Exception as e:
+                logger.warning(f"Error reading {p}: {e}. Deleting.")
+                p.unlink()
+                continue
 
     # Filter by modification time if --since is provided
     if since:
@@ -1086,7 +1114,7 @@ def batch(
         num_expected_pkl = 4 if split else 1
         glob_pattern = f"decoded-{codebook_path.stem}/{p.stem}{'-*' if split else ''}.pkl"
         # Use parent.parent because the decoded files are one level up
-        if len(list(p.parent.parent.glob(glob_pattern))) >= num_expected_pkl:
+        if len(list(p.parent.glob(glob_pattern))) == num_expected_pkl:
             already_done.add(p)
 
     if overwrite:
@@ -1101,7 +1129,8 @@ def batch(
         # Process only files in scope that are not already done
         paths_to_process = sorted(list(paths_in_scope - already_done))
         skipped_count = len(paths_in_scope) - len(paths_to_process)
-        logger.info(f"Skipping {skipped_count} already processed files within the scope.")
+        if skipped_count > 0:
+            logger.info(f"Skipping {skipped_count} already processed files within the scope.")
         logger.info(f"Processing {len(paths_to_process)} new files in scope.")
 
     if not paths_to_process:
@@ -1127,253 +1156,12 @@ def batch(
     )
 
 
+spots.add_command(optimize)
+spots.add_command(stitch)
+
 if __name__ == "__main__":
-    cli()
+    spots()
 # %%
-
-# u = run.callback(
-#     "/fast2/3t3clean/analysis/deconv/registered/reg-0000.tif",
-#     Path("/fast2/3t3clean/analysis/deconv/registered/decode_scale.json"),
-# )
-# %%
-# rand = np.random.default_rng(0)
-# t = rand.normal(10, 1, size=(18))
-# t = np.zeros(14)
-# t[:3] = 200
-
-# t = t / np.linalg.norm(t)
-
-# u = rand.normal(10, 1, size=(18))
-# u = np.zeros(14)
-# u[:2] = 200
-# u[3:5] = 50
-# u = u / np.linalg.norm(u)
-
-# 1 - np.dot(t, u)
-# %%
-# n_chans = img.shape[1]
-# scale_factors = [np.percentile(imgs.get_slice({Axes.CH: i})[0].squeeze(), 99.99) for i in range(n_chans)]
-# for i, v in enumerate(scale_factors):
-#     if v < 1e-6:
-#         scale_factors[i] = 1
-
-# %%
-
-# %%
-# %%
-# fig, axs = plt.subplots(5, 6)
-# axs = axs.flatten()
-# for i in range(n_chans):
-#     intensity_histogram(
-#         imgs,
-#         sel={Axes.ROUND: 0, Axes.CH: i},
-#         log=True,
-#         bins=50,
-#         ax=axs[i],
-#         title=f"ch: {i+1}",
-#     )
-# fig.tight_layout()
-
-# %%
-
-
-# orig_plot: xr.DataArray = stack.sel({Axes.CH: 3, Axes.ZPLANE: 0}).xarray.squeeze()
-# wth_plot: xr.DataArray = imgs.sel({Axes.CH: 3, Axes.ZPLANE: 0}).xarray.squeeze()
-
-# f, (ax1, ax2) = plt.subplots(ncols=2, dpi=200)
-# ax1.imshow(orig_plot)
-# ax1.set_title("original")
-# ax2.imshow(wth_plot)
-# ax2.set_title("with filtered")
-# ax1.axis("off")
-# ax2.axis("off")
-# %%
-# imgs = clipped_both_scaled
-
-# %%
-
-
-# %%
-# cb = json.loads(Path("scripts/starmaptest/starmaptestcb.json").read_text())
-# out = defaultdict(list)
-
-# for choose in range(2, 5):
-#     for name, arr in cb.items():
-#         if max(arr) > 10:
-#             continue
-#         for a in combinations(arr, choose):
-#             out[json.dumps(a)].append(name)
-
-# arr = np.zeros((len(out), 10), dtype=np.uint8)
-# names = []
-# for i, (k, v) in enumerate(out.items()):
-#     for idx in json.loads(k):
-#         arr[i, idx - 1] = 1
-#     names.append(k + "-" + ",".join(v))
-
-
-# order = [5, 6, 7, 8, 13, 14, 15, 16, 21, 22, 23, 24]
-# mapping = {x: i for i, x in enumerate(order)}
-# %%
-
-
-# order = list(chain.from_iterable([[i, i + 8, i + 16] for i in range(1, 9)])) + list(range(25, 33))
-# mhd = list(map(str, np.array(list(map(order.__getitem__, np.where(mhd)[1] + 1))).reshape(-1, 3)))
-# %%
-
-# %%
-
-# names.extend([f"Blank{i}" for i in range(len(blanks))])
-
-# arr = np.vstack((arr, blanks))
-# names = names[~(arr[:, 3] | arr[:, 0])]
-# arr = arr[~(arr[:, 0] | arr[:, 3])]
-# assert len(arr) == len(mhd)
-
-# codes = pd.DataFrame(arr)
-# codes['name'] = cb.keys()
-# %%
-
-# cb = pd.read_csv("scripts/working/codebook.csv").iloc[:270]
-# codes = cb.iloc[:270, 3:].to_numpy()
-
-# extendedname = []
-# extendedcode = []
-# for name, code in zip(cb["name"], codes):
-#     extendedname.append(name)
-#     extendedcode.append(code)
-#     for col in range(codes.shape[1]):
-#         nc = code.copy()
-#         if code[col] == 1:
-#             extendedname.append(name + "_10")
-#             nc[col] = 0
-#         else:
-#             extendedname.append(name + "_01")
-#             nc[col] = 1
-#         extendedcode.append(nc)
-
-# %%
-
-# %%
-# psd = DetectPixels.PixelSpotDecoder(
-#     codebook=codebook,
-#     metric="euclidean",  # distance metric to use for computing distance between a pixel vector and a codeword
-#     norm_order=2,  # the L_n norm is taken of each pixel vector and codeword before computing the distance. this is n
-#     distance_threshold=0.28,  # minimum distance between a pixel vector and a codeword for it to be called as a gene
-#     magnitude_threshold=0.001,  # discard any pixel vectors below this magnitude
-#     min_area=5,  # do not call a 'spot' if it's area is below this threshold (measured in pixels)
-#     max_area=100,  # do not call a 'spot' if it's area is above this threshold (measured in pixels)
-# )
-
-
-# %%
-
-# %%
-
-# %%
-
-
-# decoded_spots, prop_results = psd.run(sliced)
-# filter spots that do not pass thresholds
-# spot_intensities = decoded_spots.loc[decoded_spots[Features.PASSES_THRESHOLDS]]
-
-# [spot_intensities[Features.DISTANCE] < 1]
-# %%
-
-
-# %%
-
-
-# %%
-# import seaborn as sns
-
-# sns.set()
-# plt.scatter(
-#     decoded_spots.coords["radius"] + rand.normal(0, 0.05, size=decoded_spots.shape[0]),
-#     decoded_spots.coords["distance"],
-#     c=decoded_spots.coords["passes_thresholds"],
-#     # c=np.linalg.norm(decoded_spots, axis=2),
-#     # c=np.where(
-#     #     is_blank[list(map(names_l.get, initial_spot_intensities.coords["target"].to_index().values))], 1, 0
-#     # ).flatten(),
-#     alpha=0.2,
-#     cmap="bwr",
-#     s=2,
-# )
-
-
-# %%
-
-
-# %%
-# dist = spot_intensities[Features.AXIS].to_dataframe().groupby("target").agg(dict(distance="mean"))
-# dist["blank"] = dist.index.str.startswith("Blank")
-
-# c = pd.DataFrame.from_dict(gc, orient="index").sort_values(0)
-# # c = c[c[0] > 1]
-# c["color"] = c.index.str.startswith("Blank")
-# c["color"] = c["color"].map({True: "red", False: "blue"})
-
-# fig, ax = plt.subplots(figsize=(8, 10))
-# ax.bar(c.index, c[0], color=c["color"], width=1)
-# ax.set_xticks([])
-# ax.set_yscale("log")
-
-# %%
-
-# set dpi to 200
-# fig, ax = plt.subplots(figsize=(8, 10))
-# c = c[-50:]
-# c_ = pd.concat((c[:30], c[-30:]))
-# ax.barh(c_.index, c_[0], color=c_["color"])
-# ax.set_xticks(rotation="vertical", fontsize=6)
-
-# %%
-
-
-# %%
-
-
-# %%
-# genes = list(cb.keys())[:-6]
-
-# codednames = [list(map(genes.index, x.split("-")[1].split(","))) for x in c.index.tolist()]
-
-# X = np.zeros((len(codednames), len(genes)), dtype=float)
-# for i, cc in enumerate(codednames):
-#     for j in cc:
-#         X[i, j] = 1
-
-# import numpy as np
-# from scipy.optimize import minimize, nnls
-
-# solved = nnls(X, c[0].values)
-# ind = np.arange(len(c))
-# fig, ax = plt.subplots(figsize=(8, 10))
-# ax.barh(ind + 0.4, c[0].values.tolist(), 0.4, color="green", label="counts")
-# ax.barh(ind, X @ solved[0], 0.4, color="magenta", alpha=0.3, label="predicted from NNLS")
-# ax.set(yticks=ind + 0.4, yticklabels=c.index, ylim=[2 * 0.4 - 1, len(c)])
-# ax.legend()
-
-
-# def fit(X, params):
-#     return X.dot(params)
-
-
-# def cost_function(params, X, y):
-#     return np.sum(np.abs(y - fit(X, params)))
-
-
-# plt.imshow(np.array([X @ solved[0], c[0].values]).T)
-
-
-# %%
-
-
-# View decoded spots overlaid on max intensity projected image
-# imgs: ImageStack
-# single_plane_max = np.array(imgs.xarray).squeeze()[np.where(arr.sum(axis=0))].max(axis=0)
-# plt.imshow(single_plane_max)
 
 
 def plot_decoded(spots):

@@ -4,6 +4,7 @@ from .cli_basic import basic
 from .cli_deconv import deconv
 from .cli_register import register
 from .cli_stitch import stitch
+from .spots.align_prod import spots
 
 # log = setup_logging()
 click.rich_click.SHOW_ARGUMENTS = True
@@ -33,6 +34,7 @@ main.add_command(basic)
 main.add_command(deconv)
 main.add_command(register)
 main.add_command(stitch)
+main.add_command(spots)
 
 if __name__ == "__main__":
     main()

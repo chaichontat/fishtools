@@ -52,7 +52,7 @@ def load_splits(
     coords: pl.DataFrame,
     *,
     filter_: bool = True,
-    size: int = 1998,
+    size: int,
     cut: int = 1024,
     simple: bool = False,
 ):
@@ -106,12 +106,13 @@ def process(
     coords: pl.DataFrame,
     cells: Cells,
     crosses: Crosses,
+    size: int,
     *,
     filter_: bool = True,
     simple: bool = False,
 ) -> pl.DataFrame | None:
     try:
-        df = load_splits(path_pickle, curr, coords, filter_=filter_, simple=simple)
+        df = load_splits(path_pickle, curr, coords, size=size, filter_=filter_, simple=simple)
     except Exception as e:
         logger.error(f"{path_pickle.name}: {e}")
         return None
@@ -122,11 +123,7 @@ def process(
     return df_filtered
 
 
-@click.group()
-def cli(): ...
-
-
-@cli.command()
+@click.command()
 @click.argument("path_wd", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("_roi", type=str, default="*")
 @click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
@@ -134,7 +131,7 @@ def cli(): ...
 @click.option("--overwrite", is_flag=True)
 @click.option("--simple", is_flag=True)
 @click.option("--no-split", is_flag=True)
-def run(
+def stitch(
     path_wd: Path,
     _roi: str,
     codebook: Path,
@@ -208,6 +205,7 @@ def run(
                             process,
                             file,
                             i,
+                            size=size,
                             coords=coords,
                             cells=cells,
                             crosses=crosses,
@@ -226,10 +224,10 @@ def run(
                         f.cancel()
                     fut.result()
 
-        df = pl.scan_parquet(sorted([gen_out(file) for file in files])).collect()
+        out_files = sorted([gen_out(file) for file in files])
+        not_exists = [f for f in out_files if not f.exists()]
+        if not_exists:
+            logger.warning(f"{[f.name for f in not_exists]} do not exist. 0 spots or corrupted files.")
+        df = pl.scan_parquet([f for f in out_files if f.exists()]).collect()
         df.write_parquet(path_cb / "spots.parquet")
         logger.info(f"Wrote to {path_cb / 'spots.parquet'}")
-
-
-if __name__ == "__main__":
-    cli()

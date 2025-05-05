@@ -82,6 +82,11 @@ class TileConfiguration:
 
         return cls(pl.DataFrame(out))
 
+    def drop(self, idxs: list[int]):
+        df = TileConfiguration(self.df.filter(~pl.col("index").is_in(idxs)))
+        assert len(df) == len(self) - len(idxs)
+        return df
+
     def downsample(self, factor: int) -> "TileConfiguration":
         if factor == 1:
             return self
