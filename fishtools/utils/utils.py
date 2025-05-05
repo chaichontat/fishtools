@@ -159,14 +159,30 @@ def git_hash() -> str:
 _T = TypeVar("_T")
 
 
-def batch_roi(look_for: str = "registered--*"):
+def batch_roi(look_for: str = "registered--*", include_codebook: bool = False, split_codebook: bool = True):
     def decorator(func: Callable[P, _T]) -> Callable[P, _T | None]:
         @wraps(func)
         def inner(*args: P.args, **kwargs: P.kwargs) -> _T | None:
+            nonlocal look_for
             if kwargs["roi"] == "*":
-                for p in Path(kwargs["path"]).glob(look_for):  # type: ignore
-                    print(kwargs | dict(roi=p.name.split("--")[1]))
-                    kwargs = kwargs | dict(roi=p.name.split("--")[1])  # type: ignore
+                if include_codebook:
+                    if "codebook" not in kwargs:
+                        raise ValueError(
+                            "batch_roi with include_codebook=True requires codebook keyword argument"
+                        )
+                    if isinstance(kwargs["codebook"], str):
+                        look_for = f"{look_for}+{kwargs['codebook']}"
+                    elif isinstance(kwargs["codebook"], Path):
+                        look_for = f"{look_for}+{kwargs['codebook'].stem}"
+                    else:
+                        raise ValueError("codebook must be a string or Path")
+                rois = {
+                    p.name.split("--")[1].split("+")[0] if split_codebook else p.name.split("--")[1]
+                    for p in Path(kwargs["path"]).glob(look_for)
+                }  # type: ignore
+                for roi in rois:  # type: ignore
+                    kwargs = kwargs | dict(roi=roi)  # type: ignore
+                    logger.info(f"Batching {kwargs['roi']}")
                     func(*args, **kwargs)
                 return
             return func(*args, **kwargs)

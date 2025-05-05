@@ -461,7 +461,7 @@ def fuse(
         raise ValueError(f"No images found at {path_img.resolve()}")
     logger.info(f"Found {len(files)} images at {path_img.resolve()}")
 
-    if overwrite:
+    if overwrite and path.exists():
         for p in path.iterdir():
             if p.is_dir():
                 shutil.rmtree(p)
@@ -595,8 +595,11 @@ def numpy_array_to_zarr[*Ts](
 @click.argument("roi", type=str)
 @click.option("--codebook", type=str)
 @click.option("--chunk-size", type=int, default=2048)
+@click.option("--overwrite", is_flag=True)
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
-def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048):
+def combine(
+    path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwrite: bool = True
+):
     import zarr
 
     path = Path(path / f"stitch--{roi}+{codebook}")

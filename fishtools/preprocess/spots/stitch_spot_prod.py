@@ -131,6 +131,7 @@ def process(
 @click.option("--overwrite", is_flag=True)
 @click.option("--simple", is_flag=True)
 @click.option("--no-split", is_flag=True)
+@click.option("--threads", type=int, default=8)
 def stitch(
     path_wd: Path,
     _roi: str,
@@ -139,6 +140,7 @@ def stitch(
     overwrite: bool = False,
     simple: bool = False,
     no_split: bool = False,
+    threads: int = 8,
 ):
     if path_wd.name.startswith("registered--"):
         raise ValueError("Path must be the main working directory, not registered.")
@@ -196,7 +198,7 @@ def stitch(
         # Get the indices of the cells that cross each other
         crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 
-        with ProcessPoolExecutor(max_workers=8, mp_context=get_context("spawn")) as exc:
+        with ProcessPoolExecutor(max_workers=threads, mp_context=get_context("spawn")) as exc:
             futs = []
             for i, file in enumerate(files):
                 if overwrite or not gen_out(file).exists():

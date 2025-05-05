@@ -105,8 +105,8 @@ def deconv():
 
 @flow(name="Register")
 def register(ws: Workspace, codebook: Path, threads: int):
-    with setwd("analysis/deconv"):
-        execute_script(f"preprocess register batch . --codebook={codebook} --threads={threads}")
+    execute_script("preprocess deconv compute-range . --overwrite")
+    execute_script(f"preprocess register batch . --codebook={codebook} --threads={threads}")
 
 
 @flow
@@ -120,13 +120,14 @@ def call_spots(ws: Workspace, codebook: Path, threads: int):
     execute_script(f"preprocess spots stitch . --codebook={codebook} --threads={threads}")
 
 
-@flow(name="Deconv")
+@flow(name="call-spots")
 def main_workflow(path: Path, codebook: Path, threads: int):
     ws = Workspace(path)
-    deconv(ws)
-    register(ws, codebook, threads)
-    optimize(ws, codebook, threads)
-    call_spots(ws, codebook, threads)
+    # deconv(ws)
+    with setwd(ws.deconved):
+        register(ws, codebook, threads)
+        optimize(ws, codebook, threads)
+        call_spots(ws, codebook, threads)
 
 
 @click.group()
@@ -140,19 +141,16 @@ def cli(): ...
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Path to the codebook file",
 )
-@click.option(
-    "--ref", type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Path to the reference"
-)
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
 def spots(path: Path, codebook: Path, threads: int):
     main_workflow(path, codebook, threads)
 
 
 @flow
-def stitch_register(ws: Workspace, rois: list[str], threads: int):
+def stitch_register(ws: Workspace, rois: list[str], threads: int, overwrite: bool = False):
     tileconfigs = [ws.stitch(roi) / "TileConfiguration.registered.txt" for roi in rois]
     if not all(Path(p).exists() for p in tileconfigs):
-        execute_script('preprocess stitch register . "*" --idx=0 --max-proj')
+        execute_script('preprocess stitch register . "*" --idx=0 --max-proj', overwrite=overwrite)
 
 
 @flow
@@ -184,11 +182,12 @@ def stitch_fuse(ws: Workspace, rois: list[str], codebook: str, threads: int, ove
 @click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
 @click.option("--codebook", type=str, help="Codebook name")
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
-def stitch(path: Path, codebook: str, threads: int):
+@click.option("--overwrite", is_flag=True, help="Overwrite existing files")
+def stitch(path: Path, codebook: str, threads: int, overwrite: bool):
     ws = Workspace(path)
     with setwd(ws.deconved):
-        stitch_register(ws, ws.rois, threads)
-        stitch_fuse(ws, ws.rois, codebook, threads)
+        stitch_register(ws, ws.rois, threads, overwrite=overwrite)
+        stitch_fuse(ws, ws.rois, codebook, threads, overwrite=overwrite)
 
 
 if __name__ == "__main__":

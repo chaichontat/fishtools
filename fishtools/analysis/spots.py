@@ -43,7 +43,22 @@ def load_spots(
             .with_columns(z=pl.lit(0.0))
         )
 
-    return df.with_columns(
+    SCHEMA = pl.Schema([
+        ("idx_local", pl.UInt32),
+        ("area", pl.Float32),
+        ("z", pl.Float32),
+        ("y_local", pl.Float32),
+        ("x_local", pl.Float32),
+        ("y", pl.Float32),
+        ("x", pl.Float32),
+        ("target", pl.Utf8),
+        ("distance", pl.Float32),
+        ("norm", pl.Float32),
+        ("tile", pl.Utf8),
+        ("passes_thresholds", pl.Boolean),
+    ])
+
+    df = df.with_columns(
         y=pl.col("y_local") + (tile_coords[1] if tile_coords is not None else 0),
         x=pl.col("x_local") + (tile_coords[0] if tile_coords is not None else 0),
         target=pl.Series(list(d.coords["target"].values)),
@@ -52,6 +67,8 @@ def load_spots(
         tile=pl.lit(Path(path).stem.split("-")[1]),
         passes_thresholds=pl.Series(d.coords["passes_thresholds"].values),
     ).with_row_index("idx_local")
+
+    return pl.DataFrame(df, schema=SCHEMA)
 
 
 def load_spots_simple(

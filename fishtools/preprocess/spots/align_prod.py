@@ -38,15 +38,15 @@ from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread
 
 from fishtools.preprocess.addition import ElementWiseAddition
+from fishtools.preprocess.spots.align_batchoptimize import optimize
+from fishtools.preprocess.spots.overlay_spots import overlay
+from fishtools.preprocess.spots.stitch_spot_prod import stitch
 from fishtools.utils.pretty_print import progress_bar_threadpool
 from fishtools.utils.utils import git_hash
 
-from .align_batchoptimize import optimize
-from .stitch_spot_prod import stitch
-
 GPU = os.environ.get("GPU", "1") == "1"
 if GPU:
-    logger.info("Using GPU")
+    # logger.info("Using GPU")
     from fishtools.gpu.codebook import Codebook
 else:
     from starfish import Codebook
@@ -56,8 +56,8 @@ else:
 class DecodeConfig(BaseModel):
     model_config = {"frozen": True}
 
-    max_distance: float = 0.3
-    min_intensity: float = 0.0012
+    max_distance: float = 0.2
+    min_intensity: float = 0.001
     min_area: int = 10
     max_area: int = 200
     use_correct_direction: bool = True
@@ -1158,6 +1158,7 @@ def batch(
 
 spots.add_command(optimize)
 spots.add_command(stitch)
+spots.add_command(overlay)
 
 if __name__ == "__main__":
     spots()

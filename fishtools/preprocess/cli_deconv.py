@@ -695,9 +695,11 @@ def batch(
     n_fids: int,
     basic_name: str | None,
 ):
+    ws = Workspace(path)
+    print(ws.rois)
+    rois = ws.rois
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
-    ws = Workspace(path)
 
     FORBIDDEN = ["10x", "analysis", "shifts", "fid", "registered", "old", "basic"]
 
@@ -712,10 +714,12 @@ def batch(
         key=lambda x: f"{int(x.split('_')[0]):02d}" if x.split("_")[0].isdigit() else x,
     )
     logger.info(f"Rounds: {rounds}")
+
     for r in rounds:
         if ref is not None:
             files = []
-            for roi in ws.rois:
+            for roi in rois:
+                print(f"Processing {r}--{roi}")
                 ok_idxs = {
                     int(f.stem.split("-")[1])
                     for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))

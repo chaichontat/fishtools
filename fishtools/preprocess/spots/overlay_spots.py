@@ -6,18 +6,16 @@ assigns detected spots (e.g., RNA molecules) to these regions.
 Refactored for improved testability and maintainability.
 """
 
-import logging
 import signal
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import polars as pl
 import rich_click as click
-import zarr
 from loguru import logger
 from scipy.ndimage import binary_erosion, binary_fill_holes
 from shapely.geometry import MultiPolygon, Point, Polygon
@@ -45,6 +43,8 @@ Z_FILTER_TOLERANCE = 0.5
 def load_segmentation_slice(segmentation_zarr_path: Path, idx: int) -> np.ndarray:
     """Loads a specific Z-slice from the segmentation Zarr store."""
     logger.info(f"Slice {idx}: Loading segmentation image from {segmentation_zarr_path}...")
+    import zarr
+
     try:
         img_stack = zarr.open_array(str(segmentation_zarr_path), mode="r")
         if idx >= img_stack.shape[0]:
@@ -394,6 +394,8 @@ def generate_debug_plot(
     output_dir: Path,
     idx: int,
 ):
+    import zarr
+
     """Generates and saves a debug plot showing intensity, mask, and spots."""
     logger.info(f"Slice {idx}: Generating debug plots...")
     try:
@@ -721,7 +723,6 @@ def run_(
     Main function to process a specific Z-slice of segmented image data
     and assign detected spots to segmented regions. Refactored for clarity.
     """
-
     # --- Prepare Paths and Directories ---
     segmentation_path = input_dir / segmentation_name
     spots_path = spots
@@ -773,106 +774,25 @@ def run_(
         raise e
 
 
-@click.group()
-def cli(): ...
-
-
-@cli.command()
-@click.argument(
-    "input-dir",
-    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-    required=True,
-)
-@click.option(
-    "--output-dir",
-    type=click.Path(file_okay=False, dir_okay=True, writable=True, path_type=Path),
-    help="Directory to save the output Parquet files ('chunks' subdirectory will be created/used).",
-)
-@click.option(
-    "--segmentation-name",
-    type=str,
-    default="output_segmentation.zarr",
-    show_default=True,
-    help="Relative path to the segmentation Zarr store within the input directory.",
-)
-@click.option(
-    "--spots-name",
-    type=str,
-    default="../mousecommon--brain+mousecommon.parquet",
-    show_default=True,
-    help="Relative path to the spots Parquet file within the input directory.",
-)
-@click.option("-i", "--idx", type=int, required=True, help="The Z-slice index to process.")
-@click.option(
-    "--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening."
-)
-@click.option(
-    "--closing-radius", type=float, default=6.0, show_default=True, help="Radius for morphological closing."
-)
-@click.option(
-    "--dilation-radius",
-    type=float,
-    default=2.0,
-    show_default=True,
-    help="Radius for final dilation (0 to disable).",
-)
-@click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing output files.")
-@click.option("--debug", is_flag=True, default=False, help="Enable debug logging and generate debug plots.")
-def run(
-    input_dir: Path,
-    output_dir: Path,
-    segmentation_name: str,
-    spots_name: str,
-    idx: int,
-    opening_radius: float,
-    closing_radius: float,
-    dilation_radius: float,
-    overwrite: bool,
-    debug: bool,
-):
-    roi, codebook = spots.stem.split("+")
-    run_(
-        input_dir,
-        output_dir,
-        segmentation_name,
-        spots_name,
-        tile_config_path,
-        idx,
-        opening_radius,
-        closing_radius,
-        dilation_radius,
-        overwrite,
-        debug,
-    )
-
-
 def initialize():
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
-@cli.command()
+@click.command()
 @click.argument(
-    "input-dir",
+    "path",
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
     required=True,
 )
-@click.option(
-    "--output-dir",
-    type=click.Path(file_okay=False, dir_okay=True, writable=True, path_type=Path),
-    help="Directory to save the output Parquet files ('chunks' subdirectory will be created/used).",
-)
+@click.argument("roi", type=str)
+@click.option("--codebook", type=str)
+@click.option("--seg-codebook", type=str)
 @click.option(
     "--segmentation-name",
     type=str,
     default="output_segmentation.zarr",
     show_default=True,
     help="Relative path to the segmentation Zarr store within the input directory.",
-)
-@click.option(
-    "--spots",
-    type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
-    show_default=True,
-    help="Relative path to the spots Parquet file within the input directory.",
 )
 @click.option(
     "--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening."
@@ -889,17 +809,23 @@ def initialize():
 )
 @click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing output files.")
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging and generate debug plots.")
-def batch(
-    input_dir: Path,
-    output_dir: Path,
+def overlay(
+    path: Path,
+    roi: str,
+    codebook: str,
+    seg_codebook: str,
     segmentation_name: str,
-    spots: Path,
     opening_radius: float,
     closing_radius: float,
     dilation_radius: float,
     overwrite: bool,
     debug: bool,
 ):
+    import zarr
+
+    spots = path / f"{roi}+{codebook}.parquet"
+    input_dir = path / f"stitch--{roi}+{seg_codebook}"
+
     with ProcessPoolExecutor(
         max_workers=8,
         mp_context=get_context("spawn"),
@@ -912,10 +838,10 @@ def batch(
                 executor.submit(
                     run_,
                     input_dir,
-                    output_dir,
+                    input_dir,
                     segmentation_name,
                     spots,
-                    spots.parent / f"stitch--{roi}/TileConfiguration.registered.txt",
+                    path / f"stitch--{roi}/TileConfiguration.registered.txt",
                     i,
                     opening_radius,
                     closing_radius,
@@ -932,4 +858,4 @@ def batch(
 
 
 if __name__ == "__main__":
-    cli()
+    overlay()

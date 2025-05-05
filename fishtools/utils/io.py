@@ -83,8 +83,9 @@ class Workspace:
     def __repr__(self):
         return f"Workspace({self.path})"
 
-    def __init__(self, path: Path | str):
-        self.path = Path(path).expanduser().resolve()
+    def __init__(self, path: Path | str, deconved: bool = False):
+        path = Path(path)
+        self.path = Path(path if not deconved else path.parent.parent).expanduser().resolve()
 
     @property
     def rounds(self):
@@ -101,6 +102,13 @@ class Workspace:
         if not res:
             raise ValueError(f"No round subdirectories found in {path}.")
         return res
+
+    @property
+    def rois(self):
+        path = self.path if not self.deconved.exists() else self.deconved
+        return sorted({
+            p.name.split("--")[1].split("+")[0] for p in path.iterdir() if p.is_dir() and "--" in p.name
+        })
 
     @property
     def deconved(self):

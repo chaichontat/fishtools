@@ -41,9 +41,9 @@ class Shift(BaseModel):
 Shifts = TypeAdapter(dict[str, Shift])
 # %%
 ref = "2_10_18"
-roi = "hippo"
-codebook = "morris"
-path = Path(f"/working/20250421_2956/analysis/deconv/shifts--{roi}+{codebook}")
+roi = "right"
+codebook = "mousecommon"
+path = Path(f"/working/20250317_benchmark_mousecommon/analysis/deconv/shifts--{roi}+{codebook}")
 paths = sorted(path.glob("*.json"))
 
 
@@ -91,22 +91,6 @@ for ax, round_ in zip(axs.flat, sorted(first.keys())):
 plt.tight_layout()
 # %%
 
-
-# %% Correlation
-fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(12, 3 * nrows), dpi=200)
-
-for ax, round_ in zip(axs.flat, sorted(first)):
-    c1 = np.array([s[round_].corr for s in shifts.values()])
-    ax.hist(c1, linewidth=0)
-    ax.set_title(round_)
-    ax.set_xlim(0, 1)
-
-for ax in axs.flat:
-    if not ax.has_data():
-        fig.delaxes(ax)
-
-plt.tight_layout()
-
 # %%
 # Correlation vs L2 distance scatter plot
 fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(12, 3 * nrows), dpi=200)
@@ -140,7 +124,9 @@ for ax, round_ in zip(axs.flat, sorted(first.keys())):
             outliers, shifts.items(), l2_distances, corrs
         ):
             if corr < 0.8:
-                ax.text(corr + np.random.normal(0, 0.01), l2_dist + np.random.normal(0, 0.5), filename)
+                ax.text(
+                    corr + np.random.normal(0, 0.01), l2_dist + np.random.normal(0, 0.5), filename, fontsize=6
+                )
 
 
 for ax in axs.flat:
@@ -148,39 +134,22 @@ for ax in axs.flat:
         fig.delaxes(ax)
 
 plt.tight_layout()
-# %%
-
-# from scipy import ndimage, optimize
-# from scipy.optimize import least_squares
-# from scipy.stats import pearsonr
 
 
-# def optimize_shift(ref: np.ndarray, fid: np.ndarray, initial_guess=(0, 0)) -> tuple[np.ndarray, float]:
-#     """
-#     Optimize shift parameters to maximize correlation between fixed and moving images.
+# %% Correlation
+fig, axs = plt.subplots(ncols=N_COLS, nrows=nrows, figsize=(12, 3 * nrows), dpi=200)
 
-#     Args:
-#         fixed: Reference image (2D array)
-#         moving: Image to be shifted (2D array)
-#         initial_guess: Starting point for shift optimization
+for ax, round_ in zip(axs.flat, sorted(first)):
+    c1 = np.array([s[round_].corr for s in shifts.values()])
+    ax.hist(c1, linewidth=0)
+    ax.set_title(round_)
+    ax.set_xlim(0, 1)
 
-#     Returns:
-#         optimal_shift: Optimized shift values (y,x)
-#         correlation: Final correlation value
-#     """
+for ax in axs.flat:
+    if not ax.has_data():
+        fig.delaxes(ax)
 
-#     def objective(shifts):
-#         # Negative correlation since we want to maximize (optimizer minimizes)
-#         shifted = ndimage.shift(fid, shifts, mode="constant", cval=0)
-#         corr = np.corrcoef(shifted[50:-50, 50:-50].flatten(), ref[50:-50, 50:-50].flatten())[0, 1]
-#         print(corr)
-#         return -corr
-
-#     # Optimize using Nelder-Mead
-#     result = optimize.shgo(objective, bounds=((-20, 20), (-20, 20)), options={"f_tol": 0.01})
-
-#     # Return optimal shifts and correlation (positive)
-#     return result
+plt.tight_layout()
 
 
 # %%
