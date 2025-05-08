@@ -11,6 +11,7 @@ dependencies:
   - cupy
   - htslib
   - imagecodecs
+  - itk
   - kmer-jellyfish
   - levenshtein
   - loguru
@@ -28,10 +29,12 @@ dependencies:
   - polars
   - pyarrow
   - pydantic
+  - pyfiglet
   - repeatmasker
   - rich-click
   - rtree
   - samtools
   - scanpy
   - shapely
+  - simpleitk
   - toml

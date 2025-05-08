@@ -56,7 +56,7 @@ else:
 class DecodeConfig(BaseModel):
     model_config = {"frozen": True}
 
-    max_distance: float = 0.2
+    max_distance: float = 0.25
     min_intensity: float = 0.001
     min_area: int = 10
     max_area: int = 200

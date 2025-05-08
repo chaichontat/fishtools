@@ -13,7 +13,7 @@ from loguru import logger
 from fishtools.mkprobes.codebook.codebook import CodebookPicker
 
 print(Path(__file__))
-static = Path(__file__).parent.parent.parent.parent / "static"
+static = Path(__file__).resolve().parent.parent / "static"
 
 
 def _bit_count(arr: npt.NDArray[np.integer[Any]]) -> npt.ArrayLike:
@@ -168,7 +168,7 @@ def gen_codebook(tss: list[str], offset: int = 0, n_bits: int | None = None, see
 
     logger.info(f"Using {n}-bit codebook with capacity {ns[n]}.")
 
-    cb = CodebookPicker(f"../static/{n}bit_on3_dist2.csv", genes=tss)
+    cb = CodebookPicker(static / f"{n}bit_on3_dist2.csv", genes=tss)
     cb.gen_codebook(seed)
     c = cb.export_codebook(seed, offset=0)
     out = {k: sorted(order[x + offset] for x in v) for k, v in c.items()}

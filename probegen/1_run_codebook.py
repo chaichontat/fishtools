@@ -12,7 +12,7 @@ import polars as pl
 from loguru import logger
 
 from fishtools.mkprobes.candidates import get_candidates
-from fishtools.mkprobes.codebook.codebook import ProbeSet, hash_codebook
+from fishtools.mkprobes.codebook.codebook import ProbeSet
 from fishtools.mkprobes.codebook.finalconstruct import construct
 from fishtools.mkprobes.ext.external_data import Dataset
 from fishtools.mkprobes.screen import run_screen
@@ -33,7 +33,6 @@ def run_gene(
     logger.remove()
     logger.add(sys.stderr, level=log_level)
 
-    hsh = hash_codebook(codebook)
     restriction = ["BamHI", "KpnI"]
     if (
         acceptable is None
@@ -79,7 +78,7 @@ def cli(): ...
 @cli.command()
 @click.argument(
     "path",
-    type=click.Path(exists=True, dir_okay=True, path_type=Path),
+    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
 )
 @click.argument(
     "codebook_path", metavar="CODEBOOK", type=click.Path(exists=True, file_okay=True, path_type=Path)
@@ -95,7 +94,6 @@ def single(
     listfailedall: bool = False,
 ):
     codebook = json.loads(codebook_path.read_text())
-    hsh = hash_codebook(codebook)
     codebook = {k: v for k, v in codebook.items() if not k.startswith("Blank")}
     if not len(set(codebook)) == len(codebook):
         raise ValueError("Duplicated genes in codebook.")
@@ -119,11 +117,10 @@ def single(
     )
     logger.info(f"Acceptable: {acceptable} ")
 
-    context = get_context("forkserver")
     failed_path = codebook_path.parent / (codebook_path.stem + ".failed.txt")
     failed_path.unlink(missing_ok=True)
 
-    with ProcessPoolExecutor(6, mp_context=context) as exc:
+    with ProcessPoolExecutor(6, mp_context=get_context("forkserver")) as exc:
         futs = {
             gene: exc.submit(
                 run_gene,
