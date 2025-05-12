@@ -11,7 +11,8 @@ from loguru import logger
 
 from fishtools.utils.pretty_print import jprint
 
-from ..ext.external_data import Dataset, get_ensembl
+from ..ext.dataset import Dataset, ReferenceDataset
+from ..ext.external_data import get_ensembl
 
 
 def find_outdated_ts(ts: str) -> tuple[Annotated[str, "gene_name"], Annotated[str, "gene_id"]]:
@@ -43,7 +44,10 @@ def chkgenes(path: Path, genes: Path):
     """Validate/check that gene names are canonical in Ensembl"""
     from ..ext.fix_gene_name import check_gene_names
 
-    ds = Dataset(path)
+    ds = ReferenceDataset(path)
+    if not ds.ensembl:
+        raise ValueError("Not a ReferenceDataset. Cannot check genes.")
+
     del path
     gs: list[str] = re.split(r"[\s,]+", genes.read_text())
     if not gs:
@@ -91,16 +95,21 @@ def get_transcripts(
     if not genes:
         raise ValueError("No genes provided")
 
+    if not dataset.ensembl:
+        raise ValueError("Not a ReferenceDataset. Cannot get transcripts.")
+
     df_genes = dataset.ensembl.filter(pl.col("gene_name").is_in(genes))[
         ["gene_name", "gene_id", "transcript_name", "transcript_id"]
     ]
 
-    df_genes = df_genes.join(
-        dataset.appris.filter(pl.col("gene_id").is_in(df_genes["gene_id"]))[["transcript_id", "annotation"]],
-        on="transcript_id",
-        how="left",
-    ).sort("transcript_name")
-    appris = df_genes.filter(pl.col("annotation").is_not_null())
+    if dataset.appris is not None:
+        df_genes = df_genes.join(
+            dataset.appris.filter(pl.col("gene_id").is_in(df_genes["gene_id"]))[
+                ["transcript_id", "annotation"]
+            ],
+            on="transcript_id",
+            how="left",
+        ).sort("transcript_name")
 
     to_return = ["gene_name", "gene_id", "transcript_id", "transcript_name", "tag"]
 
@@ -114,10 +123,13 @@ def get_transcripts(
 
             res = dataset.ensembl.filter(pl.col("transcript_id").is_in(canonical))[to_return]
         case "gencode":
-            res = dataset.gencode.filter(pl.col("gene_id").is_in(df_genes["gene_id"]))[to_return]
+            res = dataset.data.filter(pl.col("gene_id").is_in(df_genes["gene_id"]))[to_return]
         case "ensembl":
             res = dataset.ensembl.filter(pl.col("gene_id").is_in(df_genes["gene_id"]))[to_return]
         case "appris":
+            if dataset.appris is None:
+                raise ValueError("No APPRIS data found.")
+            appris = df_genes.filter(pl.col("annotation").is_not_null())
             # if len(principal := appris.filter(pl.col("annotation").str.contains("PRINCIPAL"))):
             #     logger.info("Principal transcripts: " + "\n".join(principal["transcript_id"]))
             res = appris.join(dataset.ensembl[["transcript_id", "tag"]], on="transcript_id", how="left")
@@ -135,6 +147,9 @@ def get_transcripts(
             res = res.group_by("gene_name").map_groups(handle_transcripts)
 
         case "apprisalt":
+            if dataset.appris is None:
+                raise ValueError("No APPRIS data found.")
+            appris = df_genes.filter(pl.col("annotation").is_not_null())
             res = appris.join(dataset.ensembl[["transcript_id", "tag"]], on="transcript_id", how="left")
         case _:  # type: ignore
             raise ValueError(f"Unknown mode: {mode}")

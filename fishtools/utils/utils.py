@@ -9,6 +9,7 @@ from typing import Any, Callable, Concatenate, ParamSpec, Sequence, TypeVar, cas
 
 import loguru
 from loguru import logger
+import numpy as np
 
 P = ParamSpec("P")
 R = TypeVar("R", covariant=True)
@@ -190,3 +191,10 @@ def batch_roi(look_for: str = "registered--*", include_codebook: bool = False, s
         return inner
 
     return decorator
+
+
+def create_rotation_matrix(angle_degrees: float) -> np.ndarray:
+    angle_radians = np.deg2rad(angle_degrees)
+    cos_angle = np.cos(angle_radians)
+    sin_angle = np.sin(angle_radians)
+    return np.array([[cos_angle, -sin_angle], [sin_angle, cos_angle]])

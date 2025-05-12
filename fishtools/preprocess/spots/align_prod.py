@@ -28,7 +28,9 @@ from starfish.core.intensity_table.decoded_intensity_table import DecodedIntensi
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
 )
-from starfish.core.spots.DetectPixels.combine_adjacent_features import CombineAdjacentFeatures
+from starfish.core.spots.DetectPixels.combine_adjacent_features import (
+    CombineAdjacentFeatures,
+)
 from starfish.core.types import Axes, Coordinates, CoordinateValue
 from starfish.experiment.builder import FetchedTile, TileFetcher
 from starfish.image import Filter
@@ -56,7 +58,7 @@ else:
 class DecodeConfig(BaseModel):
     model_config = {"frozen": True}
 
-    max_distance: float = 0.25
+    max_distance: float = 0.3
     min_intensity: float = 0.001
     min_area: int = 10
     max_area: int = 200
@@ -64,7 +66,11 @@ class DecodeConfig(BaseModel):
 
 
 OPTIMIZE_CONFIG = DecodeConfig(
-    min_intensity=0.012, max_distance=0.3, min_area=20, max_area=200, use_correct_direction=True
+    min_intensity=0.012,
+    max_distance=0.3,
+    min_area=20,
+    max_area=200,
+    use_correct_direction=True,
 )
 
 
@@ -155,11 +161,16 @@ def plot_intensity_histograms(stack: starfish.ImageStack, r: int):
 
 
 def scale(
-    img: ImageStack, scale: np.ndarray[np.float32, Any], mins: np.ndarray[np.float32, Any] | None = None
+    img: ImageStack,
+    scale: np.ndarray[np.float32, Any],
+    mins: np.ndarray[np.float32, Any] | None = None,
 ):
     if mins is not None:
         ElementWiseAddition(
-            xr.DataArray(np.nan_to_num(-mins, nan=1).reshape(-1, 1, 1, 1, 1), dims=("c", "x", "y", "z", "r"))
+            xr.DataArray(
+                np.nan_to_num(-mins, nan=1).reshape(-1, 1, 1, 1, 1),
+                dims=("c", "x", "y", "z", "r"),
+            )
         ).run(img, in_place=True)
 
     Filter.ElementWiseMultiply(
@@ -260,10 +271,19 @@ def _batch(
                 )
 
 
-def sample_imgs(path: Path, codebook: str, round_num: int, *, batch_size: int = 50):
+def sample_imgs(
+    path: Path,
+    codebook: str,
+    round_num: int,
+    *,
+    roi: str | None = None,
+    batch_size: int = 50,
+):
     rand = np.random.default_rng(round_num)
+    if roi is None:
+        roi = "*"
     paths = sorted(
-        (p for p in path.glob(f"registered--*+{codebook}/reg*.tif") if not p.name.endswith(".hp.tif"))
+        (p for p in path.glob(f"registered--{roi}+{codebook}/reg*.tif") if not p.name.endswith(".hp.tif"))
     )
     if batch_size > len(paths):
         logger.info(f"Batch size {batch_size} is larger than {len(paths)}. Returning all images.")
@@ -273,6 +293,7 @@ def sample_imgs(path: Path, codebook: str, round_num: int, *, batch_size: int = 
 
 @spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str)
 @click.option("--round", "round_num", type=int)
 @click.option(
     "--codebook",
@@ -287,6 +308,7 @@ def sample_imgs(path: Path, codebook: str, round_num: int, *, batch_size: int = 
 @click.option("--max-proj", type=int, default=0)
 def step_optimize(
     path: Path,
+    roi: str,
     round_num: int,
     codebook_path: Path,
     batch_size: int = 50,
@@ -296,17 +318,18 @@ def step_optimize(
     split: int = 0,
     max_proj: int = False,
 ):
-    if round_num > 0 and not (path / f"opt_{codebook_path.stem}" / "percentiles.json").exists():
+    wd = path / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}"
+    if round_num > 0 and not (wd / "percentiles.json").exists():
         raise Exception("Please run `fishtools find-threshold` first.")
 
-    selected = sample_imgs(path, codebook_path.stem, round_num, batch_size=batch_size)
+    selected = sample_imgs(path, codebook_path.stem, round_num, roi=roi, batch_size=batch_size)
 
     group_counts = {key: len(list(group)) for key, group in groupby(selected, key=lambda x: x.parent.name)}
     logger.info(f"Group counts: {json.dumps(group_counts, indent=2)}")
 
     # Copy codebook to the same folder as the images for reproducibility.
-    (path / codebook_path.stem).mkdir(exist_ok=True)
-    if not (new_cb_path := path / codebook_path.stem / codebook_path.name).exists():
+    (path / "codebooks").mkdir(exist_ok=True)
+    if not (new_cb_path := path / "codebooks" / codebook_path.name).exists():
         shutil.copy(codebook_path, new_cb_path)
 
     return _batch(
@@ -315,7 +338,7 @@ def step_optimize(
         [
             "--calc-deviations",
             "--global-scale",
-            str(path / f"opt_{codebook_path.stem}" / "global_scale.txt"),
+            str(wd / "global_scale.txt"),
             "--codebook",
             codebook_path.as_posix(),
             f"--round={round_num}",
@@ -323,6 +346,7 @@ def step_optimize(
             f"--subsample-z={subsample_z}",
             f"--split={split}",
             *([f"--max-proj={max_proj}"] if max_proj else []),
+            *(["--roi", roi] if roi else []),
         ],
         threads=threads,
     )
@@ -330,8 +354,11 @@ def step_optimize(
 
 @spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
-@click.option("--roi", type=str, default="*")
+@click.argument("roi", type=str)
+@click.option(
+    "--codebook",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
 @click.option("--percentile", type=float, default=40)
 @click.option("--overwrite", is_flag=True)
 @click.option("--round", "round_num", type=int, default=0)
@@ -347,7 +374,7 @@ def find_threshold(
 ):
     SUBFOLDER = "_highpassed"
     paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
-    path_out = path / (f"opt_{codebook.stem}" + (f"--{roi}" if roi != "*" else ""))
+    path_out = path / (f"opt_{codebook.stem}" + (f"+{roi}" if roi != "*" else ""))
     jsonfile = path_out / "percentiles.json"
 
     rand = np.random.default_rng(0)
@@ -366,10 +393,16 @@ def find_threshold(
         )
 
     if paths:
+        logger.info(f"Creating {len(paths)} highpassed images")
         _batch(
             paths,
             "run",
-            ["--codebook", str(codebook), "--highpass-only", *(["--overwrite"] if overwrite else [])],
+            [
+                "--codebook",
+                str(codebook),
+                "--highpass-only",
+                *(["--overwrite"] if overwrite else []),
+            ],
             threads=4,
             split=[0],
         )
@@ -428,15 +461,18 @@ def create_opt_path(
     round_num: int | None = None,
     path_img: Path | None = None,
     path_folder: Path | None = None,
+    roi: str | None = None,
 ):
+    if roi is None:
+        roi = "*"
     if not ((path_img is None) ^ (path_folder is None)):
         raise ValueError("Must provide only path_img or path_folder")
 
     if path_img is not None:
-        base = path_img.parent.parent / f"opt_{codebook_path.stem}"
+        base = path_img.parent.parent / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}"
         name = f"{path_img.stem}--{path_img.resolve().parent.name.split('--')[1]}"
     elif path_folder is not None:
-        base = path_folder / f"opt_{codebook_path.stem}"
+        base = path_folder / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}"
         if mode == "folder":
             return base
         raise ValueError("Cannot use path_folder with mode other than folder")
@@ -455,6 +491,7 @@ def create_opt_path(
 
 @spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str, default="*")
 @click.option(
     "--codebook",
     "codebook_path",
@@ -462,7 +499,7 @@ def create_opt_path(
 )
 @click.option("--batch-size", "-n", type=int, default=50)
 @click.option("--round", "round_num", type=int)
-def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
+def combine(path: Path, roi: str, codebook_path: Path, batch_size: int, round_num: int):
     """Create global scaling factors from `optimize`.
 
     Part of the channel optimization process.
@@ -484,13 +521,27 @@ def combine(path: Path, codebook_path: Path, batch_size: int, round_num: int):
         round_num: starts from 0.
     """
     selected = sample_imgs(
-        path, codebook_path.stem, round_num, batch_size=batch_size * 2 if round_num == 0 else batch_size
+        path,
+        codebook_path.stem,
+        round_num,
+        batch_size=batch_size * 2 if round_num == 0 else batch_size,
+        roi=roi,
     )
     path_opt = create_opt_path(
-        path_folder=path, codebook_path=codebook_path, mode="folder", round_num=round_num
+        path_folder=path,
+        codebook_path=codebook_path,
+        mode="folder",
+        round_num=round_num,
+        roi=roi,
     )
     paths = [
-        create_opt_path(path_img=p, codebook_path=codebook_path, mode="json", round_num=round_num)
+        create_opt_path(
+            path_img=p,
+            codebook_path=codebook_path,
+            mode="json",
+            round_num=round_num,
+            roi=roi,
+        )
         for p in selected
     ]
 
@@ -624,7 +675,11 @@ def append_json(
         if round_num > 0:
             raise ValueError("Cannot set initial scale for round > 0")
         existing.append(
-            InitialScale(initial_scale=initial_scale.tolist(), round_num=round_num, mins=mins.tolist())
+            InitialScale(
+                initial_scale=initial_scale.tolist(),
+                round_num=round_num,
+                mins=mins.tolist(),
+            )
         )
     elif (initial_scale is None) ^ (mins is None):
         raise ValueError("Must provide both initial_scale and mins or not")
@@ -636,7 +691,12 @@ def append_json(
 
         existing = [e for e in existing if e.round_num < round_num]
         existing.append(
-            Deviation(n=n, deviation=deviation.tolist(), round_num=round_num, percent_blanks=percent_blanks)
+            Deviation(
+                n=n,
+                deviation=deviation.tolist(),
+                round_num=round_num,
+                percent_blanks=percent_blanks,
+            )
         )
     else:
         raise ValueError("Must provide either initial_scale or deviation and n.")
@@ -665,7 +725,7 @@ def pixel_decoding(imgs: ImageStack, config: DecodeConfig, codebook: Codebook, *
     return decoded_spots, image_decoding_results
 
 
-def pixel_decoding_gpu(imgs: ImageStack, config: DecodeConfig, codebook: Codebook, lock: threading.Lock):
+def pixel_decoding_gpu(imgs: ImageStack, config: DecodeConfig, codebook: Codebook):
     pixel_intensities = IntensityTable.from_image_stack(imgs)
     shape = imgs.xarray.squeeze().shape  # CZYX
     shape = (shape[1], shape[0], *shape[2:])
@@ -678,7 +738,6 @@ def pixel_decoding_gpu(imgs: ImageStack, config: DecodeConfig, codebook: Codeboo
         metric="euclidean",
         return_original_intensities=True,
         shape=shape,
-        lock=lock,
     )
 
     logger.info("Combining")
@@ -749,6 +808,7 @@ def spot_decoding(
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
 @click.option("--simple", is_flag=True)
+@click.option("--roi", type=str, default=None)
 def run(
     path: Path,
     *,
@@ -766,6 +826,7 @@ def run(
     max_proj: int = 0,
     config: DecodeConfig = DecodeConfig(),
     lock: None = None,
+    roi: str | None = None,
 ):
     """
     Run spot calling.
@@ -790,12 +851,22 @@ def run(
         raise ValueError("Round must be provided for calculating deviations.")
 
     # only for optimize
-    path_json = create_opt_path(path_img=path, codebook_path=codebook_path, mode="json", round_num=round_num)
+    path_json = create_opt_path(
+        path_img=path,
+        codebook_path=codebook_path,
+        mode="json",
+        round_num=round_num,
+        roi=roi,
+    )
     if calc_deviations:
         config = OPTIMIZE_CONFIG
         logger.info("Optimizing. Using optimize config.")
         path_pickle = create_opt_path(
-            path_img=path, codebook_path=codebook_path, mode="pkl", round_num=round_num
+            path_img=path,
+            codebook_path=codebook_path,
+            mode="pkl",
+            round_num=round_num,
+            roi=roi,
         )
         if path_json.exists() and any(
             round_num == v.round_num for v in Deviations.validate_json(path_json.read_text())
@@ -807,7 +878,7 @@ def run(
         (_path_out := path.parent / ("decoded-" + codebook_path.stem)).mkdir(exist_ok=True)
         path_pickle = _path_out / f"{path.stem}{f'-{split}' if split is not None else ''}.pkl"
 
-    if path_pickle.exists() and not overwrite:
+    if not highpass_only and not calc_deviations and path_pickle.exists() and not overwrite:
         logger.info(f"Skipping {path.name}. Already exists.")
         return
 
@@ -821,7 +892,7 @@ def run(
 
     codebook, used_bits, names, arr_zeroblank = load_codebook(
         codebook_path,
-        exclude={"Malat1-201"},  # , "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
+        # exclude={"Malat1-201"},  # , "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
         simple=simple,
         bit_mapping=bit_mapping,
     )
@@ -878,12 +949,16 @@ def run(
     if highpass_only:
         (path.parent / "_highpassed").mkdir(exist_ok=True)
 
-        tifffile.imwrite(
-            path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif",
-            imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
-            compression="zlib",
-            metadata={"keys": img_keys},
-        )
+        out_path = path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif"
+
+        if overwrite or not out_path.exists():
+            logger.debug(f"Writing to {out_path}")
+            tifffile.imwrite(
+                path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif",
+                imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+                compression="zlib",
+                metadata={"keys": img_keys},
+            )
         return
 
     if round_num == 0 and calc_deviations:
@@ -892,7 +967,11 @@ def run(
         path_json.write_bytes(
             Deviations.dump_json(
                 Deviations.validate_python([
-                    {"initial_scale": (1 / (base - mins)).tolist(), "mins": mins.tolist(), "round_num": 0}
+                    {
+                        "initial_scale": (1 / (base - mins)).tolist(),
+                        "mins": mins.tolist(),
+                        "round_num": 0,
+                    }
                 ])
             )
         )
@@ -924,9 +1003,12 @@ def run(
     try:
         perc = np.mean(
             list(
-                json.loads((path.parent.parent / f"opt_{codebook_path.stem}/percentiles.json").read_text())[
-                    (round_num - 1) if round_num is not None and calc_deviations else -1
-                ].values()
+                json.loads(
+                    (
+                        path.parent.parent
+                        / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}/percentiles.json"
+                    ).read_text()
+                )[(round_num - 1) if round_num is not None and calc_deviations else -1].values()
             )
         )
     except FileNotFoundError as e:
@@ -946,12 +1028,9 @@ def run(
     # Decode
     # if GPU and lock is None:
     #     raise Exception("GPU and lock are both None.")
-    lock = threading.Lock()
     if not simple:
         decoded_spots, image_decoding_results = (
-            pixel_decoding(imgs, config, codebook)
-            if not GPU
-            else pixel_decoding_gpu(imgs, config, codebook, lock)
+            pixel_decoding(imgs, config, codebook) if not GPU else pixel_decoding_gpu(imgs, config, codebook)
         )
         decoded_spots = decoded_spots.loc[decoded_spots[Features.PASSES_THRESHOLDS]]
     else:
@@ -973,7 +1052,13 @@ def run(
         try:
             if not len(spot_intensities):
                 logger.warning("No spots found. Skipping.")
-                append_json(path_json, round_num, deviation=np.ones(len(scale_all)), n=0, percent_blanks=0)
+                append_json(
+                    path_json,
+                    round_num,
+                    deviation=np.ones(len(scale_all)),
+                    n=0,
+                    percent_blanks=0,
+                )
                 return
 
             spot_intensities = spot_intensities[
@@ -986,11 +1071,18 @@ def run(
             idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
 
             deviations = np.nanmean(
-                spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan), axis=0
+                spot_intensities.squeeze() * np.where(arr_zeroblank[idxs], 1, np.nan),
+                axis=0,
             )
             logger.debug(f"Deviations: {np.round(deviations / np.nanmean(deviations), 4)}")
         except (np.exceptions.AxisError, ValueError):
-            append_json(path_json, round_num, deviation=np.ones(len(scale_factor)), n=0, percent_blanks=0)
+            append_json(
+                path_json,
+                round_num,
+                deviation=np.ones(len(scale_factor)),
+                n=0,
+                percent_blanks=0,
+            )
         else:
             """Concatenate with previous rounds. Will overwrite rounds beyond the current one."""
             append_json(
@@ -1060,6 +1152,7 @@ def parse_duration(duration_str: str) -> timedelta:
     help="Only process files modified since this duration (e.g., '30m', '2h', '1d').",
 )
 @click.option("--delete-corrupted", is_flag=True)
+@click.option("--local-opt", is_flag=True)
 def batch(
     path: Path,
     roi: str,
@@ -1073,6 +1166,7 @@ def batch(
     max_proj: bool = False,
     since: str | None = None,
     delete_corrupted: bool = False,
+    local_opt: bool = False,
 ):
     all_paths = {p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
     paths_in_scope = all_paths  # Start with all paths
@@ -1142,7 +1236,9 @@ def batch(
         "run",
         [
             "--global-scale",
-            (path / f"opt_{codebook_path.stem}" / "global_scale.txt").as_posix(),
+            (
+                path / f"opt_{codebook_path.stem}{f'+{roi}' if local_opt else ''}" / "global_scale.txt"
+            ).as_posix(),
             "--codebook",
             codebook_path.as_posix(),
             "--overwrite" if overwrite else "",
@@ -1150,6 +1246,7 @@ def batch(
             f"--limit-z={limit_z}",
             "--simple" if simple else "",
             f"--max-proj={max_proj}" if max_proj else "",
+            f"--roi={roi}" if roi else "",
         ],
         threads=threads,
         split=split,

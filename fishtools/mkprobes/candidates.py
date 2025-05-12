@@ -7,10 +7,12 @@ import polars as pl
 import pyfastx
 from loguru import logger
 
+from fishtools.mkprobes.constants import GOOD_SPECIES
 from fishtools.mkprobes.genes.chkgenes import get_transcripts
 from fishtools.mkprobes.starmap.starmap import split_probe
 
-from .ext.external_data import Dataset, _ExternalData
+from .ext.dataset import Dataset, ReferenceDataset
+from .ext.external_data import ExternalData
 from .utils._alignment import gen_fasta
 from .utils._crawler import crawler
 from .utils._filtration import PROBE_CRITERIA
@@ -28,7 +30,7 @@ pl.Config.set_tbl_rows(30)
 
 def get_pseudogenes(
     genes: list[str],
-    ensembl: _ExternalData,
+    ensembl: ExternalData,
     y: SAMFrame,
     limit: int = -1,  # allow: list[str] | None = None
 ) -> tuple[pl.Series, pl.DataFrame]:
@@ -64,9 +66,9 @@ def get_pseudogenes(
 
 
 def get_candidates(
-    dataset: Dataset,
+    dataset: Dataset | ReferenceDataset,
     gene: str | None = None,
-    fasta: Path | str | None = None,
+    seq: str | None = None,
     output: str | Path = "output/",
     *,
     ignore_revcomp: bool = False,
@@ -75,11 +77,15 @@ def get_candidates(
     disallow: list[str] | None = None,
     pseudogene_limit: int = -1,
 ):
-    if not ((gene is not None) ^ (fasta is not None)):
-        raise ValueError("Either gene or FASTA must be specified.")
+    if not ((gene is not None) ^ (seq is not None)):
+        raise ValueError("Either gene or sequence must be specified.")
 
-    if fasta is None and gene and not (re.search(r"\-2\d\d", gene) or "ENSMUST" in gene or "ENST" in gene):
-        # fmt: off
+    if (
+        seq is None
+        and gene
+        and not (re.search(r"\-2\d\d", gene) or "ENSMUST" in gene or "ENST" in gene)
+        and dataset.ensembl is not None
+    ):
         transcript = get_transcripts(dataset, [gene], mode="canonical")[0, "transcript_id"]
         appris = get_transcripts(dataset, [gene], mode="appris")
 
@@ -91,23 +97,40 @@ def get_candidates(
     else:
         transcript = gene
 
-    _run_transcript(
-        dataset=dataset,
-        transcript=transcript,
-        fasta=fasta,
-        output=output,
-        ignore_revcomp=ignore_revcomp,
-        overwrite=overwrite,
-        allow=allow,
-        disallow=disallow,
-        pseudogene_limit=pseudogene_limit,
-    )
+    if isinstance(dataset, ReferenceDataset):
+        _run_transcript(
+            dataset=dataset,
+            transcript=transcript,
+            fasta=seq,
+            output=output,
+            ignore_revcomp=ignore_revcomp,
+            overwrite=overwrite,
+            allow=allow,
+            disallow=disallow,
+            pseudogene_limit=pseudogene_limit,
+        )
+    else:
+        _run_transcript_generic(
+            dataset=dataset,
+            transcript=transcript,
+            output=output,
+            ignore_revcomp=ignore_revcomp,
+            overwrite=overwrite,
+            allow=allow,
+            disallow=disallow,
+        )
 
 
-def _run_bowtie(dataset: Dataset, seqs: pl.DataFrame, ignore_revcomp: bool = False, **kwargs):
+def _run_bowtie(
+    dataset: Dataset,
+    seqs: pl.DataFrame,
+    ignore_revcomp: bool = False,
+    bowtie2_index: str | Path | None = None,
+    **kwargs,
+):
     y = SAMFrame.from_bowtie_split_name(
         gen_fasta(seqs["seq"], names=seqs["name"]).getvalue(),
-        dataset.path / "txome",
+        bowtie2_index if bowtie2_index else dataset.data.bowtie2_index,
         seed_length=12,
         threshold=16,
         n_return=200,
@@ -139,7 +162,7 @@ def _convert_gene_to_tss(dataset: Dataset, gtss: list[str]):
 
 
 def _run_transcript(
-    dataset: Dataset,
+    dataset: ReferenceDataset,
     transcript: str | None = None,
     fasta: str | Path | None = None,
     output: str | Path = "output/",
@@ -152,6 +175,7 @@ def _run_transcript(
     pseudogene_limit: int = -1,
 ):
     allow, disallow = allow or [], disallow or []
+
     allow_tss = _convert_gene_to_tss(dataset, allow)
     disallow_tss = _convert_gene_to_tss(dataset, disallow)
 
@@ -159,6 +183,9 @@ def _run_transcript(
 
     if not ((fasta is not None) ^ (transcript is not None)):
         raise ValueError("Either FASTA or transcript must be specified.")
+
+    if fasta is not None:
+        raise NotImplementedError("FASTA not implemented yet.")
 
     if transcript is not None:
         transcript = transcript.split(".")[0]
@@ -171,7 +198,7 @@ def _run_transcript(
 
         gene, transcript_id, transcript_name = row["gene_name"], row["transcript_id"], row["transcript_name"]
         # need to be gene_name, not id, because of genes on scaffold assemblies
-        tss_gencode = set(dataset.gencode.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
+        tss_gencode = set(dataset.data.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
         tss_allofgene = set(dataset.ensembl.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
         if not len(tss_gencode):
             logger.warning(f"Transcript {transcript_id} not found in GENCODE basic.")
@@ -192,7 +219,7 @@ def _run_transcript(
         offtargets = pl.read_parquet(output / f"{transcript_name}_bowtie.parquet")
         y = pl.read_parquet(output / f"{transcript_name}_all.parquet")
     except (FileNotFoundError, pl.exceptions.ComputeError):
-        seq = dataset.gencode.get_seq(transcript_id) if fasta is None else seq
+        seq = dataset.data.get_seq(transcript_id, convert=dataset.species in GOOD_SPECIES)
         if len(seq) < 1500:
             logger.warning(
                 f"Transcript {transcript_name} is only {len(seq)}bp long. There may not be enough probes."
@@ -254,45 +281,50 @@ def _run_transcript(
         )
     )
 
-    tss_pseudo, counts = (
-        get_pseudogenes(list({gene} | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
-        if pseudogene_limit
-        else (pl.Series(), pl.DataFrame())
-    )
-
-    if len(bad_sig := counts.filter(~pl.col("acceptable") & pl.col("significant"))):
-        bad_sig.write_csv(output / f"{transcript_name}_offtarget_counts.csv")
-
-    # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
-    tss_others = {*allow_tss} - set(disallow_tss)
-
-    if len(tss_others):
-        names_with_pseudo = (
-            SAMFrame(y)
-            .filter_isin(transcript=tss_others)
-            .rename(dict(transcript="maps_to_pseudo"))[["name", "maps_to_pseudo"]]
-            .unique("name")
+    if dataset.species in GOOD_SPECIES:
+        tss_pseudo, counts = (
+            get_pseudogenes(list({gene} | set(allow)), dataset.ensembl, y, limit=pseudogene_limit)
+            if pseudogene_limit
+            else (pl.Series(), pl.DataFrame())
         )
+        if len(bad_sig := counts.filter(~pl.col("acceptable") & pl.col("significant"))):
+            bad_sig.write_csv(output / f"{transcript_name}_offtarget_counts.csv")
+
+        # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
+        tss_others = {*allow_tss} - set(disallow_tss)
+
+        if len(tss_others):
+            names_with_pseudo = (
+                SAMFrame(y)
+                .filter_isin(transcript=tss_others)
+                .rename(dict(transcript="maps_to_pseudo"))[["name", "maps_to_pseudo"]]
+                .unique("name")
+            )
+        else:
+            names_with_pseudo = pl.DataFrame({"name": y["name"].unique(), "maps_to_pseudo": ""})
+
+            isoforms = (
+                SAMFrame(y)
+                .filter_isin(transcript=tss_allofgene)[["name", "transcript"]]
+                .with_columns(
+                    isoforms=pl.col("transcript").map_elements(
+                        dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8
+                    )
+                )[["name", "isoforms"]]
+                .group_by("name")
+                .all()
+            )
+
+        tss_allacceptable: list[str] = list(tss_allofgene | tss_others) + ["*"]
+        pl.DataFrame(
+            dict(
+                transcript_id=tss_allacceptable,
+                transcript_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable if t != "*"]
+                + ["*"],
+            )
+        ).sort("transcript_name").write_csv(output / f"{transcript_name}_acceptable_tss.csv")
     else:
-        names_with_pseudo = pl.DataFrame({"name": y["name"].unique(), "maps_to_pseudo": ""})
-
-    isoforms = (
-        SAMFrame(y)
-        .filter_isin(transcript=tss_allofgene)[["name", "transcript"]]
-        .with_columns(
-            isoforms=pl.col("transcript").map_elements(dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8)
-        )[["name", "isoforms"]]
-        .group_by("name")
-        .all()
-    )
-
-    tss_allacceptable: list[str] = list(tss_allofgene | tss_others) + ["*"]
-    pl.DataFrame(
-        dict(
-            transcript_id=tss_allacceptable,
-            transcript_name=[dataset.ensembl.ts_to_tsname(t) for t in tss_allacceptable if t != "*"] + ["*"],
-        )
-    ).sort("transcript_name").write_csv(output / f"{transcript_name}_acceptable_tss.csv")
+        tss_allacceptable = allow
 
     ff = SAMFrame(y).filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
     if not len(ff):
@@ -322,14 +354,137 @@ def _run_transcript(
         .filter(
             ~pl.col("seq").map_elements(lambda x: dataset.check_kmers(cast(str, x)), return_dtype=pl.Boolean)
         )
-        .join(names_with_pseudo, on="name", how="left")
-        .join(isoforms, on="name", how="left")
     )
+
+    if dataset.species in GOOD_SPECIES:
+        ff = ff.join(names_with_pseudo, on="name", how="left").join(isoforms, on="name", how="left")
+
     logger.info(f"Generated {len(ff)} candidates.")
 
     assert not ff["seq"].str.contains("N").any()
 
     ff.write_parquet(output / f"{transcript_name}_crawled.parquet")
+    return ff
+
+
+def _run_transcript_generic(
+    dataset: Dataset,
+    transcript: str | None = None,
+    output: str | Path = "output/",
+    *,
+    ignore_revcomp: bool = False,
+    overwrite: bool = False,
+    allow: list[str] | None = None,
+    disallow: list[str] | None = None,
+    formamide: int = 40,
+):
+    allow, disallow = allow or [], disallow or []
+    (output := Path(output)).mkdir(exist_ok=True)
+
+    try:
+        if overwrite:
+            raise FileNotFoundError
+        offtargets = pl.read_parquet(output / f"{transcript}_bowtie.parquet")
+        y = pl.read_parquet(output / f"{transcript}_all.parquet")
+    except (FileNotFoundError, pl.exceptions.ComputeError):
+        seq = dataset.data.get_seq(transcript, convert=False)
+        if len(seq) < 1500:
+            logger.warning(
+                f"Transcript {transcript} is only {len(seq)}bp long. There may not be enough probes."
+            )
+        else:
+            logger.info(f"{transcript}: {len(seq)}bp")
+
+        crawled = crawler(seq, prefix=f"transcript", formamide=formamide)
+        if len(crawled) > 5000:
+            logger.warning(f"Transcript {transcript} has {len(crawled)} probes. Using only 2000.")
+            crawled = crawled.sample(n=5000, shuffle=True, seed=3)
+        if len(crawled) < 5:
+            logger.warning(f"Transcript {transcript} has only {len(crawled)} probes.")
+        if len(crawled) < 100:
+            logger.warning(f"Transcript {transcript} has only {len(crawled)} probes.")
+
+        crawled = (
+            crawled.with_columns(
+                splitted=pl.col("seq").map_elements(
+                    lambda pos: split_probe(pos, 60), return_dtype=pl.List(pl.Utf8)
+                ),
+                seq_full=pl.col("seq"),
+            )
+            .with_columns(
+                splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
+                padlock=pl.col("splitted").list.get(0),
+                pad_start=pl.col("splitted").list.get(2).cast(pl.Int16),
+            )
+            .drop("splitted")
+            .filter(pl.col("splint").str.len_chars() > 0)
+        )
+        # To get pad_start
+        crawled = (
+            crawled.melt(
+                id_vars=[col for col in crawled.columns if col not in ["splint", "padlock"]],
+                value_vars=["splint", "padlock"],
+            )
+            .with_columns(seq=pl.col("value"), name=pl.col("name") + "_" + pl.col("variable"))
+            .drop(["variable", "value"])
+        )
+        # crawled.write_parquet(output / f"{transcript_name}_rawcrawled.parquet")
+
+        y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
+        y = y.join(crawled[["name", "seq_full", "pad_start"]], on="name")
+
+        y.write_parquet(output / f"{transcript}_all.parquet")
+        offtargets.write_parquet(output / f"{transcript}_bowtie.parquet")
+
+    # Print most common offtargets
+    logger.info(
+        "Most common binders:\n"
+        + str(
+            SAMFrame(y)
+            .count_group_by("transcript", descending=True)
+            .filter(pl.col("count") > 0.1 * pl.col("count").first())
+            # .with_columns(
+            #     name=pl.col("transcript").map_elements(dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8)
+            # )[["name", "transcript", "count"]]
+        )
+    )
+
+    tss_allacceptable = allow
+    ff = SAMFrame(y).filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
+    if not len(ff):
+        raise Exception(
+            f"No probes left after filtering for {transcript}. Most likely, there is a homologous gene involved."
+        )
+
+    ff = SAMFrame(
+        ff.agg_tm_offtarget(tss_allacceptable, formamide=40)
+        .with_columns(
+            # transcript_name=pl.col("transcript").map_elements(
+            #     dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8
+            # ),
+            **PROBE_CRITERIA,
+        )
+        .with_columns([
+            (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
+            pl.col("seq")
+            .map_elements(lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .alias("tm"),
+            pl.col("seq")
+            .map_elements(lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .alias("hp"),
+        ])
+        .with_columns(oks=pl.sum_horizontal(pl.col("^ok_.*$")))
+        # .filter(~pl.col("seq").map_elements(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
+        .filter(
+            ~pl.col("seq").map_elements(lambda x: dataset.check_kmers(cast(str, x)), return_dtype=pl.Boolean)
+        )
+    )
+
+    logger.info(f"Generated {len(ff)} candidates.")
+
+    assert not ff["seq"].str.contains("N").any()
+
+    ff.write_parquet(output / f"{transcript}_crawled.parquet")
     return ff
 
 
@@ -364,7 +519,7 @@ def candidates(
     get_candidates(
         Dataset(path),
         gene=gene,
-        fasta=fasta,
+        seq=fasta,
         output=output,
         ignore_revcomp=ignore_revcomp,
         overwrite=overwrite,

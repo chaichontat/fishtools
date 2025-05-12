@@ -732,14 +732,14 @@ def run(
     help="Path to the codebook file",
     type=click.Path(exists=True, file_okay=True, path_type=Path),
 )
-@click.option("--ref", default="2_10_18", help="Reference identifier")
+@click.option("--ref", default=None, help="Reference identifier")
 @click.option("--fwhm", type=float, default=4, help="FWHM value")
 @click.option("--threshold", type=float, default=6, help="Threshold value")
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
 @click.option("--overwrite", is_flag=True)
 def batch(
     path: Path,
-    ref: str,
+    ref: str | None,
     codebook: Path,
     fwhm: int,
     threshold: int,
@@ -750,6 +750,14 @@ def batch(
     # use_custom_idx = idxs is not None
     ws = Workspace(path.parent.parent)
     logger.info(f"Found {ws.rois}")
+
+    if ref is None:
+        if "2_10_18" in ws.rounds:
+            ref = "2_10_18"
+        elif "7_15_23" in ws.rounds:
+            ref = "7_15_23"
+        else:
+            raise ValueError("No reference specified and no default found.")
 
     for roi in ws.rois:
         names = sorted({name for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")})

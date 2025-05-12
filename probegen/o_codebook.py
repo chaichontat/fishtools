@@ -3,32 +3,15 @@ import json
 import re
 from itertools import chain
 from pathlib import Path
-from typing import Any
 
 import numpy as np
-import numpy.typing as npt
 import rich_click as click
 from loguru import logger
 
-from fishtools.mkprobes.codebook.codebook import CodebookPicker
+from fishtools.mkprobes.codebook.codebook import CodebookPicker, bit_count, n_to_bit
 
 print(Path(__file__))
 static = Path(__file__).resolve().parent.parent / "static"
-
-
-def _bit_count(arr: npt.NDArray[np.integer[Any]]) -> npt.ArrayLike:
-    # Make the values type-agnostic (as long as it's integers)
-    t = arr.dtype.type
-    mask = np.array(-1).astype(arr.dtype)
-    s55 = t(0x5555555555555555 & mask)  # Add more digits for 128bit support
-    s33 = t(0x3333333333333333 & mask)
-    s0F = t(0x0F0F0F0F0F0F0F0F & mask)
-    s01 = t(0x0101010101010101 & mask)
-
-    arr = arr - ((arr >> 1) & s55)
-    arr = (arr & s33) + ((arr >> 2) & s33)
-    arr = (arr + (arr >> 4)) & s0F
-    return (arr * s01) >> (8 * (arr.itemsize - 1))
 
 
 def _gen_mhd(n: int, on: int, min_dist: int = 4, seed: int = 0):
@@ -81,7 +64,7 @@ def _gen_mhd(n: int, on: int, min_dist: int = 4, seed: int = 0):
         if not (i.bit_count() == on):
             continue
 
-        if np.any(_bit_count(out[:cnt] ^ i) < min_dist):
+        if np.any(bit_count(out[:cnt] ^ i) < min_dist):
             continue
 
         out[cnt] = i
@@ -92,48 +75,9 @@ def _gen_mhd(n: int, on: int, min_dist: int = 4, seed: int = 0):
     return out[:cnt]
 
 
-def _n_to_bit(arr: np.ndarray, n: int, on: int):
-    """
-    Convert an array of integers into a 2D array of binary representations.
-
-    Each integer in the input array is represented as an `n`-bit binary number in the output array.
-    The function also checks that the number of 1s in each binary representation is equal to `on`.
-
-    Parameters
-    ----------
-    arr : np.ndarray
-        A 1D numpy array of integers.
-    n : int
-        The number of bits to use for the binary representation of each integer.
-    on : int
-        The expected number of 1s in each binary representation.
-
-    Returns
-    -------
-    np.ndarray
-        A 2D numpy array where each row is the `n`-bit binary representation of the corresponding integer in the input array.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> print(n_to_bit(np.array([1, 2, 4]), 3, 1))
-    array([[1, 0, 0],
-          [0, 1, 0],
-          [0, 0, 1]])
-    """
-
-    if not isinstance(arr, np.ndarray):  # type: ignore
-        raise TypeError("Input array must be a numpy array.")
-
-    arr = ((arr[:, None] & (1 << np.arange(n))) > 0).astype(int)
-    if not np.all(arr.sum(axis=1) == on):
-        raise ValueError(f"Number of 1s is not equal to {on=}.")
-    return arr
-
-
 def _generate(path: Path, n: int):
     x = _gen_mhd(n, 3, seed=0, min_dist=2)
-    np.savetxt(path, out := _n_to_bit(x, n, 3), fmt="%d", delimiter=",")
+    np.savetxt(path, out := n_to_bit(x, n, 3), fmt="%d", delimiter=",")
     return out
 
 
@@ -196,10 +140,31 @@ def gen_codebook(tss: list[str], offset: int = 0, n_bits: int | None = None, see
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--offset", "-o", type=int, default=0)
+@click.option(
+    "--existing-codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path)
+)
 @click.option("--n-bits")
-def run(path: Path, offset: int = 0, n_bits: int | None = None):
-    res = gen_codebook(path.read_text().splitlines(), offset=offset, n_bits=n_bits)
-    (path.with_suffix(".json")).write_text(json.dumps(res, indent=2))
+def run(path: Path, offset: int = 0, existing_codebook: Path | None = None, n_bits: int | None = None):
+    genes = path.read_text().splitlines()
+    if offset and (existing_codebook is not None):
+        raise ValueError("Must specify either offset or existing codebook")
+
+    if existing_codebook:
+        res = json.loads(existing_codebook.read_text())
+        bits = set(chain.from_iterable(res.values()))
+        offset = len(bits)
+        logger.info(f"Using offset {offset} from existing codebook")
+
+        if set(res) & set(genes):
+            raise ValueError(f"Genes in existing codebook and input overlap: {set(res) & set(genes)}")
+
+    generated = gen_codebook(genes, offset=offset, n_bits=n_bits)
+    if existing_codebook and set(chain.from_iterable(generated.values())) & set(
+        chain.from_iterable(res.values())
+    ):
+        raise Exception("Bits overlap")
+
+    (path.with_suffix(".json")).write_text(json.dumps(generated, indent=2))
 
 
 # %%

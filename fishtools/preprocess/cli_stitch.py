@@ -172,7 +172,7 @@ def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int):
     "path",
     type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
 )
-@click.argument("roi", type=str)
+@click.argument("roi", type=str, default="*")
 @click.option(
     "--position_file",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
@@ -395,7 +395,7 @@ def walk_fused(path: Path):
 
 @stitch.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("roi", type=str)
+@click.argument("roi", type=str, default="*")
 @click.option(
     "--tile_config",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),

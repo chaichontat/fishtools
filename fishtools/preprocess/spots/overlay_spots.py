@@ -30,6 +30,7 @@ from fishtools.analysis.labelimage import (
     isotropic_label_opening,
 )
 from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.utils.io import Workspace
 
 # --- Configuration ---
 CONTOUR_PAD = 1
@@ -102,6 +103,7 @@ def load_and_prepare_spots(
     downsample_factor: int,
     x_offset: float,
     y_offset: float,
+    max_proj: bool = False,
 ) -> pl.DataFrame:
     """Loads spots, filters by Z, adjusts coordinates, and adds unique IDs."""
     logger.info(f"Slice {idx}: Loading spots from {spots_parquet_path}...")
@@ -114,8 +116,12 @@ def load_and_prepare_spots(
         f"Slice {idx}: Filtering spots for Z = {idx} +/- {z_filter_tolerance} and applying offsets..."
     )
     spots = (
-        all_spots.filter(
-            pl.col("z").is_between(idx - z_filter_tolerance, idx + z_filter_tolerance, closed="both")
+        (
+            all_spots.filter(
+                pl.col("z").is_between(idx - z_filter_tolerance, idx + z_filter_tolerance, closed="both")
+            )
+            if not max_proj
+            else all_spots
         )
         .with_columns(
             x_adj=pl.col("x") / downsample_factor - x_offset,
@@ -493,6 +499,7 @@ def process_slice(
     dilation_radius: float,
     overwrite: bool,
     debug: bool,
+    max_proj: bool = False,
 ) -> None:
     """
     Orchestrates the processing steps for a single Z-slice.
@@ -518,7 +525,13 @@ def process_slice(
             x_offset, y_offset = calculate_coordinate_offsets(tile_config_path, DOWNSAMPLE_FACTOR, idx)
 
         spots_df = load_and_prepare_spots(
-            spots_parquet_path, idx, Z_FILTER_TOLERANCE, DOWNSAMPLE_FACTOR, x_offset, y_offset
+            spots_parquet_path,
+            idx,
+            Z_FILTER_TOLERANCE,
+            DOWNSAMPLE_FACTOR,
+            x_offset,
+            y_offset,
+            max_proj=max_proj,
         )
 
         # Handle case with no spots early
@@ -718,6 +731,7 @@ def run_(
     dilation_radius: float,
     overwrite: bool,
     debug: bool,
+    max_proj: bool = False,
 ):
     """
     Main function to process a specific Z-slice of segmented image data
@@ -766,6 +780,7 @@ def run_(
             dilation_radius=dilation_radius,
             overwrite=overwrite,
             debug=debug,
+            max_proj=max_proj,
         )
         logger.info(f"Successfully finished processing slice {idx}.")
     except Exception as e:
@@ -784,7 +799,7 @@ def initialize():
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
     required=True,
 )
-@click.argument("roi", type=str)
+@click.argument("roi", type=str, default="*")
 @click.option("--codebook", type=str)
 @click.option("--seg-codebook", type=str)
 @click.option(
@@ -823,38 +838,43 @@ def overlay(
 ):
     import zarr
 
-    spots = path / f"{roi}+{codebook}.parquet"
-    input_dir = path / f"stitch--{roi}+{seg_codebook}"
+    ws = Workspace(path)
+    rois = [roi] if roi != "*" else ws.rois
 
-    with ProcessPoolExecutor(
-        max_workers=8,
-        mp_context=get_context("spawn"),
-    ) as executor:
-        futures = []
-        roi, codebook = spots.stem.split("+")
-        z = zarr.open_array(input_dir / segmentation_name, mode="r")
-        for i in range(z.shape[0]):
-            futures.append(
-                executor.submit(
-                    run_,
-                    input_dir,
-                    input_dir,
-                    segmentation_name,
-                    spots,
-                    path / f"stitch--{roi}/TileConfiguration.registered.txt",
-                    i,
-                    opening_radius,
-                    closing_radius,
-                    dilation_radius,
-                    overwrite,
-                    debug,
+    for roi in rois:
+        spots = path / f"{roi}+{codebook}.parquet"
+        input_dir = path / f"stitch--{roi}+{seg_codebook}"
+
+        with ProcessPoolExecutor(
+            max_workers=8,
+            mp_context=get_context("spawn"),
+        ) as executor:
+            futures = []
+            roi, codebook = spots.stem.split("+")
+            z = zarr.open_array(input_dir / segmentation_name, mode="r")
+            for i in range(z.shape[0]):
+                futures.append(
+                    executor.submit(
+                        run_,
+                        input_dir,
+                        input_dir,
+                        segmentation_name,
+                        spots,
+                        path / f"stitch--{roi}/TileConfiguration.registered.txt",
+                        i,
+                        opening_radius,
+                        closing_radius,
+                        dilation_radius,
+                        overwrite,
+                        debug,
+                        max_proj=z.shape[0] == 1,
+                    )
                 )
-            )
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logger.error(f"Error processing slice: {e}")
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error processing slice: {e}")
 
 
 if __name__ == "__main__":

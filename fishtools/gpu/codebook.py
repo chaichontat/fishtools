@@ -512,7 +512,6 @@ class Codebook(xr.DataArray):
         norm_codes: "Codebook",
         norm_intensities: xr.DataArray,
         metric: str,
-        lock: threading.Lock,
         shape: tuple[int, ...],
     ) -> Tuple[np.ndarray, np.ndarray]:
         """find the nearest code for each feature using the ball_tree approximate NN algorithm
@@ -601,7 +600,6 @@ class Codebook(xr.DataArray):
         max_distance: Number,
         min_intensity: Number,
         norm_order: int,
-        lock: threading.Lock,
         shape: tuple[int, ...],
         metric: str = "euclidean",
         return_original_intensities: bool = False,
@@ -667,7 +665,7 @@ class Codebook(xr.DataArray):
         norm_codes, _ = self._normalize_features(self, norm_order=norm_order)
 
         metric_outputs, targets = self._approximate_nearest_code(
-            norm_codes, norm_intensities, metric=metric, shape=shape, lock=lock
+            norm_codes, norm_intensities, metric=metric, shape=shape
         )
 
         # only targets with low distances and high intensities should be retained

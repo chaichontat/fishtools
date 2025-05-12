@@ -13,7 +13,7 @@ from loguru import logger
 from fishtools import rc
 from fishtools.mkprobes.candidates import _run_bowtie
 from fishtools.mkprobes.codebook.codebook import hash_codebook
-from fishtools.mkprobes.ext.external_data import Dataset
+from fishtools.mkprobes.ext.dataset import ReferenceDataset as Dataset
 from fishtools.mkprobes.starmap.starmap import rotate, split_probe, test_splint_padlock
 
 READOUTS: Final[dict[int, str]] = {

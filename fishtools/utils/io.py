@@ -84,8 +84,11 @@ class Workspace:
         return f"Workspace({self.path})"
 
     def __init__(self, path: Path | str, deconved: bool = False):
-        path = Path(path)
-        self.path = Path(path if not deconved else path.parent.parent).expanduser().resolve()
+        path = Path(path).expanduser().resolve()
+        if "analysis/deconv" in path.as_posix():
+            self.path = path.parent.parent
+        else:
+            self.path = path
 
     @property
     def rounds(self):

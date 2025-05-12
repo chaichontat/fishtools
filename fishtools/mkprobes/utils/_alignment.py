@@ -2,12 +2,12 @@ import io
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Collection, Iterable
 
 from Bio import AlignIO
 from loguru import logger
 
-from fishtools.utils.utils import check_if_exists
+from fishtools.utils.utils import check_if_exists, check_if_posix, run_process
 
 
 def _n_generator() -> Iterable[str]:
@@ -115,3 +115,36 @@ def run_mafft(stdin: str | bytes) -> str:
 
 def parse_mafft(s: str) -> AlignIO.MultipleSeqAlignment:
     return AlignIO.read(io.StringIO(s), "fasta")
+
+
+@check_if_posix
+@check_if_exists(logger, lambda kwargs: kwargs["out"])
+def jellyfish(
+    seqs: Collection[str] | str,
+    out: str | Path,
+    kmer: int,
+    *,
+    hash_size: str = "10G",
+    minimum: int = 1,
+    counter: int = 2,
+    thread: int = 16,
+    both_strands: bool = False,
+):
+    """
+    http://www.cs.cmu.edu/~ckingsf/software/jellyfish/jellyfish-manual-1.1.pdf
+    """
+    out = Path(out).resolve()
+    if isinstance(seqs, str):
+        stdin = Path(seqs).read_bytes()
+    else:
+        stdin = gen_fasta(seqs).getvalue().encode()
+
+    stdout1 = run_process(
+        shlex.split(
+            rf"jellyfish count -o /dev/stdout -m {kmer} -t {thread} -s {hash_size} -L {minimum} -c {counter} {'--both-strands' if both_strands else ''} /dev/stdin"
+        ),
+        stdin,
+    )
+    stdout2 = run_process(shlex.split("jellyfish dump -c -L 1 /dev/stdin"), stdout1)
+
+    Path(out).write_bytes(stdout2)

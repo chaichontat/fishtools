@@ -18,6 +18,60 @@ def hash_codebook(cb: dict[str, Collection[int]]) -> str:
     ).hexdigest()[-6:]
 
 
+def bit_count(arr: npt.NDArray[np.integer[Any]]) -> npt.ArrayLike:
+    # Make the values type-agnostic (as long as it's integers)
+    t = arr.dtype.type
+    mask = np.array(-1).astype(arr.dtype)
+    s55 = t(0x5555555555555555 & mask)  # Add more digits for 128bit support
+    s33 = t(0x3333333333333333 & mask)
+    s0F = t(0x0F0F0F0F0F0F0F0F & mask)
+    s01 = t(0x0101010101010101 & mask)
+
+    arr = arr - ((arr >> 1) & s55)
+    arr = (arr & s33) + ((arr >> 2) & s33)
+    arr = (arr + (arr >> 4)) & s0F
+    return (arr * s01) >> (8 * (arr.itemsize - 1))
+
+
+def n_to_bit(arr: np.ndarray, n: int, on: int):
+    """
+    Convert an array of integers into a 2D array of binary representations.
+
+    Each integer in the input array is represented as an `n`-bit binary number in the output array.
+    The function also checks that the number of 1s in each binary representation is equal to `on`.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        A 1D numpy array of integers.
+    n : int
+        The number of bits to use for the binary representation of each integer.
+    on : int
+        The expected number of 1s in each binary representation.
+
+    Returns
+    -------
+    np.ndarray
+        A 2D numpy array where each row is the `n`-bit binary representation of the corresponding integer in the input array.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> print(n_to_bit(np.array([1, 2, 4]), 3, 1))
+    array([[1, 0, 0],
+          [0, 1, 0],
+          [0, 0, 1]])
+    """
+
+    if not isinstance(arr, np.ndarray):  # type: ignore
+        raise TypeError("Input array must be a numpy array.")
+
+    arr = ((arr[:, None] & (1 << np.arange(n))) > 0).astype(int)
+    if not np.all(arr.sum(axis=1) == on):
+        raise ValueError(f"Number of 1s is not equal to {on=}.")
+    return arr
+
+
 class CodebookPicker:
     def __init__(
         self,

@@ -15,15 +15,15 @@ from loguru import logger as log
 from fishtools.utils.io import download, get_file_name, set_cwd
 from fishtools.utils.utils import check_if_exists, check_if_posix, run_process
 
-from ..utils._alignment import gen_fasta
-from .external_data import _ExternalData
+from ..utils._alignment import gen_fasta, jellyfish
+from .external_data import ExternalData
 
 url_files = {
     "mouse": Path(__file__).parent / "mouseurls.tsv",
     "human": Path(__file__).parent / "humanurls.tsv",
 }
 
-Gtfs = NamedTuple("gtfs", [("ensembl", _ExternalData), ("gencode", _ExternalData)])
+Gtfs = NamedTuple("gtfs", [("ensembl", ExternalData), ("gencode", ExternalData)])
 
 
 class NecessaryFiles(TypedDict):
@@ -38,39 +38,6 @@ class NecessaryFiles(TypedDict):
 def _process_tsv(file: Path | str) -> NecessaryFiles:
     file = Path(file)
     return NecessaryFiles([x.split("\t") for x in file.read_text().splitlines()])  # type: ignore
-
-
-@check_if_posix
-@check_if_exists(log, lambda kwargs: kwargs["out"])
-def jellyfish(
-    seqs: Collection[str] | str,
-    out: str | Path,
-    kmer: int,
-    *,
-    hash_size: str = "10G",
-    minimum: int = 1,
-    counter: int = 2,
-    thread: int = 16,
-    both_strands: bool = False,
-):
-    """
-    http://www.cs.cmu.edu/~ckingsf/software/jellyfish/jellyfish-manual-1.1.pdf
-    """
-    out = Path(out).resolve()
-    if isinstance(seqs, str):
-        stdin = Path(seqs).read_bytes()
-    else:
-        stdin = gen_fasta(seqs).getvalue().encode()
-
-    stdout1 = run_process(
-        shlex.split(
-            rf"jellyfish count -o /dev/stdout -m {kmer} -t {thread} -s {hash_size} -L {minimum} -c {counter} {'--both-strands' if both_strands else ''} /dev/stdin"
-        ),
-        stdin,
-    )
-    stdout2 = run_process(shlex.split("jellyfish dump -c -L 1 /dev/stdin"), stdout1)
-
-    Path(out).write_bytes(stdout2)
 
 
 def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]):
@@ -117,7 +84,7 @@ def download_gtf_fasta(path: Path | str, species: Literal["mouse", "human"]):
             p_.write_bytes(out)
 
 
-def get_rrna_snorna(gtf: _ExternalData):
+def get_rrna_snorna(gtf: ExternalData):
     ids = gtf.gtf.filter(pl.col("gene_biotype").is_in(["rRNA", "snoRNA"]))["transcript_id"]
     return ids, list(map(gtf.get_seq, ids))
 
@@ -129,7 +96,7 @@ def run_jellyfish(path: Path | str):
         urls = _process_tsv("urls.tsv")
         filenames = {k: get_file_name(v) for k, v in urls.items()}  # type: ignore
 
-        gtf = _ExternalData("ensembl.parquet", fasta="cdna_ncrna_trna.fasta", gtf_path="ensembl.gtf.gz")
+        gtf = ExternalData("ensembl.parquet", fasta="cdna_ncrna_trna.fasta", gtf_path="ensembl.gtf.gz")
         log.info("Getting tRNA, rRNA, and snoRNA sequences.")
 
         toexclude = [x.seq for x in pyfastx.Fasta(filenames["trna"].split(".")[0] + ".fa")] + get_rrna_snorna(
@@ -164,7 +131,7 @@ def run_repeatmasker(fasta: Path | str, species: str, threads: int = 16):
 
 # %%
 if __name__ == "__main__":
-    gtf = _ExternalData("data/mouse/ensembl.parquet", fasta="data/mouse/cdna_ncrna_trna.fasta")
+    gtf = ExternalData("data/mouse/ensembl.parquet", fasta="data/mouse/cdna_ncrna_trna.fasta")
 # get("data/mouse")
 
 # GTF https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_32/gencode.v32.annotation.gtf.gz
