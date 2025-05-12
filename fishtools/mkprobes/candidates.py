@@ -67,7 +67,7 @@ def get_pseudogenes(
 
 def get_candidates(
     dataset: Dataset | ReferenceDataset,
-    gene: str | None = None,
+    transcript: str | None = None,
     seq: str | None = None,
     output: str | Path = "output/",
     *,
@@ -77,17 +77,17 @@ def get_candidates(
     disallow: list[str] | None = None,
     pseudogene_limit: int = -1,
 ):
-    if not ((gene is not None) ^ (seq is not None)):
+    if not ((transcript is not None) ^ (seq is not None)):
         raise ValueError("Either gene or sequence must be specified.")
 
     if (
         seq is None
-        and gene
-        and not (re.search(r"\-2\d\d", gene) or "ENSMUST" in gene or "ENST" in gene)
+        and transcript
+        and not (re.search(r"\-2\d\d", transcript) or "ENSMUST" in transcript or "ENST" in transcript)
         and dataset.ensembl is not None
     ):
-        transcript = get_transcripts(dataset, [gene], mode="canonical")[0, "transcript_id"]
-        appris = get_transcripts(dataset, [gene], mode="appris")
+        transcript = get_transcripts(dataset, [transcript], mode="canonical")[0, "transcript_id"]
+        appris = get_transcripts(dataset, [transcript], mode="appris")
 
         if not appris.filter(pl.col("transcript_id") == transcript).shape[0]:
             logger.warning(f"Ensembl canonical transcript {transcript} not found in APPRIS.")
@@ -95,7 +95,7 @@ def get_candidates(
 
         logger.info(f"Chosen transcript: {transcript}")
     else:
-        transcript = gene
+        transcript = transcript
 
     if isinstance(dataset, ReferenceDataset):
         _run_transcript(
@@ -518,7 +518,7 @@ def candidates(
     disallow_ = disallow.split(",") if disallow else None
     get_candidates(
         Dataset(path),
-        gene=gene,
+        transcript=gene,
         seq=fasta,
         output=output,
         ignore_revcomp=ignore_revcomp,
