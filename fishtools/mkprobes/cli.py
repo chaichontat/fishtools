@@ -9,7 +9,7 @@ from fishtools.utils.utils import setup_logging
 
 from .candidates import candidates
 from .codebook.finalconstruct import click_construct, filter_genes
-from .ext.external_data import Dataset
+from .ext.dataset import Dataset
 from .genes.chkgenes import chkgenes, convert_to_transcripts, transcripts
 from .screen import screen
 from .utils._alignment import bowtie_build
