@@ -1,17 +1,27 @@
+import shutil
 from functools import cache
 from pathlib import Path
 from typing import Literal, cast
 
 import polars as pl
 from loguru import logger
+from pydantic import BaseModel
 
-from fishtools.mkprobes.ext.external_data import ExternalData
+from fishtools.mkprobes.ext.external_data import ExternalData, ExternalDataDefinition
 from fishtools.mkprobes.utils.sequtils import kmers
 
 
 def parse_jellyfish(path: Path | str) -> pl.DataFrame:
     """Parse a jellyfish output file."""
-    return pl.read_csv(path, separator=" ", has_header=False, new_columns=["kmer", "count"])
+    try:
+        return pl.read_csv(path, separator=" ", has_header=False, new_columns=["kmer", "count"])
+    except pl.exceptions.NoDataError:
+        raise ValueError(f"Jellyfish file {path} is empty.")
+
+
+class DatasetDefinition(BaseModel):
+    species: str
+    external_data: dict[str, ExternalDataDefinition]
 
 
 class Dataset:
@@ -44,6 +54,61 @@ class Dataset:
         # For backwards compatibility
         self.gencode = self.data
         self.ensembl: ExternalData | None = None
+
+    @classmethod
+    def from_components(
+        cls, path: str | Path, fasta_file: str | Path, *, species: str, overwrite: bool = False
+    ):
+        path = Path(path)
+        fasta_file = Path(fasta_file)
+
+        if path.exists() and not overwrite:
+            logger.warning(f"Path {path} already exists. Set overwrite=True to proceed.")
+
+        logger.info(f"Creating dataset at {path}")
+        path.mkdir(exist_ok=True, parents=True)
+        new_path = path / fasta_file.name
+        logger.info(f"Copying {fasta_file} to {new_path}")
+        if fasta_file.resolve() != new_path.resolve():
+            shutil.copy(fasta_file, new_path)
+
+        external_data = ExternalData(
+            cache=path / fasta_file.with_suffix(".parquet").name,
+            fasta=fasta_file,
+        )
+        external_data.bowtie_build()
+        external_data.run_jellyfish()
+
+        Path(path / "dataset.json").write_text(
+            DatasetDefinition(
+                external_data={
+                    "default": ExternalDataDefinition(
+                        path=path.as_posix(),
+                        fasta_name=fasta_file.name,
+                        bowtie2_index_name=external_data.bowtie2_index.name,
+                        kmer18_name=external_data.kmer.name,
+                    )
+                },
+                species=species,
+            ).model_dump_json()
+        )
+
+        return cls(path=path, external_data=external_data, species=species, kmer18_path=external_data.kmer)
+
+    @classmethod
+    def from_folder(cls, path: Path):
+        path = Path(path)
+        if not (path / "dataset.json").exists():
+            raise FileNotFoundError(f"Path {path} does not exist. Please create a dataset first.")
+
+        definition = DatasetDefinition.model_validate_json((path / "dataset.json").read_text())
+        external_data = ExternalData.from_definition(definition.external_data["default"])
+        return cls(
+            path=path,
+            external_data=external_data,
+            species=definition.species,
+            kmer18_path=path / external_data.kmer,
+        )
 
     def check_kmers(self, seq: str):
         if not self.trna_rna_kmers:

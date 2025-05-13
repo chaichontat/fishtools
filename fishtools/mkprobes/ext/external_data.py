@@ -12,6 +12,7 @@ import polars as pl
 import pyfastx
 import requests
 from loguru import logger
+from pydantic import BaseModel
 
 from fishtools.mkprobes.utils._alignment import bowtie_build, jellyfish
 
@@ -34,11 +35,20 @@ def get_ensembl(path: Path | str, id_: str):
 
 
 class MockGTF:
-    def __getattribute__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> Any:
         raise NotImplementedError(f"ExternalData not created with GTF path. Cannot access {name}")
 
     def __getitem__(self, name: str | list[str]) -> Any:
         raise NotImplementedError("ExternalData not created with GTF path. Cannot index.")
+
+
+class ExternalDataDefinition(BaseModel):
+    path: str
+    cache_name: str | None = None
+    gtf_name: str | None = None
+    fasta_name: str
+    kmer18_name: str
+    bowtie2_index_name: str
 
 
 class ExternalData:
@@ -126,47 +136,80 @@ class ExternalData:
 
     def __init__(
         self,
-        cache: Path | str,
+        cache: Path | str | None = None,
         *,
         fasta: Path | str,
         gtf_path: Path | str | None = None,
         regen_cache: bool = False,
         fasta_key_func: Callable[[str], str | None] = lambda x: x.split(" ")[0].split(".")[0],
+        bowtie2_index: str | None = None,
+        kmer18: str | None = None,
     ) -> None:
         self.fasta_path = Path(fasta)
         self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=fasta_key_func)
         self._ts_gene_map: dict[str, str] | None = None
 
-        if Path(cache).exists() and not regen_cache:
+        if cache and Path(cache).exists() and not regen_cache:
             self.gtf: pl.DataFrame | MockGTF = pl.read_parquet(cache)
         else:
             if gtf_path is None:
                 logger.warning("GTF path not specified. Must be specified for reference species.")
                 self.gtf = MockGTF()
             else:
+                if not cache:
+                    raise ValueError("Cache path must be specified if GTF path is provided.")
                 self.gtf = self.parse_gtf(Path(gtf_path).resolve())
                 self.gtf.write_parquet(cache)
 
+        self._override_bowtie2_index = bowtie2_index
+        self._override_kmer18 = kmer18
+
+    @classmethod
+    def from_definition(cls, definition: ExternalDataDefinition):
+        path = Path(definition.path)
+        return cls(
+            cache=path / definition.cache_name if definition.cache_name else None,
+            fasta=path / definition.fasta_name,
+            gtf_path=path / definition.gtf_name if definition.gtf_name else None,
+            bowtie2_index=definition.bowtie2_index_name,
+            kmer18=definition.kmer18_name,
+        )
+
     @property
     def bowtie2_index(self):
+        if self._override_bowtie2_index:
+            return self.fasta_path.parent / self._override_bowtie2_index
+
         bt = self.fasta_path.parent.glob(f"{self.fasta_path.stem}*.bt2")
         if not len(list(bt)):
             raise FileNotFoundError(
                 f"Bowtie2 index not found for {self.fasta_path.stem}. Please build with `bowtie2-build {{fasta_path}} {{fasta file name}}` or call self.bowtie_build()."
             )
 
-        return self.fasta_path.with_suffix("").as_posix()
+        return self.fasta_path.with_suffix("")
 
     def bowtie_build(self):
         return bowtie_build(self.fasta_path, self.fasta_path.stem)
 
     @property
     def kmer(self):
+        if self._override_kmer18:
+            kmer18 = self.fasta_path.parent / self._override_kmer18
+            if not kmer18.exists():
+                raise FileNotFoundError(
+                    f"Kmer file {kmer18} not found. Please run jellyfish or recreate the dataset."
+                )
+            return self.fasta_path.parent / kmer18
+
         if not self.fasta_path.with_suffix(".jf").exists():
             raise FileNotFoundError("Kmer file not found. Please run jellyfish.")
         return self.fasta_path.with_suffix(".jf")
 
-    def run_jellyfish(self, kmer: int = 18):
+    def run_jellyfish(self, kmer: int = 18, overwrite: bool = False):
+        if self.fasta_path.with_suffix(".jf").exists() and not overwrite:
+            logger.info(f"Jellyfish file {self.fasta_path.with_suffix('.jf')} already exists. Skipping.")
+            return
+
         logger.info("Running jellyfish for 18-mers in cDNA.")
         jellyfish(
             [x.seq for x in self.fa],
