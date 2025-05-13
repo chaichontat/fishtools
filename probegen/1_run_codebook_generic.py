@@ -30,7 +30,24 @@ def run_gene(
     log_level: str = "INFO",
     **kwargs,
 ):
-    # acceptable = ["ENSMUST00000111752", "ENSMUST00000086317"]
+    """
+    Runs the probe generation pipeline for a single gene/transcript.
+
+    This involves finding candidate probes, screening them, and potentially
+    constructing the final probe set.
+
+    Args:
+        dataset_path: Path to the dataset directory.
+        output_path: Path to the directory where output files will be saved.
+        codebook: A dictionary mapping transcript IDs to codebook values.
+        transcript: The specific transcript ID to process.
+        acceptable: An optional list of acceptable "off-target" transcript IDs.
+                    If provided, binders to these transcripts will not be discarded.
+        overwrite: If True, overwrite existing output files.
+        log_level: Logging level for the run.
+        **kwargs: Additional keyword arguments passed to `get_candidates`.
+    """
+
     ts = transcript
     logger.remove()
     logger.add(sys.stderr, level=log_level)
@@ -95,6 +112,12 @@ def single(
     listfailed: bool = False,
     listfailedall: bool = False,
 ):
+    """
+    Process a single codebook to generate probes.
+
+    PATH_DATASET: Path to the dataset directory.
+    CODEBOOK: Path to the JSON codebook file.
+    """
     codebook = json.loads(codebook_path.read_text())
     codebook = {k: v for k, v in codebook.items() if not k.startswith("Blank")}
     if not len(set(codebook)) == len(codebook):

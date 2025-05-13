@@ -15,9 +15,13 @@ from fishtools.mkprobes.utils.sequtils import kmers
 def parse_jellyfish(path: Path | str) -> pl.DataFrame:
     """Parse a jellyfish output file."""
     try:
-        return pl.read_csv(path, separator=" ", has_header=False, new_columns=["kmer", "count"])
+        return pl.read_csv(
+            path, separator=" ", has_header=False, new_columns=["kmer", "count"]
+        )
     except pl.exceptions.NoDataError:
-        raise ValueError(f"Jellyfish file {path} is empty. Please delete and rerun create-dataset.")
+        raise ValueError(
+            f"Jellyfish file {path} is empty. Please delete and rerun create-dataset."
+        )
 
 
 class DatasetDefinition(BaseModel):
@@ -83,7 +87,9 @@ class Dataset:
         self.kmer18 = parse_jellyfish(kmer18_path) if kmer18_path else None
         self.kmerset = set(self.kmer18["kmer"] if self.kmer18 is not None else [])
         self.trna_rna_kmers = (
-            set(parse_jellyfish(trna_rna_kmers_path)["kmer"]) if trna_rna_kmers_path else None
+            set(parse_jellyfish(trna_rna_kmers_path)["kmer"])
+            if trna_rna_kmers_path
+            else None
         )
 
         # For backwards compatibility
@@ -131,7 +137,9 @@ class Dataset:
             shutil.copy(fasta_file, new_path)
 
         external_data = ExternalData(
-            cache=path / fasta_file.with_suffix(".parquet").name, fasta=fasta_file, regen_cache=overwrite
+            cache=path / fasta_file.with_suffix(".parquet").name,
+            fasta=fasta_file,
+            regen_cache=overwrite,
         )
         external_data.bowtie_build(overwrite=overwrite)
         external_data.run_jellyfish(overwrite=overwrite)
@@ -175,10 +183,16 @@ class Dataset:
         """
         path = Path(path)
         if not (path / "dataset.json").exists():
-            raise FileNotFoundError(f"Path {path} does not exist. Please create a dataset first.")
+            raise FileNotFoundError(
+                f"Path {path} does not exist. Please create a dataset first."
+            )
 
-        definition = DatasetDefinition.model_validate_json((path / "dataset.json").read_text())
-        external_data = ExternalData.from_definition(path, definition.external_data["default"])
+        definition = DatasetDefinition.model_validate_json(
+            (path / "dataset.json").read_text()
+        )
+        external_data = ExternalData.from_definition(
+            path, definition.external_data["default"]
+        )
         return cls(
             path=path,
             external_data=external_data,
@@ -319,8 +333,12 @@ class ReferenceDataset(Dataset):
 
 @click.command()
 @click.argument("path", type=click.Path(dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("fasta_file", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
-@click.option("--species", "-s", type=str, default="mouse", help="Species to use for probe design")
-@click.option("--overwrite", "-o", is_flag=True, help="Overwrite existing dataset")
-def create_dataset(path: Path, fasta_file: Path, species: str, overwrite: bool):
-    Dataset.from_components(path, fasta_file, species=species, overwrite=overwrite)
+@click.option(
+    "--fasta", type=click.Path(dir_okay=False, file_okay=True, path_type=Path)
+)
+@click.option("--species", "-s", type=str, help="Species name for metadata")
+@click.option("--overwrite", is_flag=True, help="Overwrite existing dataset")
+def create_dataset(path: Path, fasta: Path, species: str, overwrite: bool):
+    if not species:
+        raise ValueError("Species name is required.")
+    Dataset.from_components(path, fasta, species=species, overwrite=overwrite)
