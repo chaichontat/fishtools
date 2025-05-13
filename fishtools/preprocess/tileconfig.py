@@ -25,10 +25,7 @@ class TileConfiguration:
         pixel = 2048
         actual = pixel * 0.108
         scaling = 200 / actual
-        adjusted = pd.DataFrame(
-            dict(y=(df[0] - df[0].min()), x=(df[1] - df[1].min())),
-            dtype=int,
-        )
+        adjusted = pd.DataFrame(dict(y=(df[0] - df[0].min()), x=(df[1] - df[1].min())))
         adjusted["x"] -= adjusted["x"].min()
         adjusted["x"] *= -(1 / 200) * pixel * scaling
         adjusted["y"] -= adjusted["y"].min()
@@ -42,7 +39,11 @@ class TileConfiguration:
         # ats["x"] = mat[:, 0]
         # ats["y"] = mat[:, 1]
 
-        return cls(pl.DataFrame(ats.reset_index()))
+        return cls(
+            pl.DataFrame(
+                ats.reset_index(), schema=pl.Schema({"index": pl.UInt32, "x": pl.Float32, "y": pl.Float32})
+            )
+        )
 
     @classmethod
     def from_file(cls, path: str | Path):
@@ -80,7 +81,21 @@ class TileConfiguration:
             d = x.as_dict()
             out.append(filename.parseString(d["filename"]).as_dict() | d)
 
-        return cls(pl.DataFrame(out))
+        if not len(out):
+            raise ValueError(f"File {path} is empty or not in the expected format.")
+
+        return cls(
+            pl.DataFrame(
+                out,
+                schema=pl.Schema({
+                    "prefix": pl.Utf8,
+                    "index": pl.UInt32,
+                    "filename": pl.Utf8,
+                    "x": pl.Float32,
+                    "y": pl.Float32,
+                }),
+            )
+        )
 
     def drop(self, idxs: list[int]):
         df = TileConfiguration(self.df.filter(~pl.col("index").is_in(idxs)))

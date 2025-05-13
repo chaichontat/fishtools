@@ -21,9 +21,9 @@ from loguru import logger
 from rich.console import Console
 from rich.logging import RichHandler
 from scipy.stats import multivariate_normal
-from tifffile import TiffFile, imread
+from tifffile import imread
 
-from fishtools.utils.io import Workspace, get_channels
+from fishtools.utils.io import Workspace, get_channels, get_metadata
 from fishtools.utils.pretty_print import progress_bar
 
 DATA = Path(__file__).parent.parent.parent / "data"
@@ -95,12 +95,8 @@ def _compute_range(
         for i, f in enumerate(files):
             try:
                 meta = json.loads(Path(f).with_suffix(".deconv.json").read_text())
-            except FileNotFoundError as e:
-                with TiffFile(f) as tif:
-                    try:
-                        meta = tif.shaped_metadata[0]
-                    except KeyError:
-                        raise AttributeError("No deconv metadata found.")
+            except FileNotFoundError:
+                meta = get_metadata(f)
 
             try:
                 deconv_min[i, :] = meta["deconv_min"]
@@ -659,9 +655,10 @@ def batch(
     basic_name: str | None,
 ):
     ws = Workspace(path)
-    print(ws.rois)
     rois = ws.rois
-    out = path / "analysis" / "deconv"
+    logger.info(f"Found ROIs: {rois}")
+
+    out = ws.deconved
     out.mkdir(exist_ok=True, parents=True)
 
     FORBIDDEN = ["10x", "analysis", "shifts", "fid", "registered", "old", "basic"]
@@ -680,7 +677,7 @@ def batch(
         if ref is not None:
             files = []
             for roi in rois:
-                print(f"Processing {r}--{roi}")
+                logger.info(f"Processing {r}--{roi}")
                 ok_idxs = {
                     int(f.stem.split("-")[1]) for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))
                 }
@@ -706,17 +703,11 @@ def batch(
             logger.warning(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
             continue
 
-        with TiffFile(files[0]) as tif:
-            try:
-                meta = tif.shaped_metadata[0]
-                import json
-
-                waveform = json.loads(meta["waveform"])
-                powers = waveform["params"]["powers"]
-                step = int(waveform["params"]["step"] * 10)
-                logger.info(f"Using step={step}")
-            except KeyError:
-                raise AttributeError("No waveform metadata found.")
+        meta = get_metadata(files[0])
+        waveform = json.loads(meta["waveform"])
+        powers = waveform["params"]["powers"]
+        step = int(waveform["params"]["step"] * 10)
+        logger.info(f"Using step={step}")
 
         if not files:
             logger.info(f"No files found for {r}, skipping. Use --overwrite to reprocess.")

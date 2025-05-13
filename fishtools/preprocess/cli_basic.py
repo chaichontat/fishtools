@@ -236,16 +236,12 @@ def run_with_extractor(
     if not all(0 <= z <= 1 for z in zs):
         raise ValueError("zs must be between 0 and 1.")
 
-    # Determine number of channels from round string
-
     if not round_:
         logger.warning("No round specified. Sampling from all rounds.")
     # Find and sort files
     files = sorted(path.glob(f"{round_}--*/*.tif" if round_ else "*_*_*--*/*.tif"))
-    # files = [f for f in files if f.parent.name.split("_").__len__() == 3]
     # Put --basic files last. These are extra files taken in random places for BaSiC training.
     files.sort(key=lambda x: ("--basic" in str(x), str(x)))
-    # files = [f for f in files if not f.parent.name.startswith("atp")]
 
     channels = get_channels(files[0])
 
