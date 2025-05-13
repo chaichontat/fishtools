@@ -139,16 +139,18 @@ def _run_bowtie(
         capture_stderr=True,
         **kwargs,
     )
-
-    return (
-        y,
+    df = (
         y["transcript"]
         .value_counts()
         .sort("count", descending=True)
         .with_columns(
             name=pl.col("transcript").map_elements(dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8)
-        ),
+            if isinstance(dataset, ReferenceDataset)
+            else pl.col("transcript")
+        )
     )
+
+    return y, df
 
 
 def _convert_gene_to_tss(dataset: Dataset, gtss: list[str]):
@@ -196,7 +198,11 @@ def _run_transcript(
         except IndexError:
             raise ValueError(f"Transcript {transcript} not found in ensembl.")
 
-        gene, transcript_id, transcript_name = row["gene_name"], row["transcript_id"], row["transcript_name"]
+        gene, transcript_id, transcript_name = (
+            row["gene_name"],
+            row["transcript_id"],
+            row["transcript_name"],
+        )
         # need to be gene_name, not id, because of genes on scaffold assemblies
         tss_gencode = set(dataset.data.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
         tss_allofgene = set(dataset.ensembl.filter(pl.col("gene_name") == row["gene_name"])["transcript_id"])
@@ -227,7 +233,11 @@ def _run_transcript(
         else:
             logger.info(f"{transcript_name}: {len(seq)}bp")
 
-        crawled = crawler(seq, prefix=f"{gene if fasta is None else ''}_{transcript_id}", formamide=formamide)
+        crawled = crawler(
+            seq,
+            prefix=f"{gene if fasta is None else ''}_{transcript_id}",
+            formamide=formamide,
+        )
         if len(crawled) > 5000:
             logger.warning(f"Transcript {transcript_id} has {len(crawled)} probes. Using only 2000.")
             crawled = crawled.sample(n=5000, shuffle=True, seed=3)
@@ -301,7 +311,10 @@ def _run_transcript(
                 .unique("name")
             )
         else:
-            names_with_pseudo = pl.DataFrame({"name": y["name"].unique(), "maps_to_pseudo": ""})
+            names_with_pseudo = pl.DataFrame({
+                "name": y["name"].unique(),
+                "maps_to_pseudo": "",
+            })
 
             isoforms = (
                 SAMFrame(y)
@@ -343,10 +356,16 @@ def _run_transcript(
         .with_columns([
             (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
             pl.col("seq")
-            .map_elements(lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .map_elements(
+                lambda s: tm(cast(str, s), "hybrid", formamide=formamide),
+                return_dtype=pl.Float32,
+            )
             .alias("tm"),
             pl.col("seq")
-            .map_elements(lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .map_elements(
+                lambda s: hp(cast(str, s), "hybrid", formamide=formamide),
+                return_dtype=pl.Float32,
+            )
             .alias("hp"),
         ])
         .with_columns(oks=pl.sum_horizontal(pl.col("^ok_.*$")))
@@ -369,7 +388,7 @@ def _run_transcript(
 
 def _run_transcript_generic(
     dataset: Dataset,
-    transcript: str | None = None,
+    transcript: str,
     output: str | Path = "output/",
     *,
     ignore_revcomp: bool = False,
@@ -395,7 +414,7 @@ def _run_transcript_generic(
         else:
             logger.info(f"{transcript}: {len(seq)}bp")
 
-        crawled = crawler(seq, prefix=f"transcript", formamide=formamide)
+        crawled = crawler(seq, prefix=f"{transcript}_{transcript}", formamide=formamide)
         if len(crawled) > 5000:
             logger.warning(f"Transcript {transcript} has {len(crawled)} probes. Using only 2000.")
             crawled = crawled.sample(n=5000, shuffle=True, seed=3)
@@ -431,7 +450,9 @@ def _run_transcript_generic(
         # crawled.write_parquet(output / f"{transcript_name}_rawcrawled.parquet")
 
         y, offtargets = _run_bowtie(dataset, crawled, ignore_revcomp=ignore_revcomp)
-        y = y.join(crawled[["name", "seq_full", "pad_start"]], on="name")
+        y = y.join(crawled[["name", "seq_full", "pad_start"]], on="name").with_columns(
+            maps_to_pseudo=pl.lit("")
+        )
 
         y.write_parquet(output / f"{transcript}_all.parquet")
         offtargets.write_parquet(output / f"{transcript}_bowtie.parquet")
@@ -449,7 +470,7 @@ def _run_transcript_generic(
         )
     )
 
-    tss_allacceptable = allow
+    tss_allacceptable = set(allow + [transcript])
     ff = SAMFrame(y).filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
     if not len(ff):
         raise Exception(
@@ -467,17 +488,20 @@ def _run_transcript_generic(
         .with_columns([
             (pl.col("gc_content").is_between(0.35, 0.65)).alias("ok_gc"),
             pl.col("seq")
-            .map_elements(lambda s: tm(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .map_elements(
+                lambda s: tm(cast(str, s), "hybrid", formamide=formamide),
+                return_dtype=pl.Float32,
+            )
             .alias("tm"),
             pl.col("seq")
-            .map_elements(lambda s: hp(cast(str, s), "hybrid", formamide=formamide), return_dtype=pl.Float32)
+            .map_elements(
+                lambda s: hp(cast(str, s), "hybrid", formamide=formamide),
+                return_dtype=pl.Float32,
+            )
             .alias("hp"),
         ])
         .with_columns(oks=pl.sum_horizontal(pl.col("^ok_.*$")))
         # .filter(~pl.col("seq").map_elements(lambda x: check_kmers(cast(str, x), dataset.kmerset, 18)))
-        .filter(
-            ~pl.col("seq").map_elements(lambda x: dataset.check_kmers(cast(str, x)), return_dtype=pl.Boolean)
-        )
     )
 
     logger.info(f"Generated {len(ff)} candidates.")
@@ -491,16 +515,23 @@ def _run_transcript_generic(
 @click.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--gene", "-g", type=str, required=False, help="Gene name")
-@click.option("--fasta", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option(
+    "--fasta",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
 @click.option("--output", "-o", type=click.Path(), default="output/")
 @click.option("--ignore-revcomp", "-r", is_flag=True)
 @click.option("--overwrite", is_flag=True)
 @click.option("--pseudogene-limit", type=int, default=-1)
 @click.option(
-    "--allow", type=str, help="Don't filter out probes that bind to these genes, separated by comma."
+    "--allow",
+    type=str,
+    help="Don't filter out probes that bind to these genes, separated by comma.",
 )
 @click.option(
-    "--disallow", type=str, help="DO filter out probes that bind to these genes, separated by comma."
+    "--disallow",
+    type=str,
+    help="DO filter out probes that bind to these genes, separated by comma.",
 )
 def candidates(
     path: str,

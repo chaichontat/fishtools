@@ -4,7 +4,7 @@ import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, overload
+from typing import Literal, overload
 
 import numpy as np
 import numpy.typing as npt
@@ -17,7 +17,7 @@ from fishtools.preprocess.tileconfig import TileConfiguration
 
 
 def download(url: str, path: str | Path, name: str | None = None) -> None:
-    with requests.get(url, stream=True, allow_redirects=True) as r:
+    with requests.get(url, stream=True, allow_redirects=True, timeout=30) as r:
         if r.status_code >= 400:
             r.raise_for_status()
             raise RuntimeError(f"Request to {url} returned status code {r.status_code}")
@@ -161,13 +161,17 @@ class Workspace:
         return OptimizePath(self.deconved / f"opt--{codebook}")
 
 
-def get_channels(file: Path):
+def get_metadata(file: Path):
     with TiffFile(file) as tif:
         try:
-            meta = tif.shaped_metadata[0]
+            meta = tif.shaped_metadata[0]  # type: ignore
         except KeyError:
             raise AttributeError("No metadata found.")
+    return meta
 
+
+def get_channels(file: Path):
+    meta = get_metadata(file)
     waveform = json.loads(meta["waveform"])
     powers = waveform["params"]["powers"]
     return [name[-3:] for name in powers]

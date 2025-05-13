@@ -2,7 +2,7 @@ import sys
 import warnings
 
 from .analysis.io import fishread, metadata
-from .mkprobes.ext.dataset import Dataset
+from .mkprobes.ext.dataset import Dataset, ReferenceDataset
 from .mkprobes.utils._alignment import gen_fasta, gen_fastq
 from .mkprobes.utils._crawler import crawler
 from .mkprobes.utils.samframe import SAMFrame

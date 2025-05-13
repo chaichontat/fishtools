@@ -131,11 +131,10 @@ class Dataset:
             shutil.copy(fasta_file, new_path)
 
         external_data = ExternalData(
-            cache=path / fasta_file.with_suffix(".parquet").name,
-            fasta=fasta_file,
+            cache=path / fasta_file.with_suffix(".parquet").name, fasta=fasta_file, regen_cache=overwrite
         )
-        external_data.bowtie_build()
-        external_data.run_jellyfish()
+        external_data.bowtie_build(overwrite=overwrite)
+        external_data.run_jellyfish(overwrite=overwrite)
 
         Path(path / "dataset.json").write_text(
             DatasetDefinition(
@@ -264,7 +263,7 @@ class ReferenceDataset(Dataset):
                 gtf_path=self.path / "gencode.gtf.gz",
                 fasta=self.path / "cdna_ncrna_trna.fasta",
             ),
-            kmer18_path=self.path / "kmer18.jf",
+            kmer18_path=self.path / "cdna18.jf",
             trna_rna_kmers_path=self.path / "r_t_snorna15.jf",
             species=cast(Literal["human", "mouse"], self.path.name),
         )

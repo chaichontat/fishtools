@@ -14,22 +14,24 @@ from loguru import logger
 from fishtools.mkprobes.candidates import get_candidates
 from fishtools.mkprobes.codebook.codebook import ProbeSet
 from fishtools.mkprobes.codebook.finalconstruct import construct
-from fishtools.mkprobes.ext.dataset import ReferenceDataset as Dataset
+from fishtools.mkprobes.ext.dataset import Dataset
 from fishtools.mkprobes.screen import run_screen
 
 # %%
 
 
 def run_gene(
-    path: Path,
-    *,
+    dataset_path: Path,
+    output_path: Path,
     codebook: dict[str, list[int]],
-    gene: str,
+    transcript: str,
     acceptable: list[str] | None,
     overwrite: bool = False,
     log_level: str = "INFO",
     **kwargs,
 ):
+    # acceptable = ["ENSMUST00000111752", "ENSMUST00000086317"]
+    ts = transcript
     logger.remove()
     logger.add(sys.stderr, level=log_level)
 
@@ -37,19 +39,19 @@ def run_gene(
     if (
         acceptable is None
         and Path(
-            f"output/{gene}_final_{''.join(restriction)}_{','.join(map(str, sorted(codebook[gene])))}.parquet"
+            f"{output_path}/{ts}_final_{''.join(restriction)}_{','.join(map(str, sorted(codebook[ts])))}.parquet"
         ).exists()
         and not overwrite
     ):
         return
 
-    ds = Dataset(path)
+    ds = Dataset.from_folder(dataset_path)
     try:
-        if overwrite or not Path(f"output/{gene}_crawled.parquet").exists():
+        if overwrite or not (output_path / f"{ts}_crawled.parquet").exists():
             get_candidates(
                 ds,
-                gene=gene,
-                output="output/",
+                transcript=ts,
+                output=output_path,
                 ignore_revcomp=False,
                 allow=acceptable,
                 overwrite=overwrite,
@@ -57,18 +59,18 @@ def run_gene(
             )
             time.sleep(1)
         overwrite = overwrite or acceptable is not None
-        run_screen("output/", gene, minimum=60, restriction=restriction, maxoverlap=0, overwrite=overwrite)
-        construct(
-            ds,
-            "output/",
-            transcript=gene,
-            codebook=codebook,
-            restriction=restriction,
-            target_probes=48,
-            overwrite=overwrite,
-        )
+        run_screen(output_path, ts, minimum=60, restriction=restriction, maxoverlap=0, overwrite=overwrite)
+        # construct(
+        #     ds,
+        #     "output/",
+        #     transcript=ts,
+        #     codebook=codebook,
+        #     restriction=restriction,
+        #     target_probes=48,
+        #     overwrite=overwrite,
+        # )
     except Exception as e:
-        raise Exception(gene) from e
+        raise Exception(ts) from e
 
 
 @click.group()
@@ -77,7 +79,7 @@ def cli(): ...
 
 @cli.command()
 @click.argument(
-    "path",
+    "path_dataset",
     type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
 )
 @click.argument(
@@ -87,7 +89,7 @@ def cli(): ...
 @click.option("--listfailed", is_flag=True)
 @click.option("--listfailedall", is_flag=True)
 def single(
-    path: Path,
+    path_dataset: Path,
     codebook_path: Path,
     overwrite: bool = False,
     listfailed: bool = False,
@@ -124,8 +126,9 @@ def single(
         futs = {
             gene: exc.submit(
                 run_gene,
-                path,
-                gene=gene,
+                path_dataset,
+                output_path=codebook_path.parent / "output",
+                transcript=gene,
                 codebook=codebook,
                 acceptable=acceptable.get(gene, None),
                 overwrite=overwrite,
@@ -151,23 +154,6 @@ def single(
             logger.critical(f"Failed on {failed}")
             for name, exc in failed:
                 logger.exception(exc.with_traceback(None))
-
-
-@cli.command()
-@click.argument("data", type=click.Path(exists=True, dir_okay=True, path_type=Path))
-@click.argument("manifest", type=click.Path(exists=True, file_okay=True, path_type=Path))
-def batch(data: Path, manifest: Path):
-    assert single.callback
-    pss = ProbeSet.from_list_json(manifest.read_text())
-    for ps in pss:
-        single.callback(
-            data / ps.species,
-            manifest.parent / ps.codebook,
-            overwrite=False,
-            onlygene=None,
-            listfailed=False,
-            listfailedall=False,
-        )
 
 
 # %%

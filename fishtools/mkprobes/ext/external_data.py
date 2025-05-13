@@ -184,7 +184,7 @@ class ExternalData:
             bowtie2_index: Optional explicit name for the Bowtie2 index files (stem).
             kmer18: Optional explicit name for the 18-mer Jellyfish output file.
         """
-        self.fasta_path = Path(fasta)
+        self.fasta_path = Path(fasta).resolve()
         self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=fasta_key_func)
         self._ts_gene_map: dict[str, str] | None = None
 
@@ -242,7 +242,7 @@ class ExternalData:
 
         return self.fasta_path.with_suffix("")
 
-    def bowtie_build(self):
+    def bowtie_build(self, overwrite: bool = False):
         """
         Builds the Bowtie2 index for the FASTA file if it doesn't already exist.
 
@@ -252,7 +252,7 @@ class ExternalData:
         Raises:
             FileNotFoundError: If `bowtie2-build` fails to create the index files.
         """
-        if self.fasta_path.with_suffix(".1.bt2").exists():
+        if self.fasta_path.with_suffix(".1.bt2").exists() and not overwrite:
             return
         logger.info(f"Bowtie2 index not found for {self.fasta_path.stem}.")
         input("\nPress Enter to start building...")

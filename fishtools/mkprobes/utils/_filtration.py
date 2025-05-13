@@ -17,7 +17,7 @@ PROBE_CRITERIA: Final = dict(
 )
 # fmt: on
 
-pair_name = pl.col("name").str.split("_").list.get(1)
+pair_name = pl.col("name").str.extract(r"^(.*)_(splint|padlock)$", 1)
 
 
 def filter_have_both(df: pl.DataFrame):
