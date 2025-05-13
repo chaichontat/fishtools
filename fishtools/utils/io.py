@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 from contextlib import contextmanager
@@ -9,7 +10,7 @@ import numpy as np
 import numpy.typing as npt
 import requests
 from loguru import logger
-from tifffile import imread
+from tifffile import TiffFile, imread
 from tqdm.auto import tqdm
 
 from fishtools.preprocess.tileconfig import TileConfiguration
@@ -158,3 +159,15 @@ class Workspace:
 
     def opt(self, codebook: str):
         return OptimizePath(self.deconved / f"opt--{codebook}")
+
+
+def get_channels(file: Path):
+    with TiffFile(file) as tif:
+        try:
+            meta = tif.shaped_metadata[0]
+        except KeyError:
+            raise AttributeError("No metadata found.")
+
+    waveform = json.loads(meta["waveform"])
+    powers = waveform["params"]["powers"]
+    return [name[-3:] for name in powers]

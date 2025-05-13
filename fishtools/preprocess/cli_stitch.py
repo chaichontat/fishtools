@@ -553,7 +553,7 @@ def numpy_array_to_zarr[*Ts](write_path: Path | str, array: np.ndarray, chunks: 
 
 @stitch.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("roi", type=str)
+@click.argument("roi", type=str, default="*")
 @click.option("--codebook", type=str)
 @click.option("--chunk-size", type=int, default=2048)
 @click.option("--overwrite", is_flag=True)
@@ -561,110 +561,117 @@ def numpy_array_to_zarr[*Ts](write_path: Path | str, array: np.ndarray, chunks: 
 def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwrite: bool = True):
     import zarr
 
-    path = Path(path / f"stitch--{roi}+{codebook}")
-    # Group folders by Z index (parent directory name)
-    folders_by_z = walk_fused(path)
-    # Sort folders within each Z index by C index (folder name)
-    for z_idx in folders_by_z:
-        folders_by_z[z_idx].sort(key=lambda f: int(f.name))
+    from fishtools.utils.io import Workspace
 
-    zs = max(folders_by_z.keys()) + 1
-    cs = max(int(f.name) for f in folders_by_z[0]) + 1  # Assume C count is same for all Z
+    ws = Workspace(path)
+    rois = ws.rois if roi == "*" else [roi]
+    for roi in rois:
+        path = Path(path / f"stitch--{roi}+{codebook}")
+        # Group folders by Z index (parent directory name)
+        folders_by_z = walk_fused(path)
+        # Sort folders within each Z index by C index (folder name)
+        for z_idx in folders_by_z:
+            folders_by_z[z_idx].sort(key=lambda f: int(f.name))
 
-    # Check for fused images in the first Z plane to get dimensions
-    first_z_folders = folders_by_z[0]
-    for folder in first_z_folders:
-        if not (folder / f"fused_{folder.name}-1.tif").exists():
-            raise ValueError(f"No fused image found for {folder.name} in Z=0")
+        zs = max(folders_by_z.keys()) + 1
+        cs = max(int(f.name) for f in folders_by_z[0]) + 1  # Assume C count is same for all Z
 
-    # Get shape from the first image of the first Z plane
-    first_folder = first_z_folders[0]
-    first_img = imread(first_folder / f"fused_{first_folder.name}-1.tif")
-    img_shape = first_img.shape
-    dtype = first_img.dtype
-    final_shape = (zs, img_shape[0], img_shape[1], cs)
-    logger.info(f"Final Zarr shape: {final_shape}, dtype: {dtype}")
+        # Check for fused images in the first Z plane to get dimensions
+        first_z_folders = folders_by_z[0]
+        for folder in first_z_folders:
+            if not (folder / f"fused_{folder.name}-1.tif").exists():
+                raise ValueError(f"No fused image found for {folder.name} in Z=0")
 
-    # Initialize the Zarr array
-    zarr_path = path / "fused.zarr"
-    logger.info(f"Writing to {zarr_path.resolve()}")
-    # Define chunks: chunk along Z=1, use user chunk_size for Y/X, full chunk for C
-    zarr_chunks = (1, chunk_size, chunk_size, cs)
-    z_array = zarr.create_array(
-        zarr_path,
-        shape=final_shape,
-        chunks=zarr_chunks,
-        dtype=dtype,
-        overwrite=True,
-    )
+        # Get shape from the first image of the first Z plane
+        first_folder = first_z_folders[0]
+        first_img = imread(first_folder / f"fused_{first_folder.name}-1.tif")
+        img_shape = first_img.shape
+        dtype = first_img.dtype
+        final_shape = (zs, img_shape[0], img_shape[1], cs)
+        logger.info(f"Final Zarr shape: {final_shape}, dtype: {dtype}")
 
-    z_plane_data = np.zeros((img_shape[0], img_shape[1], cs), dtype=dtype)
-
-    # Create thumbnail directory
-    thumbnail_dir = path / "thumbnails"
-    thumbnail_dir.mkdir(exist_ok=True)
-
-    with progress_bar(len(folders_by_z)) as progress:
-        for i in sorted(folders_by_z.keys()):
-            z_plane_folders = folders_by_z[i]
-            thumbnail_data = None
-            for folder in z_plane_folders:
-                j = int(folder.name)
-                try:
-                    img = imread(folder / f"fused_{folder.name}-1.tif")
-                    # Write into the C dimension of the current Z-plane array
-                    z_plane_data[:, :, j] = img[:, :]
-                    if thumbnail_data is None:
-                        thumbnail_data = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint16)
-                    thumbnail_data[:, :, j] = img[:, :]
-                    del img
-                except FileNotFoundError:
-                    raise FileNotFoundError(f"File not found: {folder / f'fused_{folder.name}-1.tif'}")
-                except Exception as e:
-                    raise Exception(f"Error reading {folder / f'fused_{folder.name}-1.tif'}") from e
-
-            logger.info(f"Writing Z-plane {i}/{zs - 1} to Zarr array")
-            z_array[i, :, :, :] = z_plane_data
-
-            if i % 8 == 0:
-                assert thumbnail_data is not None
-
-                # Save as PNG
-                thumbnail_img = Image.fromarray((thumbnail_data[::8, ::8] >> 10).astype(np.uint8), mode="RGB")
-                thumbnail_path = thumbnail_dir / f"thumbnail_z{i:03d}.png"
-                thumbnail_img.save(thumbnail_path)
-                logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
-
-            progress()
-
-    # Add metadata (channel names)
-    try:
-        first_reg_file = next((path.parent / f"registered--{roi}+{codebook}").glob("*.tif"))
-        with TiffFile(first_reg_file) as tif:
-            # Attempt to get channel names, handle potential errors
-            names = tif.shaped_metadata[0].get("key") if tif.shaped_metadata else None
-            if names:
-                z_array.attrs["key"] = names
-                logger.info(f"Added channel names: {names}")
-            else:
-                logger.warning("Could not find channel names ('key') in TIF metadata.")
-    except StopIteration:
-        logger.warning(
-            f"No registered TIF file found in {path.parent / f'registered--{roi}'} to read channel names."
+        # Initialize the Zarr array
+        zarr_path = path / "fused.zarr"
+        logger.info(f"Writing to {zarr_path.resolve()}")
+        # Define chunks: chunk along Z=1, use user chunk_size for Y/X, full chunk for C
+        zarr_chunks = (1, chunk_size, chunk_size, cs)
+        z_array = zarr.create_array(
+            zarr_path,
+            shape=final_shape,
+            chunks=zarr_chunks,
+            dtype=dtype,
+            overwrite=True,
         )
-    except Exception as e:
-        logger.warning(f"Error reading metadata from TIF file: {e}")
 
-    logger.info("Deleting source folders.")
-    all_folders = [f for z_folders in folders_by_z.values() for f in z_folders]
+        z_plane_data = np.zeros((img_shape[0], img_shape[1], cs), dtype=dtype)
 
-    for folder in all_folders:
+        # Create thumbnail directory
+        thumbnail_dir = path / "thumbnails"
+        thumbnail_dir.mkdir(exist_ok=True)
+
+        with progress_bar(len(folders_by_z)) as progress:
+            for i in sorted(folders_by_z.keys()):
+                z_plane_folders = folders_by_z[i]
+                thumbnail_data = None
+                for folder in z_plane_folders:
+                    j = int(folder.name)
+                    try:
+                        img = imread(folder / f"fused_{folder.name}-1.tif")
+                        # Write into the C dimension of the current Z-plane array
+                        z_plane_data[:, :, j] = img[:, :]
+                        if thumbnail_data is None:
+                            thumbnail_data = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint16)
+                        thumbnail_data[:, :, j] = img[:, :]
+                        del img
+                    except FileNotFoundError:
+                        raise FileNotFoundError(f"File not found: {folder / f'fused_{folder.name}-1.tif'}")
+                    except Exception as e:
+                        raise Exception(f"Error reading {folder / f'fused_{folder.name}-1.tif'}") from e
+
+                logger.info(f"Writing Z-plane {i}/{zs - 1} to Zarr array")
+                z_array[i, :, :, :] = z_plane_data
+
+                if i % 8 == 0:
+                    assert thumbnail_data is not None
+
+                    # Save as PNG
+                    thumbnail_img = Image.fromarray(
+                        (thumbnail_data[::8, ::8] >> 10).astype(np.uint8), mode="RGB"
+                    )
+                    thumbnail_path = thumbnail_dir / f"thumbnail_z{i:03d}.png"
+                    thumbnail_img.save(thumbnail_path)
+                    logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
+
+                progress()
+
+        # Add metadata (channel names)
         try:
-            shutil.rmtree(folder.parent)  # Remove the Z-level parent folder
-        except FileNotFoundError:
-            # Can happen since some folder in all_folders are subdirectories of others
-            ...
-    logger.info("Done.")
+            first_reg_file = next((path.parent / f"registered--{roi}+{codebook}").glob("*.tif"))
+            with TiffFile(first_reg_file) as tif:
+                # Attempt to get channel names, handle potential errors
+                names = tif.shaped_metadata[0].get("key") if tif.shaped_metadata else None
+                if names:
+                    z_array.attrs["key"] = names
+                    logger.info(f"Added channel names: {names}")
+                else:
+                    logger.warning("Could not find channel names ('key') in TIF metadata.")
+        except StopIteration:
+            logger.warning(
+                f"No registered TIF file found in {path.parent / f'registered--{roi}'} to read channel names."
+            )
+        except Exception as e:
+            logger.warning(f"Error reading metadata from TIF file: {e}")
+
+        logger.info("Deleting source folders.")
+        all_folders = [f for z_folders in folders_by_z.values() for f in z_folders]
+
+        for folder in all_folders:
+            try:
+                shutil.rmtree(folder.parent)  # Remove the Z-level parent folder
+            except FileNotFoundError:
+                # Can happen since some folder in all_folders are subdirectories of others
+                ...
+        logger.info("Done.")
 
 
 @stitch.command()

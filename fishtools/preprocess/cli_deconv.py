@@ -23,7 +23,7 @@ from rich.logging import RichHandler
 from scipy.stats import multivariate_normal
 from tifffile import TiffFile, imread
 
-from fishtools.utils.io import Workspace
+from fishtools.utils.io import Workspace, get_channels
 from fishtools.utils.pretty_print import progress_bar
 
 DATA = Path(__file__).parent.parent.parent / "data"
@@ -120,9 +120,7 @@ def _compute_range(
             m_[i] = np.percentile(deconv_min[:, i], perc_min[i])
             s_[i] = np.percentile(deconv_scale[:, i], perc_scale[i])
     else:
-        raise ValueError(
-            "perc_min and perc_scale must be either float or list of floats."
-        )
+        raise ValueError("perc_min and perc_scale must be either float or list of floats.")
 
     if np.any(m_ == 0) or np.any(s_ == 0):
         raise ValueError("Found a channel with min=0. This is not allowed.")
@@ -133,15 +131,11 @@ def _compute_range(
 
 
 logger.remove()
-logger.configure(
-    handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}]
-)
+logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
 console = Console()
 
 
-def high_pass_filter(
-    img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32
-) -> npt.NDArray:
+def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32) -> npt.NDArray:
     """
     Args:
         image: the input image to be filtered
@@ -154,9 +148,7 @@ def high_pass_filter(
     """
     img = img.astype(dtype)
     window_size = int(2 * np.ceil(2 * σ) + 1)
-    lowpass = cv2.GaussianBlur(
-        img, (window_size, window_size), σ, borderType=cv2.BORDER_REPLICATE
-    )
+    lowpass = cv2.GaussianBlur(img, (window_size, window_size), σ, borderType=cv2.BORDER_REPLICATE)
     gauss_highpass = img - lowpass
     gauss_highpass[lowpass > img] = 0
     return gauss_highpass
@@ -377,16 +369,12 @@ def _get_percentiles_for_round(
                 f"Using protein percentiles: min={PROTEIN_PERC_MIN}, scale={PROTEIN_PERC_SCALE}."
             )
         percentile_mins.append(PROTEIN_PERC_MIN if not is_rna_bit else default_perc_min)
-        percentile_scales.append(
-            PROTEIN_PERC_SCALE if not is_rna_bit else default_perc_scale
-        )
+        percentile_scales.append(PROTEIN_PERC_SCALE if not is_rna_bit else default_perc_scale)
     return percentile_mins, percentile_scales
 
 
 @deconv.command()
-@click.argument(
-    "path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path)
-)
+@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
 @click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
 @click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
 @click.option("--overwrite", is_flag=True)
@@ -410,9 +398,7 @@ def compute_range(
         max_rna_bit: The maximum integer value considered an RNA bit. Others are treated differently (e.g., protein).
     """
     if "deconv" not in path.resolve().as_posix():
-        raise ValueError(
-            f"This command must be run within a 'deconv' directory. Path provided: {path}"
-        )
+        raise ValueError(f"This command must be run within a 'deconv' directory. Path provided: {path}")
 
     ws = Workspace(path)
     rounds = ws.rounds
@@ -433,22 +419,16 @@ def compute_range(
                 round_name, perc_min, perc_scale, max_rna_bit
             )
 
-            _compute_range(
-                path, round_name, perc_min=percentile_mins, perc_scale=percentile_scales
-            )
+            _compute_range(path, round_name, perc_min=percentile_mins, perc_scale=percentile_scales)
 
         except FileNotFoundError:
-            logger.warning(
-                f"No .tif files found for round {round_name} in {path}. Skipping."
-            )
+            logger.warning(f"No .tif files found for round {round_name} in {path}. Skipping.")
         except AttributeError as e:
             logger.error(f"Metadata error processing {round_name}: {e}. Skipping.")
         except ValueError as e:
             logger.error(f"Value error processing {round_name}: {e}. Skipping.")
         except Exception as e:
-            logger.exception(
-                f"An unexpected error occurred while processing {round_name}: {e}. Skipping."
-            )
+            logger.exception(f"An unexpected error occurred while processing {round_name}: {e}. Skipping.")
 
 
 @functools.cache
@@ -469,9 +449,7 @@ def _run(
         paths = [f for f in paths if not (out / f.parent.name / f.name).exists()]
 
     q_write = queue.Queue(maxsize=3)
-    q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = (
-        queue.Queue(maxsize=1)
-    )
+    q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
 
     def f_read(files: list[Path]):
         logger.debug("Read thread started.")
@@ -490,13 +468,9 @@ def _run(
                     img = tif.asarray()
 
                 fid = np.atleast_3d(img[-n_fids:])
-                nofid = (
-                    img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
-                )
+                nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
             except ValueError as e:
-                raise Exception(
-                    f"File {file.resolve()} is corrupted. Please check the file."
-                ) from e
+                raise Exception(f"File {file.resolve()} is corrupted. Please check the file.") from e
             logger.debug(f"Finished reading {file.name}")
 
             for i, basic in enumerate(basics[round_]):
@@ -516,9 +490,7 @@ def _run(
             sub = out / file.parent.name
             sub.mkdir(exist_ok=True, parents=True)
 
-            (sub / file.name).with_suffix(".deconv.json").write_text(
-                json.dumps(scaling, indent=2)
-            )
+            (sub / file.name).with_suffix(".deconv.json").write_text(json.dumps(scaling, indent=2))
 
             tifffile.imwrite(
                 sub / file.name,
@@ -542,20 +514,11 @@ def _run(
                 start, img, fid, metadata = q_img.get()
                 t = time.time()
 
-                res = deconvolve_lucyrichardson_guo(
-                    cp.asarray(img), projectors(step), iters=1
-                )
-                mins, maxs = np.percentile(
-                    res, (0.1, 99.999), axis=(0, 2, 3), keepdims=True
-                )
+                res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors(step), iters=1)
+                mins, maxs = np.percentile(res, (0.1, 99.999), axis=(0, 2, 3), keepdims=True)
 
                 scale = 65534 / (maxs - mins)
-                towrite = (
-                    ((res - mins) * scale)
-                    .astype(np.uint16)
-                    .get()
-                    .reshape(-1, 2048, 2048)
-                )
+                towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
                 del res
 
                 scaling = {
@@ -622,9 +585,7 @@ def run(
         logger.remove()
         logger.add(sys.stderr, level="DEBUG")
 
-    console.print(
-        f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]"
-    )
+    console.print(f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]")
 
     out = path / "analysis" / "deconv"
     out.mkdir(exist_ok=True, parents=True)
@@ -632,8 +593,7 @@ def run(
         files = []
         for roi in [r.name.split("--")[1] for r in path.glob(f"{ref}--*")]:
             ok_idxs = {
-                int(f.stem.split("-")[1])
-                for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))
+                int(f.stem.split("-")[1]) for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))
             }
 
             files.extend([
@@ -653,8 +613,7 @@ def run(
 
     files = files[:limit] if limit is not None else files
     logger.info(
-        f"Total: {len(files)} at {path}/{name}*"
-        + (f" Limited to {limit}" if limit is not None else "")
+        f"Total: {len(files)} at {path}/{name}*" + (f" Limited to {limit}" if limit is not None else "")
     )
 
     if not overwrite:
@@ -668,15 +627,19 @@ def run(
 
     basic_name = basic_name or name
     logger.info(f"Using({path / 'basic'}/{basic_name}-*.pkl for BaSiC")
+
+    channels = get_channels(files[0])
     basics: dict[str, list[BaSiC]] = {
         name: [
-            pickle.loads((path / "basic" / f"{basic_name}-{405}.pkl").read_bytes())
-            for c in range(len(name.split("_")))
+            loaded["basic"]
+            if isinstance(
+                loaded := pickle.loads((path / "basic" / f"{basic_name}-{c}.pkl").read_bytes()), dict
+            )
+            else loaded
+            for c in channels
         ]
     }
-    _run(
-        files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids
-    )
+    _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids)
 
 
 @deconv.command()
@@ -707,9 +670,7 @@ def batch(
         {
             p.name.split("--")[0]
             for p in path.iterdir()
-            if "--" in p.name
-            and p.is_dir()
-            and not any(p.name.startswith(f) for f in FORBIDDEN)
+            if "--" in p.name and p.is_dir() and not any(p.name.startswith(f) for f in FORBIDDEN)
         },
         key=lambda x: f"{int(x.split('_')[0]):02d}" if x.split("_")[0].isdigit() else x,
     )
@@ -721,8 +682,7 @@ def batch(
             for roi in rois:
                 print(f"Processing {r}--{roi}")
                 ok_idxs = {
-                    int(f.stem.split("-")[1])
-                    for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))
+                    int(f.stem.split("-")[1]) for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))
                 }
                 if not ok_idxs:
                     raise ValueError(f"No files found for {r}--{roi} as reference.")
@@ -739,14 +699,11 @@ def batch(
             files = [
                 f
                 for f in sorted(path.glob(f"{r}--*/{r}-*.tif"))
-                if "analysis/deconv" not in str(f)
-                and not f.parent.name.endswith("basic")
+                if "analysis/deconv" not in str(f) and not f.parent.name.endswith("basic")
             ]
 
         if not files:
-            logger.warning(
-                f"No files found for {r}, skipping. Use --overwrite to reprocess."
-            )
+            logger.warning(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
             continue
 
         with TiffFile(files[0]) as tif:
@@ -762,19 +719,13 @@ def batch(
                 raise AttributeError("No waveform metadata found.")
 
         if not files:
-            logger.info(
-                f"No files found for {r}, skipping. Use --overwrite to reprocess."
-            )
+            logger.info(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
             continue
 
         try:
             basics: dict[str, list[BaSiC]] = {
                 r: [
-                    pickle.loads(
-                        (
-                            path / "basic" / f"{basic_name or r}-{c[-3:]}.pkl"
-                        ).read_bytes()
-                    )
+                    pickle.loads((path / "basic" / f"{basic_name or r}-{c[-3:]}.pkl").read_bytes())
                     for c in powers
                 ]
             }

@@ -301,7 +301,7 @@ def sample_imgs(
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
 @click.option("--subsample-z", type=int, default=1)
-@click.option("--batch-size", "-n", type=int, default=50)
+@click.option("--batch-size", "-n", type=int, default=40)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--overwrite", is_flag=True)
 @click.option("--split", type=int, default=0)
@@ -311,7 +311,7 @@ def step_optimize(
     roi: str,
     round_num: int,
     codebook_path: Path,
-    batch_size: int = 50,
+    batch_size: int = 40,
     subsample_z: int = 1,
     threads: int = 8,
     overwrite: bool = False,
@@ -1231,26 +1231,45 @@ def batch(
         logger.warning("No files found to process based on current filters and overwrite status.")
         return
 
-    return _batch(
-        paths_to_process,
-        "run",
-        [
-            "--global-scale",
-            (
-                path / f"opt_{codebook_path.stem}{f'+{roi}' if local_opt else ''}" / "global_scale.txt"
-            ).as_posix(),
-            "--codebook",
-            codebook_path.as_posix(),
-            "--overwrite" if overwrite else "",
-            f"--subsample-z={subsample_z}",
-            f"--limit-z={limit_z}",
-            "--simple" if simple else "",
-            f"--max-proj={max_proj}" if max_proj else "",
-            f"--roi={roi}" if roi else "",
-        ],
-        threads=threads,
-        split=split,
-    )
+    if local_opt:
+        return _batch(
+            paths_to_process,
+            "run",
+            [
+                "--global-scale",
+                (path / f"opt_{codebook_path.stem}" / "global_scale.txt").as_posix(),
+                "--codebook",
+                codebook_path.as_posix(),
+                "--overwrite" if overwrite else "",
+                f"--subsample-z={subsample_z}",
+                f"--limit-z={limit_z}",
+                "--simple" if simple else "",
+                f"--max-proj={max_proj}" if max_proj else "",
+                f"--roi={roi}" if roi else "",
+            ],
+            threads=threads,
+            split=split,
+        )
+
+    for _roi, _paths in groupby(paths_to_process, lambda x: x.parent.name.split("--")[1].split("+")[0]):
+        _batch(
+            sorted(_paths),
+            "run",
+            [
+                "--global-scale",
+                (path / f"opt_{codebook_path.stem}+{_roi}" / "global_scale.txt").as_posix(),
+                "--codebook",
+                codebook_path.as_posix(),
+                "--overwrite" if overwrite else "",
+                f"--subsample-z={subsample_z}",
+                f"--limit-z={limit_z}",
+                "--simple" if simple else "",
+                f"--max-proj={max_proj}" if max_proj else "",
+                f"--roi={_roi}",
+            ],
+            threads=threads,
+            split=split,
+        )
 
 
 spots.add_command(optimize)
