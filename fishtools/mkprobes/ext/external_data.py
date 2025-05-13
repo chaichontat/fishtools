@@ -35,6 +35,14 @@ def get_ensembl(path: Path | str, id_: str):
 
 
 class MockGTF:
+    """
+    A placeholder for GTF data when a GTF file is not provided or cannot be loaded.
+
+    This class is used internally by `ExternalData` when GTF information is unavailable.
+    Any attempt to access attributes or items that would normally come from a parsed
+    GTF file will result in a `NotImplementedError`.
+    """
+
     def __getattr__(self, name: str) -> Any:
         raise NotImplementedError(f"ExternalData not created with GTF path. Cannot access {name}")
 
@@ -43,7 +51,24 @@ class MockGTF:
 
 
 class ExternalDataDefinition(BaseModel):
-    path: str
+    """
+    Defines the structure for storing external data source file names.
+
+    This Pydantic model is used to serialize and deserialize the names of files
+    associated with an `ExternalData` instance, such as the cache, GTF, FASTA,
+    k-mer count file, and Bowtie2 index. It's primarily used when saving or
+    loading dataset configurations that include `ExternalData`.
+
+    Potential Pitfalls:
+        - All file names are relative to a base path that is typically managed by
+          the `Dataset` class. Ensure these names correctly point to existing files
+          within that context when an `ExternalData` instance is created using
+          this definition.
+        - `cache_name` and `gtf_name` are optional. If `gtf_name` is not provided,
+          the resulting `ExternalData` instance will use `MockGTF` for its GTF component,
+          limiting its functionality.
+    """
+
     cache_name: str | None = None
     gtf_name: str | None = None
     fasta_name: str
@@ -145,6 +170,20 @@ class ExternalData:
         bowtie2_index: str | None = None,
         kmer18: str | None = None,
     ) -> None:
+        """
+        Initializes an ExternalData object.
+
+        See the class docstring for detailed information on parameters and behavior.
+
+        Args:
+            cache: Path to the Parquet file for caching parsed GTF data.
+            fasta: Path to the FASTA file.
+            gtf_path: Path to the GTF file. Optional if cache exists or only FASTA access is needed.
+            regen_cache: If True, forces re-parsing of the GTF file and overwrites the cache.
+            fasta_key_func: Function to extract a lookup key from FASTA headers.
+            bowtie2_index: Optional explicit name for the Bowtie2 index files (stem).
+            kmer18: Optional explicit name for the 18-mer Jellyfish output file.
+        """
         self.fasta_path = Path(fasta)
         self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=fasta_key_func)
         self._ts_gene_map: dict[str, str] | None = None
@@ -153,7 +192,7 @@ class ExternalData:
             self.gtf: pl.DataFrame | MockGTF = pl.read_parquet(cache)
         else:
             if gtf_path is None:
-                logger.warning("GTF path not specified. Must be specified for reference species.")
+                # logger.warning("GTF path not specified. Must be specified for reference species.")
                 self.gtf = MockGTF()
             else:
                 if not cache:
@@ -165,8 +204,10 @@ class ExternalData:
         self._override_kmer18 = kmer18
 
     @classmethod
-    def from_definition(cls, definition: ExternalDataDefinition):
-        path = Path(definition.path)
+    def from_definition(cls, path: Path, definition: ExternalDataDefinition):
+        """
+        Creates an ExternalData instance from an ExternalDataDefinition.
+        """
         return cls(
             cache=path / definition.cache_name if definition.cache_name else None,
             fasta=path / definition.fasta_name,
@@ -177,6 +218,19 @@ class ExternalData:
 
     @property
     def bowtie2_index(self):
+        """
+        Gets the base path for the Bowtie2 index files.
+
+        If `bowtie2_index` was provided during class initialization, that is used.
+        Otherwise, it searches for index files (e.g., `{self.fasta_path}.1.bt2`) in the
+        same directory as the FASTA file.
+
+        Returns:
+            Path: The base path (stem) of the Bowtie2 index files.
+
+        Raises:
+            FileNotFoundError: If the Bowtie2 index cannot be found.
+        """
         if self._override_bowtie2_index:
             return self.fasta_path.parent / self._override_bowtie2_index
 
@@ -189,10 +243,40 @@ class ExternalData:
         return self.fasta_path.with_suffix("")
 
     def bowtie_build(self):
-        return bowtie_build(self.fasta_path, self.fasta_path.stem)
+        """
+        Builds the Bowtie2 index for the FASTA file if it doesn't already exist.
+
+        Checks for the existence of `fasta_stem.1.bt2`. If not found, it prompts
+        the user before running `bowtie2-build`.
+
+        Raises:
+            FileNotFoundError: If `bowtie2-build` fails to create the index files.
+        """
+        if self.fasta_path.with_suffix(".1.bt2").exists():
+            return
+        logger.info(f"Bowtie2 index not found for {self.fasta_path.stem}.")
+        input("\nPress Enter to start building...")
+        bowtie_build(self.fasta_path, self.fasta_path.stem)
+        if not self.fasta_path.with_suffix(".1.bt2").exists():
+            raise FileNotFoundError(
+                f"Bowtie2 index not found for {self.fasta_path.stem}. Bowtie2 build failed."
+            )
+        logger.info(f"Bowtie2 index successfully built for {self.fasta_path.stem}.")
 
     @property
     def kmer(self):
+        """
+        Gets the path to the k-mer count file (Jellyfish output).
+
+        If `kmer18` was provided, that is used. Otherwise, it looks for
+        a file named `{self.fasta_stem}.jf` in the same directory as the FASTA file.
+
+        Returns:
+            Path: The path to the k-mer file.
+
+        Raises:
+            FileNotFoundError: If the k-mer file cannot be found.
+        """
         if self._override_kmer18:
             kmer18 = self.fasta_path.parent / self._override_kmer18
             if not kmer18.exists():
@@ -206,11 +290,29 @@ class ExternalData:
         return self.fasta_path.with_suffix(".jf")
 
     def run_jellyfish(self, kmer: int = 18, overwrite: bool = False):
+        """
+        Runs Jellyfish to count k-mers from the sequences in the FASTA file.
+
+        Generates a `.jf` file (e.g., `fasta_stem.jf`). If the output file
+        already exists and `overwrite` is False, the operation is skipped.
+        Prompts the user before running if not overwriting.
+
+        Args:
+            kmer: The k-mer size to use for counting. Defaults to 18.
+            overwrite: If True, run Jellyfish even if the output file exists.
+                Defaults to False.
+
+        Raises:
+            FileNotFoundError: If Jellyfish fails to create the output file.
+        """
         if self.fasta_path.with_suffix(".jf").exists() and not overwrite:
             logger.info(f"Jellyfish file {self.fasta_path.with_suffix('.jf')} already exists. Skipping.")
             return
 
-        logger.info("Running jellyfish for 18-mers in cDNA.")
+        logger.info("Need to run jellyfish to get 18-mers in cDNA.")
+        if not overwrite:
+            input("Press Enter to start running...")
+
         jellyfish(
             [x.seq for x in self.fa],
             self.fasta_path.with_suffix(".jf"),
@@ -220,13 +322,36 @@ class ExternalData:
         )
         if not self.fasta_path.with_suffix(".jf").exists():
             raise FileNotFoundError("cdna18.jf not found. Jellyfish run failed.")
+        logger.info(f"Jellyfish file {self.fasta_path.with_suffix('.jf')} successfully created.")
 
     @cache
     def gene_info(self, gene: str) -> pl.DataFrame:
+        """
+        Retrieves all GTF entries for a given gene name.
+
+        Args:
+            gene: The gene name (e.g., "Actb").
+
+        Returns:
+            A Polars DataFrame containing rows from the GTF that match the gene name.
+            Returns an empty DataFrame if the gene is not found or if GTF data is unavailable.
+        """
         return self.gtf.filter(pl.col("gene_name") == gene)
 
     @cache
     def gene_to_eid(self, gene: str) -> pl.Series:
+        """
+        Converts a gene name to its corresponding gene ID(s) (e.g., Ensembl ID).
+
+        Args:
+            gene: The gene name.
+
+        Returns:
+            A Polars Series containing the gene ID(s) for the given gene name.
+
+        Raises:
+            ValueError: If the gene name is not found in the GTF data.
+        """
         ret = self.gene_info(gene)
         if ret.is_empty():
             raise ValueError(f"Could not find {gene}")
@@ -234,6 +359,18 @@ class ExternalData:
 
     @cache
     def ts_to_gene(self, ts: str) -> str:
+        """
+        Maps a transcript ID (version stripped) to its corresponding gene name.
+
+        Uses an internal cached mapping. If the transcript ID is not found,
+        it returns the input transcript ID.
+
+        Args:
+            ts: The transcript ID (e.g., "ENSMUST00000000001.4" or "ENSMUST00000000001").
+
+        Returns:
+            The gene name associated with the transcript ID, or the input `ts` if not found.
+        """
         ts = ts.split(".")[0]
         if self._ts_gene_map is None:
             self._ts_gene_map = {k: v for k, v in zip(self.gtf["transcript_id"], self.gtf["gene_name"])}
@@ -241,6 +378,19 @@ class ExternalData:
 
     @cache
     def ts_to_tsname(self, eid: str) -> str | None:
+        """
+        Converts a transcript ID (version stripped) to its transcript name.
+
+        If the transcript ID is found, returns the 'transcript_name' attribute.
+        Otherwise, returns the input transcript ID.
+
+        Args:
+            eid: The transcript ID (e.g., "ENSMUST00000000001.4" or "ENSMUST00000000001").
+
+        Returns:
+            The transcript name, or the input `eid` if not found or if 'transcript_name'
+            is missing.
+        """
         eid = eid.split(".")[0]
         try:
             return self.gtf.filter(pl.col("transcript_id") == eid)["transcript_name"].first()  # type: ignore
@@ -249,6 +399,20 @@ class ExternalData:
 
     @cache
     def eid_to_ts(self, eid: str) -> str:
+        """
+        Converts a gene ID (Ensembl ID, version stripped) to a transcript ID.
+
+        Returns the first transcript ID associated with the given gene ID.
+
+        Args:
+            eid: The gene ID (e.g., "ENSMUSG00000000001.4" or "ENSMUSG00000000001").
+
+        Returns:
+            The first transcript ID found for that gene ID.
+
+        Raises:
+            Polars expression error or IndexError if the gene ID is not found or has no transcripts.
+        """
         eid = eid.split(".")[0]
         return self.gtf.filter(pl.col("gene_id") == eid)[0, "transcript_id"]
 
@@ -259,11 +423,14 @@ class ExternalData:
 
         Args:
             val: list of values to convert.
-            src: Attribute to convert from.
-            dst: Attribute to convert to.
+            src: Attribute to convert from (column name in GTF).
+            dst: Attribute to convert to (column name in GTF).
 
         Returns:
-            pl.DataFrame[[src, dst]]
+            pl.DataFrame with two columns: `src` and `dst`, containing the mappings.
+
+        Raises:
+            ValueError: If none of the input values are found in the `src` column.
         """
 
         res = pl.DataFrame({src: val}).join(self.gtf.group_by(src).first(), on=src, how="inner")[[src, dst]]
@@ -276,6 +443,21 @@ class ExternalData:
         return res
 
     def convert(self, val: str, src: str, dst: str) -> str:
+        """
+        Converts a single value from a source attribute to a destination attribute using GTF data.
+
+        Args:
+            val: The value to convert.
+            src: The source attribute column name in the GTF data.
+            dst: The destination attribute column name in the GTF data.
+
+        Returns:
+            The converted value from the `dst` attribute.
+
+        Raises:
+            ValueError: If the `val` is not found in the `src` column or if multiple
+                matches are found (indicating non-uniqueness).
+        """
         res = self.gtf.filter(pl.col(src) == val)[dst]
         if not len(res):
             raise ValueError(f"Could not find {val} in {src}")
@@ -285,12 +467,47 @@ class ExternalData:
 
     @cache
     def get_transcripts(self, gene: str | None = None, *, eid: str | None = None) -> pl.Series:
+        """
+        Retrieves transcript IDs for a given gene name or gene ID (Ensembl ID).
+
+        Exactly one of `gene` or `eid` must be provided.
+
+        Args:
+            gene: The gene name.
+            eid: The gene ID (Ensembl ID).
+
+        Returns:
+            A Polars Series containing all transcript IDs associated with the specified gene.
+        """
         if gene is not None:
             return self.gtf.filter(pl.col("gene_name") == gene)["transcript_id"]
         return self.gtf.filter(pl.col("gene_id") == eid)["transcript_id"]
 
     @cache
     def get_seq(self, eid: str, convert: bool = True) -> str:
+        """
+        Retrieves a sequence from the FASTA file using an ID.
+
+        The ID is typically a transcript ID. If `convert` is True and the ID contains
+        a hyphen (suggesting it might be a transcript name), it first attempts to
+        convert the transcript name to a transcript ID using `self.convert`.
+        The ID (original or converted) is then version-stripped before FASTA lookup.
+        If lookup with the version-stripped ID fails, it tries with the original ID.
+
+        Args:
+            eid: The identifier (transcript ID or transcript name) for the sequence.
+            convert: If True and `eid` contains "-", attempt to convert it from
+                'transcript_name' to 'transcript_id' first. Defaults to True.
+
+        Returns:
+            The sequence string.
+
+        Raises:
+            ValueError: If the ID cannot be found in the FASTA file after attempts,
+                or if the sequence is empty.
+            ValueError: If `convert` is True and the conversion from transcript name
+                to ID fails.
+        """
         if "-" in eid and convert:
             eid = self.convert(eid, "transcript_name", "transcript_id")
 
@@ -307,6 +524,17 @@ class ExternalData:
         return res
 
     def filter_gene(self, gene: str) -> pl.DataFrame:
+        """
+        Filters the GTF DataFrame for entries matching a specific gene name.
+
+        This is a convenience method, equivalent to `self.gtf.filter(pl.col("gene_name") == gene)`.
+
+        Args:
+            gene: The gene name to filter by.
+
+        Returns:
+            A Polars DataFrame containing only rows related to the specified gene.
+        """
         return self.gtf.filter(pl.col("gene_name") == gene)
 
     @overload
@@ -325,6 +553,25 @@ class ExternalData:
     def parse_gtf(
         path: str | Path | StringIO, filters: Sequence[str] | None = ("transcript",)
     ) -> pl.DataFrame:
+        """
+        Parses a GTF file into a Polars DataFrame.
+
+        Handles gzipped GTF files. It dynamically discovers attribute keys from the
+        GTF's attribute column by sampling rows, then parses these attributes into
+        separate columns. 'gene_id' and 'transcript_id' are mandatory and have their
+        version suffixes (e.g., .1) stripped.
+
+        Args:
+            path: Path to the GTF file or an StringIO object containing GTF data.
+            filters: A sequence of feature types (e.g., "transcript", "exon") to keep.
+                If None, all features are kept. Defaults to ("transcript",).
+
+        Returns:
+            A Polars DataFrame representing the parsed GTF data.
+
+        Raises:
+            ValueError: If 'gene_id' or 'transcript_id' attributes are not found in the GTF.
+        """
         if not isinstance(path, StringIO) and Path(path).suffix == ".gz":
             path = StringIO(gzip.open(path, "rt").read())
         # fmt: off

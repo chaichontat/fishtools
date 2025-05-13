@@ -128,7 +128,6 @@ class TestDataset:
             "species": "folder_species",
             "external_data": {
                 "default": {
-                    "path": str(dataset_path),
                     "fasta_name": "test.fa",
                     "bowtie2_index_name": "test.bt2",
                     "kmer18_name": "test.jf",
@@ -141,7 +140,7 @@ class TestDataset:
         dataset = Dataset.from_folder(dataset_path)
 
         expected_def = ExternalDataDefinition(**definition_content["external_data"]["default"])
-        mock_ed_from_def.assert_called_once_with(expected_def)
+        mock_ed_from_def.assert_called_once_with(dataset_path, expected_def)
         assert dataset.species == "folder_species"
         assert dataset.data == mock_ed_instance
         assert dataset.path == dataset_path
@@ -243,7 +242,6 @@ class TestDatasetFromComponents:
         assert "default" in json_data["external_data"]
         default_ext_data_def = json_data["external_data"]["default"]
 
-        assert default_ext_data_def["path"] == dataset_path.as_posix()
         assert default_ext_data_def["fasta_name"] == source_fasta_file.name
         assert default_ext_data_def["bowtie2_index_name"] == expected_bowtie_index_stem_path.name
         assert default_ext_data_def["kmer18_name"] == expected_kmer_file_path.name

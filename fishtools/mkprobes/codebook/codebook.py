@@ -247,16 +247,16 @@ class ProbeSet(BaseModel):
             if not k.startswith("Blank")
         }
 
-    def codebook_dfs(self, path: Path | str):
-        codebook = self.load_codebook(path)
-        tss = list(codebook)
-        dfs = pl.concat([
-            pl.read_parquet(Path(path) / f"{hash_codebook(codebook)}/output/{ts}_final_BamHIKpnI.parquet")
-            # .sample(shuffle=True, seed=4, fraction=1)
-            .sort(["priority", "hp"])
-            for ts in tss
-        ])
-        return dfs
+    # def codebook_dfs(self, path: Path | str):
+    #     codebook = self.load_codebook(path)
+    #     tss = list(codebook)
+    #     dfs = pl.concat([
+    #         pl.read_parquet(Path(path) / f"{hash_codebook(codebook)}/output/{ts}_final_BamHIKpnI.parquet")
+    #         # .sample(shuffle=True, seed=4, fraction=1)
+    #         .sort(["priority", "hp"])
+    #         for ts in tss
+    #     ])
+    #     return dfs
 
     @classmethod
     def from_list_json(cls, path: str | Path):

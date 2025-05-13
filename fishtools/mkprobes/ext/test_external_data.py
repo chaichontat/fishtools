@@ -421,9 +421,8 @@ class TestExternalDataNoGTF:
 
 
 @pytest.fixture
-def data_definition_minimal(tmp_path: Path) -> ExternalDataDefinition:
+def data_definition_minimal() -> ExternalDataDefinition:
     return ExternalDataDefinition(
-        path=str(tmp_path),
         fasta_name="test.fasta",
         bowtie2_index_name="test_bowtie_index",
         kmer18_name="test_kmer.jf",
@@ -431,9 +430,8 @@ def data_definition_minimal(tmp_path: Path) -> ExternalDataDefinition:
 
 
 @pytest.fixture
-def data_definition_full(tmp_path: Path) -> ExternalDataDefinition:
+def data_definition_full() -> ExternalDataDefinition:
     return ExternalDataDefinition(
-        path=str(tmp_path),
         cache_name="test_cache.parquet",
         gtf_name="test.gtf",
         fasta_name="test.fasta",
@@ -444,19 +442,16 @@ def data_definition_full(tmp_path: Path) -> ExternalDataDefinition:
 
 @pytest.fixture
 def create_files_factory(
-    tmp_path: Path,  # tmp_path is used by the definition objects
     dummy_gtf_content: str,
     dummy_fasta_content: str,
 ):
     """
-    Factory fixture that returns a function to create files based on a definition.
-    The definition object's 'path' attribute should be pre-set (e.g., to tmp_path).
+    Factory fixture that returns a function to create files based on a definition
+    at a specified base path.
     """
 
-    def _create_files(definition_obj: ExternalDataDefinition) -> Path:
-        base_path = Path(
-            definition_obj.path
-        )  # Assumes definition_obj.path is correctly set (e.g., by tmp_path in definition fixtures)
+    def _create_files(definition_obj: ExternalDataDefinition, base_path: Path) -> Path:
+        # base_path is where files will be created.
         base_path.mkdir(parents=True, exist_ok=True)
 
         fasta_file = base_path / definition_obj.fasta_name
@@ -485,13 +480,14 @@ def create_files_factory(
 class TestExternalDataFromDefinition:
     def test_from_definition_full(
         self,
+        tmp_path: Path,
         data_definition_full: ExternalDataDefinition,
-        create_files_factory: Callable[[ExternalDataDefinition], Path],
+        create_files_factory: Callable[[ExternalDataDefinition, Path], Path],
     ) -> None:
         definition_obj = data_definition_full
-        base_path = create_files_factory(definition_obj)  # Call the factory
+        base_path = create_files_factory(definition_obj, tmp_path)
 
-        ext_data = ExternalData.from_definition(definition_obj)
+        ext_data = ExternalData.from_definition(base_path, definition_obj)
 
         assert ext_data.fasta_path == base_path / definition_obj.fasta_name
         assert isinstance(ext_data.gtf, pl.DataFrame)  # GTF and cache should be processed
@@ -503,13 +499,14 @@ class TestExternalDataFromDefinition:
 
     def test_from_definition_minimal_gtf_and_cache(
         self,
+        tmp_path: Path,
         data_definition_minimal: ExternalDataDefinition,
-        create_files_factory: Callable[[ExternalDataDefinition], Path],
+        create_files_factory: Callable[[ExternalDataDefinition, Path], Path],
     ) -> None:
         definition_obj = data_definition_minimal  # gtf_name and cache_name are None
-        base_path = create_files_factory(definition_obj)  # Call the factory
+        base_path = create_files_factory(definition_obj, tmp_path)
 
-        ext_data = ExternalData.from_definition(definition_obj)
+        ext_data = ExternalData.from_definition(base_path, definition_obj)
 
         assert ext_data.fasta_path == base_path / definition_obj.fasta_name
         assert isinstance(ext_data.gtf, MockGTF)  # No GTF path, so MockGTF
@@ -518,13 +515,14 @@ class TestExternalDataFromDefinition:
 
     def test_from_definition_with_preexisting_cache(
         self,
+        tmp_path: Path,
         data_definition_full: ExternalDataDefinition,
-        create_files_factory: Callable[[ExternalDataDefinition], Path],
+        create_files_factory: Callable[[ExternalDataDefinition, Path], Path],
         dummy_gtf_content: str,
     ) -> None:
         definition_obj = data_definition_full
         # First, create the directory structure and necessary files using the factory
-        base_path = create_files_factory(definition_obj)
+        base_path = create_files_factory(definition_obj, tmp_path)
 
         # Now, create the pre-existing cache file
         assert definition_obj.cache_name is not None
@@ -537,7 +535,7 @@ class TestExternalDataFromDefinition:
             modified_gtf_content = dummy_gtf_content.replace("DDX11L1", "MODIFIEDGENE")
             (base_path / definition_obj.gtf_name).write_text(modified_gtf_content)
 
-        ext_data = ExternalData.from_definition(definition_obj)  # regen_cache is False by default
+        ext_data = ExternalData.from_definition(base_path, definition_obj)
 
         assert ext_data.fasta_path == base_path / definition_obj.fasta_name
         assert isinstance(ext_data.gtf, pl.DataFrame)
@@ -548,13 +546,14 @@ class TestExternalDataFromDefinition:
 
     def test_from_definition_regen_cache(
         self,
+        tmp_path: Path,
         data_definition_full: ExternalDataDefinition,
-        create_files_factory: Callable[[ExternalDataDefinition], Path],
+        create_files_factory: Callable[[ExternalDataDefinition, Path], Path],
         dummy_gtf_content: str,
     ) -> None:
         definition_obj = data_definition_full
         # Create initial files (including the GTF that will be "old")
-        base_path = create_files_factory(definition_obj)
+        base_path = create_files_factory(definition_obj, tmp_path)
 
         assert definition_obj.cache_name is not None
         cache_path = base_path / definition_obj.cache_name
@@ -573,7 +572,7 @@ class TestExternalDataFromDefinition:
         # as from_definition doesn't expose regen_cache.
         # We ensure the cache is regenerated from the new GTF content.
         ext_data = ExternalData(
-            cache=cache_path,  # Use the same cache path
+            cache=base_path / definition_obj.cache_name,  # Pass name, not full path
             fasta=base_path / definition_obj.fasta_name,
             gtf_path=base_path / definition_obj.gtf_name if definition_obj.gtf_name else None,
             regen_cache=True,  # Explicitly testing regen
@@ -589,11 +588,9 @@ class TestExternalDataFromDefinition:
     def test_from_definition_cache_name_provided_no_gtf_no_actual_cache_file(
         self,
         tmp_path: Path,
-        create_files_factory: Callable[[ExternalDataDefinition], Path],
-        dummy_fasta_content: str,  # Only fasta is strictly needed for this definition
+        create_files_factory: Callable[[ExternalDataDefinition, Path], Path],
     ) -> None:
         definition_obj = ExternalDataDefinition(
-            path=str(tmp_path),
             cache_name="non_existent_cache.parquet",  # Cache name provided
             gtf_name=None,  # No GTF name
             fasta_name="test.fasta",
@@ -603,13 +600,13 @@ class TestExternalDataFromDefinition:
         # Create only the fasta and other non-cache/gtf files
         # The factory normally creates a GTF if gtf_name is present,
         # but here it's None. It also doesn't create the cache file.
-        base_path = create_files_factory(definition_obj)
+        base_path = create_files_factory(definition_obj, tmp_path)
 
         assert definition_obj.cache_name is not None
         cache_file_path = base_path / definition_obj.cache_name
         assert not cache_file_path.exists()  # Ensure cache file does not exist
 
-        ext_data = ExternalData.from_definition(definition_obj)
+        ext_data = ExternalData.from_definition(tmp_path, definition_obj)
 
         assert ext_data.fasta_path == base_path / definition_obj.fasta_name
         assert isinstance(ext_data.gtf, MockGTF)  # Should be MockGTF
