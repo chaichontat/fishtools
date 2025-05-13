@@ -7,7 +7,14 @@ Tools for FISH analysis
 ## Installation
 
 ```sh
-pip install -e .
+mamba env create -n fishtools -f environment.yml
+```
+
+`mamba` is a drop-in replacement for `conda` that is faster and more reliable.
+You can install `mamba` using `conda`:
+
+```sh
+conda install mamba -c conda-forge
 ```
 
 ## Compression

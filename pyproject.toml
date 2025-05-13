@@ -77,7 +77,7 @@ reportUnusedVariable = false
 typeCheckingMode = "strict"
 
 [tool.ruff]
-ignore = ["E501", "E731"]
+ignore = ["E501", "E731", "E713"]
 line-length = 110
 
 [tool.isort]
@@ -87,11 +87,10 @@ py_version = 312
 src_paths = ["fishtools"]
 
 [tool.pytest.ini_options]
-addopts = "--cov=fishtools --cov-report=html --cov-report=xml"
+# addopts = "--cov=fishtools --cov-report=html --cov-report=xml"
 log_cli = 1
 # log_cli_level = "DEBUG"
 minversion = "7.0"
-testpaths = ["test"]
 
 [tool.bandit]
 exclude = "test"
@@ -100,3 +99,6 @@ targets = "fishtools"
 
 [tool.codespell]
 skip = 'scripts/'
+
+[tool.pyupgrade]
+py312-plus = true

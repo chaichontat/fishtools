@@ -1,9 +1,10 @@
-import json
 import pickle
+from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Collection, List, Optional, Protocol
+from typing import Protocol
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,19 +12,30 @@ import rich_click as click
 import seaborn as sns
 from basicpy import BaSiC
 from loguru import logger
-from skimage.filters import gaussian
 from tifffile import TiffFile, imread
 
 from fishtools.preprocess.basic import fit_basic, plot_basic
 from fishtools.preprocess.cli_deconv import scale_deconv
+from fishtools.utils.io import get_channels
 
 sns.set_theme()
 
 
+class DataExtractor(Protocol):
+    def __call__(
+        self,
+        files: list[Path],
+        zs: Collection[float],
+        deconv_meta: np.ndarray | None = None,
+        max_files: int = 800,
+        nc: int | None = None,
+    ) -> np.ndarray: ...
+
+
 def extract_data_from_tiff(
-    files: List[Path],
+    files: list[Path],
     zs: Collection[float],
-    deconv_meta: Optional[np.ndarray] = None,
+    deconv_meta: np.ndarray | None = None,
     max_files: int = 500,
     nc: int | None = None,
 ) -> np.ndarray:
@@ -82,7 +94,7 @@ def extract_data_from_tiff(
                             raise ValueError("All zeros.")
 
                     except Exception as e:
-                        raise Exception(f"Error at {file},{i}, {k}, {c}.") from e
+                        raise Exception(f"Error at {file}, {i}, {k}, {c}.") from e
 
     # Reshape to combine file and z dimensions
     out = np.reshape(out, (n * len(zs), nc, 2048, 2048))
@@ -97,7 +109,7 @@ def fit_and_save_basic(
     round_: str,
     channels: list[str],
     plot: bool = True,
-) -> List[BaSiC]:
+) -> list[BaSiC]:
     """
     Fit BaSiC models for each channel and save the results.
 
@@ -118,7 +130,15 @@ def fit_and_save_basic(
         logger.info(f"Writing {round_}-{channel}.pkl")
 
         with open(output_dir / f"{round_}-{channel}.pkl", "wb") as f:
-            pickle.dump(basic, f)
+            pickle.dump(
+                dict(
+                    basic=basic,
+                    path=output_dir.resolve().as_posix(),
+                    name=round_,
+                    created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+                f,
+            )
 
         with lock:
             plot_basic(basic)
@@ -129,7 +149,7 @@ def fit_and_save_basic(
 
     with ThreadPoolExecutor(3) as exc:
         futs = [exc.submit(fit_write, i, channel) for i, channel in enumerate(channels)]
-        basics: List[BaSiC] = []
+        basics: list[BaSiC] = []
 
         for fut in futs:
             basics.append(fut.result())
@@ -140,25 +160,11 @@ def fit_and_save_basic(
         return basics
 
 
-# The original _run function has been removed in favor of the more generic run_with_extractor function
-
-
-class DataExtractor(Protocol):
-    def __call__(
-        self,
-        files: List[Path],
-        zs: Collection[float],
-        deconv_meta: Optional[np.ndarray] = None,
-        max_files: int = 800,
-        nc: int | None = None,
-    ) -> np.ndarray: ...
-
-
 # Alternative data extractor for single-file format
 def extract_data_from_registered(
-    files: List[Path],
+    files: list[Path],
     zs: Collection[float],
-    deconv_meta: Optional[np.ndarray] = None,
+    deconv_meta: np.ndarray | None = None,
     max_files: int = 800,
     nc: int | None = None,
     max_proj: bool = True,
@@ -219,9 +225,7 @@ def run_with_extractor(
         zs: Z-slice positions (between 0 and 1)
     """
     if "deconv" in path.resolve().as_posix() and round_ != "registered":
-        input(
-            "deconv in path. This script runs prior to deconvolution. Press Enter to continue."
-        )
+        input("deconv in path. This script runs prior to deconvolution. Press Enter to continue.")
 
     basic_dir = path / "basic"
     basic_dir.mkdir(exist_ok=True)
@@ -232,33 +236,18 @@ def run_with_extractor(
     if not all(0 <= z <= 1 for z in zs):
         raise ValueError("zs must be between 0 and 1.")
 
-    # Determine number of channels from round string
-
     if not round_:
         logger.warning("No round specified. Sampling from all rounds.")
     # Find and sort files
     files = sorted(path.glob(f"{round_}--*/*.tif" if round_ else "*_*_*--*/*.tif"))
-    # files = [f for f in files if f.parent.name.split("_").__len__() == 3]
     # Put --basic files last. These are extra files taken in random places for BaSiC training.
     files.sort(key=lambda x: ("--basic" in str(x), str(x)))
-    # files = [f for f in files if not f.parent.name.startswith("atp")]
 
-    with TiffFile(files[0]) as tif:
-        try:
-            meta = tif.shaped_metadata[0]
-        except KeyError:
-            raise AttributeError("No waveform metadata found.")
-
-    waveform = json.loads(meta["waveform"])
-    powers = waveform["params"]["powers"]
-    channels = [name[-3:] for name in powers]
-    nc = len(channels)
+    channels = get_channels(files[0])
 
     # Validate file count
     if len(files) < 100:
-        raise ValueError(
-            f"Not enough files ({len(files)}). Need at least 100 to be somewhat reliable."
-        )
+        raise ValueError(f"Not enough files ({len(files)}). Need at least 100 to be somewhat reliable.")
 
     if len(files) < 500:
         logger.warning(f"Not enough files ({len(files)}). Result may be unreliable.")
@@ -273,24 +262,10 @@ def run_with_extractor(
     deconv_path = path / "deconv_scaling" / f"{round_ or 'all'}.txt"
     deconv_meta = np.loadtxt(deconv_path) if deconv_path.exists() else None
     if deconv_meta is not None:
-        logger.info("Using deconvolution scaling.")
+        logger.warning("Using deconvolution scaling. Should not use for normal workflow.")
 
     # Extract data using the provided extractor function
-    data = extractor_func(
-        files, zs, deconv_meta, nc=nc, max_files=1000 if round_ else 1000
-    )
-
-    # out = np.zeros_like(data).astype(np.float32)
-    # for i in range(data.shape[0]):
-    #     d32 = data[i].astype(np.float32)
-    #     lp = gaussian(d32, sigma=8, cval=0, preserve_range=True, truncate=4.0)
-    #     out[i] = d32 - np.minimum(d32, lp)
-    # from tifffile import imread, imwrite
-
-    # imwrite(
-    #     "/working/20250317_benchmark_mousecommon/analysis/deconv/registered--center+mousecommon/_highpassed/outstack.tif",
-    #     out,
-    # )
+    data = extractor_func(files, zs, deconv_meta, nc=len(channels), max_files=1000 if round_ else 1000)
 
     # Fit and save BaSiC models
     return fit_and_save_basic(data, basic_dir, round_ or "all", channels, plot)
@@ -301,46 +276,26 @@ def basic(): ...
 
 
 @basic.command()
-@click.argument(
-    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
-)
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("round_", type=str)
 @click.option("--zs", type=str, default="0.5")
 @click.option("--overwrite", is_flag=True)
 def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5"):
-    # paths_pickle = [path / "basic" / f"{round_}-{c}.pkl" for c in range(len(round_.split("_")))]
-    # if all(p.exists() for p in paths_pickle) and not overwrite:
-    # logger.info(f"Skipping {round_}. Already exists.")
-    # return
-
     z_values = tuple(map(float, zs.split(",")))
-    extractor = (
-        extract_data_from_registered
-        if round_ == "registered"
-        else extract_data_from_tiff
-    )
+    extractor = extract_data_from_registered if round_ == "registered" else extract_data_from_tiff
 
-    return run_with_extractor(
-        path, round_ if round_ != "all" else None, extractor, plot=False, zs=z_values
-    )
+    return run_with_extractor(path, round_ if round_ != "all" else None, extractor, plot=False, zs=z_values)
 
 
 @basic.command()
-@click.argument(
-    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
-)
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--overwrite", is_flag=True)
 @click.option("--threads", "-t", type=int, default=1)
 @click.option("--zs", type=str, default="0.5")
 def batch(path: Path, overwrite: bool = False, threads: int = 1, zs: str = "0.5"):
-    rounds = sorted({
-        p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name
-    })
+    rounds = sorted({p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name})
     with ThreadPoolExecutor(threads) as exc:
-        futs = [
-            exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs)
-            for r in rounds
-        ]  # type: ignore
+        futs = [exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs) for r in rounds]  # type: ignore
         for fut in as_completed(futs):
             fut.result()
 
