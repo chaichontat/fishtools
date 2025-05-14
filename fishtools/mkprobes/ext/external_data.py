@@ -166,7 +166,7 @@ class ExternalData:
         fasta: Path | str,
         gtf_path: Path | str | None = None,
         regen_cache: bool = False,
-        fasta_key_func: Callable[[str], str | None] = lambda x: x.split(" ")[0].split(".")[0],
+        fasta_key_func: Callable[[str], str | None] = lambda x: x,
         bowtie2_index: str | None = None,
         kmer18: str | None = None,
     ) -> None:
