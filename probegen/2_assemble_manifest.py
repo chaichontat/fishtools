@@ -247,6 +247,31 @@ def cli(ctx: click.Context, manifest: Path):
 def short(
     ctx: click.Context, short: int, verbose: bool = False, delete: bool = False, permanent: bool = False
 ):
+    """
+    Identifies and optionally removes transcripts with fewer probes than a specified threshold.
+
+    This function iterates through probe sets defined in the manifest. For each probe set,
+    it loads the corresponding codebook and associated parquet files containing probe data.
+    It then counts the number of probes per gene.
+
+    If the '--delete' flag is set, genes with probe counts below the 'short' threshold
+    are removed from a copy of the .tss.txt file.
+    If '--permanent' is also set, the original .tss.txt file is overwritten.
+    Otherwise, a new file with the suffix '.tss.ok.txt' is created.
+
+    Args:
+        ctx: The Click context, containing the manifest and path.
+        short: The minimum number of probes a gene must have.
+        verbose: If True, prints detailed information about genes with too few probes.
+        delete: If True, removes genes with too few probes from the .tss.txt file.
+        permanent: If True (and 'delete' is True), overwrites the original .tss.txt file.
+                   Otherwise, a new file with '.tss.ok.txt' suffix is created.
+
+    Raises:
+        ValueError: If '--permanent' is used without '--delete'.
+        ValueError: If genes marked for deletion are not found in the .tss.txt file.
+    """
+
     if permanent and not delete:
         raise ValueError("Cannot use --permanent without --delete")
 
