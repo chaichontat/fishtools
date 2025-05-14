@@ -222,7 +222,7 @@ class TestDatasetFromComponents:
         # Assertions for ExternalData method calls
         mock_external_data_cls.assert_called_once_with(
             cache=dataset_path / source_fasta_file.with_suffix(".parquet").name,  # Cache is in dataset_path
-            fasta=source_fasta_file,  # Initialized with original fasta_file
+            fasta=dataset_path / source_fasta_file.name,  # Initialized with original fasta_file
             regen_cache=True,
         )
         mock_ed_instance.bowtie_build.assert_called_once()

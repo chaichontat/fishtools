@@ -135,10 +135,11 @@ class Dataset:
         logger.info(f"Copying {fasta_file} to {new_path}")
         if fasta_file.resolve() != new_path.resolve():
             shutil.copy(fasta_file, new_path)
+        del fasta_file
 
         external_data = ExternalData(
-            cache=path / fasta_file.with_suffix(".parquet").name,
-            fasta=fasta_file,
+            cache=path / new_path.with_suffix(".parquet").name,
+            fasta=new_path,
             regen_cache=overwrite,
         )
         external_data.bowtie_build(overwrite=overwrite)
@@ -148,7 +149,7 @@ class Dataset:
             DatasetDefinition(
                 external_data={
                     "default": ExternalDataDefinition(
-                        fasta_name=fasta_file.name,
+                        fasta_name=new_path.name,
                         bowtie2_index_name=external_data.bowtie2_index.name,
                         kmer18_name=external_data.kmer.name,
                     )
