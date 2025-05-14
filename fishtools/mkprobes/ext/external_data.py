@@ -132,8 +132,7 @@ class ExternalData:
     - **FASTA Key Function (`fasta_key_func`)**:
         - This function normalizes sequence headers from the FASTA file to generate
           keys for sequence lookup (e.g., extracting transcript IDs).
-        - The default function (`lambda x: x.split(" ")[0].split(".")[0]`) attempts
-          to get the ID before the first space and remove any version suffix (like .1).
+        - The default function captures the first word.
         - If your FASTA headers have a different format, you MUST provide a custom
           `fasta_key_func` to ensure IDs match those used/derived from the GTF.
           Mismatched keys will lead to `KeyError` or `ValueError` when fetching sequences.
@@ -159,12 +158,13 @@ class ExternalData:
           workflow relies on versioned IDs.
     """
 
-    def __init__(
+    def __init__[T: str](
         self,
         cache: Path | str | None = None,
         *,
         fasta: Path | str,
         gtf_path: Path | str | None = None,
+        key_func: Callable[[T], T] = lambda x: x.split(" ")[0],
         regen_cache: bool = False,
         fasta_key_func: Callable[[str], str | None] = lambda x: x,
         bowtie2_index: str | None = None,
@@ -206,6 +206,7 @@ class ExternalData:
                 self.gtf = self.parse_gtf(Path(gtf_path).resolve())
                 self.gtf.write_parquet(cache)
 
+        self.key_func = key_func
         self._override_bowtie2_index = bowtie2_index
         self._override_kmer18 = kmer18
 
@@ -377,7 +378,7 @@ class ExternalData:
         Returns:
             The gene name associated with the transcript ID, or the input `ts` if not found.
         """
-        ts = ts.split(".")[0]
+        ts = self.key_func(ts)
         if self._ts_gene_map is None:
             self._ts_gene_map = {k: v for k, v in zip(self.gtf["transcript_id"], self.gtf["gene_name"])}
         return self._ts_gene_map.get(ts, ts)
