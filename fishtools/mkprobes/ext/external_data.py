@@ -205,7 +205,7 @@ class ExternalData:
                 self.gtf = self.parse_gtf(Path(gtf_path).resolve())
                 self.gtf.write_parquet(cache)
 
-        self.key_func = key_func
+        self.key_func = fasta_key_func
         self._override_bowtie2_index = bowtie2_index
         self._override_kmer18 = kmer18
 
