@@ -12,7 +12,6 @@ import polars as pl
 from loguru import logger
 
 from fishtools.mkprobes.candidates import get_candidates
-from fishtools.mkprobes.codebook.codebook import ProbeSet
 from fishtools.mkprobes.codebook.finalconstruct import construct
 from fishtools.mkprobes.ext.dataset import Dataset
 from fishtools.mkprobes.screen import run_screen
@@ -77,15 +76,15 @@ def run_gene(
             time.sleep(1)
         overwrite = overwrite or acceptable is not None
         run_screen(output_path, ts, minimum=60, restriction=restriction, maxoverlap=0, overwrite=overwrite)
-        # construct(
-        #     ds,
-        #     "output/",
-        #     transcript=ts,
-        #     codebook=codebook,
-        #     restriction=restriction,
-        #     target_probes=48,
-        #     overwrite=overwrite,
-        # )
+        construct(
+            ds,
+            output_path,
+            transcript=ts,
+            codebook=codebook,
+            restriction=restriction,
+            target_probes=48,
+            overwrite=overwrite,
+        )
     except Exception as e:
         raise Exception(ts) from e
 

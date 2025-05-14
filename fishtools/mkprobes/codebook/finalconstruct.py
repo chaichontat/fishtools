@@ -12,9 +12,8 @@ from loguru import logger
 
 from fishtools import rc
 from fishtools.mkprobes.candidates import _run_bowtie
-from fishtools.mkprobes.codebook.codebook import hash_codebook
-from fishtools.mkprobes.ext.dataset import ReferenceDataset as Dataset
-from fishtools.mkprobes.starmap.starmap import rotate, split_probe, test_splint_padlock
+from fishtools.mkprobes.ext.dataset import Dataset, ReferenceDataset
+from fishtools.mkprobes.starmap.starmap import rotate, test_splint_padlock
 
 READOUTS: Final[dict[int, str]] = {
     x["id"]: x["seq"] for x in pl.read_csv(Path(__file__).parent / "readout_ref_filtered.csv").to_dicts()
@@ -155,7 +154,7 @@ def click_construct(
     restriction: list[str] | str | None = None,
 ):
     construct(
-        Dataset(path),
+        ReferenceDataset(path),
         output_path,
         transcript=gene,
         codebook=json.loads(codebook.read_text()),
