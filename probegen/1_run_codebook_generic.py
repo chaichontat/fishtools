@@ -101,12 +101,14 @@ def cli(): ...
 @click.argument(
     "codebook_path", metavar="CODEBOOK", type=click.Path(exists=True, file_okay=True, path_type=Path)
 )
+@click.option("--allow-file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
 @click.option("--listfailed", is_flag=True)
 @click.option("--listfailedall", is_flag=True)
 def single(
     path_dataset: Path,
     codebook_path: Path,
+    allow_file: Path | None = None,
     overwrite: bool = False,
     listfailed: bool = False,
     listfailedall: bool = False,
@@ -135,7 +137,7 @@ def single(
                     print(pl.read_csv(codebook_path.parent / "output" / f"{gene}_offtarget_counts.csv")[:5])
         return
 
-    acceptable_path = codebook_path.with_suffix(".acceptable.json")
+    acceptable_path = allow_file or codebook_path.parent / "acceptable.json"
     acceptable: dict[str, list[str]] = (
         json.loads(acceptable_path.read_text()) if acceptable_path.exists() else {}
     )

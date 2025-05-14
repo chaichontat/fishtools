@@ -158,14 +158,14 @@ class ExternalData:
           workflow relies on versioned IDs.
     """
 
-    def __init__[T: str](
+    def __init__(
         self,
         cache: Path | str | None = None,
         *,
         fasta: Path | str,
         gtf_path: Path | str | None = None,
         regen_cache: bool = False,
-        fasta_key_func: Callable[[T], T] = lambda x: x.split(" ")[0],
+        fasta_key_func: Callable[[str], str] = lambda x: x.split(" ")[0],
         bowtie2_index: str | None = None,
         kmer18: str | None = None,
     ) -> None:
@@ -205,7 +205,7 @@ class ExternalData:
                 self.gtf = self.parse_gtf(Path(gtf_path).resolve())
                 self.gtf.write_parquet(cache)
 
-        self.key_func = key_func
+        self.key_func = fasta_key_func
         self._override_bowtie2_index = bowtie2_index
         self._override_kmer18 = kmer18
 
@@ -397,7 +397,7 @@ class ExternalData:
             The transcript name, or the input `eid` if not found or if 'transcript_name'
             is missing.
         """
-        eid = eid.split(".")[0]
+        eid = self.key_func(eid)
         try:
             return self.gtf.filter(pl.col("transcript_id") == eid)["transcript_name"].first()  # type: ignore
         except pl.exceptions.ComputeError:
@@ -419,7 +419,7 @@ class ExternalData:
         Raises:
             Polars expression error or IndexError if the gene ID is not found or has no transcripts.
         """
-        eid = eid.split(".")[0]
+        eid = self.key_func(eid)
         return self.gtf.filter(pl.col("gene_id") == eid)[0, "transcript_id"]
 
     def batch_convert(self, val: list[str], src: str, dst: str) -> pl.DataFrame:
@@ -518,7 +518,7 @@ class ExternalData:
             eid = self.convert(eid, "transcript_name", "transcript_id")
 
         try:
-            res = self.fa[eid.split(".")[0]].seq
+            res = self.fa[eid].seq
         except KeyError:
             try:
                 res = self.fa[eid].seq
