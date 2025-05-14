@@ -185,7 +185,13 @@ class ExternalData:
             kmer18: Optional explicit name for the 18-mer Jellyfish output file.
         """
         self.fasta_path = Path(fasta).resolve()
-        self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=fasta_key_func)
+        try:
+            self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=fasta_key_func)
+        except Exception as e:
+            raise Exception(
+                f"Error reading FASTA file {fasta}. Ensure the file is valid and not empty."
+            ) from e
+
         self._ts_gene_map: dict[str, str] | None = None
 
         if cache and Path(cache).exists() and not regen_cache:
