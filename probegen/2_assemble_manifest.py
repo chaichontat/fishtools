@@ -23,7 +23,7 @@ from fishtools.mkprobes.codebook.codebook import ProbeSet, hash_codebook
 from fishtools.mkprobes.starmap.starmap import generate_head_splint, test_splint_padlock
 
 pl.Config.set_fmt_str_lengths(100)
-hfs = pl.read_csv("../data/headerfooter.csv")
+hfs = pl.read_csv(Path(__file__).parent.parent / "data/headerfooter.csv")
 console = rich.get_console()
 rich.traceback.install()
 species_mapping = {"mouse": "mus musculus", "human": "homo sapiens"}
@@ -209,8 +209,6 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
     (gen_path := path / "generated").mkdir(exist_ok=True, parents=True)
     out.write_parquet(gen_path / (probeset.name + ".parquet"))
     logger.info(f"{len(out)} probe pairs written to {gen_path / (probeset.name + '.parquet')}")
-
-    # Path("starwork/genestar_out.txt").write_text("\n".join([*out["padlockcons"], *out["splintcons"]]))
 
     (gen_path / (probeset.name + "_pad.fasta")).write_text(
         gen_fasta(out["padlockcons"], names=range(len(out))).getvalue()
