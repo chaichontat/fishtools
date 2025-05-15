@@ -111,7 +111,13 @@ class SAMFrame(pl.DataFrame):
         )
 
     @classmethod
-    def from_sam(cls, sam: str, split_name: bool = True, count_match: bool = True) -> SAMFrame:
+    def from_sam(
+        cls,
+        sam: str,
+        split_name: bool = True,
+        count_match: bool = True,
+        transcript_regex: str = r"",
+    ) -> SAMFrame:
         # s = (
         #     pl.DataFrame(dict(strs=[sam]))
         #     .lazy()
@@ -168,18 +174,18 @@ class SAMFrame(pl.DataFrame):
             )
             .drop(["column_1", "mapq", "rnext", "pnext", "tlen"])
             .with_columns(
-                [
-                    pl.when(pl.col("transcript").str.contains(r"(.*)\.\d+"))
-                    .then(pl.col("transcript").str.extract(r"(.*)\.\d+"))
+                (([
+                    pl.when(pl.col("transcript").str.contains(transcript_regex))
+                    .then(pl.col("transcript").str.extract(transcript_regex, 1))
                     .otherwise(pl.col("transcript"))
                     .alias("transcript")
-                ]
+                ] if transcript_regex else [])
                 + [
                     pl.col("name").str.extract(r"(.+)_(.+):(\d+)-(\d+)", 1).alias("gene"),
                     pl.col("name").str.extract(r"(.+)_(.+):(\d+)-(\d+)", 2).alias("transcript_ori"),
                     pl.col("name").str.extract(r"(.+)_(.+):(\d+)-(\d+)", 3).cast(pl.UInt32).alias("pos_start"),
                     pl.col("name").str.extract(r"(.+)_(.+):(\d+)-(\d+)", 4).cast(pl.UInt32).alias("pos_end"),
-                ]
+                ])
                 if split_name
                 else []
             )
@@ -228,7 +234,11 @@ class SAMFrame(pl.DataFrame):
         tm_offtarget = self.filter(
             ~pl.col("transcript").is_in(acceptable_tss) & pl.col("match_consec").gt(18)
         ).with_columns(
-            tm_offtarget=pl.struct(["seq", "cigar", "mismatched_reference"]).map_elements(
+            tm_offtarget=pl.struct([
+                "seq",
+                "cigar",
+                "mismatched_reference",
+            ]).map_elements(
                 lambda x: tm_pairwise(x["seq"], x["cigar"], x["mismatched_reference"], formamide=formamide),
                 return_dtype=pl.Float32,
             )
@@ -259,13 +269,21 @@ class SAMFrame(pl.DataFrame):
 
     @classmethod
     @copy_signature_method(run_bowtie, Self)
-    def from_bowtie_split_name(cls, *args: Any, **kwargs: Any):
-        return cls.from_sam(run_bowtie(*args, **kwargs), split_name=True)
+    def from_bowtie_split_name(cls, *args: Any, transcript_regex: str = "", **kwargs: Any):
+        return cls.from_sam(
+            run_bowtie(*args, **kwargs),
+            split_name=True,
+            transcript_regex=transcript_regex,
+        )
 
     @classmethod
     @copy_signature_method(run_bowtie, Self)
-    def from_bowtie(cls, *args: Any, **kwargs: Any):
-        return cls.from_sam(run_bowtie(*args, **kwargs), split_name=False)
+    def from_bowtie(cls, *args: Any, transcript_regex: str = "", **kwargs: Any):
+        return cls.from_sam(
+            run_bowtie(*args, **kwargs),
+            split_name=False,
+            transcript_regex=transcript_regex,
+        )
 
 
 if __name__ == "__main__":

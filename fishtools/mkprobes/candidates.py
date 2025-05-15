@@ -137,6 +137,7 @@ def _run_bowtie(
         fasta=True,
         no_reverse=ignore_revcomp,
         capture_stderr=True,
+        transcript_regex=dataset.data.key_regex,  # type: ignore
         **kwargs,
     )
     df = (

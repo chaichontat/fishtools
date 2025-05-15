@@ -1,6 +1,7 @@
 # %%
 import gzip
 import json
+import re
 from collections.abc import Callable
 from functools import cache
 from io import StringIO
@@ -165,7 +166,7 @@ class ExternalData:
         fasta: Path | str,
         gtf_path: Path | str | None = None,
         regen_cache: bool = False,
-        fasta_key_func: Callable[[str], str] = lambda x: x.split(" ")[0],
+        fasta_key_regex: str = r"^(\S+)",
         bowtie2_index: str | None = None,
         kmer18: str | None = None,
     ) -> None:
@@ -184,8 +185,13 @@ class ExternalData:
             kmer18: Optional explicit name for the 18-mer Jellyfish output file.
         """
         self.fasta_path = Path(fasta).resolve()
+
+        self.key_regex = fasta_key_regex
+        regex = re.compile(fasta_key_regex)
+        self.key_func: Callable[[str], str] = lambda x: match.group(1) if (match := regex.match(x)) else x
+
         try:
-            self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=fasta_key_func)
+            self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=self.key_func)
         except Exception as e:
             raise Exception(
                 f"Error reading FASTA file {fasta}. Ensure the file is valid and not empty."
@@ -205,7 +211,6 @@ class ExternalData:
                 self.gtf = self.parse_gtf(Path(gtf_path).resolve())
                 self.gtf.write_parquet(cache)
 
-        self.key_func = fasta_key_func
         self._override_bowtie2_index = bowtie2_index
         self._override_kmer18 = kmer18
 

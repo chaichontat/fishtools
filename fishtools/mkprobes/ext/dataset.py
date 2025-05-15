@@ -265,7 +265,7 @@ class ReferenceDataset(Dataset):
                 cache=self.path / "gencode.parquet",
                 gtf_path=self.path / "gencode.gtf.gz",
                 fasta=self.path / "cdna_ncrna_trna.fasta",
-                fasta_key_func=lambda x: x.split(" ")[0].split(".")[0],
+                fasta_key_regex=r"^([^.\s]+)",
             ),
             kmer18_path=self.path / "cdna18.jf",
             trna_rna_kmers_path=self.path / "r_t_snorna15.jf",

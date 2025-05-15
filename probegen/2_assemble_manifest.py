@@ -288,14 +288,14 @@ def short(
         dfs_ = []
         for ts in tss:
             try:
-                dfs_.append(
-                    pl.read_parquet(
-                        Path(path)
-                        / f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
-                    )
-                    # .sample(shuffle=True, seed=4, fraction=1)
-                    .sort(["priority", "hp"])
+                _df = pl.read_parquet(
+                    Path(path)
+                    / f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
                 )
+                _df = _df.sort([pl.col("priority").list.min(), pl.col("hp").list.max()])
+                dfs_.append(_df)
+            # .sample(shuffle=True, seed=4, fraction=1)
+
             except FileNotFoundError:
                 baddies.append(probeset.name)
                 if verbose:
@@ -317,6 +317,8 @@ def short(
                 rich.print(bad)
             else:
                 rich.print("\n".join(bad[COL_NAME].to_list()))
+        else:
+            logger.info(f"All genes have at least {short} probes.")
 
         if delete:
             tss = probeset.load_codebook(path)
