@@ -12,6 +12,8 @@ import scanpy as sc
 import seaborn as sns
 from matplotlib.figure import Figure
 
+from fishtools.utils.utils import create_rotation_matrix
+
 
 def qc(adata: ad.AnnData):
     n_genes = adata.shape[1]
@@ -187,3 +189,54 @@ def plot_ranked_genes(
 def jitter(data: np.ndarray, amount: float = 0.5, seed: int | None = None):
     rand = np.random.default_rng(seed)
     return data + rand.normal(0, amount, size=data.shape[0])
+
+
+def rotate_rois_in_adata(adata: ad.AnnData, roi_rotation_angles: dict[str, float]) -> ad.AnnData:
+    """
+    Rotates spatial coordinates in an AnnData object for specified ROIs around their respective centers.
+
+    Args:
+        adata: The AnnData object with 'roi' in obs and 'spatial' in obsm.
+        roi_rotation_angles: A dictionary where keys are ROI names (matching those in adata.obs['roi'])
+                             and values are the rotation angles in degrees.
+
+    Returns:
+        A new AnnData object with rotated spatial coordinates.
+    """
+    spatial_coords = adata.obsm["spatial"].copy()
+
+    for roi_name, angle_degrees in roi_rotation_angles.items():
+        # Find indices for the current ROI
+        roi_indices = np.where(adata.obs["roi"] == roi_name)[0]
+
+        if len(roi_indices) == 0:
+            raise ValueError(
+                f"ROI '{roi_name}' not found in adata.obs['roi']. Skipping rotation for this ROI."
+            )
+
+        # Get the spatial coordinates for the current ROI
+        roi_spatial_coords = spatial_coords[roi_indices, :]
+
+        if roi_spatial_coords.shape[1] != 2:
+            raise ValueError(
+                f"Spatial coordinates for ROI '{roi_name}' are not 2D. "
+                f"Expected shape (n_cells, 2), got {roi_spatial_coords.shape}"
+            )
+
+        # Calculate the center of the ROI
+        center_x = np.mean(roi_spatial_coords[:, 0])
+        center_y = np.mean(roi_spatial_coords[:, 1])
+        center = np.array([center_x, center_y])
+
+        # Translate ROI to origin
+        translated_coords = roi_spatial_coords - center
+        rotation_matrix = create_rotation_matrix(-angle_degrees)
+        rotated_coords_at_origin = (rotation_matrix @ translated_coords.T).T
+
+        # Translate ROI back to its original position
+        rotated_coords = rotated_coords_at_origin + center
+
+        spatial_coords[roi_indices, :] = rotated_coords
+
+    adata.obsm["spatial_rot"] = spatial_coords
+    return adata

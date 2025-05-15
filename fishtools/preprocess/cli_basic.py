@@ -236,21 +236,42 @@ def run_with_extractor(
     if not all(0 <= z <= 1 for z in zs):
         raise ValueError("zs must be between 0 and 1.")
 
-    if not round_:
-        logger.warning("No round specified. Sampling from all rounds.")
-    # Find and sort files
+    # Get rounds with 3 channels bits
     files = sorted(path.glob(f"{round_}--*/*.tif" if round_ else "*_*_*--*/*.tif"))
+
+    if not round_:
+        import re
+
+        regex = re.compile(r"\d+_\d+_\d+")
+        files = [f for f in files if regex.match(f.stem.split("--")[0])]
+
+        already = set(p.parent.name.split("--")[0] for p in files)
+        logger.warning(f"No round specified. Sampling from {sorted(already)}.")
+        extra_rounds = sorted(
+            s
+            for s in set(p.name.split("--")[0] for p in path.glob("*--*")) - already
+            if not all(c.isdigit() for c in s.split("_")) and len(list(path.glob(f"{s}--*/*.tif")))
+        )
+        if extra_rounds:
+            logger.info(f"Will run {extra_rounds} separately due to an atypical channel layout.")
+    else:
+        extra_rounds = []
+
     # Put --basic files last. These are extra files taken in random places for BaSiC training.
     files.sort(key=lambda x: ("--basic" in str(x), str(x)))
 
     channels = get_channels(files[0])
+    if not round_ and channels != ["560", "650", "750"]:
+        raise ValueError(f"Expected channels 560, 650, 750 when running all. Found {channels} at {files[0]}")
 
     # Validate file count
     if len(files) < 100:
-        raise ValueError(f"Not enough files ({len(files)}). Need at least 100 to be somewhat reliable.")
+        raise ValueError(
+            f"Not enough files ({len(files)}) for {path}. Need at least 100 to be somewhat reliable."
+        )
 
     if len(files) < 500:
-        logger.warning(f"Not enough files ({len(files)}). Result may be unreliable.")
+        logger.warning(f"Not enough files ({len(files)}) for {path}. Result may be unreliable.")
     import random
 
     files = random.sample(files, k=min(1000, len(files)))
@@ -268,7 +289,13 @@ def run_with_extractor(
     data = extractor_func(files, zs, deconv_meta, nc=len(channels), max_files=1000 if round_ else 1000)
 
     # Fit and save BaSiC models
-    return fit_and_save_basic(data, basic_dir, round_ or "all", channels, plot)
+    res = fit_and_save_basic(data, basic_dir, round_ or "all", channels, plot)
+
+    for r in extra_rounds:
+        logger.info(f"Running {r}")
+        run_with_extractor(path, r, extractor_func, plot=plot, zs=zs)
+
+    return res
 
 
 @click.group()

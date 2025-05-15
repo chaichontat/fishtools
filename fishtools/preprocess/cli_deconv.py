@@ -5,6 +5,7 @@ import queue
 import sys
 import threading
 import time
+from itertools import chain
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -350,13 +351,22 @@ def _get_percentiles_for_round(
     default_perc_min: float,
     default_perc_scale: float,
     max_rna_bit: int,
+    override: dict[str, tuple[float, float]] | None = None,
 ) -> tuple[list[float], list[float]]:
     """Determines the percentile values for min and scale based on the round name components."""
     percentile_mins: list[float] = []
     percentile_scales: list[float] = []
+    override = override or {}
 
     bits = round_name.split("_")
     for bit in bits:
+        if bit in override:
+            min_val, scale_val = override[bit]
+            logger.info(f"Using override for bit '{bit}' to {override[bit]} in round '{round_name}'.")
+            percentile_mins.append(min_val)
+            percentile_scales.append(scale_val)
+            continue
+
         is_rna_bit = bit.isdigit() and int(bit) <= max_rna_bit
         if not is_rna_bit:
             # Protein staining often has bright flare spots.
@@ -374,6 +384,7 @@ def _get_percentiles_for_round(
 @click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
 @click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
 @click.option("--overwrite", is_flag=True)
+@click.option("--override", type=str, multiple=True)
 @click.option("--max-rna-bit", type=int, default=36)
 def compute_range(
     path: Path,
@@ -381,6 +392,7 @@ def compute_range(
     perc_scale: float = 0.1,
     overwrite: bool = False,
     max_rna_bit: int = 36,
+    override: list[str] | None = None,
 ):
     """
     Find the scaling factors of all images in the children sub-folder of `path`.
@@ -397,7 +409,18 @@ def compute_range(
         raise ValueError(f"This command must be run within a 'deconv' directory. Path provided: {path}")
 
     ws = Workspace(path)
+    override = override or []
     rounds = ws.rounds
+    try:
+        override_dict = {(parts := v.split(","))[0]: (float(parts[1]), float(parts[2])) for v in override}
+    except ValueError:
+        raise ValueError("Override must be in the format 'bit,min,scale'.")
+    del override
+
+    if not len(set(override_dict) & set(chain.from_iterable(map(lambda x: x.split("_"), rounds)))) == len(
+        override_dict
+    ):
+        raise ValueError("Overridden bits must exist.")
 
     logger.info(f"Found rounds: {rounds}")
     scaling_dir = path / "deconv_scaling"
@@ -412,7 +435,7 @@ def compute_range(
         try:
             logger.info(f"Processing {round_name}")
             percentile_mins, percentile_scales = _get_percentiles_for_round(
-                round_name, perc_min, perc_scale, max_rna_bit
+                round_name, perc_min, perc_scale, max_rna_bit, override=override_dict
             )
 
             _compute_range(path, round_name, perc_min=percentile_mins, perc_scale=percentile_scales)
@@ -580,6 +603,9 @@ def run(
     if debug:
         logger.remove()
         logger.add(sys.stderr, level="DEBUG")
+    else:
+        logger.remove()
+        logger.add(sys.stderr, level="INFO")
 
     console.print(f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]")
 
@@ -622,19 +648,29 @@ def run(
         return
 
     basic_name = basic_name or name
-    logger.info(f"Using({path / 'basic'}/{basic_name}-*.pkl for BaSiC")
+    logger.info(f"Using {path / 'basic'}/{basic_name}-*.pkl for BaSiC")
 
     channels = get_channels(files[0])
-    basics: dict[str, list[BaSiC]] = {
-        name: [
-            loaded["basic"]
-            if isinstance(
-                loaded := pickle.loads((path / "basic" / f"{basic_name}-{c}.pkl").read_bytes()), dict
-            )
-            else loaded
-            for c in channels
-        ]
-    }
+
+    basic_list: list[BaSiC] = []
+    for c in channels:
+        try:
+            loaded = pickle.loads((path / "basic" / f"{basic_name}-{c}.pkl").read_bytes())
+        except FileNotFoundError:
+            # Fallback to specific BaSiC
+            try:
+                loaded = pickle.loads((path / "basic" / f"{name}-{c}.pkl").read_bytes())
+                logger.warning(
+                    f"Could not find basic file for {basic_name}-{c}.pkl. Using {name}-{c}.pkl instead."
+                )
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"Could not find basic file for {name}-{c}.pkl. Please run `preprocess basic run` first."
+                )
+
+        basic_list.append(loaded["basic"] if isinstance(loaded, dict) else loaded)
+
+    basics = {name: basic_list}
     _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids)
 
 
@@ -644,7 +680,7 @@ def run(
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2)
-@click.option("--basic-name", type=str, default=None)
+@click.option("--basic-name", type=str)
 def batch(
     path: Path,
     *,
@@ -652,7 +688,7 @@ def batch(
     ref: Path | None,
     overwrite: bool,
     n_fids: int,
-    basic_name: str | None,
+    basic_name: str | None = "all",
 ):
     ws = Workspace(path)
     rois = ws.rois
@@ -704,8 +740,8 @@ def batch(
             continue
 
         meta = get_metadata(files[0])
+        channels = get_channels(files[0])
         waveform = json.loads(meta["waveform"])
-        powers = waveform["params"]["powers"]
         step = int(waveform["params"]["step"] * 10)
         logger.info(f"Using step={step}")
 
@@ -713,26 +749,31 @@ def batch(
             logger.info(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
             continue
 
-        try:
-            basics: dict[str, list[BaSiC]] = {
-                r: [
-                    pickle.loads((path / "basic" / f"{basic_name or r}-{c[-3:]}.pkl").read_bytes())
-                    for c in powers
-                ]
-            }
-        except FileNotFoundError:
-            logger.error(
-                f"Could not find {path / 'basic' / f'{basic_name or r}-[n].pkl'}. Please run basic first. Skipping to rounds with basic."
-            )
-        else:
-            _run(
-                files,
-                path / "analysis" / "deconv",
-                basics,
-                overwrite=overwrite,
-                n_fids=n_fids,
-                step=step,
-            )
+        basic_list: list[BaSiC] = []
+        for c in channels:
+            try:
+                loaded = pickle.loads((path / "basic" / f"{basic_name}-{c}.pkl").read_bytes())
+            except FileNotFoundError:
+                # Fallback to specific BaSiC
+                try:
+                    loaded = pickle.loads((path / "basic" / f"{r}-{c}.pkl").read_bytes())
+                except FileNotFoundError:
+                    raise FileNotFoundError(
+                        f"Could not find basic file for {r}-{c}.pkl. Please run `preprocess basic run` first."
+                    )
+
+            basic_list.append(loaded["basic"] if isinstance(loaded, dict) else loaded)
+
+        basics = {r: basic_list}
+
+        _run(
+            files,
+            path / "analysis" / "deconv",
+            basics,
+            overwrite=overwrite,
+            n_fids=n_fids,
+            step=step,
+        )
 
 
 if __name__ == "__main__":

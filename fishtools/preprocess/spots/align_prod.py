@@ -1006,7 +1006,7 @@ def run(
                 json.loads(
                     (
                         path.parent.parent
-                        / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}/percentiles.json"
+                        / f"opt_{codebook_path.stem}{f'+{roi}' if roi and roi != '*' else ''}/percentiles.json"
                     ).read_text()
                 )[(round_num - 1) if round_num is not None and calc_deviations else -1].values()
             )
@@ -1257,7 +1257,7 @@ def batch(
             "run",
             [
                 "--global-scale",
-                (path / f"opt_{codebook_path.stem}+{_roi}" / "global_scale.txt").as_posix(),
+                (path / f"opt_{codebook_path.stem}" / "global_scale.txt").as_posix(),
                 "--codebook",
                 codebook_path.as_posix(),
                 "--overwrite" if overwrite else "",
@@ -1265,7 +1265,6 @@ def batch(
                 f"--limit-z={limit_z}",
                 "--simple" if simple else "",
                 f"--max-proj={max_proj}" if max_proj else "",
-                f"--roi={_roi}",
             ],
             threads=threads,
             split=split,
