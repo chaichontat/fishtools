@@ -5,6 +5,7 @@ from itertools import chain
 from typing import Literal, cast
 
 import anndata as ad
+from loguru import logger
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -210,9 +211,7 @@ def rotate_rois_in_adata(adata: ad.AnnData, roi_rotation_angles: dict[str, float
         roi_indices = np.where(adata.obs["roi"] == roi_name)[0]
 
         if len(roi_indices) == 0:
-            raise ValueError(
-                f"ROI '{roi_name}' not found in adata.obs['roi']. Skipping rotation for this ROI."
-            )
+            logger.warning(f"ROI '{roi_name}' not found in adata.obs['roi']. Skipping rotation for this ROI.")
 
         # Get the spatial coordinates for the current ROI
         roi_spatial_coords = spatial_coords[roi_indices, :]

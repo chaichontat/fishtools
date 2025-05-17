@@ -1,6 +1,8 @@
+import functools
 import logging
 import subprocess
 import sys
+import types
 from functools import cache, wraps
 from inspect import getcallargs
 from pathlib import Path
@@ -8,8 +10,8 @@ from subprocess import PIPE, Popen
 from typing import Any, Callable, Concatenate, ParamSpec, Sequence, TypeVar, cast
 
 import loguru
-from loguru import logger
 import numpy as np
+from loguru import logger
 
 P = ParamSpec("P")
 R = TypeVar("R", covariant=True)
@@ -191,6 +193,58 @@ def batch_roi(look_for: str = "registered--*", include_codebook: bool = False, s
         return inner
 
     return decorator
+
+
+def noglobal(fn: Callable[P, R]) -> Callable[P, R]:
+    """
+    Creates a copy of the input function `fn` that runs in a restricted environment.
+
+    This new function will not have access to non-callable global variables
+    from the module where `fn` was defined. It will, however, have access to:
+    1.  Modules imported into `fn`'s original module.
+    2.  Other functions and classes defined in or imported into `fn`'s original module.
+
+    This is to ensure that a function doesn't unintentionally rely on or
+    change global state, making its behavior more predictable and self-contained.
+
+    Example:
+    --------
+    >>> my_global_var = 10
+    >>> def my_func():
+    ...     print(f"Inside my_func: {my_global_var}")
+    ...     return my_global_var * 2
+    >>>
+    >>> my_func()  # Regular call, can access my_global_var
+    Inside my_func: 10
+    20
+    >>>
+    >>> isolated_func = noglobal(my_func)
+    >>> try:
+    ...     isolated_func()  # Call through noglobal
+    ... except NameError as e:
+    ...     print(e)
+    name 'my_global_var' is not defined
+    """
+
+    restricted_globals = {
+        name: val
+        for name, val in fn.__globals__.items()
+        # Keep modules and any callable (functions, classes, etc.)
+        if isinstance(val, types.ModuleType) or callable(val)
+    }
+    fn_restricted = types.FunctionType(
+        fn.__code__,
+        restricted_globals,
+        name=fn.__name__,
+        argdefs=fn.__defaults__,
+        closure=fn.__closure__,  # Preserves the closure (for nested functions accessing nonlocals)
+    )
+
+    @functools.wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        return fn_restricted(*args, **kwargs)
+
+    return wrapper
 
 
 def create_rotation_matrix(angle_degrees: float) -> np.ndarray:
