@@ -10,12 +10,15 @@ from pathlib import Path
 import click
 import polars as pl
 from loguru import logger
+from rich.console import Console
+from rich.text import Text
 
 from fishtools.mkprobes.candidates import get_candidates
 from fishtools.mkprobes.codebook.codebook import ProbeSet
 from fishtools.mkprobes.codebook.finalconstruct import construct
 from fishtools.mkprobes.ext.dataset import ReferenceDataset as Dataset
 from fishtools.mkprobes.screen import run_screen
+from fishtools.utils.pretty_print import progress_bar
 
 # %%
 
@@ -28,16 +31,18 @@ def run_gene(
     acceptable: list[str] | None,
     overwrite: bool = False,
     log_level: str = "INFO",
+    output: Path = Path("output/"),
     **kwargs,
 ):
     logger.remove()
     logger.add(sys.stderr, level=log_level)
+    logger.add(output / f"{gene}.log", level=log_level, colorize=False, backtrace=True, diagnose=True)
 
     restriction = ["BamHI", "KpnI"]
     if (
         acceptable is None
-        and Path(
-            f"output/{gene}_final_{''.join(restriction)}_{','.join(map(str, sorted(codebook[gene])))}.parquet"
+        and output.joinpath(
+            f"{gene}_final_{''.join(restriction)}_{','.join(map(str, sorted(codebook[gene])))}.parquet"
         ).exists()
         and not overwrite
     ):
@@ -45,11 +50,11 @@ def run_gene(
 
     ds = Dataset(path)
     try:
-        if overwrite or not Path(f"output/{gene}_crawled.parquet").exists():
+        if overwrite or not output.joinpath(f"{gene}_crawled.parquet").exists():
             get_candidates(
                 ds,
-                gene=gene,
-                output="output/",
+                transcript=gene,
+                output=output,
                 ignore_revcomp=False,
                 allow=acceptable,
                 overwrite=overwrite,
@@ -57,10 +62,10 @@ def run_gene(
             )
             time.sleep(1)
         overwrite = overwrite or acceptable is not None
-        run_screen("output/", gene, minimum=60, restriction=restriction, maxoverlap=0, overwrite=overwrite)
+        run_screen(output, gene, minimum=60, restriction=restriction, maxoverlap=0, overwrite=overwrite)
         construct(
             ds,
-            "output/",
+            output,
             transcript=gene,
             codebook=codebook,
             restriction=restriction,
@@ -93,6 +98,16 @@ def single(
     listfailed: bool = False,
     listfailedall: bool = False,
 ):
+    console = Console(stderr=True)
+    logger.configure(
+        handlers=[
+            {
+                "sink": lambda s: console.print(Text.from_ansi(s)),
+                "colorize": console.is_terminal,
+            }
+        ]
+    )
+
     codebook = json.loads(codebook_path.read_text())
     codebook = {k: v for k, v in codebook.items() if not k.startswith("Blank")}
     if not len(set(codebook)) == len(codebook):
@@ -119,8 +134,10 @@ def single(
 
     failed_path = codebook_path.parent / (codebook_path.stem + ".failed.txt")
     failed_path.unlink(missing_ok=True)
-
-    with ProcessPoolExecutor(6, mp_context=get_context("forkserver")) as exc:
+    with (
+        ProcessPoolExecutor(16, mp_context=get_context("forkserver")) as exc,
+        progress_bar(len(genes)) as pbar,
+    ):
         futs = {
             gene: exc.submit(
                 run_gene,
@@ -135,6 +152,9 @@ def single(
             if overwrite or not (codebook_path.parent / f"output/{gene}_final_BamHIKpnI_.parquet").exists()
         }
         failed: list[tuple[str, Exception]] = []
+        for fut in futs.values():
+            fut.add_done_callback(pbar)
+
         for fut in as_completed(futs.values()):
             try:
                 fut.result()

@@ -276,36 +276,86 @@ def short(
         raise ValueError("Cannot use --permanent without --delete")
 
     manifest: list[ProbeSet] = ctx.obj["manifest"]
-    path: Path = ctx.obj["path"]
+    path_main: Path = ctx.obj["path"]
 
     COL_NAME = "gene"
     for probeset in manifest:
         console.print(rich.rule.Rule(title=probeset.name, align="left"))
         baddies = []
 
-        codebook = probeset.load_codebook(path)
+        codebook = probeset.load_codebook(path_main)
+
+        path = (path_main / probeset.codebook).parent
+
         tss = list(codebook)
         dfs_ = []
         for ts in tss:
             try:
                 _df = pl.read_parquet(
-                    Path(path)
-                    / f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
+                    path / f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
                 )
                 _df = _df.sort([pl.col("priority").list.min(), pl.col("hp").list.max()])
-                dfs_.append(_df)
+                dfs_.append(
+                    _df.select([
+                        "name",
+                        "seq",
+                        "code1",
+                        "code2",
+                        "code3",
+                        "index",
+                        "id",
+                        "flag",
+                        "transcript",
+                        "pos",
+                        "cigar",
+                        "aln_score",
+                        "aln_score_best",
+                        "n_ambiguous",
+                        "n_mismatches",
+                        "n_opens",
+                        "n_extensions",
+                        "edit_distance",
+                        "mismatched_reference",
+                        "gene",
+                        "transcript_ori",
+                        "pos_start",
+                        "pos_end",
+                        "length",
+                        "match",
+                        "match_consec",
+                        "pad_start",
+                        "maps_to_pseudo",
+                        "max_tm_offtarget",
+                        "match_consec_all",
+                        "ok_quad_c",
+                        "ok_quad_a",
+                        "ok_stack_c",
+                        "ok_comp_a",
+                        "gc_content",
+                        "ok_gc",
+                        "tm",
+                        "hp",
+                        "oks",
+                        "priority",
+                        "splint",
+                        "padlock",
+                        "seqori",
+                    ])
+                )
             # .sample(shuffle=True, seed=4, fraction=1)
 
             except FileNotFoundError:
                 baddies.append(probeset.name)
-                if verbose:
-                    logger.warning(
-                        "File "
-                        + f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
-                        + " not found."
-                    )
-                else:
-                    print(ts)
+                # if verbose:
+                logger.warning(
+                    "File "
+                    + f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
+                    + " not found."
+                )
+
+        if not len(dfs_):
+            logger.warning(f"No data for {probeset.name} at {probeset.codebook}")
+            continue
 
         dfs: pl.DataFrame = pl.concat(dfs_)
 
@@ -317,6 +367,7 @@ def short(
                 rich.print(bad)
             else:
                 rich.print("\n".join(bad[COL_NAME].to_list()))
+            print(f"Found {len(bad)} genes with fewer than {short} probes.")
         else:
             logger.info(f"All genes have at least {short} probes.")
 

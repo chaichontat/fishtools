@@ -1,3 +1,4 @@
+import json
 import re
 import sys
 from itertools import chain
@@ -10,7 +11,7 @@ from Bio import Restriction
 from Bio.Seq import Seq
 from loguru import logger
 
-from .utils._filtration import the_filter
+from .utils._filtration import the_filter, visualize_probe_coverage
 from .utils.samframe import SAMFrame
 
 sys.setrecursionlimit(5000)
@@ -42,7 +43,7 @@ def _screen(
             )
         )
 
-    final = the_filter(ff, overlap=overlap)
+    final, stats_filter = the_filter(ff, overlap=overlap)
     assert not final["seq"].str.contains("N").any(), "N appears out of nowhere."
 
     final = final.with_columns(
@@ -73,7 +74,13 @@ def _screen(
         / f"{gene}_screened_ol{overlap}{'_' + ''.join(restriction) if restriction else ''}.parquet"
     )
 
-    logger.debug(f"Written to {write_path}.")
+    stats = {
+        "input": len(ff),
+        "filtering": stats_filter,
+        "final": len(final),
+    }
+    logger.debug(f"Written to {write_path}, {len(final)} pairs for {gene}.")
+    write_path.with_suffix(".stats.json").write_text(json.dumps(stats, indent=2))
     return final
 
 
@@ -136,16 +143,29 @@ def run_screen(
         if maxoverlap % 5 != 0:
             raise ValueError("maxoverlap must be multiple of 5")
 
-        res = {}
+        res: dict[int, pl.DataFrame] = {}
         for i in chain((-2,), range(5, maxoverlap + 1, 5)):
             res[i] = (
                 final := _screen(output_dir, gene, fpkm_path=fpkm_path, overlap=i, restriction=restriction)
             )
+
             if len(final) >= minimum:
                 logger.info(f"Overlap {i} results in {len(final)} probes. Stopping.")
+                visualize_probe_coverage(
+                    res[i]["pos_start"].list.min(),
+                    res[i]["pos_end"].list.max(),
+                    res[i]["pos_end"].list.max().max(),
+                    output_file=output_dir / f"{gene}_coverage.txt",
+                )
                 return res
             logger.warning(f"Overlap {i} results in {len(final)} probes. Trying next overlap.")
 
+        visualize_probe_coverage(
+            res[i]["pos_start"].list.min(),
+            res[i]["pos_end"].list.max(),
+            res[i]["pos_end"].list.max().max(),
+            output_file=output_dir / f"{gene}_coverage.txt",
+        )
         return res
 
     return _screen(output_dir, gene, fpkm_path=fpkm_path, overlap=overlap, restriction=restriction)

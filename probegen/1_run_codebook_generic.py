@@ -50,6 +50,9 @@ def run_gene(
     ts = transcript
     logger.remove()
     logger.add(sys.stderr, level=log_level)
+    logger.add(
+        output_path / f"{transcript}.log", level=log_level, colorize=False, backtrace=True, diagnose=True
+    )
 
     restriction = ["BamHI", "KpnI"]
     if (
@@ -137,7 +140,7 @@ def single(
                     print(pl.read_csv(codebook_path.parent / "output" / f"{gene}_offtarget_counts.csv")[:5])
         return
 
-    acceptable_path = allow_file or codebook_path.parent / "acceptable.json"
+    acceptable_path = allow_file or codebook_path.with_suffix(".acceptable.json")
     acceptable: dict[str, list[str]] = (
         json.loads(acceptable_path.read_text()) if acceptable_path.exists() else {}
     )
@@ -146,7 +149,7 @@ def single(
     failed_path = codebook_path.parent / (codebook_path.stem + ".failed.txt")
     failed_path.unlink(missing_ok=True)
 
-    with ProcessPoolExecutor(6, mp_context=get_context("forkserver")) as exc:
+    with ProcessPoolExecutor(16, mp_context=get_context("forkserver")) as exc:
         futs = {
             gene: exc.submit(
                 run_gene,

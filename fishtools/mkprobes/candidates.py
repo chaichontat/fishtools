@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 from typing import cast
@@ -45,7 +46,7 @@ def get_pseudogenes(
         .sort("count", descending=True)
         .with_row_count("i")
         .with_columns(
-            acceptable=pl.col("transcript_name").str.contains(rf"^({'|'.join(genes)})[a-zA-Z]?.*")
+            acceptable=pl.col("transcript_name").str.contains(rf"^({'|'.join(genes)})-[a-zA-Z]?.*")
             # | pl.col("transcript").is_in(allow)
             # | pl.col("transcript_name").str.starts_with("Gm")
             | pl.col("transcript_name").is_null(),
@@ -225,6 +226,10 @@ def _run_transcript(
             raise FileNotFoundError
         offtargets = pl.read_parquet(output / f"{transcript_name}_bowtie.parquet")
         y = pl.read_parquet(output / f"{transcript_name}_all.parquet")
+        try:
+            stats = json.loads(output.joinpath(f"{transcript}_crawled.stats.json").read_text())
+        except FileNotFoundError:
+            stats = {}
     except (FileNotFoundError, pl.exceptions.ComputeError):
         seq = dataset.data.get_seq(transcript_id, convert=dataset.species in GOOD_SPECIES)
         if len(seq) < 1500:
@@ -278,6 +283,10 @@ def _run_transcript(
 
         y.write_parquet(output / f"{transcript_name}_all.parquet")
         offtargets.write_parquet(output / f"{transcript_name}_bowtie.parquet")
+        stats = {
+            "seq_length": len(seq),
+            "crawled_length": len(crawled),
+        }
 
     # Print most common offtargets
     logger.info(
@@ -382,8 +391,13 @@ def _run_transcript(
     logger.info(f"Generated {len(ff)} candidates.")
 
     assert not ff["seq"].str.contains("N").any()
-
+    stats |= {
+        "allow": list(tss_allacceptable),
+        "offtargets": offtargets.to_dicts(),
+        "post_match_filter": len(ff),
+    }
     ff.write_parquet(output / f"{transcript_name}_crawled.parquet")
+    output.joinpath(f"{transcript}_crawled.stats.json").write_text(json.dumps(stats, indent=2))
     return ff
 
 
@@ -406,6 +420,10 @@ def _run_transcript_generic(
             raise FileNotFoundError
         offtargets = pl.read_parquet(output / f"{transcript}_bowtie.parquet")
         y = pl.read_parquet(output / f"{transcript}_all.parquet")
+        try:
+            stats = json.loads(output.joinpath(f"{transcript}_crawled.stats.json").read_text())
+        except FileNotFoundError:
+            stats = {}
     except (FileNotFoundError, pl.exceptions.ComputeError):
         seq = dataset.data.get_seq(transcript, convert=False)
         if len(seq) < 1500:
@@ -457,12 +475,16 @@ def _run_transcript_generic(
 
         y.write_parquet(output / f"{transcript}_all.parquet")
         offtargets.write_parquet(output / f"{transcript}_bowtie.parquet")
+        stats = {
+            "seq_length": len(seq),
+            "crawled_length": len(crawled),
+        }
 
     # Print most common offtargets
     logger.info(
         "Most common binders:\n"
         + str(
-            SAMFrame(y)
+            offtargets := SAMFrame(y)
             .count_group_by("transcript", descending=True)
             .filter(pl.col("count") > 0.1 * pl.col("count").first())
             # .with_columns(
@@ -472,6 +494,7 @@ def _run_transcript_generic(
     )
 
     tss_allacceptable = set(allow + [transcript])
+
     ff = SAMFrame(y).filter_by_match(tss_allacceptable, match=0.8, match_consec=0.8)
     if not len(ff):
         raise Exception(
@@ -508,9 +531,15 @@ def _run_transcript_generic(
     logger.info(f"Generated {len(ff)} candidates.")
 
     assert not ff["seq"].str.contains("N").any()
+    stats |= {
+        "allow": list(tss_allacceptable),
+        "offtargets": offtargets.to_dicts(),
+        "post_match_filter": len(ff),
+    }
 
     ff.write_parquet(output / f"{transcript}_crawled.parquet")
-    return ff
+    output.joinpath(f"{transcript}_crawled.stats.json").write_text(json.dumps(stats, indent=2))
+    return ff, stats
 
 
 @click.command()

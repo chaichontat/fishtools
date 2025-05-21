@@ -18,10 +18,10 @@ from pydantic import BaseModel
 from fishtools.mkprobes.utils._alignment import bowtie_build, jellyfish
 
 
-def get_ensembl(path: Path | str, id_: str):
+def get_ensembl(path: Path | str, id_: str, overwrite: bool = False):
     path = Path(path)
     path.mkdir(exist_ok=True, parents=True)
-    if (p := (path / f"{id_}.json")).exists():
+    if (p := (path / f"{id_}.json")).exists() and not overwrite:
         try:
             return json.loads(p.read_text())
         except json.JSONDecodeError:
@@ -427,7 +427,7 @@ class ExternalData:
         eid = self.key_func(eid)
         return self.gtf.filter(pl.col("gene_id") == eid)[0, "transcript_id"]
 
-    def batch_convert(self, val: list[str], src: str, dst: str) -> pl.DataFrame:
+    def batch_convert(self, val: Sequence[str], src: str, dst: str) -> pl.DataFrame:
         """Batch convert attributes. See available attributes in `self.gtf.columns`.
         Will take the first value found for each attribute.
         !! Will skip non-existent values.

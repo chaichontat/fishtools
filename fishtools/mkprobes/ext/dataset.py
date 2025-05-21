@@ -264,7 +264,7 @@ class ReferenceDataset(Dataset):
             external_data=ExternalData(
                 cache=self.path / "gencode.parquet",
                 gtf_path=self.path / "gencode.gtf.gz",
-                fasta=self.path / "cdna_ncrna_trna.fasta",
+                fasta=self.path / "txome.fasta",
                 fasta_key_regex=r"^([^.\s]+)",
             ),
             kmer18_path=self.path / "cdna18.jf",
@@ -278,7 +278,7 @@ class ReferenceDataset(Dataset):
             self.ensembl = ExternalData(
                 cache=self.path / "ensembl.parquet",
                 gtf_path=self.path / "ensembl.gtf.gz",
-                fasta=self.path / "cdna_ncrna_trna.fasta",
+                fasta=self.path / "txome.fasta",
             )
         except FileNotFoundError:
             if self.species in ("human", "mouse"):

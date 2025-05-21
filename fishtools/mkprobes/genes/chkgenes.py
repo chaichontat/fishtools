@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Annotated, Literal
@@ -83,16 +84,17 @@ def chkgenes(path: Path, genes: Path):
 
 def get_transcripts(
     dataset: Dataset,
-    genes: list[str],
+    genes: Sequence[str],
     mode: Literal["gencode", "ensembl", "canonical", "appris", "apprisalt"] = "canonical",
     output_path: Path | None = None,
+    overwrite: bool = False,
 ) -> pl.DataFrame:
     """Get transcript ID from gene name or gene ID
     Returns:
         pl.DataFrame[[transcript_id, transcript_name, tag]]
         pl.DataFrame[[transcript_id, transcript_name, annotation, tag]] if appris
     """
-    if not genes:
+    if not len(genes):
         raise ValueError("No genes provided")
 
     if not dataset.ensembl:
@@ -118,7 +120,9 @@ def get_transcripts(
             with ThreadPoolExecutor(3) as exc:
                 from functools import partial
 
-                res = exc.map(partial(get_ensembl, output_path or "output/"), df_genes["gene_id"])
+                res = exc.map(
+                    partial(get_ensembl, output_path or "output/", overwrite=overwrite), df_genes["gene_id"]
+                )
                 canonical = [r["canonical_transcript"].split(".")[0] for r in res]
 
             res = dataset.ensembl.filter(pl.col("transcript_id").is_in(canonical))[to_return]
@@ -169,6 +173,9 @@ def get_transcripts(
     # except ValueError:
     #     raise ValueError(f"No transcripts found for {genes}")
     # return out
+    if len(res) != len(genes):
+        logger.warning(f"Found {len(res)} transcripts for {len(genes)} genes.")
+        logger.warning(f"Missing genes: {', '.join(set(genes) - set(res['gene_name']))}")
     return res
 
 
