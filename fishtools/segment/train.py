@@ -103,4 +103,4 @@ def run_train(name: str, path: Path, train_config: TrainConfig):
 
     logger.info(f"Training data loaded: {len(out2[0])} images")
     model_path, train_losses, test_losses = _train(out2, path, train_config=train_config, name=name)
-    return train_config.model_copy(update=dict(train_losses=train_losses))
+    return train_config.model_copy(update=dict(train_losses=train_losses.tolist()))

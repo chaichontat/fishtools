@@ -13,11 +13,15 @@ import spaco
 import tifffile
 from shapely import MultiPolygon, Point, Polygon, STRtree
 
+from fishtools.postprocess import normalize_total
+
 sns.set_theme()
 plt.rcParams["figure.dpi"] = 200
-path = Path("/working/20250202_bigprobesamebuffer/analysis/deconv/baysor--full")
+path = Path("/working/20250612_ebe00219_3/analysis/deconv/baysor10")
+# path = Path("/working/20250407_cs3_2/analysis/deconv/baysor--br/point8")
 adata = sc.read_loom(path / "segmentation_counts.loom")
 adata.var_names = adata.var["Name"]
+
 # adata = adata[~adata.obs["y"].between(24000, 45000) & adata.obs["x"].gt(2000)]
 # %%
 # %%
@@ -29,7 +33,7 @@ adata.var_names = adata.var["Name"]
 # adata2.obs["batch"] = "trc"
 # adata2.var_names = adata.var["Name"]
 # %%
-plt.scatter(adata.obs["y"], adata.obs["x"])
+plt.scatter(adata.obs["y"], adata.obs["x"], s=0.3, alpha=0.4)
 # adata = ad.concat([adata, adata2])
 # %%
 
@@ -56,62 +60,40 @@ print(np.median(adata.obs["total_counts"]))
 # sc.pp.log1p(adata)
 # %%
 # %%
-sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=1000)
+normalize_total(adata)
+# sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=2000)
 # %%
-# %%
-fig, ax = plt.subplots(figsize=(8, 6))
-
-hvgs = adata.var["highly_variable"]
-
-ax.scatter(adata.var["means"], adata.var["residual_variances"], s=3, edgecolor="none")
-ax.scatter(
-    adata.var["means"][hvgs],
-    adata.var["residual_variances"][hvgs],
-    c="tab:red",
-    label="selected genes",
-    s=3,
-    edgecolor="none",
-)
-
-ax.set_xscale("log")
-ax.set_xlabel("mean expression")
-ax.set_yscale("log")
-ax.set_ylabel("residual variance")
-
-
-ax.spines["right"].set_visible(False)
-ax.spines["top"].set_visible(False)
-ax.yaxis.set_ticks_position("left")
-ax.xaxis.set_ticks_position("bottom")
-plt.legend()
 
 # %%
-adata = adata[:, adata.var["highly_variable"]]
-
-adata.layers["raw"] = adata.X.copy()
-adata.layers["sqrt_norm"] = np.sqrt(sc.pp.normalize_total(adata, inplace=False)["X"])
-sc.experimental.pp.normalize_pearson_residuals(adata)
-
-# %%
-sc.tl.pca(adata, n_comps=50)
-sc.pl.pca_variance_ratio(adata, log=True)
-
+# sc.pp.scale(adata, max_value=10)
 # %%
 import rapids_singlecell as rsc
 
+rsc.tl.pca(adata, n_comps=50)
+sc.pl.pca_variance_ratio(adata, log=True)
+
+# %%
+
 rsc.pp.neighbors(adata, n_neighbors=15, n_pcs=30, metric="cosine")
-sc.tl.leiden(adata, n_iterations=2, resolution=1, flavor="igraph")
-sc.tl.umap(adata, min_dist=0.1, n_components=2)
+sc.tl.leiden(adata, n_iterations=2, resolution=0.8, flavor="igraph")
+rsc.tl.umap(adata, min_dist=0.1, n_components=2)
+# sc.tl.umap(adata, min_dist=0.1, n_components=2)
 # %%
 
 # sc.pl.embedding(adata, basis="spatial", color="total_counts")
 
 sc.tl.rank_genes_groups(adata, groupby="leiden", method="wilcoxon")
-
-sc.pl.umap(adata, color="leiden")
+# %%
+sc.pl.umap(adata, color=["leiden"])
+# %%
 
 # %%
-sc.pl.embedding(adata, color="leiden", basis="spatial")  # type: ignore
+for i in range(adata.obs["leiden"].cat.categories.size):
+    fig, ax = plt.subplots(figsize=(4, 4), dpi=200)
+    sc.pl.embedding(adata, color="leiden", basis="spatial", ax=ax, palette=palette_spaco, groups=[str(i)])
+    ax.set_aspect("equal")
+    plt.show()
+
 # %%
 # import rapids_singlecell as rsc
 
@@ -119,11 +101,13 @@ sc.pl.embedding(adata, color="leiden", basis="spatial")  # type: ignore
 # adata_gpu = adata.copy()
 # rsc.pp.neighbors(adata_gpu, n_neighbors=20, n_pcs=30)
 # %%
-
+sc.pl.umap(
+    adata, color=["leiden", "Pax6", "Gad1", "Satb2", "Tbr1", "Lhx6"], frameon=False, cmap="Blues", ncols=2
+)
 
 # %%
 with sns.axes_style("darkgrid"):
-    sc.pl.rank_genes_groups(adata, n_genes=20, sharey=False, fontsize=9, show=False)
+    sc.pl.rank_genes_groups(adata, n_genes=15, sharey=False, fontsize=14, show=False)
     for ax in plt.gcf().axes:
         for text in ax.texts:
             text.set_rotation(40)
@@ -140,9 +124,11 @@ sc.pl.embedding(
     adata,
     color=["leiden"],
     basis="spatial",
+    vmin=2,
+    vmax=10,
     # legend_loc="on data",
     frameon=False,
-    # cmap="Blues",
+    cmap="Blues",
     show=False,
 )
 fig = plt.gcf()
@@ -151,12 +137,35 @@ for ax in fig.axes:
     ax.set_aspect("equal")
 
 # %%
+
+
+# %%
 adata.write_h5ad(path / "pearsonedcortex.h5ad")
-
 # %%
 
-# %%
+plt.scatter(
+    adata[:, "Slc17a7"].X.flatten() + np.random.normal(0, 0.5, size=adata.shape[0]),
+    adata[:, "Gad1"].X.flatten() + np.random.normal(0, 0.5, size=adata.shape[0]),
+    s=0.3,
+    alpha=0.4,
+)
 
+# %%
+plt.scatter(
+    adata[:, "Gad1"].X.flatten() + np.random.normal(0, 0.5, size=adata.shape[0]),
+    adata[:, "Npy"].X.flatten() + np.random.normal(0, 0.5, size=adata.shape[0]),
+    s=0.3,
+    alpha=0.4,
+)
+
+# %%
+plt.scatter(
+    adata[:, "Satb2"].X.flatten() + np.random.normal(0, 0.5, size=adata.shape[0]),
+    adata[:, "Fezf2"].X.flatten() + np.random.normal(0, 0.5, size=adata.shape[0]),
+    s=0.3,
+    alpha=0.4,
+)
+# %%
 
 edu_stats = pd.read_csv(path / "edu_stats.csv")
 edu_stats["label"] = [f"{x:.1f}" for x in edu_stats["label"]]
@@ -196,7 +205,7 @@ sc.pl.embedding(
     frameon=False,
     # cmap="Blues",
     cmap="cet_colorwheel",
-    palette=palette_spaco,
+    # palette=palette_spaco,
     show=False,
 )
 fig = plt.gcf()
@@ -204,7 +213,7 @@ fig.set_size_inches(8, 10)
 for ax in fig.axes:
     ax.set_aspect("equal")
 # %%
-sc.pl.umap(adata, color=["intensity_mean", "tricycle"], frameon=False, cmap="magma")
+sc.pl.umap(adata, color=["leiden", "tricycle"], frameon=False, cmap="cet_colorwheel")
 
 
 # %%
@@ -227,6 +236,21 @@ print(
         for c in adata.obs["leiden"].cat.categories
     ])
 )
+# %%
+import spaco
+
+color_mapping = spaco.colorize(
+    cell_coordinates=adata.obsm["spatial"],
+    cell_labels=adata.obs["leiden"],
+    radius=0.1,
+    n_neighbors=15,
+    colorblind_type="none",
+)
+# %%
+
+color_mapping = {k: color_mapping[k] for k in adata.obs["leiden"].cat.categories}
+palette_spaco = list(color_mapping.values())
+
 # %%
 genes = sorted(
     set(
@@ -257,7 +281,7 @@ for ax in p.axes:
 plt.show()
 
 # %%
-
+genes = ["Pax6"]
 p = sc.pl.embedding(
     adata,
     basis="spatial",
@@ -345,7 +369,7 @@ for c in adata.obs["leiden"].cat.categories:
         ncols=3,
         show=False,
         # cmap="Blues",
-        palette=palette_spaco,
+        # palette=palette_spaco,
     )
     fig = plt.gcf()
     for ax in fig.axes:

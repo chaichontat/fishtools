@@ -8,7 +8,8 @@ import pyfastx
 from Bio import Restriction, Seq
 from loguru import logger
 
-from fishtools import Dataset, SAMFrame, gen_fasta, rc
+from fishtools import ReferenceDataset as Dataset
+from fishtools import SAMFrame, gen_fasta, rc
 from fishtools.mkprobes.starmap.starmap import test_splint_padlock
 from fishtools.mkprobes.utils.sequtils import is_subsequence
 from fishtools.utils.pretty_print import printc
@@ -18,8 +19,8 @@ t7promoter = "TAATACGACTCACTATAGGG"
 bits = pl.read_csv("data/readout_ref_filtered.csv")
 bits = dict(zip(bits["seq"], bits["id"]))
 # %%
-manifest = json.loads(Path("starwork6/_manifest.json").read_text())
-idx = 3
+manifest = json.loads(Path("2025-05/manifest.json").read_text())
+idx = 4
 species = manifest[idx]["species"]
 # %%
 species = "mouse"
@@ -29,7 +30,7 @@ try:
 except (FileNotFoundError, FileExistsError):
     logger.warning(f"Could not find {species}.")
 
-ss = Path(f"starwork6/generated/{manifest[idx]['name']}_final.txt").read_text().splitlines()
+ss = Path(f"2025-05/generated/{manifest[idx]['name']}_final.txt").read_text().splitlines()
 assert manifest[idx]["bcidx"] == idx
 # %%
 
@@ -82,7 +83,7 @@ def process(seq: str, rt_primer: str, anneal_primer: tuple[str, str]):
     return double_digest(rted)
 
 
-i = 5
+i = 14
 sp = process(
     ss[2 * i],
     hfs[2 * idx, "header"],
@@ -97,8 +98,8 @@ pad = process(
 # pad = "GTAGACTACACACGGACACATTCATCTCTAACTCACATACACTAAAGATTGGTTC"
 # sp = "GGCTTCCCATAGGTGTATATGCTAGTCTACGAACCA"
 # %%
-sp = "gtgtcgatctttactgtgtggagattgTAGTCTACGAACCA"
-pad = "GTAGACTActggtgtcccgtgaaatcatcaTTATCCATCCCTCTTCCTACATTGGTTC"
+# sp = "gtgtcgatctttactgtgtggagattgTAGTCTACGAACCA"
+# pad = "GTAGACTActggtgtcccgtgaaatcatcaTTATCCATCCCTCTTCCTACATTGGTTC"
 
 
 # %%
@@ -126,7 +127,7 @@ sps = set(df.filter(pl.col("name") == "splint").sort("match_consec")["transcript
 pads = set(df.filter(pl.col("name") == "padlock").sort("match_consec")["transcript"])
 filtered = df.filter(pl.col("transcript").is_in(sps & pads)).sort(["transcript", "name"])
 if mode == "txome":
-    assert filtered.select((pl.col("flag") & 16 != 0).all())[0, "flag"]  # reverse strand
+    filtered = filtered.filter((pl.col("flag") & 16 != 0))
 print(filtered[["name", "flag", "transcript", "pos"]])
 
 if mode == "genome":
@@ -142,7 +143,7 @@ assert test_splint_padlock(sp, pad, lengths=(6, 6))
 
 
 # %%
-transcript = ds.ensembl.get_seq(filtered[0, "transcript"])
+transcript = ds.ensembl.get_seq(filtered[0, "transcript"].split(".")[0])
 # transcript = pyfastx.Fasta("data/doryteuthis/GCA_023376005.1_UCB_Dpea_1_genomic.fna")[
 #     filtered[0, "transcript"]
 # ].seq
@@ -182,8 +183,7 @@ def show_starmap(
         printc(space + a + ("-" if rc(a) == b else " ") * gap + b)
 
     combi = splint[:-overhang] + " " * gap + pad[pad_hang + splint_gap : pad_hang + 25] + "---"
-    template = rc(transcript[idxs[0] - 27 : idxs[1] + len(splint) - overhang - 1])[::-1]
-
+    template = transcript[idxs[0] - 27 : idxs[1] + len(splint) - overhang - 1][::-1]
     # alignment
     printc(combi)
     print("".join("|" if rc(a) == b else " " for a, b in zip(combi, template)))

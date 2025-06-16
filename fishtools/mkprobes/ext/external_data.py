@@ -29,7 +29,10 @@ def get_ensembl(path: Path | str, id_: str, overwrite: bool = False):
             p.unlink(missing_ok=True)
 
     logger.info(f"Fetching {id_} on ensembl")
-    res = requests.get(f"https://rest.ensembl.org/lookup/id/{id_}?content-type=application/json", timeout=30)
+    res = requests.get(
+        f"https://rest.ensembl.org/lookup/id/{id_}?content-type=application/json",
+        timeout=30,
+    )
     res.raise_for_status()
     p.write_text(json.dumps(j := res.json(), indent=2))
     return j
@@ -404,7 +407,8 @@ class ExternalData:
         """
         eid = self.key_func(eid)
         try:
-            return self.gtf.filter(pl.col("transcript_id") == eid)["transcript_name"].first()  # type: ignore
+            res = self.gtf.filter(pl.col("transcript_id") == eid)["transcript_name"].first()
+            return res if res else eid  # type: ignore
         except pl.exceptions.ComputeError:
             return eid
 
@@ -520,7 +524,12 @@ class ExternalData:
                 to ID fails.
         """
         if "-" in eid and convert:
-            eid = self.convert(eid, "transcript_name", "transcript_id")
+            try:
+                eid = self.convert(eid, "transcript_name", "transcript_id")
+            except ValueError:
+                logger.warning(
+                    f"Could not convert {eid} from transcript_name to transcript_id. Trying to get the sequence directly."
+                )
 
         try:
             res = self.fa[eid].seq
@@ -532,6 +541,7 @@ class ExternalData:
 
         if not res:
             raise ValueError(f"Could not find {eid}")
+        print(f"Found {eid} in fasta file.")
         return res
 
     def filter_gene(self, gene: str) -> pl.DataFrame:

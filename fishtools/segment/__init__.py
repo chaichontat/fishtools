@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Annotated
 
@@ -23,6 +24,7 @@ def train(
     name: Annotated[str, typer.Argument(help="Name of the model")],
 ):
     models_path = path / "models"
+
     if not models_path.exists():
         raise FileNotFoundError(
             f"Models path {models_path} does not exist. If this is the correct directory, create one."
@@ -45,6 +47,7 @@ def run(): ...
 
 
 def main():
+    logging.basicConfig(level=logging.INFO)
     app()
 
 

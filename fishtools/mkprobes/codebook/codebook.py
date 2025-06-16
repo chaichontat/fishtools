@@ -239,13 +239,13 @@ class ProbeSet(BaseModel):
     all_bit: int = 29
     n_probes: Literal["high", "low"] | int | None = None
 
-    def load_codebook(self, path: Path | str):
+    def load_codebook(self, path: Path | str, include_blank: bool = False) -> dict[str, list[int]]:
         path = Path(path)
-        return {
-            k: v
-            for k, v in json.loads((path / self.codebook).read_text()).items()
-            if not k.startswith("Blank")
-        }
+        try:
+            cb = json.loads((path / self.codebook).read_text())
+        except FileNotFoundError:
+            cb = json.loads((path / self.codebook.split("/")[-1]).read_text())
+        return {k: v for k, v in cb.items() if not k.startswith("Blank") or include_blank}
 
     # def codebook_dfs(self, path: Path | str):
     #     codebook = self.load_codebook(path)

@@ -101,7 +101,7 @@ def construct_encoding(
         assert pad_start > 17
         for sep, codes in zip(["AA", "TA", "AT", "TT"], perms):
             stitched = stitch(pad, codes, sep=sep)
-            if "AAAAA" in stitched or "TTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
+            if "AAAAAA" in stitched or "TTTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
                 continue
             if Restriction.BamHI.search(s_ := Seq.Seq(stitched)):
                 continue

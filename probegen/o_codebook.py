@@ -102,7 +102,7 @@ def gen_codebook(tss: list[str], offset: int = 0, n_bits: int | None = None, see
             logger.warning("Less than 5% of coding capacity is blank")
     else:
         for bits, cnts in ns.items():
-            if len(tss) < cnts:
+            if len(tss) * 1.05 < cnts:
                 n = bits
                 if (cnts - len(tss)) / cnts < 0.05:
                     logger.warning("Less than 5% of coding capacity is blank")

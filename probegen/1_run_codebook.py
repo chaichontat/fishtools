@@ -40,8 +40,7 @@ def run_gene(
 
     restriction = ["BamHI", "KpnI"]
     if (
-        acceptable is None
-        and output.joinpath(
+        output.joinpath(
             f"{gene}_final_{''.join(restriction)}_{','.join(map(str, sorted(codebook[gene])))}.parquet"
         ).exists()
         and not overwrite
@@ -50,19 +49,27 @@ def run_gene(
 
     ds = Dataset(path)
     try:
-        if overwrite or not output.joinpath(f"{gene}_crawled.parquet").exists():
-            get_candidates(
-                ds,
-                transcript=gene,
-                output=output,
-                ignore_revcomp=False,
-                allow=acceptable,
-                overwrite=overwrite,
-                **kwargs,
-            )
-            time.sleep(1)
+        # if overwrite or not output.joinpath(f"{gene}_crawled.parquet").exists():
+        #     get_candidates(
+        #         ds,
+        #         transcript=gene,
+        #         output=output,
+        #         ignore_revcomp=False,
+        #         allow=acceptable,
+        #         overwrite=overwrite,
+        #         **kwargs,
+        #     )
+        #     time.sleep(1)
+
         overwrite = overwrite or acceptable is not None
-        run_screen(output, gene, minimum=60, restriction=restriction, maxoverlap=0, overwrite=overwrite)
+        run_screen(
+            output,
+            gene,
+            minimum=60,
+            restriction=restriction,
+            maxoverlap=0,
+            overwrite=overwrite,
+        )
         construct(
             ds,
             output,
@@ -88,12 +95,14 @@ def cli(): ...
 @click.argument(
     "codebook_path", metavar="CODEBOOK", type=click.Path(exists=True, file_okay=True, path_type=Path)
 )
+@click.argument("gene", type=str, default=None, required=False)
 @click.option("--overwrite", is_flag=True)
 @click.option("--listfailed", is_flag=True)
 @click.option("--listfailedall", is_flag=True)
 def single(
     path: Path,
     codebook_path: Path,
+    gene: str | None = None,
     overwrite: bool = False,
     listfailed: bool = False,
     listfailedall: bool = False,
@@ -113,6 +122,7 @@ def single(
     if not len(set(codebook)) == len(codebook):
         raise ValueError("Duplicated genes in codebook.")
     genes = sorted(codebook)
+    onlygene = gene
 
     if listfailed or listfailedall:
         for gene in genes:
@@ -145,11 +155,14 @@ def single(
                 gene=gene,
                 codebook=codebook,
                 acceptable=acceptable.get(gene, None),
-                overwrite=overwrite,
+                overwrite=overwrite or onlygene is not None or gene in acceptable,
                 log_level="DEBUG",
             )
-            for gene in genes
-            if overwrite or not (codebook_path.parent / f"output/{gene}_final_BamHIKpnI_.parquet").exists()
+            for gene in (genes if onlygene is None else [onlygene])
+            if overwrite
+            or onlygene is not None
+            or gene in acceptable
+            or not (codebook_path.parent / f"output/{gene}_final_BamHIKpnI_.parquet").exists()
         }
         failed: list[tuple[str, Exception]] = []
         for fut in futs.values():

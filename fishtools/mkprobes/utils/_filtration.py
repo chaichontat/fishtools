@@ -1,3 +1,4 @@
+import io
 import math
 from collections.abc import Sequence
 from pathlib import Path
@@ -16,6 +17,7 @@ PROBE_CRITERIA: Final = dict(
     # ok_stack_c= pl.all([pl.col("seq").str.slice(-6 - i, 6).str.count_matches("G").lt(4) for i in range(6)]),
     ok_stack_c= pl.fold(True, (lambda acc, x: acc & x), [pl.col("seq").str.slice(-6 - i, 6).str.count_matches("G").lt(4) for i in range(6)]),
     ok_comp_a =(pl.col("seq").str.count_matches("T") / pl.col("seq").str.len_chars() < 0.28),
+    ok_homopolymer=~pl.col("seq").str.contains("A{4,}|T{4,}|C{4,}|G{4,}"),
     gc_content=(pl.col("seq").str.count_matches("G|C") / (pl.col("seq").str.len_chars()))
 )
 # fmt: on
@@ -113,22 +115,25 @@ def handle_overlap(
 def the_filter(
     df: pl.DataFrame,
     overlap: int = -1,
-    max_tm_offtarget: float = 30,
-    max_hp: float = 37,
+    max_tm_offtarget: float = 20,
+    max_hp: float = 32,
 ) -> tuple[pl.DataFrame, dict]:
     ff, stats = handle_overlap(
         df,
         criteria=[
             # fmt: off
+            (pl.col("oks") > 5)
+            & (pl.col("hp") < max_hp)
+            & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
+            & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
             (pl.col("oks") > 4)
             & (pl.col("hp") < max_hp)
             & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
             & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 3)
-            & (pl.col("hp") < max_hp)
-            & pl.col("max_tm_offtarget").lt(max_tm_offtarget)
-            & (pl.col("maps_to_pseudo").is_null() | pl.col("maps_to_pseudo").eq("")),
-            (pl.col("oks") > 3) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget),
+            (pl.col("oks") > 4) & (pl.col("hp") < max_hp) & pl.col("max_tm_offtarget").lt(max_tm_offtarget),
+            (pl.col("oks") > 4)
+            & (pl.col("hp") < max_hp + 5)
+            & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
             (pl.col("oks") > 3)
             & (pl.col("hp") < max_hp + 5)
             & pl.col("max_tm_offtarget").lt(max_tm_offtarget + 4),
@@ -151,7 +156,7 @@ def visualize_probe_coverage(
     gene_length: int,
     label: str = "Probe Coverage",
     thresholds: list[float | str] | None = None,
-    output_file: str | Path | None = None,
+    output_file: str | Path | io.StringIO | None = None,
     max_line_width: int = 110,
 ):
     """
@@ -197,14 +202,7 @@ def visualize_probe_coverage(
                 remaining_str = remaining_str[content_plot_width:]
 
     if gene_length <= 0:
-        _add_line_to_output(f"\n--- {label} ---")
-        _add_line_to_output(f"Invalid gene length: {gene_length}")
-        if output_file:
-            Path(output_file).write_text("\n".join(output_lines) + "\n")
-        else:
-            for line in output_lines:
-                print(line)
-        return
+        raise ValueError("Gene length must be a positive integer.")
 
     gene_length_int = int(gene_length)
     effective_thresholds = thresholds if thresholds is not None else ["any", 0.1, 0.25, 0.5, 0.75]
@@ -254,7 +252,14 @@ def visualize_probe_coverage(
             # For empty probes, the plot line is just spaces of the determined width
             _add_wrapped_line(t_s, " " * current_plot_string_width)
         if output_file:
-            Path(output_file).write_text("\n".join(output_lines) + "\n")
+            output_content = "\n".join(output_lines) + "\n"
+            if isinstance(output_file, (str, Path)):
+                Path(output_file).write_text(output_content)
+            elif hasattr(output_file, "write"):  # Check for StringIO or other file-like objects
+                output_file.write(output_content)
+            else:  # Fallback if type is unexpected, though type hint should prevent this
+                for line in output_lines:
+                    print(line)
         else:
             for line in output_lines:
                 print(line)
@@ -307,7 +312,15 @@ def visualize_probe_coverage(
         _add_wrapped_line(threshold_str_display, "".join(line_chars))
 
     if output_file:
-        Path(output_file).write_text("\n".join(output_lines) + "\n")
+        output_content = "\n".join(output_lines) + "\n"
+        if isinstance(output_file, (str, Path)):
+            Path(output_file).write_text(output_content)
+        elif hasattr(output_file, "write"):  # Check for StringIO
+            output_file.write(output_content)
+        else:  # Fallback
+            # This case should ideally not be reached if type hints are respected
+            for ol_content in output_lines:  # Renamed to avoid conflict
+                print(ol_content)
     else:
         for ol in output_lines:
             print(ol)

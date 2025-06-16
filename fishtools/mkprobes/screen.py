@@ -37,11 +37,13 @@ def _screen(
     if restriction:
         logger.info(f"Filtering for probes w/o {', '.join(restriction)} site(s).")
         res = Restriction.RestrictionBatch(restriction)
+        initial_len = len(ff)
         ff = ff.filter(
             ~pl.col("seq").map_elements(
                 lambda x: any(res.search(Seq("NNNNNN" + x + "NNNNNN")).values()), return_dtype=pl.Boolean
             )
         )
+        logger.info(f"Filtered {initial_len - len(ff)} probes with restriction sites.")
 
     final, stats_filter = the_filter(ff, overlap=overlap)
     assert not final["seq"].str.contains("N").any(), "N appears out of nowhere."

@@ -11,6 +11,7 @@ def unsharp_all(
 
 def calc_percentile(
     img: np.ndarray,
+    channels: list[int],
     block: tuple[int, int] = (512, 512),
     *,
     n: int = 25,
@@ -23,11 +24,12 @@ def calc_percentile(
     y_start = rand.integers(0, img.shape[2] - block[1], n * 2)
     out = []
     j = 0
+    channels = [c - 1 for c in channels]  # Convert to 0-based index
     for i, (x, y) in enumerate(zip(x_start, y_start)):
         if j == n:
             break
         logger.info(f"Calculating percentile {j + 1}/{n}")
-        _img = img[:, x : x + block[0], y : y + block[1]]
+        _img = img[:, x : x + block[0], y : y + block[1], channels]
         if not np.all(_img[0, :, :, 0]):  # Skip areas with 0 (stitch edge)
             continue
         unsharped = unsharp_all(_img)

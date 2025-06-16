@@ -51,9 +51,9 @@ def scale_deconv(
 
     # Same as:
     # scaled = s_ * ((img / self.metadata["deconv_scale"][idx] + self.metadata["deconv_min"][idx]) - m_)
-    scale_factor = s_ / metadata["deconv_scale"][idx]
-    offset = s_ * (metadata["deconv_min"][idx] - m_)
-    scaled = scale_factor * img + offset
+    scale_factor = np.float32(s_ / metadata["deconv_scale"][idx])
+    offset = np.float32(s_ * (metadata["deconv_min"][idx] - m_))
+    scaled = scale_factor * img.astype(np.float32) + offset
 
     if debug:
         logger.debug(f"Deconvolution scaling: {scale_factor}. Offset: {offset}")
@@ -63,7 +63,7 @@ def scale_deconv(
     if np.all(scaled < 0):
         logger.warning(f"Scaled image {name} has all negative values.")
 
-    return np.clip(scaled, 0, 65535)
+    return np.clip(scaled, 0, 65534)
 
 
 def _compute_range(
@@ -132,7 +132,11 @@ logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level
 console = Console()
 
 
-def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLike = np.float32) -> npt.NDArray:
+def high_pass_filter(
+    img: npt.NDArray[Any],
+    σ: tuple[float, ...] = (3.0, 3.0, 3.0),
+    dtype: npt.DTypeLike = np.float32,
+) -> npt.NDArray:
     """
     Args:
         image: the input image to be filtered
@@ -143,12 +147,21 @@ def high_pass_filter(img: npt.NDArray[Any], σ: float = 2.0, dtype: npt.DTypeLik
         the high pass filtered image. The returned image is the same type
         as the input image.
     """
-    img = img.astype(dtype)
-    window_size = int(2 * np.ceil(2 * σ) + 1)
-    lowpass = cv2.GaussianBlur(img, (window_size, window_size), σ, borderType=cv2.BORDER_REPLICATE)
-    gauss_highpass = img - lowpass
-    gauss_highpass[lowpass > img] = 0
-    return gauss_highpass
+    from cupyx.scipy.ndimage import gaussian_filter
+
+    img = cp.asarray(img)
+    lowpass = cp.zeros_like(img)
+    for c in range(img.shape[1]):
+        lowpass[:, c] = gaussian_filter(img[:, c], sigma=σ, cval=0, truncate=4.0)
+
+    # img = img.astype(dtype)
+    # window_size = int(2 * np.ceil(2 * σ) + 1)
+    # lowpass = cv2.GaussianBlur(img, (window_size, window_size), σ, borderType=cv2.BORDER_REPLICATE)
+    img -= lowpass
+    del lowpass
+    img = cp.clip(img, 0, None)
+
+    return img
 
 
 def _matlab_gauss2D(
@@ -269,10 +282,10 @@ def center_index(center: int, nz: int, step: int):
 
 
 def deconvolve_lucyrichardson_guo(
-    img: np.ndarray[np.float32, Any],
+    img: np.ndarray[cp.float32, Any],
     projectors: tuple[cp.ndarray, cp.ndarray],
     iters: int = 1,
-) -> np.ndarray:
+) -> cp.ndarray:
     """Performs Lucy-Richardson deconvolution on the provided image using a
     Gaussian point spread function. This version used the optimized
     deconvolution approach described in:
@@ -280,7 +293,7 @@ def deconvolve_lucyrichardson_guo(
     of magnitude', Guo et al, bioRxiv 2019.
     """
 
-    if img.dtype not in [np.float32, np.float16]:
+    if img.dtype not in [cp.float32, cp.float16]:
         raise ValueError("Image must be float32")
     forward_projector, backward_projector = projectors
 
@@ -532,18 +545,29 @@ def _run(
             for _ in range(len(paths)):
                 start, img, fid, metadata = q_img.get()
                 t = time.time()
-
+                # img = high_pass_filter(img.astype(np.float32), σ=(3.0, 3.0, 3.0))
                 res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors(step), iters=1)
-                mins, maxs = np.percentile(res, (0.1, 99.999), axis=(0, 2, 3), keepdims=True)
+                # Somehow will result in an invalidAccessMemoryError when res.shape[1] == 1 if done directly with cupy.
+                if res.shape[1] == 1:
+                    res = res.get()
+                mins, maxs = (cp if res.shape[1] > 1 else np).percentile(
+                    res, (0.1, 99.999), axis=(0, 2, 3), keepdims=True
+                )
 
-                scale = 65534 / (maxs - mins)
-                towrite = ((res - mins) * scale).astype(np.uint16).get().reshape(-1, 2048, 2048)
+                scale = 65534 / (maxs - mins + 1e-20)
+                towrite = (
+                    cp.clip((cp.asarray(res) - cp.asarray(mins)) * cp.asarray(scale), 0.0, 65534.0)
+                    .astype(np.uint16)
+                    .get()
+                    .reshape(-1, 2048, 2048)
+                )
                 del res
 
                 scaling = {
-                    "deconv_min": list(map(float, mins.get().flatten())),
-                    "deconv_scale": list(map(float, scale.get().flatten())),
+                    "deconv_min": list(map(float, mins.flatten())),
+                    "deconv_scale": list(map(float, scale.flatten())),
                 }
+                print(scaling)
                 logger.info(f"Finished {start.name}: {time.time() - t:.2f}s")
 
                 q_write.put((
@@ -681,6 +705,7 @@ def run(
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2)
 @click.option("--basic-name", type=str)
+@click.option("--debug", is_flag=True)
 def batch(
     path: Path,
     *,
@@ -689,7 +714,11 @@ def batch(
     overwrite: bool,
     n_fids: int,
     basic_name: str | None = "all",
+    debug: bool = False,
 ):
+    logger.remove()
+    logger.add(sys.stderr, level="INFO" if not debug else "DEBUG")
+
     ws = Workspace(path)
     rois = ws.rois
     logger.info(f"Found ROIs: {rois}")

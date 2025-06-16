@@ -272,6 +272,70 @@ def extract_polygons_from_mask(
     return polygons_with_meta
 
 
+def extract_polygons_from_roifile(
+    roi_file_path: Path,
+    slice_idx: int,
+    downsample_factor: int,
+) -> list[tuple[Polygon | MultiPolygon, dict[str, Any]]]:
+    """Extracts Shapely polygons for a specific Z-slice from an ImageJ ROI file."""
+    from roifile import ImagejRoi, roiread
+
+    logger.info(f"Slice {slice_idx}: Loading ROIs from {roi_file_path}...")
+    try:
+        rois = roiread(roi_file_path)
+    except Exception as e:
+        logger.error(f"Slice {slice_idx}: Failed to read ROI file {roi_file_path}: {e}")
+        return []
+
+    polygons_with_meta = []
+    target_slice = slice_idx + 1  # ImageJ slices are 1-based
+
+    if isinstance(rois, ImagejRoi):
+        rois = [rois]
+
+    for roi in rois:
+        roi_slice = roi.z_position if roi.z_position is not None else roi.position
+        if roi_slice is not None and roi_slice != 0 and roi_slice != target_slice:
+            continue
+
+        logger.debug(f"Slice {slice_idx}: Processing ROI '{roi.name}' for target slice {target_slice}.")
+
+        abs_coords = roi.integer_coordinates + np.array([roi.left, roi.top])
+        adj_coords = abs_coords.astype(np.float64) / downsample_factor
+        shapely_coords = adj_coords[:]
+
+        if len(shapely_coords) < 3:
+            continue
+
+        try:
+            poly = Polygon(shapely_coords)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+
+            if poly.is_empty or not isinstance(poly, (Polygon, MultiPolygon)):
+                continue
+
+            polygon_index = len(polygons_with_meta)
+            try:
+                label = int(roi.name)
+            except (ValueError, TypeError):
+                label = polygon_index
+
+            meta = {
+                "polygon_id": polygon_index,
+                "label": label,
+                "area": poly.area,
+                "centroid_y": poly.centroid.y,
+                "centroid_x": poly.centroid.x,
+            }
+            polygons_with_meta.append((poly, meta))
+        except Exception as e:
+            logger.debug(f"Slice {slice_idx}: Could not create polygon for ROI '{roi.name}': {e}")
+
+    logger.info(f"Slice {slice_idx}: Extracted {len(polygons_with_meta)} polygons from ROI file.")
+    return polygons_with_meta
+
+
 # --- Spatial Indexing and Assignment Functions ---
 
 

@@ -232,7 +232,7 @@ class SAMFrame(pl.DataFrame):
         # to save time.
 
         tm_offtarget = self.filter(
-            ~pl.col("transcript").is_in(acceptable_tss) & pl.col("match_consec").gt(18)
+            ~pl.col("transcript").is_in(acceptable_tss) & pl.col("match_consec").gt(16)
         ).with_columns(
             tm_offtarget=pl.struct([
                 "seq",

@@ -59,7 +59,7 @@ def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
             from collections import deque
 
             deque(track, maxlen=0)  # Exhaust the iterator
-        except StopIteration:
+        except (StopIteration, ValueError):
             ...
 
 

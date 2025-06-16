@@ -20,7 +20,6 @@ import cupy as cp
 import numpy as np
 import pandas as pd
 import xarray as xr
-
 from loguru import logger
 from semantic_version import Version
 from slicedimage.io import resolve_path_or_url
@@ -550,7 +549,7 @@ class Codebook(xr.DataArray):
         index = brute_force.build(dataset_norm_cp, metric=metric)
         all_distances = np.empty(linear_features.shape[0], dtype=np.float32)
         all_neighbors = np.empty(linear_features.shape[0], dtype=np.uint32)
-        SPLIT = 4
+        SPLIT = 8
         batch_size = linear_features.shape[0] // SPLIT
         frame_cp = cp.empty(
             (batch_size, linear_features.shape[1]),
@@ -558,7 +557,14 @@ class Codebook(xr.DataArray):
         )
         for i in range(SPLIT):
             start_idx = i * batch_size
-            end_idx = (i + 1) * batch_size
+            end_idx = (
+                (i + 1) * batch_size if i < SPLIT - 1 else linear_features.shape[0]
+            )  # in case division is not exact
+            current_batch_size = end_idx - start_idx
+
+            # Resize frame_cp if needed for the last batch
+            if current_batch_size != batch_size:
+                frame_cp = cp.empty((current_batch_size, linear_features.shape[1]), dtype=cp.float32)
 
             # Convert current frame to cupy array
             frame_cp[:] = cp.asarray(linear_features[start_idx:end_idx], dtype=cp.float32)

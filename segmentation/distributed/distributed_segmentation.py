@@ -5,8 +5,9 @@ import json
 import logging
 import os
 import pathlib
+import shutil
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, cast
 
 import cellpose.io
 import cellpose.models
@@ -686,57 +687,44 @@ def distributed_eval(
 
     timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     worker_logs_dirname = f"dask_worker_logs_{timestamp}"
-    worker_logs_dir = pathlib.Path().absolute().joinpath(worker_logs_dirname)
+    worker_logs_dir = input_zarr.parent / worker_logs_dirname
     worker_logs_dir.mkdir()
 
     if "diameter" not in eval_kwargs.keys():
         raise ValueError("Diameter must be set in eval_kwargs")
 
     overlap = eval_kwargs["diameter"] * 2
-    block_indices, block_crops = get_block_crops(
-        input_zarr.shape,
-        blocksize,
-        overlap,
-        mask,
-    )
+    block_indices, block_crops = get_block_crops(input_zarr.shape, blocksize, overlap, mask)
 
-    def check_block_has_data(crop, zarr_array, threshold=0):
+    def check_block_has_data(crop, zarr_array, threshold=0) -> bool:
         """
         Checks if a given crop in a Zarr array contains any data above a threshold.
         Returns True if data exists, False otherwise.
         """
         try:
-            # Access the data slice as a Dask array and perform the check
             data_slice = zarr_array[crop]
             if threshold == 0:
-                # Efficient check for any non-zero element
-                return data_slice.any()  # Compute the single boolean result
+                return data_slice.any()
             else:
-                # Check against the threshold
-                return (data_slice > threshold).any()  # Compute the single boolean result
+                return (data_slice > threshold).any()
         except Exception as e:
             print(f"Error checking block crop {crop}: {e}")
-            # Decide how to handle errors - conservatively assume it *might* have data?
-            # Or return False to skip? Let's return False to avoid processing potentially bad blocks.
             return False
 
-    # Use client.map to run the check function on workers
-    # Pass necessary arguments: input_zarr and zero_input_threshold
-    # Note: Passing large arrays like input_zarr repeatedly can add overhead,
-    # but Dask should handle passing the reference efficiently.
-    # Alternatively, scatter input_zarr once if performance is an issue.
     offset = 0
     n = None
 
-    if not (path_nonempty := (temporary_directory.parent / "nonempty.json")).exists():
+    path_nonempty = temporary_directory.parent / "nonempty.json"
+    try:
+        idxs = json.loads(path_nonempty.read_text())["idxs"]
+    except (FileNotFoundError, json.decoder.JSONDecodeError, KeyError):
         check_futures = cluster.client.map(
             check_block_has_data,
-            block_crops[offset : None if n is None else offset + n],  # Iterate over crops
-            zarr_array=input_zarr,  # Pass input_zarr reference
-            threshold=0,  # Pass threshold
+            block_crops[offset : None if n is None else offset + n],
+            zarr_array=input_zarr,
+            threshold=0,
         )
 
-        # Gather the boolean results from the futures
         logger.info("Gathering input data check results...")
         try:
             non_zero_results = cluster.client.gather(check_futures, errors="raise")
@@ -746,15 +734,9 @@ def distributed_eval(
             logger.critical("Skipping zero-input block filtering due to error.")
             raise e
 
-        # Filter the indices and crops based on the results
-        idxs = []
-        for i, is_non_zero in enumerate(non_zero_results, offset):
-            if is_non_zero:
-                idxs.append(i)
+        idxs = [i for i, is_non_zero in enumerate(non_zero_results, offset) if is_non_zero]
 
         path_nonempty.write_text(json.dumps({"idxs": idxs}, indent=2))
-    else:
-        idxs = json.loads(path_nonempty.read_text())["idxs"]
 
     # final_block_indices, final_block_crops = [], []
     final_block_indices, final_block_crops = (
@@ -877,15 +859,12 @@ def determine_merge_relabeling(block_indices, faces, used_labels):
     """Determine boundary segment mergers, remap all label IDs to merge
     and put all label IDs in range [1..N] for N global segments found"""
     faces = adjacent_faces(block_indices, faces)
-    # FIX float parameters
-    # print("Used labels:", used_labels, "Type:", type(used_labels))
     used_labels = used_labels.astype(int)
-    # print("Used labels:", used_labels, "Type:", type(used_labels))
     label_range = int(np.max(used_labels))
 
     label_groups = block_face_adjacency_graph(faces, label_range)
     new_labeling = scipy.sparse.csgraph.connected_components(label_groups, directed=False)[1]
-    # XXX: new_labeling is returned as int32. Loses half range. Potentially a problem.
+    # new_labeling is returned as int32. Loses half range. Potentially a problem.
     unused_labels = np.ones(label_range + 1, dtype=bool)
     unused_labels[used_labels] = 0
     new_labeling[unused_labels] = 0
@@ -981,22 +960,20 @@ app = typer.Typer()
 
 
 @app.command()
-def main(path: Path = typer.Argument(..., help="Path to the folder containing the zarr file.")):
+def main(
+    path: Path = typer.Argument(..., help="Path to the folder containing the zarr file."),
+    channels: str = typer.Option(..., help="Comma-separated list of channel names to use."),
+    overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
+):
+    if not overwrite and (path / "segmentation.done").exists():
+        logger.warning("Segmentation already exists. Exiting.")
+        exit()
     # ---- 1. Configuration ----
-    # path = Path("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA")
     path = Path(path)
-    zarr_input_path = path / "fused.zarr"  # Path to store intermediate Zarr
-    zarr_output_path = path / "output_segmentation.zarr"  # <-- SET THIS: Path for final segmentation Zarr
-
-    # Define block size (e.g., for a 3D image Z, Y, X) - ADJUST TO YOUR DATA AND MEMORY
-    # Should be large enough for context but small enough for memory per worker
-
-    # Cellpose Model Configuration
-    # cellpose_model_kwargs = {
-    #     "pretrained_model": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/models/2025-04-16_21-32-16",  # Or 'nuclei', 'cyto', or path to custom model
-    #     "pretrained_model_ortho": "/working/20250327_benchmark_coronal2/analysis/deconv/segment--brain+polyA/ortho/models/2025-04-14_18-38-00",
-    #     "gpu": True,cls=))
-    # }
+    zarr_input_path = path / "fused.zarr"
+    zarr_output_path = path / "output_segmentation.zarr"
+    temporary_directory = path / "cellpose_temp"
+    (zarr_output_path.parent / "segmentation.done").unlink(missing_ok=True)
 
     config = json.loads((path.parent / "config.json").read_text())
     cellpose_model_kwargs = {
@@ -1006,8 +983,6 @@ def main(path: Path = typer.Argument(..., help="Path to the folder containing th
     }
 
     # Dask Cluster Configuration (for local machine)
-    # Adjust n_workers and memory_limit based on your system (CPU cores, RAM, GPU)
-    # If gpu=True in model_kwargs, often n_workers=1 is best.
     local_cluster_kwargs = {
         "n_workers": 4,  # Example: 1 worker for GPU, 4 for CPU
         "ncpus": 4,  # Physical cores per worker (adjust based on your CPU)
@@ -1018,69 +993,52 @@ def main(path: Path = typer.Argument(..., help="Path to the folder containing th
 
     preprocessing_pipeline = [(unsharp_all, {})]
 
-    # Optional Mask (set path to a mask file if you have one)
-    mask_path = None  # Example: "path/to/foreground_mask.tif"
+    mask_path = None
     foreground_mask = None
     if mask_path and os.path.exists(mask_path):
         print(f"Loading mask from {mask_path}")
-        foreground_mask = tifffile.imread(mask_path) > 0  # Assuming mask is binary or thresholded
+        foreground_mask = tifffile.imread(mask_path) > 0
 
-    # ---- 2. Convert TIFF to Zarr ----
-    # print(f"Loading TIFF: {tiff_path}")
-    # if not os.path.exists(zarr_input_path):
-    #     try:
-    #         image_data = tifffile.imread(tiff_path).transpose(0, 2, 3, 1)
-    #         print(f"Image loaded. Shape: {image_data.shape}, dtype: {image_data.dtype}")
-
-    #         # Ensure blocksize matches image dimensions
-    #         if len(processing_blocksize) != image_data.ndim:
-    #             raise ValueError(
-    #                 f"Blocksize dimension {len(processing_blocksize)} != Image dimension {image_data.ndim}"
-    #             )
-
-    #         print(f"Converting to Zarr: {zarr_input_path} with chunks={processing_blocksize}")
-    #         # Use the processing blocksize as the chunk size for the input Zarr
-    #         input_zarr_array = numpy_array_to_zarr(zarr_input_path, image_data, chunks=processing_blocksize)
-    #         print("Zarr conversion complete.")
-    #         del image_data
-
-    #     except FileNotFoundError:
-    #         print(f"Error: Input TIFF file not found at {tiff_path}")
-    #         exit()
-    #     except Exception as e:
-    #         print(f"Error during TIFF loading or Zarr conversion: {e}")
-    #         exit()
-    # else:
     input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
 
-    channel_names = ["reddot", "atp"]
-    key = input_zarr_array.attrs["key"]
+    key = cast(str, input_zarr_array.attrs["key"])
     try:
-        channels = [key.index(c) for c in channel_names]
-    except ValueError as e:
-        raise ValueError(f"Channel names {channel_names} not found in {key}")
+        channels_list = [key.index(c) + 1 for c in channels.split(",")]
+        logger.info(f"Using channels: {channels}")
+    except ValueError:
+        raise ValueError(f"Channel names {channels} not found in {key}")
+    del channels
 
-    processing_blocksize = (input_zarr_array.shape[0], 512, 512, len(channels))  # Example for 3D
+    processing_blocksize = (input_zarr_array.shape[0], 512, 512, len(channels_list))
     try:
+        if overwrite:
+            raise FileNotFoundError
         normalization = json.loads((path / "normalization.json").read_text())
     except FileNotFoundError:
         logger.info("Existing normalization params not found. Calculating percentiles.")
         perc, _ = calc_percentile(
-            input_zarr_array, block=(processing_blocksize[1], processing_blocksize[2]), n=30, low=5, high=99.5
+            input_zarr_array,
+            channels=channels_list,
+            block=(processing_blocksize[1], processing_blocksize[2]),
+            n=30,
+            low=5,
+            high=99.5,
         )
         normalization = {"lowhigh": perc}
-        logger.info(f"Normalization params: {normalization}")
         (path / "normalization.json").write_text(json.dumps(normalization, indent=2, cls=NumpyEncoder))
+
+    if len(channels_list) == 1:
+        channels_list = [channels_list[0], channels_list[0]]
+        normalization = {"lowhigh": [normalization["lowhigh"], normalization["lowhigh"]]}
+    logger.info(f"Normalization params: {normalization}")
 
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
-        "diameter": 31,  # MUST BE INT <-- SET THIS: Estimated average object diameter in pixels
-        "channels": channels,  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
+        "diameter": config["diameter"],  # MUST BE INT
+        "channels": channels_list,  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
         "batch_size": 24,  # Adjust based on GPU memory (if using GPU)
         # Use Cellpose's internal normalization (or False if pre-normalized)
-        # "normalize": {
-        # },
-        "normalize": {"lowhigh": [normalization["lowhigh"][c - 1] for c in channels]},
+        "normalize": {},
         "flow_threshold": 0,  # Useless in 3D
         "cellprob_threshold": -2,  # Default is 0.0, adjust if needed
         "anisotropy": 3.0,
@@ -1103,35 +1061,20 @@ def main(path: Path = typer.Argument(..., help="Path to the folder containing th
             preprocessing_steps=preprocessing_pipeline,
             model_kwargs=cellpose_model_kwargs,
             eval_kwargs=cellpose_eval_kwargs,
-            cluster_kwargs=local_cluster_kwargs,  # Pass kwargs for cluster creation
-            temporary_directory=path / "cellpose_temp",  # Optional: specify temp dir location
+            cluster_kwargs=local_cluster_kwargs,
+            temporary_directory=temporary_directory,
         )
-
+        (zarr_output_path.parent / "segmentation.done").touch()
+        shutil.rmtree(temporary_directory)
         print("\n--- Run Finished ---")
         print(f"Final segmentation saved to: {zarr_output_path}")
         print(f"Output Zarr shape: {final_segmentation_zarr.shape}, dtype: {final_segmentation_zarr.dtype}")
         print(f"Number of segmented objects found: {len(final_bounding_boxes)}")
-        # You can now inspect the zarr_output_path (e.g., with napari-zarr)
-        # final_bounding_boxes contains the list of bounding boxes for labels [1, 2, ...]
-
-        # Example: Print the first 5 bounding boxes
-        # for i, bbox in enumerate(final_bounding_boxes[:5]):
-        #     print(f"  Label {i+1}: {bbox}")
 
     except Exception as e:
-        print(f"\n--- Error during distributed evaluation ---")
-        import traceback
-
-        traceback.print_exc()
-
-    finally:
-        # Clean up intermediate Zarr input file if desired
-        # import shutil
-        # if os.path.exists(zarr_input_path):
-        #     print(f"Removing intermediate Zarr: {zarr_input_path}")
-        #     shutil.rmtree(zarr_input_path)
-        print("Script finished.")
+        print("\n--- Error during distributed evaluation ---")
+        raise e
 
 
 if __name__ == "__main__":
-    main()
+    app()

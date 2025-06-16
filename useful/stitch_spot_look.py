@@ -14,16 +14,13 @@ from tifffile import TiffFile, imread
 
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.io import Workspace
-
-# path = Path("/working/20250229_2242_2/analysis/deconv")
-# codebook = "morris"
-# roi = f"hippo+{codebook}"
+from fishtools.utils.plot import add_scale_bar
 
 
-path = Path("/working/20250317_benchmark_mousecommon/analysis/deconv")
-codebook = "mousecommon"
+path = Path("/working/20250611_as_fosai14_d7bad/analysis/deconv")
+codebook = "alina_synapse.good"
 ws = Workspace(path)
-ROIS = ws.rois
+ROIS = ["cortex"]
 
 # Baysor
 # spots.filter(
@@ -57,7 +54,7 @@ spots = pl.concat(spots)
 # %%
 # spots = spots_ok
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(8, 8), dpi=200)
-ax.scatter(spots["x"][::50], spots["y"][::50], s=0.1, alpha=0.3)
+ax.scatter(spots["x"][::20], spots["y"][::20], s=0.1, alpha=0.3)
 ax.set_aspect("equal")
 
 
@@ -105,7 +102,7 @@ spots_ = (
     spots_.with_columns(
         x_=(pl.col("area")) ** (1 / 3) + np.random.uniform(-0.75, 0.75, size=len(spots_)),
         y_=(pl.col("norm") * (1 - pl.col("distance"))).log10(),
-    )
+    ).filter(pl.col("distance") < 0.3)
     # .filter(pl.col("y") > -1.8)
 )
 # sns.catplot(
@@ -282,23 +279,31 @@ spots_ok = filter_threshold(3)  # .filter(pl.col("norm").gt(-1) & pl.col("z").lt
 # spots_ok = spots.filter(pl.col("area").is_between(9, 60) & pl.col("norm").gt(0.08))
 fig, ax = plt.subplots(ncols=1, nrows=1, figsize=(10, 10), dpi=200)
 filtered = spots_ok  # .filter(pl.col("z").is_between(12, 18))
-ax.scatter(filtered["x"][::20], filtered["y"][::20], s=0.1, alpha=0.3)
+ax.scatter(
+    filtered["y"][:: max(1, len(spots_ok) // 200000)],
+    filtered["x"][:: max(1, len(spots_ok) // 200000)],
+    s=0.1,
+    alpha=0.3,
+)
 ax.set_aspect("equal")
 ax.axis("off")
 tf = TileConfiguration.from_file(path / f"stitch--{ROIS[0]}" / "TileConfiguration.registered.txt")
 
 # Set axis limits based on filtered data
-x_min, x_max = filtered["x"].min(), filtered["x"].max()
-y_min, y_max = filtered["y"].min(), filtered["y"].max()
-ax.set_xlim(x_min, x_max)
-ax.set_ylim(y_min, y_max)
+# x_min, x_max = filtered["x"].min(), filtered["x"].max()
+# y_min, y_max = filtered["y"].min(), filtered["y"].max()
+# ax.set_xlim(x_min, x_max)
+# ax.set_ylim(y_min, y_max)
 
-for row in tf.df.iter_rows(named=True):
-    text_x = row["x"] + 1968 / 2
-    text_y = row["y"] + 1968 / 2
-    if x_min <= text_x <= x_max and y_min <= text_y <= y_max:
-        ax.text(text_x, text_y, str(row["index"]), fontsize=5, ha="center", va="center")
-ax.set_aspect("equal")
+# for row in tf.df.iter_rows(named=True):
+#     text_x = row["x"] + 1968 / 2
+#     text_y = row["y"] + 1968 / 2
+#     if x_min <= text_x <= x_max and y_min <= text_y <= y_max:
+#         ax.text(text_x, text_y, str(row["index"]), fontsize=5, ha="center", va="center")
+# ax.set_aspect("equal")
+
+add_scale_bar(ax, 1000 / 0.108, "1000 μm")
+plt.tight_layout()
 
 # %%
 # density_result = (
@@ -339,7 +344,7 @@ def plot_scree(pergene: pl.DataFrame, limit: int = 5):
 plot_scree(count_by_gene(spots_ok))
 
 # %%
-cb_raw = json.loads(Path(f"/home/chaichontat/fishtools/starwork6/{codebook}.json").read_text())
+cb_raw = json.loads((path / "codebooks" / f"{codebook}.json").read_text())
 
 cb = (
     pl.DataFrame(cb_raw)
@@ -360,22 +365,37 @@ for roi in ROIS:
 # %% Blank abundance
 
 joined.group_by("target").len().join(cb, left_on="target", right_on="gene", how="left").filter(
+    ~pl.col("is_blank")
+).sort("len", descending=True)
+
+# %%
+joined.group_by("target").len().join(cb, left_on="target", right_on="gene", how="left").filter(
     pl.col("is_blank")
 ).sort("len", descending=True)
 
 # %%
-
-joined.join(cb, left_on="target", right_on="gene", how="left").group_by(pl.col("z").round()).agg(
-    n=pl.col("is_blank").sum(), blank=pl.col("is_blank").sum() / pl.len()
-).sort("z")
-
-
-# %%
 if codebook == "tricycleplus":
     genes = ["Ccnd3", "Cdc45", "Top2a", "Pou3f2", "Cenpa", "Hells"]
+elif codebook == "mousecommon":
+    genes = [
+        "Tbr1",
+        "Pax6",
+        "Fezf2",
+        "Cux2",
+        "Notch1",
+        "Notch2",
+        "Gad2",
+        "Hes5",
+        "Btg2",
+        "Dll1",
+        "Lhx2",
+        "Neurod6",
+    ]
+elif codebook == "10xhuman":
+    genes = ["PAX6", "TOP2A"]
 else:
-    genes = ["Tbr1", "Bcl11b", "Fezf2", "Cux2", "Notch1", "Notch2", "Gad2", "Hes5"]
-fig, axs = plt.subplots(ncols=3, nrows=3, figsize=(12, 12), dpi=200, facecolor="black")
+    genes = ["Eomes", "Adora2a", "Tenm2", "Sfrp2", "Ccnd2"]
+fig, axs = plt.subplots(ncols=3, nrows=4, figsize=(12, 12), dpi=200, facecolor="black")
 
 for ax, gene in zip(axs.flat, genes):
     selected = spots_.filter(pl.col("target").str.starts_with(gene))
@@ -486,10 +506,10 @@ def plot_target_locations(
 plot_target_locations(
     spots_ok,  # .filter(pl.col("x").gt(-22000)),
     # ["O"],
-    ["HSPA1A", "CALM1", "PPIA", "SLC17A7", "GAD1"],
+    ["Cpe", "Rorb"],
     target_size=2,
     background_alpha=0.1,
-    target_alpha=0.1,
+    target_alpha=0.01,
 )
 
 
@@ -504,9 +524,14 @@ if plot:
     genes = filter(lambda x: x.startswith("Blank"), genes) if only_blank else spots_["target"]
     genes = sorted(set(genes))
     dark = False
-    nrows = int(np.ceil(len(genes) / 20))
+    ncols = int(np.sqrt(len(genes)))
+    nrows = int(np.ceil(len(genes) / ncols))
     fig, axs = plt.subplots(
-        ncols=20, nrows=nrows, figsize=(72, int(2.4 * nrows)), dpi=160, facecolor="black" if dark else "white"
+        ncols=ncols,
+        nrows=nrows,
+        figsize=(int(72 / 20 * ncols), int(2.4 * nrows)),
+        dpi=160,
+        facecolor="black" if dark else "white",
     )
     axs = axs.flatten()
     for ax, gene in zip(axs, genes):

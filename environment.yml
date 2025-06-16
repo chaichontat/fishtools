@@ -15,18 +15,21 @@ dependencies:
   - levenshtein
   - loguru
   - matplotlib
-  - numpy
+  - numpy<2
   - opencv
   - pandas
   - pip
   - pip:
       - basicpy
       - biopython
+      - cmocean
+      - colorcet
       - kb-python
       - itk
-      - simpleitk
       - primer3-py
       - pyfastx
+      - simpleitk
+      - spaco-release
   - polars
   - pyarrow
   - pydantic

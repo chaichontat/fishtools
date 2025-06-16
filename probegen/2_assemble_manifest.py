@@ -2,9 +2,9 @@
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from itertools import cycle, islice
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 import numpy as np
 import polars as pl
@@ -16,10 +16,10 @@ import rich_click as click
 from Bio import Seq
 from Bio.Restriction import BamHI, KpnI  # type: ignore
 from loguru import logger
-from pydantic import BaseModel, TypeAdapter
+from pydantic import TypeAdapter
 
-from fishtools import gen_fasta, hp, rc
-from fishtools.mkprobes.codebook.codebook import ProbeSet, hash_codebook
+from fishtools import gen_fasta, rc
+from fishtools.mkprobes.codebook.codebook import ProbeSet
 from fishtools.mkprobes.starmap.starmap import generate_head_splint, test_splint_padlock
 
 pl.Config.set_fmt_str_lengths(100)
@@ -72,8 +72,8 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
             continue
 
         if len(df) < low:
-            # Resample to prevent probe dropout. Capping at 2x coverage.
-            df = pl.concat([df, df[: min(low - len(df), len(df))]])
+            # Resample to prevent probe dropout. Capping at 3x coverage.
+            df = pl.concat([df, df[: min(low - len(df), len(df) * 2)]])
 
         if not cols:
             cols = df.columns
@@ -91,30 +91,30 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
     outpath = Path(path / "generated" / probeset.name)
     outpath.mkdir(exist_ok=True, parents=True)
     # RepeatMasker
-    if probeset.species not in species_mapping:
-        probeset.species = "mouse"
+    # if probeset.species in species_mapping:
+    #     with ThreadPoolExecutor() as exc:
+    #         for col_name in ["splint", "padlock"]:
+    #             (outpath / f"{col_name}.fasta").write_text(gen_fasta(dfs[col_name]).getvalue())
+    #             exc.submit(
+    #                 subprocess.run,
+    #                 f'RepeatMasker -pa 16 -norna -s -no_is -species "{species_mapping[probeset.species]}" {outpath / f"{col_name}.fasta"}',
+    #                 shell=True,
+    #                 check=True,
+    #             )
 
-    with ThreadPoolExecutor() as exc:
-        for col_name in ["splint", "padlock"]:
-            (outpath / f"{col_name}.fasta").write_text(gen_fasta(dfs[col_name]).getvalue())
-            exc.submit(
-                subprocess.run,
-                f'RepeatMasker -pa 16 -norna -s -no_is -species "{species_mapping[probeset.species]}" {outpath / f"{col_name}.fasta"}',
-                shell=True,
-                check=True,
-            )
-
-    dfs = dfs.with_columns({
-        col_name: [seq for name, seq in pyfastx.Fastx((outpath / f"{col_name}.fasta.masked").as_posix())]
-        for col_name in ["splint", "padlock"]
-        if (outpath / f"{col_name}.fasta.masked").exists()
-    }).filter(~pl.col("splint").str.contains("N") & ~pl.col("padlock").str.contains("N"))
+    #     dfs = dfs.with_columns({
+    #         col_name: [seq for name, seq in pyfastx.Fastx((outpath / f"{col_name}.fasta.masked").as_posix())]
+    #         for col_name in ["splint", "padlock"]
+    #         if (outpath / f"{col_name}.fasta.masked").exists()
+    #     }).filter(~pl.col("splint").str.contains("N") & ~pl.col("padlock").str.contains("N"))
+    # else:
+    #     logger.warning("Species not found in species mapping. Skipping RepeatMasker.")
 
     counts = dfs.group_by("gene").len(name="count")
     # Since we resample low counting probes, we need to double the threshold.
     if (bad := counts.filter(pl.col("count") < toolow * 2)).__len__():
-        print(bad)
-        raise ValueError("Not enough probes")
+        msg = f"Too few probe pairs ({toolow=}) for {len(bad)} genes.\n{bad}"
+        raise ValueError(msg)
 
     # Before
     spl_idx = idx * 2
@@ -155,8 +155,8 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
     res = (
         res.with_columns(
             spl_cut=(
-                "TGTTGATGAGGTGTTGATGAATA"
-                + pl.col("splint").map_elements(rc, return_dtype=pl.Utf8)
+                # "TGTTGATGAGGTGTTGATGAATA"
+                pl.col("splint").map_elements(rc, return_dtype=pl.Utf8)
                 + "ca"
                 + pl.col("pad_cut").str.slice(0, 6).map_elements(rc, return_dtype=pl.Utf8)
                 + pl.col("pad_cut").str.slice(-6, 6).map_elements(rc, return_dtype=pl.Utf8)
@@ -233,15 +233,11 @@ def cli(ctx: click.Context, manifest: Path):
 @cli.command()
 @click.argument("short", type=int)
 @click.option("--verbose", "-v", is_flag=True)
+# @click.option("--output", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
 @click.option(
     "--delete",
     is_flag=True,
     help="Delete the probes from a .tss.txt file that are too short.",
-)
-@click.option(
-    "--permanent",
-    is_flag=True,
-    help="Delete the probes from a .tss.txt file that are too short permanently.",
 )
 @click.pass_context
 def short(
@@ -264,22 +260,16 @@ def short(
         short: The minimum number of probes a gene must have.
         verbose: If True, prints detailed information about genes with too few probes.
         delete: If True, removes genes with too few probes from the .tss.txt file.
-        permanent: If True (and 'delete' is True), overwrites the original .tss.txt file.
-                   Otherwise, a new file with '.tss.ok.txt' suffix is created.
 
     Raises:
-        ValueError: If '--permanent' is used without '--delete'.
         ValueError: If genes marked for deletion are not found in the .tss.txt file.
     """
-
-    if permanent and not delete:
-        raise ValueError("Cannot use --permanent without --delete")
 
     manifest: list[ProbeSet] = ctx.obj["manifest"]
     path_main: Path = ctx.obj["path"]
 
-    COL_NAME = "gene"
     for probeset in manifest:
+        print("\n")
         console.print(rich.rule.Rule(title=probeset.name, align="left"))
         baddies = []
 
@@ -342,89 +332,82 @@ def short(
                         "seqori",
                     ])
                 )
-            # .sample(shuffle=True, seed=4, fraction=1)
+                # .sample(shuffle=True, seed=4, fraction=1)
+                if len(_df) < short:
+                    baddies.append(ts)
 
             except FileNotFoundError:
-                baddies.append(probeset.name)
+                baddies.append(ts)
                 # if verbose:
                 logger.warning(
                     "File "
                     + f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
-                    + " not found."
+                    + " not found. This usually means that there are no probes for this gene."
                 )
 
-        if not len(dfs_):
-            logger.warning(f"No data for {probeset.name} at {probeset.codebook}")
-            continue
+        # if not len(dfs_):
+        #     logger.warning(f"No data for {probeset.name} at {probeset.codebook}")
+        #     continue
 
-        dfs: pl.DataFrame = pl.concat(dfs_)
-
-        counts = dfs.group_by(COL_NAME).len(name="count")
-        if len(bad := counts.filter(pl.col("count") < short)):
+        # dfs: pl.DataFrame = pl.concat(dfs_)
+        # print(dfs)
+        # counts = dfs.group_by(COL_NAME).len(name="count")
+        if baddies:
             # print(probeset.name)
-            baddies = bad[COL_NAME].to_list()
-            if verbose:
-                rich.print(bad)
-            else:
-                rich.print("\n".join(bad[COL_NAME].to_list()))
-            print(f"Found {len(bad)} genes with fewer than {short} probes.")
+
+            print("\n".join(sorted(baddies)))
+            logger.warning(f"Found {len(baddies)} genes with fewer than {short} probes.")
         else:
             logger.info(f"All genes have at least {short} probes.")
 
-        if delete:
-            tss = probeset.load_codebook(path)
+        if delete and baddies:
+            tss = probeset.load_codebook(path_main)
             # Check
-            genes = {("-".join(ts.split("-")[:-1]) if "-" in ts else ts) for ts in tss}
+            genes = set(tss)
             baddies = set(baddies)
             if not baddies.issubset(genes):
-                raise ValueError(f"{baddies - genes} not found in .tss.txt file. Wrong file?")
+                raise ValueError(f"{baddies - genes} not found in codebook file. Wrong file?")
 
-            goodies = [ts for ts in tss if ("-".join(ts.split("-")[:-1]) if "-" in ts else ts) not in baddies]
+            goodies = [ts for ts in tss if ts not in baddies]
+
+            out_path = path.joinpath(probeset.name).with_suffix(".good.txt")
+            out_path.write_text("\n".join(sorted(goodies)))
             logger.info(
-                f"Deleted {len(tss) - len(goodies)} genes from {Path(probeset.codebook).with_suffix('.tss.txt')}"
+                f"Outputted {len(goodies)} genes with >={short} probes to {out_path}. Please remake the codebook."
             )
-            out_path = (
-                path / probeset.codebook
-                if permanent
-                else (path / probeset.codebook).with_suffix(".tss.ok.txt")
-            )
-            out_path.with_suffix(".tss.txt").write_text("\n".join(sorted(goodies)))
 
 
 @cli.command()
 @click.pass_context
 def gen(ctx: click.Context):
     mfs: list[ProbeSet] = ctx.obj["manifest"]
-    path: Path = ctx.obj["path"]
+    path_main: Path = ctx.obj["path"]
+    logger.info(f"{path_main=}")
 
     total_probes = 0
     for x in mfs:
+        path = (path_main / x.codebook).parent
         if isinstance(x.n_probes, int):
+            logger.info(f"Using {x.n_probes} probes for {x.name}.")
             n = x.n_probes
-            low = min(n, 13)
+            low = min(n, 15)
         elif x.n_probes is not None:
             n = 34 if x.n_probes == "high" else 16
             low = 24 if x.n_probes == "high" else 12
         else:
-            n = 34 if x.species == "human" else 16
-            low = 24 if x.species == "human" else 12
+            n = 34 if x.species == "human" else 24
+            low = 24 if x.species == "human" else 16
 
-        total_probes += len(run(path, x, n=n, toolow=4, low=low)) * 2
+        probes = run(path, x, n=n, toolow=3, low=low)
+
+        total_probes += len(probes) * 2
         logger.info(f"Cumulative probes: {total_probes}")
 
-    # with ThreadPoolExecutor(4) as exc:
-    #     for m in mfs:
-    #         for ps in ["splint"]:
-    #             exc.submit(
-    #                 subprocess.run,
-    #                 f'RepeatMasker -pa 16 -norna -s -no_is -species "{species_mapping[m.species]}" {path}/generated/{m.name}_{ps}.fasta',
-    #                 shell=True,
-    #                 check=True,
-    #             )
-
     superout = []
+    Path(path_main / "generated").mkdir(exist_ok=True, parents=True)
     for m in mfs:
         out = []
+        path = (path_main / m.codebook).parent
         paths = [
             (path / "generated" / f"{m.name}_splint.fasta"),
             (path / "generated" / f"{m.name}_pad.fasta"),
@@ -439,10 +422,11 @@ def gen(ctx: click.Context):
             if "N" not in s[1] and "N" not in p[1]:
                 out.append(s[1])
                 out.append(p[1])
-        Path(path / "generated" / f"{m.name}_final.txt").write_text("\n".join(out))
+        Path(path_main / "generated" / f"{m.name}_final.txt").write_text("\n".join(out))
         superout.extend(out)
 
-    Path(path / "generated" / f"_allout{int(time.time())}.txt").write_text("\n".join(superout))
+    now_str = datetime.now().replace(microsecond=0).isoformat()
+    Path(path_main / "generated" / f"_allout{now_str}.txt").write_text("\n".join(superout))
 
 
 if __name__ == "__main__":

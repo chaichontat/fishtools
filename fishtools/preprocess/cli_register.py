@@ -454,8 +454,7 @@ def _run(
         for p in Path(path).glob(f"*--{roi}")
         if p.is_dir()
         and not any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
-        and set(p.name.split("--")[0].split("_"))
-        & set(map(str, bits_cb | set(map(int, reference.split("_")))))
+        and set(p.name.split("--")[0].split("_")) & set(map(str, bits_cb | set(reference.split("_"))))
     }
 
     # Convert file name to bit
@@ -548,18 +547,6 @@ def _run(
             debug=debug,
         )
 
-        # if bit == "atp":
-        #     img *= 4
-
-        # Illumination correction
-        # basic = imgs[orig_name].basic()
-        # if basic is not None:
-        # logger.debug("Running BaSiC")
-        # img = np.stack(basic[bit].transform(np.array(img)))
-        # else:
-        # ...
-        # raise Exception("No basic template found.")
-
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
             affine.ref_image = ref = img
@@ -567,7 +554,7 @@ def _run(
         # Within-tile alignment. Chromatic corrections.
         logger.debug(f"{bit}: before affine channel={c}, shiftpx={-bits_shifted[bit]}")
         img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
-        transformed[bit] = np.clip(img, 0, 65535).astype(np.uint16)
+        transformed[bit] = np.clip(img, 0, 65534).astype(np.uint16)
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
 
     if not len(transformed):

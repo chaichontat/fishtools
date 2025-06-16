@@ -308,6 +308,9 @@ def basic(): ...
 @click.option("--zs", type=str, default="0.5")
 @click.option("--overwrite", is_flag=True)
 def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5"):
+    if not overwrite and list((path / "basic").glob(f"{round_}*")):
+        logger.info(f"Basic already run for {round_} in {path}. Use --overwrite to re-run.")
+        return
     z_values = tuple(map(float, zs.split(",")))
     extractor = extract_data_from_registered if round_ == "registered" else extract_data_from_tiff
 

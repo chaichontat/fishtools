@@ -24,8 +24,12 @@ sns.set_theme()
 # %%
 
 
-path = Path("/mnt/working/e155_zach/baysor--all")
-rois = sorted({x.stem.split("--")[1] for x in path.parent.glob("*.parquet") if "mid" not in x.name})
+path = Path("/working/20250612_ebe00219_3/analysis/deconv/baysor")
+rois = sorted({
+    x.stem.split("+")[0]
+    for x in path.parent.glob("*.parquet")
+    if "old" not in x.name and x.stem.split("+").__len__() == 2
+})
 print()
 if not rois:
     raise ValueError("No ROIs found. Check path.")
@@ -34,6 +38,7 @@ try:
 except FileNotFoundError as e:
     logger.warning(e)
     imgs = None
+
 
 # %%
 
@@ -86,47 +91,97 @@ imgs_roted = defaultdict(list)
 ymax = [0]
 spotss = []
 centers = []
-config = json.loads((path / "config.json").read_text())
-rots = config["rots"]
+# config = json.loads((path / "config.json").read_text())
+# rots = config["rots"]
 # rots = [54]
 ori_dims = []
 
 new_centers = []
 # config["bins"] = bins
+all_spots = []
+# Initialize for X-axis offsetting
+next_roi_start_x = 0.0
+x_padding = 0.0
+rots = [-68, 6]
 
-for i, roi in enumerate(rois[:3]):
+for i, roi in enumerate(rois):
     print(f"Processing {roi}")
     stitched_shift = (
-        TileConfiguration.from_file(path.parent / f"stitch--{roi}" / "TileConfiguration.registered.txt")
+        TileConfiguration.from_file(
+            path.parent / f"stitch--{roi.split('+')[0]}" / "TileConfiguration.registered.txt"
+        )
         .df[["x", "y"]]
         .to_numpy()
         .min(axis=0)
     )
 
-    center = np.array(imgs[i].shape[-2:]) / 2
+    # center = np.array(imgs[i].shape[-2:]) / 2
 
-    centers.append(center)
-    ori_dims.append(imgs[i].shape)
-    for z in range(10):
-        imgs_roted[i].append(
-            rotate(
-                imgs[i][int(imgs[i].shape[0] / 10 * i) : int(imgs[i].shape[0] / 10 * (i + 1)), 0].max(axis=0),
-                rots[i],
-                center=center[::-1],
-                order=1,
-                preserve_range=True,
-                clip=False,
-                resize=True,
-            )
-        )
-    imgs_roted[i] = np.array(imgs_roted[i])
-    new_centers.append(np.array(imgs_roted[i].shape[1:]) / 2)
+    # centers.append(center)
+    # ori_dims.append(imgs[i].shape)
+    # for z in range(10):
+    #     imgs_roted[i].append(
+    #         rotate(
+    #             imgs[i][int(imgs[i].shape[0] / 10 * i) : int(imgs[i].shape[0] / 10 * (i + 1)), 0].max(axis=0),
+    #             rots[i],
+    #             center=center[::-1],
+    #             order=1,
+    #             preserve_range=True,
+    #             clip=False,
+    #             resize=True,
+    #         )
+    #     )
+    # imgs_roted[i] = np.array(imgs_roted[i])
+    # new_centers.append(np.array(imgs_roted[i].shape[1:]) / 2)
     _spots = (
-        pl.scan_parquet(path.parent / f"*--{roi}.parquet")
+        pl.scan_parquet(path.parent / f"{roi}+*.parquet")
         .collect()
         .with_columns(roi=pl.lit(i))
-        .with_columns(y=(pl.col("y") - stitched_shift[1]) / 2, x=(pl.col("x") - stitched_shift[0]) / 2)
+        .with_columns(
+            y=(pl.col("y") - stitched_shift[1]) / 2 * 0.216, x=(pl.col("x") - stitched_shift[0]) / 2 * 0.216
+        )
     )
+
+    if _spots.height > 0 and "x" in _spots.columns and "y" in _spots.columns and rots[i] != 0:
+        # Calculate center of the current ROI for rotation (before x-offsetting)
+        # Ensure min/max return non-null values if there are spots
+        min_x_roi, max_x_roi = _spots["x"].min(), _spots["x"].max()
+        min_y_roi, max_y_roi = _spots["y"].min(), _spots["y"].max()
+
+        if not (min_x_roi is None or max_x_roi is None or min_y_roi is None or max_y_roi is None):
+            center_x_roi = (min_x_roi + max_x_roi) / 2
+            center_y_roi = (min_y_roi + max_y_roi) / 2
+            rotation_center_roi = np.array([center_x_roi, center_y_roi])
+
+            print(f"Rotating ROI {i} by {rots[i]} degrees around {rotation_center_roi}")
+            # Rotate the spots for the current ROI
+            # Note: rotate_points has plt.show(), which will pause execution for each ROI.
+            # You might want to modify rotate_points to not show plots in a loop.
+            _spots = rotate_points(_spots, rots[i], rotation_center_roi)
+        else:
+            print(f"Skipping rotation for ROI {i} due to missing coordinate bounds (empty or all nulls).")
+
+    # Offset ROI along X-axis to prevent overlap
+    if _spots.height > 0 and "x" in _spots.columns and _spots["x"].is_not_null().any():
+        original_min_x = _spots["x"].min()
+
+        # Shift current ROI's X coordinates to start at next_roi_start_x
+        _spots = _spots.with_columns(x=(pl.col("x") - original_min_x + next_roi_start_x))
+
+        # Update next_roi_start_x for the subsequent ROI
+        current_max_x = _spots["x"].max()
+        if current_max_x is not None:
+            next_roi_start_x = current_max_x + x_padding
+        else:
+            # Fallback if max_x is None (e.g., all x values became null)
+            # Advance by padding from where this ROI was supposed to start
+            next_roi_start_x = next_roi_start_x + x_padding
+    else:
+        # If ROI is empty or has no valid x-coordinates,
+        # advance next_roi_start_x by padding to leave a gap.
+        next_roi_start_x += x_padding
+
+    spotss.append(_spots)
 
     if imgs is None:
         center = np.array([
@@ -134,23 +189,51 @@ for i, roi in enumerate(rois[:3]):
             (_spots["x"].max() - _spots["x"].min()) / 2,
         ])
     print(_spots["y"].min())
-    spotss.append(rotate_points(_spots, rots[i], center[::-1]))
+    # spotss.append(rotate_points(_spots, rots[i], center[::-1]))
 # %%
 
-spots = pl.concat(spotss2)
-shifts_from_rotation = np.concatenate([[0], np.cumsum((np.array(new_centers) - np.array(centers))[:, 1])])
+spots = pl.concat(spotss)
+# shifts_from_rotation = np.concatenate([[0], np.cumsum((np.array(new_centers) - np.array(centers))[:, 1])])
 
 bins = np.concatenate([[0], np.cumsum(spots.group_by("roi").agg(pl.col("x").max()).sort("roi")["x"])])
-bins += shifts_from_rotation
+# bins += shifts_from_rotation
 bins += np.arange(0, len(bins)) * 200
 mins_y = spots.group_by("roi").agg(pl.col("y").min()).sort("roi")["y"]
 
 spots = spots.with_columns(
-    x=pl.col("x") + pl.col("roi").map_elements(bins.__getitem__, return_dtype=pl.Float64),
+    # x=pl.col("x") + pl.col("roi").map_elements(bins.__getitem__, return_dtype=pl.Float64),
     y=pl.col("y") - pl.col("roi").map_elements(mins_y.__getitem__, return_dtype=pl.Float64),
 )
 plt.scatter(*spots[::100][["x", "y"]].to_numpy().T, s=0.1, alpha=0.1)
 plt.gca().set_aspect("equal")
+# %%
+spots_merged = pl.concat([
+    spots.filter(pl.col("roi") == 0),
+    spots.filter(pl.col("roi") == 1).with_columns(
+        y=pl.col("y") + spots.group_by("roi").agg(pl.col("y").max())[0, "y"] + 100
+    ),
+])
+
+# %%
+
+
+def plot(ax, spots, gene: str):
+    filtered = spots.filter(pl.col("target").eq(gene))
+    ax.scatter(
+        filtered["x"],
+        filtered["y"],
+        s=5,
+        alpha=1,
+        label=gene,
+    )
+
+
+fig, ax = plt.subplots(figsize=(8, 6))
+plot(ax, spots.filter(pl.col("z").is_between(7, 9)), "SLC17A7-201")
+plot(ax, spots.filter(pl.col("z").is_between(7, 9)), "GAD1-202")
+ax.set_xlim(700, 1200)
+ax.set_ylim(2500, 3500)
+
 # %%
 
 
@@ -306,13 +389,13 @@ ax.set_aspect("equal")
 
 # %%
 path.mkdir(exist_ok=True, parents=True)
-spots.select(x="x", y="y", z="z", gene=pl.col("target").str.split("-").list.get(0)).write_csv(
-    path / "spots.csv"
-)
+spots.select(x="x", y="y", z="z", gene=pl.col("target").str.split("-").list.get(0)).filter(
+    pl.col("gene") != "Blank"
+).write_csv(path / "spots.csv")
 
 
 # %%
-spots[res].select(x="x", y="y", z="z", gene=pl.col("target").str.split("-").list.get(0)).write_csv(
+spots.select(x="x", y="y", z="z", gene=pl.col("target").str.split("-").list.get(0)).write_csv(
     path / "spots.cortex.csv"
 )
 
@@ -409,6 +492,7 @@ plt.hist(df["intensity_sum"], log=True)
 df.write_csv(path / "cfse_stats.csv")
 # %%
 from json import JSONEncoder
+
 import numpy
 
 

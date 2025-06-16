@@ -25,7 +25,7 @@ def run_gene(
     codebook: dict[str, list[int]],
     transcript: str,
     acceptable: list[str] | None,
-    overwrite: bool = False,
+    overwrite: bool | str = False,
     log_level: str = "INFO",
     **kwargs,
 ):
@@ -104,6 +104,7 @@ def cli(): ...
 @click.argument(
     "codebook_path", metavar="CODEBOOK", type=click.Path(exists=True, file_okay=True, path_type=Path)
 )
+@click.argument("gene", type=str, default=None, required=False)
 @click.option("--allow-file", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
 @click.option("--listfailed", is_flag=True)
@@ -111,6 +112,7 @@ def cli(): ...
 def single(
     path_dataset: Path,
     codebook_path: Path,
+    gene: str | None,
     allow_file: Path | None = None,
     overwrite: bool = False,
     listfailed: bool = False,
@@ -127,6 +129,7 @@ def single(
     if not len(set(codebook)) == len(codebook):
         raise ValueError("Duplicated genes in codebook.")
     genes = sorted(codebook)
+    onlygene = gene
 
     if listfailed or listfailedall:
         for gene in genes:
@@ -158,11 +161,13 @@ def single(
                 transcript=gene,
                 codebook=codebook,
                 acceptable=acceptable.get(gene, None),
-                overwrite=overwrite,
+                overwrite=overwrite or onlygene is not None,
                 log_level="DEBUG",
             )
-            for gene in genes
-            if overwrite or not (codebook_path.parent / f"output/{gene}_final_BamHIKpnI_.parquet").exists()
+            for gene in (genes if onlygene is None else [onlygene])
+            if overwrite
+            or onlygene is not None
+            or not (codebook_path.parent / f"output/{gene}_final_BamHIKpnI_.parquet").exists()
         }
         failed: list[tuple[str, Exception]] = []
         for fut in as_completed(futs.values()):

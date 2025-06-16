@@ -16,7 +16,7 @@ from .ext.dataset import Dataset, ReferenceDataset
 from .ext.external_data import ExternalData
 from .utils._alignment import gen_fasta
 from .utils._crawler import crawler
-from .utils._filtration import PROBE_CRITERIA
+from .utils._filtration import PROBE_CRITERIA, visualize_probe_coverage
 from .utils.samframe import SAMFrame
 from .utils.seqcalc import hp, tm
 
@@ -27,12 +27,14 @@ except NameError:
 
 
 pl.Config.set_tbl_rows(30)
+EXTRA_FLAG = "-extra"
 
 
 def get_pseudogenes(
     genes: list[str],
     ensembl: ExternalData,
     y: SAMFrame,
+    allow_pseudogenes: bool = False,
     limit: int = -1,  # allow: list[str] | None = None
 ) -> tuple[pl.Series, pl.DataFrame]:
     counts = (
@@ -46,24 +48,39 @@ def get_pseudogenes(
         .sort("count", descending=True)
         .with_row_count("i")
         .with_columns(
-            acceptable=pl.col("transcript_name").str.contains(rf"^({'|'.join(genes)})-[a-zA-Z]?.*")
-            # | pl.col("transcript").is_in(allow)
-            # | pl.col("transcript_name").str.starts_with("Gm")
-            | pl.col("transcript_name").is_null(),
+            is_related=pl.col("transcript_name").str.contains(rf"^({'|'.join(genes)})-[\w-]?.*")
+            | pl.col("transcript").is_in(genes),
             significant=pl.col("count") > 0.1 * pl.col("count").max(),
         )
+    )
+    max_related = counts.filter(pl.col("is_related"))["i"].max()
+
+    # print(genes, max_related, counts)
+    counts = counts.with_columns(
+        maybe_acceptable=(pl.col("transcript_name").str.starts_with("Gm"))
+        & (pl.col("count") > 0.5 * pl.col("count").max())
+        & pl.col("i").lt(max_related),
+        # | pl.col("i").lt(max_related)
+        # & (
+        #     pl.col("transcript_name").is_null()
+        #     | pl.col("transcript_name").str.starts_with("Gm")
+        # )
+    ).with_columns(
+        acceptable=pl.col("is_related")
+        if not allow_pseudogenes
+        else (pl.col("is_related") | pl.col("maybe_acceptable"))
     )
 
     not_acceptable = counts.filter(~pl.col("acceptable"))
     # cutoff when the probes bind to other genes
-    limit = limit if limit > 0 else (not_acceptable[0, "i"] - 1 or 10)
+    # limit = limit if limit > 0 else (not_acceptable[0, "i"] - 1 or 10)
 
     if len(not_acceptable) > 0.1 * len(counts):
         logger.warning(f"More than 10% of candidates of {genes} bind to other genes.")
         # print(not_acceptable[:50])
 
     # Filter based on expression and number of probes aligned.
-    return counts.filter(pl.col("significant") & pl.col("acceptable"))[:limit]["transcript"], counts
+    return counts.filter(pl.col("significant") & pl.col("acceptable"))["transcript"], counts
 
 
 def get_candidates(
@@ -81,22 +98,30 @@ def get_candidates(
     if not ((transcript is not None) ^ (seq is not None)):
         raise ValueError("Either gene or sequence must be specified.")
 
-    if (
-        seq is None
-        and transcript
-        and not (re.search(r"\-2\d\d", transcript) or "ENSMUST" in transcript or "ENST" in transcript)
-        and dataset.ensembl is not None
-    ):
-        transcript = get_transcripts(dataset, [transcript], mode="canonical")[0, "transcript_id"]
-        appris = get_transcripts(dataset, [transcript], mode="appris")
+    # if (
+    #     seq is None
+    #     and transcript
+    #     and not (
+    #         re.search(r"\-2\d\d", transcript)
+    #         or "ENSMUST" in transcript
+    #         or "ENST" in transcript
+    #     )
+    #     and dataset.ensembl is not None
+    # ):
+    #     transcript = get_transcripts(dataset, [transcript], mode="canonical")[
+    #         0, "transcript_id"
+    #     ]
+    #     appris = get_transcripts(dataset, [transcript], mode="appris")
 
-        if not appris.filter(pl.col("transcript_id") == transcript).shape[0]:
-            logger.warning(f"Ensembl canonical transcript {transcript} not found in APPRIS.")
-            transcript = appris[0, "transcript_id"]
+    #     if not appris.filter(pl.col("transcript_id") == transcript).shape[0]:
+    #         logger.warning(
+    #             f"Ensembl canonical transcript {transcript} not found in APPRIS."
+    #         )
+    #         transcript = appris[0, "transcript_id"]
 
-        logger.info(f"Chosen transcript: {transcript}")
-    else:
-        transcript = transcript
+    #     logger.info(f"Chosen transcript: {transcript}")
+    # else:
+    transcript = transcript
 
     if isinstance(dataset, ReferenceDataset):
         _run_transcript(
@@ -146,7 +171,9 @@ def _run_bowtie(
         .value_counts()
         .sort("count", descending=True)
         .with_columns(
-            name=pl.col("transcript").map_elements(dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8)
+            name=pl.when(pl.col("transcript").ne("*"))
+            .then(pl.col("transcript").map_elements(dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8))
+            .otherwise(pl.col("transcript"))
             if isinstance(dataset, ReferenceDataset)
             else pl.col("transcript")
         )
@@ -191,7 +218,7 @@ def _run_transcript(
     if fasta is not None:
         raise NotImplementedError("FASTA not implemented yet.")
 
-    if transcript is not None:
+    if transcript is not None and not transcript.endswith(EXTRA_FLAG):
         transcript = transcript.split(".")[0]
         try:
             row = dataset.ensembl.filter(
@@ -212,11 +239,14 @@ def _run_transcript(
             logger.warning(f"Transcript {transcript_id} not found in GENCODE basic.")
 
         logger.info(f"Crawler running for {transcript_id}")
-
+    elif transcript is not None and transcript.endswith(EXTRA_FLAG):
+        transcript_id = transcript_name = gene = transcript = transcript
+        tss_gencode = tss_allofgene = {transcript}
     else:
         tss_gencode = tss_allofgene = set()
         gene, seq = next(pyfastx.Fastx(fasta))
         transcript_id = transcript_name = gene
+    del transcript
 
     gene: str
     transcript_id: str
@@ -227,7 +257,7 @@ def _run_transcript(
         offtargets = pl.read_parquet(output / f"{transcript_name}_bowtie.parquet")
         y = pl.read_parquet(output / f"{transcript_name}_all.parquet")
         try:
-            stats = json.loads(output.joinpath(f"{transcript}_crawled.stats.json").read_text())
+            stats = json.loads(output.joinpath(f"{transcript_name}_crawled.stats.json").read_text())
         except FileNotFoundError:
             stats = {}
     except (FileNotFoundError, pl.exceptions.ComputeError):
@@ -244,6 +274,12 @@ def _run_transcript(
             prefix=f"{gene if fasta is None else ''}_{transcript_id}",
             formamide=formamide,
         )
+        # visualize_probe_coverage(
+        #     crawled["pos_start"],
+        #     crawled["pos_end"],
+        #     len(seq),
+        #     output / f"{transcript_name}_crawled.coverage.txt",
+        # )
         if len(crawled) > 5000:
             logger.warning(f"Transcript {transcript_id} has {len(crawled)} probes. Using only 2000.")
             crawled = crawled.sample(n=5000, shuffle=True, seed=3)
@@ -260,7 +296,8 @@ def _run_transcript(
                 seq_full=pl.col("seq"),
             )
             .with_columns(
-                splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
+                # need to be swapped because split_probe is not rced.
+                splint=pl.col("splitted").list.get(1),
                 padlock=pl.col("splitted").list.get(0),
                 pad_start=pl.col("splitted").list.get(2).cast(pl.Int16),
             )
@@ -326,17 +363,15 @@ def _run_transcript(
                 "maps_to_pseudo": "",
             })
 
-            isoforms = (
-                SAMFrame(y)
-                .filter_isin(transcript=tss_allofgene)[["name", "transcript"]]
-                .with_columns(
-                    isoforms=pl.col("transcript").map_elements(
-                        dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8
-                    )
-                )[["name", "isoforms"]]
-                .group_by("name")
-                .all()
-            )
+        isoforms = (
+            SAMFrame(y)
+            .filter_isin(transcript=tss_allofgene)[["name", "transcript"]]
+            .with_columns(
+                isoforms=pl.col("transcript").map_elements(dataset.ensembl.ts_to_tsname, return_dtype=pl.Utf8)
+            )[["name", "isoforms"]]
+            .group_by("name")
+            .all()
+        )
 
         tss_allacceptable: list[str] = list(tss_allofgene | tss_others) + ["*"]
         pl.DataFrame(
@@ -356,7 +391,7 @@ def _run_transcript(
         )
 
     ff = SAMFrame(
-        ff.agg_tm_offtarget(tss_allacceptable, formamide=40)
+        ff.agg_tm_offtarget(tss_allacceptable, formamide=formamide)
         .with_columns(
             transcript_name=pl.col("transcript").map_elements(
                 dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8
@@ -384,6 +419,9 @@ def _run_transcript(
             ~pl.col("seq").map_elements(lambda x: dataset.check_kmers(cast(str, x)), return_dtype=pl.Boolean)
         )
     )
+    notoks = ff.filter(pl.col("oks") == 0)
+    if not notoks.is_empty():
+        logger.info(f"{len(notoks)} have no priority")
 
     if dataset.species in GOOD_SPECIES:
         ff = ff.join(names_with_pseudo, on="name", how="left").join(isoforms, on="name", how="left")
@@ -397,7 +435,7 @@ def _run_transcript(
         "post_match_filter": len(ff),
     }
     ff.write_parquet(output / f"{transcript_name}_crawled.parquet")
-    output.joinpath(f"{transcript}_crawled.stats.json").write_text(json.dumps(stats, indent=2))
+    output.joinpath(f"{transcript_name}_crawled.stats.json").write_text(json.dumps(stats, indent=2))
     return ff
 
 
@@ -433,7 +471,12 @@ def _run_transcript_generic(
         else:
             logger.info(f"{transcript}: {len(seq)}bp")
 
-        crawled = crawler(seq, prefix=f"{transcript}_{transcript}", formamide=formamide)
+        crawled = crawler(
+            seq,
+            prefix=f"{transcript}_{transcript}",
+            formamide=formamide,
+            length_limit=(43, 54),
+        )
         if len(crawled) > 5000:
             logger.warning(f"Transcript {transcript} has {len(crawled)} probes. Using only 2000.")
             crawled = crawled.sample(n=5000, shuffle=True, seed=3)
@@ -450,12 +493,20 @@ def _run_transcript_generic(
                 seq_full=pl.col("seq"),
             )
             .with_columns(
-                splint=pl.col("splitted").list.get(1),  # need to be swapped because split_probe is not rced.
+                # need to be swapped because split_probe is not rced.
+                splint=pl.col("splitted").list.get(1),
                 padlock=pl.col("splitted").list.get(0),
                 pad_start=pl.col("splitted").list.get(2).cast(pl.Int16),
             )
             .drop("splitted")
             .filter(pl.col("splint").str.len_chars() > 0)
+        )
+        # print(crawled.schema)
+        visualize_probe_coverage(
+            crawled["pos_start"],
+            crawled["pos_end"],
+            len(seq),
+            output_file=output / f"{transcript}_crawled.coverage.txt",
         )
         # To get pad_start
         crawled = (
@@ -502,7 +553,7 @@ def _run_transcript_generic(
         )
 
     ff = SAMFrame(
-        ff.agg_tm_offtarget(tss_allacceptable, formamide=40)
+        ff.agg_tm_offtarget(tss_allacceptable, formamide=formamide)
         .with_columns(
             # transcript_name=pl.col("transcript").map_elements(
             #     dataset.ensembl.ts_to_gene, return_dtype=pl.Utf8

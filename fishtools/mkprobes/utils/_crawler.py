@@ -8,9 +8,9 @@ from .sequtils import gc_content
 def crawler(
     seq: str,
     prefix: str,
-    length_limit: tuple[int, int] = (43, 52),
+    length_limit: tuple[int, int] = (43, 55),
     gc_limit: tuple[float, float] = (0.3, 0.7),
-    tm_limit: tuple[float, float] = (54, 66),
+    tm_limit: tuple[float, float] = (54, 68),
     hairpin_limit: float = 50,
     tm_model: Model = "hybrid",
     to_avoid: list[str] | None = None,
@@ -46,10 +46,13 @@ def crawler(
     if to_avoid is None:
         to_avoid = []
     to_avoid = to_avoid.copy()
-    to_avoid.extend(["A" * 5, "T" * 5, "C" * 5, "G" * 5])
+    to_avoid.extend(["A" * 6, "T" * 6, "C" * 5, "G" * 5])
+    poss_start = []
+    poss_end = []
+    seq = seq.upper()
 
     for start in range(len(seq) - length_limit[0]):
-        if seq[start].lower() == "n":
+        if seq[start] == "N":
             continue
 
         while True:
@@ -75,12 +78,14 @@ def crawler(
                 ):
                     names.append(f"{prefix}:{start}-{end - 1}")
                     seqs.append(seq[start:end])
+                    poss_start.append(start)
+                    poss_end.append(end - 1)
                 else:
                     fail_reasons["hairpin"] += 1
                 break
             end += 1
 
-    df = pl.DataFrame(dict(name=names, seq=seqs))
+    df = pl.DataFrame(dict(name=names, seq=seqs, pos_start=poss_start, pos_end=poss_end))
     ret = df.filter(~pl.col("seq").str.contains("|".join(to_avoid)))
     assert not df["seq"].str.contains("N").any()
     fail_reasons["homopolymer"] = len(df) - len(ret)

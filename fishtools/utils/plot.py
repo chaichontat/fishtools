@@ -1,4 +1,5 @@
-from typing import Any, NamedTuple
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import cmocean  # colormap, do not remove
 import colorcet as cc  # colormap, do not remove
@@ -7,11 +8,18 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
+import scanpy as sc
 from matplotlib.axes import Axes
 from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
+
+from fishtools.utils.utils import copy_signature
+
+if TYPE_CHECKING:
+    import anndata as ad
 
 
 def plot_wheel(
@@ -68,7 +76,32 @@ def plot_wheel(
     return fig, axs
 
 
-def add_scalebar(
+def plot_with_hist(
+    pcs: npt.NDArray[np.float32],
+    fig: Figure | None = None,
+    **kwargs: Any,
+) -> tuple[Figure, NamedTuple]:
+    axs = NamedTuple("axs", scatter=Axes, histx=Axes)(
+        scatter=plt.subplot2grid((6, 6), (1, 0), colspan=5, rowspan=5),
+        histx=plt.subplot2grid((6, 6), (0, 0), colspan=5),
+    )
+    fig = fig or plt.figure(1, figsize=(6, 6))
+    H, xedges, yedges = np.histogram2d(pcs[:, 0], pcs[:, 1], bins=(200, 200))
+
+    scatter_kw = kwargs
+    sc = axs.scatter.scatter(pcs[:, 0], pcs[:, 1], **scatter_kw)
+    sc.set_edgecolor((0.4, 0.4, 0.4, 0.5))
+
+    axs.histx.hist(pcs[:, 0], bins=xedges, alpha=0.8, edgecolor=None, linewidth=0)
+
+    nullfmt = mpl.ticker.NullFormatter()
+    axs.histx.xaxis.set_major_formatter(nullfmt)
+
+    fig.tight_layout()
+    return fig, axs
+
+
+def add_scale_bar(
     ax: Axes,
     length: float,
     label: str,
@@ -183,3 +216,157 @@ def create_label_colormap(label_image: np.ndarray):
     cmap = ListedColormap(colors)
 
     return normalized_image, cmap
+
+
+def make_rgb(
+    r: np.ndarray | None = None, g: np.ndarray | None = None, b: np.ndarray | None = None
+) -> np.ndarray:
+    """
+    Create an RGB image from three separate channels.
+    If a channel is None, it will be treated as an array of zeros.
+
+    Parameters:
+    - r: Red channel (2D array) or None
+    - g: Green channel (2D array) or None
+    - b: Blue channel (2D array) or None
+
+    Returns:
+    - RGB image (3D array with shape (height, width, 3))
+    """
+    channels = [r, g, b]
+    provided_channels = [c for c in channels if c is not None]
+
+    if not provided_channels:
+        raise ValueError("At least one channel must be provided.")
+
+    ref_shape = provided_channels[0].shape
+    ref_dtype = provided_channels[0].dtype
+
+    for c in provided_channels:
+        if c.shape != ref_shape:
+            raise ValueError("All provided input arrays must have the same shape.")
+        if c.ndim != 2:
+            raise ValueError("Input arrays must be 2D.")
+
+    final_channels = []
+    for c in channels:
+        if c is None:
+            final_channels.append(np.zeros(ref_shape, dtype=ref_dtype))
+        else:
+            final_channels.append(c)
+
+    return np.dstack(final_channels)
+
+
+def imshow_perc(ax: Axes, img: np.ndarray, percs: Sequence[float] | None = None, **kwargs: Any) -> None:
+    """
+    Display an image on a given Axes with percentiles for color scaling.
+
+    Parameters:
+    - ax: matplotlib.axes.Axes
+        The axes to display the image on.
+    - img: numpy.ndarray
+        The image to display.
+    - kwargs: Additional keyword arguments for imshow.
+    """
+    if percs is None:
+        percs = [1, 99]
+    vmin = np.percentile(img, percs[0])
+    vmax = np.percentile(img, percs[1])
+
+    ax.imshow(img, vmin=vmin, vmax=vmax, **kwargs)
+
+
+def normalize(x: np.ndarray, percs: Sequence[float] = (1, 99)):
+    """Normalize the image to the given percentiles."""
+    vmin = np.percentile(x, percs[0])
+    vmax = np.percentile(x, percs[1])
+    return (x - vmin) / (vmax - vmin)
+
+
+def add_legend(
+    ax: plt.Axes,
+    channel_names: Sequence[str | None],
+    colors: Sequence[str] | None = None,
+    loc: str = "best",
+    **kwargs,
+):
+    """
+    Adds a legend to an Axes object for an RGB image, with colored text.
+
+    Parameters:
+    - ax: The Matplotlib Axes to add the legend to.
+    - channel_names: A sequence of names for the R, G, B channels.
+                     If a name is None, that channel is skipped.
+                     Example: ["Red Channel", "Green Channel", "Blue Channel"]
+    - colors: A sequence of colors corresponding to R, G, B.
+              Defaults to ["magenta", "lime", "blue"].
+    - loc: Location of the legend (e.g., "upper right").
+    - kwargs: Additional keyword arguments to pass to ax.legend().
+    """
+    if colors is None:
+        colors = ["red", "lime", "blue"]
+
+    active_labels = []
+    active_colors = []
+    dummy_handles = []
+
+    for name, color_str in zip(channel_names, colors):
+        if name is not None:
+            active_labels.append(name)
+            active_colors.append(color_str)
+            # Create a dummy handle that won't be visible
+            dummy_handles.append(Line2D([0], [0], marker="", color="none", linestyle="None"))
+
+    if active_labels:
+        legend = ax.legend(
+            dummy_handles,
+            active_labels,
+            loc=loc,
+            handlelength=0,
+            handletextpad=0,
+            frameon=False,
+            **kwargs,
+        )
+        shift = max([t.get_window_extent().width for t in legend.get_texts()])
+
+        for text, color_str in zip(legend.get_texts(), active_colors):
+            text.set_color(color_str)
+            text.set_fontweight("bold")
+            if "right" in loc:
+                text.set_horizontalalignment("right")
+                text.set_position((shift - text.get_window_extent().width, 0))
+    return ax
+
+
+@copy_signature(sc.pl.embedding)
+def plot_embedding(
+    adata: "ad.AnnData", figsize: tuple[float, float] | None = None, dpi: float = 200, **kwargs: Any
+):
+    """
+    Plot the embedding of an AnnData object.
+
+    Parameters:
+    - adata: AnnData object containing the embedding data.
+    """
+
+    kwargs = kwargs | {"return_fig": True}
+    fig = cast(Figure, sc.pl.embedding(adata, **kwargs))
+
+    if figsize:
+        fig.set_size_inches(*figsize)
+    if dpi:
+        fig.set_dpi(dpi)
+
+    axes: list[plt.Axes] = []
+    for ax in fig.axes:
+        if ax.get_label() == "<colorbar>":
+            continue
+        if not ax.has_data():
+            fig.delaxes(ax)
+            continue
+
+        ax.set_aspect("equal")
+        axes.append(ax)
+
+    return fig, axes

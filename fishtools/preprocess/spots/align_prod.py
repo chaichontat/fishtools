@@ -60,9 +60,10 @@ class DecodeConfig(BaseModel):
 
     max_distance: float = 0.3
     min_intensity: float = 0.001
-    min_area: int = 10
+    min_area: int = 8
     max_area: int = 200
     use_correct_direction: bool = True
+    sigma: tuple[float, float, float] = (2.0, 2, 2)
 
 
 OPTIMIZE_CONFIG = DecodeConfig(
@@ -70,6 +71,7 @@ OPTIMIZE_CONFIG = DecodeConfig(
     max_distance=0.3,
     min_area=20,
     max_area=200,
+    # sigma=(2.0, 1.5, 1.5),
     use_correct_direction=True,
 )
 
@@ -940,8 +942,10 @@ def run(
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
     # But it's there as a reference.
 
-    ghp = Filter.GaussianHighPass(sigma=8, is_volume=True, level_method=Levels.SCALE_SATURATED_BY_IMAGE)
-    ghp.sigma = (6 / (max_proj or 1), 8, 8)  # z,y,x
+    ghp = Filter.GaussianHighPass(
+        sigma=config.sigma[2], is_volume=True, level_method=Levels.SCALE_SATURATED_BY_IMAGE
+    )
+    ghp.sigma = (config.sigma[0] / (max_proj or 1), config.sigma[1], config.sigma[2])  # z,y,x
     logger.debug(f"Running GHP with sigma {ghp.sigma}")
 
     imgs: ImageStack = ghp.run(stack)

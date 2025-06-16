@@ -36,9 +36,7 @@ rCU/dGA,-0.99,-4.79,-12.2
 rCG/dGC,-1.67,-8.53,-22.1
 rCC/dGG,-1.87,-5.28,-11.0
 init,+2.65,-3.11,-18.8
-""".replace(
-            "I", "/"
-        )
+""".replace("I", "/")
         .replace("U", "T")
         .replace("r", "")
         .replace("d", "")
@@ -89,7 +87,11 @@ def tm_q5(seq: str, /, **kwargs: Unpack[Conditions]) -> float:
 
 def tm(seq: str, model: Model, formamide: float = 0, **kwargs: Unpack[Conditions]) -> float:
     return (
-        mt.Tm_NN(Seq(seq), **(CONDITIONS[model] | kwargs), saltcorr=5 if model == "dna" else 0)
+        mt.Tm_NN(
+            Seq(seq),
+            **(CONDITIONS[model] | kwargs),
+            saltcorr=5 if model == "dna" else 0,
+        )
         + formamide_correction(seq, fmd=formamide)
         + (rna_salt_corr((CONDITIONS[model] | kwargs)["Na"], gc_content(seq)) if model != "dna" else 0)
     )
@@ -122,7 +124,11 @@ r = re.compile(r"(\|{15,})")
 
 @cache
 def tm_pairwise(
-    seq: str, cigar: str, mismatched_reference: str, model: Model = "rna", formamide: float = 0
+    seq: str,
+    cigar: str,
+    mismatched_reference: str,
+    model: Model = "hybrid",
+    formamide: float = 0,
 ) -> float:
     p = pairwise_alignment(seq, cigar, mismatched_reference)
     try:
