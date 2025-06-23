@@ -16,6 +16,7 @@ from typing import Any, Literal, Mapping, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
+import polars as pl
 import rich_click as click
 import starfish
 import starfish.data
@@ -69,7 +70,7 @@ class DecodeConfig(BaseModel):
 OPTIMIZE_CONFIG = DecodeConfig(
     min_intensity=0.012,
     max_distance=0.3,
-    min_area=20,
+    min_area=15,
     max_area=200,
     # sigma=(2.0, 1.5, 1.5),
     use_correct_direction=True,
@@ -79,7 +80,7 @@ OPTIMIZE_CONFIG = DecodeConfig(
 os.environ["TQDM_DISABLE"] = "1"
 
 
-def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = False):
+def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = False) -> ImageStack:
     try:
         with warnings.catch_warnings(action="ignore"):
             # ! Normalize to 1. Any operations done after this WILL be clipped in [0, 1].
@@ -89,15 +90,16 @@ def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = F
         raise Exception(f"{path} is corrupted. Deleted. Please rerun register")
 
     class DemoFetchedTile(FetchedTile):
-        def __init__(self, z, chs, *args, **kwargs):
+        def __init__(self, img: np.ndarray, z: int, chs: int, *args, **kwargs):
+            self.img = img
             self.z = z
             self.c = chs
 
         @property
         def shape(self) -> Mapping[Axes, int]:
             return {
-                Axes.Y: img.shape[2],
-                Axes.X: img.shape[3],
+                Axes.Y: self.img.shape[2],
+                Axes.X: self.img.shape[3],
             }
 
         @property
@@ -110,17 +112,17 @@ def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = F
 
         def tile_data(self) -> np.ndarray:
             if not max_proj:
-                return img[self.z, self.c]
+                return self.img[self.z, self.c]
             elif max_proj == 1:
-                return img[:, self.c].max(axis=0)
+                return self.img[:, self.c].max(axis=0)
             else:
                 start = self.z // max_proj
-                end = min(start + max_proj, img.shape[0])
-                return img[start:end, self.c].max(axis=0)
+                end = min(start + max_proj, self.img.shape[0])
+                return self.img[start:end, self.c].max(axis=0)
 
     class DemoTileFetcher(TileFetcher):
         def get_tile(self, fov_id: int, round_label: int, ch_label: int, zplane_label: int) -> FetchedTile:
-            return DemoFetchedTile(zplane_label, ch_label)
+            return DemoFetchedTile(img, zplane_label, ch_label)
 
     return ImageStack.from_tilefetcher(
         DemoTileFetcher(),
@@ -308,6 +310,7 @@ def sample_imgs(
 @click.option("--overwrite", is_flag=True)
 @click.option("--split", type=int, default=0)
 @click.option("--max-proj", type=int, default=0)
+@click.option("--blank", type=str, default=None)
 def step_optimize(
     path: Path,
     roi: str,
@@ -319,6 +322,7 @@ def step_optimize(
     overwrite: bool = False,
     split: int = 0,
     max_proj: int = False,
+    blank: str | None = None,
 ):
     wd = path / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}"
     if round_num > 0 and not (wd / "percentiles.json").exists():
@@ -349,6 +353,7 @@ def step_optimize(
             f"--split={split}",
             *([f"--max-proj={max_proj}"] if max_proj else []),
             *(["--roi", roi] if roi else []),
+            *(["--blank", blank] if blank else []),
         ],
         threads=threads,
     )
@@ -365,6 +370,7 @@ def step_optimize(
 @click.option("--overwrite", is_flag=True)
 @click.option("--round", "round_num", type=int, default=0)
 @click.option("--max-proj", type=int, default=0)
+@click.option("--blank", type=str, default=None)
 def find_threshold(
     path: Path,
     roi: str,
@@ -373,6 +379,7 @@ def find_threshold(
     overwrite: bool = False,
     round_num: int = 0,
     max_proj: int = 0,
+    blank: str | None = None,
 ):
     SUBFOLDER = "_highpassed"
     paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
@@ -404,6 +411,7 @@ def find_threshold(
                 str(codebook),
                 "--highpass-only",
                 *(["--overwrite"] if overwrite else []),
+                *(["--blank", blank] if blank else []),
             ],
             threads=4,
             split=[0],
@@ -568,8 +576,8 @@ def combine(path: Path, roi: str, codebook_path: Path, batch_size: int, round_nu
             except IndexError:
                 logger.warning(f"No deviation for round {round_num} in {p}. Skipping.")
                 continue
-            if want.n < 200:
-                logger.debug(f"Skipping {p} at round {round_num} because n={want.n} < 200.")
+            if want.n < 150:
+                logger.debug(f"Skipping {p} at round {round_num} because n={want.n} < 150.")
                 continue
             curr.append(np.nan_to_num(np.array(want.deviation, dtype=float), nan=1) * want.n)
             n += want.n
@@ -627,7 +635,7 @@ def initial(img: ImageStack, percentiles: tuple[float, float] = (1, 99.99)):
     maxed = img.reduce({Axes.ROUND, Axes.ZPLANE}, func="max")
     res = np.percentile(np.array(maxed.xarray).squeeze(), percentiles, axis=(1, 2))
     # res = np.array(maxed.xarray).squeeze()
-    if np.isnan(res).any() or (res == 0).any():
+    if np.isnan(res).any() or (res[:, 1] == 0).any():
         raise ValueError("NaNs or zeros found in initial scaling factor.")
     return res
 
@@ -791,6 +799,70 @@ def spot_decoding(
     return decoder.run(spots=spots)
 
 
+KEYS_560NM = set(range(1, 9)) | {25, 28, 31, 34}
+KEYS_650NM = set(range(9, 17)) | {26, 29, 32, 35}
+KEYS_750NM = set(range(17, 25)) | {27, 30, 33, 36}
+GAUSS_SIGMA = (2, 2, 2)
+
+
+def get_blank_channel_info(key: str) -> tuple[int, int]:
+    """
+    Maps an image channel key to its corresponding wavelength and blank channel index.
+
+    Args:
+        key: The channel key (string representation of an integer).
+
+    Returns:
+        A tuple containing (wavelength_nm, blank_channel_index).
+    """
+    key_int = int(key)
+    if key_int in KEYS_560NM:
+        return 560, 0
+    if key_int in KEYS_650NM:
+        return 650, 1
+    if key_int in KEYS_750NM:
+        return 750, 2
+    raise ValueError(f"Channel key '{key}' has no defined wavelength mapping.")
+
+
+def generate_subtraction_matrix(blanks: xr.DataArray, coefs: pl.DataFrame, keys: list[str]) -> xr.DataArray:
+    keys_df = pl.DataFrame({"channel_key": [int(k) for k in keys], "output_key": keys})
+    params_df = keys_df.join(coefs, on="channel_key", how="left", maintain_order="left")
+    if params_df["slope"].is_null().any():
+        missing_key = params_df.filter(pl.col("slope").is_null())["output_key"][0]
+        raise ValueError(f"No parameters found for channel key '{missing_key}'.")
+
+    # Extract slopes and intercepts as NumPy arrays
+    slopes = params_df["slope"].to_numpy()
+    intercepts = params_df["intercept"].to_numpy()
+
+    # G# Get the corresponding source blank index for each output key
+
+    # --- 2. Vectorized Selection ---
+
+    # Select all necessary source blank channels at once using the list of indices.
+    # If blanks.dims is (r,c,z,y,x) and len(keys) is N,
+    # this creates a DataArray with dims (r, c, z, y, x) and shape (1, N, z, y, x).
+    # The new 'c' dimension corresponds to our N output channels.
+    source_indices = [get_blank_channel_info(key)[1] for key in keys]
+    selected_blanks = blanks.isel(c=source_indices)
+    # print(selected_blanks.max({Axes.X, Axes.Y, Axes.ZPLANE}))
+
+    slope_da = xr.DataArray(slopes, dims=[str(Axes.CH)])
+    intercept_da = xr.DataArray(intercepts, dims=[str(Axes.CH)])
+    # print(slope_da)
+    # print(intercept_da)
+
+    scaled_channels = (selected_blanks * slope_da) + intercept_da / 65535
+    # print(scaled_channels.max({Axes.X, Axes.Y, Axes.ZPLANE}))
+    floored_channels = xr.where(scaled_channels < 0, 0, scaled_channels)
+
+    # Ensure the dimension order is what we expect (though it should be already)
+    return -floored_channels.transpose(
+        str(Axes.ROUND), str(Axes.CH), str(Axes.ZPLANE), str(Axes.Y), str(Axes.X)
+    )
+
+
 @spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--overwrite", is_flag=True)
@@ -811,6 +883,7 @@ def spot_decoding(
 )
 @click.option("--simple", is_flag=True)
 @click.option("--roi", type=str, default=None)
+@click.option("--blank", type=str, default=None)
 def run(
     path: Path,
     *,
@@ -827,8 +900,8 @@ def run(
     simple: bool = False,
     max_proj: int = 0,
     config: DecodeConfig = DecodeConfig(),
-    lock: None = None,
     roi: str | None = None,
+    blank: str | None = None,
 ):
     """
     Run spot calling.
@@ -937,18 +1010,78 @@ def run(
         #     [bit_mapping[k] for k in used_bits],
         # ],
     )
+    # print(stack.xarray)
+
+    match = re.match(r"^registered--(\w+)\+(\w+)$", path.parent.name)
+    if match is None:
+        raise ValueError(
+            f"Path {path.parent.name} does not match expected format 'registered--<roi>+<codebook>'"
+        )
+    _roi, _codebook = match.groups()
+
+    _slc_blank = tuple(np.s_[::subsample_z, :]) + tuple(split_slice)
+    stack_blank = (
+        make_fetcher(
+            path.parent.parent / f"registered--{_roi}+{blank}" / path.name,
+            _slc_blank,
+            max_proj=max_proj,
+        )
+        if blank is not None
+        else None
+    )
+    del _roi, _codebook, _slc_blank
 
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
     # But it's there as a reference.
 
     ghp = Filter.GaussianHighPass(
-        sigma=config.sigma[2], is_volume=True, level_method=Levels.SCALE_SATURATED_BY_IMAGE
+        sigma=config.sigma[2],
+        is_volume=True,
+        level_method=Levels.SCALE_SATURATED_BY_IMAGE,
     )
-    ghp.sigma = (config.sigma[0] / (max_proj or 1), config.sigma[1], config.sigma[2])  # z,y,x
+    ghp.sigma = (
+        config.sigma[0] / (max_proj or 1),
+        config.sigma[1],
+        config.sigma[2],
+    )  # z,y,x
     logger.debug(f"Running GHP with sigma {ghp.sigma}")
 
     imgs: ImageStack = ghp.run(stack)
+    blanks: ImageStack | None = ghp.run(stack_blank) if stack_blank is not None else None
+
+    # --- Blank subtraction ---
+    if blanks is not None:
+        import polars as pl
+
+        df = pl.read_csv(path.parent.parent / "robust_bleedthrough_params.csv")
+        logger.info("Generating subtraction matrix for blanks.")
+        sub_mtx = generate_subtraction_matrix(blanks.xarray, df, used_bits)
+        # print(imgs.xarray)
+        # print(sub_mtx)
+        del blanks
+        logger.debug("Subtracting")
+        # Will automatically clip at 0.
+        # tifffile.imwrite(
+        #     path.parent.parent / f"{path.stem}_{codebook_path.stem}.hp.tif",
+        #     imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+        #     compression="zlib",
+        #     metadata={"keys": img_keys},
+        # )
+        # tifffile.imwrite(
+        #     path.parent.parent / f"{path.stem}_{codebook_path.stem}.blank.tif",
+        #     sub_mtx.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+        #     compression="zlib",
+        #     metadata={"keys": img_keys},
+        # )
+        ElementWiseAddition(sub_mtx).run(imgs, in_place=True)
+        # tifffile.imwrite(
+        #     path.parent.parent / f"{path.stem}_{codebook_path.stem}.hpsub.tif",
+        #     imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+        #     compression="zlib",
+        #     metadata={"keys": img_keys},
+        # )
+        del sub_mtx
 
     if highpass_only:
         (path.parent / "_highpassed").mkdir(exist_ok=True)
@@ -1157,6 +1290,7 @@ def parse_duration(duration_str: str) -> timedelta:
 )
 @click.option("--delete-corrupted", is_flag=True)
 @click.option("--local-opt", is_flag=True)
+@click.option("--blank", type=str, default=None)
 def batch(
     path: Path,
     roi: str,
@@ -1171,6 +1305,7 @@ def batch(
     since: str | None = None,
     delete_corrupted: bool = False,
     local_opt: bool = False,
+    blank: str | None = None,
 ):
     all_paths = {p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
     paths_in_scope = all_paths  # Start with all paths
@@ -1250,6 +1385,7 @@ def batch(
                 "--simple" if simple else "",
                 f"--max-proj={max_proj}" if max_proj else "",
                 f"--roi={roi}" if roi else "",
+                f"--blank={blank}" if blank else "",
             ],
             threads=threads,
             split=split,
@@ -1269,6 +1405,7 @@ def batch(
                 f"--limit-z={limit_z}",
                 "--simple" if simple else "",
                 f"--max-proj={max_proj}" if max_proj else "",
+                f"--blank={blank}" if blank else "",
             ],
             threads=threads,
             split=split,

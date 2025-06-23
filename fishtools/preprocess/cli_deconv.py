@@ -2,6 +2,7 @@ import functools
 import json
 import pickle
 import queue
+import re
 import sys
 import threading
 import time
@@ -380,7 +381,7 @@ def _get_percentiles_for_round(
             percentile_scales.append(scale_val)
             continue
 
-        is_rna_bit = bit.isdigit() and int(bit) <= max_rna_bit
+        is_rna_bit = (bit.isdigit() and int(bit) <= max_rna_bit) or re.match(r"^b\d{3}$", bit)
         if not is_rna_bit:
             # Protein staining often has bright flare spots.
             logger.info(

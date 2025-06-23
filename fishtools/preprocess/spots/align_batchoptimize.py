@@ -20,6 +20,7 @@ from loguru import logger
 @click.option("--threads", type=int, default=10)
 @click.option("--batch-size", type=int, default=50)
 @click.option("--max-proj", is_flag=True)
+@click.option("--blank", type=str, default=None, help="Blank image to subtract")
 def optimize(
     path: Path,
     roi: str,
@@ -28,6 +29,7 @@ def optimize(
     threads: int = 10,
     max_proj: bool = False,
     batch_size: int = 50,
+    blank: str | None = None,
 ):
     if not len(list(path.glob(f"registered--{roi}{'*' if roi != '*' else ''}"))):
         raise ValueError(
@@ -56,7 +58,7 @@ def optimize(
         logger.info(f"Starting from round {min(existing, existing_perc)}")
 
     if existing < existing_perc:
-        raise Exception("Percentiles count < existing rounds. Should not happen.")
+        raise Exception("Existing rounds < Percentiles rounds. Should not happen.")
 
     for i in range(min(existing, existing_perc), rounds):
         logger.critical(f"Starting round {i}")
@@ -77,6 +79,7 @@ def optimize(
                 "--overwrite",
                 "--split=0",
                 *(["--max-proj=1"] if max_proj else []),
+                *(["--blank", blank] if blank else []),
             ],
             check=True,
             capture_output=False,
@@ -109,6 +112,7 @@ def optimize(
                 "--codebook",
                 codebook,
                 f"--round={i}",
+                *(["--blank", blank] if blank else []),
             ],
             check=True,
             capture_output=False,
