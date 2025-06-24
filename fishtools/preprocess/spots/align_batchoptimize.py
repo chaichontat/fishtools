@@ -21,6 +21,7 @@ from loguru import logger
 @click.option("--batch-size", type=int, default=50)
 @click.option("--max-proj", is_flag=True)
 @click.option("--blank", type=str, default=None, help="Blank image to subtract")
+@click.option("--threshold", type=float, default=0.008, help="CV before stopping")
 def optimize(
     path: Path,
     roi: str,
@@ -30,6 +31,7 @@ def optimize(
     max_proj: bool = False,
     batch_size: int = 50,
     blank: str | None = None,
+    threshold: float = 0.008,
 ):
     if not len(list(path.glob(f"registered--{roi}{'*' if roi != '*' else ''}"))):
         raise ValueError(
@@ -61,6 +63,17 @@ def optimize(
         raise Exception("Existing rounds < Percentiles rounds. Should not happen.")
 
     for i in range(min(existing, existing_perc), rounds):
+        try:
+            if i < 2:
+                raise IndexError  # Skip CV check for first two rounds
+            curr_cv = (wd / "mse.txt").read_text().splitlines()[i - 2]
+        except (FileNotFoundError, IndexError):
+            logger.warning(f"CV for round {i} not found. Assuming it is above threshold.")
+        else:
+            if float(curr_cv.split("\t")[1]) < threshold:
+                logger.info(f"CV at round {i} already below threshold {threshold}. Converged. Stopping.")
+                return
+
         logger.critical(f"Starting round {i}")
         # Increases global scale count
         subprocess.run(

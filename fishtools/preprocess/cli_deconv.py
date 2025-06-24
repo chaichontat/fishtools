@@ -516,6 +516,7 @@ def _run(
 
         while True:
             gotten = q_write.get()
+            t0 = time.time()
             if gotten is None:
                 break
             file, towrite, fid, metadata = gotten
@@ -533,6 +534,8 @@ def _run(
                 metadata=metadata,
             )
             logger.debug(f"Finished writing {file.name}")
+            if time.time() - t0 > 5:
+                logger.warning(f"Writing {file.name} took too long: {time.time() - t0:.2f}s")
             q_write.task_done()
 
     try:
@@ -544,20 +547,32 @@ def _run(
 
         with progress_bar(len(paths)) as callback:
             for _ in range(len(paths)):
+                t0 = time.time()
                 start, img, fid, metadata = q_img.get()
                 t = time.time()
+                if (t - t0) > 3:
+                    logger.warning(f"Reading {start.name} took too long: {t - t0:.2f}s")
                 # img = high_pass_filter(img.astype(np.float32), σ=(3.0, 3.0, 3.0))
                 res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors(step), iters=1)
+
                 # Somehow will result in an invalidAccessMemoryError when res.shape[1] == 1 if done directly with cupy.
-                if res.shape[1] == 1:
-                    res = res.get()
-                mins, maxs = (cp if res.shape[1] > 1 else np).percentile(
-                    res, (0.1, 99.999), axis=(0, 2, 3), keepdims=True
-                )
+                single_chan = res.shape[1] == 1
+
+                if single_chan:
+                    mins, maxs = cp.percentile(res.squeeze(), (0.1, 99.999))
+                else:
+                    mins, maxs = cp.percentile(res, (0.1, 99.999), axis=(0, 2, 3), keepdims=True)
+
+                if ((maxs - mins) < 1e-20).any():
+                    logger.warning("Dynamic range is very low.")
 
                 scale = 65534 / (maxs - mins + 1e-20)
                 towrite = (
-                    cp.clip((cp.asarray(res) - cp.asarray(mins)) * cp.asarray(scale), 0.0, 65534.0)
+                    cp.clip(
+                        (cp.asarray(res) - cp.asarray(mins)) * cp.asarray(scale),
+                        0.0,
+                        65534.0,
+                    )
                     .astype(np.uint16)
                     .get()
                     .reshape(-1, 2048, 2048)

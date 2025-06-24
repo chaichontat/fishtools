@@ -60,7 +60,7 @@ class DecodeConfig(BaseModel):
     model_config = {"frozen": True}
 
     max_distance: float = 0.3
-    min_intensity: float = 0.001
+    min_intensity: float = 0.002
     min_area: int = 8
     max_area: int = 200
     use_correct_direction: bool = True
@@ -918,6 +918,7 @@ def run(
     For actual spot calling, call with `--global-scale`.
     This will use the latest scaling factors calculated from the previous step to decode.
     """
+    debug = debug or (os.environ.get("DEBUG", "0") == "1")
     if debug:
         logger.remove()
         logger.add(sys.stderr, level="INFO")
@@ -1012,7 +1013,7 @@ def run(
     )
     # print(stack.xarray)
 
-    match = re.match(r"^registered--(\w+)\+(\w+)$", path.parent.name)
+    match = re.match(r"^registered--(.+)\+(.*)$", path.parent.name)
     if match is None:
         raise ValueError(
             f"Path {path.parent.name} does not match expected format 'registered--<roi>+<codebook>'"
@@ -1062,41 +1063,29 @@ def run(
         del blanks
         logger.debug("Subtracting")
         # Will automatically clip at 0.
-        # tifffile.imwrite(
-        #     path.parent.parent / f"{path.stem}_{codebook_path.stem}.hp.tif",
-        #     imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
-        #     compression="zlib",
-        #     metadata={"keys": img_keys},
-        # )
-        # tifffile.imwrite(
-        #     path.parent.parent / f"{path.stem}_{codebook_path.stem}.blank.tif",
-        #     sub_mtx.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
-        #     compression="zlib",
-        #     metadata={"keys": img_keys},
-        # )
-        ElementWiseAddition(sub_mtx).run(imgs, in_place=True)
-        # tifffile.imwrite(
-        #     path.parent.parent / f"{path.stem}_{codebook_path.stem}.hpsub.tif",
-        #     imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
-        #     compression="zlib",
-        #     metadata={"keys": img_keys},
-        # )
-        del sub_mtx
-
-    if highpass_only:
-        (path.parent / "_highpassed").mkdir(exist_ok=True)
-
-        out_path = path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif"
-
-        if overwrite or not out_path.exists():
-            logger.debug(f"Writing to {out_path}")
+        if debug:
+            logger.info(f"Keys: {used_bits}")
             tifffile.imwrite(
-                path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif",
+                path.parent.parent / f"{path.stem}_{codebook_path.stem}.hp.tif",
                 imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
                 compression="zlib",
                 metadata={"keys": img_keys},
             )
-        return
+            tifffile.imwrite(
+                path.parent.parent / f"{path.stem}_{codebook_path.stem}.blank.tif",
+                sub_mtx.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+                compression="zlib",
+                metadata={"keys": img_keys},
+            )
+        ElementWiseAddition(sub_mtx).run(imgs, in_place=True)
+        if debug:
+            tifffile.imwrite(
+                path.parent.parent / f"{path.stem}_{codebook_path.stem}.hpsub.tif",
+                imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+                compression="zlib",
+                metadata={"keys": img_keys},
+            )
+        del sub_mtx
 
     if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
@@ -1112,6 +1101,20 @@ def run(
                 ])
             )
         )
+
+    if highpass_only or (round_num == 0 and calc_deviations):
+        (path.parent / "_highpassed").mkdir(exist_ok=True)
+
+        out_path = path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif"
+
+        if overwrite or not out_path.exists():
+            logger.debug(f"Writing to {out_path}")
+            tifffile.imwrite(
+                path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif",
+                imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+                compression="zlib",
+                metadata={"keys": img_keys},
+            )
         return
 
     if not global_scale or not global_scale.exists():
