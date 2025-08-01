@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import cupy as cp
-import cv2
 import numpy as np
 import numpy.typing as npt
 import pyfiglet
@@ -298,18 +297,36 @@ def deconvolve_lucyrichardson_guo(
         raise ValueError("Image must be float32")
     forward_projector, backward_projector = projectors
 
+    #  for _ in range(iters):
+    #     # filtered_estimate = cconvolve(estimate, forward_projector, mode="reflect").clip(
+    #     #     EPS,
+    #     #     I_MAX,
+    #     # )
+    #     cconvolve(estimate, forward_projector, output=filtered_estimate, mode="reflect")
+    #     cp.clip(filtered_estimate, EPS, I_MAX, out=filtered_estimate)
+
+    #     # ratio = img / filtered_estimate
+    #     cp.divide(img, filtered_estimate, out=filtered_estimate)
+    #     cconvolve(
+    #         filtered_estimate,
+    #         backward_projector,
+    #         output=filtered_estimate,
+    #         mode="reflect",
+    #     )
+    #     # Correction
+    #     estimate *= filtered_estimate
+
     estimate = cp.clip(img, EPS, None)
-    # print(estimate.shape, forward_projector.shape, backward_projector.shape)
+    if iters > 1:
+        raise NotImplementedError
 
-    for _ in range(iters):
-        filtered_estimate = cconvolve(estimate, forward_projector, mode="reflect").clip(
-            EPS,
-            I_MAX,
-        )
-
-        ratio = img / filtered_estimate
-        # Correction
-        estimate *= cconvolve(ratio, backward_projector, mode="reflect")
+    filtered_estimate = cconvolve(estimate, forward_projector, mode="reflect").clip(
+        EPS,
+        I_MAX,
+    )
+    img /= filtered_estimate
+    # Correction
+    estimate *= cconvolve(img, backward_projector, mode="reflect")
 
     return estimate
 
@@ -477,54 +494,95 @@ def _run(
     overwrite: bool,
     n_fids: int,
     step: int = 6,
+    debug: bool = False,
 ):
     if not overwrite:
         paths = [f for f in paths if not (out / f.parent.name / f.name).exists()]
 
     q_write = queue.Queue(maxsize=3)
-    q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict]] = queue.Queue(maxsize=1)
+    q_img: queue.Queue[tuple[Path, np.ndarray, Iterable[np.ndarray], dict[str, Any]]] = queue.Queue(maxsize=1)
+    profiles = []
 
     def f_read(files: list[Path]):
-        logger.debug("Read thread started.")
         for file in files:
+            t0_file = time.perf_counter()
+            logger.debug(f"[{file.name}] START Read/Pre-process")
             round_ = file.name.split("-")[0]
             bits = round_.split("_")
             if file.name.startswith("fid"):
                 continue
-            logger.debug(f"Reading {file.name}")
+
             try:
+                t_read_start = time.perf_counter()
                 with tifffile.TiffFile(file) as tif:
                     try:
                         metadata = tif.shaped_metadata[0]  # type: ignore
                     except (TypeError, IndexError):
                         metadata = tif.imagej_metadata or {}
                     img = tif.asarray()
+                t_read_end = time.perf_counter()
+                logger.debug(f"[{file.name}] Disk read took: {t_read_end - t_read_start:.4f}s")
 
                 fid = np.atleast_3d(img[-n_fids:])
-                nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(np.float32)
+                nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(cp.float32)
+                print(nofid.shape)
+                nofid = cp.asarray(nofid)
             except ValueError as e:
                 raise Exception(f"File {file.resolve()} is corrupted. Please check the file.") from e
-            logger.debug(f"Finished reading {file.name}")
 
-            for i, basic in enumerate(basics[round_]):
-                logger.debug(f"Running BaSiC on channel {i}")
-                nofid[:, i] = basic.transform(np.array(nofid[:, i]))
+            t_basic_start = time.perf_counter()
+            if not profiles:
+                darkfield = cp.asarray(
+                    np.stack([basic.darkfield for basic in basics[round_]], axis=0)[np.newaxis, ...]
+                )
+                flatfield = cp.asarray(
+                    np.stack([basic.flatfield for basic in basics[round_]], axis=0)[np.newaxis, ...]
+                )
+                profiles.append((darkfield, flatfield))
+
+            nofid -= profiles[0][0]
+            nofid /= profiles[0][1]
+            cp.clip(nofid, 0, None, out=nofid)
+
+            t_basic_end = time.perf_counter()
+            logger.debug(f"[{file.name}] BaSiC correction took: {t_basic_end - t_basic_start:.4f}s")
+
+            total_preprocess_time = time.perf_counter() - t0_file
+            logger.debug(f"[{file.name}] Total preprocess time: {total_preprocess_time:.4f}s")
+
+            t_put_start = time.perf_counter()
             q_img.put((file, nofid, fid, metadata))
+            t_put_end = time.perf_counter()
+            put_wait_time = t_put_end - t_put_start
+            if put_wait_time > 0.01:
+                logger.warning(
+                    f"[{file.name}] Waited {put_wait_time:.4f}s to put in q_img (GPU stage is likely the bottleneck)"
+                )
+        q_img.put((Path("STOP"), np.array([]), np.array([]), {}))  # Sentinel value
 
     def f_write():
-        logger.debug("Write thread started.")
-
         while True:
+            t_get_write_start = time.perf_counter()
             gotten = q_write.get()
-            t0 = time.time()
+            t_get_write_end = time.perf_counter()
+
             if gotten is None:
                 break
+
             file, towrite, fid, metadata = gotten
-            logger.debug(f"Writing {file.name}")
+            if file.name == "STOP":
+                break
+
+            get_wait_time = t_get_write_end - t_get_write_start
+            if get_wait_time > 0.01:
+                logger.debug(f"[{file.name}] Waited {get_wait_time:.4f}s to get from q_write")
+
+            logger.debug(f"[{file.name}] START Write")
+            t_write_start = time.perf_counter()
             sub = out / file.parent.name
             sub.mkdir(exist_ok=True, parents=True)
 
-            (sub / file.name).with_suffix(".deconv.json").write_text(json.dumps(scaling, indent=2))
+            (sub / file.name).with_suffix(".deconv.json").write_text(json.dumps(metadata, indent=2))
 
             tifffile.imwrite(
                 sub / file.name,
@@ -533,70 +591,96 @@ def _run(
                 compressionargs={"level": 0.75},
                 metadata=metadata,
             )
-            logger.debug(f"Finished writing {file.name}")
-            if time.time() - t0 > 5:
-                logger.warning(f"Writing {file.name} took too long: {time.time() - t0:.2f}s")
+            t_write_end = time.perf_counter()
+            logger.debug(f"[{file.name}] Disk write took: {t_write_end - t_write_start:.4f}s")
             q_write.task_done()
+        logger.debug("Write thread finished.")
 
     try:
-        thread = threading.Thread(target=f_read, args=(paths,), daemon=True)
+        threading.current_thread().name = "MainGPUThread"
+        thread = threading.Thread(target=f_read, args=(paths,), daemon=True, name="ReadThread")
         thread.start()
 
-        thread_write = threading.Thread(target=f_write, args=(), daemon=True)
+        thread_write = threading.Thread(target=f_write, args=(), daemon=True, name="WriteThread")
         thread_write.start()
 
         with progress_bar(len(paths)) as callback:
-            for _ in range(len(paths)):
-                t0 = time.time()
+            while True:
+                t_get_start = time.perf_counter()
                 start, img, fid, metadata = q_img.get()
-                t = time.time()
-                if (t - t0) > 3:
-                    logger.warning(f"Reading {start.name} took too long: {t - t0:.2f}s")
-                # img = high_pass_filter(img.astype(np.float32), σ=(3.0, 3.0, 3.0))
-                res = deconvolve_lucyrichardson_guo(cp.asarray(img), projectors(step), iters=1)
+                t_get_end = time.perf_counter()
 
-                # Somehow will result in an invalidAccessMemoryError when res.shape[1] == 1 if done directly with cupy.
+                if start.name == "STOP":
+                    logger.debug("Stop signal received in main thread.")
+                    q_img.task_done()
+                    break
+
+                logger.debug(f"[{start.name}] START GPU Stage")
+                get_wait_time = t_get_end - t_get_start
+                if get_wait_time > 0.01:
+                    logger.warning(
+                        f"[{start.name}] Waited {get_wait_time:.4f}s to get from q_img (Read stage is likely the bottleneck)"
+                    )
+
+                t_gpu_stage_start = time.perf_counter()
+
+                img_gpu = cp.asarray(img)
+                if debug:
+                    cp.cuda.runtime.deviceSynchronize()
+
+                # Deconvolution
+                t_deconv_start = time.perf_counter()
+                res = deconvolve_lucyrichardson_guo(img_gpu, projectors(step), iters=1)
+                if debug:
+                    cp.cuda.runtime.deviceSynchronize()
+                t_deconv_end = time.perf_counter()
+                logger.debug(
+                    f"[{start.name}] Deconvolution kernel took: {t_deconv_end - t_deconv_start:.4f}s"
+                )
+
                 single_chan = res.shape[1] == 1
-
                 if single_chan:
                     mins, maxs = cp.percentile(res.squeeze(), (0.1, 99.999))
                 else:
                     mins, maxs = cp.percentile(res, (0.1, 99.999), axis=(0, 2, 3), keepdims=True)
 
                 if ((maxs - mins) < 1e-20).any():
-                    logger.warning("Dynamic range is very low.")
+                    logger.warning(f"[{start.name}] Dynamic range is very low.")
 
                 scale = 65534 / (maxs - mins + 1e-20)
+                if debug:
+                    cp.cuda.runtime.deviceSynchronize()
+
                 towrite = (
-                    cp.clip(
-                        (cp.asarray(res) - cp.asarray(mins)) * cp.asarray(scale),
-                        0.0,
-                        65534.0,
-                    )
+                    cp.clip((res - mins) * scale, 0.0, 65534.0)
                     .astype(np.uint16)
                     .get()
                     .reshape(-1, 2048, 2048)
                 )
-                del res
+                del res, img_gpu
 
                 scaling = {
                     "deconv_min": list(map(float, mins.flatten())),
                     "deconv_scale": list(map(float, scale.flatten())),
                 }
-                print(scaling)
-                logger.info(f"Finished {start.name}: {time.time() - t:.2f}s")
+                print(f"[{start.name}] Scaling: {scaling['deconv_min']}, {scaling['deconv_scale']}")
+                total_gpu_time = time.perf_counter() - t_gpu_stage_start
+                logger.info(f"{start.name}: GPU took {total_gpu_time:.2f}s")
 
-                q_write.put((
-                    start,
-                    towrite,
-                    fid,
-                    metadata | scaling,
-                ))
+                t_put_write_start = time.perf_counter()
+                q_write.put((start, towrite, fid, metadata | scaling))
+                t_put_write_end = time.perf_counter()
+                put_write_wait_time = t_put_write_end - t_put_write_start
+                if put_write_wait_time > 0.01:
+                    logger.warning(
+                        f"[{start.name}] Waited {put_write_wait_time:.4f}s to put in q_write (Write stage is likely the bottleneck)"
+                    )
+
                 q_img.task_done()
                 callback()
 
     except Exception as e:
-        logger.error(f"Error in thread: {e}")
+        logger.exception(f"Error in processing pipeline: {e}")
         q_write.put(None)
         raise e
 
@@ -642,10 +726,18 @@ def run(
     """
     if debug:
         logger.remove()
-        logger.add(sys.stderr, level="DEBUG")
+        log_format = (
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{thread.name: <13}</cyan> | "
+            "<level>{message}</level>"
+        )
+        logger.add(sys.stderr, level="DEBUG", format=log_format)
+        logger.add("profiling_{time}.log", level="DEBUG", format=log_format, enqueue=True)
+        logger.info("DEBUG mode enabled. Detailed profiling logs will be generated.")
     else:
         logger.remove()
-        logger.add(sys.stderr, level="INFO")
+        logger.add(sys.stderr, level="INFO", format="{message}")
 
     console.print(f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]")
 
@@ -678,13 +770,8 @@ def run(
         f"Total: {len(files)} at {path}/{name}*" + (f" Limited to {limit}" if limit is not None else "")
     )
 
-    if not overwrite:
-        files = [f for f in files if not (out / f.parent.name / f.name).exists()]
-
-    if files:
-        logger.info(f"Running {len(files)} files.")
-    else:
-        logger.warning("No files found. Skipping.")
+    if not files:
+        logger.warning("No files found to process. Exiting.")
         return
 
     basic_name = basic_name or name
@@ -697,7 +784,6 @@ def run(
         try:
             loaded = pickle.loads((path / "basic" / f"{basic_name}-{c}.pkl").read_bytes())
         except FileNotFoundError:
-            # Fallback to specific BaSiC
             try:
                 loaded = pickle.loads((path / "basic" / f"{name}-{c}.pkl").read_bytes())
                 logger.warning(
@@ -707,11 +793,17 @@ def run(
                 raise FileNotFoundError(
                     f"Could not find basic file for {name}-{c}.pkl. Please run `preprocess basic run` first."
                 )
-
         basic_list.append(loaded["basic"] if isinstance(loaded, dict) else loaded)
 
     basics = {name: basic_list}
-    _run(files, path / "analysis" / "deconv", basics, overwrite=overwrite, n_fids=n_fids)
+    _run(
+        files,
+        path / "analysis" / "deconv",
+        basics,
+        overwrite=overwrite,
+        n_fids=n_fids,
+        debug=debug,
+    )
 
 
 @deconv.command()
@@ -732,8 +824,20 @@ def batch(
     basic_name: str | None = "all",
     debug: bool = False,
 ):
-    logger.remove()
-    logger.add(sys.stderr, level="INFO" if not debug else "DEBUG")
+    if debug:
+        logger.remove()
+        log_format = (
+            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{thread.name: <13}</cyan> | "
+            "<level>{message}</level>"
+        )
+        logger.add(sys.stderr, level="DEBUG", format=log_format)
+        logger.add("profiling_{time}.log", level="DEBUG", format=log_format, enqueue=True)
+        logger.info("DEBUG mode enabled. Detailed profiling logs will be generated.")
+    else:
+        logger.remove()
+        logger.add(sys.stderr, level="INFO", format="{message}")
 
     ws = Workspace(path)
     rois = ws.rois
@@ -755,19 +859,21 @@ def batch(
     logger.info(f"Rounds: {rounds}")
 
     for r in rounds:
+        logger.info(f"Processing round: {r}")
         if ref is not None:
             files = []
-            for roi in rois:
-                logger.info(f"Processing {r}--{roi}")
+            for roi_ in rois:
+                logger.info(f"Processing {r}--{roi_}")
                 ok_idxs = {
-                    int(f.stem.split("-")[1]) for f in sorted((path / f"{ref}--{roi}").glob(f"{ref}-*.tif"))
+                    int(f.stem.split("-")[1]) for f in sorted((path / f"{ref}--{roi_}").glob(f"{ref}-*.tif"))
                 }
                 if not ok_idxs:
-                    raise ValueError(f"No files found for {r}--{roi} as reference.")
+                    logger.warning(f"No reference files found for {ref}--{roi_}. Skipping ROI.")
+                    continue
 
                 files.extend([
                     f
-                    for f in sorted(path.glob(f"{r}--{roi}/{r}-*.tif"))
+                    for f in sorted(path.glob(f"{r}--{roi_}/{r}-*.tif"))
                     if "analysis/deconv" not in str(f)
                     and not f.parent.name.endswith("basic")
                     and int(f.stem.split("-")[1]) in ok_idxs
@@ -780,33 +886,44 @@ def batch(
                 if "analysis/deconv" not in str(f) and not f.parent.name.endswith("basic")
             ]
 
+        if not overwrite:
+            n_before = len(files)
+            files = [f for f in files if not (out / f.parent.name / f.name).exists()]
+            logger.info(f"Skipping {n_before - len(files)} already processed files.")
+
         if not files:
-            logger.warning(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
+            logger.warning(
+                f"No files found to process for round {r}, skipping. Use --overwrite to reprocess."
+            )
             continue
 
         meta = get_metadata(files[0])
         channels = get_channels(files[0])
-        waveform = json.loads(meta["waveform"])
-        step = int(waveform["params"]["step"] * 10)
-        logger.info(f"Using step={step}")
-
-        if not files:
-            logger.info(f"No files found for {r}, skipping. Use --overwrite to reprocess.")
-            continue
+        try:
+            waveform = json.loads(meta["waveform"])
+            step = int(waveform["params"]["step"] * 10)
+            logger.info(f"Using PSF step={step} from waveform metadata.")
+        except (KeyError, json.JSONDecodeError):
+            step = 6
+            logger.warning("Could not determine step from metadata, using default step=6.")
 
         basic_list: list[BaSiC] = []
         for c in channels:
             try:
-                loaded = pickle.loads((path / "basic" / f"{basic_name}-{c}.pkl").read_bytes())
+                basic_path = path / "basic" / f"{basic_name}-{c}.pkl"
+                loaded = pickle.loads(basic_path.read_bytes())
+                logger.debug(f"Loaded BaSiC profile from {basic_path}")
             except FileNotFoundError:
-                # Fallback to specific BaSiC
                 try:
-                    loaded = pickle.loads((path / "basic" / f"{r}-{c}.pkl").read_bytes())
+                    basic_path = path / "basic" / f"{r}-{c}.pkl"
+                    loaded = pickle.loads(basic_path.read_bytes())
+                    logger.warning(
+                        f"Could not find basic file for {basic_name}-{c}.pkl. Using {r}-{c}.pkl instead."
+                    )
                 except FileNotFoundError:
                     raise FileNotFoundError(
                         f"Could not find basic file for {r}-{c}.pkl. Please run `preprocess basic run` first."
                     )
-
             basic_list.append(loaded["basic"] if isinstance(loaded, dict) else loaded)
 
         basics = {r: basic_list}
@@ -818,6 +935,7 @@ def batch(
             overwrite=overwrite,
             n_fids=n_fids,
             step=step,
+            debug=debug,
         )
 
 

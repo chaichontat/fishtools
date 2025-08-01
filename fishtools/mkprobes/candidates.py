@@ -345,7 +345,7 @@ def _run_transcript(
             else (pl.Series(), pl.DataFrame())
         )
         if len(bad_sig := counts.filter(~pl.col("acceptable") & pl.col("significant"))):
-            bad_sig.write_csv(output / f"{transcript_name}_offtarget_counts.csv")
+            counts.filter("significant").write_csv(output / f"{transcript_name}_offtarget_counts.csv")
 
         # logger.info(f"Pseudogenes allowed: {', '.join(pseudo_name)}")
         tss_others = {*allow_tss} - set(disallow_tss)
