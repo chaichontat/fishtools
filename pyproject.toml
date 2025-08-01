@@ -38,6 +38,8 @@ dependencies = [
     "pyarrow>=17.0.0",
     "pydantic>=2.11.3",
     "starfish @ git+https://github.com/chaichontat/starfish@master",
+    "prefect>=3",
+    "typer>=0.16.0",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +49,7 @@ dev = ["pre-commit>=3.3.3", "pytest>=7.4.0", "pytest-cov>=4.1.0"]
 fishtools = "fishtools.cli:main"
 mkprobes = "fishtools.mkprobes.cli:main"
 preprocess = "fishtools.preprocess.cli:main"
+segment = "fishtools.segment:main"
 
 [tool.uv]
 override-dependencies = ["scikit-image>=0.23.2"]
