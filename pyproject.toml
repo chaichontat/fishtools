@@ -39,11 +39,16 @@ dependencies = [
     "pydantic>=2.11.3",
     "starfish @ git+https://github.com/chaichontat/starfish@master",
     "prefect>=3",
-    "typer>=0.16.0",
+    "typer>=0.15.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pre-commit>=3.3.3", "pytest>=7.4.0", "pytest-cov>=4.1.0"]
+dev = [
+    "pre-commit>=3.3.3",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.14.1",
+]
 
 [project.scripts]
 fishtools = "fishtools.cli:main"
