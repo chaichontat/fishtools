@@ -1,4 +1,5 @@
 # %%
+import json
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -58,6 +59,8 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
     tss = list(codebook)
     dfs_ = []
     cols = []
+    bads = []
+    lows = []
 
     for ts in tss:
         try:
@@ -71,8 +74,14 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
             logger.critical(e)
             continue
 
-        if len(df) < low:
+        if len(df) < toolow:
+            bads.append({"name": ts, "count": len(df)})
+            logger.error(f"Too few probes ({len(df)}) for {ts}.")
+            continue
+
+        if len(df) < toolow * 2:
             # Resample to prevent probe dropout. Capping at 3x coverage.
+            lows.append({"name": ts, "count": len(df)})
             df = pl.concat([df, df[: min(low - len(df), len(df) * 2)]])
 
         if not cols:
@@ -91,30 +100,32 @@ def run(path: Path, probeset: ProbeSet, n: int = 16, toolow: int = 4, low: int =
     outpath = Path(path / "generated" / probeset.name)
     outpath.mkdir(exist_ok=True, parents=True)
     # RepeatMasker
-    # if probeset.species in species_mapping:
-    #     with ThreadPoolExecutor() as exc:
-    #         for col_name in ["splint", "padlock"]:
-    #             (outpath / f"{col_name}.fasta").write_text(gen_fasta(dfs[col_name]).getvalue())
-    #             exc.submit(
-    #                 subprocess.run,
-    #                 f'RepeatMasker -pa 16 -norna -s -no_is -species "{species_mapping[probeset.species]}" {outpath / f"{col_name}.fasta"}',
-    #                 shell=True,
-    #                 check=True,
-    #             )
+    if probeset.species in species_mapping:
+        with ThreadPoolExecutor() as exc:
+            for col_name in ["splint", "padlock"]:
+                (outpath / f"{col_name}.fasta").write_text(gen_fasta(dfs[col_name]).getvalue())
+                exc.submit(
+                    subprocess.run,
+                    f'RepeatMasker -pa 16 -norna -s -no_is -species "{species_mapping[probeset.species]}" {outpath / f"{col_name}.fasta"}',
+                    shell=True,
+                    check=True,
+                )
 
-    #     dfs = dfs.with_columns({
-    #         col_name: [seq for name, seq in pyfastx.Fastx((outpath / f"{col_name}.fasta.masked").as_posix())]
-    #         for col_name in ["splint", "padlock"]
-    #         if (outpath / f"{col_name}.fasta.masked").exists()
-    #     }).filter(~pl.col("splint").str.contains("N") & ~pl.col("padlock").str.contains("N"))
-    # else:
-    #     logger.warning("Species not found in species mapping. Skipping RepeatMasker.")
+        dfs = dfs.with_columns({
+            col_name: [seq for name, seq in pyfastx.Fastx((outpath / f"{col_name}.fasta.masked").as_posix())]
+            for col_name in ["splint", "padlock"]
+            if (outpath / f"{col_name}.fasta.masked").exists()
+        }).filter(~pl.col("splint").str.contains("N") & ~pl.col("padlock").str.contains("N"))
+    else:
+        logger.warning("Species not found in species mapping. Skipping RepeatMasker.")
 
-    counts = dfs.group_by("gene").len(name="count")
-    # Since we resample low counting probes, we need to double the threshold.
-    if (bad := counts.filter(pl.col("count") < toolow * 2)).__len__():
-        msg = f"Too few probe pairs ({toolow=}) for {len(bad)} genes.\n{bad}"
-        raise ValueError(msg)
+    if len(bads):
+        msg = f"Too few probe pairs ({toolow=}) for {len(bads)} genes.\n{pl.DataFrame(bads).sort('count')}"
+        logger.error(msg)
+
+    if len(lows):
+        msg = f"Low count genes.\n{pl.DataFrame(lows).sort('count')}"
+        logger.warning(msg)
 
     # Before
     spl_idx = idx * 2
@@ -230,6 +241,45 @@ def cli(ctx: click.Context, manifest: Path):
     ctx.obj["path"] = manifest.parent
 
 
+import questionary
+
+
+def handle_checks(ts: str, offtargets: pl.DataFrame):
+    offtargets = offtargets.with_columns(
+        label=pl.when(pl.col("transcript_name").is_not_null())
+        .then(pl.col("transcript_name"))
+        .otherwise(pl.col("transcript"))
+        + " "
+        + pl.col("count").cast(pl.Utf8)
+        + pl.when(pl.col("acceptable")).then(pl.lit(" (already ok)")).otherwise(pl.lit(""))
+    )
+    if offtargets.is_empty():
+        return []
+    selected_files = questionary.checkbox(
+        f"Select acceptable genes for {ts}", choices=offtargets["label"]
+    ).ask()
+    return sorted({x.split(" ")[0].rsplit("-", 1)[0] for x in selected_files})
+
+
+def manual_accept(path: Path, probeset: ProbeSet, *, ts: str):
+    try:
+        offtargets = pl.read_csv(path / f"output/{ts}_offtarget_counts.csv")
+    except FileNotFoundError:
+        ...
+    else:
+        path_accept = path / (probeset.codebook.rsplit(".", 1)[0] + ".acceptable.json")
+        curr = json.loads(path_accept.read_text()) if path_accept.exists() else {}
+        if ts in curr:
+            logger.info(f"{ts} already in acceptable genes. Skipping manual check.")
+        elif questionary.confirm(f"{ts} manual check?", default=True).ask():
+            user_ok = handle_checks(ts, offtargets)
+            if user_ok:
+                path_accept.write_text(json.dumps({**curr, **{ts: user_ok}}, indent=2, sort_keys=True))
+            logger.info("Outputted acceptable genes to " + str(path_accept))
+            return user_ok
+        return None
+
+
 @cli.command()
 @click.argument("short", type=int)
 @click.option("--verbose", "-v", is_flag=True)
@@ -279,6 +329,7 @@ def short(
 
         tss = list(codebook)
         dfs_ = []
+
         for ts in tss:
             try:
                 _df = pl.read_parquet(
@@ -335,15 +386,15 @@ def short(
                 # .sample(shuffle=True, seed=4, fraction=1)
                 if len(_df) < short:
                     baddies.append(ts)
-
+                    manual_accept(path, probeset, ts=ts)
             except FileNotFoundError:
                 baddies.append(ts)
-                # if verbose:
                 logger.warning(
                     "File "
                     + f"output/{ts}_final_BamHIKpnI_{','.join(map(str, sorted(codebook[ts])))}.parquet"
                     + " not found. This usually means that there are no probes for this gene."
                 )
+                manual_accept(path, probeset, ts=ts)
 
         # if not len(dfs_):
         #     logger.warning(f"No data for {probeset.name} at {probeset.codebook}")
@@ -352,11 +403,17 @@ def short(
         # dfs: pl.DataFrame = pl.concat(dfs_)
         # print(dfs)
         # counts = dfs.group_by(COL_NAME).len(name="count")
-        if baddies:
-            # print(probeset.name)
 
+        if baddies:
+            print(probeset.name)
             print("\n".join(sorted(baddies)))
             logger.warning(f"Found {len(baddies)} genes with fewer than {short} probes.")
+
+            # path_accept = path / (probeset.name + ".acceptable.json")
+            # curr = json.loads(path_accept.read_text()) if path_accept.exists() else {}
+            # path_accept.write_text(json.dumps({**curr, **out_dict}, indent=2, sort_keys=True))
+            # logger.info("Outputted acceptable genes to " + str(path_accept))
+
         else:
             logger.info(f"All genes have at least {short} probes.")
 
@@ -398,7 +455,7 @@ def gen(ctx: click.Context):
             n = 34 if x.species == "human" else 24
             low = 24 if x.species == "human" else 16
 
-        probes = run(path, x, n=n, toolow=3, low=low)
+        probes = run(path, x, n=n, toolow=4, low=low)
 
         total_probes += len(probes) * 2
         logger.info(f"Cumulative probes: {total_probes}")

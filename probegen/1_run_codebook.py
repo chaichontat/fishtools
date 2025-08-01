@@ -10,6 +10,7 @@ from pathlib import Path
 import click
 import polars as pl
 from loguru import logger
+from pydantic import TypeAdapter
 from rich.console import Console
 from rich.text import Text
 
@@ -49,17 +50,17 @@ def run_gene(
 
     ds = Dataset(path)
     try:
-        # if overwrite or not output.joinpath(f"{gene}_crawled.parquet").exists():
-        #     get_candidates(
-        #         ds,
-        #         transcript=gene,
-        #         output=output,
-        #         ignore_revcomp=False,
-        #         allow=acceptable,
-        #         overwrite=overwrite,
-        #         **kwargs,
-        #     )
-        #     time.sleep(1)
+        if overwrite or not output.joinpath(f"{gene}_crawled.parquet").exists():
+            get_candidates(
+                ds,
+                transcript=gene,
+                output=output,
+                ignore_revcomp=False,
+                allow=acceptable,
+                overwrite=overwrite,
+                **kwargs,
+            )
+            time.sleep(1)
 
         overwrite = overwrite or acceptable is not None
         run_screen(
@@ -191,13 +192,12 @@ def single(
 @click.argument("manifest", type=click.Path(exists=True, file_okay=True, path_type=Path))
 def batch(data: Path, manifest: Path):
     assert single.callback
-    pss = ProbeSet.from_list_json(manifest.read_text())
-    for ps in pss:
+    mfs = TypeAdapter(list[ProbeSet]).validate_json(Path(manifest).read_text())
+    for ps in mfs:
         single.callback(
-            data / ps.species,
+            data,
             manifest.parent / ps.codebook,
             overwrite=False,
-            onlygene=None,
             listfailed=False,
             listfailedall=False,
         )

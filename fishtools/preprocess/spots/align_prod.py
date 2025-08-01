@@ -6,7 +6,6 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import warnings
 from datetime import timedelta
@@ -41,6 +40,7 @@ from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread
 
 from fishtools.preprocess.addition import ElementWiseAddition
+from fishtools.preprocess.cli_spotlook import threshold
 from fishtools.preprocess.spots.align_batchoptimize import optimize
 from fishtools.preprocess.spots.overlay_spots import overlay
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
@@ -968,7 +968,10 @@ def run(
 
     codebook, used_bits, names, arr_zeroblank = load_codebook(
         codebook_path,
-        # exclude={"Malat1-201"},  # , "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
+        exclude={
+            "Malat1-201",
+            "tdTomato-Ai9-extra",
+        },  # , "Nfib-201", "Stmn1-201", "Ywhae-201", "Sox11-201", "Neurod6-201"},
         simple=simple,
         bit_mapping=bit_mapping,
     )
@@ -1418,6 +1421,7 @@ def batch(
 spots.add_command(optimize)
 spots.add_command(stitch)
 spots.add_command(overlay)
+spots.add_command(threshold)
 
 if __name__ == "__main__":
     spots()
