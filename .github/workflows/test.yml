@@ -17,6 +17,7 @@ jobs:
           activate-environment: fishtools
           environment-file: environment.yml
           python-version: 3.12
+          conda-remove-defaults: true
 
       - name: Install dependencies
         run: pip install .[dev]
