@@ -74,11 +74,12 @@ def execute_script(args: str, *, cwd: Path | None = None, overwrite: bool = Fals
     while True:
         try:
             r, _, _ = select.select([master], [], [])
-            if r:
-                data = os.read(master, 1024).decode("utf-8")
-                if data:
-                    print(data, end="", flush=True)
-                    output.append(data)
+            if not r:
+                continue
+            if not (data := os.read(master, 1024).decode("utf-8")):
+                continue
+            print(data, end="", flush=True)
+            output.append(data)
         except OSError:
             break
 
@@ -109,25 +110,34 @@ def register(ws: Workspace, codebook: Path, threads: int):
     execute_script(f"preprocess register batch . --codebook={codebook} --threads={threads}")
 
 
-@flow
-def optimize(ws: Workspace, codebook: Path, threads: int, *, rounds: int = 6):
-    execute_script(f"preprocess spots optimize . --codebook={codebook} --rounds={rounds} --threads={threads}")
+@flow(name="Spots optimize: {ws.path.name}")
+def optimize(ws: Workspace, codebook: Path, threads: int, *, rounds: int = 6, blank: str | None = None):
+    execute_script(
+        f"preprocess spots optimize . --codebook={codebook} --rounds={rounds} --threads={threads} {f'--blank={blank}' if blank else ''}"
+    )
 
 
-@flow
-def call_spots(ws: Workspace, codebook: Path, threads: int):
-    execute_script(f"preprocess spots batch . --codebook={codebook} --threads={threads} --split")
+def pathname(ws: Workspace):
+    return ws.path.name
+
+
+@flow(name="Spots calling: {ws.path.name}")
+def call_spots(ws: Workspace, codebook: Path, threads: int, blank: str | None = None):
+    execute_script(
+        f"preprocess spots batch . --codebook={codebook} --threads={threads} --split {f'--blank={blank}' if blank else ''}"
+    )
     execute_script(f"preprocess spots stitch . --codebook={codebook} --threads={threads}")
 
 
-@flow(name="call-spots")
-def main_workflow(path: Path, codebook: Path, threads: int):
+@flow(name="Spots workflow: {path.resolve()}")
+def main_workflow(path: Path, codebook: Path, threads: int, blank: str | None = None):
     ws = Workspace(path)
     # deconv(ws)
     with setwd(ws.deconved):
         register(ws, codebook, threads)
-        optimize(ws, codebook, threads)
-        call_spots(ws, codebook, threads)
+        stitch_register(ws, ws.rois, threads)
+        optimize(ws, codebook, threads, blank=blank, rounds=8)
+        call_spots(ws, codebook, threads, blank=blank)
 
 
 @click.group()
@@ -142,8 +152,9 @@ def cli(): ...
     help="Path to the codebook file",
 )
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
-def spots(path: Path, codebook: Path, threads: int):
-    main_workflow(path, codebook, threads)
+@click.option("--blank", type=str, default=None, help="Blank image to subtract")
+def spots(path: Path, codebook: Path, threads: int, blank: str | None = None):
+    main_workflow(path, codebook, threads, blank=blank)
 
 
 @flow
@@ -178,6 +189,35 @@ def stitch_fuse(ws: Workspace, rois: list[str], codebook: str, threads: int, ove
             raise ValueError(f"No fused image found at {path / 'fused.zarr'}")
 
 
+@flow
+def segment_workflow(
+    ws: Workspace,
+    seg_codebook: str,
+    channels: str,
+    overwrite: bool = False,
+):
+    logger = get_run_logger()
+    for roi in ws.rois:
+        if (
+            (ws.stitch(roi, codebook=seg_codebook) / "segmentation.done").exists()
+            and (ws.stitch(roi, codebook=seg_codebook) / "segmentation_output.zarr").exists()
+            and not overwrite
+        ):
+            logger.info(f"{roi} already segmented.")
+            continue
+        execute_script(
+            f"python /working/fishtools/segmentation/distributed/distributed_segmentation.py {ws.stitch(roi, codebook=seg_codebook)} --channels={channels}",
+            overwrite=overwrite,
+        )
+
+    for roi in ws.rois:
+        for codebook in ["mousecommon", "zachDE"]:
+            execute_script(
+                f"preprocess spots overlay . {roi} --{codebook=} --seg-codebook={seg_codebook}",
+                overwrite=overwrite,
+            )
+
+
 @cli.command()
 @click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
 @click.option("--codebook", type=str, help="Codebook name")
@@ -188,6 +228,17 @@ def stitch(path: Path, codebook: str, threads: int, overwrite: bool):
     with setwd(ws.deconved):
         stitch_register(ws, ws.rois, threads, overwrite=overwrite)
         stitch_fuse(ws, ws.rois, codebook, threads, overwrite=overwrite)
+
+
+@cli.command()
+@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
+@click.option("--seg-codebook", type=str, help="Codebook name")
+@click.option("--channels", type=str, help="Comma-separated channels to segment. E.g. 'ch1,ch2'")
+@click.option("--overwrite", is_flag=True, help="Overwrite existing files")
+def segment(path: Path, seg_codebook: str, channels: str, overwrite: bool):
+    ws = Workspace(path)
+    with setwd(ws.deconved):
+        segment_workflow(ws, seg_codebook, channels=channels, overwrite=overwrite)
 
 
 if __name__ == "__main__":

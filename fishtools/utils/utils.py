@@ -3,11 +3,12 @@ import logging
 import subprocess
 import sys
 import types
+from collections.abc import Callable, Sequence
 from functools import cache, wraps
 from inspect import getcallargs
 from pathlib import Path
 from subprocess import PIPE, Popen
-from typing import Any, Callable, Concatenate, ParamSpec, Sequence, TypeVar, cast
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
 import loguru
 import numpy as np
@@ -51,6 +52,35 @@ def setup_logging():
         "<cyan>{name}</cyan> | <level>{message}</level>",
     )
 
+
+def initialize_logger(idx: int | None = None, debug: bool = False, file: str = "") -> None:
+    """Initialize logger with CLI-specific format and context.
+
+    Standardized logger setup for CLI commands that process indexed data.
+    Removes existing handlers and configures logger with consistent format
+    including timestamp, level, location, index context, and message.
+
+    Args:
+        idx: Processing index (formatted as 4-digit zero-padded string)
+        debug: If True, sets DEBUG level; otherwise WARNING level
+        file: Optional file identifier for additional context
+
+    Example:
+        >>> initialize_logger(42, debug=True)
+        >>> logger.info("Processing started")
+        # Output: 2023-01-01 12:00:00.123 | DEBUG    | module:line 0042 | - Processing started
+    """
+    logger_format = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{line}</cyan> {extra[idx]} {extra[file]}| "
+        "- <level>{message}</level>"
+    )
+    logger.remove()
+    if idx is not None:
+        logger.configure(extra=dict(idx=f"{idx:04d}", file=file))
+    logger.add(sys.stderr, level="DEBUG" if debug else "WARNING", format=logger_format)
+
     class InterceptHandler(logging.Handler):
         def emit(self, record: logging.LogRecord):
             # Get corresponding Loguru level if it exists.
@@ -69,7 +99,6 @@ def setup_logging():
 
     logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
     logging.getLogger("biothings").setLevel(logging.CRITICAL)
-    return logger
 
 
 def check_if_posix(f: Callable[P, R]) -> Callable[P, R]:
@@ -162,33 +191,129 @@ def git_hash() -> str:
 _T = TypeVar("_T")
 
 
-def batch_roi(look_for: str = "registered--*", include_codebook: bool = False, split_codebook: bool = True):
+def batch_roi(
+    look_for: str = "registered--*", include_codebook: bool = False, split_codebook: bool = True
+) -> Callable[[Callable[P, _T]], Callable[P, _T | None]]:
+    """Decorator enabling batch ROI processing when roi='*' is specified.
+
+    Transforms functions that process individual ROIs into batch processors that can
+    handle multiple ROIs sequentially. When roi='*' is passed, the decorator discovers
+    all matching ROI directories and calls the decorated function once for each ROI.
+
+    Args:
+        look_for: Glob pattern for discovering ROI directories. Defaults to "registered--*"
+                 for standard preprocessing workflows.
+        include_codebook: Whether to include codebook information in directory matching.
+                         Requires 'codebook' parameter in function kwargs when enabled.
+        split_codebook: Whether to split codebook suffix from ROI names. If False,
+                       ROI names include "+codebook" suffix.
+
+    Returns:
+        Decorator function that transforms ROI processors into batch processors.
+
+    Raises:
+        ValueError: If required parameters ('roi', 'path') are missing or if
+                   codebook parameter is missing when include_codebook=True.
+        RuntimeError: If ROI processing fails, with specific ROI context included.
+
+    Example:
+        @batch_roi(look_for="stitch--*", include_codebook=True)
+        def process_roi(path: Path, roi: str, codebook: str) -> None:
+            # Process individual ROI
+            pass
+
+        # Single ROI processing
+        process_roi(path=workspace, roi="cortex", codebook="book1")
+
+        # Batch processing (processes all matching ROIs)
+        process_roi(path=workspace, roi="*", codebook="book1")
+
+    Note:
+        - Batch processing always returns None regardless of individual function return types
+        - ROIs are processed sequentially in sorted order for reproducible results
+        - Uses fishtools.utils.io.Workspace for ROI discovery
+        - Failed ROI processing stops the entire batch with clear error context
+    """
+
     def decorator(func: Callable[P, _T]) -> Callable[P, _T | None]:
         @wraps(func)
         def inner(*args: P.args, **kwargs: P.kwargs) -> _T | None:
-            nonlocal look_for
-            if kwargs["roi"] == "*":
+            # Validate required parameters
+            if "roi" not in kwargs:
+                raise ValueError("batch_roi requires 'roi' keyword argument")
+            if "path" not in kwargs:
+                raise ValueError("batch_roi requires 'path' keyword argument")
+
+            if kwargs["roi"] != "*":
+                return func(*args, **kwargs)
+
+            # Create local copy to avoid state mutation bug
+            current_look_for = look_for
+
+            if include_codebook:
+                if "codebook" not in kwargs:
+                    raise ValueError(
+                        "batch_roi with include_codebook=True requires codebook keyword argument"
+                    )
+                if isinstance(kwargs["codebook"], str):
+                    current_look_for = f"{look_for}+{kwargs['codebook']}"
+                elif isinstance(kwargs["codebook"], Path):
+                    current_look_for = f"{look_for}+{kwargs['codebook'].stem}"
+                else:
+                    raise ValueError("codebook must be a string or Path")
+
+            # Use Workspace to get ROIs instead of manual directory parsing
+            try:
+                from fishtools.utils.io import Workspace
+
+                # Convert path to Path object for type safety
+                workspace_path = Path(str(kwargs["path"]))
+                workspace = Workspace(workspace_path)
+
+                # Filter ROIs based on pattern and codebook requirements
                 if include_codebook:
-                    if "codebook" not in kwargs:
-                        raise ValueError(
-                            "batch_roi with include_codebook=True requires codebook keyword argument"
-                        )
-                    if isinstance(kwargs["codebook"], str):
-                        look_for = f"{look_for}+{kwargs['codebook']}"
-                    elif isinstance(kwargs["codebook"], Path):
-                        look_for = f"{look_for}+{kwargs['codebook'].stem}"
+                    # Find directories matching the full pattern including codebook
+                    matching_dirs = list(workspace_path.glob(current_look_for))
+                    if split_codebook:
+                        rois = {
+                            p.name.split("--")[1].split("+")[0]
+                            for p in matching_dirs
+                            if "--" in p.name and "+" in p.name.split("--")[1]
+                        }
                     else:
-                        raise ValueError("codebook must be a string or Path")
-                rois = {
-                    p.name.split("--")[1].split("+")[0] if split_codebook else p.name.split("--")[1]
-                    for p in Path(kwargs["path"]).glob(look_for)
-                }  # type: ignore
-                for roi in rois:  # type: ignore
-                    kwargs = kwargs | dict(roi=roi)  # type: ignore
-                    logger.info(f"Batching {kwargs['roi']}")
-                    func(*args, **kwargs)
-                return
-            return func(*args, **kwargs)
+                        rois = {p.name.split("--")[1] for p in matching_dirs if "--" in p.name}
+                else:
+                    # Use Workspace.rois for non-codebook patterns
+                    if look_for == "registered--*":
+                        # Standard case - use all workspace ROIs
+                        rois = set(workspace.rois)
+                    else:
+                        # Custom pattern - fall back to glob
+                        matching_dirs = list(workspace_path.glob(current_look_for))
+                        rois = {
+                            p.name.split("--")[1].split("+")[0] if split_codebook else p.name.split("--")[1]
+                            for p in matching_dirs
+                            if "--" in p.name
+                        }
+
+                if not rois:
+                    logger.warning(f"No ROIs found matching pattern '{current_look_for}' in {kwargs['path']}")
+                    return None
+
+                # Process each ROI with proper kwargs isolation
+                for roi in sorted(rois):  # Sort for consistent ordering
+                    roi_kwargs = {**kwargs, "roi": roi}
+                    logger.info(f"Batching {roi}")
+                    try:
+                        func(*args, **roi_kwargs)  # type: ignore[misc]
+                    except Exception as e:
+                        raise RuntimeError(f"Failed processing ROI '{roi}': {e}") from e
+
+                return None
+
+            except Exception as e:
+                logger.error(f"Error during batch processing: {e}")
+                raise
 
         return inner
 

@@ -1,4 +1,32 @@
-# %%
+"""
+FISH Image Stitching Pipeline
+
+This module provides tools for stitching multi-tile FISH images into seamless mosaics.
+The workflow includes:
+
+1. Tile registration using ImageJ Grid/Collection stitching
+2. Channel extraction and preprocessing 
+3. Multi-threaded image fusion
+4. Zarr array creation for large datasets
+
+Key Functions:
+- create_tile_config: Generate ImageJ-compatible tile configuration files
+- run_imagej: Execute ImageJ stitching operations via subprocess
+- extract_channel: Extract and preprocess individual channels from multi-channel images
+- extract: Process images for segmentation with proper formatting
+- walk_fused: Navigate fused image directory structures
+
+CLI Commands:
+- register-simple: Basic tile registration workflow
+- register: Advanced registration with fiducial markers  
+- fuse: Multi-threaded image fusion with compression
+- combine: Combine fused tiles into Zarr arrays for analysis
+- run: Complete end-to-end stitching pipeline
+
+Uses ImageJ Grid/Collection stitching for accurate tile alignment and supports
+large-scale datasets through efficient memory management and parallelization.
+"""
+
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +52,19 @@ def create_tile_config(
     *,
     name: str = "TileConfiguration.txt",
     pixel: int = 1024,
-):
+) -> None:
+    """
+    Generate ImageJ-compatible tile configuration file from stage positions.
+    
+    Converts microscope stage coordinates to pixel coordinates with proper scaling
+    for ImageJ Grid/Collection stitching plugin.
+    
+    Args:
+        path: Directory to write configuration file
+        df: DataFrame with stage positions (Y in column 0, X in column 1)
+        name: Output filename for tile configuration
+        pixel: Pixel size for scaling calculations
+    """
     scale = 2048 / pixel
     actual = pixel * (0.108 * scale)
     scaling = 200 / actual
@@ -55,7 +95,25 @@ def run_imagej(
     threshold: float = 0.4,
     name: str = "TileConfiguration.txt",
     capture_output: bool = False,
-):
+) -> None:
+    """
+    Execute ImageJ Grid/Collection stitching via subprocess.
+    
+    Runs ImageJ headless with Grid/Collection stitching plugin to register
+    and optionally fuse image tiles based on tile configuration.
+    
+    Args:
+        path: Directory containing tiles and configuration file
+        compute_overlap: Whether to compute tile overlaps automatically
+        fuse: Whether to fuse tiles into final image
+        threshold: Regression threshold for tile alignment
+        name: Tile configuration filename (without .txt or .registered.txt)
+        capture_output: Whether to capture subprocess output
+        
+    Raises:
+        FileNotFoundError: If ImageJ installation not found
+        subprocess.CalledProcessError: If ImageJ execution fails
+    """
     options = "subpixel_accuracy"  # compute_overlap
     if compute_overlap:
         options += " compute_overlap"
@@ -92,7 +150,14 @@ def run_imagej(
         )
 
 
-def copy_registered(reference_path: Path, actual_path: Path):
+def copy_registered(reference_path: Path, actual_path: Path) -> None:
+    """
+    Copy registered tile configuration files between directories.
+    
+    Args:
+        reference_path: Source directory containing .registered.txt files
+        actual_path: Destination directory for configuration files
+    """
     for file in reference_path.glob("*.registered.txt"):
         shutil.copy(file, actual_path)
 
@@ -106,7 +171,26 @@ def extract_channel(
     max_proj: bool = False,
     downsample: int = 1,
     reduce_bit_depth: int = 0,
-):
+) -> None:
+    """
+    Extract and preprocess a single channel from multi-channel TIFF image.
+    
+    Supports channel extraction, maximum projection, trimming, downsampling,
+    and bit depth reduction with compressed output.
+    
+    Args:
+        path: Input TIFF file path
+        out: Output TIFF file path
+        idx: Channel index to extract (required unless max_proj=True)
+        trim: Pixels to trim from each edge
+        max_proj: Compute maximum projection over Z and C dimensions
+        downsample: Downsampling factor for spatial dimensions
+        reduce_bit_depth: Number of bits to reduce (right shift)
+        
+    Raises:
+        ValueError: If trim is negative or bit depth reduction on non-uint16
+        TiffFileError: If input file is corrupted or unreadable
+    """
     try:
         with TiffFile(path) as tif:
             if trim < 0:
@@ -139,7 +223,8 @@ def extract_channel(
 
 
 @click.group()
-def stitch(): ...
+def stitch():
+    """FISH image stitching pipeline for multi-tile datasets."""
 
 
 @stitch.command()
@@ -199,7 +284,7 @@ def register(
     if not path.exists():
         raise ValueError(f"No registered images at {path.resolve()} found.")
 
-    imgs = sorted((f for f in path.glob("*.tif") if not f.name.endswith(".hp.tif")))
+    imgs = sorted(f for f in path.glob("*.tif") if not f.name.endswith(".hp.tif"))
     (out_path := path.parent / f"stitch--{roi.split('+')[0]}").mkdir(exist_ok=True)
 
     if overwrite:
@@ -256,7 +341,7 @@ def register(
 
     del path
     if overwrite or not (out_path / "TileConfiguration.registered.txt").exists():
-        files = sorted((f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif")))
+        files = sorted(f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif"))
         files_idx = [int(file.stem.split("-")[-1]) for file in files if file.stem.split("-")[-1].isdigit()]
         logger.debug(f"Using {files_idx}")
         tileconfig = TileConfiguration.from_pos(
@@ -294,7 +379,30 @@ def extract(
     is_2d: bool = False,
     channels: list[int] | None = None,
     max_from: Path | None = None,
-):
+) -> None:
+    """
+    Extract and format images for downstream segmentation analysis.
+    
+    Processes multi-dimensional images by extracting specific channels,
+    downsampling, and organizing into directory structure suitable for
+    segmentation workflows. Supports both 2D and 3D processing modes.
+    
+    Args:
+        path: Input image file path
+        out_path: Output directory for processed images
+        trim: Pixels to trim from each edge
+        downsample: Spatial downsampling factor
+        reduce_bit_depth: Number of bits to reduce (right shift)
+        subsample_z: Z-dimension subsampling factor
+        max_proj: Compute maximum Z-projection
+        is_2d: Process as 2D image (max project if 4D input)
+        channels: List of channel indices to extract
+        max_from: Additional file to merge for max projection
+        
+    Raises:
+        ValueError: If is_2d=False but max_proj required for 4D input
+        FileNotFoundError: If input files not found
+    """
     try:
         img = imread(path)
     except FileNotFoundError:
@@ -383,7 +491,22 @@ def extract(
     return
 
 
-def walk_fused(path: Path):
+def walk_fused(path: Path) -> dict[int, list[Path]]:
+    """
+    Navigate fused image directory structure organized by Z-planes and channels.
+    
+    Discovers image directories organized as: path/ZZ/CC/ where ZZ is Z-plane
+    index and CC is channel index, returning them grouped by Z-plane.
+    
+    Args:
+        path: Root directory containing Z/C folder hierarchy
+        
+    Returns:
+        Dictionary mapping Z-plane indices to lists of channel directories
+        
+    Raises:
+        ValueError: If no valid Z/C folder structure found
+    """
     folders_by_z: dict[int, list[Path]] = {}
     for folder, subfolders, _ in path.walk():
         if (
@@ -609,12 +732,22 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
         logger.info(f"Writing to {zarr_path.resolve()}")
         # Define chunks: chunk along Z=1, use user chunk_size for Y/X, full chunk for C
         zarr_chunks = (1, chunk_size, chunk_size, cs)
+    try:
         z_array = zarr.create_array(
             zarr_path,
             shape=final_shape,
             chunks=zarr_chunks,
             dtype=dtype,
             overwrite=True,
+        )
+    except AttributeError:
+        # New zarr API
+        z_array = zarr.open_array(
+            zarr_path,
+            mode="w",
+            shape=final_shape,
+            chunks=zarr_chunks,
+            dtype=dtype,
         )
 
         z_plane_data = np.zeros((img_shape[0], img_shape[1], cs), dtype=dtype)

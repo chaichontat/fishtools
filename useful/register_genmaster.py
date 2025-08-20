@@ -10,52 +10,45 @@ import SimpleITK as sitk
 import tifffile
 from scipy.ndimage import shift
 
-from fishtools.preprocess.chromatic import Affine
+from fishtools.preprocess.chromatic import Affine, FitAffine
 from fishtools.preprocess.config import NumpyEncoder
 
 sns.set_theme()
 
 
 # %%
-As = []
-ts = []
-cg = []
-parameter_object = itk.ParameterObject.New()
-default_rigid_parameter_map = parameter_object.GetDefaultParameterMap("affine")
-default_rigid_parameter_map["AutomaticTransformInitialization"] = ["true"]
-default_rigid_parameter_map["AutomaticScalesEstimation"] = ["true"]
-# default_rigid_parameter_map["AutomaticTransformInitializationMethod"] = ["CenterOfGravity"]
-parameter_object.AddParameterMap(default_rigid_parameter_map)
-result_transform_parameters = parameter_object
 
 
 # Actual calculation
-# As is a 2x2 matrix
-# ts is a 2x1 matrix (translation)
-def calc_shift(path: Path | str):
-    global result_transform_parameters
-    cells = tifffile.imread(path)[:-2].reshape(-1, 2, 2048, 2048).astype(np.float32)
-    print(cells.shape)
-    result_image, result_transform_parameters = itk.elastix_registration_method(
-        cells[10, 0], cells[10, 1], parameter_object=parameter_object, log_to_console=True
-    )
 
-    params = np.array(list(map(float, result_transform_parameters.GetParameter(0, "TransformParameters"))))
-    As.append(params[:4].reshape(2, 2))
-    ts.append(params[-2:])
-    print(result_transform_parameters.GetParameter(0, "CenterOfRotationPoints"))
-    print(As[-1])
+# def calc_shift(path: Path | str):
+#     global result_transform_parameters
+#     cells = tifffile.imread(path)[:-2].reshape(-1, 2, 2048, 2048).astype(np.float32)
+#     print(cells.shape)
+#     result_image, result_transform_parameters = itk.elastix_registration_method(
+#         cells[10, 0], cells[10, 1], parameter_object=parameter_object, log_to_console=True
+#     )
+
+#     params = np.array(list(map(float, result_transform_parameters.GetParameter(0, "TransformParameters"))))
+#     As.append(params[:4].reshape(2, 2))
+#     ts.append(params[-2:])
+#     print(result_transform_parameters.GetParameter(0, "CenterOfRotationPoints"))
+#     print(As[-1])
 
 
 # %%
 # Somehow you need to run this, stop this cell and run it again.
 # The first run will stall.
 target = "650"
-# Input files here.
-[
-    calc_shift(file)
-    for _, file in zip(range(10), Path(f"/working/20250322_cal/cal560_cal{target}--cere/").glob("*.tif"))
-]
+fit = FitAffine()
+
+As, ts = [], []
+
+for _, file in zip(range(10), Path(f"/working/20250322_cal/cal560_cal{target}--cere/").glob("*.tif")):
+    img = tifffile.imread(file)[:-2].reshape(-1, 2, 2048, 2048)
+    A, t = fit.fit(img[10, 0], img[10, 1])
+    As.append(A), ts.append(t)
+
 
 # %%
 # %%
@@ -71,7 +64,6 @@ if write:
             dict(
                 As=np.median(np.stack(As), axis=0),
                 At=np.median(np.stack(ts), axis=0),
-                cg=np.median(np.stack(cg), axis=0),
             ),
             indent=2,
             cls=NumpyEncoder,

@@ -126,18 +126,14 @@ def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = F
         ) -> Future[_R] | Future[TaskCancelledException]:
             def wrapped_f(*args: P.args, **kwargs: P.kwargs) -> _R:
                 if should_terminate.is_set():
-                    raise TaskCancelledException(
-                        "Task cancelled due to shutdown signal or prior exception."
-                    )
+                    raise TaskCancelledException("Task cancelled due to shutdown signal or prior exception.")
                 return f(*args, **kwargs)
 
             # Don't submit if already terminating
             if should_terminate.is_set():
                 # Create a cancelled future to represent the skipped task
                 fut = Future()
-                fut.set_exception(
-                    TaskCancelledException("Shutdown initiated before task submission.")
-                )
+                fut.set_exception(TaskCancelledException("Shutdown initiated before task submission."))
                 futs.append(fut)
                 return fut
             else:
@@ -177,9 +173,7 @@ def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = F
                     # Log the exception regardless
                     task_args = getattr(f, "_args", "N/A")
                     task_kwargs = getattr(f, "_kwargs", "N/A")
-                    logger.error(
-                        f"Task raised an exception: {e} (args={task_args}, kwargs={task_kwargs})"
-                    )
+                    logger.error(f"Task raised an exception: {e} (args={task_args}, kwargs={task_kwargs})")
                     exceptions_encountered.append(e)
 
                     if stop_on_exception:
@@ -204,9 +198,7 @@ def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = F
             if stop_on_exception and exceptions_encountered:
                 raise exceptions_encountered[0]
             elif not stop_on_exception and exceptions_encountered:
-                logger.warning(
-                    f"Finished processing with {len(exceptions_encountered)} errors."
-                )
+                logger.warning(f"Finished processing with {len(exceptions_encountered)} errors.")
 
         finally:
             # Ensure original signal handler is restored
@@ -226,9 +218,7 @@ console = Console()
 
 # Massive hack to get rid of the first two arguments from the type signature.
 class _JPrint(Protocol[P]):
-    def __call__(
-        self, code: str, lexer: str, *args: P.args, **kwargs: P.kwargs
-    ) -> Any: ...
+    def __call__(self, code: str, lexer: str, *args: P.args, **kwargs: P.kwargs) -> Any: ...
 
 
 def _jprint(f: _JPrint[P]) -> Callable[Concatenate[Any, P], None]:

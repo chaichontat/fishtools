@@ -2,7 +2,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import imagecodecs
 import numpy as np
 import numpy.typing as npt
 import pytest
@@ -22,7 +21,7 @@ def img():
     imwrite(path, img)
     yield img
     path.unlink(missing_ok=True)
-    path.with_suffix(".jxl").unlink(missing_ok=True)
+    path.with_suffix(".tif").unlink(missing_ok=True)
     path.with_suffix(".dax").unlink(missing_ok=True)
 
 
@@ -43,15 +42,17 @@ def test_lossy(img: npt.NDArray[np.uint16]):
     size = img.nbytes
     imwrite(path, img)
     compress(path, level=99)
-    jxl = path.with_suffix(".jxl")
-    imgjxl = imagecodecs.imread(jxl)  # type: ignore
+    compressed_path = path.with_suffix(".compressed.tif")
 
-    assert jxl.__sizeof__() < size
+    imgjxl = imread(compressed_path)  # type: ignore
+
+    assert compressed_path.__sizeof__() < size
     assert np.mean(np.abs(img.astype(np.int32) - imgjxl.astype(np.int32))) < 1000
 
-    decompress(jxl, "tif")
-    assert np.allclose(imgjxl, imread(path))
-    decompress(jxl, "dax")
+    with pytest.raises(ValueError, match="No need to decompress to tif. ImageJ can read JPEG-XR."):
+        decompress(compressed_path, "tif")
+
+    assert decompress(compressed_path, "dax")
     assert np.allclose(imgjxl, dax_reader(path.with_suffix(".dax")))
 
 
@@ -97,4 +98,4 @@ def test_do_not_allow_autodelete_if_quality_below_98(
         assert runner.invoke(main, ["compress", "--quality=90", "--delete", path.as_posix()]).exit_code == 0
     time.sleep(0.1)
     assert path.exists()
-    assert path.with_suffix(".jxl").exists()
+    assert path.with_suffix(".compressed.tif").exists()

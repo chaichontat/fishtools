@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -76,15 +77,76 @@ class OptimizePath:
 
 @dataclass
 class Workspace:
+    """FISH experiment workspace manager with verified directory structure.
+
+    Provides standardized access to FISH data following the processing pipeline:
+    Raw Data → Deconv → Register → Stitch → Analysis
+
+    Directory Structure:
+        workspace/
+        ├── {round}--{roi}/                    # Raw imaging data
+        │   ├── {round}-0001.tif
+        │   └── {round}-0002.tif
+        └── analysis/
+            ├── deconv/
+            │   ├── {round}--{roi}/            # Deconvolved images
+            │   ├── registered--{roi}+{codebook}/  # Registration results
+            │   ├── stitch--{roi}/             # Stitching results
+            │   ├── segment--{roi}+{codebook}/ # Segmentation results
+            │   ├── shifts--{roi}+{codebook}/  # Registration shifts
+            │   │   └── shifts-0001.json
+            │   ├── fids--{roi}/               # Fiducial markers
+            │   │   └── fids-0001.tif
+            │   └── opt_{codebook}/            # Optimization results
+            │       ├── mse.txt
+            │       └── global_scale.txt
+            └── output/                        # Final analysis output
+
+    CLI Pipeline & I/O:
+        deconv:     {round}--{roi}/*.tif → analysis/deconv/{round}--{roi}/*.tif
+        register:   analysis/deconv/{round}--{roi}/ → analysis/deconv/registered--{roi}+{codebook}/
+        stitch:     analysis/deconv/registered--{roi}+{codebook}/ → analysis/deconv/stitch--{roi}/
+        spotlook:   analysis/deconv/registered--{roi}+{codebook}/ → analysis/output/
+
+    Key Methods:
+        ws.rounds, ws.rois          # Discover available data
+        ws.img(round, roi, idx)     # Access deconvolved images
+        ws.regimg(roi, cb, idx)     # Access registered results
+        ws.registered(roi, cb)      # Registration directory
+        ws.stitch(roi)              # Stitching directory
+        ws.opt(codebook)            # Optimization results
+
+    Args:
+        path: Workspace root path (auto-detects from subdirectories)
+    """
+
+    # Regex patterns for robust directory name parsing
+    ROUND_ROI_PATTERN = re.compile(
+        r"^([^-]+)--([^+]+)(?:\+.*)?$"
+    )  # {round}--{roi} or {round}--{roi}+{suffix}
+    ROI_CODEBOOK_PATTERN = re.compile(r"^[^-]+--([^+]+)(?:\+(.+))?$")  # Extract ROI and optional codebook
+    NUMERIC_SORT_PATTERN = re.compile(r"^(\d+)_")  # For numerical sorting of rounds
+
     path: Path
 
-    def __str__(self):
+    def __str__(self) -> str:
+        """Return string representation of workspace path."""
         return str(self.path)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
+        """Return detailed string representation for debugging."""
         return f"Workspace({self.path})"
 
-    def __init__(self, path: Path | str, deconved: bool = False):
+    def __init__(self, path: Path | str, deconved: bool = False) -> None:
+        """Initialize workspace with automatic path resolution.
+
+        Automatically detects and normalizes workspace root path. If path points
+        to analysis/deconv subdirectory, automatically resolves to workspace root.
+
+        Args:
+            path: Path to workspace root or any subdirectory within workspace
+            deconved: Unused parameter (backward compatibility)
+        """
         path = Path(path).expanduser().resolve()
         if "analysis/deconv" in path.as_posix():
             self.path = path.parent.parent
@@ -92,30 +154,91 @@ class Workspace:
             self.path = path
 
     @property
-    def rounds(self):
+    def rounds(self) -> list[str]:
+        """Discover and return all available imaging rounds in the workspace.
+
+        Uses regex pattern matching for robust directory name parsing. Scans workspace
+        directories for round subdirectories following the naming convention '{round}--{roi}'.
+        Automatically filters out processing directories and sorts numerically by round identifier.
+
+        Returns:
+            List of round identifiers (e.g., ['1_9_17', '2_10_18', '3_11_19'])
+
+        Raises:
+            ValueError: If no valid round directories are found
+
+        Example:
+            >>> ws = Workspace("/experiment")
+            >>> ws.rounds  # ['1_9_17', '2_10_18', '3_11_19']
+        """
         FORBIDDEN = {"10x", "analysis", "shifts", "stitch", "fid", "registered", "old", "basic"}
         path = self.path if not self.deconved.exists() else self.deconved
-        res = sorted(
-            {
-                p.name.split("--")[0]
-                for p in path.iterdir()
-                if "--" in p.name and p.is_dir() and not any(p.name.startswith(bad) for bad in FORBIDDEN)
-            },
-            key=lambda x: f"{int(x.split('_')[0]):02d}" if x.split("_")[0].isdigit() else x,
-        )
-        if not res:
+
+        rounds_set = set()
+        for p in path.iterdir():
+            if not p.is_dir():
+                continue
+
+            # Use regex to parse directory names
+            match = self.ROUND_ROI_PATTERN.match(p.name)
+            if match:
+                round_name = match.group(1)
+                # Filter out forbidden prefixes
+                if not any(round_name.startswith(bad) for bad in FORBIDDEN):
+                    rounds_set.add(round_name)
+
+        if not rounds_set:
             raise ValueError(f"No round subdirectories found in {path}.")
-        return res
+
+        # Sort numerically if possible, otherwise alphabetically
+        def sort_key(x: str) -> str:
+            numeric_match = self.NUMERIC_SORT_PATTERN.match(x)
+            if numeric_match:
+                return f"{int(numeric_match.group(1)):02d}{x[len(numeric_match.group(1)) :]}"
+            return x
+
+        return sorted(rounds_set, key=sort_key)
 
     @property
-    def rois(self):
+    def rois(self) -> list[str]:
+        """Discover and return all available regions of interest (ROIs) in the workspace.
+
+        Uses regex pattern matching for robust directory name parsing. Scans workspace
+        directories to extract ROI identifiers from directory names following the
+        convention '{round}--{roi}' or '{process}--{roi}+{codebook}'.
+
+        Returns:
+            Sorted list of ROI identifiers (e.g., ['roi1', 'roi2', 'roi3'])
+
+        Example:
+            >>> ws = Workspace("/experiment")
+            >>> ws.rois  # ['cortex', 'hippocampus', 'striatum']
+        """
         path = self.path if not self.deconved.exists() else self.deconved
-        return sorted({
-            p.name.split("--")[1].split("+")[0] for p in path.iterdir() if p.is_dir() and "--" in p.name
-        })
+
+        rois_set = set()
+        for p in path.iterdir():
+            if not p.is_dir():
+                continue
+
+            # Use regex to extract ROI from directory names
+            match = self.ROI_CODEBOOK_PATTERN.match(p.name)
+            if match:
+                roi_name = match.group(1)
+                rois_set.add(roi_name)
+
+        return sorted(rois_set)
 
     @property
-    def deconved(self):
+    def deconved(self) -> Path:
+        """Return path to deconvolved/processed data directory.
+
+        Returns:
+            Path to analysis/deconv directory containing processed images
+
+        Example:
+            >>> ws.deconved  # PosixPath('/experiment/analysis/deconv')
+        """
         return self.path / "analysis" / "deconv"
 
     @overload
@@ -123,12 +246,43 @@ class Workspace:
     @overload
     def img(self, round_: str, roi: str, idx: int, *, read: Literal[True]) -> npt.NDArray[np.uint16]: ...
     def img(self, round_: str, roi: str, idx: int, *, read: bool = False):
+        """Access deconvolved images by round, ROI, and index.
+
+        Provides type-safe access to processed image files with optional direct loading.
+        Uses overloaded signatures to ensure correct return type based on read parameter.
+
+        Args:
+            round_: Imaging round identifier (e.g., '1_9_17')
+            roi: Region of interest identifier (e.g., 'cortex')
+            idx: Image index (0-based)
+            read: If True, load and return image data; if False, return path
+
+        Returns:
+            Path object if read=False, numpy array if read=True
+
+        Example:
+            >>> path = ws.img('1_9_17', 'cortex', 42)  # Returns Path
+            >>> data = ws.img('1_9_17', 'cortex', 42, read=True)  # Returns ndarray
+        """
         path = self.deconved / f"{round_}--{roi}/{round_}-{idx:04d}.tif"
         if read:
             return imread(path)
         return path
 
-    def registered(self, roi: str, codebook: str):
+    def registered(self, roi: str, codebook: str) -> Path:
+        """Return path to registration results directory.
+
+        Args:
+            roi: Region of interest identifier
+            codebook: Codebook name used for registration
+
+        Returns:
+            Path to registered image directory
+
+        Example:
+            >>> ws.registered('cortex', 'codebook_v1')
+            # PosixPath('/experiment/analysis/deconv/registered--cortex+codebook_v1')
+        """
         return self.deconved / f"registered--{roi}+{codebook}"
 
     @overload
@@ -136,17 +290,63 @@ class Workspace:
     @overload
     def regimg(self, roi: str, codebook: str, idx: int, *, read: Literal[True]) -> npt.NDArray[np.uint16]: ...
     def regimg(self, roi: str, codebook: str, idx: int, *, read: bool = False):
+        """Access registered images by ROI, codebook, and index.
+
+        Provides type-safe access to registration results with optional direct loading.
+        Uses overloaded signatures to ensure correct return type based on read parameter.
+
+        Args:
+            roi: Region of interest identifier
+            codebook: Codebook name used for registration
+            idx: Image index (0-based)
+            read: If True, load and return image data; if False, return path
+
+        Returns:
+            Path object if read=False, numpy array if read=True
+
+        Example:
+            >>> path = ws.regimg('cortex', 'codebook_v1', 42)  # Returns Path
+            >>> data = ws.regimg('cortex', 'codebook_v1', 42, read=True)  # Returns ndarray
+        """
         path = self.registered(roi, codebook) / f"reg-{idx:04d}.tif"
         if read:
             return imread(path)
         return path
 
-    def stitch(self, roi: str, codebook: str | None = None):
+    def stitch(self, roi: str, codebook: str | None = None) -> Path:
+        """Return path to stitching results directory.
+
+        Args:
+            roi: Region of interest identifier
+            codebook: Optional codebook name for registration-based stitching
+
+        Returns:
+            Path to stitched image directory
+
+        Example:
+            >>> ws.stitch('cortex')  # PosixPath('...deconv/stitch--cortex')
+            >>> ws.stitch('cortex', 'cb_v1')  # PosixPath('...deconv/stitch--cortex+cb_v1')
+        """
         if codebook is None:
             return self.deconved / f"stitch--{roi}"
         return self.deconved / f"stitch--{roi}+{codebook}"
 
-    def tileconfig(self, roi: str):
+    def tileconfig(self, roi: str) -> "TileConfiguration":
+        """Load tile configuration for stitched images.
+
+        Args:
+            roi: Region of interest identifier
+
+        Returns:
+            TileConfiguration object with registered tile positions
+
+        Raises:
+            FileNotFoundError: If stitching has not been performed yet
+
+        Example:
+            >>> config = ws.tileconfig('cortex')
+            >>> print(config.tiles)  # Access tile positions
+        """
         try:
             return TileConfiguration.from_file(
                 self.path / f"stitch--{roi}" / "TileConfiguration.registered.txt"
@@ -154,11 +354,39 @@ class Workspace:
         except FileNotFoundError:
             raise FileNotFoundError("Haven't stitch/registered yet. Run preprocess stitch register first.")
 
-    def segment(self, roi: str, codebook: str):
+    def segment(self, roi: str, codebook: str) -> Path:
+        """Return path to segmentation results directory.
+
+        Args:
+            roi: Region of interest identifier
+            codebook: Codebook name used for segmentation
+
+        Returns:
+            Path to segmentation results directory
+
+        Example:
+            >>> ws.segment('cortex', 'codebook_v1')
+            # PosixPath('/experiment/analysis/deconv/segment--cortex+codebook_v1')
+        """
         return self.deconved / f"segment--{roi}+{codebook}"
 
-    def opt(self, codebook: str):
-        return OptimizePath(self.deconved / f"opt--{codebook}")
+    def opt(self, codebook: str) -> OptimizePath:
+        """Return path to optimization results directory.
+
+        Args:
+            codebook: Codebook name used for optimization
+
+        Returns:
+            OptimizePath object for accessing optimization results
+
+        Note:
+            Real pattern verified: opt_{codebook} (underscore, not double-dash)
+
+        Example:
+            >>> ws.opt("ebe_tricycle_targets")
+            # OptimizePath('/experiment/analysis/deconv/opt_ebe_tricycle_targets')
+        """
+        return OptimizePath(self.deconved / f"opt_{codebook}")
 
 
 def get_metadata(file: Path):

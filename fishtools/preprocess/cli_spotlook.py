@@ -12,14 +12,109 @@ import typer
 from loguru import logger
 from matplotlib.contour import QuadContourSet
 from matplotlib.figure import Figure
+from pydantic import BaseModel, Field
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
 from fishtools.utils.io import Workspace
 from fishtools.utils.plot import add_scale_bar
+from fishtools.utils.utils import initialize_logger
+
+
+class SpotlookParams(BaseModel):
+    """Parameters for spotlook analysis with validation and type safety."""
+
+    # Core filtering parameters
+    area_min: float = Field(default=10.0, gt=0, description="Minimum spot area in pixels")
+    area_max: float = Field(default=200.0, gt=0, description="Maximum spot area in pixels")
+    norm_threshold: float = Field(
+        default=0.007, gt=0, description="Normalization threshold for spot filtering"
+    )
+    distance_threshold: float = Field(default=0.3, gt=0, description="Distance threshold for spot filtering")
+
+    # Density analysis parameters
+    density_grid_size: int = Field(default=50, gt=0, description="Grid size for density map calculation")
+    density_smooth_sigma: float = Field(
+        default=4.0, gt=0, description="Gaussian smoothing sigma for density map"
+    )
+    min_spots_for_density: int = Field(
+        default=100, gt=0, description="Minimum spots required for density analysis"
+    )
+
+    # Reproducibility
+    seed: int = Field(default=0, ge=0, description="Random seed for reproducible analysis")
+
+    # Visualization settings
+    subsample: int = Field(default=200000, gt=0, description="Maximum spots to display in plots")
+    scale_bar_um: float = Field(default=1000.0, gt=0, description="Scale bar size in micrometers")
+    dpi: int = Field(default=200, gt=0, description="Plot resolution in DPI")
+    figsize_spots: tuple[float, float] = Field(default=(10.0, 10.0), description="Figure size for spot plots")
+    figsize_thresh: tuple[float, float] = Field(
+        default=(8.0, 6.0), description="Figure size for threshold plots"
+    )
+
+    @classmethod
+    def from_config(
+        cls,
+        config_path: Path | None = None,
+        area_min: float | None = None,
+        area_max: float | None = None,
+        norm_threshold: float | None = None,
+        distance_threshold: float | None = None,
+        seed: int | None = None,
+    ) -> "SpotlookParams":
+        """Create SpotlookParams from config file with CLI overrides."""
+        try:
+            from fishtools.preprocess.config_loader import load_config
+
+            if config_path:
+                config = load_config(config_path)
+                spot_config = config.spot_analysis
+
+                # Extract from nested config structure
+                params = cls(
+                    area_min=spot_config.area_range[0],
+                    area_max=spot_config.area_range[1],
+                    norm_threshold=spot_config.norm_threshold,
+                    distance_threshold=spot_config.distance_threshold,
+                    density_grid_size=int(spot_config.density["grid_size"]),
+                    density_smooth_sigma=float(spot_config.density["smooth_sigma"]),
+                    min_spots_for_density=int(spot_config.density["min_spots"]),
+                    seed=spot_config.seed,
+                    subsample=int(spot_config.visualization["subsample"]),
+                    scale_bar_um=float(spot_config.visualization["scale_bar_um"]),
+                    dpi=int(spot_config.visualization["dpi"]),
+                    figsize_spots=tuple(spot_config.visualization["figsize_spots"]),
+                    figsize_thresh=tuple(spot_config.visualization["figsize_thresh"]),
+                )
+            else:
+                # Use defaults
+                params = cls()
+
+        except ImportError:
+            # Fallback if config system unavailable
+            params = cls()
+
+        # Apply CLI overrides using Pydantic's update mechanism
+        overrides = {
+            k: v
+            for k, v in {
+                "area_min": area_min,
+                "area_max": area_max,
+                "norm_threshold": norm_threshold,
+                "distance_threshold": distance_threshold,
+                "seed": seed,
+            }.items()
+            if v is not None
+        }
+
+        if overrides:
+            return params.model_copy(update=overrides)
+        return params
+
 
 # --- Analysis Parameters ---
-# These parameters are defined globally for this script's execution context.
+# DEPRECATED: These global constants will be replaced with config-based parameters
 SEED = 0
 AREA_MIN = 10.0
 AREA_MAX = 200.0
@@ -70,22 +165,29 @@ def _load_spots_data(path: Path, roi: str, codebook: str) -> pl.DataFrame | None
     return df
 
 
-def _apply_initial_filters(spots: pl.DataFrame, rng: np.random.Generator) -> pl.DataFrame:
+def _apply_initial_filters(
+    spots: pl.DataFrame,
+    rng: np.random.Generator,
+    params: SpotlookParams,
+) -> pl.DataFrame:
     """Applies initial area/norm filters and engineers features for density analysis."""
     logger.info("Applying initial filters and engineering features...")
-    spots_ = spots.filter(pl.col("area").is_between(AREA_MIN, AREA_MAX) & pl.col("norm").gt(NORM_GT))
+    spots_ = spots.filter(
+        pl.col("area").is_between(params.area_min, params.area_max) & pl.col("norm").gt(params.norm_threshold)
+    )
     logger.info(f"Spots after area/norm filter: {len(spots_):,}")
 
     spots_ = spots_.with_columns(
         x_=(pl.col("area")) ** (1 / 3) + rng.uniform(-0.75, 0.75, size=len(spots_)),
         y_=(pl.col("norm") * (1 - pl.col("distance"))).log10(),
-    ).filter(pl.col("distance") < DISTANCE_LT)
+    ).filter(pl.col("distance") < params.distance_threshold)
     logger.info(f"Spots after distance filter: {len(spots_):,}")
     return spots_
 
 
 def _calculate_density_map(
     spots_: pl.DataFrame,
+    params: SpotlookParams,
 ) -> tuple[QuadContourSet, RegularGridInterpolator] | None:
     """Calculates and smooths the blank proportion density map."""
     logger.info("Calculating blank proportion density map...")
@@ -96,8 +198,8 @@ def _calculate_density_map(
         pl.col("y_").max().alias("y_max"),
     ]).row(0, named=True)
 
-    x_coords = np.linspace(bounds["x_min"], bounds["x_max"], DENSITY_GRID_SIZE)
-    y_coords = np.linspace(bounds["y_min"], bounds["y_max"], DENSITY_GRID_SIZE)
+    x_coords = np.linspace(bounds["x_min"], bounds["x_max"], params.density_grid_size)
+    y_coords = np.linspace(bounds["y_min"], bounds["y_max"], params.density_grid_size)
     X, Y = np.meshgrid(x_coords, y_coords)
 
     step_x = x_coords[1] - x_coords[0] if len(x_coords) > 1 else 1
@@ -110,9 +212,9 @@ def _calculate_density_map(
         ])
         .filter(
             (pl.col("i") >= 0)
-            & (pl.col("i") < DENSITY_GRID_SIZE)
+            & (pl.col("i") < params.density_grid_size)
             & (pl.col("j") >= 0)
-            & (pl.col("j") < DENSITY_GRID_SIZE)
+            & (pl.col("j") < params.density_grid_size)
         )
         .group_by(["i", "j"])
         .agg([pl.sum("is_blank").alias("blank_count"), pl.len().alias("total_count")])
@@ -122,7 +224,7 @@ def _calculate_density_map(
     Z = np.zeros_like(X)
     for row in binned_counts.iter_rows(named=True):
         Z[row["j"], row["i"]] = row["proportion"]
-    Z_smooth = gaussian_filter(Z, sigma=DENSITY_SMOOTH_SIGMA)
+    Z_smooth = gaussian_filter(Z, sigma=params.density_smooth_sigma)
 
     # Use a dummy figure to generate contours, as we only need the contour object itself.
     with plt.ioff():  # Turn off interactive plotting temporarily
@@ -145,6 +247,7 @@ def _get_interactive_threshold(
     output_dir: Path,
     roi: str,
     codebook: str,
+    params: SpotlookParams,
 ) -> int:
     """Generates a threshold plot and interactively asks the user for a threshold level."""
     logger.info("Generating threshold selection plot...")
@@ -158,7 +261,7 @@ def _get_interactive_threshold(
         blank_proportions.append(spots_ok.filter(pl.col("is_blank")).height / max(1, len(spots_ok)))
 
     sns.set_theme()
-    fig_thresh, ax1 = plt.subplots(figsize=(8, 6), dpi=200)
+    fig_thresh, ax1 = plt.subplots(figsize=params.figsize_thresh, dpi=params.dpi)
     ax1.plot(threshold_levels, spot_counts, "g-", label="Remaining Spots")
     ax1.set_xlabel("Threshold Contour Level")
     ax1.set_ylabel("Number of Spots", color="g")
@@ -204,22 +307,24 @@ def _apply_final_filter(
     return spots_ok
 
 
-def _generate_final_outputs(spots_ok: pl.DataFrame, output_dir: Path, roi: str, codebook: str):
+def _generate_final_outputs(
+    spots_ok: pl.DataFrame, output_dir: Path, roi: str, codebook: str, params: SpotlookParams
+):
     """Generates all final plots and saves the filtered data for a single ROI."""
     logger.info("Generating final plots and saving data...")
     # Final Spots Spatial Plot
-    fig_spots, ax = plt.subplots(figsize=(10, 10), dpi=200)
-    subsample = max(1, len(spots_ok) // 200_000)
+    fig_spots, ax = plt.subplots(figsize=params.figsize_spots, dpi=params.dpi)
+    subsample = max(1, len(spots_ok) // params.subsample)
     ax.scatter(spots_ok["y"][::subsample], spots_ok["x"][::subsample], s=0.1, alpha=0.3)
     ax.set_aspect("equal")
     ax.axis("off")
-    add_scale_bar(ax, 1000 / 0.108, "1000 μm")
+    add_scale_bar(ax, params.scale_bar_um / 0.108, f"{params.scale_bar_um} μm")
     ax.set_title(f"Filtered Spots for ROI {roi} (n={len(spots_ok):,})")
     save_figure(fig_spots, output_dir, "spots_final", roi, codebook)
 
     # Final Scree Plot
     per_gene_final = count_by_gene(spots_ok)
-    fig_scree, ax_scree = plt.subplots(figsize=(8, 6), dpi=200)
+    fig_scree, ax_scree = plt.subplots(figsize=params.figsize_thresh, dpi=params.dpi)
     blank_prop = per_gene_final.filter(pl.col("is_blank"))["count"].sum() / per_gene_final["count"].sum()
     total_spots = per_gene_final["count"].sum()
     ax_scree.bar(
@@ -280,21 +385,50 @@ def _generate_final_outputs(spots_ok: pl.DataFrame, output_dir: Path, roi: str, 
     multiple=True,
     help="Specific ROI to process. Can be used multiple times. [default: all found ROIs]",
 )
-def threshold(path: Path, codebook_path: Path, output_dir: Path | None = None, rois: list[str] | None = None):
+@click.option(
+    "--config",
+    type=click.Path(exists=True, path_type=Path),
+    help="Configuration file path (TOML format)",
+)
+@click.option("--area-min", type=float, help="Override minimum spot area")
+@click.option("--area-max", type=float, help="Override maximum spot area")
+@click.option("--norm-threshold", type=float, help="Override norm threshold")
+@click.option("--distance-threshold", type=float, help="Override distance threshold")
+@click.option("--seed", type=int, help="Override random seed")
+def threshold(
+    path: Path,
+    codebook_path: Path,
+    output_dir: Path | None = None,
+    rois: list[str] | None = None,
+    config: Path | None = None,
+    area_min: float | None = None,
+    area_max: float | None = None,
+    norm_threshold: float | None = None,
+    distance_threshold: float | None = None,
+    seed: int | None = None,
+):
     """
     Process spot data for each ROI individually with an interactive threshold selection step.
     """
-    logger.remove()
-    logger.add(
-        sys.stderr,
-        level="INFO",
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-    )
+    initialize_logger()
 
     if output_dir is None:
         output_dir = path.parent / "output"
     output_dir.mkdir(exist_ok=True, parents=True)
     logger.info(f"Using output directory: {output_dir}")
+
+    # Load configuration and create parameters model
+    params = SpotlookParams.from_config(
+        config_path=config,
+        area_min=area_min,
+        area_max=area_max,
+        norm_threshold=norm_threshold,
+        distance_threshold=distance_threshold,
+        seed=seed,
+    )
+    logger.info(
+        f"Using analysis parameters: seed={params.seed}, area=[{params.area_min}, {params.area_max}], norm_threshold={params.norm_threshold}"
+    )
 
     codebook = codebook_path.stem
 
@@ -309,34 +443,33 @@ def threshold(path: Path, codebook_path: Path, output_dir: Path | None = None, r
     # --- Main Processing Loop ---
     for i, roi in enumerate(rois_to_process, 1):
         logger.info(f"--- Starting processing for ROI: {roi} ({i}/{len(rois_to_process)}) ---")
-        rng = np.random.default_rng(SEED)
+        rng = np.random.default_rng(params.seed)
 
         spots_raw = _load_spots_data(path, roi, codebook)
         if spots_raw is None or spots_raw.is_empty():
             logger.warning(f"No data loaded for ROI {roi}. Skipping to next.")
             continue
 
-        spots_intermediate = _apply_initial_filters(spots_raw, rng)
-        if spots_intermediate.height < MIN_SPOTS_FOR_DENSITY_ANALYSIS:
+        spots_intermediate = _apply_initial_filters(spots_raw, rng, params)
+        if spots_intermediate.height < params.min_spots_for_density:
             logger.warning(
                 f"Insufficient spots ({spots_intermediate.height}) for ROI {roi} after initial filtering. Skipping density analysis."
             )
             continue
 
-        density_results = _calculate_density_map(spots_intermediate)
+        density_results = _calculate_density_map(spots_intermediate, params)
         if density_results is None:
             continue
         contours, interp_func = density_results
 
         chosen_level = _get_interactive_threshold(
-            spots_intermediate, contours, interp_func, output_dir, roi, codebook
+            spots_intermediate, contours, interp_func, output_dir, roi, codebook, params
         )
         if chosen_level == -1:  # User cancelled
             continue
 
         spots_final = _apply_final_filter(spots_intermediate, interp_func, contours, chosen_level)
-
-        _generate_final_outputs(spots_final, output_dir, roi, codebook)
+        _generate_final_outputs(spots_final, output_dir, roi, codebook, params)
 
         logger.success(f"--- Finished processing for ROI: {roi} ---")
 

@@ -6,8 +6,9 @@ import logging
 import os
 import pathlib
 import shutil
+from collections.abc import Callable
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated, Any, cast
 
 import cellpose.io
 import cellpose.models
@@ -23,7 +24,7 @@ import typer
 import yaml
 import zarr
 from loguru import logger
-from rich.console import Console
+from numpy.typing import NDArray
 from rich.logging import RichHandler
 
 from fishtools.preprocess.config import NumpyEncoder
@@ -42,7 +43,7 @@ logger = logging.getLogger("rich")
 
 
 ######################## File format functions ################################
-def numpy_array_to_zarr(write_path: Path | str, array, chunks):
+def numpy_array_to_zarr(write_path: Path | str, array: NDArray[Any], chunks: tuple[int, ...]) -> zarr.Array:
     """
     Store an in memory numpy array to disk as a chunked Zarr array
 
@@ -75,9 +76,9 @@ def numpy_array_to_zarr(write_path: Path | str, array, chunks):
 
 
 def wrap_folder_of_tiffs(
-    filename_pattern,
-    block_index_pattern=r"_(Z)(\d+)(Y)(\d+)(X)(\d+)",
-):
+    filename_pattern: str,
+    block_index_pattern: str = r"_(Z)(\d+)(Y)(\d+)(X)(\d+)",
+) -> zarr.Array:
     """
     Wrap a folder of tiff files with a zarr array without duplicating data.
     Tiff files must all contain images with the same shape and data type.
@@ -117,7 +118,7 @@ def wrap_folder_of_tiffs(
     """
 
     # define function to read individual files
-    def imread(fname):
+    def imread(fname: str) -> NDArray[Any]:
         with open(fname, "rb") as fh:
             return imagecodecs.tiff_decode(fh.read(), index=None)
 
@@ -138,35 +139,43 @@ def wrap_folder_of_tiffs(
 DEFAULT_CONFIG_FILENAME = "distributed_cellpose_dask_config.yaml"
 
 
-def _config_path(config_name):
-    """Add config directory path to config filename"""
+def _config_path(config_name: str) -> str:
     return str(pathlib.Path.home()) + "/.config/dask/" + config_name
 
 
 def _modify_dask_config(
-    config,
-    config_name=DEFAULT_CONFIG_FILENAME,
-):
-    """
-    Modifies dask config dictionary, but also dumps modified
-    config to disk as a yaml file in ~/.config/dask/. This
-    ensures that workers inherit config options.
-    """
+    config: dict[str, Any],
+    config_name: str = DEFAULT_CONFIG_FILENAME,
+) -> None:
     dask.config.set(config)
     with open(_config_path(config_name), "w") as f:
         yaml.dump(dask.config.config, f, default_flow_style=False)
 
 
 def _remove_config_file(
-    config_name=DEFAULT_CONFIG_FILENAME,
-):
-    """Removes a config file from disk"""
+    config_name: str = DEFAULT_CONFIG_FILENAME,
+) -> None:
     config_path = _config_path(config_name)
     if os.path.exists(config_path):
         os.remove(config_path)
 
 
-def format_slice(s: slice) -> str:
+def format_slice(s: slice | tuple[slice, ...]) -> str:
+    """
+    Format a slice or tuple of slices as a human-readable string.
+
+    This function converts slice objects into string representation
+    suitable for logging and debugging purposes.
+
+    Examples
+    --------
+    >>> format_slice(slice(1, 10, 2))
+    '1:10:2'
+    >>> format_slice((slice(0, 5), slice(10, 20)))
+    '0:5,10:20'
+    """
+    if isinstance(s, tuple):
+        return ",".join(format_slice(item) for item in s)
     if not isinstance(s, slice):  # type: ignore
         return str(s)
 
@@ -207,18 +216,20 @@ class myLocalCluster(distributed.LocalCluster):
 
     def __init__(
         self,
-        ncpus,
-        config={},
-        config_name=DEFAULT_CONFIG_FILENAME,
-        persist_config=False,
-        **kwargs,
-    ):
+        ncpus: int,
+        config: dict[str, Any] | None = None,
+        config_name: str = DEFAULT_CONFIG_FILENAME,
+        persist_config: bool = False,
+        **kwargs: Any,
+    ) -> None:
         # config
         self.config_name = config_name
         self.persist_config = persist_config
         scratch_dir = f"{os.getcwd()}/"
         scratch_dir += f".{getpass.getuser()}_distributed_cellpose/"
         config_defaults = {"temporary-directory": scratch_dir}
+        if config is None:
+            config = {}
         config = {**config_defaults, **config}
         _modify_dask_config(config, config_name)
 
@@ -245,10 +256,10 @@ class myLocalCluster(distributed.LocalCluster):
 
         print("Cluster dashboard link: ", self.dashboard_link)
 
-    def __enter__(self):
+    def __enter__(self) -> "myLocalCluster":
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         if not self.persist_config:
             _remove_config_file(self.config_name)
         self.client.close()
@@ -256,7 +267,7 @@ class myLocalCluster(distributed.LocalCluster):
 
 
 # ----------------------- decorator -------------------------------------------#
-def cluster(func):
+def cluster(func: Callable[..., Any]) -> Callable[..., Any]:
     """
     This decorator ensures a function will run inside a cluster
     as a context manager. The decorated function, "func", must
@@ -268,7 +279,7 @@ def cluster(func):
     """
 
     @functools.wraps(func)
-    def create_or_pass_cluster(*args, **kwargs):
+    def create_or_pass_cluster(*args: Any, **kwargs: Any) -> Any:
         # TODO: this only checks if args are explicitly present in function call
         #       it does not check if they are set correctly in any way
         assert "cluster" in kwargs or "cluster_kwargs" in kwargs, (
@@ -276,9 +287,6 @@ def cluster(func):
         )
         if not "cluster" in kwargs:
             cluster_constructor = myLocalCluster
-            F = lambda x: x in kwargs["cluster_kwargs"]
-            if F("ncpus") and F("min_workers") and F("max_workers"):
-                cluster_constructor = janeliaLSFCluster
             with cluster_constructor(**kwargs["cluster_kwargs"]) as cluster:
                 kwargs["cluster"] = cluster
                 return func(*args, **kwargs)
@@ -292,17 +300,20 @@ def cluster(func):
 
 # ----------------------- The main function -----------------------------------#
 def process_block(
-    block_index,
-    crop,
-    input_zarr,
-    model_kwargs,
-    eval_kwargs,
-    blocksize,
-    overlap,
-    output_zarr,
-    preprocessing_steps=[],
-    worker_logs_directory=None,
-    test_mode=False,
+    block_index: tuple[int, ...],
+    crop: tuple[slice, ...],
+    input_zarr: zarr.Array,
+    model_kwargs: dict[str, Any],
+    eval_kwargs: dict[str, Any],
+    blocksize: tuple[int, ...],
+    overlap: int,
+    output_zarr: zarr.Array,
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]] = [],
+    worker_logs_directory: str | None = None,
+    test_mode: bool = False,
+) -> (
+    tuple[NDArray[np.uint32], list[tuple[slice, ...]], NDArray[np.uint32]]
+    | tuple[list[NDArray[Any]], list[tuple[slice, ...]], NDArray[np.uint32]]
 ):
     """
     Preprocess and segment one block, of many, with eventual merger
@@ -474,14 +485,48 @@ def process_block(
 
 # ----------------------- component functions ---------------------------------#
 def read_preprocess_and_segment(
-    input_zarr,
-    crop,
-    preprocessing_steps,
-    model_kwargs,
-    eval_kwargs,
-    worker_logs_directory,
-) -> Annotated[np.ndarray, "Masks"]:
-    """Read block from zarr array, run all preprocessing steps, run cellpose"""
+    input_zarr: zarr.Array,
+    crop: tuple[slice, ...],
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
+    model_kwargs: dict[str, Any],
+    eval_kwargs: dict[str, Any],
+    worker_logs_directory: str | None,
+) -> Annotated[NDArray[np.uint32], "Segmentation masks"]:
+    """
+    Read image block from zarr array, apply preprocessing pipeline, and run Cellpose segmentation.
+
+    This function forms the core of the distributed segmentation pipeline. It handles loading
+    a specific block of image data, applies user-defined preprocessing steps, and runs
+    Cellpose segmentation on the processed block.
+
+    Parameters
+    ----------
+    input_zarr : zarr.Array
+        Input zarr array containing image data
+    crop : tuple of slice
+        Crop coordinates defining the block to process
+    preprocessing_steps : list of tuple
+        List of (function, kwargs) pairs for preprocessing pipeline
+    model_kwargs : dict
+        Arguments passed to CellposeModel constructor
+    eval_kwargs : dict
+        Arguments passed to CellposeModel.eval method
+    worker_logs_directory : str, optional
+        Directory for worker log files, by default None
+
+    Returns
+    -------
+    NDArray[np.uint32]
+        Segmentation masks with uint32 labels
+
+    Notes
+    -----
+    The preprocessing pipeline allows arbitrary image processing before segmentation.
+    Each preprocessing function must accept an image array and a 'crop' keyword argument.
+    """
+    if preprocessing_steps is None:
+        preprocessing_steps = []
+
     image = input_zarr[crop]
     for pp_step in preprocessing_steps:
         pp_step[1]["crop"] = crop
@@ -495,10 +540,37 @@ def read_preprocess_and_segment(
     return model.eval(image, **eval_kwargs)[0].astype(np.uint32)
 
 
-def remove_overlaps(array, crop, overlap, blocksize):
-    """overlaps only there to provide context for boundary voxels
-    and can be removed after segmentation is complete
-    reslice array to remove the overlaps"""
+def remove_overlaps(
+    array: NDArray[Any], crop: tuple[slice, ...], overlap: int, blocksize: tuple[int, ...]
+) -> tuple[NDArray[Any], list[slice]]:
+    """
+    Remove overlapping regions from segmented block.
+
+    Overlapping regions are added during processing to provide context for boundary
+    pixels/voxels during segmentation. After segmentation is complete, these overlaps
+    must be removed to prevent double-counting during block stitching.
+
+    Parameters
+    ----------
+    array : NDArray
+        The segmented array with overlaps to be trimmed
+    crop : tuple of slice
+        Original crop coordinates including overlaps
+    overlap : int
+        Size of overlap in pixels/voxels
+    blocksize : tuple of int
+        Target block size without overlaps
+
+    Returns
+    -------
+    tuple[NDArray, list[slice]]
+        Trimmed array and updated crop coordinates
+
+    Notes
+    -----
+    This function modifies both the array dimensions and the crop coordinates
+    to maintain consistency for downstream processing.
+    """
     crop_trimmed = list(crop)
     for axis in range(array.ndim):
         if crop[axis].start != 0:
@@ -520,9 +592,34 @@ def remove_overlaps(array, crop, overlap, blocksize):
     return array, crop_trimmed
 
 
-def bounding_boxes_in_global_coordinates(segmentation, crop):
-    """bounding boxes (tuples of slices) are super useful later
-    best to compute them now while things are distributed"""
+def bounding_boxes_in_global_coordinates(
+    segmentation: NDArray[Any], crop: tuple[slice, ...]
+) -> list[tuple[slice, ...]]:
+    """
+    Compute bounding boxes for all segments in global coordinates.
+
+    Calculates tight bounding boxes for each segmented object and converts
+    local block coordinates to global image coordinates. This is performed
+    during distributed processing to avoid recomputation later.
+
+    Parameters
+    ----------
+    segmentation : NDArray
+        Segmented array with integer labels
+    crop : tuple of slice
+        Global crop coordinates for this block
+
+    Returns
+    -------
+    list[tuple[slice, ...]]
+        List of bounding box coordinates as tuples of slices in global coordinates
+
+    Notes
+    -----
+    Bounding boxes are essential for efficient downstream processing and
+    analysis of segmented objects. Computing them during distributed processing
+    avoids the need to reload large arrays later.
+    """
     boxes = scipy.ndimage.find_objects(segmentation)
     boxes = [b for b in boxes if b is not None]
     translate = lambda a, b: slice(a.start + b.start, a.start + b.stop)
@@ -531,17 +628,66 @@ def bounding_boxes_in_global_coordinates(segmentation, crop):
     return boxes
 
 
-def get_nblocks(shape, blocksize):
-    """Given a shape and blocksize determine the number of blocks per axis"""
+def get_nblocks(shape: tuple[int, ...], blocksize: np.ndarray) -> NDArray[np.int_]:
+    """
+    Calculate the number of blocks needed per axis given shape and block size.
+
+    Determines how many blocks are required along each axis to cover the entire
+    image volume, accounting for partial blocks at boundaries.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Dimensions of the full image volume
+    blocksize : tuple of int
+        Size of individual blocks along each axis
+
+    Returns
+    -------
+    NDArray[np.int_]
+        Number of blocks needed per axis
+
+    Examples
+    --------
+    >>> get_nblocks((1000, 1000), (256, 256))
+    array([4, 4])
+    """
     return np.ceil(np.array(shape) / blocksize).astype(int)
 
 
-def global_segment_ids(segmentation, block_index, nblocks):
-    """pack the block index into the segment IDs so they are
-    globally unique. Everything gets remapped to [1..N] later.
-    A uint32 is split into 5 digits on left and 5 digits on right.
-    This creates limits: 42950 maximum number of blocks and
-    99999 maximum number of segments per block"""
+def global_segment_ids(
+    segmentation: NDArray[Any], block_index: tuple[int, ...], nblocks: NDArray[np.int_]
+) -> tuple[NDArray[np.uint32], list[np.uint32]]:
+    """
+    Generate globally unique segment IDs by encoding block indices.
+
+    Creates unique segment identifiers by packing block indices into the segment IDs.
+    This ensures that segments from different blocks have unique identifiers before
+    the final relabeling step that maps all segments to the range [1..N].
+
+    Parameters
+    ----------
+    segmentation : NDArray
+        Local segmentation array with local segment IDs
+    block_index : tuple of int
+        Multi-dimensional index of this block in the block grid
+    nblocks : NDArray[np.int_]
+        Number of blocks along each axis
+
+    Returns
+    -------
+    tuple[NDArray[np.uint32], list[np.uint32]]
+        Global segmentation array and remapping table
+
+    Notes
+    -----
+    The encoding scheme uses a uint32 split into 5 digits for block ID and
+    5 digits for local segment ID. This limits the system to:
+    - Maximum 42,950 blocks total
+    - Maximum 99,999 segments per block
+
+    The background label (0) is preserved across all blocks.
+    """
     unique, unique_inverse = np.unique(segmentation, return_inverse=True)
     p = str(np.ravel_multi_index(block_index, nblocks))
     remap = [np.uint32(p + str(x).zfill(5)) for x in unique]
@@ -551,8 +697,29 @@ def global_segment_ids(segmentation, block_index, nblocks):
     return segmentation, remap
 
 
-def block_faces(segmentation):
-    """slice faces along every axis"""
+def block_faces(segmentation: NDArray[Any]) -> list[NDArray[Any]]:
+    """
+    Extract block faces along all axes for boundary matching.
+
+    Extracts the faces (boundary slices) of a segmented block along each axis.
+    These faces are used to identify segments that cross block boundaries
+    and need to be merged during the final stitching step.
+
+    Parameters
+    ----------
+    segmentation : NDArray
+        Segmented block array
+
+    Returns
+    -------
+    list[NDArray]
+        List of face arrays, two per axis (start and end faces)
+
+    Notes
+    -----
+    For a 3D block, this returns 6 faces: left/right, front/back, top/bottom.
+    Face matching is essential for identifying segments that span multiple blocks.
+    """
     faces = []
     for iii in range(segmentation.ndim):
         a = [
@@ -574,17 +741,17 @@ def block_faces(segmentation):
 # ----------------------- The main function -----------------------------------#
 @cluster
 def distributed_eval(
-    input_zarr,
-    blocksize,
-    write_path,
-    mask=None,
-    preprocessing_steps=[],
-    model_kwargs={},
-    eval_kwargs={},
-    cluster: myLocalCluster = None,
-    cluster_kwargs={},
-    temporary_directory: Path = None,
-):
+    input_zarr: zarr.Array,
+    blocksize: tuple[int, ...],
+    write_path: Path | str,
+    mask: NDArray[Any] | None = None,
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]] | None = None,
+    model_kwargs: dict[str, Any] | None = None,
+    eval_kwargs: dict[str, Any] | None = None,
+    cluster: myLocalCluster | None = None,
+    cluster_kwargs: dict[str, Any] | None = None,
+    temporary_directory: Path | None = None,
+) -> tuple[zarr.Array, list[tuple[slice, ...]]]:
     """
     Evaluate a cellpose model on overlapping blocks of a big image.
     Distributed over workstation or cluster resources with Dask.
@@ -684,6 +851,15 @@ def distributed_eval(
         ID is the first tuple in the list, the largest segment ID is the last
         tuple in the list.
     """
+    # Handle default parameters
+    if preprocessing_steps is None:
+        preprocessing_steps = []
+    if model_kwargs is None:
+        model_kwargs = {}
+    if eval_kwargs is None:
+        eval_kwargs = {}
+    if cluster_kwargs is None:
+        cluster_kwargs = {}
 
     timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     worker_logs_dirname = f"dask_worker_logs_{timestamp}"
@@ -696,7 +872,7 @@ def distributed_eval(
     overlap = eval_kwargs["diameter"] * 2
     block_indices, block_crops = get_block_crops(input_zarr.shape, blocksize, overlap, mask)
 
-    def check_block_has_data(crop, zarr_array, threshold=0) -> bool:
+    def check_block_has_data(crop: tuple[slice, ...], zarr_array: zarr.Array, threshold: int = 0) -> bool:
         """
         Checks if a given crop in a Zarr array contains any data above a threshold.
         Returns True if data exists, False otherwise.
@@ -822,7 +998,9 @@ def distributed_eval(
 
 
 # ----------------------- component functions ---------------------------------#
-def get_block_crops(shape, blocksize, overlap, mask):
+def get_block_crops(
+    shape: tuple[int, ...], blocksize: np.ndarray, overlap: int, mask: NDArray[Any] | None
+) -> tuple[list[tuple[int, ...]], list[tuple[slice, ...]]]:
     """Given a voxel grid shape, blocksize, and overlap size, construct
     tuples of slices for every block; optionally only include blocks
     that contain foreground in the mask. Returns parallel lists,
@@ -855,7 +1033,9 @@ def get_block_crops(shape, blocksize, overlap, mask):
     return indices, crops
 
 
-def determine_merge_relabeling(block_indices, faces, used_labels):
+def determine_merge_relabeling(
+    block_indices: list[tuple[int, ...]], faces: list[list[NDArray[Any]]], used_labels: NDArray[Any]
+) -> NDArray[np.uint32]:
     """Determine boundary segment mergers, remap all label IDs to merge
     and put all label IDs in range [1..N] for N global segments found"""
     faces = adjacent_faces(block_indices, faces)
@@ -873,7 +1053,9 @@ def determine_merge_relabeling(block_indices, faces, used_labels):
     return new_labeling
 
 
-def adjacent_faces(block_indices, faces):
+def adjacent_faces(
+    block_indices: list[tuple[int, ...]], faces: list[list[NDArray[Any]]]
+) -> list[NDArray[Any]]:
     """Find faces which touch and pair them together in new data structure"""
     face_pairs = []
     faces_index_lookup = {a: b for a, b in zip(block_indices, faces)}
@@ -891,7 +1073,7 @@ def adjacent_faces(block_indices, faces):
     return face_pairs
 
 
-def block_face_adjacency_graph(faces, nlabels):
+def block_face_adjacency_graph(faces: list[NDArray[Any]], nlabels: int) -> scipy.sparse._matrix.csr_matrix:
     """Shrink labels in face plane, then find which labels touch across the
     face boundary"""
     # FIX float parameters
@@ -914,7 +1096,7 @@ def block_face_adjacency_graph(faces, nlabels):
     return scipy.sparse.coo_matrix((v, (i, j)), shape=(nlabels + 1, nlabels + 1)).tocsr()
 
 
-def shrink_labels(plane, threshold):
+def shrink_labels(plane: NDArray[Any], threshold: float) -> NDArray[Any]:
     """Shrink labels in plane by some distance from their boundary"""
     gradmag = np.linalg.norm(np.gradient(plane.squeeze()), axis=0)
     shrunk_labels = np.copy(plane.squeeze())
@@ -924,7 +1106,7 @@ def shrink_labels(plane, threshold):
     return shrunk_labels.reshape(plane.shape)
 
 
-def merge_all_boxes(boxes, box_ids):
+def merge_all_boxes(boxes: list[tuple[slice, ...]], box_ids: NDArray[Any]) -> list[tuple[slice, ...]]:
     """Merge all boxes that map to the same box_ids"""
     merged_boxes = []
     boxes_array = np.array(boxes, dtype=object)
@@ -943,7 +1125,7 @@ def merge_all_boxes(boxes, box_ids):
     return merged_boxes
 
 
-def merge_boxes(boxes):
+def merge_boxes(boxes: NDArray[Any]) -> tuple[slice, ...]:
     """Take union of two or more parallelpipeds"""
     box_union = boxes[0]
     for iii in range(1, len(boxes)):
@@ -964,10 +1146,41 @@ def main(
     path: Path = typer.Argument(..., help="Path to the folder containing the zarr file."),
     channels: str = typer.Option(..., help="Comma-separated list of channel names to use."),
     overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
-):
+) -> None:
+    """
+    Main CLI entry point for distributed Cellpose segmentation.
+
+    Orchestrates the complete distributed segmentation workflow including:
+    - Loading and validating input data
+    - Setting up distributed computing cluster
+    - Running preprocessing and segmentation
+    - Post-processing and result saving
+
+    Parameters
+    ----------
+    path : Path
+        Path to folder containing 'fused.zarr' input file and 'config.json'
+    channels : str
+        Comma-separated channel names to use for segmentation
+    overwrite : bool, optional
+        Whether to overwrite existing segmentation results, by default False
+
+    Notes
+    -----
+    Expected folder structure:
+    - path/fused.zarr (input image data)
+    - path/config.json (segmentation parameters)
+    - path/normalization.json (optional, auto-generated if missing)
+
+    Output files:
+    - path/output_segmentation.zarr (segmentation results)
+    - path/segmentation.done (completion marker)
+    - path/cellpose_temp/ (temporary processing files)
+    """
     if not overwrite and (path / "segmentation.done").exists():
         logger.warning("Segmentation already exists. Exiting.")
         exit()
+
     # ---- 1. Configuration ----
     path = Path(path)
     zarr_input_path = path / "fused.zarr"
@@ -984,7 +1197,7 @@ def main(
 
     # Dask Cluster Configuration (for local machine)
     local_cluster_kwargs = {
-        "n_workers": 4,  # Example: 1 worker for GPU, 4 for CPU
+        "n_workers": 4,  # 4 cellpose instances can run on an RTX 4090
         "ncpus": 4,  # Physical cores per worker (adjust based on your CPU)
         "memory_limit": "64GB",  # RAM per worker - CRITICAL: Must fit block+model+overhead
         "threads_per_worker": 1,  # Usually 1 for Cellpose

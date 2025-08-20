@@ -345,7 +345,7 @@ rsc.tl.umap(adata, min_dist=0.1, n_components=2, random_state=0)
 
 rotate_rois_in_adata(adata, dict(tl=-70, tc=-18, tr=5, br=-38))
 # %%
-from fishtools.utils.plot import plot_embedding, add_scale_bar
+from fishtools.utils.plot import add_scale_bar, plot_embedding
 
 fig, axs = plot_embedding(
     adata,

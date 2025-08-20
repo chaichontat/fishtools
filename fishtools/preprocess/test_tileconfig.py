@@ -99,13 +99,15 @@ CH1-0002.tif; ; (10.5, -20.0)
     }
     expected_df = pl.DataFrame(
         expected_data,
-        schema=pl.Schema({
-            "prefix": pl.Utf8,
-            "index": pl.UInt32,
-            "filename": pl.Utf8,
-            "x": pl.Float32,
-            "y": pl.Float32,
-        }),
+        schema=pl.Schema(
+            {
+                "prefix": pl.Utf8,
+                "index": pl.UInt32,
+                "filename": pl.Utf8,
+                "x": pl.Float32,
+                "y": pl.Float32,
+            }
+        ),
     )
 
     assert len(tc) == 3

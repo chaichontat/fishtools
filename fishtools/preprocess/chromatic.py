@@ -1,4 +1,3 @@
-# %%
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +9,13 @@ from matplotlib.axes import Axes
 
 
 class Affine:
+    """Chromatic aberration correction using pre-computed affine transforms.
+
+    Corrects optical aberrations across wavelengths by applying channel-specific
+    2D affine transformations to align all channels to a reference wavelength.
+    Also applies inter-round registration shifts.
+    """
+
     IGNORE = {"405", "488", "560"}
 
     def __init__(
@@ -21,6 +27,14 @@ class Affine:
         # cg: dict[str, np.ndarray[np.float64, Any]],
         ref: str = "560",
     ):
+        """Initialize chromatic correction with pre-computed transforms.
+
+        Args:
+            ref_img: Reference image for resampling geometry
+            As: Channel-specific 2x2 affine matrices
+            ats: Channel-specific translation vectors
+            ref: Reference channel name (default: "560")
+        """
         self.As: dict[str, np.ndarray[np.float64, Any]] = As
         self.ats: dict[str, np.ndarray[np.float64, Any]] = ats
         # self.cg: dict[str, np.ndarray[np.float64, Any]] = cg
@@ -31,10 +45,12 @@ class Affine:
 
     @property
     def ref_image(self):
+        """Get reference image in SimpleITK format."""
         return self._ref_image
 
     @ref_image.setter
     def ref_image(self, img: np.ndarray[np.float32, Any]):
+        """Set reference image, converting to SimpleITK format."""
         self._ref_image = sitk.Cast(sitk.GetImageFromArray(img), sitk.sitkFloat32)
 
     def __call__(
@@ -128,6 +144,23 @@ def overlay(
     ax: Axes | None = None,
     title: str | None = None,
 ):
+    """Create RGB overlay visualization comparing reference and corrected images.
+
+    Displays reference in green, target in red, and optional third image in blue
+    to visualize registration quality and chromatic correction effectiveness.
+
+    Args:
+        ref: Reference image (displayed in green)
+        img: Target image (displayed in red)
+        img2: Optional third image (displayed in blue)
+        sl: Image region to display (default: center 200x200 crop)
+        percentile: Intensity normalization range (min, max percentiles)
+        ax: Matplotlib axis for plotting (creates new if None)
+        title: Plot title
+
+    Returns:
+        Matplotlib axis with RGB overlay plot
+    """
     import matplotlib.pyplot as plt
 
     if sl is not None:
@@ -172,13 +205,30 @@ def overlay(
 
 
 class FitAffine:
+    """Compute affine transform parameters using elastix registration.
+
+    Fits 2D affine transformations between reference and target images to
+    characterize chromatic aberration. Uses elastix library for robust
+    optimization-based registration.
+    """
+
     def __init__(self):
+        """Initialize elastix parameter object with affine registration settings."""
         self.parameter_object = itk.ParameterObject.New()
         default_rigid_parameter_map = self.parameter_object.GetDefaultParameterMap("affine")
         default_rigid_parameter_map["AutomaticScalesEstimation"] = ["true"]
         self.parameter_object.AddParameterMap(default_rigid_parameter_map)
 
     def fit(self, ref: np.ndarray, target: np.ndarray):
+        """Fit affine transform from reference to target image.
+
+        Args:
+            ref: Reference image (fixed)
+            target: Target image to be aligned
+
+        Returns:
+            Tuple of (affine_matrices, translation_vectors) as lists
+        """
         # As is a 2x2 matrix
         # ts is a 2x1 matrix (translation)
         As = []
@@ -209,97 +259,18 @@ class FitAffine:
         As: list[np.ndarray[np.float64, Any]],
         ts: list[np.ndarray[np.float64, Any]],
     ):
+        """Save median affine parameters to text file.
+
+        Computes median transformation from multiple fits and saves as
+        single line with matrix elements followed by translation vector.
+
+        Args:
+            path: Output file path
+            As: List of 2x2 affine matrices
+            ts: List of 2D translation vectors
+        """
         affined = np.array([
             *np.median(np.stack(As), axis=0).flatten(),
             *np.median(np.stack(ts), axis=0),
         ])
         Path(path).write_text("\n".join(map(str, affined.flatten())))
-
-
-# %%
-
-if __name__ == "__main__":
-    from pathlib import Path
-
-    import seaborn as sns
-    from tifffile import imread
-
-    sns.set_theme()
-
-    img = imread("/mnt/archive/starmap/sagittal-calibration/4_4--cortexRegion/4_4-0000.tif")[:-1].reshape(
-        -1, 2, 2048, 2048
-    )
-
-    DATA = Path("/home/chaichontat/fishtools/data")
-
-    print(img.max(axis=(0, 2, 3)))
-    # %%
-
-    As = {}
-    ats = {}
-    for λ in ["650", "750"]:
-        a_ = np.loadtxt(DATA / f"560to{λ}.txt")
-        A = np.zeros((3, 3), dtype=np.float64)
-        A[:2, :2] = a_[:4].reshape(2, 2)
-        t = np.zeros(3, dtype=np.float64)
-        t[:2] = a_[-2:]
-
-        A[2] = [0, 0, 1]
-        A[:, 2] = [0, 0, 1]
-        t[2] = 0
-        As[λ] = A
-        ats[λ] = t
-
-    # %%
-    affine = Affine(As=As, ats=ats, ref_img=img[[0], 0])
-    fig, axs = plt.subplots(ncols=2, figsize=(12, 6), dpi=200, facecolor="black")
-
-    img = imread("/disk/chaichontat/2024/sv101_ACS/2_10_18--noRNAse_big/2_10_18-0012.tif")[:-1].reshape(
-        -1, 3, 2048, 2048
-    )
-
-    overlay(img[:, 1][5], img[:, 2][5], ax=axs[0], sl=np.s_[1400:1800, 1400:1800])
-    overlay(
-        img[[0], 1][0],
-        affine(img[[0], 2], channel="750", shiftpx=np.array([0, 0.0]))[0],
-        ax=axs[1],
-        sl=np.s_[1400:1800, 1400:1800],
-    )
-
-    # %%
-    img = imread("/disk/chaichontat/2024/sv101_ACS/registered/reg-0074.tif")
-    # fig, axs = plt.subplots(ncols=2, figsize=(12, 6), dpi=200, facecolor="black")
-
-    overlay(
-        img[0, 1],
-        img[0, 17],
-        # affine(img[:, 24], channel="750", shiftpx=np.array([0, 0.0]))[0],
-        # ax=axs[0],
-        sl=np.s_[200:450, 0:1000],
-        percentile=(1, 99.9),
-        title="Green: bit2, Red: bit 18. No chromatic aberration.",
-    )
-
-    # %%
-
-    fid = imread("/disk/chaichontat/2024/sv101_ACS/fids_shifted-0075.tif")
-    # %%
-    overlay(
-        fid[1],
-        fid[-2],
-        # ax=axs[0],
-        sl=np.s_[200:450, 800:1000],
-        percentile=(1, 100),
-        title="Fiducial from the same area. Green: bit2, Red: bit29",
-    )
-    # %%
-    overlay(
-        img[0, 1],
-        img[0, 24],
-        # affine(img[:, 24], channel="750", shiftpx=np.array([0, 0.0]))[0],
-        # ax=axs[0],
-        sl=np.s_[200:450, 800:1000],
-        percentile=(1, 99.9),
-        title="Green: bit2, Red: bit 29. Slight shift.",
-    )
-    # %%

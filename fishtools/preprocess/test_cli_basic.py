@@ -72,12 +72,14 @@ def temp_tiff_files(tmp_path: Path) -> tuple[Path, list[dict[str, Any]]]:
     reg_dir.mkdir()
     file_reg_path = reg_dir / "reg_img1.tif"
 
-    data_reg_for_max_proj = np.arange(5 * 2 * IMG_HEIGHT * IMG_WIDTH, dtype=np.uint16).reshape((
-        5,
-        2,
-        IMG_HEIGHT,
-        IMG_WIDTH,
-    ))
+    data_reg_for_max_proj = np.arange(5 * 2 * IMG_HEIGHT * IMG_WIDTH, dtype=np.uint16).reshape(
+        (
+            5,
+            2,
+            IMG_HEIGHT,
+            IMG_WIDTH,
+        )
+    )
     # Make values distinct for max projection
     for z_val in range(5):
         data_reg_for_max_proj[z_val, :, :, :] += z_val * 1000
@@ -161,12 +163,14 @@ class TestExtractDataFromRegistered:
         # Mock imread to return the specific data we saved for this test
         # The data was (5, 2, H, W) with z_val * 1000 added
         # Max projection over axis 0
-        original_data = np.arange(5 * 2 * IMG_HEIGHT * IMG_WIDTH, dtype=np.uint16).reshape((
-            5,
-            2,
-            IMG_HEIGHT,
-            IMG_WIDTH,
-        ))
+        original_data = np.arange(5 * 2 * IMG_HEIGHT * IMG_WIDTH, dtype=np.uint16).reshape(
+            (
+                5,
+                2,
+                IMG_HEIGHT,
+                IMG_WIDTH,
+            )
+        )
         for z_val in range(5):
             original_data[z_val, :, :, :] += z_val * 1000
 

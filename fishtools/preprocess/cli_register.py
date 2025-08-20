@@ -2,10 +2,8 @@
 import json
 import pickle
 import subprocess
-import sys
 from collections import defaultdict
 from collections.abc import Callable
-from concurrent.futures import as_completed
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -34,11 +32,12 @@ from fishtools.preprocess.config import (
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
 from fishtools.utils.io import Workspace
 from fishtools.utils.pretty_print import progress_bar_threadpool
+from fishtools.utils.utils import initialize_logger
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
 if TYPE_CHECKING:
-    from loguru import Logger
+    pass
 
 
 # %%
@@ -261,12 +260,15 @@ class Image:
     @staticmethod
     def loG_fids(fid: np.ndarray):
         if len(fid.shape) == 3:
-            temp = fid.max(axis=0)
+            fid = fid.max(axis=0)
+
         temp = -ndimage.gaussian_laplace(fid.astype(np.float32).copy(), sigma=3)  # type: ignore
         temp -= temp.min()
         percs = np.percentile(temp, [1, 99.99])
-        temp = (temp - percs[0]) / (percs[1] - percs[0])
 
+        if percs[1] - percs[0] == 0:
+            raise ValueError("Uniform image")
+        temp = (temp - percs[0]) / (percs[1] - percs[0])
         return temp
 
 
@@ -662,15 +664,7 @@ def run(
         threshold: σ above median to call fiducial spots. Defaults to 6.
         fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
     """
-    logger_format = (
-        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{line}</cyan> {extra[idx]} {extra[file]}| "
-        "- <level>{message}</level>"
-    )
-    logger.remove()
-    logger.configure(extra=dict(idx=f"{idx:04d}", file=""))
-    logger.add(sys.stderr, level="DEBUG" if debug else "WARNING", format=logger_format)
+    initialize_logger(idx, debug)
 
     rois = get_rois(path, roi)
 
@@ -685,7 +679,7 @@ def run(
             no_priors=no_priors,
             config=Config(
                 dataPath=str(DATA),
-                channels=ChannelConfig(discards={"af": ["af_3_11_19"]}),
+                channels=ChannelConfig(discards=None),
                 basic=None,
                 exclude=None,
                 registration=RegisterConfig(
