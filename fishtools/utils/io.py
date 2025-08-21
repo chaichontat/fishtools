@@ -214,18 +214,19 @@ class Workspace:
             >>> ws = Workspace("/experiment")
             >>> ws.rois  # ['cortex', 'hippocampus', 'striatum']
         """
-        path = self.path if not self.deconved.exists() else self.deconved
 
         rois_set = set()
-        for p in path.iterdir():
-            if not p.is_dir():
+        for path in [self.path, self.deconved]:
+            if not path.exists():
                 continue
 
-            # Use regex to extract ROI from directory names
-            match = self.ROI_CODEBOOK_PATTERN.match(p.name)
-            if match:
-                roi_name = match.group(1)
-                rois_set.add(roi_name)
+            for p in path.iterdir():
+                if not p.is_dir():
+                    continue
+                match = self.ROI_CODEBOOK_PATTERN.match(p.name)
+                if match:
+                    roi_name = match.group(1)
+                    rois_set.add(roi_name)
 
         return sorted(rois_set)
 

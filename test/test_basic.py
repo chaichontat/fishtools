@@ -1,28 +1,14 @@
 import re
+from collections.abc import Generator
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Generator
-from unittest.mock import patch
 
 import numpy as np
 import pytest
-from click.testing import CliRunner
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from tifffile import imwrite
 
-# Import the module to test
-# Note: Adjust these imports to match your actual module structure
-from fishtools.preprocess.cli_basic import (
-    basic,
-    extract_data_from_registered,
-    extract_data_from_tiff,
-    fit_and_save_basic,
-    run,
-    run_with_extractor,
-)
 
-
-# Define a Pydantic model for the test data directory
 class DataDir(BaseModel):
     """Pydantic model for test data directory structure and metadata"""
 
@@ -109,7 +95,7 @@ def test_fixture(test_data_dir: DataDir) -> None:
 
     assert len(list(round_path.glob("*.tif"))) == test_data_dir.n
 
-    regex = re.compile(rf"{test_data_dir.round_name}-(\d{4}).tif")
+    regex = re.compile(rf"{test_data_dir.round_name}-(\d{{4}}).tif")
     for f in round_path.glob("*.tif"):
         assert regex.match(f.name)
 

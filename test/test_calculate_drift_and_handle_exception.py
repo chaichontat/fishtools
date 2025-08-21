@@ -39,12 +39,14 @@ class TestCalculateDrift:
         idx = 0
         for y in [20, 50, 80]:
             for x in [20, 50, 80]:
-                ref_data.append({
-                    "idx": idx,
-                    "xcentroid": float(x),
-                    "ycentroid": float(y),
-                    "mag": -10.0 - np.random.random() * 2,  # Magnitude: more negative = brighter
-                })
+                ref_data.append(
+                    {
+                        "idx": idx,
+                        "xcentroid": float(x),
+                        "ycentroid": float(y),
+                        "mag": -10.0 - np.random.random() * 2,  # Magnitude: more negative = brighter
+                    }
+                )
                 idx += 1
 
         return pl.DataFrame(ref_data)
@@ -75,13 +77,15 @@ class TestCalculateDrift:
             x_noise = np.random.normal(0, noise_std) if noise_std > 0 else 0
             y_noise = np.random.normal(0, noise_std) if noise_std > 0 else 0
 
-            target_data.append({
-                "idx": i,
-                "xcentroid": row["xcentroid"] + dx + x_noise,
-                "ycentroid": row["ycentroid"] + dy + y_noise,
-                "mag": row["mag"]
-                - np.random.random() * 0.5,  # Slight magnitude variation (more negative = brighter)
-            })
+            target_data.append(
+                {
+                    "idx": i,
+                    "xcentroid": row["xcentroid"] + dx + x_noise,
+                    "ycentroid": row["ycentroid"] + dy + y_noise,
+                    "mag": row["mag"]
+                    - np.random.random() * 0.5,  # Slight magnitude variation (more negative = brighter)
+                }
+            )
 
         return pl.DataFrame(target_data)
 
@@ -203,12 +207,14 @@ class TestCalculateDrift:
         # Make them dimmer so use_brightest can filter them out
         outlier_data = []
         for i in range(5):
-            outlier_data.append({
-                "idx": len(target_points) + i,
-                "xcentroid": 150.0 + np.random.random() * 20,  # Far from main cluster
-                "ycentroid": 150.0 + np.random.random() * 20,
-                "mag": -5.0,  # Much dimmer magnitude (less negative = dimmer)
-            })
+            outlier_data.append(
+                {
+                    "idx": len(target_points) + i,
+                    "xcentroid": 150.0 + np.random.random() * 20,  # Far from main cluster
+                    "ycentroid": 150.0 + np.random.random() * 20,
+                    "mag": -5.0,  # Much dimmer magnitude (less negative = dimmer)
+                }
+            )
 
         target_with_outliers = pl.concat([target_points, pl.DataFrame(outlier_data)])
 
@@ -259,12 +265,14 @@ class TestCalculateDrift:
         # Create many target points to trigger warning
         large_target_data = []
         for i in range(1200):  # > 1000 to trigger warning
-            large_target_data.append({
-                "idx": i,
-                "xcentroid": np.random.random() * 100,
-                "ycentroid": np.random.random() * 100,
-                "mag": -10.0 - np.random.random(),  # Bright magnitude
-            })
+            large_target_data.append(
+                {
+                    "idx": i,
+                    "xcentroid": np.random.random() * 100,
+                    "ycentroid": np.random.random() * 100,
+                    "mag": -10.0 - np.random.random(),  # Bright magnitude
+                }
+            )
 
         large_target_points = pl.DataFrame(large_target_data)
 
@@ -295,12 +303,14 @@ class TestCalculateDrift:
         for i in range(5):
             # Most points have main_drift, one outlier
             drift_x = main_drift if i < 4 else main_drift + 10.0
-            target_data.append({
-                "idx": i,
-                "xcentroid": float(i * 10) + drift_x,
-                "ycentroid": 20.0,
-                "mag": -10.0,
-            })
+            target_data.append(
+                {
+                    "idx": i,
+                    "xcentroid": float(i * 10) + drift_x,
+                    "ycentroid": 20.0,
+                    "mag": -10.0,
+                }
+            )
 
         target_points = pl.DataFrame(target_data)
 
@@ -381,11 +391,8 @@ class TestHandleException:
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
         exc = NotEnoughSpots("Not enough spots found")
-        rand = 42
 
-        new_sigma, new_fwhm = handle_exception(
-            initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand
-        )
+        new_sigma, new_fwhm = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
         # Should reduce sigma by 0.5
         assert new_sigma == initial_sigma - 0.5
@@ -397,11 +404,8 @@ class TestHandleException:
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
         exc = NotEnoughSpots("Not enough spots found")
-        rand = 42
 
-        new_sigma, new_fwhm = handle_exception(
-            initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand
-        )
+        new_sigma, new_fwhm = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
         # Should increase FWHM instead of reducing sigma
         assert new_sigma == initial_sigma  # Sigma unchanged
@@ -413,11 +417,8 @@ class TestHandleException:
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
         exc = TooManySpots("Too many spots found")
-        rand = 42
 
-        new_sigma, new_fwhm = handle_exception(
-            initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand
-        )
+        new_sigma, new_fwhm = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
         # Should increase sigma by 0.5
         assert new_sigma == initial_sigma + 0.5
@@ -430,11 +431,7 @@ class TestHandleException:
         # Mark the obvious next combination as already tried
         tried_set = {(3.5, 4.0), (3.5, 4.5)}
         exc = TooManySpots("Too many spots found")
-        rand = 42
-
-        new_sigma, new_fwhm = handle_exception(
-            initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand
-        )
+        new_sigma, new_fwhm = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
         # Should increase sigma and adjust FWHM to avoid tried combinations
         assert new_sigma == initial_sigma + 0.5  # Sigma increased
@@ -447,11 +444,7 @@ class TestHandleException:
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
         exc = DriftTooLarge("Drift is too large")
-        rand = 42
-
-        new_sigma, new_fwhm = handle_exception(
-            initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand
-        )
+        new_sigma, new_fwhm = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
         # Should increase sigma by 0.5
         assert new_sigma == initial_sigma + 0.5
@@ -463,11 +456,7 @@ class TestHandleException:
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
         exc = ResidualTooLarge("Residual is too large")
-        rand = 42
-
-        new_sigma, new_fwhm = handle_exception(
-            initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand
-        )
+        new_sigma, new_fwhm = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
         # Should increase sigma by 0.5
         assert new_sigma == initial_sigma + 0.5
@@ -480,11 +469,7 @@ class TestHandleException:
         # Mark increased sigma combination as tried
         tried_set = {(3.5, 5.0)}
         exc = DriftTooLarge("Drift is too large")
-        rand = 42
-
-        new_sigma, new_fwhm = handle_exception(
-            initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand
-        )
+        new_sigma, new_fwhm = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
         # Should increase sigma and potentially adjust FWHM
         assert new_sigma == initial_sigma + 0.5
@@ -497,10 +482,9 @@ class TestHandleException:
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
         exc = ValueError("Some other error")  # Not a recognized fiducial exception
-        rand = 42
 
         with pytest.raises(ValueError, match="Some other error"):
-            handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand)
+            handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
     def test_handle_exception_parameter_bounds(self) -> None:
         """Test parameter adjustment stays within reasonable bounds."""
@@ -514,11 +498,8 @@ class TestHandleException:
         for initial_sigma, initial_fwhm, exc_type in test_cases:
             tried_set: set[tuple[float, float]] = set()
             exc = exc_type("Test exception")
-            rand = 42
 
-            new_sigma, new_fwhm = handle_exception(
-                initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand
-            )
+            new_sigma, new_fwhm = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
             # Parameters should remain positive and reasonable
             assert new_sigma > 0, f"Sigma became non-positive: {new_sigma}"
@@ -531,17 +512,16 @@ class TestHandleException:
         initial_sigma = 3.0
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
-        rand = 42
 
         # Simulate multiple attempts with TooManySpots
         exc = TooManySpots("Too many spots")
 
         # First call
-        sigma1, fwhm1 = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand)
+        sigma1, fwhm1 = handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
         tried_set.add((sigma1, fwhm1))
 
         # Second call with updated tried set
-        sigma2, fwhm2 = handle_exception(sigma1, fwhm1, tried=tried_set, exc=exc, rand=rand)
+        sigma2, fwhm2 = handle_exception(sigma1, fwhm1, tried=tried_set, exc=exc)
 
         # Should produce different parameters
         assert (sigma1, fwhm1) != (sigma2, fwhm2)
@@ -553,10 +533,9 @@ class TestHandleException:
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
         exc = NotEnoughSpots("Not enough spots found")
-        rand = 42
 
         with patch("fishtools.preprocess.fiducial.logger.warning") as mock_warning:
-            handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc, rand=rand)
+            handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
             # Should log warning with exception type and parameters
             mock_warning.assert_called_once()
@@ -571,7 +550,6 @@ class TestHandleException:
         sigma = 6.0  # Start high
         fwhm = 3.0
         tried_set: set[tuple[float, float]] = set()
-        rand = 42
 
         # Sequence of exceptions that might occur in practice
         exception_sequence = [
@@ -586,7 +564,7 @@ class TestHandleException:
 
         for exc in exception_sequence:
             tried_set.add((sigma, fwhm))
-            sigma, fwhm = handle_exception(sigma, fwhm, tried=tried_set, exc=exc, rand=rand)
+            sigma, fwhm = handle_exception(sigma, fwhm, tried=tried_set, exc=exc)
             parameter_history.append((sigma, fwhm))
 
         # Should produce mostly different parameter combinations (some duplication is OK)
@@ -604,19 +582,19 @@ class TestHandleException:
     def test_handle_exception_edge_case_parameter_combinations(self) -> None:
         """Test edge cases with extreme parameter combinations."""
         edge_cases = [
-            # (sigma, fwhm, exception, description)
+            # (sigma, fwhm, exception)
             (0.1, 0.1, NotEnoughSpots("Minimal parameters")),
             (100.0, 100.0, TooManySpots("Extreme parameters")),
             (2.0, 4.0, DriftTooLarge("At FWHM threshold")),
             (2.0, 3.9, ResidualTooLarge("Below FWHM threshold")),
         ]
 
-        for sigma, fwhm, exc, description in edge_cases:
+        for sigma, fwhm, exc in edge_cases:
             tried_set: set[tuple[float, float]] = set()
-            rand = 42
+            description = str(exc)
 
             try:
-                new_sigma, new_fwhm = handle_exception(sigma, fwhm, tried=tried_set, exc=exc, rand=rand)
+                new_sigma, new_fwhm = handle_exception(sigma, fwhm, tried=tried_set, exc=exc)
 
                 # Should produce valid output
                 assert isinstance(new_sigma, float), f"Invalid sigma type for {description}"

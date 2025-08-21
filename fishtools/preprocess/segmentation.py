@@ -1,16 +1,17 @@
 import numpy as np
+import numpy.typing as npt
 from loguru import logger
 from skimage.filters import unsharp_mask
 
 
 def unsharp_all(
-    img: np.ndarray, crop: None = None, channel_axis: int = 3
+    img: npt.ArrayLike, crop: None = None, channel_axis: int = 3
 ):  # crop is for distributed_segmentation
     return unsharp_mask(img, preserve_range=True, radius=3, channel_axis=channel_axis)
 
 
 def calc_percentile(
-    img: np.ndarray,
+    img: npt.ArrayLike,
     channels: list[int],
     block: tuple[int, int] = (512, 512),
     *,

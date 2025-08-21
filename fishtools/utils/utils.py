@@ -302,6 +302,11 @@ def batch_roi(
 
                 # Process each ROI with proper kwargs isolation
                 for roi in sorted(rois):  # Sort for consistent ordering
+                    # Skip empty ROI names which indicate malformed directory names
+                    if not roi.strip():
+                        logger.warning("Skipping empty/whitespace ROI name from malformed directory")
+                        continue
+
                     roi_kwargs = {**kwargs, "roi": roi}
                     logger.info(f"Batching {roi}")
                     try:

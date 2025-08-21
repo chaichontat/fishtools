@@ -663,7 +663,7 @@ def _run(
                     "deconv_min": list(map(float, mins.flatten())),
                     "deconv_scale": list(map(float, scale.flatten())),
                 }
-                print(f"[{start.name}] Scaling: {scaling['deconv_min']}, {scaling['deconv_scale']}")
+                logger.info(f"[{start.name}] Scaling: {scaling['deconv_min']}, {scaling['deconv_scale']}")
                 total_gpu_time = time.perf_counter() - t_gpu_stage_start
                 logger.info(f"{start.name}: GPU took {total_gpu_time:.2f}s")
 
@@ -842,6 +842,8 @@ def batch(
     ws = Workspace(path)
     rois = ws.rois
     logger.info(f"Found ROIs: {rois}")
+    if not rois:
+        raise ValueError("No ROIs found.")
 
     out = ws.deconved
     out.mkdir(exist_ok=True, parents=True)

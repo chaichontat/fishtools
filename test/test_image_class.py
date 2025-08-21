@@ -10,16 +10,15 @@ This version incorporates code review recommendations:
 """
 
 import json
-import pickle
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Generator, Tuple
-from unittest.mock import MagicMock, Mock, mock_open, patch
+from typing import Any
+from collections.abc import Generator
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pytest
-import toml
 from numpy.typing import NDArray
 
 from fishtools.preprocess.cli_register import Image
@@ -121,24 +120,18 @@ class TestLoGFidsUnit:
         assert not np.allclose(spot_region.mean(), background_region.mean(), rtol=1e-3)
 
     def test_log_fids_zero_input_handled(self) -> None:
-        """Test loG_fids with zero input - handles uniform data gracefully"""
+        """Test loG_fids with zero input - should raise ValueError for uniform data"""
         fid_data = np.zeros(SMALL_IMAGE_SIZE, dtype=np.float32)
 
-        result = Image.loG_fids(fid_data)
-
-        assert result.shape == SMALL_IMAGE_SIZE
-        assert np.isfinite(result).all()
-        assert np.allclose(result, 0.0)
+        with pytest.raises(ValueError, match="Uniform image"):
+            Image.loG_fids(fid_data)
 
     def test_log_fids_uniform_input_handled(self) -> None:
-        """Test loG_fids with uniform input - handles uniform data gracefully"""
+        """Test loG_fids with uniform input - should raise ValueError for uniform data"""
         fid_data = np.full(SMALL_IMAGE_SIZE, 100.0, dtype=np.float32)
 
-        result = Image.loG_fids(fid_data)
-
-        assert result.shape == SMALL_IMAGE_SIZE
-        assert np.isfinite(result).all()
-        assert np.allclose(result, 0.0)
+        with pytest.raises(ValueError, match="Uniform image"):
+            Image.loG_fids(fid_data)
 
     def test_log_fids_normal_case(self) -> None:
         """Test loG_fids with varied input that works correctly"""
@@ -159,26 +152,18 @@ class TestLoGFidsNumericalStability:
     """Numerical stability tests for scientific edge cases"""
 
     def test_log_fids_very_small_values(self) -> None:
-        """Test numerical stability with very small values"""
+        """Test numerical stability with very small values - should raise ValueError for uniform data"""
         fid_data = np.full(SMALL_IMAGE_SIZE, 1e-10, dtype=np.float32)
 
-        result = Image.loG_fids(fid_data)
-
-        assert result.shape == SMALL_IMAGE_SIZE
-        assert np.isfinite(result).all()
-        # Small uniform values should result in zeros
-        assert np.allclose(result, 0.0, atol=1e-6)
+        with pytest.raises(ValueError, match="Uniform image"):
+            Image.loG_fids(fid_data)
 
     def test_log_fids_very_large_values(self) -> None:
-        """Test numerical stability with very large values"""
+        """Test numerical stability with very large values - should raise ValueError for uniform data"""
         fid_data = np.full(SMALL_IMAGE_SIZE, 1e6, dtype=np.float32)
 
-        result = Image.loG_fids(fid_data)
-
-        assert result.shape == SMALL_IMAGE_SIZE
-        assert np.isfinite(result).all()
-        # Large uniform values should result in zeros
-        assert np.allclose(result, 0.0, atol=1e-6)
+        with pytest.raises(ValueError, match="Uniform image"):
+            Image.loG_fids(fid_data)
 
     def test_log_fids_with_nan_values(self) -> None:
         """Test handling of NaN values in scientific data"""
@@ -236,7 +221,7 @@ class TestLoGFidsRegressionTests:
         assert np.isfinite(result).all()
 
     def test_regression_division_by_zero_original_bug(self) -> None:
-        """Regression test: Document the original division by zero bug"""
+        """Regression test: Verify uniform images raise appropriate error instead of NaN"""
         # Test both zero and uniform cases that originally caused NaN
         test_cases = [
             ("zeros", np.zeros(SMALL_IMAGE_SIZE, dtype=np.float32)),
@@ -244,12 +229,17 @@ class TestLoGFidsRegressionTests:
         ]
 
         for case_name, fid_data in test_cases:
-            result = Image.loG_fids(fid_data)
-
             # ORIGINAL BUG: Would return NaN due to division by zero when percs[1] == percs[0]
-            # FIXED BEHAVIOR: Now returns zeros for uniform data
-            assert np.isfinite(result).all(), f"Bug fix: {case_name} input should not produce NaN"
-            assert np.allclose(result, 0.0), f"Bug fix: {case_name} input should return zeros"
+            # FIXED BEHAVIOR: Now raises clear error instead of returning NaN
+            with pytest.raises(ValueError, match="Uniform image"):
+                Image.loG_fids(fid_data)
+        
+        # Test that non-uniform data works correctly
+        np.random.seed(42)  # Reproducible
+        non_uniform = np.random.uniform(100, 1000, SMALL_IMAGE_SIZE).astype(np.float32)
+        non_uniform[50, 50] = 2000  # Add bright spot
+        result = Image.loG_fids(non_uniform)
+        assert np.isfinite(result).all(), "Non-uniform data should process without NaN"
 
     def test_regression_percentile_normalization(self) -> None:
         """Test the percentile-based normalization edge cases"""
@@ -520,13 +510,11 @@ class TestImageClassEdgeCases:
         assert image.nofid.shape == (1, 1, 10, 10)
 
     def test_log_fids_single_pixel(self) -> None:
-        """Test loG_fids with single pixel image"""
+        """Test loG_fids with single pixel image - should raise ValueError for uniform data"""
         fid_data = np.array([[100.0]], dtype=np.float32)
 
-        result = Image.loG_fids(fid_data)
-
-        assert result.shape == (1, 1)
-        assert np.isfinite(result).all()
+        with pytest.raises(ValueError, match="Uniform image"):
+            Image.loG_fids(fid_data)
 
     def test_log_fids_empty_image(self) -> None:
         """Test loG_fids with empty image"""
@@ -550,15 +538,24 @@ class TestImageClassEdgeCases:
             (256, 256),
         ],
     )
-    def test_log_fids_various_sizes(self, shape: Tuple[int, int]) -> None:
+    def test_log_fids_various_sizes(self, shape: tuple[int, int]) -> None:
         """Test loG_fids with various image sizes"""
-        fid_data = np.random.uniform(100, 1000, shape).astype(np.float32)
-
-        result = Image.loG_fids(fid_data)
-
-        assert result.shape == shape
-        assert result.dtype == np.float32
-        assert np.isfinite(result).all()
+        if shape == (1, 1):
+            # Single pixel is uniform, expect error
+            fid_data = np.random.uniform(100, 1000, shape).astype(np.float32)
+            with pytest.raises(ValueError, match="Uniform image"):
+                Image.loG_fids(fid_data)
+        else:
+            # Create non-uniform data with features
+            fid_data = np.random.uniform(100, 1000, shape).astype(np.float32)
+            # Add a bright spot to ensure non-uniformity
+            if shape[0] > 2 and shape[1] > 2:
+                fid_data[shape[0]//2, shape[1]//2] = 2000
+            
+            result = Image.loG_fids(fid_data)
+            assert result.shape == shape
+            assert result.dtype == np.float32
+            assert np.isfinite(result).all()
 
 
 # Add pytest markers for test organization

@@ -333,8 +333,8 @@ class TestBatchRoiEdgeCases:
 
         mock_func(path=temp_workspace, roi="*")
 
-        # Should handle empty string ROI gracefully
-        expected_rois = {"", "roi1"}
+        # Should skip empty ROI names from malformed directories
+        expected_rois = {"roi1"}  # Empty ROI should be filtered out
         assert set(call_log) == expected_rois
 
 

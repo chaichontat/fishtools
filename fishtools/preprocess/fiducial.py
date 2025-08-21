@@ -149,7 +149,7 @@ def find_spots(
             f"Reference image must be 2D for DAOStarFinder (is {img.shape}). https://github.com/astropy/photutils/issues/1328"
         )
     if np.sum(img) == 0:
-        raise ValueError("Reference image must have non-zero sum.")
+        raise NotEnoughSpots("Reference image has zero sum - no signal available.")
 
     # min_ = img.min()
     # normalized = clahe((img - min_) / (img.max() - min_))
@@ -160,7 +160,9 @@ def find_spots(
         threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True, roundhi=0.5, roundlo=-0.5
     )
     try:
-        df = pl.DataFrame(iraffind(img - median).to_pandas()).sort("mag").with_row_count("idx")
+        df = pl.DataFrame(iraffind(img - median).to_pandas())
+        # Filter out null mag values and sort by magnitude (brightest first - most negative values)
+        df = df.filter(pl.col("mag").is_not_null()).sort("mag").with_row_index("idx")
     except AttributeError:
         df = pl.DataFrame()
     if len(df) < minimum_spots:
@@ -192,7 +194,9 @@ def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2) -> np.ndar
     return phase_cross_correlation(ref, img, upsample_factor=int(10**precision))[0]
 
 
-def background(img: np.ndarray, box_size: tuple[int, int] = (50, 50), sigma_clip: float = 2.0) -> np.ndarray:
+def background(
+    img: np.ndarray, box_size: tuple[int, int] | None = None, sigma_clip: float = 2.0
+) -> np.ndarray:
     """Estimate spatially varying background using 2D background fitting.
 
     This function creates a smooth background model by dividing the image into boxes,
@@ -203,6 +207,7 @@ def background(img: np.ndarray, box_size: tuple[int, int] = (50, 50), sigma_clip
         img: Input microscopy image for background estimation
         box_size: Size of background estimation boxes (y, x) in pixels.
                  Larger boxes = smoother background, smaller boxes = more local adaptation
+                 If None, automatically determines size based on image dimensions
         sigma_clip: Standard deviation threshold for outlier rejection.
                    Higher values include more pixels in background estimation
 
@@ -215,6 +220,11 @@ def background(img: np.ndarray, box_size: tuple[int, int] = (50, 50), sigma_clip
         further improves robustness by rejecting pixels that deviate significantly from
         the local median, ensuring the background model represents true background signal.
     """
+    if box_size is None:
+        # Auto-determine box size based on image dimensions
+        # Use boxes that are ~10% of the image size, but at least 10x10
+        box_size = (max(10, img.shape[0] // 10), max(10, img.shape[1] // 10))
+
     sigma_clip_obj = SigmaClip(sigma=sigma_clip)
     bkg = Background2D(
         img, box_size, filter_size=(3, 3), sigma_clip=sigma_clip_obj, bkg_estimator=MedianBackground()

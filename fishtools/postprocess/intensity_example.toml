@@ -1,0 +1,35 @@
+# Example configuration for intensity extraction from segmentation masks
+# Copy this file and modify for your specific experiment
+
+# Path to the experiment workspace directory
+# This should contain the ROI-specific directories with Zarr stores
+workspace_path = "/working/data/20250407_cs3_2"
+
+# ROI identifier for processing
+roi = "roi1"
+
+# Segmentation codebook identifier (used in directory structure)
+seg_codebook = "atp"
+
+# Name of the segmentation Zarr store within the ROI directory
+segmentation_name = "output_segmentation.zarr"
+
+# Name of the intensity image Zarr store within the ROI directory
+intensity_name = "input_image.zarr"
+
+# Target intensity channel for extraction
+# This should match one of the channels in the intensity Zarr metadata
+channel = "cfse"
+
+# Number of parallel processes for Z-slice processing
+# Recommended: 2-8 depending on available memory and CPU cores
+max_workers = 4
+
+# Whether to overwrite existing output files
+overwrite = false
+
+# Processing and Performance Notes:
+# - Each Z-slice is processed independently in parallel
+# - Output files are saved as intensity-{slice:02d}.parquet in the output directory
+# - Memory usage scales with max_workers and image size
+# - The pipeline automatically validates Zarr stores and estimates memory requirements

@@ -5,15 +5,43 @@ from itertools import chain
 from typing import Literal, cast
 
 import anndata as ad
-from loguru import logger
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
 import seaborn as sns
+from loguru import logger
 from matplotlib.figure import Figure
 
 from fishtools.utils.utils import create_rotation_matrix
+
+
+def std_log1p(adata: ad.AnnData, min_genes: int = 200, min_cells: int = 100):
+    sc.pp.filter_cells(adata, min_genes=min_genes)
+    sc.pp.filter_genes(adata, min_cells=min_cells)
+    sc.pp.normalize_total(adata)
+    sc.pp.log1p(adata)
+    return adata
+
+
+def cluster(
+    adata: ad.AnnData,
+    min_cells: int = 10,
+    n_neighbors: int = 15,
+    n_pcs: int = 30,
+    use_rep: str = "X_pca",
+    metric: str = "cosine",
+    leiden_resolution: float = 1.0,
+):
+    import rapids_singlecell as rsc
+
+    if use_rep == "X_pca":
+        sc.pp.filter_genes(adata, min_cells=min_cells)
+        rsc.pp.pca(adata)
+    rsc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs, metric=metric, use_rep=use_rep)  # type: ignore[call-arg]
+    rsc.tl.umap(adata)
+    rsc.tl.leiden(adata, resolution=leiden_resolution)
+    return adata
 
 
 def qc(adata: ad.AnnData):
@@ -25,8 +53,8 @@ def qc(adata: ad.AnnData):
     return adata
 
 
-def normalize_pearson(adata: ad.AnnData):
-    sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=2000)
+def normalize_pearson(adata: ad.AnnData, n_top_genes: int = 2000):
+    sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=n_top_genes)
 
     def plot():
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -109,10 +137,12 @@ def get_leiden_genes(adata: ad.AnnData, group: int | str | Literal["all"], head:
     if group == "all":
         return sorted(
             set(
-                chain.from_iterable([
-                    sc.get.rank_genes_groups_df(adata, group=str(c)).head(head)["names"]
-                    for c in adata.obs["leiden"].cat.categories
-                ])
+                chain.from_iterable(
+                    [
+                        sc.get.rank_genes_groups_df(adata, group=str(c)).head(head)["names"]
+                        for c in adata.obs["leiden"].cat.categories
+                    ]
+                )
             )
         )
     return sc.get.rank_genes_groups_df(adata, group=str(group)).head(head)["names"]

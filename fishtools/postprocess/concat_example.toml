@@ -1,0 +1,42 @@
+# Example configuration for multi-ROI FISH data concatenation
+# Copy this file and modify for your specific experiment
+
+# Path to the experiment workspace directory
+# This should contain the deconved/ subdirectory with your processed data
+workspace_path = "/working/data/20250407_cs3_2"
+
+# Segmentation codebook identifier used for cell segmentation
+seg_codebook = "atp"
+
+# List of codebooks for analysis (spots/gene identification)
+codebooks = ["mousecommon", "zachDE"]
+
+[intensity]
+# Intensity channel for additional analysis (e.g., CFSE, EdU)
+channel = "cfse"
+# Whether intensity data is required (set to false if optional)
+required = true
+
+[quality_control]
+# Minimum total counts per cell for filtering
+min_counts = 40
+# Maximum total counts per cell for filtering (removes outliers)
+max_counts = 1200
+# Minimum number of cells expressing a gene for gene filtering
+min_cells = 10
+# Minimum cell area in pixels for cell filtering
+min_area = 500.0
+
+[spatial]
+# Maximum number of columns in ROI grid arrangement for visualization
+max_columns = 2
+# Padding between ROIs in spatial coordinates
+padding = 100.0
+
+[output]
+# Output path for the concatenated AnnData file
+h5ad_path = "concatenated.h5ad"
+# Whether to export spots in Baysor-compatible format
+baysor_export = true
+# Output path for Baysor spots CSV file
+baysor_path = "baysor/spots.csv"
