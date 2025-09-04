@@ -512,13 +512,9 @@ def generate_debug_plot(
         # Plot 3: Spots on Mask
         axs[2].imshow(img[sl], origin="lower", cmap=cmap, interpolation="none", vmin=1, alpha=0.6)
         if not spots_df.is_empty():
-            # Need utility function from original code
-            # Assuming filter_spots_for_imshow exists globally or is imported
             try:
                 from __main__ import filter_spots_for_imshow  # Hacky way if running as script
             except ImportError:
-                # If filter_spots_for_imshow is defined elsewhere, import it properly
-                # from your_utility_module import filter_spots_for_imshow
                 logger.warning("filter_spots_for_imshow function not found for debug plot.")
                 plot_spots_x, plot_spots_y = [], []  # Avoid error
             else:

@@ -1,4 +1,3 @@
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -13,12 +12,16 @@ from loguru import logger
 from matplotlib.contour import QuadContourSet
 from matplotlib.figure import Figure
 from pydantic import BaseModel, Field
+from rich.console import Console
+from rich.text import Text
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
-from fishtools.utils.io import Workspace
+from fishtools.utils.io import Codebook, Workspace
 from fishtools.utils.plot import add_scale_bar
 from fishtools.utils.utils import initialize_logger
+
+console = Console()
 
 
 class SpotlookParams(BaseModel):
@@ -128,11 +131,23 @@ MIN_SPOTS_FOR_DENSITY_ANALYSIS = 100
 # --- Core Helper Functions ---
 
 
+def create_shimmer_text(text: str, style: str = "bold cyan") -> Text:
+    """Creates a shimmering text effect using Rich styling."""
+    shimmer_text = Text(text)
+    shimmer_text.stylize(style)
+    return shimmer_text
+
+
 def count_by_gene(spots: pl.DataFrame) -> pl.DataFrame:
     """Counts spots per gene, adding metadata for plotting."""
     return (
         spots.group_by("target")
-        .len("count")
+        .agg([
+            pl.len().alias("count"),
+            pl.col("bit0").first(),
+            pl.col("bit1").first(),
+            pl.col("bit2").first(),
+        ])
         .sort("count", descending=True)
         .with_columns(is_blank=pl.col("target").str.starts_with("Blank"))
         .with_columns(color=pl.when(pl.col("is_blank")).then(pl.lit("red")).otherwise(pl.lit("blue")))
@@ -142,7 +157,7 @@ def count_by_gene(spots: pl.DataFrame) -> pl.DataFrame:
 def save_figure(fig: Figure, output_dir: Path, name: str, roi: str, codebook: str):
     """Saves a matplotlib figure to the output directory with a standardized name for a single ROI."""
     filename = output_dir / f"{name}--{roi}+{codebook}.png"
-    fig.savefig(filename, dpi=300, bbox_inches="tight")
+    fig.savefig(filename.as_posix(), dpi=300, bbox_inches="tight")
     logger.info(f"Saved plot: {filename}")
     plt.close(fig)
 
@@ -150,16 +165,19 @@ def save_figure(fig: Figure, output_dir: Path, name: str, roi: str, codebook: st
 # --- Pipeline Stage Functions ---
 
 
-def _load_spots_data(path: Path, roi: str, codebook: str) -> pl.DataFrame | None:
+def _load_spots_data(path: Path, roi: str, codebook: Codebook) -> pl.DataFrame | None:
     """Loads spot data from a parquet file for a single ROI."""
-    spots_path = path / f"registered--{roi}+{codebook}" / f"decoded-{codebook}" / "spots.parquet"
+    spots_path = path / f"registered--{roi}+{codebook.name}" / f"decoded-{codebook.name}" / "spots.parquet"
     if not spots_path.exists():
         logger.warning(f"Spots file not found for ROI {roi}, skipping: {spots_path}")
         return None
 
     logger.info(f"Loading spots for ROI {roi} from {spots_path.name}")
-    df = pl.read_parquet(spots_path)
-    df = df.with_columns(is_blank=pl.col("target").str.starts_with("Blank"), roi=pl.lit(roi))
+    df = (
+        pl.read_parquet(spots_path)
+        .with_columns(is_blank=pl.col("target").str.starts_with("Blank"), roi=pl.lit(roi))
+        .join(codebook.to_dataframe(), on="target", how="left")
+    )
     mtime = datetime.fromtimestamp(spots_path.stat().st_mtime)
     logger.info(f"-> Found {len(df):,} spots. Data timestamp: {mtime:%Y-%m-%d %H:%M:%S}")
     return df
@@ -232,7 +250,7 @@ def _calculate_density_map(
         contours = ax_dummy.contour(X, Y, Z_smooth, levels=50)
         plt.close(fig_dummy)
 
-    if not contours.levels.size:
+    if not contours.levels.size:  # type: ignore
         logger.warning("Could not generate density contours. The data may be too sparse or uniform.")
         return None
 
@@ -250,32 +268,36 @@ def _get_interactive_threshold(
     params: SpotlookParams,
 ) -> int:
     """Generates a threshold plot and interactively asks the user for a threshold level."""
-    logger.info("Generating threshold selection plot...")
-    threshold_levels = list(range(1, min(len(contours.levels), 15), 2))
-    spot_counts, blank_proportions = [], []
-    for level_idx in threshold_levels:
-        threshold_value = contours.levels[level_idx]
-        point_densities = interp_func(spots_.select(["y_", "x_"]).to_numpy())
-        spots_ok = spots_.filter(pl.lit(point_densities) < threshold_value)
-        spot_counts.append(len(spots_ok))
-        blank_proportions.append(spots_ok.filter(pl.col("is_blank")).height / max(1, len(spots_ok)))
+    with console.status(
+        create_shimmer_text(f"🧮 Generating threshold selection plot for ROI {roi}...", "magenta"),
+        spinner="dots4",
+    ):
+        threshold_levels = list(range(1, min(len(contours.levels), 15), 2))  # type: ignore
+        spot_counts, blank_proportions = [], []
+        for level_idx in threshold_levels:
+            threshold_value = contours.levels[level_idx]  # type: ignore
+            point_densities = interp_func(spots_.select(["y_", "x_"]).to_numpy())
+            spots_ok = spots_.filter(pl.lit(point_densities) < threshold_value)
+            spot_counts.append(len(spots_ok))
+            blank_proportions.append(spots_ok.filter(pl.col("is_blank")).height / max(1, len(spots_ok)))
 
-    sns.set_theme()
-    fig_thresh, ax1 = plt.subplots(figsize=params.figsize_thresh, dpi=params.dpi)
-    ax1.plot(threshold_levels, spot_counts, "g-", label="Remaining Spots")
-    ax1.set_xlabel("Threshold Contour Level")
-    ax1.set_ylabel("Number of Spots", color="g")
-    ax1.tick_params(axis="y", labelcolor="g")
-    ax1.set_ylim(0, None)
-    ax2 = ax1.twinx()
-    ax2.plot(threshold_levels, blank_proportions, "r-", label="Blank Proportion")
-    ax2.set_ylabel("Blank Proportion", color="r")
-    ax2.tick_params(axis="y", labelcolor="r")
-    ax1.set_title(f"Filter Threshold Selection for ROI: {roi}")
-    fig_thresh.tight_layout()
-    save_figure(fig_thresh, output_dir, "threshold_selection", roi, codebook)
+        sns.set_theme()
+        fig_thresh, ax1 = plt.subplots(figsize=params.figsize_thresh, dpi=params.dpi)
+        ax1.plot(threshold_levels, spot_counts, "g-", label="Remaining Spots")
+        ax1.set_xlabel("Threshold Contour Level")
+        ax1.set_ylabel("Number of Spots", color="g")
+        ax1.tick_params(axis="y", labelcolor="g")
+        ax1.set_ylim(0, None)  # type: ignore
+        ax2 = ax1.twinx()
+        ax2.plot(threshold_levels, blank_proportions, "r-", label="Blank Proportion")
+        ax2.set_ylabel("Blank Proportion", color="r")
+        ax2.tick_params(axis="y", labelcolor="r")
+        ax1.set_title(f"Filter Threshold Selection for ROI: {roi}")
+        fig_thresh.tight_layout()
+        save_figure(fig_thresh, output_dir, "threshold_selection", roi, codebook)
 
-    max_level = len(contours.levels) - 1
+        max_level = len(contours.levels) - 1  # type: ignore
+
     level = questionary.text(
         f"For ROI '{roi}', please inspect 'threshold_selection--{roi}+{codebook}.png' in your output directory.\nEnter a threshold level (0-{max_level}):",
         validate=lambda val: val.isdigit()
@@ -295,7 +317,7 @@ def _apply_final_filter(
 ) -> pl.DataFrame:
     """Applies the final density-based filter to the spot data."""
     logger.info(f"Applying final filter at threshold level: {threshold_level}")
-    final_threshold_value = contours.levels[threshold_level]
+    final_threshold_value = contours.levels[threshold_level]  # type: ignore
     point_densities = interp_func(spots_.select(["y_", "x_"]).to_numpy())
     spots_ok = spots_.with_columns(point_density=point_densities).filter(
         pl.col("point_density") < final_threshold_value
@@ -322,8 +344,13 @@ def _generate_final_outputs(
     ax.set_title(f"Filtered Spots for ROI {roi} (n={len(spots_ok):,})")
     save_figure(fig_spots, output_dir, "spots_final", roi, codebook)
 
-    # Final Scree Plot
+    # Save blank counts
     per_gene_final = count_by_gene(spots_ok)
+    per_gene_final.filter(pl.col("is_blank")).sort("count", descending=True).write_csv(
+        output_dir / f"blanks--{roi}+{codebook}.csv"
+    )
+
+    # Final Scree Plot
     fig_scree, ax_scree = plt.subplots(figsize=params.figsize_thresh, dpi=params.dpi)
     blank_prop = per_gene_final.filter(pl.col("is_blank"))["count"].sum() / per_gene_final["count"].sum()
     total_spots = per_gene_final["count"].sum()
@@ -430,7 +457,7 @@ def threshold(
         f"Using analysis parameters: seed={params.seed}, area=[{params.area_min}, {params.area_max}], norm_threshold={params.norm_threshold}"
     )
 
-    codebook = codebook_path.stem
+    codebook = Codebook(codebook_path)
 
     ws = Workspace(path)
     rois_to_process = rois if rois else ws.rois
@@ -445,32 +472,47 @@ def threshold(
         logger.info(f"--- Starting processing for ROI: {roi} ({i}/{len(rois_to_process)}) ---")
         rng = np.random.default_rng(params.seed)
 
-        spots_raw = _load_spots_data(path, roi, codebook)
-        if spots_raw is None or spots_raw.is_empty():
-            logger.warning(f"No data loaded for ROI {roi}. Skipping to next.")
-            continue
+        with console.status(
+            create_shimmer_text(f"🧮 Analyzing spot density patterns for ROI {roi}...", "magenta"),
+            spinner="dots4",
+        ) as status:
+            spots_raw = _load_spots_data(path, roi, codebook)
+            if spots_raw is None or spots_raw.is_empty():
+                logger.warning(f"No data loaded for ROI {roi}. Skipping to next.")
+                continue
 
-        spots_intermediate = _apply_initial_filters(spots_raw, rng, params)
-        if spots_intermediate.height < params.min_spots_for_density:
-            logger.warning(
-                f"Insufficient spots ({spots_intermediate.height}) for ROI {roi} after initial filtering. Skipping density analysis."
-            )
-            continue
+            spots_intermediate = _apply_initial_filters(spots_raw, rng, params)
+            if spots_intermediate.height < params.min_spots_for_density:
+                logger.warning(
+                    f"Insufficient spots ({spots_intermediate.height}) for ROI {roi} after initial filtering. Skipping density analysis."
+                )
+                continue
+            density_results = _calculate_density_map(spots_intermediate, params)
 
-        density_results = _calculate_density_map(spots_intermediate, params)
         if density_results is None:
             continue
         contours, interp_func = density_results
 
         chosen_level = _get_interactive_threshold(
-            spots_intermediate, contours, interp_func, output_dir, roi, codebook, params
+            spots_intermediate, contours, interp_func, output_dir, roi, codebook.name, params
         )
         if chosen_level == -1:  # User cancelled
             continue
 
-        spots_final = _apply_final_filter(spots_intermediate, interp_func, contours, chosen_level)
-        _generate_final_outputs(spots_final, output_dir, roi, codebook, params)
+        with console.status(
+            create_shimmer_text(
+                f"✨ Processing threshold level {chosen_level} for ROI {roi}...", "bold green"
+            ),
+            spinner="dots4",
+        ) as status:
+            status.update("🔄 Applying final density-based filter...")
+            spots_final = _apply_final_filter(spots_intermediate, interp_func, contours, chosen_level)
 
+            status.update("📊 Generating plots and saving results...")
+            _generate_final_outputs(spots_final, output_dir, roi, codebook.name, params)
+
+        # Show completion message with visual flair
+        console.print(create_shimmer_text(f"Successfully processed ROI {roi}!", "bright_green"))
         logger.success(f"--- Finished processing for ROI: {roi} ---")
 
     logger.success("All specified ROIs have been processed.")

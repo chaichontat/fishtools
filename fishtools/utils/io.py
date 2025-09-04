@@ -76,6 +76,33 @@ class OptimizePath:
 
 
 @dataclass
+class Codebook:
+    path: Path
+
+    def __post_init__(self):
+        self.path = Path(self.path)
+        self.codebook = json.loads(self.path.read_text())
+
+    @property
+    def name(self):
+        return self.path.stem
+
+    def to_dataframe(self, bits_as_list: bool = False):
+        import polars as pl
+
+        df = (pl.DataFrame(self.codebook).transpose(include_header=True)).rename({"column": "target"})
+
+        if not bits_as_list:
+            return df.rename({"column_0": "bit0", "column_1": "bit1", "column_2": "bit2"})
+
+        return df.with_columns(
+            concat_list=pl.concat_list("column_0", "column_1", "column_2")
+            .cast(pl.List(pl.UInt8))
+            .alias("bits")
+        )
+
+
+@dataclass
 class Workspace:
     """FISH experiment workspace manager with verified directory structure.
 
@@ -137,7 +164,7 @@ class Workspace:
         """Return detailed string representation for debugging."""
         return f"Workspace({self.path})"
 
-    def __init__(self, path: Path | str, deconved: bool = False) -> None:
+    def __init__(self, path: Path | str) -> None:
         """Initialize workspace with automatic path resolution.
 
         Automatically detects and normalizes workspace root path. If path points
