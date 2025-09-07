@@ -11,12 +11,12 @@ import typer
 from loguru import logger
 from matplotlib.contour import QuadContourSet
 from matplotlib.figure import Figure
-from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.text import Text
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
+from fishtools.preprocess.config import SpotlookParams
 from fishtools.utils.io import Codebook, Workspace
 from fishtools.utils.plot import add_scale_bar
 from fishtools.utils.utils import initialize_logger
@@ -24,96 +24,39 @@ from fishtools.utils.utils import initialize_logger
 console = Console()
 
 
-class SpotlookParams(BaseModel):
-    """Parameters for spotlook analysis with validation and type safety."""
+def build_spotlook_params(
+    config_path: Path | None = None,
+    *,
+    area_min: float | None = None,
+    area_max: float | None = None,
+    norm_threshold: float | None = None,
+    distance_threshold: float | None = None,
+    seed: int | None = None,
+) -> SpotlookParams:
+    """Create SpotlookParams from project config (if provided) with CLI overrides."""
+    params: SpotlookParams
+    if config_path:
+        from fishtools.preprocess.config_loader import load_config
 
-    # Core filtering parameters
-    area_min: float = Field(default=10.0, gt=0, description="Minimum spot area in pixels")
-    area_max: float = Field(default=200.0, gt=0, description="Maximum spot area in pixels")
-    norm_threshold: float = Field(
-        default=0.007, gt=0, description="Normalization threshold for spot filtering"
-    )
-    distance_threshold: float = Field(default=0.3, gt=0, description="Distance threshold for spot filtering")
+        cfg = load_config(config_path)
+        params = SpotlookParams.from_spot_analysis(
+            cfg.spot_analysis, pixel_size_um=cfg.image_processing.pixel_size_um
+        )
+    else:
+        params = SpotlookParams()
 
-    # Density analysis parameters
-    density_grid_size: int = Field(default=50, gt=0, description="Grid size for density map calculation")
-    density_smooth_sigma: float = Field(
-        default=4.0, gt=0, description="Gaussian smoothing sigma for density map"
-    )
-    min_spots_for_density: int = Field(
-        default=100, gt=0, description="Minimum spots required for density analysis"
-    )
-
-    # Reproducibility
-    seed: int = Field(default=0, ge=0, description="Random seed for reproducible analysis")
-
-    # Visualization settings
-    subsample: int = Field(default=200000, gt=0, description="Maximum spots to display in plots")
-    scale_bar_um: float = Field(default=1000.0, gt=0, description="Scale bar size in micrometers")
-    dpi: int = Field(default=200, gt=0, description="Plot resolution in DPI")
-    figsize_spots: tuple[float, float] = Field(default=(10.0, 10.0), description="Figure size for spot plots")
-    figsize_thresh: tuple[float, float] = Field(
-        default=(8.0, 6.0), description="Figure size for threshold plots"
-    )
-
-    @classmethod
-    def from_config(
-        cls,
-        config_path: Path | None = None,
-        area_min: float | None = None,
-        area_max: float | None = None,
-        norm_threshold: float | None = None,
-        distance_threshold: float | None = None,
-        seed: int | None = None,
-    ) -> "SpotlookParams":
-        """Create SpotlookParams from config file with CLI overrides."""
-        try:
-            from fishtools.preprocess.config_loader import load_config
-
-            if config_path:
-                config = load_config(config_path)
-                spot_config = config.spot_analysis
-
-                # Extract from nested config structure
-                params = cls(
-                    area_min=spot_config.area_range[0],
-                    area_max=spot_config.area_range[1],
-                    norm_threshold=spot_config.norm_threshold,
-                    distance_threshold=spot_config.distance_threshold,
-                    density_grid_size=int(spot_config.density["grid_size"]),
-                    density_smooth_sigma=float(spot_config.density["smooth_sigma"]),
-                    min_spots_for_density=int(spot_config.density["min_spots"]),
-                    seed=spot_config.seed,
-                    subsample=int(spot_config.visualization["subsample"]),
-                    scale_bar_um=float(spot_config.visualization["scale_bar_um"]),
-                    dpi=int(spot_config.visualization["dpi"]),
-                    figsize_spots=tuple(spot_config.visualization["figsize_spots"]),
-                    figsize_thresh=tuple(spot_config.visualization["figsize_thresh"]),
-                )
-            else:
-                # Use defaults
-                params = cls()
-
-        except ImportError:
-            # Fallback if config system unavailable
-            params = cls()
-
-        # Apply CLI overrides using Pydantic's update mechanism
-        overrides = {
-            k: v
-            for k, v in {
-                "area_min": area_min,
-                "area_max": area_max,
-                "norm_threshold": norm_threshold,
-                "distance_threshold": distance_threshold,
-                "seed": seed,
-            }.items()
-            if v is not None
-        }
-
-        if overrides:
-            return params.model_copy(update=overrides)
-        return params
+    overrides = {
+        k: v
+        for k, v in {
+            "area_min": area_min,
+            "area_max": area_max,
+            "norm_threshold": norm_threshold,
+            "distance_threshold": distance_threshold,
+            "seed": seed,
+        }.items()
+        if v is not None
+    }
+    return params.model_copy(update=overrides) if overrides else params
 
 
 # --- Analysis Parameters ---
@@ -340,7 +283,7 @@ def _generate_final_outputs(
     ax.scatter(spots_ok["y"][::subsample], spots_ok["x"][::subsample], s=0.1, alpha=0.3)
     ax.set_aspect("equal")
     ax.axis("off")
-    add_scale_bar(ax, params.scale_bar_um / 0.108, f"{params.scale_bar_um} μm")
+    add_scale_bar(ax, params.scale_bar_um / params.pixel_size_um, f"{params.scale_bar_um} μm")
     ax.set_title(f"Filtered Spots for ROI {roi} (n={len(spots_ok):,})")
     save_figure(fig_spots, output_dir, "spots_final", roi, codebook)
 
@@ -445,7 +388,7 @@ def threshold(
     logger.info(f"Using output directory: {output_dir}")
 
     # Load configuration and create parameters model
-    params = SpotlookParams.from_config(
+    params = build_spotlook_params(
         config_path=config,
         area_min=area_min,
         area_max=area_max,

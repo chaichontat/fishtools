@@ -684,7 +684,7 @@ def run(
                 exclude=None,
                 registration=RegisterConfig(
                     chromatic_shifts={
-                        "647": str(DATA / "560to647.txt"),
+                        "647": str(DATA / "560to650.txt"),
                         "750": str(DATA / "560to750.txt"),
                     },
                     fiducial=Fiducial(

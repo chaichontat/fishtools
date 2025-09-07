@@ -2,6 +2,7 @@ from json import JSONEncoder
 from typing import Annotated, Any, Literal
 
 import numpy as np
+from loguru import logger
 from pydantic import BaseModel, Field, PlainSerializer, field_validator
 
 
@@ -119,6 +120,32 @@ class RegisterConfig(BaseModel):
                 )
         return v
 
+    # Canonicalize chromatic shift keys to wavelengths {560, 650, 750}
+    @field_validator("chromatic_shifts", mode="before")
+    @classmethod
+    def canonicalize_chromatic(cls, v: dict[str, str]) -> dict[str, str]:
+        if not isinstance(v, dict):  # type: ignore
+            return v
+        synonym_map = {"561": "560", "640": "650", "647": "650"}
+        allowed = {"650", "750"}  # chromatic shifts are defined relative to 560
+        out: dict[str, str] = {}
+        for k, path in v.items():
+            ks = str(k)
+            kc = synonym_map.get(ks, ks)
+            if kc != ks:
+                logger.warning(
+                    f"Normalized chromatic key '{ks}' -> '{kc}' (canonical wavelengths: 560, 650, 750)"
+                )
+            out[kc] = path
+        # Warn on unexpected keys; keep them for backward-compat
+        for k in list(out.keys()):
+            if k not in allowed:
+                logger.warning(
+                    "Chromatic shift provided for '%s'. Expected only target channels {'650','750'} relative to 560.",
+                    k,
+                )
+        return out
+
 
 class ChannelConfig(BaseModel):
     discards: dict[str, list[str]] | None = Field(
@@ -223,6 +250,59 @@ class SpotAnalysisConfig(BaseModel):
     )
 
 
+class SpotlookParams(BaseModel):
+    """Flattened, CLI-friendly parameters for spotlook analysis.
+
+    Derived from `SpotAnalysisConfig` and `ImageProcessingConfig` so CLIs don't
+    have to know the nested shapes. Keep defaults in sync with SpotAnalysisConfig.
+    """
+
+    # Core filtering parameters
+    area_min: float = Field(default=10.0, gt=0, description="Minimum spot area in pixels")
+    area_max: float = Field(default=200.0, gt=0, description="Maximum spot area in pixels")
+    norm_threshold: float = Field(default=0.007, gt=0, description="Normalization threshold")
+    distance_threshold: float = Field(default=0.3, gt=0, description="Distance threshold")
+
+    # Density analysis parameters
+    density_grid_size: int = Field(default=50, gt=0, description="Grid size for density map")
+    density_smooth_sigma: float = Field(default=4.0, gt=0, description="Gaussian sigma for density")
+    min_spots_for_density: int = Field(default=100, gt=0, description="Minimum spots for density analysis")
+
+    # Reproducibility
+    seed: int = Field(default=0, ge=0, description="Random seed")
+
+    # Visualization
+    subsample: int = Field(default=200000, gt=0, description="Max spots to display in plots")
+    scale_bar_um: float = Field(default=1000.0, gt=0, description="Scale bar size (micrometers)")
+    dpi: int = Field(default=200, gt=0, description="Plot DPI")
+    figsize_spots: tuple[float, float] = Field(default=(10.0, 10.0), description="Figure size for spots plot")
+    figsize_thresh: tuple[float, float] = Field(default=(8.0, 6.0), description="Figure size for threshold plot")
+
+    # Imaging meta
+    pixel_size_um: float = Field(default=0.108, gt=0, description="Pixel size in micrometers")
+
+    @classmethod
+    def from_spot_analysis(
+        cls, spot: "SpotAnalysisConfig", pixel_size_um: float = 0.108
+    ) -> "SpotlookParams":
+        return cls(
+            area_min=float(spot.area_range[0]),
+            area_max=float(spot.area_range[1]),
+            norm_threshold=float(spot.norm_threshold),
+            distance_threshold=float(spot.distance_threshold),
+            density_grid_size=int(spot.density["grid_size"]),
+            density_smooth_sigma=float(spot.density["smooth_sigma"]),
+            min_spots_for_density=int(spot.density["min_spots"]),
+            seed=int(spot.seed),
+            subsample=int(spot.visualization["subsample"]),
+            scale_bar_um=float(spot.visualization["scale_bar_um"]),
+            dpi=int(spot.visualization["dpi"]),
+            figsize_spots=tuple(spot.visualization["figsize_spots"]),
+            figsize_thresh=tuple(spot.visualization["figsize_thresh"]),
+            pixel_size_um=float(pixel_size_um),
+        )
+
+
 class SystemConfig(BaseModel):
     """System paths and infrastructure configuration."""
 
@@ -243,6 +323,10 @@ class ImageProcessingConfig(BaseModel):
     """Low-level image processing parameters."""
 
     image_size: int = Field(default=2048, description="Standard image size in pixels")
+    pixel_size_um: float = Field(
+        default=0.108,
+        description="Pixel size in micrometers for plotting/scale bars (used by spotlook and figures)",
+    )
     log_sigma: float = Field(default=3.0, description="Sigma parameter for Laplacian of Gaussian filtering")
     percentiles: list[float] = Field(
         default=[1.0, 99.99], description="Percentile values for intensity normalization"

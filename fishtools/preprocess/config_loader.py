@@ -12,16 +12,16 @@ from loguru import logger
 from pydantic import ValidationError
 
 from .config import (
-    Config,
-    RegisterConfig,
-    Fiducial,
-    ProcessingConfig,
-    DeconvolutionConfig,
     BasicConfig,
-    StitchingConfig,
-    SpotAnalysisConfig,
-    SystemConfig,
+    Config,
+    DeconvolutionConfig,
+    Fiducial,
     ImageProcessingConfig,
+    ProcessingConfig,
+    RegisterConfig,
+    SpotAnalysisConfig,
+    StitchingConfig,
+    SystemConfig,
 )
 
 
@@ -106,7 +106,8 @@ def load_minimal_config(
         fiducial=fiducial_config,
         reference=reference,
         chromatic_shifts={
-            "647": str(Path(data_path) / "560to647.txt"),
+            # Canonical target wavelengths are 650 and 750
+            "650": str(Path(data_path) / "560to650.txt"),
             "750": str(Path(data_path) / "560to750.txt"),
         },
     )
