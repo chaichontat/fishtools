@@ -16,7 +16,7 @@ from rich.text import Text
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
-from fishtools.preprocess.config import SpotlookParams
+from fishtools.preprocess.config import SpotThresholdParams
 from fishtools.utils.io import Codebook, Workspace
 from fishtools.utils.plot import add_scale_bar
 from fishtools.utils.utils import initialize_logger
@@ -32,18 +32,18 @@ def build_spotlook_params(
     norm_threshold: float | None = None,
     distance_threshold: float | None = None,
     seed: int | None = None,
-) -> SpotlookParams:
+) -> SpotThresholdParams:
     """Create SpotlookParams from project config (if provided) with CLI overrides."""
-    params: SpotlookParams
+    params: SpotThresholdParams
     if config_path:
         from fishtools.preprocess.config_loader import load_config
 
         cfg = load_config(config_path)
-        params = SpotlookParams.from_spot_analysis(
+        params = SpotThresholdParams.from_spot_analysis(
             cfg.spot_analysis, pixel_size_um=cfg.image_processing.pixel_size_um
         )
     else:
-        params = SpotlookParams()
+        params = SpotThresholdParams()
 
     overrides = {
         k: v
@@ -129,7 +129,7 @@ def _load_spots_data(path: Path, roi: str, codebook: Codebook) -> pl.DataFrame |
 def _apply_initial_filters(
     spots: pl.DataFrame,
     rng: np.random.Generator,
-    params: SpotlookParams,
+    params: SpotThresholdParams,
 ) -> pl.DataFrame:
     """Applies initial area/norm filters and engineers features for density analysis."""
     logger.info("Applying initial filters and engineering features...")
@@ -148,7 +148,7 @@ def _apply_initial_filters(
 
 def _calculate_density_map(
     spots_: pl.DataFrame,
-    params: SpotlookParams,
+    params: SpotThresholdParams,
 ) -> tuple[QuadContourSet, RegularGridInterpolator] | None:
     """Calculates and smooths the blank proportion density map."""
     logger.info("Calculating blank proportion density map...")
@@ -208,7 +208,7 @@ def _get_interactive_threshold(
     output_dir: Path,
     roi: str,
     codebook: str,
-    params: SpotlookParams,
+    params: SpotThresholdParams,
 ) -> int:
     """Generates a threshold plot and interactively asks the user for a threshold level."""
     with console.status(
@@ -273,7 +273,7 @@ def _apply_final_filter(
 
 
 def _generate_final_outputs(
-    spots_ok: pl.DataFrame, output_dir: Path, roi: str, codebook: str, params: SpotlookParams
+    spots_ok: pl.DataFrame, output_dir: Path, roi: str, codebook: str, params: SpotThresholdParams
 ):
     """Generates all final plots and saves the filtered data for a single ROI."""
     logger.info("Generating final plots and saving data...")

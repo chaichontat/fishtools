@@ -1,5 +1,5 @@
 from json import JSONEncoder
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 import numpy as np
 from loguru import logger
@@ -250,7 +250,7 @@ class SpotAnalysisConfig(BaseModel):
     )
 
 
-class SpotlookParams(BaseModel):
+class SpotThresholdParams(BaseModel):
     """Flattened, CLI-friendly parameters for spotlook analysis.
 
     Derived from `SpotAnalysisConfig` and `ImageProcessingConfig` so CLIs don't
@@ -276,15 +276,15 @@ class SpotlookParams(BaseModel):
     scale_bar_um: float = Field(default=1000.0, gt=0, description="Scale bar size (micrometers)")
     dpi: int = Field(default=200, gt=0, description="Plot DPI")
     figsize_spots: tuple[float, float] = Field(default=(10.0, 10.0), description="Figure size for spots plot")
-    figsize_thresh: tuple[float, float] = Field(default=(8.0, 6.0), description="Figure size for threshold plot")
+    figsize_thresh: tuple[float, float] = Field(
+        default=(8.0, 6.0), description="Figure size for threshold plot"
+    )
 
     # Imaging meta
     pixel_size_um: float = Field(default=0.108, gt=0, description="Pixel size in micrometers")
 
     @classmethod
-    def from_spot_analysis(
-        cls, spot: "SpotAnalysisConfig", pixel_size_um: float = 0.108
-    ) -> "SpotlookParams":
+    def from_spot_analysis(cls, spot: SpotAnalysisConfig, pixel_size_um: float = 0.108) -> Self:
         return cls(
             area_min=float(spot.area_range[0]),
             area_max=float(spot.area_range[1]),
@@ -361,7 +361,6 @@ class Config(BaseModel):
         description="Perform BaSiC correction specific to each round or use the same template for all rounds.",
     )
 
-    # New configuration sections (optional for backward compatibility)
     processing: ProcessingConfig = Field(
         default_factory=ProcessingConfig, description="Generic processing configuration"
     )
@@ -382,4 +381,7 @@ class Config(BaseModel):
     )
     image_processing: ImageProcessingConfig = Field(
         default_factory=ImageProcessingConfig, description="Low-level image processing parameters"
+    )
+    spot_threshold: SpotThresholdParams = Field(
+        default_factory=SpotThresholdParams, description="Threshold parameters"
     )
