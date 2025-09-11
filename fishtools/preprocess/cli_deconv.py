@@ -8,7 +8,8 @@ import threading
 import time
 from itertools import chain
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 import cupy as cp
 import numpy as np
@@ -856,7 +857,7 @@ def batch(
             for p in path.iterdir()
             if "--" in p.name and p.is_dir() and not any(p.name.startswith(f) for f in FORBIDDEN)
         },
-        key=lambda x: f"{int(x.split('_')[0]):02d}" if x.split("_")[0].isdigit() else x,
+        key=lambda x: (x.split('_')[0].isdigit(), f"{int(x.split('_')[0]):02d}" if x.split("_")[0].isdigit() else x),
     )
     logger.info(f"Rounds: {rounds}")
 
