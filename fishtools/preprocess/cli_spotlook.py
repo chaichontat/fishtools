@@ -39,9 +39,7 @@ def build_spotlook_params(
         from fishtools.preprocess.config_loader import load_config
 
         cfg = load_config(config_path)
-        params = SpotThresholdParams.from_spot_analysis(
-            cfg.spot_analysis, pixel_size_um=cfg.image_processing.pixel_size_um
-        )
+        params = cfg.spot_threshold
     else:
         params = SpotThresholdParams()
 
@@ -149,7 +147,7 @@ def _apply_initial_filters(
 def _calculate_density_map(
     spots_: pl.DataFrame,
     params: SpotThresholdParams,
-) -> tuple[QuadContourSet, RegularGridInterpolator] | None:
+) -> tuple[Figure, QuadContourSet, RegularGridInterpolator] | None:
     """Calculates and smooths the blank proportion density map."""
     logger.info("Calculating blank proportion density map...")
     bounds = spots_.select([
@@ -187,18 +185,21 @@ def _calculate_density_map(
         Z[row["j"], row["i"]] = row["proportion"]
     Z_smooth = gaussian_filter(Z, sigma=params.density_smooth_sigma)
 
-    # Use a dummy figure to generate contours, as we only need the contour object itself.
-    with plt.ioff():  # Turn off interactive plotting temporarily
-        fig_dummy, ax_dummy = plt.subplots()
-        contours = ax_dummy.contour(X, Y, Z_smooth, levels=50)
-        plt.close(fig_dummy)
+    # Build a real figure showing the raw density heatmap (Z) with smoothed contours overlaid.
+    fig, ax = plt.subplots(figsize=params.figsize_thresh, dpi=params.dpi)
+    im = ax.pcolormesh(X, Y, Z, shading="auto", vmin=0, vmax=np.percentile(Z, 99.9))
+    contours = ax.contour(X, Y, Z_smooth, levels=50, colors="white", alpha=0.5, linewidths=0.5)
+    ax.set_xlabel("Area")
+    ax.set_ylabel("Norm * (1 - Distance) [log10]")
+    ax.set_title("Blank Proportion Density (Z) with Smoothed Contours")
+    fig.colorbar(im, ax=ax, label="Proportion")
 
     if not contours.levels.size:  # type: ignore
         logger.warning("Could not generate density contours. The data may be too sparse or uniform.")
         return None
 
     interp_func = RegularGridInterpolator((y_coords, x_coords), Z_smooth, bounds_error=False, fill_value=0)
-    return contours, interp_func
+    return fig, contours, interp_func
 
 
 def _get_interactive_threshold(
@@ -241,16 +242,20 @@ def _get_interactive_threshold(
 
         max_level = len(contours.levels) - 1  # type: ignore
 
+    # Show the absolute path to the threshold plot for clarity
+    threshold_png = (output_dir / f"threshold_selection--{roi}+{codebook}.png").resolve()
     level = questionary.text(
-        f"For ROI '{roi}', please inspect 'threshold_selection--{roi}+{codebook}.png' in your output directory.\nEnter a threshold level (0-{max_level}):",
+        f"For ROI '{roi}', please inspect: {threshold_png}\nEnter a threshold level (0-{max_level}):",
         validate=lambda val: val.isdigit()
         and 0 <= int(val) <= max_level
         or f"Please enter a valid integer between 0 and {max_level}.",
     ).ask()
 
-    if level is None:  # User pressed Ctrl+C
-        logger.warning("User cancelled input. Aborting process for this ROI.")
-        return -1
+    # Always exit on KeyboardInterrupt/Ctrl+C instead of continuing to next ROI
+    # questionary returns None on Ctrl+C; treat as an immediate, global abort.
+    if level is None:
+        logger.warning("KeyboardInterrupt detected during threshold input. Exiting immediately.")
+        raise typer.Exit(code=1)
 
     return int(level)
 
@@ -434,7 +439,9 @@ def threshold(
 
         if density_results is None:
             continue
-        contours, interp_func = density_results
+        fig_contours, contours, interp_func = density_results
+
+        save_figure(fig_contours, output_dir, "contours", roi, codebook.name)
 
         chosen_level = _get_interactive_threshold(
             spots_intermediate, contours, interp_func, output_dir, roi, codebook.name, params

@@ -1,9 +1,12 @@
 from json import JSONEncoder
+from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 import numpy as np
 from loguru import logger
 from pydantic import BaseModel, Field, PlainSerializer, field_validator
+
+DATA = Path("/working/fishtools/data")
 
 
 class NumpyEncoder(JSONEncoder):
@@ -23,7 +26,8 @@ class FiducialDetailedConfig(BaseModel):
 
     # Threshold adjustment parameters
     threshold_step: float = Field(
-        default=0.5, description="Step size for threshold adjustment during spot finding"
+        default=0.5,
+        description="Step size for threshold adjustment during spot finding",
     )
     min_threshold_sigma: float = Field(
         default=2.0, description="Minimum threshold sigma before adjusting FWHM"
@@ -32,7 +36,8 @@ class FiducialDetailedConfig(BaseModel):
 
     # Image preprocessing
     percentile_clip: float = Field(
-        default=50.0, description="Percentile value for image clipping during preprocessing"
+        default=50.0,
+        description="Percentile value for image clipping during preprocessing",
     )
     background_box_size: tuple[int, int] = Field(
         default=(50, 50), description="Box size for background estimation"
@@ -56,7 +61,8 @@ class FiducialDetailedConfig(BaseModel):
 
 class Fiducial(BaseModel):
     use_fft: bool = Field(
-        default=False, description="Use FFT to find fiducial spots. Overrides everything else."
+        default=False,
+        description="Use FFT to find fiducial spots. Overrides everything else.",
     )
     fwhm: float = Field(
         default=4.0,
@@ -78,7 +84,8 @@ class Fiducial(BaseModel):
     )
     n_fids: int = Field(default=2, ge=1, description="Number of fiducial frames in each image.")
     detailed: FiducialDetailedConfig = Field(
-        default_factory=FiducialDetailedConfig, description="Detailed fiducial processing parameters"
+        default_factory=FiducialDetailedConfig,
+        description="Detailed fiducial processing parameters",
     )
 
 
@@ -93,11 +100,12 @@ class RegisterConfig(BaseModel):
         description="Reduce bit depth by n bits. 0 to disable. This is to assist in compression of output intended for visualization.",
     )
     crop: int = Field(
-        default=30,
+        default=40,
         description="Pixels to crop from each edge. This is to account for translation during alignment.",
     )
     slices: Annotated[
-        list[tuple[int | None, int | None]] | slice | str, PlainSerializer(lambda x: str(x))
+        list[tuple[int | None, int | None]] | slice | str,
+        PlainSerializer(lambda x: str(x)),
     ] = Field(default=slice(None), description="Slice range to use for registration")
     split_channels: bool = False
     chromatic_shifts: dict[str, Annotated[str, "path for 560to{channel}.txt"]]
@@ -123,9 +131,12 @@ class RegisterConfig(BaseModel):
     # Canonicalize chromatic shift keys to wavelengths {560, 650, 750}
     @field_validator("chromatic_shifts", mode="before")
     @classmethod
-    def canonicalize_chromatic(cls, v: dict[str, str]) -> dict[str, str]:
+    def canonicalize_chromatic(cls, v: dict[str, str] | None) -> dict[str, str]:
+        # Fallback to sensible defaults when empty or missing
+        if not v:
+            return {"650": "data/560to650.txt", "750": "data/560to750.txt"}
         if not isinstance(v, dict):  # type: ignore
-            return v
+            return v  # type: ignore
         synonym_map = {"561": "560", "640": "650", "647": "650"}
         allowed = {"650", "750"}  # chromatic shifts are defined relative to 560
         out: dict[str, str] = {}
@@ -154,31 +165,31 @@ class ChannelConfig(BaseModel):
     )
 
 
+def default_register_config() -> "RegisterConfig":
+    """Factory for RegisterConfig with built-in chromatic shift defaults.
+
+    Uses canonical target wavelengths (650, 750) relative to the 560 channel.
+    Paths are relative and can be resolved by the caller as needed.
+    """
+    return RegisterConfig(
+        chromatic_shifts={
+            "650": (DATA / "560to650.txt").resolve().as_posix(),
+            "750": (DATA / "560to750.txt").resolve().as_posix(),
+        },
+        fiducial=Fiducial(),
+        downsample=1,
+        crop=40,
+        slices=slice(None),
+        reduce_bit_depth=0,
+    )
+
+
 class ProcessingConfig(BaseModel):
     """Generic processing configuration for cross-cutting concerns."""
 
     queue_max_sizes: list[int] = Field(
         default=[3, 1], description="Maximum queue sizes for write and image processing"
     )
-
-
-class DeconvolutionConfig(BaseModel):
-    """3D deconvolution processing configuration."""
-
-    projector_step: int = Field(default=6, description="PSF projector step size parameter")
-    wiener_params: dict[str, float] = Field(
-        default={"alpha": 0.02, "beta": 0.02, "n": 10},
-        description="Wiener-Butterworth deconvolution parameters",
-    )
-    percentiles: dict[str, float] = Field(
-        default={"min": 0.1, "max": 99.999}, description="Percentile values for intensity scaling"
-    )
-    protein_percentiles: dict[str, float] = Field(
-        default={"min": 50, "max": 50}, description="Percentile values specifically for protein channels"
-    )
-    max_rna_bit: int = Field(default=36, description="Maximum bit number considered RNA (vs protein)")
-    # Moved from HardwareConfig - threads used specifically for deconvolution
-    threads: int = Field(default=6, description="Number of threads for deconvolution operations")
 
 
 class BasicConfig(BaseModel):
@@ -196,6 +207,29 @@ class BasicConfig(BaseModel):
     random_sample_limit: int = Field(default=1000, description="Maximum number of files to randomly sample")
     # Moved from HardwareConfig - threads used specifically for BaSiC correction
     threads: int = Field(default=3, description="Number of threads for BaSiC correction operations")
+
+
+class DeconvolutionConfig(BaseModel):
+    """3D deconvolution processing configuration."""
+
+    projector_step: int = Field(default=6, description="PSF projector step size parameter")
+    wiener_params: dict[str, float] = Field(
+        default={"alpha": 0.02, "beta": 0.02, "n": 10},
+        description="Wiener-Butterworth deconvolution parameters",
+    )
+    percentiles: dict[str, float] = Field(
+        default={"min": 0.1, "max": 99.999},
+        description="Percentile values for intensity scaling",
+    )
+    protein_percentiles: dict[str, float] = Field(
+        default={"min": 50, "max": 50},
+        description="Percentile values specifically for protein channels",
+    )
+    max_rna_bit: int = Field(default=36, description="Maximum bit number considered RNA (vs protein)")
+    # Moved from HardwareConfig - threads used specifically for deconvolution
+    threads: int = Field(default=6, description="Number of threads for deconvolution operations")
+    # BaSiC correction nested under deconvolution
+    basic: BasicConfig = Field(default_factory=BasicConfig, description="BaSiC correction configuration")
 
 
 class StitchingConfig(BaseModel):
@@ -217,37 +251,15 @@ class StitchingConfig(BaseModel):
     )
     # Moved from HardwareConfig - ImageJ-specific settings used in stitching
     max_memory_mb: int = Field(
-        default=102400, description="Maximum memory allocation in MB for ImageJ stitching operations"
+        default=102400,
+        description="Maximum memory allocation in MB for ImageJ stitching operations",
     )
     parallel_threads: int = Field(
-        default=32, description="Number of parallel threads for ImageJ stitching operations"
+        default=32,
+        description="Number of parallel threads for ImageJ stitching operations",
     )
     # Moved from HardwareConfig - threads used specifically for stitching
     threads: int = Field(default=8, description="Number of threads for stitching operations")
-
-
-class SpotAnalysisConfig(BaseModel):
-    """Spot detection and analysis configuration."""
-
-    area_range: list[float] = Field(default=[10.0, 200.0], description="Valid spot area range in pixels")
-    norm_threshold: float = Field(default=0.007, description="Normalization threshold for spot filtering")
-    distance_threshold: float = Field(default=0.3, description="Distance threshold for spot filtering")
-    density: dict[str, float | int] = Field(
-        default={"grid_size": 50, "smooth_sigma": 4.0, "min_spots": 100},
-        description="Density map calculation parameters",
-    )
-    seed: int = Field(default=0, description="Random seed for reproducible analysis")
-    visualization: dict[str, int | float | list[int | float]] = Field(
-        default={
-            "subsample": 200000,
-            "scale_bar_um": 1000,
-            "thumbnail_interval": 8,
-            "dpi": 200,
-            "figsize_spots": [10, 10],
-            "figsize_thresh": [8, 6],
-        },
-        description="Visualization and output parameters",
-    )
 
 
 class SpotThresholdParams(BaseModel):
@@ -283,24 +295,44 @@ class SpotThresholdParams(BaseModel):
     # Imaging meta
     pixel_size_um: float = Field(default=0.108, gt=0, description="Pixel size in micrometers")
 
-    @classmethod
-    def from_spot_analysis(cls, spot: SpotAnalysisConfig, pixel_size_um: float = 0.108) -> Self:
-        return cls(
-            area_min=float(spot.area_range[0]),
-            area_max=float(spot.area_range[1]),
-            norm_threshold=float(spot.norm_threshold),
-            distance_threshold=float(spot.distance_threshold),
-            density_grid_size=int(spot.density["grid_size"]),
-            density_smooth_sigma=float(spot.density["smooth_sigma"]),
-            min_spots_for_density=int(spot.density["min_spots"]),
-            seed=int(spot.seed),
-            subsample=int(spot.visualization["subsample"]),
-            scale_bar_um=float(spot.visualization["scale_bar_um"]),
-            dpi=int(spot.visualization["dpi"]),
-            figsize_spots=tuple(spot.visualization["figsize_spots"]),
-            figsize_thresh=tuple(spot.visualization["figsize_thresh"]),
-            pixel_size_um=float(pixel_size_um),
-        )
+    # Note: previously derived from SpotAnalysisConfig; now SpotThresholdParams is the source of truth.
+
+
+# === Align/Spot decoding config (centralized for align_prod.py) ===
+
+
+class SpotDecodeConfig(BaseModel):
+    """Decoding + prefilter parameters used by align_prod.
+
+    These intentionally mirror semantics from SpotThresholdParams to avoid drift.
+    """
+
+    max_distance: float = 0.3  # ↔ SpotThresholdParams.distance_threshold
+    min_intensity: float = 0.002  # ↔ SpotThresholdParams.norm_threshold
+    min_area: int = 8  # ↔ SpotThresholdParams.area_min
+    max_area: int = 200  # ↔ SpotThresholdParams.area_max
+    use_correct_direction: bool = True
+    sigma: tuple[float, float, float] = (
+        2.0,
+        2.0,
+        2.0,
+    )  # (z, y, x) for GaussianHighPass
+    threads: int = 12  # CAF/decoding parallelism where applicable
+    clip_percentile: float = 40.0  # used by align_prod find_threshold
+
+
+# Optimize round defaults used by align_prod when --calc-deviations is enabled
+OPTIMIZE_DECODE = SpotDecodeConfig(
+    min_intensity=0.012,
+    max_distance=0.3,
+    min_area=15,
+    max_area=200,
+    sigma=(2.0, 2.0, 2.0),
+    use_correct_direction=True,
+)
+
+
+"""Decoding knobs are centralized via SpotDecodeConfig and embedded in Config."""
 
 
 class SystemConfig(BaseModel):
@@ -315,7 +347,8 @@ class SystemConfig(BaseModel):
         description="Default reference round identifiers in priority order",
     )
     available_channels: list[str] = Field(
-        default=["405", "488", "560", "650", "750"], description="Available laser wavelength channels"
+        default=["405", "488", "560", "650", "750"],
+        description="Available laser wavelength channels",
     )
 
 
@@ -329,7 +362,8 @@ class ImageProcessingConfig(BaseModel):
     )
     log_sigma: float = Field(default=3.0, description="Sigma parameter for Laplacian of Gaussian filtering")
     percentiles: list[float] = Field(
-        default=[1.0, 99.99], description="Percentile values for intensity normalization"
+        default=[1.0, 99.99],
+        description="Percentile values for intensity normalization",
     )
     spillover_corrections: dict[str, float] | None = Field(
         default=None,
@@ -344,44 +378,40 @@ class ImageProcessingConfig(BaseModel):
         default=10, description="Minimum number of existing shifts to use as priors"
     )
     correlation_region: dict[str, int] = Field(
-        default={"start": 500, "end": -500, "step": 2}, description="Region for correlation calculation"
+        default={"start": 500, "end": -500, "step": 2},
+        description="Region for correlation calculation",
     )
 
 
 class Config(BaseModel):
     """Master configuration for fishtools preprocessing pipeline."""
 
-    # Existing fields for backward compatibility
-    dataPath: str
+    dataPath: str | None = None
     exclude: list[str] | None = Field(None, description="Exclude rounds with these prefixes.")
-    registration: RegisterConfig
-    channels: ChannelConfig | None = None
-    basic: Literal["per_round", "all_round"] | None = Field(
-        None,
-        description="Perform BaSiC correction specific to each round or use the same template for all rounds.",
+    system: SystemConfig | None = Field(
+        default_factory=SystemConfig,
+        description="System paths and infrastructure configuration",
     )
-
-    processing: ProcessingConfig = Field(
-        default_factory=ProcessingConfig, description="Generic processing configuration"
+    # RegisterConfig cannot have a safe default (requires chromatic_shifts); leave optional
+    registration: RegisterConfig = Field(
+        default_factory=default_register_config,
+        description="Image registration parameters",
     )
-    deconvolution: DeconvolutionConfig = Field(
-        default_factory=DeconvolutionConfig, description="3D deconvolution processing configuration"
+    image_processing: ImageProcessingConfig | None = Field(
+        default_factory=ImageProcessingConfig,
+        description="Low-level image processing parameters",
     )
-    basic_correction: BasicConfig = Field(
-        default_factory=BasicConfig, description="BaSiC correction configuration"
+    deconvolution: DeconvolutionConfig | None = Field(
+        default_factory=DeconvolutionConfig,
+        description="3D deconvolution processing configuration",
     )
-    stitching: StitchingConfig = Field(
-        default_factory=StitchingConfig, description="Image stitching and fusion configuration"
+    stitching: StitchingConfig | None = Field(
+        default_factory=StitchingConfig,
+        description="Image stitching and fusion configuration",
     )
-    spot_analysis: SpotAnalysisConfig = Field(
-        default_factory=SpotAnalysisConfig, description="Spot detection and analysis configuration"
+    spot_decode: SpotDecodeConfig | None = Field(
+        default_factory=SpotDecodeConfig, description="Spot decoding parameters"
     )
-    system: SystemConfig = Field(
-        default_factory=SystemConfig, description="System paths and infrastructure configuration"
-    )
-    image_processing: ImageProcessingConfig = Field(
-        default_factory=ImageProcessingConfig, description="Low-level image processing parameters"
-    )
-    spot_threshold: SpotThresholdParams = Field(
+    spot_threshold: SpotThresholdParams | None = Field(
         default_factory=SpotThresholdParams, description="Threshold parameters"
     )
