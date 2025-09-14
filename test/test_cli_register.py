@@ -1,385 +1,196 @@
-"""
-Comprehensive CLI tests for fishtools.preprocess.cli_register (Typer-based)
+from __future__ import annotations
 
-This module tests the Typer-based command line interface for image registration:
-- CLI command parsing and validation
-- Parameter validation and defaults
-- Error handling for missing files and invalid parameters
-- Integration with the actual CLI workflow
-- Mock-based testing to avoid filesystem dependencies
-
-Tests the user-facing CLI that orchestrates the complete registration pipeline.
-"""
-
-import json
-import tempfile
+import sys
+import types
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
 
 import pytest
-import typer
-from typer.testing import CliRunner
+from click.testing import CliRunner
 
-from fishtools.preprocess.cli_register_migrated import app
-
-
-class TestTyperCLICommandParsing:
-    """Test Typer CLI command parsing and parameter validation"""
-
-    def setup_method(self) -> None:
-        """Set up test fixtures"""
-        self.runner = CliRunner()
-
-    def test_register_app_help(self) -> None:
-        """Test register app help command"""
-        result = self.runner.invoke(app, ["--help"])
-
-        assert result.exit_code == 0
-        assert "Register FISH images" in result.stdout
-        assert "PATH" in result.stdout
-        assert "progressive scoping" in result.stdout
-
-    def test_register_command_help(self) -> None:
-        """Test unified register command help"""
-        result = self.runner.invoke(app, ["--help"])
-
-        assert result.exit_code == 0
-        assert "PATH" in result.stdout
-        assert "ROI" in result.stdout
-        assert "IDX" in result.stdout
-        assert "--codebook" in result.stdout
-        assert "--reference" in result.stdout
-        assert "--debug" in result.stdout
-        assert "--threshold" in result.stdout
-        assert "--fwhm" in result.stdout
-        assert "--overwrite" in result.stdout
-        assert "--no-priors" in result.stdout
-
-    def test_register_examples_help(self) -> None:
-        """Test register command includes usage examples"""
-        result = self.runner.invoke(app, ["--help"])
-
-        assert result.exit_code == 0
-        assert "Examples:" in result.stdout
-        assert "All files in all ROIs" in result.stdout
-
-    def test_register_progressive_scoping_help(self) -> None:
-        """Test register command shows progressive scoping pattern"""
-        result = self.runner.invoke(app, ["--help"])
-
-        assert result.exit_code == 0
-        assert "register /workspace" in result.stdout
-        assert "register /workspace cortex" in result.stdout
-        assert "/workspace cortex 42" in result.stdout
-
-    def test_register_required_arguments(self) -> None:
-        """Test register command with missing required arguments"""
-        # Missing PATH argument
-        result = self.runner.invoke(app, [])
-        assert result.exit_code != 0
-        assert "Missing argument" in result.stdout
-        
-        # PATH argument alone should be valid (processes all files)
-        with tempfile.TemporaryDirectory() as temp_dir:
-            result = self.runner.invoke(app, [temp_dir])
-            # Should succeed with path alone, but fail due to no files found
-            assert "No files found" in result.stdout or result.exit_code != 0
-
-    def test_register_progressive_scoping_behavior(self) -> None:
-        """Test register command progressive scoping behavior"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # In progressive scoping, path 42 means roi=42, idx=None
-            result = self.runner.invoke(app, [temp_dir, "42"])  # This means roi="42", idx=None
-            assert result.exit_code == 0  # Should succeed but find no files
-            assert "No files found" in result.stdout
-
-    def test_register_nonexistent_path(self) -> None:
-        """Test path validation for non-existent directories"""
-        result = self.runner.invoke(app, ["/nonexistent/path"])
-        
-        assert result.exit_code != 0
-        # Typer's validation should catch this
-        assert "not found" in result.stdout or "Invalid value" in result.stdout
-
-    def test_register_invalid_idx_type(self) -> None:
-        """Test IDX parameter type validation"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Non-integer IDX should fail
-            result = self.runner.invoke(app, [temp_dir, "cortex", "not_an_integer"])
-
-            assert result.exit_code != 0
-            assert "Invalid value" in result.stdout or "is not a valid integer" in result.stdout
-
-    def test_register_nonexistent_codebook(self) -> None:
-        """Test codebook file validation"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Non-existent codebook file should fail
-            result = self.runner.invoke(
-                app, [temp_dir, "--codebook", "/nonexistent/codebook.json"]
-            )
-
-            assert result.exit_code != 0
-            assert "not found" in result.stdout or "Invalid value" in result.stdout
-
-    def test_threshold_parameter_validation(self) -> None:
-        """Test threshold parameter type validation"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            codebook = Path(temp_dir) / "codebook.json"
-            codebook.write_text("{}")
-            
-            # Test invalid string threshold
-            result = self.runner.invoke(app, [temp_dir, "--codebook", str(codebook), "--threshold", "not_a_float"])
-            assert result.exit_code != 0
-            assert "Invalid value" in result.stdout
-
-            # Test valid float values (should succeed - no range constraints)
-            result = self.runner.invoke(app, [temp_dir, "--codebook", str(codebook), "--threshold", "0.05"])
-            assert result.exit_code == 0  # Should succeed (just find no files)
-            assert "No files found" in result.stdout
-
-            result = self.runner.invoke(app, [temp_dir, "--codebook", str(codebook), "--threshold", "25.0"])
-            assert result.exit_code == 0  # Should succeed (just find no files)
-            assert "No files found" in result.stdout
-
-    def test_fwhm_parameter_validation(self) -> None:
-        """Test FWHM parameter type validation"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            codebook = Path(temp_dir) / "codebook.json"
-            codebook.write_text("{}")
-            
-            # Test invalid string FWHM
-            result = self.runner.invoke(app, [temp_dir, "--codebook", str(codebook), "--fwhm", "not_a_float"])
-            assert result.exit_code != 0
-            assert "Invalid value" in result.stdout
-
-            # Test valid float values (should succeed - no range constraints)
-            result = self.runner.invoke(app, [temp_dir, "--codebook", str(codebook), "--fwhm", "0.1"])
-            assert result.exit_code == 0  # Should succeed (just find no files)
-            assert "No files found" in result.stdout
-
-            result = self.runner.invoke(app, [temp_dir, "--codebook", str(codebook), "--fwhm", "25.0"])
-            assert result.exit_code == 0  # Should succeed (just find no files)
-            assert "No files found" in result.stdout
+from fishtools.preprocess.cli_register import register as register_cli
 
 
-class TestTyperCLIIntegration:
-    """Integration tests for Typer CLI with mocked dependencies"""
-
-    def setup_method(self) -> None:
-        """Set up test fixtures"""
-        self.runner = CliRunner()
-
-    @pytest.fixture
-    def mock_workspace(self, tmp_path: Path) -> Path:
-        """Create mock workspace structure"""
-        workspace = tmp_path / "test_workspace"
-        workspace.mkdir()
-
-        # Create mock ROI directories
-        (workspace / "data--roi1").mkdir()
-        (workspace / "data--roi2").mkdir()
-
-        # Create mock codebook
-        codebook = workspace / "codebook.json"
-        codebook.write_text(
-            json.dumps({"1": {"gene": "gene1", "ch": "488"}, "2": {"gene": "gene2", "ch": "560"}})
-        )
-
-        return workspace
-
-    @patch("fishtools.preprocess.cli_register_migrated.scan_workspace_once")
-    @patch("fishtools.preprocess.cli_register_migrated._run")
-    def test_register_single_file_execution(
-        self, mock_run: Mock, mock_scan: Mock, mock_workspace: Path
-    ) -> None:
-        """Test successful CLI execution with single file (path roi idx)"""
-        codebook_path = mock_workspace / "codebook.json"
-        
-        # Mock scan_workspace_once to return available files
-        mock_scan.return_value = {"cortex": [42, 43, 44]}
-
-        result = self.runner.invoke(
-            app,
-            [
-                str(mock_workspace),
-                "cortex",
-                "42",
-                "--codebook",
-                str(codebook_path),
-                "--reference",
-                "test_ref",
-                "--threshold",
-                "5.0",
-                "--fwhm",
-                "4.0",
-            ],
-        )
-
-        # Should execute successfully
-        assert result.exit_code == 0
-
-        # Verify _run was called with correct parameters
-        mock_run.assert_called_once()
-
-        # Check the call was made with correct arguments
-        call_args = mock_run.call_args
-        assert call_args is not None
-        
-        # Check keyword arguments
-        call_kwargs = call_args[1] if call_args[1] else call_args.kwargs
-        assert call_kwargs["codebook"] == codebook_path
-        assert call_kwargs["reference"] == "test_ref"
-        assert call_kwargs["debug"] == False
-        assert call_kwargs["overwrite"] == False
-        assert call_kwargs["no_priors"] == False
-
-    @patch("fishtools.preprocess.cli_register_migrated.scan_workspace_once")
-    @patch("fishtools.preprocess.cli_register_migrated.process_files")
-    def test_register_all_files_execution(self, mock_process: Mock, mock_scan: Mock, mock_workspace: Path) -> None:
-        """Test CLI execution for all files (path only)"""
-        codebook_path = mock_workspace / "codebook.json"
-        
-        # Mock scan_workspace_once to return available files
-        mock_scan.return_value = {"cortex": [42, 43], "striatum": [44, 45]}
-
-        result = self.runner.invoke(
-            app,
-            [
-                str(mock_workspace),
-                "--codebook",
-                str(codebook_path),
-                "--reference",
-                "custom_ref",
-                "--debug",
-                "--threshold",
-                "7.5",
-                "--fwhm",
-                "3.5",
-                "--overwrite",
-                "--no-priors",
-            ],
-        )
-
-        assert result.exit_code == 0
-
-        # process_files should be called once with all target files
-        mock_process.assert_called_once()
-        
-        # Verify the target files passed to process_files
-        call_args = mock_process.call_args
-        target_files = call_args[0][1]  # Second positional argument
-        
-        # Should process all 4 files from both ROIs
-        assert len(target_files) == 4
-        assert ("cortex", 42) in target_files
-        assert ("cortex", 43) in target_files
-        assert ("striatum", 44) in target_files
-        assert ("striatum", 45) in target_files
-
-    @patch("fishtools.preprocess.cli_register_migrated.scan_workspace_once")
-    @patch("fishtools.preprocess.cli_register_migrated.process_files")
-    def test_register_execution_error(self, mock_process: Mock, mock_scan: Mock) -> None:
-        """Test CLI handles execution errors gracefully"""
-        # Mock scan to return files, but process_files to raise an error
-        mock_scan.return_value = {"test_roi": [42]}
-        mock_process.side_effect = ValueError("Test execution error")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir)
-            codebook = workspace / "codebook.json"
-            codebook.write_text("{}")
-
-            result = self.runner.invoke(app, [str(workspace), "test_roi", "42", "--codebook", str(codebook)])
-
-            # Should propagate the error
-            assert result.exit_code != 0
-            assert "Test execution error" in str(result.exception) or "failed" in result.stdout.lower()
+def _make_codebook(tmp_path: Path) -> Path:
+    cb = tmp_path / "cb.json"
+    cb.write_text("{}")
+    return cb
 
 
-class TestTyperCLIValidation:
-    """Test error handling and validation in unified register command"""
+def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> None:
+    # Arrange: create minimal workspace and codebook
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cb = _make_codebook(tmp_path)
 
-    def setup_method(self) -> None:
-        """Set up test fixtures"""
-        self.runner = CliRunner()
+    called: dict[str, Any] = {}
 
-    def test_validate_nonexistent_workspace(self) -> None:
-        """Test register command with non-existent workspace"""
-        result = self.runner.invoke(app, ["/nonexistent/path"])
-        
-        assert result.exit_code != 0
-        assert "not found" in result.stdout
+    # Stub heavy internal pipeline to avoid I/O
+    def fake__run(
+        path: Path,
+        roi: str,
+        idx: int,
+        *,
+        codebook: str | Path,
+        reference: str,
+        config,
+        debug: bool,
+        overwrite: bool,
+        no_priors: bool,
+    ) -> None:  # type: ignore[no-untyped-def]
+        called.update({
+            "path": path,
+            "roi": roi,
+            "idx": idx,
+            "codebook": Path(codebook),
+            "reference": reference,
+            "config": config,
+            "debug": debug,
+            "overwrite": overwrite,
+            "no_priors": no_priors,
+        })
 
-    @patch("fishtools.preprocess.cli_register_migrated.scan_workspace_once")
-    def test_validate_basic_workspace(self, mock_scan: Mock) -> None:
-        """Test register command with empty workspace (no files found)"""
-        mock_scan.return_value = {}  # No files found
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir)
-            
-            result = self.runner.invoke(app, [str(workspace)])
-            
-            # Should handle gracefully when no files are found
-            assert result.exit_code == 0
-            assert "No files found" in result.stdout
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
 
-    @patch("fishtools.preprocess.cli_register_migrated.scan_workspace_once")
-    def test_validate_with_codebook(self, mock_scan: Mock) -> None:
-        """Test register command ROI validation"""
-        mock_scan.return_value = {"cortex": [42], "striatum": [43]}
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir)
-            codebook = workspace / "codebook.json"
-            codebook.write_text('{"1": {"gene": "test", "ch": "488"}}')
-            
-            # Test invalid ROI name
-            result = self.runner.invoke(app, [str(workspace), "nonexistent_roi", "--codebook", str(codebook)])
-            
-            assert result.exit_code != 0
-            assert "ROI 'nonexistent_roi' not found" in result.stdout
-            assert "Available ROIs:" in result.stdout
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(ws),
+            "42",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--reference",
+            "4_12_20",
+            "--overwrite",
+        ],
+    )
 
-
-# Fixtures for common test data
-@pytest.fixture
-def mock_codebook_data() -> dict[str, Any]:
-    """Mock codebook data for testing"""
-    return {
-        "1": {"gene": "ACTB", "ch": "488"},
-        "2": {"gene": "GAPDH", "ch": "560"},
-        "3": {"gene": "DAPI", "ch": "405"},
-        "4": {"gene": "PolyT", "ch": "650"},
-    }
-
-
-@pytest.fixture
-def typer_cli_runner() -> CliRunner:
-    """Pytest fixture for Typer CLI runner"""
-    return CliRunner()
-
-
-def test_mock_codebook_fixture(mock_codebook_data: dict[str, Any]) -> None:
-    """Test that mock codebook fixture works correctly"""
-    assert len(mock_codebook_data) == 4
-    assert "1" in mock_codebook_data
-    assert mock_codebook_data["1"]["gene"] == "ACTB"
-    assert mock_codebook_data["1"]["ch"] == "488"
+    assert result.exit_code == 0, result.output
+    # Verify our stub saw the right parameters
+    assert called["path"] == ws
+    assert called["roi"] == "roiA"
+    assert called["idx"] == 42
+    assert called["codebook"] == cb
+    assert called["reference"] == "4_12_20"
+    assert called["overwrite"] is True
+    # Defaults: fwhm=4.0 (from click default), threshold=5.0
+    cfg = called["config"]
+    assert pytest.approx(cfg.registration.fiducial.fwhm, rel=0, abs=1e-6) == 4.0
+    assert pytest.approx(cfg.registration.fiducial.threshold, rel=0, abs=1e-6) == 5.0
+    # Sanity on other core defaults plumbed through
+    assert cfg.registration.crop == 40
+    assert cfg.registration.downsample == 1
 
 
-def test_typer_cli_runner_fixture(typer_cli_runner: CliRunner) -> None:
-    """Test that Typer CLI runner fixture works correctly"""
-    assert isinstance(typer_cli_runner, CliRunner)
-    
-    # Test basic Typer functionality
-    simple_app = typer.Typer()
-    
-    @simple_app.command()
-    def test_cmd():
-        typer.echo("test")
-    
-    result = typer_cli_runner.invoke(simple_app, [])
-    assert result.exit_code == 0
-    assert "test" in result.stdout
+def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) -> None:
+    # Arrange workspace structure expected by batch
+    base = tmp_path / "analysis" / "deconv"
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    # create one input tif path that matches the glob, content not used
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    # Fake Workspace returned by cli_register.Workspace
+    class _WS:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], check: bool):  # type: ignore[no-untyped-def]
+        assert check is True
+        calls.append(argv)
+
+        class _R:  # minimal CompletedProcess-like shim
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.subprocess.run", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--overwrite",
+            "--threads",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Expect one submission for idx 1 in roiA
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[:3] == ["preprocess", "register", "run"]
+    assert str(base) in argv
+    assert f"--codebook={cb}" in argv
+    assert "--reference" in argv  # ref auto-selected
+    # Batch should forward default fwhm/threshold into child command
+    assert any(a.startswith("--fwhm=") and float(a.split("=", 1)[1]) == 4.0 for a in argv)
+    assert any(a.startswith("--threshold=") and float(a.split("=", 1)[1]) == 6.0 for a in argv)
+
+
+def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ensure CLI flags override the config passed to _run."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cb = _make_codebook(tmp_path)
+
+    seen: dict[str, Any] = {}
+
+    def fake__run(
+        path: Path,
+        roi: str,
+        idx: int,
+        *,
+        codebook: str | Path,
+        reference: str,
+        config,
+        debug: bool,
+        overwrite: bool,
+        no_priors: bool,
+    ) -> None:  # type: ignore[no-untyped-def]
+        seen.update({"config": config, "roi": roi, "idx": idx, "reference": reference})
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(ws),
+            "7",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiB",
+            "--reference",
+            "7_15_23",
+            "--threshold",
+            "7.5",
+            "--fwhm",
+            "3.5",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = seen["config"]
+    assert pytest.approx(cfg.registration.fiducial.threshold, rel=0, abs=1e-6) == 7.5
+    assert pytest.approx(cfg.registration.fiducial.fwhm, rel=0, abs=1e-6) == 3.5
+    assert seen["roi"] == "roiB"
+    assert seen["idx"] == 7
+    assert seen["reference"] == "7_15_23"

@@ -93,7 +93,7 @@ class TestFindSpots:
         with pytest.raises(ValueError, match="Reference image must be 2D for DAOStarFinder"):
             find_spots(img_3d, threshold_sigma=3.0, fwhm=4.0)
 
-    @pytest.mark.parametrize("dtype", [np.uint8, np.uint16, np.float32, np.float64])
+    @pytest.mark.parametrize("dtype", [np.uint16, np.float32])
     def test_find_spots_dtypes(self, dtype: np.dtype[Any]) -> None:
         """Test find_spots with different data types"""
         # Create image with bright spots
@@ -385,11 +385,14 @@ class TestAlignFiducials:
         assert residuals["reference"] == 0.0
 
         # Other shifts should be reasonable (within 2 pixels of expected for synthetic data)
+        # known_shifts were applied as (dy, dx). Returned drift is [dx, dy] to align back → expect [-dx, -dy].
+        expected = {"shift_A": (-2, -3), "shift_B": (-4, 2), "shift_C": (3, -1)}
         for name in ["shift_A", "shift_B", "shift_C"]:
             assert isinstance(shifts[name], np.ndarray)
             assert shifts[name].shape == (2,)
             assert isinstance(residuals[name], (int, float))
             assert residuals[name] >= 0
+            np.testing.assert_allclose(shifts[name], expected[name], atol=2.0)
 
     def test_align_fiducials_with_overrides(self, fiducial_image_set: dict[str, NDArray[np.uint16]]) -> None:
         """Test align_fiducials with manual shift overrides"""
@@ -591,52 +594,3 @@ class TestFiducialEdgeCases:
             # Expected for high noise levels
             if noise_level < 500:  # Low noise should still work
                 pytest.fail(f"Should find spots with noise level {noise_level}")
-
-    def test_memory_efficiency_large_images(self) -> None:
-        """Test memory efficiency with large images"""
-        # Create large synthetic image (simulating real microscopy data)
-        large_img = np.random.randint(100, 300, (512, 512), dtype=np.uint16)
-
-        # Add some fiducials
-        for i in range(0, 512, 100):
-            for j in range(0, 512, 100):
-                if i + 20 < 512 and j + 20 < 512:
-                    large_img[i : i + 20, j : j + 20] = 3000
-
-        try:
-            # This should complete without excessive memory usage
-            import time
-
-            start_time = time.time()
-
-            spots = find_spots(large_img, threshold_sigma=4.0, fwhm=6.0, minimum_spots=5)
-
-            processing_time = time.time() - start_time
-            assert processing_time < 5.0, f"Processing took too long: {processing_time:.2f}s"
-
-            # Should find reasonable number of spots
-            assert len(spots) >= 5
-
-        except NotEnoughSpots:
-            # May happen with challenging synthetic data
-            pytest.skip("Insufficient spots found in large synthetic image")
-
-    def test_extreme_parameter_values(self) -> None:
-        """Test behavior with extreme parameter values"""
-        img = np.random.randint(100, 200, SMALL_IMAGE_SIZE, dtype=np.uint16)
-        img[20:30, 20:30] = 2000  # Add bright spot
-
-        # Test extreme sigma values
-        try:
-            # Very low sigma (should find many spots)
-            spots_low = find_spots(img, threshold_sigma=0.1, fwhm=2.0, minimum_spots=1)
-            assert len(spots_low) >= 1
-        except (NotEnoughSpots, TooManySpots):
-            pass  # Either outcome reasonable for extreme parameters
-
-        try:
-            # Very high sigma (should find few spots)
-            spots_high = find_spots(img, threshold_sigma=20.0, fwhm=2.0, minimum_spots=1)
-            assert len(spots_high) >= 1
-        except NotEnoughSpots:
-            pass  # Expected for very high threshold

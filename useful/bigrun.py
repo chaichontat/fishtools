@@ -111,9 +111,19 @@ def register(ws: Workspace, codebook: Path, threads: int):
 
 
 @flow(name="Spots optimize: {ws.path.name}")
-def optimize(ws: Workspace, codebook: Path, threads: int, *, rounds: int = 6, blank: str | None = None):
+def optimize(
+    ws: Workspace,
+    codebook: Path,
+    threads: int,
+    *,
+    rounds: int = 6,
+    blank: str | None = None,
+    json_config: Path | None = None,
+):
     execute_script(
-        f"preprocess spots optimize . --codebook={codebook} --rounds={rounds} --threads={threads} {f'--blank={blank}' if blank else ''}"
+        f"preprocess spots optimize . --codebook={codebook} --rounds={rounds} --threads={threads} "
+        + (f"--blank={blank} " if blank else "")
+        + (f"--config={json_config} " if json_config else "")
     )
 
 
@@ -122,22 +132,31 @@ def pathname(ws: Workspace):
 
 
 @flow(name="Spots calling: {ws.path.name}")
-def call_spots(ws: Workspace, codebook: Path, threads: int, blank: str | None = None):
+def call_spots(
+    ws: Workspace, codebook: Path, threads: int, blank: str | None = None, json_config: Path | None = None
+):
     execute_script(
-        f"preprocess spots batch . --codebook={codebook} --threads={threads} --split {f'--blank={blank}' if blank else ''}"
+        f"preprocess spots batch . --codebook={codebook} --threads={threads} --split "
+        + (f"--blank={blank} " if blank else "")
+        + (f"--config={json_config} " if json_config else "")
     )
-    execute_script(f"preprocess spots stitch . --codebook={codebook} --threads={threads}")
+    execute_script(
+        f"preprocess spots stitch . --codebook={codebook} --threads={threads}"
+        + (f" --config={json_config}" if json_config else "")
+    )
 
 
 @flow(name="Spots workflow: {path.resolve()}")
-def main_workflow(path: Path, codebook: Path, threads: int, blank: str | None = None):
+def main_workflow(
+    path: Path, codebook: Path, threads: int, blank: str | None = None, json_config: Path | None = None
+):
     ws = Workspace(path)
     # deconv(ws)
     with setwd(ws.deconved):
         register(ws, codebook, threads)
-        stitch_register(ws, ws.rois, threads)
-        optimize(ws, codebook, threads, blank=blank, rounds=8)
-        call_spots(ws, codebook, threads, blank=blank)
+        stitch_register(ws, ws.rois, threads, json_config=json_config)
+        optimize(ws, codebook, threads, blank=blank, rounds=8, json_config=json_config)
+        call_spots(ws, codebook, threads, blank=blank, json_config=json_config)
 
 
 @click.group()
@@ -153,19 +172,37 @@ def cli(): ...
 )
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
 @click.option("--blank", type=str, default=None, help="Blank image to subtract")
-def spots(path: Path, codebook: Path, threads: int, blank: str | None = None):
-    main_workflow(path, codebook, threads, blank=blank)
+@click.option(
+    "--config",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional project config to populate stitching/decoding defaults.",
+)
+def spots(path: Path, codebook: Path, threads: int, blank: str | None = None, config: Path | None = None):
+    main_workflow(path, codebook, threads, blank=blank, json_config=config)
 
 
 @flow
-def stitch_register(ws: Workspace, rois: list[str], threads: int, overwrite: bool = False):
+def stitch_register(
+    ws: Workspace, rois: list[str], threads: int, overwrite: bool = False, json_config: Path | None = None
+):
     tileconfigs = [ws.stitch(roi) / "TileConfiguration.registered.txt" for roi in rois]
     if not all(Path(p).exists() for p in tileconfigs):
-        execute_script('preprocess stitch register . "*" --idx=0 --max-proj', overwrite=overwrite)
+        cmd = 'preprocess stitch register . "*" --idx=0 --max-proj'
+        if json_config:
+            cmd += f" --config={json_config}"
+        execute_script(cmd, overwrite=overwrite)
 
 
 @flow
-def stitch_fuse(ws: Workspace, rois: list[str], codebook: str, threads: int, overwrite: bool = False):
+def stitch_fuse(
+    ws: Workspace,
+    rois: list[str],
+    codebook: str,
+    threads: int,
+    overwrite: bool = False,
+    json_config: Path | None = None,
+):
     logger = get_run_logger()
     for roi in rois:
         path = ws.stitch(roi, codebook)
@@ -179,10 +216,10 @@ def stitch_fuse(ws: Workspace, rois: list[str], codebook: str, threads: int, ove
             logger.info(f"{roi} already fused.")
 
         if overwrite or not done:
-            execute_script(
-                f"preprocess stitch fuse . {roi} --codebook={codebook}",
-                overwrite=overwrite,
-            )
+            cmd = f"preprocess stitch fuse . {roi} --codebook={codebook}"
+            if json_config:
+                cmd += f" --config={json_config}"
+            execute_script(cmd, overwrite=overwrite)
             execute_script(f"preprocess stitch combine . {roi} --codebook={codebook}", overwrite=overwrite)
 
         if not (path / "fused.zarr").exists():
