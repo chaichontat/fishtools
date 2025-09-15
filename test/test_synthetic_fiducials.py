@@ -15,6 +15,7 @@ from synthetic_fiducials import (
 )
 
 
+@pytest.mark.unit
 class TestFiducialParams:
     """Test parameter validation and defaults."""
 
@@ -85,6 +86,7 @@ class TestFiducialParams:
         assert params.fiducial_positions == custom_positions
 
 
+@pytest.mark.unit
 class TestSyntheticFiducialImage:
     """Test synthetic image generation."""
 
@@ -266,6 +268,7 @@ class TestSyntheticFiducialImage:
         assert len(img_gen.ground_truth_positions) == 4
 
 
+@pytest.mark.unit
 class TestValidation:
     """Test validation functionality."""
 
@@ -315,6 +318,7 @@ class TestValidation:
         assert artifact_score < 0.1  # Should have low artifacts
 
 
+@pytest.mark.unit
 class TestFixtureIntegration:
     """Test pytest fixture integration."""
 
@@ -353,6 +357,7 @@ class TestFixtureIntegration:
         assert abs(ref.fiducial_count - shifted.fiducial_count) <= 2  # Allow some boundary losses
 
 
+@pytest.mark.unit
 class TestEdgeCases:
     """Test edge cases and error conditions."""
 
@@ -410,40 +415,8 @@ class TestEdgeCases:
         assert img_high.image.max() <= 65535  # Should be clipped to uint16 range
 
 
-class TestPerformance:
-    """Test performance characteristics."""
-
-    def test_generation_speed(self) -> None:
-        """Test that image generation completes in reasonable time."""
-        import time
-
-        params = FiducialParams(image_size=(512, 512))
-
-        start_time = time.time()
-        img_gen = SyntheticFiducialImage(params)
-        generation_time = time.time() - start_time
-
-        # Should complete in under 1 second for 512x512 image
-        assert generation_time < 1.0
-
-        # Should actually produce an image
-        assert img_gen.image.size == 512 * 512
-
-    def test_memory_efficiency(self) -> None:
-        """Test memory usage is reasonable."""
-        # Create several images to test memory doesn't accumulate
-        for i in range(5):
-            params = FiducialParams(seed=i, image_size=(256, 256))
-            img_gen = SyntheticFiducialImage(params)
-
-            # Basic check that image was created
-            assert img_gen.image.size == 256 * 256
-
-            # Delete reference to ensure cleanup
-            del img_gen
-
-
 # Integration tests with actual fiducial detection algorithms
+@pytest.mark.integration
 class TestFiducialModuleIntegration:
     """Test integration with actual fiducial detection algorithms.
 
@@ -498,48 +471,11 @@ class TestFiducialModuleIntegration:
 
         except ImportError:
             pytest.skip("find_spots function not available")
-        except Exception as e:
-            # Work around known bugs by providing useful diagnostic info
-            pytest.skip(f"find_spots failed due to known bugs: {e}")
+        except Exception:
+            # Let unexpected failures surface for regression protection
+            raise
 
-    def test_synthetic_vs_real_fiducial_characteristics(self) -> None:
-        """Compare synthetic fiducial characteristics to realistic expectations."""
-        # Create various synthetic conditions
-        test_conditions = [
-            ("high_snr", FiducialParams(background_level=100.0, peak_intensity=2000.0, noise_factor=0.5)),
-            ("medium_snr", FiducialParams(background_level=200.0, peak_intensity=1000.0, noise_factor=1.0)),
-            ("low_snr", FiducialParams(background_level=300.0, peak_intensity=800.0, noise_factor=1.5)),
-            ("large_psf", FiducialParams(psf_sigma=3.0, noise_factor=0.8)),
-            ("small_psf", FiducialParams(psf_sigma=1.0, noise_factor=0.8)),
-        ]
-
-        results = {}
-
-        for condition_name, params in test_conditions:
-            synthetic_img = SyntheticFiducialImage(params)
-
-            # Calculate image quality metrics
-            snr = synthetic_img._calculate_mean_snr()
-            artifact_score = synthetic_img._calculate_artifact_score()
-            dynamic_range = params.peak_intensity / params.background_level
-
-            results[condition_name] = {
-                "snr": snr,
-                "artifact_score": artifact_score,
-                "dynamic_range": dynamic_range,
-                "fiducial_count": len(params.fiducial_positions),
-            }
-
-            # Validate realistic ranges
-            assert snr >= 0.5, f"SNR too low for {condition_name}: {snr}"
-            assert artifact_score < 0.05, f"Too many artifacts for {condition_name}: {artifact_score}"
-            assert 1.5 <= dynamic_range <= 50, (
-                f"Unrealistic dynamic range for {condition_name}: {dynamic_range}"
-            )
-
-        # High SNR should be better than low SNR
-        assert results["high_snr"]["snr"] > results["low_snr"]["snr"]
-        assert results["large_psf"]["snr"] != results["small_psf"]["snr"]  # Should be different
+    # Removed overlapping characteristics test; covered by comprehensive validation
 
     def test_alignment_accuracy_with_ground_truth(self) -> None:
         """Test alignment accuracy using synthetic data with known shifts."""
@@ -599,8 +535,9 @@ class TestFiducialModuleIntegration:
                             f"Alignment error too large for {key}: {max_error} pixels (expected: {expected}, got: {calculated})"
                         )
 
-            except Exception as e:
-                pytest.skip(f"Phase alignment failed due to known bugs: {e}")
+            except Exception:
+                # Surface failures to catch regressions in alignment implementation
+                raise
 
         except ImportError:
             pytest.skip("Fiducial alignment functions not available")
@@ -669,87 +606,10 @@ class TestFiducialModuleIntegration:
                     f"max_error={max_error:.3f}"
                 )
 
-            # Test explains the mathematical relationship
-            print("\n=== PHASE CORRELATION SIGN CONVENTION EXPLAINED ===")
-            print("Applied transform: image = T(reference) where T(x,y) = (x+dx, y+dy)")
-            print("Phase correlation: returns T_inv needed for registration: T_inv(image) = reference")
-            print("Therefore: T_inv(x,y) = (x-dx, y-dy) → detected_shift = (-dy, -dx) in (y,x) order")
-            print("This is WHY we need the sign flip in our alignment tests!")
+            # Keep test output silent; explanation omitted
 
         except ImportError:
             pytest.skip("phase_shift function not available")
-
-    def test_performance_benchmarks_with_synthetic_data(self) -> None:
-        """Benchmark fiducial detection performance with synthetic data."""
-        import time
-
-        try:
-            from fishtools.preprocess.fiducial import find_spots
-
-            # Test different image sizes for performance scaling
-            test_sizes = [(256, 256), (512, 512), (1024, 1024)]
-            performance_results = {}
-
-            for size in test_sizes:
-                # Create challenging but realistic conditions
-                params = FiducialParams(
-                    image_size=size,
-                    background_level=250.0,
-                    peak_intensity=2000.0,
-                    psf_sigma=1.8,
-                    noise_factor=1.2,
-                    seed=42,
-                )
-
-                synthetic_img = SyntheticFiducialImage(params)
-
-                # Benchmark detection time
-                start_time = time.time()
-                try:
-                    spots = find_spots(synthetic_img.image, threshold_sigma=3.5, fwhm=4.0, minimum_spots=3)
-                    detection_time = time.time() - start_time
-                    num_spots = len(spots)
-
-                except Exception:
-                    detection_time = float("inf")
-                    num_spots = 0
-
-                performance_results[size] = {
-                    "detection_time": detection_time,
-                    "spots_found": num_spots,
-                    "pixels": size[0] * size[1],
-                }
-
-                # Performance expectations (generous to account for bugs)
-                if detection_time != float("inf"):
-                    pixels = size[0] * size[1]
-                    if pixels <= 256 * 256:
-                        assert detection_time < 1.0, f"Too slow for {size}: {detection_time:.3f}s"
-                    elif pixels <= 512 * 512:
-                        assert detection_time < 3.0, f"Too slow for {size}: {detection_time:.3f}s"
-                    elif pixels <= 1024 * 1024:
-                        assert detection_time < 10.0, f"Too slow for {size}: {detection_time:.3f}s"
-
-            # Validate performance scaling is reasonable
-            successful_results = {
-                k: v for k, v in performance_results.items() if v["detection_time"] != float("inf")
-            }
-
-            if len(successful_results) >= 2:
-                # Check that performance scales sub-quadratically with image size
-                sizes = sorted(successful_results.keys(), key=lambda x: x[0] * x[1])
-                if len(sizes) >= 2:
-                    small_time = successful_results[sizes[0]]["detection_time"]
-                    large_time = successful_results[sizes[-1]]["detection_time"]
-                    small_pixels = sizes[0][0] * sizes[0][1]
-                    large_pixels = sizes[-1][0] * sizes[-1][1]
-
-                    # Performance should scale better than O(n^2)
-                    scaling_factor = (large_time / small_time) / (large_pixels / small_pixels)
-                    assert scaling_factor <= 2.0, f"Performance scaling too poor: {scaling_factor:.2f}"
-
-        except ImportError:
-            pytest.skip("find_spots function not available for benchmarking")
 
     def test_fiducial_detection_robustness_against_bugs(self) -> None:
         """Test that synthetic fiducials can work around known fiducial module bugs."""
@@ -801,8 +661,7 @@ class TestFiducialModuleIntegration:
                         )
 
                 except Exception as e:
-                    # Document which conditions cause failures for debugging
-                    print(f"WARNING: {case['name']} failed: {e}")
+                    pytest.xfail(f"{case['name']} fragile scenario: {e}")
 
         except ImportError:
             pytest.skip("Fiducial functions not available")

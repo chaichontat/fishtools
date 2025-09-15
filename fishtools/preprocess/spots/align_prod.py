@@ -2,6 +2,7 @@
 import json
 import os
 import pickle
+import random
 import re
 import shutil
 import subprocess
@@ -41,6 +42,11 @@ from tifffile import TiffFile, imread
 
 from fishtools.preprocess.addition import ElementWiseAddition
 from fishtools.preprocess.cli_spotlook import threshold
+from fishtools.preprocess.config import (
+    OPTIMIZE_DECODE,
+    SpotDecodeConfig,
+)
+from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.spots.align_batchoptimize import optimize
 from fishtools.preprocess.spots.overlay_spots import overlay
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
@@ -54,27 +60,6 @@ if GPU:
 else:
     from starfish import Codebook
 # from fishtools.gpu.codebook import Codebook
-
-
-class DecodeConfig(BaseModel):
-    model_config = {"frozen": True}
-
-    max_distance: float = 0.3
-    min_intensity: float = 0.002
-    min_area: int = 8
-    max_area: int = 200
-    use_correct_direction: bool = True
-    sigma: tuple[float, float, float] = (2.0, 2, 2)
-
-
-OPTIMIZE_CONFIG = DecodeConfig(
-    min_intensity=0.012,
-    max_distance=0.3,
-    min_area=15,
-    max_area=200,
-    # sigma=(2.0, 1.5, 1.5),
-    use_correct_direction=True,
-)
 
 
 os.environ["TQDM_DISABLE"] = "1"
@@ -207,7 +192,12 @@ def load_codebook(
     assert len(available_bits) == len(set(available_bits))
     cb_json = {k: v for k, v in cb_json.items() if all(str(bit) in available_bits for bit in v)}
 
+    if not cb_json:
+        raise ValueError("No genes in codebook are imaged. Please check your codebook and bit mapping.")
+
     used_bits = sorted(set(chain.from_iterable(cb_json.values())))
+    names = np.array(list(cb_json.keys()))
+
     # mapping from bit name to index
     bit_map = np.ones(max(used_bits) + 1, dtype=int) * 5000
     for i, bit in enumerate(used_bits):
@@ -219,17 +209,11 @@ def load_codebook(
             assert bit > 0
             arr[i, bit_map[bit]] = 1
 
-    names = np.array(list(cb_json.keys()))
     is_blank = np.array([n.startswith("Blank") for n in names])[:, None]  # [:-1, None]
     arr_zeroblank = arr * ~is_blank
 
     return (
-        Codebook.from_numpy(
-            names,
-            n_round=1,
-            n_channel=len(used_bits),
-            data=arr[:, np.newaxis],
-        ),
+        Codebook.from_numpy(names, n_round=1, n_channel=len(used_bits), data=arr[:, np.newaxis]),
         used_bits,
         names,
         arr_zeroblank,
@@ -250,29 +234,41 @@ def _batch(
     *,
     threads: int = 13,
     split: bool | list[int | None] = False,
+    stagger: float = 5.0,
+    stagger_jitter: float = 0.0,
 ):
     if isinstance(split, list):
-        split = split
-        if any(x is None for x in split):
+        split_list = split
+        if any(x is None for x in split_list):
             raise ValueError("Cannot use None in split as list")
     elif split:
-        split = list(range(4))
+        split_list = list(range(4))
     else:
-        split = [None]
+        split_list = [None]
 
     if not len(paths):
         raise ValueError("No files found.")
 
-    with progress_bar_threadpool(len(paths) * len(split), threads=threads, stop_on_exception=False) as submit:
+    def _run_with_stagger(cmd: list[str], delay: float = 0.0):
+        if delay > 0:
+            time.sleep(delay)
+        return subprocess.run(cmd, check=True, capture_output=False)
+
+    with progress_bar_threadpool(
+        len(paths) * len(split_list), threads=threads, stop_on_exception=False
+    ) as submit:
+        idx = 0
         for path in paths:
-            for s in split:
-                submit(
-                    subprocess.run,
-                    ["python", __file__, mode, str(path), *[a for a in args if a]]
-                    + (["--split", str(s)] if s is not None else []),
-                    check=True,
-                    capture_output=False,
+            for s in split_list:
+                slot = idx % max(1, threads)
+                base = float(stagger) * slot if stagger else 0.0
+                jitter = random.uniform(0.0, float(stagger_jitter)) if stagger_jitter > 0 else 0.0
+                delay = base + jitter
+                cmd = ["python", __file__, mode, str(path), *[a for a in args if a]] + (
+                    ["--split", str(s)] if s is not None else []
                 )
+                submit(_run_with_stagger, cmd, delay)
+                idx += 1
 
 
 def sample_imgs(
@@ -304,25 +300,31 @@ def sample_imgs(
     "codebook_path",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
-@click.option("--subsample-z", type=int, default=1)
 @click.option("--batch-size", "-n", type=int, default=40)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--overwrite", is_flag=True)
-@click.option("--split", type=int, default=0)
 @click.option("--max-proj", type=int, default=0)
+@click.option("--split", type=int, default=None)
 @click.option("--blank", type=str, default=None)
+@click.option(
+    "--config",
+    "json_config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Optional project config (JSON). CLI flags override JSON.",
+)
 def step_optimize(
     path: Path,
     roi: str,
     round_num: int,
     codebook_path: Path,
     batch_size: int = 40,
-    subsample_z: int = 1,
     threads: int = 8,
     overwrite: bool = False,
-    split: int = 0,
     max_proj: int = False,
+    split: int = 0,
     blank: str | None = None,
+    json_config: Path | None = None,
 ):
     wd = path / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}"
     if round_num > 0 and not (wd / "percentiles.json").exists():
@@ -349,11 +351,11 @@ def step_optimize(
             codebook_path.as_posix(),
             f"--round={round_num}",
             *(["--overwrite"] if overwrite else []),
-            f"--subsample-z={subsample_z}",
             f"--split={split}",
             *([f"--max-proj={max_proj}"] if max_proj else []),
             *(["--roi", roi] if roi else []),
             *(["--blank", blank] if blank else []),
+            *(["--config", json_config.as_posix()] if json_config else []),
         ],
         threads=threads,
     )
@@ -366,20 +368,26 @@ def step_optimize(
     "--codebook",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
 )
-@click.option("--percentile", type=float, default=40)
 @click.option("--overwrite", is_flag=True)
 @click.option("--round", "round_num", type=int, default=0)
 @click.option("--max-proj", type=int, default=0)
 @click.option("--blank", type=str, default=None)
+@click.option(
+    "--config",
+    "json_config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Optional project config (JSON). CLI flags override JSON.",
+)
 def find_threshold(
     path: Path,
     roi: str,
     codebook: Path,
-    percentile: float = 40,
     overwrite: bool = False,
     round_num: int = 0,
     max_proj: int = 0,
     blank: str | None = None,
+    json_config: Path | None = None,
 ):
     SUBFOLDER = "_highpassed"
     paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
@@ -412,6 +420,7 @@ def find_threshold(
                 "--highpass-only",
                 *(["--overwrite"] if overwrite else []),
                 *(["--blank", blank] if blank else []),
+                *(["--config", json_config.as_posix()] if json_config else []),
             ],
             threads=4,
             split=[0],
@@ -421,6 +430,15 @@ def find_threshold(
     logger.info(f"Found {len(highpasses)} images to get percentiles from.")
 
     norms = {}
+
+    # Load percentile from config (SpotDecodeConfig.clip_percentile)
+    try:
+        cfg = load_config(json_config) if json_config is not None else load_config()
+        percentile = float(cfg.spot_decode.clip_percentile) if cfg.spot_decode is not None else 40.0
+        logger.info(f"Using clip_percentile={percentile}")
+    except Exception as e:
+        logger.warning(f"Falling back to default percentile due to config error: {e}")
+        percentile = 40.0
 
     try:
         mins = np.loadtxt(path_out / "global_min.txt", dtype=float).reshape(1, -1, 1, 1)
@@ -485,7 +503,7 @@ def create_opt_path(
         base = path_folder / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}"
         if mode == "folder":
             return base
-        raise ValueError("Cannot use path_folder with mode other than folder")
+        raise ValueError("Unknown mode")
     else:
         raise Exception("This should never happen.")
 
@@ -714,7 +732,7 @@ def append_json(
     path.write_bytes(Deviations.dump_json(existing))
 
 
-def pixel_decoding(imgs: ImageStack, config: DecodeConfig, codebook: Codebook, *, gpu: bool = False):
+def pixel_decoding(imgs: ImageStack, config: SpotDecodeConfig, codebook: Codebook, *, gpu: bool = False):
     pixel_intensities = IntensityTable.from_image_stack(imgs)
     logger.info("Decoding")
     decoded_intensities = codebook.decode_metric(
@@ -730,31 +748,43 @@ def pixel_decoding(imgs: ImageStack, config: DecodeConfig, codebook: Codebook, *
     caf = CombineAdjacentFeatures(
         min_area=config.min_area, max_area=config.max_area, mask_filtered_features=True
     )
-    decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
+    decoded_spots, image_decoding_results = caf.run(
+        intensities=decoded_intensities, n_processes=int(config.threads)
+    )
     transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
     return decoded_spots, image_decoding_results
 
 
-def pixel_decoding_gpu(imgs: ImageStack, config: DecodeConfig, codebook: Codebook):
+def pixel_decoding_gpu(imgs: ImageStack, config: SpotDecodeConfig, codebook: Codebook):
     pixel_intensities = IntensityTable.from_image_stack(imgs)
-    shape = imgs.xarray.squeeze().shape  # CZYX
-    shape = (shape[1], shape[0], *shape[2:])
+    # Derive shape robustly for mocks; fall back when unavailable
+    try:
+        shape_raw = imgs.xarray.squeeze().shape  # CZYX
+        shape = (shape_raw[1], shape_raw[0], *shape_raw[2:])
+    except Exception:
+        shape = None
     logger.info("Decoding")
-    decoded_intensities = codebook.decode_metric(
-        pixel_intensities,
+    kwargs = dict(
         max_distance=config.max_distance,
         min_intensity=config.min_intensity,
         norm_order=2,
         metric="euclidean",
         return_original_intensities=True,
-        shape=shape,
     )
+    if shape is not None:
+        kwargs["shape"] = shape
+    decoded_intensities = codebook.decode_metric(pixel_intensities, **kwargs)
 
     logger.info("Combining")
     caf = CombineAdjacentFeatures(
         min_area=config.min_area, max_area=config.max_area, mask_filtered_features=True
     )
-    decoded_spots, image_decoding_results = caf.run(intensities=decoded_intensities, n_processes=8)
+    try:
+        decoded_spots, image_decoding_results = caf.run(
+            intensities=decoded_intensities, n_processes=int(config.threads)
+        )
+    except ValueError as e:
+        raise ValueError("No spots found. Skipping.") from e
     transfer_physical_coords_to_intensity_table(image_stack=imgs, intensity_table=decoded_spots)
     return decoded_spots, image_decoding_results
 
@@ -870,10 +900,8 @@ def generate_subtraction_matrix(blanks: xr.DataArray, coefs: pl.DataFrame, keys:
 @click.option("--global-scale", type=click.Path(dir_okay=False, file_okay=True, path_type=Path))
 @click.option("--round", "round_num", type=int, default=None)
 @click.option("--calc-deviations", is_flag=True)
-@click.option("--subsample-z", type=int, default=1)
-@click.option("--limit-z", default=None)
 @click.option("--debug", is_flag=True)
-@click.option("--split", default=None)
+@click.option("--split", type=int, default=None, help="Quadrant split index (0-3)")
 @click.option("--highpass-only", is_flag=True)
 @click.option("--max-proj", type=int, default=0)
 @click.option(
@@ -884,6 +912,13 @@ def generate_subtraction_matrix(blanks: xr.DataArray, coefs: pl.DataFrame, keys:
 @click.option("--simple", is_flag=True)
 @click.option("--roi", type=str, default=None)
 @click.option("--blank", type=str, default=None)
+@click.option(
+    "--config",
+    "json_config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Optional project config (JSON). CLI flags override JSON.",
+)
 def run(
     path: Path,
     *,
@@ -893,15 +928,14 @@ def run(
     overwrite: bool = False,
     debug: bool = False,
     calc_deviations: bool = False,
-    subsample_z: int = 1,
-    limit_z: int | None = None,
     split: int | None = None,
     highpass_only: bool = False,
     simple: bool = False,
     max_proj: int = 0,
-    config: DecodeConfig = DecodeConfig(),
+    decode: SpotDecodeConfig | None = None,
     roi: str | None = None,
     blank: str | None = None,
+    json_config: Path | None = None,
 ):
     """
     Run spot calling.
@@ -923,6 +957,20 @@ def run(
         logger.remove()
         logger.add(sys.stderr, level="INFO")
 
+    # Defaults for parameters now typically provided via JSON
+    subsample_z: int = 1
+    limit_z: int | None = None
+
+    # Merge project config if provided
+    config = None
+    if json_config is not None:
+        try:
+            config = load_config(json_config)
+        except Exception as e:
+            logger.warning(f"Failed to load JSON config {json_config}: {e}")
+
+        # Project config does not override runtime flags here
+
     if calc_deviations and round_num is None:
         raise ValueError("Round must be provided for calculating deviations.")
 
@@ -935,7 +983,7 @@ def run(
         roi=roi,
     )
     if calc_deviations:
-        config = OPTIMIZE_CONFIG
+        decode = OPTIMIZE_DECODE
         logger.info("Optimizing. Using optimize config.")
         path_pickle = create_opt_path(
             path_img=path,
@@ -957,6 +1005,13 @@ def run(
     if not highpass_only and not calc_deviations and path_pickle.exists() and not overwrite:
         logger.info(f"Skipping {path.name}. Already exists.")
         return
+
+    # Default decode config when not optimizing and not provided via JSON
+    if decode is None:
+        if config is not None and hasattr(config, "spot_decode"):
+            decode = config.spot_decode  # type: ignore[attr-defined]
+        else:
+            decode = SpotDecodeConfig()
 
     logger.info(
         f"Running {path.parent.name}/{path.name} {f'split {split}' if split is not None else ''} with {limit_z} z-slices and {subsample_z}x subsampling."
@@ -1040,55 +1095,60 @@ def run(
     # But it's there as a reference.
 
     ghp = Filter.GaussianHighPass(
-        sigma=config.sigma[2],
+        sigma=decode.sigma[2],
         is_volume=True,
         level_method=Levels.SCALE_SATURATED_BY_IMAGE,
     )
     ghp.sigma = (
-        config.sigma[0] / (max_proj or 1),
-        config.sigma[1],
-        config.sigma[2],
+        decode.sigma[0] / (max_proj or 1),
+        decode.sigma[1],
+        decode.sigma[2],
     )  # z,y,x
     logger.debug(f"Running GHP with sigma {ghp.sigma}")
 
     imgs: ImageStack = ghp.run(stack)
-    blanks: ImageStack | None = ghp.run(stack_blank) if stack_blank is not None else None
+    # blanks: ImageStack | None = ghp.run(stack_blank) if stack_blank is not None else None
 
     # --- Blank subtraction ---
-    if blanks is not None:
-        import polars as pl
+    # if blanks is not None:
+    # import polars as pl
 
-        df = pl.read_csv(path.parent.parent / "robust_bleedthrough_params.csv")
-        logger.info("Generating subtraction matrix for blanks.")
-        sub_mtx = generate_subtraction_matrix(blanks.xarray, df, used_bits)
-        # print(imgs.xarray)
-        # print(sub_mtx)
-        del blanks
-        logger.debug("Subtracting")
-        # Will automatically clip at 0.
-        if debug:
-            logger.info(f"Keys: {used_bits}")
-            tifffile.imwrite(
-                path.parent.parent / f"{path.stem}_{codebook_path.stem}.hp.tif",
-                imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
-                compression="zlib",
-                metadata={"keys": img_keys},
-            )
-            tifffile.imwrite(
-                path.parent.parent / f"{path.stem}_{codebook_path.stem}.blank.tif",
-                sub_mtx.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
-                compression="zlib",
-                metadata={"keys": img_keys},
-            )
-        ElementWiseAddition(sub_mtx).run(imgs, in_place=True)
-        if debug:
-            tifffile.imwrite(
-                path.parent.parent / f"{path.stem}_{codebook_path.stem}.hpsub.tif",
-                imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
-                compression="zlib",
-                metadata={"keys": img_keys},
-            )
-        del sub_mtx
+    # bleed_path = (
+    #     Path(cfg.bleedthrough_params_csv)
+    #     if ("cfg" in locals() and cfg is not None and cfg.common.bleedthrough_params_csv)
+    #     else (path.parent.parent / "robust_bleedthrough_params.csv")
+    # )
+    # df = pl.read_csv(bleed_path)
+    # logger.info("Generating subtraction matrix for blanks.")
+    # sub_mtx = generate_subtraction_matrix(blanks.xarray, df, used_bits)
+    # # print(imgs.xarray)
+    # # print(sub_mtx)
+    # del blanks
+    # logger.debug("Subtracting")
+    # # Will automatically clip at 0.
+    # if debug:
+    #     logger.info(f"Keys: {used_bits}")
+    #     tifffile.imwrite(
+    #         path.parent.parent / f"{path.stem}_{codebook_path.stem}.hp.tif",
+    #         imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+    #         compression="zlib",
+    #         metadata={"keys": img_keys},
+    #     )
+    #     tifffile.imwrite(
+    #         path.parent.parent / f"{path.stem}_{codebook_path.stem}.blank.tif",
+    #         sub_mtx.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+    #         compression="zlib",
+    #         metadata={"keys": img_keys},
+    #     )
+    # ElementWiseAddition(sub_mtx).run(imgs, in_place=True)
+    # if debug:
+    #     tifffile.imwrite(
+    #         path.parent.parent / f"{path.stem}_{codebook_path.stem}.hpsub.tif",
+    #         imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
+    #         compression="zlib",
+    #         metadata={"keys": img_keys},
+    #     )
+    # del sub_mtx
 
     if round_num == 0 and calc_deviations:
         logger.debug("Making scale file.")
@@ -1173,7 +1233,7 @@ def run(
     #     raise Exception("GPU and lock are both None.")
     if not simple:
         decoded_spots, image_decoding_results = (
-            pixel_decoding(imgs, config, codebook) if not GPU else pixel_decoding_gpu(imgs, config, codebook)
+            pixel_decoding(imgs, decode, codebook) if not GPU else pixel_decoding_gpu(imgs, decode, codebook)
         )
         decoded_spots = decoded_spots.loc[decoded_spots[Features.PASSES_THRESHOLDS]]
     else:
@@ -1209,7 +1269,7 @@ def run(
                     np.linalg.norm(spot_intensities.squeeze(), axis=1)
                     * (1 - spot_intensities.coords["distance"])
                 )
-                > config.min_intensity
+                > decode.min_intensity
             ]
             idxs = list(map(names_l.get, spot_intensities.coords["target"].to_index().values))
 
@@ -1246,7 +1306,7 @@ def run(
     )
     meta = {
         "fishtools_commit": git_hash(),
-        "config": config.model_dump(),
+        "config": decode.model_dump(),
     }
 
     with path_pickle.open("wb") as f:
@@ -1283,9 +1343,6 @@ def parse_duration(duration_str: str) -> timedelta:
 )
 @click.option("--threads", "-t", type=int, default=13)
 @click.option("--overwrite", is_flag=True)
-@click.option("--subsample-z", type=int, default=1)
-@click.option("--limit-z", default=None)
-@click.option("--split", is_flag=True)
 @click.option("--simple", is_flag=True)
 @click.option("--max-proj", type=int, default=0)
 @click.option(
@@ -1295,29 +1352,46 @@ def parse_duration(duration_str: str) -> timedelta:
     help="Only process files modified since this duration (e.g., '30m', '2h', '1d').",
 )
 @click.option("--delete-corrupted", is_flag=True)
+@click.option("--split", is_flag=True, help="Whether to split into quadrants. True regardless.")
 @click.option("--local-opt", is_flag=True)
 @click.option("--blank", type=str, default=None)
+@click.option("--stagger", type=float, default=5.0, help="Seconds to stagger starts per worker slot")
+@click.option(
+    "--stagger-jitter",
+    type=float,
+    default=0.0,
+    help="Add random jitter in [0..x] seconds to each start",
+)
+@click.option(
+    "--config",
+    "json_config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Optional project config (JSON). CLI flags override JSON.",
+)
 def batch(
     path: Path,
     roi: str,
     codebook_path: Path,
     threads: int = 13,
     overwrite: bool = False,
-    subsample_z: int = 1,
-    limit_z: int | None = None,
-    split: bool = False,
     simple: bool = False,
+    split: bool = False,
     max_proj: bool = False,
     since: str | None = None,
     delete_corrupted: bool = False,
     local_opt: bool = False,
     blank: str | None = None,
+    json_config: Path | None = None,
+    stagger: float = 0.0,
+    stagger_jitter: float = 0.0,
 ):
+    split = True  # Intentional override. --split kept for backward compatibility
     all_paths = {p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
     paths_in_scope = all_paths  # Start with all paths
 
     if delete_corrupted:
-        logger.info(f"Checking all files for corruption.")
+        logger.info("Checking all files for corruption.")
         for i, p in enumerate(sorted(all_paths)):
             if i % 100 == 0:
                 logger.info(f"Checked {i}/{len(all_paths)} files.")
@@ -1386,15 +1460,16 @@ def batch(
                 "--codebook",
                 codebook_path.as_posix(),
                 "--overwrite" if overwrite else "",
-                f"--subsample-z={subsample_z}",
-                f"--limit-z={limit_z}",
                 "--simple" if simple else "",
                 f"--max-proj={max_proj}" if max_proj else "",
                 f"--roi={roi}" if roi else "",
                 f"--blank={blank}" if blank else "",
+                *(["--config", json_config.as_posix()] if json_config else []),
             ],
             threads=threads,
             split=split,
+            stagger=stagger,
+            stagger_jitter=stagger_jitter,
         )
 
     for _roi, _paths in groupby(paths_to_process, lambda x: x.parent.name.split("--")[1].split("+")[0]):
@@ -1407,14 +1482,15 @@ def batch(
                 "--codebook",
                 codebook_path.as_posix(),
                 "--overwrite" if overwrite else "",
-                f"--subsample-z={subsample_z}",
-                f"--limit-z={limit_z}",
                 "--simple" if simple else "",
                 f"--max-proj={max_proj}" if max_proj else "",
                 f"--blank={blank}" if blank else "",
+                *(["--config", json_config.as_posix()] if json_config else []),
             ],
             threads=threads,
             split=split,
+            stagger=stagger,
+            stagger_jitter=stagger_jitter,
         )
 
 

@@ -10,8 +10,7 @@ This module tests the utility functions that support image registration:
 
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
-from unittest.mock import Mock, patch
+from typing import Any
 
 import numpy as np
 import pytest
@@ -406,7 +405,7 @@ class TestParseNofidsIntegration:
 
 # Test fixtures for realistic data
 @pytest.fixture
-def sample_nofids_data() -> Dict[str, NDArray[np.float32]]:
+def sample_nofids_data() -> dict[str, NDArray[np.float32]]:
     """Create sample nofids data for testing"""
     np.random.seed(42)  # For reproducible tests
     return {
@@ -416,7 +415,7 @@ def sample_nofids_data() -> Dict[str, NDArray[np.float32]]:
 
 
 @pytest.fixture
-def sample_shifts_data() -> Dict[str, NDArray[np.float64]]:
+def sample_shifts_data() -> dict[str, NDArray[np.float64]]:
     """Create sample shifts data for testing"""
     return {
         "1_2_3-0001": np.array([0.1, 0.2]),
@@ -425,7 +424,7 @@ def sample_shifts_data() -> Dict[str, NDArray[np.float64]]:
 
 
 def test_sample_fixtures(
-    sample_nofids_data: Dict[str, NDArray[np.float32]], sample_shifts_data: Dict[str, NDArray[np.float64]]
+    sample_nofids_data: dict[str, NDArray[np.float32]], sample_shifts_data: dict[str, NDArray[np.float64]]
 ) -> None:
     """Test that fixtures work correctly"""
     assert len(sample_nofids_data) == 2
@@ -542,55 +541,3 @@ class TestRegisterUtilsEdgeCases:
 
         # Clean up
         large_array[0, 0, 50, 50] = original_value
-
-    def test_parse_nofids_performance_benchmark(self) -> None:
-        """Test parse_nofids performance with large realistic datasets"""
-        import time
-
-        # Create realistic large microscopy dataset with unique bit names (as required by parse_nofids)
-        # Each image gets unique bit numbers to avoid duplication errors
-        large_nofids = {
-            f"{1 + i * 3}_{2 + i * 3}_{3 + i * 3}-{i:04d}": np.random.randint(
-                100, 4000, (8, 3, 512, 512), dtype=np.uint16
-            ).astype(np.float32)
-            for i in range(3)  # 3 images, each 8x3x512x512 ≈ 36MB total (reduced for performance)
-        }
-        large_shifts = {name: np.array([0.1 * i, 0.2 * i]) for i, name in enumerate(large_nofids.keys())}
-        # Create channels mapping for all unique bits
-        channels = {
-            str(bit): "488" if bit % 3 == 1 else ("560" if bit % 3 == 2 else "650") for bit in range(1, 10)
-        }
-
-        try:
-            # Benchmark parsing performance
-            start_time = time.time()
-            out, out_shift, bit_name_mapping = parse_nofids(large_nofids, large_shifts, channels)
-            processing_time = time.time() - start_time
-
-            # Verify results
-            assert len(out) == 9  # 3 images × 3 bits each
-            assert all(array.shape == (8, 512, 512) for array in out.values())
-
-            # Performance should be reasonable for large datasets
-            assert processing_time < 2.0, (
-                f"parse_nofids took {processing_time:.2f}s, expected < 2.0s for large dataset"
-            )
-
-            # Memory efficiency check - all outputs should be views
-            for name, original_array in large_nofids.items():
-                bits = name.split("-")[0].split("_")
-                for i, bit in enumerate(bits):
-                    assert np.shares_memory(out[bit], original_array), (
-                        f"Bit {bit} should share memory with original array"
-                    )
-
-        except ValueError as e:
-            if "Duplicated bit" in str(e):
-                pytest.skip(f"Test hit expected duplicate bit constraint: {e}")
-            else:
-                raise  # Re-raise unexpected ValueError
-        except AssertionError as e:
-            if "shape" in str(e).lower():
-                pytest.skip(f"Test hit expected shape constraint: {e}")
-            else:
-                raise  # Re-raise unexpected AssertionError

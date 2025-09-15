@@ -1,57 +1,30 @@
-"""
-Simple configuration loader for fishtools preprocessing pipeline.
-
-Provides utilities for loading configurations from TOML files with
-backward compatibility support.
-"""
-
+import json
 from pathlib import Path
 
-import toml
 from loguru import logger
 from pydantic import ValidationError
 
-from .config import (
-    BasicConfig,
-    Config,
-    DeconvolutionConfig,
-    Fiducial,
-    ImageProcessingConfig,
-    ProcessingConfig,
-    RegisterConfig,
-    SpotAnalysisConfig,
-    StitchingConfig,
-    SystemConfig,
-)
+from .config import Config, Fiducial, RegisterConfig
 
 
-def load_config_from_toml(config_path: Path, data_path: str, **overrides) -> Config:
-    """Load configuration from TOML file.
+def load_config_from_json(config_path: Path, data_path: str, **overrides) -> Config:
+    """Load configuration from JSON file (base format).
 
-    Args:
-        config_path: Path to TOML configuration file
-        data_path: Data directory path
-        **overrides: Additional configuration overrides
-
-    Returns:
-        Loaded and validated Config object
+    Mirrors load_config_from_toml behavior, including CLI-style overrides for nested keys.
     """
     if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     try:
-        config_dict = toml.load(config_path)
-        logger.info(f"Loaded configuration from {config_path}")
+        config_dict = json.loads(config_path.read_text())
+        logger.debug(f"Loaded configuration from {config_path}")
     except Exception as e:
-        logger.error(f"Failed to load config file {config_path}: {e}")
-        raise
+        logger.error(f"Failed to load JSON config {config_path}: {e}")
+        raise ValueError(f"Failed to load config file {config_path}: {e}") from e
 
-    # Ensure required fields are present
     config_dict["dataPath"] = data_path
 
-    # Apply any explicit overrides with proper nesting
     if overrides:
-        # Map CLI parameters to their nested config locations
         cli_param_mapping = {
             "fwhm": ["registration", "fiducial", "fwhm"],
             "threshold": ["registration", "fiducial", "threshold"],
@@ -64,28 +37,21 @@ def load_config_from_toml(config_path: Path, data_path: str, **overrides) -> Con
 
         for key, value in overrides.items():
             if key in cli_param_mapping:
-                # Apply to nested structure
                 path = cli_param_mapping[key]
                 current = config_dict
-
-                # Navigate to parent of target key
                 for part in path[:-1]:
                     if part not in current:
                         current[part] = {}
                     current = current[part]
-
-                # Set the final value
                 current[path[-1]] = value
                 logger.debug(f"Applied CLI override: {'.'.join(path)} = {value}")
             else:
-                # Unknown parameter, add to top level (for extensibility)
                 config_dict[key] = value
 
     try:
         return Config(**config_dict)
     except ValidationError as e:
         logger.error(f"Configuration validation error: {e}")
-        # Log specific field errors for better debugging
         for error in e.errors():
             field_path = " -> ".join(str(x) for x in error["loc"])
             logger.error(f"  Field '{field_path}': {error['msg']}")
@@ -100,68 +66,34 @@ def load_minimal_config(
     This is designed to be a drop-in replacement for existing config creation
     patterns while still providing access to all the new configuration sections.
     """
-    fiducial_config = Fiducial(**fiducial_overrides)
-
-    register_config = RegisterConfig(
-        fiducial=fiducial_config,
-        reference=reference,
-        chromatic_shifts={
-            # Canonical target wavelengths are 650 and 750
-            "650": str(Path(data_path) / "560to650.txt"),
-            "750": str(Path(data_path) / "560to750.txt"),
-        },
-    )
-
-    config_dict = {
-        "dataPath": data_path,
-        "registration": register_config,  # Pass the object directly, not dumped
-    }
-
-    return Config(**config_dict)
+    # Keep minimal shape; rely on default_register_config() from Config for chromatic shifts
+    return Config(dataPath=data_path)
 
 
 def generate_config_template(output_path: Path) -> None:
-    """Generate a template TOML configuration file with all defaults."""
-    # Create a complete configuration with all required fields
+    """Generate a JSON configuration file with minimal required defaults."""
     config_dict = {
         "dataPath": "/path/to/your/data",
         "registration": {
             "reference": "4_12_20",
             "crop": 40,
             "downsample": 1,
-            "slices": "slice(None)",  # Simplified slice notation for TOML
+            "slices": "slice(None)",
             "reduce_bit_depth": 0,
             "split_channels": False,
             "fiducial": Fiducial().model_dump(),
             "chromatic_shifts": {"647": "data/560to647.txt", "750": "data/560to750.txt"},
         },
-        "system": SystemConfig().model_dump(),
-        "processing": ProcessingConfig().model_dump(),
-        "image_processing": ImageProcessingConfig().model_dump(),
-        "deconvolution": DeconvolutionConfig().model_dump(),
-        "basic_correction": BasicConfig().model_dump(),
-        "stitching": StitchingConfig().model_dump(),
-        "spot_analysis": SpotAnalysisConfig().model_dump(),
     }
-
-    # Write TOML file with comments using standard toml.dump
-    with open(output_path, "w") as f:
-        f.write("# Fishtools Preprocessing Configuration\n")
-        f.write(
-            "# This file contains all configurable parameters for the fishtools preprocessing pipeline.\n\n"
-        )
-
-        # Use toml.dump for the entire config to ensure proper formatting
-        toml.dump(config_dict, f)
-
-    logger.info(f"Generated configuration template at {output_path}")
+    output_path.write_text(json.dumps(config_dict, indent=2))
+    logger.info(f"Generated JSON configuration template at {output_path}")
 
 
 # Convenience functions for backward compatibility
 def load_config(
     config_path: Path | None = None, data_path: str = "/working/fishtools/data", **overrides
 ) -> Config:
-    """Load configuration from TOML file or create minimal config.
+    """Load configuration from JSON file or create minimal config.
 
     Args:
         config_path: Path to TOML config file (optional)
@@ -172,6 +104,20 @@ def load_config(
         Loaded and validated Config object
     """
     if config_path:
-        return load_config_from_toml(config_path, data_path, **overrides)
-    else:
-        return load_minimal_config(data_path, **overrides)
+        return load_config_from_json(config_path, data_path, **overrides)
+    return load_minimal_config(data_path, **overrides)
+
+
+# ---- Align/Spot JSON config loader (for align_prod.py) ----
+
+
+def _resolve(base: Path, maybe: str | None) -> str | None:
+    if maybe is None:
+        return None
+    p = Path(maybe)
+    if not p.is_absolute():
+        p = (base / p).resolve()
+    return str(p)
+
+
+# Note: align_prod consumes the main project Config. No separate loader needed.

@@ -20,8 +20,15 @@ from loguru import logger
 @click.option("--threads", type=int, default=10)
 @click.option("--batch-size", type=int, default=50)
 @click.option("--max-proj", is_flag=True)
-@click.option("--blank", type=str, default=None, help="Blank image to subtract")
+@click.option("--blank", type=str, default=None, help="Blank image to subtract (config preferred)")
 @click.option("--threshold", type=float, default=0.008, help="CV before stopping")
+@click.option(
+    "--config",
+    "json_config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Optional project config (JSON) forwarded to subcommands.",
+)
 def optimize(
     path: Path,
     roi: str,
@@ -32,6 +39,7 @@ def optimize(
     batch_size: int = 50,
     blank: str | None = None,
     threshold: float = 0.008,
+    json_config: Path | None = None,
 ):
     if not len(list(path.glob(f"registered--{roi}{'*' if roi != '*' else ''}"))):
         raise ValueError(
@@ -86,13 +94,13 @@ def optimize(
                 "--codebook",
                 codebook,
                 f"--batch-size={batch_size}",
-                "--subsample-z=1",
                 f"--round={i}",
                 f"--threads={threads}",
                 "--overwrite",
                 "--split=0",
                 *(["--max-proj=1"] if max_proj else []),
                 *(["--blank", blank] if blank else []),
+                *(["--config", json_config] if json_config else []),
             ],
             check=True,
             capture_output=False,
@@ -107,7 +115,6 @@ def optimize(
                 roi,
                 "--codebook",
                 codebook,
-                "--batch-size=50",
                 f"--round={i}",
             ],
             check=True,
@@ -126,6 +133,7 @@ def optimize(
                 codebook,
                 f"--round={i}",
                 *(["--blank", blank] if blank else []),
+                *(["--config", json_config] if json_config else []),
             ],
             check=True,
             capture_output=False,

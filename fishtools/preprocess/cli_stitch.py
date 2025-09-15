@@ -41,6 +41,8 @@ from loguru import logger
 from PIL import Image
 from tifffile import TiffFile, TiffFileError, imread, imwrite
 
+from fishtools.preprocess.config import StitchingConfig
+from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
 from fishtools.utils.utils import batch_roi
@@ -92,9 +94,10 @@ def run_imagej(
     *,
     compute_overlap: bool = False,
     fuse: bool = True,
-    threshold: float = 0.4,
+    threshold: float | None = None,
     name: str = "TileConfiguration.txt",
     capture_output: bool = False,
+    sc: StitchingConfig | None = None,
 ) -> None:
     """
     Execute ImageJ Grid/Collection stitching via subprocess.
@@ -124,19 +127,26 @@ def run_imagej(
             f"ImageJ not found at {imagej_path}. Please install ImageJ in your home directory."
         )
 
+    # Defaults from config when available
+    max_mem = sc.max_memory_mb if sc else 102400
+    par_thr = sc.parallel_threads if sc else 32
+    reg_thr = threshold if threshold is not None else (sc.fusion_thresholds.get("regression") if sc else 0.4)
+    disp_max = sc.fusion_thresholds.get("displacement_max") if sc else 1.5
+    disp_abs = sc.fusion_thresholds.get("displacement_abs") if sc else 2.5
+
     macro = f"""
-    run("Memory & Threads...", "maximum=102400 parallel=32");
+    run(\"Memory & Threads...\", \"maximum={max_mem} parallel={par_thr}\");
 
     // run("Memory & Threads...", "parallel=16");
 
-    run("Grid/Collection stitching", "type=[Positions from file] \
+    run(\"Grid/Collection stitching\", \"type=[Positions from file] \
     order=[Defined by TileConfiguration] directory={path.resolve()} \
     layout_file={name}{"" if compute_overlap else ".registered"}.txt \
-    fusion_method=[{fusion}] regression_threshold={threshold} \
-    max/avg_displacement_threshold=1.5 absolute_displacement_threshold=2.5 {options} \
+    fusion_method=[{fusion}] regression_threshold={reg_thr} \
+    max/avg_displacement_threshold={disp_max} absolute_displacement_threshold={disp_abs} {options} \
     computation_parameters=[Save computation time (but use more RAM)] \
     image_output=[Write to disk] \
-    output_directory={path.resolve()}");
+    output_directory={path.resolve()}\");
     """
 
     with NamedTemporaryFile("wt") as f:
@@ -171,6 +181,7 @@ def extract_channel(
     max_proj: bool = False,
     downsample: int = 1,
     reduce_bit_depth: int = 0,
+    sc: StitchingConfig | None = None,
 ) -> None:
     """
     Extract and preprocess a single channel from multi-channel TIFF image.
@@ -213,12 +224,13 @@ def extract_channel(
             raise ValueError("Cannot reduce bit depth if image is not uint16")
         img >>= reduce_bit_depth
 
+    level = sc.compression_levels.get("low") if sc else 0.7
     imwrite(
         out,
         img,
         compression=22610,
         metadata={"axes": "YX"},
-        compressionargs={"level": 0.7},
+        compressionargs={"level": level},
     )
 
 
@@ -238,7 +250,20 @@ def stitch():
 )
 @click.option("--fuse", is_flag=True)
 @click.option("--downsample", type=int, default=2)
-def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int):
+@click.option(
+    "--config",
+    "json_config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Optional project config to populate stitching defaults.",
+)
+def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int, json_config: Path | None):
+    sc: StitchingConfig | None = None
+    if json_config:
+        try:
+            sc = load_config(json_config).stitching
+        except Exception as e:
+            logger.warning(f"Failed to load config {json_config}: {e}")
     if downsample > 1:
         logger.info(f"Downsampling tile config by {downsample}x to {path / 'TileConfiguration.txt'}")
     TileConfiguration.from_file(tileconfig).downsample(downsample).write(path / "TileConfiguration.txt")
@@ -248,6 +273,7 @@ def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int):
         compute_overlap=True,
         fuse=fuse,
         name="TileConfiguration",
+        sc=sc,
     )
 
 
@@ -264,9 +290,16 @@ def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int):
 )
 @click.option("--idx", "-i", type=int, help="Channel (index) to use for registration")
 @click.option("--fid", is_flag=True)
-@click.option("--threshold", type=float, default=0.4)
+@click.option("--threshold", type=float, default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--max-proj", is_flag=True)
+@click.option(
+    "--config",
+    "json_config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Optional project config to populate stitching defaults.",
+)
 @batch_roi()
 def register(
     path: Path,
@@ -277,8 +310,15 @@ def register(
     fid: bool = False,
     max_proj: bool = False,
     overwrite: bool = False,
-    threshold: float = 0.4,
+    threshold: float | None = None,
+    json_config: Path | None = None,
 ):
+    sc: StitchingConfig | None = None
+    if json_config:
+        try:
+            sc = load_config(json_config).stitching
+        except Exception as e:
+            logger.warning(f"Failed to load config {json_config}: {e}")
     base_path = path
     path = next(path.glob(f"registered--{roi}*"))
     if not path.exists():
@@ -310,6 +350,7 @@ def register(
                         idx=0,
                         downsample=1,
                         max_proj=False,  # already max proj
+                        sc=sc,
                     )
                 )
 
@@ -332,6 +373,7 @@ def register(
                         out_path / out_name,
                         idx=idx,
                         max_proj=max_proj,
+                        sc=sc,
                     )
                 )
 
@@ -364,6 +406,7 @@ def register(
             fuse=False,
             threshold=threshold,
             name="TileConfiguration",
+            sc=sc,
         )
 
 
@@ -379,6 +422,7 @@ def extract(
     is_2d: bool = False,
     channels: list[int] | None = None,
     max_from: Path | None = None,
+    sc: StitchingConfig | None = None,
 ) -> None:
     """
     Extract and format images for downstream segmentation analysis.
@@ -548,6 +592,12 @@ def walk_fused(path: Path) -> dict[int, list[Path]]:
 @click.option("--max-proj", is_flag=True)
 @click.option("--debug", is_flag=True)
 @click.option("--max-from", type=str)
+@click.option(
+    "--json-config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Optional project config to populate stitching defaults.",
+)
 # @click.option("--skip-extract", is_flag=True)
 @batch_roi("registered--*", include_codebook=True, split_codebook=True)
 def fuse(
@@ -566,8 +616,15 @@ def fuse(
     max_proj: bool = False,
     debug: bool = False,
     max_from: str | None = None,
+    json_config: Path | None = None,
     # skip_extract: bool = False,
 ):
+    sc: StitchingConfig | None = None
+    if json_config:
+        try:
+            sc = load_config(json_config).stitching
+        except Exception as e:
+            logger.warning(f"Failed to load config {json_config}: {e}")
     if "--" in path.as_posix():
         raise ValueError("Please be in the workspace folder.")
 
@@ -633,6 +690,7 @@ def fuse(
                     max_from=file.parent.parent / f"registered--{roi}+{max_from}" / file.name
                     if max_from
                     else None,
+                    sc=sc,
                 )
 
     def run_folder(folder: Path, capture_output: bool = False):
@@ -643,6 +701,7 @@ def fuse(
                     folder,
                     name=f"TileConfiguration{i + 1}",
                     capture_output=capture_output,
+                    sc=sc,
                 )
             except Exception as e:
                 logger.critical(f"Error running ImageJ for {folder}: {e}")
@@ -668,7 +727,7 @@ def fuse(
 
     if split > 1:
         for folder in folders:
-            final_stitch(folder, split)
+            final_stitch(folder, split, sc=sc)
 
 
 def numpy_array_to_zarr[*Ts](write_path: Path | str, array: np.ndarray, chunks: tuple[*Ts]):
