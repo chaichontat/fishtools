@@ -1,8 +1,6 @@
 """
-Comprehensive unit tests for fiducial processing in fishtools.preprocess.fiducial
-
 This module tests the fiducial detection and alignment functions:
-- run_fiducial: Complete fiducial alignment pipeline
+- individual_align_fiducial: Complete fiducial alignment pipeline
 - align_fiducials: Multi-threaded fiducial alignment with overrides
 - align_phase: FFT-based phase correlation alignment
 - find_spots: DAOStarFinder spot detection
@@ -27,8 +25,8 @@ from fishtools.preprocess.fiducial import (
     butterworth,
     clahe,
     find_spots,
+    individual_align_fiducial,
     phase_shift,
-    run_fiducial,
 )
 
 # Test constants
@@ -191,7 +189,7 @@ class TestImageProcessing:
 
 
 class TestRunFiducial:
-    """Unit tests for run_fiducial function - the core alignment pipeline"""
+    """Unit tests for individual_align_fiducial function - the core alignment pipeline"""
 
     @pytest.fixture
     def synthetic_reference_image(self) -> NDArray[np.uint16]:
@@ -214,10 +212,10 @@ class TestRunFiducial:
 
         return img
 
-    def test_run_fiducial_basic(self, synthetic_reference_image: NDArray[np.uint16]) -> None:
-        """Test basic run_fiducial functionality"""
+    def test_individual_align_fiducial_basic(self, synthetic_reference_image: NDArray[np.uint16]) -> None:
+        """Test basic individual_align_fiducial functionality"""
         # Get the alignment function
-        align_func = run_fiducial(
+        align_func = individual_align_fiducial(
             synthetic_reference_image, subtract_background=False, debug=False, threshold_sigma=3.0, fwhm=4.0
         )
 
@@ -245,11 +243,11 @@ class TestRunFiducial:
         # Drift should be negative of the applied shift (correction to align back to reference)
         np.testing.assert_allclose(calculated_drift, -shift, atol=1.0)
 
-    def test_run_fiducial_with_background_subtraction(
+    def test_individual_align_fiducial_with_background_subtraction(
         self, synthetic_reference_image: NDArray[np.uint16]
     ) -> None:
-        """Test run_fiducial with background subtraction enabled"""
-        align_func = run_fiducial(
+        """Test individual_align_fiducial with background subtraction enabled"""
+        align_func = individual_align_fiducial(
             synthetic_reference_image, subtract_background=True, threshold_sigma=3.0, fwhm=4.0
         )
 
@@ -260,10 +258,12 @@ class TestRunFiducial:
         # Zero shift expected for identical images
         np.testing.assert_allclose(calculated_drift, [0, 0], atol=0.5)
 
-    def test_run_fiducial_insufficient_spots(self, synthetic_reference_image: NDArray[np.uint16]) -> None:
-        """Test run_fiducial behavior with insufficient spots"""
+    def test_individual_align_fiducial_insufficient_spots(
+        self, synthetic_reference_image: NDArray[np.uint16]
+    ) -> None:
+        """Test individual_align_fiducial behavior with insufficient spots"""
         # Use moderate threshold that works for reference but should fail on poor target
-        align_func = run_fiducial(
+        align_func = individual_align_fiducial(
             synthetic_reference_image,
             threshold_sigma=4.0,  # Moderate threshold that works for synthetic ref
             fwhm=4.0,
@@ -275,13 +275,13 @@ class TestRunFiducial:
         with pytest.raises(NotEnoughSpots):
             align_func(target_img, bitname="insufficient_test")
 
-    def test_run_fiducial_too_many_spots(self) -> None:
-        """Test run_fiducial behavior with too many spots (noisy image)"""
+    def test_individual_align_fiducial_too_many_spots(self) -> None:
+        """Test individual_align_fiducial behavior with too many spots (noisy image)"""
         # Create very noisy reference image
         noisy_ref = np.random.randint(500, 2000, TEST_IMAGE_SIZE, dtype=np.uint16)
 
         try:
-            align_func = run_fiducial(
+            align_func = individual_align_fiducial(
                 noisy_ref,
                 threshold_sigma=1.0,  # Low threshold for noisy image
                 fwhm=2.0,
@@ -298,9 +298,11 @@ class TestRunFiducial:
             # Expected for very noisy images
             pass
 
-    def test_run_fiducial_drift_too_large(self, synthetic_reference_image: NDArray[np.uint16]) -> None:
-        """Test run_fiducial behavior with very large drift"""
-        align_func = run_fiducial(synthetic_reference_image, threshold_sigma=3.0, fwhm=4.0)
+    def test_individual_align_fiducial_drift_too_large(
+        self, synthetic_reference_image: NDArray[np.uint16]
+    ) -> None:
+        """Test individual_align_fiducial behavior with very large drift"""
+        align_func = individual_align_fiducial(synthetic_reference_image, threshold_sigma=3.0, fwhm=4.0)
 
         # Create target with completely uncorrelated pattern - high intensity noise
         # that will create many false spots but no real alignment
@@ -309,10 +311,12 @@ class TestRunFiducial:
         with pytest.raises((NotEnoughSpots, DriftTooLarge, ResidualTooLarge)):
             align_func(target_img, bitname="large_drift_test", limit=1)  # Reduce limit to make it fail faster
 
-    def test_run_fiducial_parameter_adaptation(self, synthetic_reference_image: NDArray[np.uint16]) -> None:
-        """Test that run_fiducial adapts parameters when alignment fails"""
+    def test_individual_align_fiducial_parameter_adaptation(
+        self, synthetic_reference_image: NDArray[np.uint16]
+    ) -> None:
+        """Test that individual_align_fiducial adapts parameters when alignment fails"""
         # This tests the retry logic with different sigma/fwhm combinations
-        align_func = run_fiducial(
+        align_func = individual_align_fiducial(
             synthetic_reference_image,
             threshold_sigma=4.0,  # Use a threshold that works from previous successful tests
             fwhm=4.0,
