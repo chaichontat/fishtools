@@ -9,7 +9,7 @@ import polars as pl
 
 from fishtools.mkprobes import get_candidates, run_screen
 from fishtools.mkprobes.codebook.finalconstruct import construct
-from fishtools.mkprobes.ext.external_data import Dataset
+from fishtools.mkprobes.ext.dataset import ReferenceDataset as Dataset
 from fishtools.mkprobes.utils.sequtils import reverse_complement
 
 

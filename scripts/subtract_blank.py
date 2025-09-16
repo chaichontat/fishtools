@@ -17,7 +17,8 @@ from pydantic import BaseModel
 
 from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.fiducial import run_fiducial
-from fishtools.preprocess.subtraction import plot_regression, regress
+from fishtools.postprocess.subtraction import plot_regression, regress
+from fishtools.utils.io import get_metadata
 
 sns.set_theme()
 
@@ -208,14 +209,122 @@ def apply(path: Path, roi: str, i: int, round_: str, round_blank: str):
 
 
 # %%
-
-img = get_img("/working/20250312_melphahuman/4_12_20--hippo/4_12_20-0457.tif", 3, run_basic=True)
-blank = get_img(
-    "/working/20250312_melphahuman/b560_b650_b750--hippo/b560_b650_b750-0457.tif", 3, run_basic=True
-)
+path = Path("/working/20250605_2486/analysis/deconv/registered--hippo+laihuman")
+img = tifffile.imread(path / "reg-0045.tif")
+blank = tifffile.imread(path.parent / "registered--hippo+blank" / "reg-0045.tif")
 
 # %%
+from skimage.filters import gaussian
 
+c = -1
+g = gaussian(img[:, c], sigma=(2, 2, 2), preserve_range=True)
+# %%
+subtracted = img[:, c] - np.minimum(g, img[:, c])
+
+# %%
+bsubtracted = blank[:, 0] - np.minimum(
+    gaussian(blank[:, 0], sigma=(2, 2, 2), preserve_range=True), blank[:, 0]
+)
+# %%
+plt.imshow(subtracted[5], zorder=1, vmax=500)
+# %%
+w = bsubtracted[5].flatten(), subtracted[5].flatten()
+# %%
+mask = w[0] > 120
+w = w[0][mask], w[1][mask]
+# %%
+# logged = np.log10(w[0] + 1e-6), np.log10(w[1] + 1e-6)
+from sklearn.linear_model import HuberRegressor
+
+linreg = HuberRegressor(epsilon=1.1)
+linreg.fit(w[0].reshape(-1, 1), w[1])
+# Plot the fit in loglog space
+fig, ax = plt.subplots(figsize=(8, 6))
+
+# Plot the data points in log-log space
+ax.scatter(np.log10(w[0]), np.log10(w[1]), alpha=0.1, s=1)
+
+# Create prediction line
+x_range = np.linspace(w[0].min(), w[0].max(), 100)
+y_pred = linreg.predict(x_range.reshape(-1, 1))
+
+# Plot the fit line in log-log space
+ax.plot(
+    np.log10(x_range),
+    np.log10(y_pred),
+    "r-",
+    linewidth=2,
+    label=f"Fit: slope={linreg.coef_[0]:.3f}, intercept={linreg.intercept_:.1f}",
+)
+
+ax.set_xlabel("log10(blank)")
+ax.set_ylabel("log10(subtracted)")
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.title("Log-Log Plot of Regression Fit")
+plt.show()
+# %%
+# Apply the subtraction using the fit
+corrected = w[1] - linreg.predict(w[0].reshape(-1, 1))
+# Ensure corrected values don't go negative
+corrected = np.maximum(0, corrected)
+
+# Plot the results
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+# Before correction
+ax1.scatter(w[0], w[1], alpha=0.1, s=1)
+ax1.set_xlabel("Blank")
+ax1.set_ylabel("Original")
+ax1.set_title("Before Correction")
+ax1.grid(True, alpha=0.3)
+
+# After correction
+ax2.scatter(w[0], corrected, alpha=0.1, s=1)
+ax2.axhline(y=0, color="r", linestyle="--", alpha=0.5)
+ax2.set_xlabel("Blank")
+ax2.set_ylabel("Corrected")
+ax2.set_title("After Correction")
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+print(f"Original correlation: {np.corrcoef(w[0], w[1])[0, 1]:.3f}")
+print(f"Corrected correlation: {np.corrcoef(w[0], corrected)[0, 1]:.3f}")
+
+# %%
+# Apply the learned coefficients to subtract the processed blank from processed image
+tosub = np.maximum(bsubtracted[5] * linreg.coef_[0] + linreg.intercept_, 0)
+corrected_image = np.maximum(0, subtracted[5].astype(np.float32) - tosub)
+
+plt.figure(figsize=(15, 5))
+plt.subplot(1, 3, 1)
+plt.imshow(subtracted[5], vmin=0, vmax=500)
+plt.title("Original Subtracted")
+plt.colorbar()
+plt.axis("off")
+
+plt.subplot(1, 3, 2)
+plt.imshow(bsubtracted[5], vmin=0, vmax=500)
+plt.title("Blank Subtracted")
+plt.colorbar()
+plt.axis("off")
+
+plt.subplot(1, 3, 3)
+plt.imshow(corrected_image, vmin=0, vmax=500)
+plt.title("Final Corrected")
+plt.colorbar()
+plt.axis("off")
+
+plt.tight_layout()
+plt.show()
+# %%
+from fishtools.utils.io import Workspace, get_channels, get_metadata
+
+get_metadata(path / "reg-0045.tif")
+
+# %%
 # %%
 res = json.loads(Path("/working/20250312_melphahuman/subtract/4_12_20-1.json").read_text())
 # %%

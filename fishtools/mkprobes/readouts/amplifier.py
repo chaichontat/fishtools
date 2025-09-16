@@ -5,13 +5,13 @@ from typing import Callable, Collection, Iterable, Literal, Sequence, TypeVar, c
 import numpy as np
 import polars as pl
 from expression.collections import Seq
+from fishtools.mkprobes.screen_utils._alignment import gen_bowtie_index, gen_fasta
+from fishtools.mkprobes.screen_utils.samframe import SAMFrame
 from Levenshtein import distance
 from loguru import logger
 
 from fishtools.mkprobes.constants import DT, SP6
 from fishtools.mkprobes.definitions import Filter
-from fishtools.mkprobes.screen_utils._alignment import gen_bowtie_index, gen_fasta
-from fishtools.mkprobes.screen_utils.samframe import SAMFrame
 from fishtools.mkprobes.utils.seqcalc import hp, tm
 from fishtools.mkprobes.utils.sequtils import gc_content, reverse_complement
 from fishtools.utils.utils import TAny, slide
@@ -30,13 +30,11 @@ def extract_ok(generated: T, ok_keys: list[int] | list[str]) -> T:
 
 
 @overload
-def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[False] = ...) -> pl.DataFrame:
-    ...
+def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[False] = ...) -> pl.DataFrame: ...
 
 
 @overload
-def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[True]) -> tuple[pl.DataFrame, T]:
-    ...
+def run_filter(f: Filter, seqs: T, return_ok_seqs: Literal[True]) -> tuple[pl.DataFrame, T]: ...
 
 
 def run_filter(f: Filter, seqs: T, return_ok_seqs: bool = False) -> pl.DataFrame | tuple[pl.DataFrame, T]:
@@ -276,22 +274,16 @@ assert list(map(splitter(1), seqs)) == zeroth_readouts["seq"].to_list()[:to_gen]
 SP6_F = reverse_complement("ACGTGACTGCTCC" + SP6[:-1])
 
 # %%
-idt = pl.concat(
-    [
-        pl.DataFrame(
-            {
-                "Pool name": "Amp1-Aug23",
-                "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs)),
-            }
-        ),
-        pl.DataFrame(
-            {
-                "Pool name": "Amp2-Aug23",
-                "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs_2)),
-            }
-        ),
-    ]
-)
+idt = pl.concat([
+    pl.DataFrame({
+        "Pool name": "Amp1-Aug23",
+        "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs)),
+    }),
+    pl.DataFrame({
+        "Pool name": "Amp2-Aug23",
+        "Sequence": list(map(lambda x: x.replace(" ", "") + SP6_F, seqs_2)),
+    }),
+])
 
 idt == pl.read_excel("amplifiers.xlsx")
 # idt.write_excel("amplifiers2.xlsx")
