@@ -2,8 +2,8 @@
 
 This module combines the production bleed-through constant discovery CLI that
 previously lived in ``scripts/sub.py`` with the exploratory regression helpers
-from ``fishtools/preprocess/subtraction.py``. The CLI exposes two Typer
-commands, ``preprocess`` and ``fit``, which pool blank/sample image pairs and
+from ``fishtools/preprocess/subtraction.py``. The CLI exposes Click
+commands such as ``preprocess`` and ``fit`` which pool blank/sample image pairs and
 fit robust linear models per imaging channel. The regression utilities are
 retained so ad-hoc scripts (e.g. ``scripts/subtract_blank.py``) can continue to
 inspect the underlying relationships.
@@ -15,13 +15,12 @@ import random
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Annotated
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tifffile
-import typer
+import click
 from loguru import logger
 from matplotlib.figure import Figure
 from rich.progress import (
@@ -37,13 +36,9 @@ from sklearn.linear_model import RANSACRegressor
 
 from fishtools.utils.io import get_metadata
 
-# Typer application -----------------------------------------------------------------
+# CLI application -----------------------------------------------------------------
 
-app = typer.Typer(
-    name="Parallel Bleed-through Analyzer",
-    help="Two-step pipeline for calculating bleed-through parameters.",
-    add_completion=False,
-)
+app = click.Group(name="parallel-bleed-through-analyzer", help="Two-step pipeline for calculating bleed-through parameters.")
 
 # Shared constants kept in sync with production subtraction logic.
 KEYS_560NM = set(range(0, 9)) | {25, 28, 31, 34}
@@ -102,23 +97,21 @@ def process_single_file(image_path: Path, blank_path: Path, output_dir: Path, z_
 
 @app.command("preprocess")
 @logger.catch
+@click.argument("analysis_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True, exists=True))
+@click.argument("preprocessed_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True))
+@click.option("--data-dir", default="registered--hippo+10xhuman", show_default=True, help="Directory name for sample images.")
+@click.option("--blank-dir", default="registered--hippo+blank", show_default=True, help="Directory name for blank images.")
+@click.option("--num-sample-images", default=10, show_default=True, help="Number of images to sample. -1 for all.", type=int)
+@click.option("--z-slice", default=5, show_default=True, help="Z-slice index to use.", type=int)
+@click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def run_preprocess(
-    analysis_path: Annotated[Path, typer.Argument(help="Path to the analysis project directory.")],
-    preprocessed_path: Annotated[Path, typer.Argument(help="Directory to save intermediate .npz files.")],
-    data_dir: Annotated[
-        str,
-        typer.Option(help="Directory name for sample images."),
-    ] = "registered--hippo+10xhuman",
-    blank_dir: Annotated[
-        str,
-        typer.Option(help="Directory name for blank images."),
-    ] = "registered--hippo+blank",
-    num_sample_images: Annotated[
-        int,
-        typer.Option(help="Number of images to sample. -1 for all."),
-    ] = 10,
-    z_slice: Annotated[int, typer.Option(help="Z-slice index to use.")] = 5,
-    log_level: Annotated[str, typer.Option(help="Logging level.")] = "INFO",
+    analysis_path: Path,
+    preprocessed_path: Path,
+    data_dir: str,
+    blank_dir: str,
+    num_sample_images: int,
+    z_slice: int,
+    log_level: str,
 ) -> None:
     """Step 1: preprocess images in parallel and save representative slices."""
 
@@ -134,7 +127,7 @@ def run_preprocess(
     image_files = sorted(data_path.glob("reg-*.tif"))
     if not image_files:
         logger.critical(f"No images found in {data_path}. Aborting.")
-        raise typer.Exit(code=1)
+        raise click.ClickException(f"No images found in {data_path}.")
 
     if num_sample_images > 0 and len(image_files) > num_sample_images:
         sampled_files = random.sample(image_files, num_sample_images)
@@ -172,31 +165,25 @@ def run_preprocess(
 
 @app.command("fit")
 @logger.catch
+@click.argument("analysis_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True))
+@click.argument("preprocessed_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True, exists=True))
+@click.option("--output-filename", default="robust_bleedthrough_params.csv", show_default=True, help="Name for the final output CSV file.")
+@click.option("--fit-threshold", default=120.0, show_default=True, type=float, help="Intensity threshold for fitting.")
+@click.option("--percentile", default=20.0, show_default=True, type=float, help="Percentile of signal per bin used for regression.")
+@click.option("--max-percentile", default=99.99, show_default=True, type=float, help="Upper percentile bound for blank bins.")
+@click.option("--num-bins", default=50, show_default=True, type=int, help="Number of evenly spaced blank bins.")
+@click.option("--min-bin-count", default=100, show_default=True, type=int, help="Minimum pixels per bin to keep it in the fit.")
+@click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def run_fit(
-    analysis_path: Annotated[Path, typer.Argument(help="Path to the analysis project directory.")],
-    preprocessed_path: Annotated[Path, typer.Argument(help="Directory containing intermediate .npz files.")],
-    output_filename: Annotated[
-        str,
-        typer.Option(help="Name for the final output CSV file."),
-    ] = "robust_bleedthrough_params.csv",
-    fit_threshold: Annotated[float, typer.Option(help="Intensity threshold for fitting.")] = 120.0,
-    percentile: Annotated[
-        float,
-        typer.Option(help="Percentile of signal per bin used for regression."),
-    ] = 20.0,
-    max_percentile: Annotated[
-        float,
-        typer.Option(help="Upper percentile bound for blank bins."),
-    ] = 99.99,
-    num_bins: Annotated[
-        int,
-        typer.Option(help="Number of evenly spaced blank bins."),
-    ] = 50,
-    min_bin_count: Annotated[
-        int,
-        typer.Option(help="Minimum pixels per bin to keep it in the fit."),
-    ] = 100,
-    log_level: Annotated[str, typer.Option(help="Logging level.")] = "INFO",
+    analysis_path: Path,
+    preprocessed_path: Path,
+    output_filename: str,
+    fit_threshold: float,
+    percentile: float,
+    max_percentile: float,
+    num_bins: int,
+    min_bin_count: int,
+    log_level: str,
 ) -> None:
     """Step 2: fit robust blank-to-signal relationships per channel."""
 
@@ -210,7 +197,7 @@ def run_fit(
         logger.critical(
             f"No .npz files found in {preprocessed_path}. Did you run the 'preprocess' step? Aborting."
         )
-        raise typer.Exit(code=1)
+        raise click.ClickException(f"No .npz files found in {preprocessed_path}.")
 
     files_by_key: dict[str, list[Path]] = {}
     for file in npz_files:
@@ -349,32 +336,27 @@ def _subtract_registered_channels(
 
 @app.command("fit-registered")
 @logger.catch
+@click.argument("registered_path", type=click.Path(path_type=Path, file_okay=True, dir_okay=False, exists=True))
+@click.argument("output_csv", type=click.Path(path_type=Path, file_okay=True, dir_okay=False))
+@click.option("--signal-channel", required=True, help="Channel name to correct.")
+@click.option("--blank-channel", required=True, help="Reference blank channel name.")
+@click.option("--fit-threshold", default=120.0, show_default=True, type=float, help="Ignore blank pixels at or below this intensity.")
+@click.option("--percentile", default=20.0, show_default=True, type=float, help="Percentile of signal per bin used for regression.")
+@click.option("--max-percentile", default=99.99, show_default=True, type=float, help="Upper percentile bound for blank bins.")
+@click.option("--num-bins", default=50, show_default=True, type=int, help="Number of evenly spaced blank bins.")
+@click.option("--min-bin-count", default=100, show_default=True, type=int, help="Minimum pixels per bin to keep it in the fit.")
+@click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def run_fit_registered(
-    registered_path: Annotated[Path, typer.Argument(help="Registered ZCYX TIFF to analyze.")],
-    output_csv: Annotated[Path, typer.Argument(help="Where to write the fitted coefficients.")],
-    signal_channel: Annotated[str, typer.Option("--signal-channel", help="Channel name to correct.")],
-    blank_channel: Annotated[str, typer.Option("--blank-channel", help="Reference blank channel name.")],
-    fit_threshold: Annotated[
-        float,
-        typer.Option(help="Ignore blank pixels at or below this intensity."),
-    ] = 120.0,
-    percentile: Annotated[
-        float,
-        typer.Option(help="Percentile of signal per bin used for regression."),
-    ] = 20.0,
-    max_percentile: Annotated[
-        float,
-        typer.Option(help="Upper percentile bound for blank bins."),
-    ] = 99.99,
-    num_bins: Annotated[
-        int,
-        typer.Option(help="Number of evenly spaced blank bins."),
-    ] = 50,
-    min_bin_count: Annotated[
-        int,
-        typer.Option(help="Minimum pixels per bin to keep it in the fit."),
-    ] = 100,
-    log_level: Annotated[str, typer.Option(help="Logging level.")] = "INFO",
+    registered_path: Path,
+    output_csv: Path,
+    signal_channel: str,
+    blank_channel: str,
+    fit_threshold: float,
+    percentile: float,
+    max_percentile: float,
+    num_bins: int,
+    min_bin_count: int,
+    log_level: str,
 ) -> None:
     logger.remove()
     logger.add(sys.stderr, level=log_level.upper())
@@ -388,7 +370,7 @@ def run_fit_registered(
     flat_signal = signal.reshape(-1)
     mask = flat_blank > fit_threshold
     if np.sum(mask) < min_bin_count:
-        raise ValueError(
+        raise click.ClickException(
             f"Not enough pixels above threshold {fit_threshold} to fit regression (found {np.sum(mask)})."
         )
 
@@ -432,35 +414,32 @@ def run_fit_registered(
 
 @app.command("subtract-registered")
 @logger.catch
+@click.argument("registered_path", type=click.Path(path_type=Path, file_okay=True, dir_okay=False, exists=True))
+@click.argument("output_path", type=click.Path(path_type=Path, file_okay=True, dir_okay=False))
+@click.option("--signal-channel", required=True, help="Channel to correct.")
+@click.option("--blank-channel", required=True, help="Reference blank channel.")
+@click.option("--params-csv", type=click.Path(path_type=Path, dir_okay=False, file_okay=True), help="CSV produced by fit commands containing slope/intercept.")
+@click.option("--slope", type=float, help="Slope to apply (overrides CSV if provided).")
+@click.option("--intercept", type=float, help="Intercept to apply (overrides CSV if provided).")
+@click.option("--clip-min", default=0.0, show_default=True, type=float, help="Lower bound after subtraction; defaults to 0.")
+@click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def run_subtract_registered(
-    registered_path: Annotated[Path, typer.Argument(help="Input registered ZCYX TIFF.")],
-    output_path: Annotated[Path, typer.Argument(help="Output path for corrected TIFF.")],
-    signal_channel: Annotated[str, typer.Option("--signal-channel", help="Channel to correct.")],
-    blank_channel: Annotated[str, typer.Option("--blank-channel", help="Reference blank channel.")],
-    params_csv: Annotated[
-        Path | None,
-        typer.Option(help="CSV produced by fit commands containing slope/intercept."),
-    ] = None,
-    slope: Annotated[
-        float | None,
-        typer.Option(help="Slope to apply (overrides CSV if provided)."),
-    ] = None,
-    intercept: Annotated[
-        float | None,
-        typer.Option(help="Intercept to apply (overrides CSV if provided)."),
-    ] = None,
-    clip_min: Annotated[
-        float,
-        typer.Option(help="Lower bound after subtraction; defaults to 0."),
-    ] = 0.0,
-    log_level: Annotated[str, typer.Option(help="Logging level.")] = "INFO",
+    registered_path: Path,
+    output_path: Path,
+    signal_channel: str,
+    blank_channel: str,
+    params_csv: Path | None,
+    slope: float | None,
+    intercept: float | None,
+    clip_min: float,
+    log_level: str,
 ) -> None:
     logger.remove()
     logger.add(sys.stderr, level=log_level.upper())
 
     if slope is None or intercept is None:
         if params_csv is None:
-            raise typer.BadParameter("Provide either --params-csv or both --slope and --intercept.")
+            raise click.BadParameter("Provide either --params-csv or both --slope and --intercept.")
         df = pd.read_csv(params_csv)
         candidates = df[df.get("signal_channel", df.get("channel_key")) == signal_channel]
         if "blank_channel" in df.columns:

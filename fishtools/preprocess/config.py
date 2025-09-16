@@ -112,6 +112,10 @@ class RegisterConfig(BaseModel):
     reference: str = Field(default="4_12_20", description="Reference round to align others to.")
     # Moved from HardwareConfig - threads used specifically for registration
     threads: int = Field(default=15, description="Number of threads for registration operations")
+    discards: dict[str, list[str]] | None = Field(
+        None,
+        description="In case of duplicated key(s), discard the ones from the file in value.",
+    )
 
     @field_validator("slices", mode="before")
     @classmethod
@@ -156,13 +160,6 @@ class RegisterConfig(BaseModel):
                     k,
                 )
         return out
-
-
-class ChannelConfig(BaseModel):
-    discards: dict[str, list[str]] | None = Field(
-        None,
-        description="In case of duplicated key(s), discard the ones from the file in value.",
-    )
 
 
 def default_register_config() -> "RegisterConfig":

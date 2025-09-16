@@ -23,7 +23,6 @@ from tifffile import TiffFile
 from fishtools.preprocess.chromatic import Affine
 from fishtools.preprocess.cli_deconv import scale_deconv
 from fishtools.preprocess.config import (
-    ChannelConfig,
     Config,
     Fiducial,
     NumpyEncoder,
@@ -463,7 +462,7 @@ def _run(
     _imgs: list[Image] = [
         Image.from_file(
             file,
-            discards=config.channels and config.channels.discards,
+            discards=config.registration and config.registration.discards,
             n_fids=config.registration.fiducial.n_fids,
         )
         for file in chain.from_iterable(p.glob(f"*-{idx:04d}.tif") for p in folders)
@@ -679,12 +678,10 @@ def run(
             no_priors=no_priors,
             config=Config(
                 dataPath=str(DATA),
-                channels=ChannelConfig(discards=None),
-                basic=None,
                 exclude=None,
                 registration=RegisterConfig(
                     chromatic_shifts={
-                        "647": str(DATA / "560to650.txt"),
+                        "650": str(DATA / "560to650.txt"),
                         "750": str(DATA / "560to750.txt"),
                     },
                     fiducial=Fiducial(
@@ -700,6 +697,7 @@ def run(
                     crop=40,
                     slices=slice(None),
                     reduce_bit_depth=0,
+                    discards=None,
                 ),
             ),
             overwrite=overwrite,
