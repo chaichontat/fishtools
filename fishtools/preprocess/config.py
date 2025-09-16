@@ -272,13 +272,20 @@ class SpotThresholdParams(BaseModel):
     # Core filtering parameters
     area_min: float = Field(default=10.0, gt=0, description="Minimum spot area in pixels")
     area_max: float = Field(default=200.0, gt=0, description="Maximum spot area in pixels")
-    norm_threshold: float = Field(default=0.007, gt=0, description="Normalization threshold")
+    norm_threshold: float = Field(
+        default=0.007, gt=0, description="Norm threshold BEFORE contours calculation"
+    )
+    min_norm: float = Field(default=0, ge=0, description="Norm threshold AFTER contours calculation")
     distance_threshold: float = Field(default=0.3, gt=0, description="Distance threshold")
 
     # Density analysis parameters
     density_grid_size: int = Field(default=50, gt=0, description="Grid size for density map")
-    density_smooth_sigma: float = Field(default=4.0, gt=0, description="Gaussian sigma for density")
-    min_spots_for_density: int = Field(default=100, gt=0, description="Minimum spots for density analysis")
+    density_smooth_sigma: float = Field(default=2.0, gt=0, description="Gaussian sigma for density")
+    min_spots_per_bin: int = Field(default=50, gt=0, description="Minimum raw spots required per grid bin")
+    density_metric: Literal["count", "proportion"] = Field(
+        default="proportion",
+        description="Density map value: raw blank counts or blank proportion",
+    )
 
     # Reproducibility
     seed: int = Field(default=0, ge=0, description="Random seed")

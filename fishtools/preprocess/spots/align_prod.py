@@ -220,9 +220,6 @@ def load_codebook(
     )
 
 
-# %%
-
-
 @click.group()
 def spots(): ...
 
