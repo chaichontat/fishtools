@@ -22,6 +22,40 @@ if TYPE_CHECKING:
     import anndata as ad
 
 
+# Common plot styling primitives -------------------------------------------------
+
+DARK_PANEL_STYLE = {
+    "figure.facecolor": "#000000",
+    "savefig.facecolor": "#000000",
+    "axes.facecolor": "#000000",
+    "axes.edgecolor": "#9ca3af",
+    "axes.grid": False,
+    "axes.labelcolor": "#e5e7eb",
+    "text.color": "#e5e7eb",
+    "axes.titlecolor": "#ffffff",
+    "xtick.color": "#e5e7eb",
+    "ytick.color": "#e5e7eb",
+}
+
+
+def configure_dark_axes(
+    ax: Axes,
+    *,
+    spine_color: str = "#9ca3af",
+    tick_color: str = "#e5e7eb",
+    enable_grid: bool = False,
+) -> None:
+    """Apply a consistent dark theme to an axes' spines, ticks, and grid."""
+
+    ax.grid(enable_grid)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_visible(True)
+        ax.spines[side].set_color(spine_color)
+    ax.tick_params(bottom=True, left=True, top=False, right=False, colors=tick_color)
+
+
 def plot_wheel(
     pcs: npt.NDArray[np.float32],
     cmap: str = "cet_colorwheel",

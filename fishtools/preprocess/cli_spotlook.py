@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import questionary
 import seaborn as sns
 import typer
 from loguru import logger
+from matplotlib.axes import Axes
 from matplotlib.contour import QuadContourSet
 from matplotlib.figure import Figure
 from rich.console import Console
@@ -18,10 +20,24 @@ from scipy.ndimage import gaussian_filter
 
 from fishtools.preprocess.config import SpotThresholdParams
 from fishtools.utils.io import Codebook, Workspace
-from fishtools.utils.plot import add_scale_bar
+from fishtools.utils.plot import DARK_PANEL_STYLE, add_scale_bar, configure_dark_axes
 from fishtools.utils.utils import initialize_logger
 
 console = Console()
+
+
+@dataclass(slots=True)
+class DensitySurface:
+    """Container for density grid data used across plotting stages."""
+
+    x_coords: np.ndarray
+    y_coords: np.ndarray
+    z_raw: np.ndarray
+    z_smooth: np.ndarray
+    contour_levels: np.ndarray
+
+    def meshgrid(self) -> tuple[np.ndarray, np.ndarray]:
+        return np.meshgrid(self.x_coords, self.y_coords)
 
 
 def build_spotlook_params(
@@ -104,6 +120,55 @@ def _label_contour_levels(contour_set: QuadContourSet, max_level_index: int = 10
     contour_set.clabel(levels=list(labels.keys()), fmt=labels, inline=True, fontsize=8)
 
 
+def _filter_contour_levels(levels: np.ndarray, cutoff: int = 10, spacing: int = 5) -> np.ndarray:
+    """Reduce contour levels after a cutoff to every `spacing`th entry."""
+    if levels.size == 0:
+        return levels
+    indices = np.arange(levels.size)
+    mask = (indices <= cutoff) | ((indices > cutoff) & (((indices - cutoff) % spacing) == 0))
+    return levels[mask]
+
+
+def _render_hexbin_panel(
+    ax: Axes,
+    spots_df: pl.DataFrame,
+    title: str,
+    X: np.ndarray,
+    Y: np.ndarray,
+    z_smooth: np.ndarray,
+    contour_levels: np.ndarray,
+    cmap: str,
+    *,
+    show_ylabel: bool,
+) -> None:
+    """Render a single hexbin + contour panel on the provided axis."""
+    if spots_df.is_empty():
+        ax.text(
+            0.5,
+            0.5,
+            f"No {title.lower()}",
+            ha="center",
+            va="center",
+            color=DARK_PANEL_STYLE["text.color"],
+        )
+    else:
+        ax.hexbin(
+            spots_df["x_"].to_numpy(),
+            spots_df["y_"].to_numpy(),
+            gridsize=250,
+            cmap=cmap,
+            mincnt=5,
+            linewidths=0,
+        )
+    contour = ax.contour(X, Y, z_smooth, levels=contour_levels, colors="white", linewidths=0.4, alpha=0.6)
+    _label_contour_levels(contour)
+    ax.set_xlabel("Area (cube-root, jittered)")
+    if show_ylabel:
+        ax.set_ylabel("log10(norm * (1 - distance))")
+    ax.set_title(title, color=DARK_PANEL_STYLE["axes.titlecolor"])
+    configure_dark_axes(ax)
+
+
 # --- Pipeline Stage Functions ---
 
 
@@ -137,6 +202,10 @@ def _apply_initial_filters(
     )
     logger.info(f"Spots after area/norm filter: {len(spots_):,}")
 
+    if params.min_norm:
+        spots_ = spots_.filter(pl.col("norm") >= params.min_norm)
+        logger.info(f"Spots after minimum norm filter ({params.min_norm}): {len(spots_):,}")
+
     spots_ = spots_.with_columns(
         x_=(pl.col("area")) ** (1 / 3) + rng.uniform(-0.75, 0.75, size=len(spots_)),
         y_=(pl.col("norm") * (1 - pl.col("distance"))).log10(),
@@ -148,7 +217,7 @@ def _apply_initial_filters(
 def _calculate_density_map(
     spots_: pl.DataFrame,
     params: SpotThresholdParams,
-) -> tuple[Figure, QuadContourSet, RegularGridInterpolator, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[Figure, QuadContourSet, RegularGridInterpolator, DensitySurface]:
     """Calculates and smooths the blank proportion density map."""
     logger.info("Calculating blank proportion density map...")
     bounds = spots_.select([
@@ -222,25 +291,28 @@ def _calculate_density_map(
     if not contours.levels.size:  # type: ignore[attr-defined]
         raise RuntimeError("Could not generate density contours. The data may be too sparse or uniform.")
 
+    surface = DensitySurface(
+        x_coords=x_coords,
+        y_coords=y_coords,
+        z_raw=Z,
+        z_smooth=Z_smooth,
+        contour_levels=np.asarray(contours.levels).copy(),
+    )
     interp_func = RegularGridInterpolator((y_coords, x_coords), Z_smooth, bounds_error=False, fill_value=0)
-    return fig, contours, interp_func, x_coords, y_coords, Z_smooth
+    return fig, contours, interp_func, surface
 
 
-def _plot_blank_vs_nonblank_panels(
+def _create_spots_contours_figure(
     spots_: pl.DataFrame,
-    output_dir: Path,
     roi: str,
     codebook: str,
     params: SpotThresholdParams,
-    x_coords: np.ndarray,
-    y_coords: np.ndarray,
-    z_smooth: np.ndarray,
-    contour_levels: np.ndarray,
-) -> None:
+    surface: DensitySurface,
+) -> Figure | None:
     """Render side-by-side scatter panels for blank and non-blank spots."""
     if spots_.is_empty():
         logger.warning(f"No spots available to plot for ROI {roi}; skipping blank/non-blank panels.")
-        return
+        return None
 
     non_blank = spots_.filter(~pl.col("is_blank"))
     blank = spots_.filter(pl.col("is_blank"))
@@ -251,20 +323,7 @@ def _plot_blank_vs_nonblank_panels(
         )
         return
 
-    # Dark theme for high-contrast titles on pure black background
-    style_rc = {
-        "figure.facecolor": "#000000",
-        "savefig.facecolor": "#000000",
-        "axes.facecolor": "#000000",
-        "axes.edgecolor": "#9ca3af",
-        "axes.grid": False,
-        "axes.labelcolor": "#e5e7eb",
-        "text.color": "#e5e7eb",
-        "axes.titlecolor": "#ffffff",
-        "xtick.color": "#e5e7eb",
-        "ytick.color": "#e5e7eb",
-    }
-    with sns.axes_style("dark", rc=style_rc), sns.plotting_context(rc={"axes.titlesize": 14}):
+    with sns.axes_style("dark", rc=DARK_PANEL_STYLE), sns.plotting_context(rc={"axes.titlesize": 14}):
         fig, axes = plt.subplots(
             1,
             2,
@@ -273,72 +332,36 @@ def _plot_blank_vs_nonblank_panels(
             sharey=True,
         )
 
-        X, Y = np.meshgrid(x_coords, y_coords)
+        X, Y = surface.meshgrid()
+        filtered_levels = _filter_contour_levels(surface.contour_levels, cutoff=10, spacing=5)
 
-        # After contour index 15, only include every 5th level to reduce clutter
-        if contour_levels.size:
-            idx = np.arange(len(contour_levels))
-            mask = (idx <= 10) | ((idx > 10) & (((idx - 10) % 5) == 0))
-            filtered_levels = contour_levels[mask]
-        else:
-            filtered_levels = contour_levels
-
-        if non_blank.is_empty():
-            axes[0].text(0.5, 0.5, "No non-blank spots", ha="center", va="center")
-        else:
-            axes[0].hexbin(
-                non_blank["x_"].to_numpy(),
-                non_blank["y_"].to_numpy(),
-                gridsize=250,
-                cmap="inferno",
-                mincnt=5,
-                linewidths=0,
-            )
-        contour_non_blank = axes[0].contour(
-            X, Y, z_smooth, levels=filtered_levels, colors="white", linewidths=0.4, alpha=0.6
+        panels = (
+            (axes[0], non_blank, "Non-blank spots"),
+            (axes[1], blank, "Blank spots"),
         )
-        _label_contour_levels(contour_non_blank)
-        axes[0].set_xlabel("Area (cube-root, jittered)")
-        axes[0].set_ylabel("log10(norm * (1 - distance))")
-        axes[0].set_title("Non-blank spots", color=style_rc["axes.titlecolor"])
-
-        if blank.is_empty():
-            axes[1].text(0.5, 0.5, "No blank spots", ha="center", va="center")
-        else:
-            axes[1].hexbin(
-                blank["x_"].to_numpy(),
-                blank["y_"].to_numpy(),
-                gridsize=250,
-                cmap="inferno",
-                mincnt=5,
-                linewidths=0,
+        for idx, (ax, spots_panel, title) in enumerate(panels):
+            _render_hexbin_panel(
+                ax,
+                spots_panel,
+                title,
+                X,
+                Y,
+                surface.z_smooth,
+                filtered_levels,
+                "inferno",
+                show_ylabel=idx == 0,
             )
-        contour_blank = axes[1].contour(
-            X, Y, z_smooth, levels=filtered_levels, colors="white", linewidths=0.4, alpha=0.6
-        )
-        _label_contour_levels(contour_blank)
-        axes[1].set_xlabel("Area (cube-root, jittered)")
-        axes[1].set_ylabel("log10(norm * (1 - distance))")
-        axes[1].set_title("Blank spots", color=style_rc["axes.titlecolor"])
 
-        x_min = min(float(spots_["x_"].min()), x_coords[0])
-        x_max = max(float(spots_["x_"].max()), x_coords[-1])
+        x_min = min(float(spots_["x_"].min()), surface.x_coords[0])
+        x_max = max(float(spots_["x_"].max()), surface.x_coords[-1])
+        y_min, y_max = surface.y_coords[0], surface.y_coords[-1]
         for ax in axes:
             ax.set_xlim(x_min, x_max)
-            ax.set_ylim(y_coords[0], y_coords[-1])
-            # No grid, spine on left and bottom only
-            ax.grid(False)
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            for side in ("left", "bottom"):
-                ax.spines[side].set_visible(True)
-                ax.spines[side].set_color("#9ca3af")
-            ax.tick_params(bottom=True, left=True, top=False, right=False, colors="#e5e7eb")
+            ax.set_ylim(y_min, y_max)
 
         fig.tight_layout()
-        # End seaborn context
 
-    save_figure(fig, output_dir, "spots_contours", roi, codebook)
+    return fig
 
 
 def _get_interactive_threshold(
@@ -584,24 +607,18 @@ def threshold(
             spots_intermediate = _apply_initial_filters(spots_raw, rng, params)
             density_results = _calculate_density_map(spots_intermediate, params)
 
-        fig_contours, contours, interp_func, x_coords, y_coords, z_smooth = density_results
-
+        fig_contours, contours, interp_func, surface = density_results
         save_figure(fig_contours, output_dir, "contours", roi, codebook.name)
-        _plot_blank_vs_nonblank_panels(
+
+        fig_blank_panels = _create_spots_contours_figure(
             spots_intermediate,
-            output_dir,
             roi,
             codebook.name,
             params,
-            x_coords,
-            y_coords,
-            z_smooth,
-            np.asarray(contours.levels),  # type: ignore
+            surface,
         )
-
-        if params.min_norm:
-            spots_intermediate = spots_intermediate.filter(pl.col("norm") >= params.min_norm)
-            logger.info(f"Spots after minimum norm filter ({params.min_norm}): {len(spots_intermediate):,}")
+        if fig_blank_panels is not None:
+            save_figure(fig_blank_panels, output_dir, "spots_contours", roi, codebook.name)
 
         chosen_level = _get_interactive_threshold(
             spots_intermediate, contours, interp_func, output_dir, roi, codebook.name, params
