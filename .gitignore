@@ -174,3 +174,4 @@ squid/
 *.pkl
 *.pdf
 *.h5
+.vscode/

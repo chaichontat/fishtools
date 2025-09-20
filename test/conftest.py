@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from scipy import ndimage as _scipy_ndimage
 
 # Lightweight stub for heavy optional dependency 'scanpy' used in import-time
 # paths (e.g., fishtools.postprocess). This avoids importing the real package
@@ -32,6 +33,59 @@ if "scanpy" not in sys.modules:
         )
     )
     sys.modules["scanpy"] = _sc
+
+
+if "cupy" not in sys.modules:
+    class _CuPyModule(types.ModuleType):
+        """NumPy-backed stub providing a minimal CuPy surface for tests."""
+
+        ndarray = np.ndarray
+
+        def __getattr__(self, name: str):  # type: ignore[override]
+            if hasattr(np, name):
+                return getattr(np, name)
+            raise AttributeError(name)
+
+        def array(self, *args, **kwargs):
+            return np.array(*args, **kwargs)
+
+        def asarray(self, *args, **kwargs):
+            return np.asarray(*args, **kwargs)
+
+        def zeros_like(self, *args, **kwargs):
+            return np.zeros_like(*args, **kwargs)
+
+        def ones_like(self, *args, **kwargs):
+            return np.ones_like(*args, **kwargs)
+
+        def empty_like(self, *args, **kwargs):
+            return np.empty_like(*args, **kwargs)
+
+        def clip(self, *args, **kwargs):
+            return np.clip(*args, **kwargs)
+
+        def asnumpy(self, array, *args, **kwargs):
+            return np.asarray(array, *args, **kwargs)
+
+        def get_array_module(self, *_: object, **__: object):
+            return np
+
+    _cupy = _CuPyModule("cupy")
+    sys.modules["cupy"] = _cupy
+
+    cupyx = types.ModuleType("cupyx")
+    sys.modules["cupyx"] = cupyx
+
+    cupyx_scipy = types.ModuleType("cupyx.scipy")
+    sys.modules["cupyx.scipy"] = cupyx_scipy
+
+    cupyx_ndimage = types.ModuleType("cupyx.scipy.ndimage")
+    cupyx_ndimage.convolve = _scipy_ndimage.convolve
+    cupyx_ndimage.gaussian_filter = _scipy_ndimage.gaussian_filter
+    sys.modules["cupyx.scipy.ndimage"] = cupyx_ndimage
+
+    cupyx_scipy.ndimage = cupyx_ndimage
+    cupyx.scipy = cupyx_scipy
 
 
 @pytest.fixture(autouse=True)

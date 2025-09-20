@@ -4,10 +4,9 @@ import numpy as np
 import pandas as pd
 import pytest
 import tifffile
-from typer.testing import CliRunner
+from click.testing import CliRunner
 
 from fishtools.postprocess.subtraction import app
-
 
 runner = CliRunner()
 
@@ -47,9 +46,11 @@ def test_fit_cli_raw(raw_bleed_setup: tuple[Path, Path, float, float]) -> None:
 
 
 def test_fit_and_subtract_registered_cli(
-    registered_stack_data: tuple[Path, np.ndarray, dict[str, int], float, float, np.ndarray, np.ndarray]
+    registered_stack_data: tuple[Path, np.ndarray, dict[str, int], float, float, np.ndarray, np.ndarray],
 ) -> None:
-    stack_path, stack_uint16, channel_index, slope_true, intercept_true, signal_float, blank_float = registered_stack_data
+    stack_path, stack_uint16, channel_index, slope_true, intercept_true, signal_float, blank_float = (
+        registered_stack_data
+    )
     params_csv = stack_path.with_name("registered_params.csv")
     output_path = stack_path.with_name("registered_corrected.tif")
 
@@ -101,13 +102,12 @@ def test_fit_and_subtract_registered_cli(
 
     with tifffile.TiffFile(output_path) as tif:
         corrected = tif.asarray()
-        meta = tif.shaped_metadata[0]
+        meta = tif.shaped_metadata[0]  # type: ignore
 
     assert meta.get("subtract", {}).get("signal_channel") == "geneA"
     assert meta.get("subtract", {}).get("blank_channel") == "Blank-560"
 
     corrected_signal = corrected[:, channel_index["geneA"]].astype(np.float32)
-    original_blank = stack_uint16[:, channel_index["Blank-560"]].astype(np.float32)
 
     expected = signal_float - (blank_float * params["slope"] + params["intercept"])
     assert np.mean(expected) >= -50  # sanity check baseline
@@ -116,9 +116,11 @@ def test_fit_and_subtract_registered_cli(
 
 
 def test_subtract_registered_manual_params(
-    registered_stack_data: tuple[Path, np.ndarray, dict[str, int], float, float, np.ndarray, np.ndarray]
+    registered_stack_data: tuple[Path, np.ndarray, dict[str, int], float, float, np.ndarray, np.ndarray],
 ) -> None:
-    stack_path, stack_uint16, channel_index, slope_true, intercept_true, signal_float, blank_float = registered_stack_data
+    stack_path, stack_uint16, channel_index, slope_true, intercept_true, signal_float, blank_float = (
+        registered_stack_data
+    )
     manual_out = stack_path.with_name("manual_corrected.tif")
 
     result_sub = runner.invoke(

@@ -12,9 +12,9 @@ This version incorporates code review recommendations:
 import json
 import tempfile
 import warnings
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
-from collections.abc import Generator
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -233,7 +233,7 @@ class TestLoGFidsRegressionTests:
             # FIXED BEHAVIOR: Now raises clear error instead of returning NaN
             with pytest.raises(ValueError, match="Uniform image"):
                 Image.loG_fids(fid_data)
-        
+
         # Test that non-uniform data works correctly
         np.random.seed(42)  # Reproducible
         non_uniform = np.random.uniform(100, 1000, SMALL_IMAGE_SIZE).astype(np.float32)
@@ -304,7 +304,6 @@ class TestImageFromFileComprehensiveMocks:
         self, complete_tiff_mock: MagicMock, mock_file_system: MagicMock
     ) -> None:
         """Test from_file with comprehensive, realistic mocking"""
-        test_path = Path("A_B_C-1234.tif")
 
         # This test demonstrates the comprehensive mocking setup
         # The actual from_file call would require extensive filesystem mocking
@@ -550,8 +549,8 @@ class TestImageClassEdgeCases:
             fid_data = np.random.uniform(100, 1000, shape).astype(np.float32)
             # Add a bright spot to ensure non-uniformity
             if shape[0] > 2 and shape[1] > 2:
-                fid_data[shape[0]//2, shape[1]//2] = 2000
-            
+                fid_data[shape[0] // 2, shape[1] // 2] = 2000
+
             result = Image.loG_fids(fid_data)
             assert result.shape == shape
             assert result.dtype == np.float32
