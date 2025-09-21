@@ -23,6 +23,7 @@ dependencies = [
     "numpy>=1.25.1",
     "polars>=1.32.3",
     "primer3-py>=2.2.0",
+    "hyperactive<=5",
     "pyfastx>=2.1.0",
     "rich-click>=1.8.9",
     "tifffile",
@@ -44,6 +45,7 @@ dependencies = [
     "prefect>=3",
     "typer>=0.15.0",
     "zarr>=3",
+    "pyfiglet>=1.0.4",
 ]
 
 [project.optional-dependencies]

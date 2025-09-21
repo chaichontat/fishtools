@@ -768,6 +768,7 @@ dependencies = [
     { name = "biopython" },
     { name = "click" },
     { name = "colorama" },
+    { name = "hyperactive" },
     { name = "imagecodecs" },
     { name = "itk" },
     { name = "levenshtein" },
@@ -782,6 +783,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pyfastx" },
+    { name = "pyfiglet" },
     { name = "questionary" },
     { name = "rich-click" },
     { name = "rtree" },
@@ -821,6 +823,7 @@ requires-dist = [
     { name = "dask", marker = "extra == 'segment'" },
     { name = "dask-image", marker = "extra == 'segment'" },
     { name = "dask-jobqueue", marker = "extra == 'segment'" },
+    { name = "hyperactive", specifier = "<=5" },
     { name = "imagecodecs", specifier = ">=2025.8.2" },
     { name = "itk", specifier = ">=5" },
     { name = "levenshtein", specifier = ">=0.27.1" },
@@ -836,10 +839,11 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=21.0.0" },
     { name = "pydantic", specifier = ">=2.11.7" },
     { name = "pyfastx", specifier = ">=2.1.0" },
+    { name = "pyfiglet", specifier = ">=1.0.4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.4.1" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=6.2.1" },
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.14.1" },
-    { name = "questionary" },
+    { name = "questionary", specifier = ">=2.1.1" },
     { name = "rich-click", specifier = ">=1.8.9" },
     { name = "rtree", specifier = ">=1.4.1" },
     { name = "scikit-image", specifier = ">=0.25.2" },
@@ -2403,6 +2407,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/03/51/ac63cf8bb9b14627084004ddfdc3fcf7adf9672187af4d765d6f75f6549a/pyfastx-2.2.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:16a211abc16184e20edcc7f4329590d4a68ec43a4782fa70e5883adae41703cf", size = 869502, upload-time = "2024-12-24T15:01:00.713Z" },
     { url = "https://files.pythonhosted.org/packages/44/8c/f02503197b99b09c62a90af4dc8189efbe0aefe2786655c77fcd51207aad/pyfastx-2.2.0-cp313-cp313-win32.whl", hash = "sha256:346c6f54019ae065ab6194d75c821bdbbdc27e667f41f3675bc1364785737313", size = 575085, upload-time = "2024-12-24T15:01:02.961Z" },
     { url = "https://files.pythonhosted.org/packages/f5/df/8b44bfe9c43a2d4d3ba48da23c2becddd053ea9065a894559f322aa38f8b/pyfastx-2.2.0-cp313-cp313-win_amd64.whl", hash = "sha256:3d6b882594b233724dfa9ecca4d2fd55456bf6b08c9b79aa4dc06ff15c1ffdea", size = 681832, upload-time = "2024-12-24T15:01:05.275Z" },
+]
+
+[[package]]
+name = "pyfiglet"
+version = "1.0.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/e3/0a86276ad2c383ce08d76110a8eec2fe22e7051c4b8ba3fa163a0b08c428/pyfiglet-1.0.4.tar.gz", hash = "sha256:db9c9940ed1bf3048deff534ed52ff2dafbbc2cd7610b17bb5eca1df6d4278ef", size = 1560615, upload-time = "2025-08-15T18:32:47.302Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9f/5c/fe9f95abd5eaedfa69f31e450f7e2768bef121dbdf25bcddee2cd3087a16/pyfiglet-1.0.4-py3-none-any.whl", hash = "sha256:65b57b7a8e1dff8a67dc8e940a117238661d5e14c3e49121032bd404d9b2b39f", size = 1806118, upload-time = "2025-08-15T18:32:45.556Z" },
 ]
 
 [[package]]
