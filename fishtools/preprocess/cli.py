@@ -2,6 +2,7 @@ import rich_click as click
 
 from .cli_basic import basic
 from .cli_deconv import deconv
+from .cli_inspect import inspect_cli
 from .cli_register import register
 from .cli_stitch import stitch
 from .spots.align_prod import spots
@@ -68,6 +69,7 @@ main.add_command(register)
 main.add_command(registerv1)
 main.add_command(stitch)
 main.add_command(spots)
+main.add_command(inspect_cli)
 
 if __name__ == "__main__":
     main()

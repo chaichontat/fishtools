@@ -122,3 +122,13 @@ class TileConfiguration:
             ax.scatter(row["x"], row["y"], s=0.1)
             ax.text(row["x"], row["y"], str(row["index"]), fontsize=6, ha="center", va="center")
         ax.set_aspect("equal")
+
+
+def copy_registered(reference_path: Path, actual_path: Path) -> None:
+    """Copy *.registered.txt files from one directory to another.
+
+    Kept as a library helper to avoid re-implementations across CLIs.
+    """
+    for file in reference_path.glob("*.registered.txt"):
+        Path(actual_path).mkdir(parents=True, exist_ok=True)
+        (actual_path / file.name).write_text(file.read_text())

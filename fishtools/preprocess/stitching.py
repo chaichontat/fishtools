@@ -131,3 +131,24 @@ def generate_cells(
             )
 
     return cells
+
+
+def walk_fused(path: Path) -> dict[int, list[Path]]:
+    """Discover stitched folders arranged as path/ZZ/CC/.
+
+    Returns a mapping of Z-plane index to a list of channel directories.
+    """
+    folders_by_z: dict[int, list[Path]] = {}
+    for folder, subfolders, _ in path.walk():
+        if (
+            not subfolders
+            and folder.name.isdigit()
+            and folder.parent.name.isdigit()
+            and ".zarr" not in folder.resolve().as_posix()
+        ):
+            z_idx = int(folder.parent.name)
+            folders_by_z.setdefault(z_idx, []).append(folder)
+
+    if not folders_by_z:
+        raise ValueError(f"No valid Z/C folders found in {path}")
+    return folders_by_z

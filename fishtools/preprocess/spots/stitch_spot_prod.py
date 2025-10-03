@@ -74,6 +74,8 @@ def load_splits(
         return (load_spots if not simple else load_spots_simple)(
             path, i, filter_=filter_, tile_coords=(c["x"], c["y"])
         )
+    except pl.exceptions.ColumnNotFoundError:
+        raise ValueError(f"No spots found in {path}")
     except Exception as e:
         msg = f"Error reading {path}: {e.__class__.__name__}. Please rerun."
         logger.critical(msg)

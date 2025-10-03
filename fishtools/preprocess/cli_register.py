@@ -28,6 +28,7 @@ from fishtools.preprocess.config import (
     NumpyEncoder,
     RegisterConfig,
 )
+from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
 from fishtools.utils.io import Workspace
 from fishtools.utils.pretty_print import progress_bar_threadpool
@@ -132,6 +133,32 @@ def sort_key(x: tuple[str, np.ndarray]) -> int | str:
         return f"{int(x[0]):02d}"
     except ValueError:
         return x[0]
+
+
+def apply_deconv_scaling(
+    img: np.ndarray,
+    *,
+    idx: int,
+    orig_name: str,
+    global_deconv_scaling: np.ndarray,
+    metadata: dict[str, Any],
+    debug: bool,
+) -> np.ndarray:
+    """Apply deconvolution rescaling unless input is already prenormalized."""
+
+    if metadata.get("prenormalized"):
+        if debug:
+            logger.debug(f"Skipping deconvolution scaling for {orig_name}: metadata prenormalized flag set.")
+        return img
+
+    return scale_deconv(
+        img,
+        idx,
+        name=orig_name,
+        global_deconv_scaling=global_deconv_scaling,
+        metadata=metadata,
+        debug=debug,
+    )
 
 
 @dataclass
@@ -539,12 +566,13 @@ def _run(
         # Deconvolution scaling
         orig_name, orig_idx = bit_name_mapping[bit]
         img = collapse_z(img, config.registration.slices).astype(np.float32)
-        img = scale_deconv(
+        metadata = imgs[orig_name].metadata
+        img = apply_deconv_scaling(
             img,
-            orig_idx,
-            name=orig_name,
+            idx=orig_idx,
+            orig_name=orig_name,
             global_deconv_scaling=imgs[orig_name].global_deconv_scaling,
-            metadata=imgs[orig_name].metadata,
+            metadata=metadata,
             debug=debug,
         )
 
@@ -555,7 +583,23 @@ def _run(
         # Within-tile alignment. Chromatic corrections.
         logger.debug(f"{bit}: before affine channel={c}, shiftpx={-bits_shifted[bit]}")
         img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
-        transformed[bit] = np.clip(img, 0, 65534).astype(np.uint16)
+        crop = config.registration.crop
+        downsample = config.registration.downsample
+        if crop:
+            img = img[:, crop:-crop, crop:-crop]
+
+        if downsample > 1:
+            transformed_img = gpu_downsample_xy(
+                img,
+                crop=0,
+                factor=downsample,
+                clip_range=(0, 65534),
+                output_dtype=np.uint16,
+            )
+        else:
+            transformed_img = np.clip(img, 0, 65534).astype(np.uint16)
+
+        transformed[bit] = transformed_img
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
 
     if not len(transformed):
@@ -566,22 +610,12 @@ def _run(
             f"Transformed images have different shapes: {set(img.shape for img in transformed.values())}"
         )
 
-    crop, downsample = config.registration.crop, config.registration.downsample
-    out = np.zeros(
-        [
-            next(iter(transformed.values())).shape[0],
-            # if isinstance(config.registration.slices, slice)
-            # else len(config.registration.slices),
-            len(transformed),
-            (2048 - 2 * crop) // downsample,
-            (2048 - 2 * crop) // downsample,
-        ],
-        dtype=np.uint16,
-    )
+    sample = next(iter(transformed.values()))
+    out = np.zeros((sample.shape[0], len(transformed), sample.shape[1], sample.shape[2]), dtype=np.uint16)
 
     # Sort by channel
     for i, (k, v) in enumerate(items := sorted(transformed.items(), key=sort_key)):
-        out[:, i] = v[:, crop:-crop:downsample, crop:-crop:downsample]
+        out[:, i] = v
     del transformed
 
     # out[0, -1] = fids[reference][crop:-crop:downsample, crop:-crop:downsample]
