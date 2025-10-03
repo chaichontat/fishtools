@@ -21,7 +21,12 @@ from scipy.ndimage import gaussian_filter
 
 from fishtools.preprocess.config import SpotThresholdParams
 from fishtools.utils.io import Codebook, Workspace
-from fishtools.utils.plot import DARK_PANEL_STYLE, add_scale_bar, configure_dark_axes
+from fishtools.utils.plot import (
+    DARK_PANEL_STYLE,
+    add_scale_bar,
+    configure_dark_axes,
+    si_tick_formatter,
+)
 from fishtools.utils.utils import configure_cli_logging, initialize_logger
 
 console = Console()
@@ -71,6 +76,8 @@ def build_spotlook_params(
     min_norm: float | None = None,
     distance_threshold: float | None = None,
     seed: int | None = None,
+    contour_mode: str | None = None,
+    contour_levels: int | None = None,
 ) -> SpotThresholdParams:
     """Create SpotlookParams from project config (if provided) with CLI overrides."""
     params: SpotThresholdParams
@@ -91,6 +98,8 @@ def build_spotlook_params(
             "min_norm": min_norm,
             "distance_threshold": distance_threshold,
             "seed": seed,
+            "contour_mode": contour_mode,
+            "contour_levels": contour_levels,
         }.items()
         if v is not None
     }
@@ -236,6 +245,38 @@ def _apply_initial_filters(
     return spots_
 
 
+def _compute_contour_levels(z_smooth: np.ndarray, mode: str, n_levels: int) -> np.ndarray:
+    """Compute monotonic contour levels for a density map under different spacings.
+
+    - linear: evenly spaced in value
+    - log: evenly spaced in log10(value); requires positive min; uses a tiny floor if needed
+    - sqrt: evenly spaced in sqrt(value) then squared back
+    """
+    z = np.asarray(z_smooth, dtype=float)
+    vmin = float(np.nanmin(z))
+    vmax = float(np.nanmax(z))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or np.isclose(vmin, vmax):
+        # Fallback: Matplotlib will error on degenerate levels; caller guards earlier too
+        return np.linspace(vmin, vmax + 1e-12, n_levels)
+
+    if mode == "linear":
+        return np.linspace(vmin, vmax, n_levels)
+    if mode == "sqrt":
+        vmin_clamped = max(vmin, 0.0)
+        return np.linspace(np.sqrt(vmin_clamped), np.sqrt(vmax), n_levels) ** 2
+    if mode == "log":
+        # Ensure strictly positive lower bound; pick smallest positive or a small fraction of vmax
+        positive = z[z > 0]
+        if positive.size == 0:
+            # If all non-positive, fall back to linear
+            return np.linspace(vmin, vmax, n_levels)
+        lo = float(np.min(positive))
+        # Guard extremely tiny lower bound to avoid exploding ranges
+        lo = max(lo, vmax * 1e-6)
+        return 10 ** np.linspace(np.log10(lo), np.log10(vmax), n_levels)
+    raise ValueError(f"Unsupported contour mode: {mode}")
+
+
 def _calculate_density_map(
     spots_: pl.DataFrame,
     params: SpotThresholdParams,
@@ -303,7 +344,8 @@ def _calculate_density_map(
     if np.isclose(vmax, 0.0):
         vmax = 1e-6
     im = ax.pcolormesh(X, Y, Z, shading="auto", vmin=0, vmax=vmax)  # Z is intentional to show raw values.
-    contours = ax.contour(X, Y, Z_smooth, levels=50, colors="white", alpha=0.5, linewidths=0.5)
+    levels = _compute_contour_levels(Z_smooth, params.contour_mode, params.contour_levels)
+    contours = ax.contour(X, Y, Z_smooth, levels=levels, colors="white", alpha=0.5, linewidths=0.5)
     ax.set_xlabel("Area")
     ax.set_ylabel("Norm * (1 - Distance) [log10]")
     title_metric = "Blank Count" if metric == "count" else "Blank Proportion"
@@ -426,6 +468,8 @@ def _save_threshold_plot(
     ax1.set_xlabel("Threshold Contour Level")
     ax1.set_ylabel("Number of Spots", color="g")
     ax1.tick_params(axis="y", labelcolor="g")
+    # Use SI-prefix formatting without spaces and without unnecessary trailing .0
+    ax1.yaxis.set_major_formatter(si_tick_formatter())
     ax1.set_ylim(0, None)  # type: ignore[arg-type]
 
     ax2 = ax1.twinx()
@@ -470,11 +514,13 @@ def _save_combined_threshold_plot(
 
     ax1.set_xlabel("Threshold Contour Level")
     ax1.set_ylabel("Number of Spots")
+    # Apply SI-prefix formatting without spaces and without unnecessary trailing .0
+    ax1.yaxis.set_major_formatter(si_tick_formatter())
     ax2.set_ylabel("Blank Proportion")
     ax1.set_title(f"Threshold Selection Curves | Codebook {codebook}")
 
     legend1 = ax1.legend(handles=roi_handles, title="ROI", loc="upper right")
-    legend2 = ax1.legend(handles=style_handles, title="Line Style", loc="lower left")
+    legend2 = ax1.legend(handles=style_handles, title=None, loc="lower right")
     ax1.add_artist(legend1)
 
     fig.tight_layout()
@@ -655,6 +701,12 @@ def _generate_final_outputs(
 @click.option("--min-norm", type=float, help="Minimum norm filter applied before density analysis")
 @click.option("--distance-threshold", type=float, help="Override distance threshold")
 @click.option("--seed", type=int, help="Override random seed")
+@click.option(
+    "--contour-mode",
+    type=click.Choice(["linear", "log", "sqrt"], case_sensitive=False),
+    help="Spacing mode for density contours",
+)
+@click.option("--contour-levels", type=int, help="Number of contour levels")
 def threshold(
     path: Path,
     codebook_path: Path,
@@ -667,6 +719,8 @@ def threshold(
     min_norm: float | None = None,
     distance_threshold: float | None = None,
     seed: int | None = None,
+    contour_mode: str | None = None,
+    contour_levels: int | None = None,
 ):
     """
     Process spot data for each ROI individually with an interactive threshold selection step.
@@ -694,6 +748,8 @@ def threshold(
         min_norm=min_norm,
         distance_threshold=distance_threshold,
         seed=seed,
+        contour_mode=contour_mode.lower() if contour_mode else None,
+        contour_levels=contour_levels,
     )
     logger.debug(
         "Using analysis parameters: seed=%s, area=[%.3f, %.3f], norm_threshold=%.4f, min_norm=%s",

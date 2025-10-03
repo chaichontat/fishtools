@@ -283,6 +283,10 @@ class SpotThresholdParams(BaseModel):
         default="proportion",
         description="Density map value: raw blank counts or blank proportion",
     )
+    contour_mode: Literal["linear", "log", "sqrt"] = Field(
+        default="linear", description="Spacing of density contour levels"
+    )
+    contour_levels: int = Field(default=50, gt=1, description="Number of contour levels")
 
     # Reproducibility
     seed: int = Field(default=0, ge=0, description="Random seed")

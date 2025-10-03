@@ -3,8 +3,8 @@
 This module provides queue-managed worker orchestration that allows the
 existing single-GPU deconvolution codepath to remain untouched while enabling
 future dynamic scheduling across multiple CUDA devices. Each worker process
-requests new work units from the main process once it consumes one item,
-allowing faster GPUs to receive more tiles without static sharding.
+pipelines read/compute/write so the GPU is continuously fed; faster GPUs pull
+more tiles without static sharding.
 """
 
 from __future__ import annotations
@@ -15,9 +15,10 @@ import json
 import multiprocessing as mp
 import os
 import pickle
-import queue
+import queue as pyqueue
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -28,7 +29,6 @@ import cupy as cp
 import numpy as np
 import rich_click as click
 import tifffile
-from basicpy import BaSiC
 from loguru import logger
 
 from fishtools.preprocess.deconv.normalize import quantize_global
@@ -47,10 +47,8 @@ FORBIDDEN_PREFIXES = ("10x", "analysis", "shifts", "fid", "registered", "old", "
 
 def _configure_logging(debug: bool, *, process_label: str) -> None:
     """Configure loguru output consistently for the CLI surface."""
-
     logger.remove()
     logger.configure(extra={"process_label": process_label})
-
     prefix = "[P{extra[process_label]}]"
     if debug:
         log_format = (
@@ -67,7 +65,7 @@ def _configure_logging(debug: bool, *, process_label: str) -> None:
 def _round_sort_key(round_name: str) -> tuple[bool, str]:
     head = round_name.split("_")[0]
     if head.isdigit():
-        return (True, f"{int(head):02d}")
+        return (True, f"{int(head):08d}_{round_name}")
     return (False, round_name)
 
 
@@ -96,11 +94,36 @@ class TileProcessor(Protocol):
     def setup(self) -> None:  # pragma: no cover - thin interface
         """Initialize GPU resources. Called once per worker."""
 
-    def process(self, path: Path) -> float:  # pyright: ignore[reportReturnType]
-        """Process a single file path and return the elapsed seconds."""
-
     def teardown(self) -> None:  # pragma: no cover - thin interface
         """Release resources prior to worker exit."""
+
+    # Pipeline steps (used by the multi-threaded worker loop)
+    def read_tile(
+        self, path: Path
+    ) -> tuple[Path, np.ndarray, np.ndarray, dict[str, Any], tuple[int, int], int]:
+        """Read TIFF, split fid/payload, reshape payload to (-1,C,H,W) float32 on CPU."""
+        ...
+
+    def compute_tile(
+        self,
+        payload_np: np.ndarray,
+        path: Path,
+        hw: tuple[int, int],
+    ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, Any] | None, dict[str, float]]:
+        """Run GPU BaSiC + deconvolution + (optional) quantize/hist; return artifacts & timings."""
+        ...
+
+    def write_tile(
+        self,
+        path: Path,
+        fid_np: np.ndarray,
+        metadata_out: dict[str, Any],
+        towrite_u16: np.ndarray | None,
+        f32_payload: np.ndarray | None,
+        hist_payload: dict[str, Any] | None,
+    ) -> float:
+        """Write TIFF/CSV artifacts; return write seconds."""
+        ...
 
 
 ProcessorFactory = Callable[[int], TileProcessor]
@@ -121,8 +144,8 @@ class ProcessorConfig:
     debug: bool
 
 
-class DeconvolutionTileProcessor(TileProcessor):
-    """Concrete processor mirroring the single-GPU `_run` pipeline."""
+class DeconvolutionTileProcessor:
+    """Concrete processor with split read/compute/write for pipelining."""
 
     def __init__(self, config: ProcessorConfig, *, device_id: int | None = None):
         self.config = config
@@ -143,7 +166,7 @@ class DeconvolutionTileProcessor(TileProcessor):
             loaded = pickle.loads(pkl_path.read_bytes())
             basic = loaded.get("basic") if isinstance(loaded, dict) else loaded
             if not hasattr(basic, "darkfield") or not hasattr(basic, "flatfield"):
-                raise TypeError("Basic profile payload must expose 'darkfield' and 'flatfield' attributes.")
+                raise TypeError("BaSiC payload must expose 'darkfield' and 'flatfield'.")
             dark = np.asarray(basic.darkfield, dtype=np.float32)
             flat = np.asarray(basic.flatfield, dtype=np.float32)
             if dark.shape != flat.shape:
@@ -151,9 +174,7 @@ class DeconvolutionTileProcessor(TileProcessor):
             if reference_shape is None:
                 reference_shape = dark.shape
             elif dark.shape != reference_shape:
-                raise ValueError(
-                    "Inconsistent BaSiC profile geometry detected; all dark/flat fields must match."
-                )
+                raise ValueError("Inconsistent BaSiC profile geometry; all dark/flat fields must match.")
             if not np.all(np.isfinite(flat)) or np.any(flat <= 0):
                 raise ValueError(f"Invalid flatfield values encountered in {pkl_path}.")
             if not np.all(np.isfinite(dark)):
@@ -162,7 +183,7 @@ class DeconvolutionTileProcessor(TileProcessor):
             flats.append(flat)
 
         if not darks or not flats:
-            raise ValueError("No BaSiC profiles were loaded; cannot continue.")
+            raise ValueError("No BaSiC profiles were loaded.")
 
         darkfield_np = np.stack(darks, axis=0)[np.newaxis, ...].astype(np.float32, copy=False)
         flatfield_np = np.stack(flats, axis=0)[np.newaxis, ...].astype(np.float32, copy=False)
@@ -171,6 +192,10 @@ class DeconvolutionTileProcessor(TileProcessor):
 
     def setup(self) -> None:
         from fishtools.preprocess.cli_deconv import projectors
+
+        # Memory pools to reduce alloc/free overhead.
+        cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
+        cp.cuda.set_pinned_memory_allocator(cp.cuda.PinnedMemoryPool().malloc)
 
         self._load_basics()
         self._projectors = projectors(self.config.step)
@@ -184,22 +209,12 @@ class DeconvolutionTileProcessor(TileProcessor):
         self._flatfield = None
         self._projectors = None
 
-    # -- Core processing ----------------------------------------------------------
-    def process(self, path: Path) -> float:
-        from fishtools.preprocess.cli_deconv import deconvolve_lucyrichardson_guo
+    # ------------------- Pipeline stages -------------------
 
-        if self._darkfield is None or self._flatfield is None or self._projectors is None:
-            raise RuntimeError("Processor not initialised; call setup() before process().")
-
-        start = time.perf_counter()
-        read_elapsed = 0.0
-        basic_elapsed = 0.0
-        deconv_elapsed = 0.0
-        quant_elapsed = 0.0
-        write_elapsed = 0.0
-
-        logger.debug(f"[{path.name}] START Read/Pre-process")
-
+    def read_tile(
+        self, path: Path
+    ) -> tuple[Path, np.ndarray, np.ndarray, dict[str, Any], tuple[int, int], int]:
+        """Disk read + split fid/payload + reshape CPU payload to (-1,C,H,W) float32."""
         read_start = time.perf_counter()
         with tifffile.TiffFile(path) as tif:
             try:
@@ -231,63 +246,71 @@ class DeconvolutionTileProcessor(TileProcessor):
         plane_count = int(np.prod(payload.shape[:-2]))
         if plane_count % channels != 0:
             raise ValueError(
-                f"{path} has {plane_count} payload planes which is not divisible by the {channels} BaSiC channel(s)."
+                f"{path} has {plane_count} payload planes not divisible by {channels} BaSiC channel(s)."
             )
 
         try:
             nofid = payload.reshape(-1, channels, height, width).astype(np.float32, copy=False)
         except ValueError as exc:
             raise ValueError(
-                f"{path} has unexpected shape {payload.shape} for {channels} channels after removing {n_fids} fiducial slice(s)."
+                f"{path} unexpected shape {payload.shape} for {channels} channel(s) after removing {n_fids} fid slice(s)."
             ) from exc
 
-        nofid_gpu = cp.asarray(nofid)
-        logger.debug(
-            f"[{path.name}] Loaded payload with {nofid_gpu.shape[0]} block(s) and {channels} channel(s)."
-        )
+        return path, nofid, fid, metadata, (height, width), channels
 
-        basic_start = time.perf_counter()
-        nofid_gpu -= self._darkfield
-        nofid_gpu /= self._flatfield
-        cp.clip(nofid_gpu, 0, None, out=nofid_gpu)
+    def compute_tile(
+        self,
+        payload_np: np.ndarray,
+        path: Path,
+        hw: tuple[int, int],
+    ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, Any] | None, dict[str, float]]:
+        """GPU BaSiC, deconvolution and optional quantize/hist+copy."""
+        from fishtools.preprocess.cli_deconv import deconvolve_lucyrichardson_guo
 
+        # Ensure the compute thread is bound to the right device.
+        if self._device_id is not None:
+            cp.cuda.Device(self._device_id).use()
+
+        H, W = hw
+        timings: dict[str, float] = {}
+        t0 = time.perf_counter()
+
+        # H2D + BaSiC
+        t_basic0 = time.perf_counter()
+        x = cp.asarray(payload_np)
+        x -= self._darkfield  # type: ignore[operator]
+        x /= self._flatfield  # type: ignore[operator]
+        cp.clip(x, 0, None, out=x)
         if self.config.debug:
             cp.cuda.runtime.deviceSynchronize()
-        basic_elapsed = time.perf_counter() - basic_start
-        logger.debug(f"[{path.name}] BaSiC correction took: {basic_elapsed:.4f}s")
+        timings["basic"] = time.perf_counter() - t_basic0
 
+        # Deconvolution
+        t_dec0 = time.perf_counter()
+        res = deconvolve_lucyrichardson_guo(x, self._projectors, iters=1)  # type: ignore[arg-type]
         if self.config.debug:
             cp.cuda.runtime.deviceSynchronize()
+        timings["deconv"] = time.perf_counter() - t_dec0
 
-        deconv_start = time.perf_counter()
-        res = deconvolve_lucyrichardson_guo(nofid_gpu, self._projectors, iters=1)
-
-        if self.config.debug:
-            cp.cuda.runtime.deviceSynchronize()
-        deconv_elapsed = time.perf_counter() - deconv_start
-        logger.debug(f"[{path.name}] Deconvolution kernel took: {deconv_elapsed:.4f}s")
-
+        # Quantization / float32 / histogram
         towrite_u16: np.ndarray | None = None
-        if not self.config.save_float32:
-            if self.config.m_glob is None or self.config.s_glob is None:
-                raise ValueError("Global scaling not provided for quantisation path")
-            quant_start = time.perf_counter()
-            towrite_u16 = quantize_global(
-                res,
-                self.config.m_glob,
-                self.config.s_glob,
-                i_max=65535,
-                return_stats=False,
-                as_numpy=True,
-            )
-            quant_elapsed = time.perf_counter() - quant_start
-            logger.debug(f"[{path.name}] Quantization took: {quant_elapsed:.4f}s")
-
         f32_payload: np.ndarray | None = None
         hist_payload: dict[str, Any] | None = None
 
+        if not self.config.save_float32:
+            if self.config.m_glob is None or self.config.s_glob is None:
+                raise ValueError("Global scaling not provided for quantisation path.")
+            t_quant0 = time.perf_counter()
+            towrite_u16 = quantize_global(
+                res, self.config.m_glob, self.config.s_glob, i_max=65535, return_stats=False, as_numpy=True
+            )
+            timings["quant"] = time.perf_counter() - t_quant0
+        else:
+            timings["quant"] = 0.0
+
         if self.config.save_float32 or self.config.save_histograms:
-            reshaped = res.reshape(-1, height, width)
+            t_post0 = time.perf_counter()
+            reshaped = res.reshape(-1, H, W)
             f32_payload = cp.asnumpy(reshaped).astype(np.float32, copy=False)
 
             if self.config.save_histograms:
@@ -299,9 +322,9 @@ class DeconvolutionTileProcessor(TileProcessor):
                 counts_list: list[np.ndarray] = []
                 edges_list: list[np.ndarray] = []
                 SZ, SY, SX = 4, 2, 2
-                off_z = rng.integers(SZ) if SZ > 1 else 0
-                off_y = rng.integers(SY) if SY > 1 else 0
-                off_x = rng.integers(SX) if SX > 1 else 0
+                off_z = int(rng.integers(SZ)) if SZ > 1 else 0
+                off_y = int(rng.integers(SY)) if SY > 1 else 0
+                off_x = int(rng.integers(SX)) if SX > 1 else 0
 
                 mins_ch = cp.min(res[off_z::SZ, :, off_y::SY, off_x::SX], axis=(0, 2, 3))
                 maxs_ch = cp.max(res[off_z::SZ, :, off_y::SY, off_x::SX], axis=(0, 2, 3))
@@ -328,31 +351,40 @@ class DeconvolutionTileProcessor(TileProcessor):
                     "sampled_per_channel": n_samp,
                     "tile_shape": tuple(int(x) for x in res.shape),
                 }
+            timings["post"] = time.perf_counter() - t_post0
+        else:
+            timings["post"] = 0.0
 
-        # All GPU work complete; release arrays before CPU writes
+        # release GPU intermediates as early as possible
         del res
-        del nofid_gpu
+        del x
 
+        return towrite_u16, f32_payload, hist_payload, timings
+
+    def write_tile(
+        self,
+        path: Path,
+        fid_np: np.ndarray,
+        metadata_out: dict[str, Any],
+        towrite_u16: np.ndarray | None,
+        f32_payload: np.ndarray | None,
+        hist_payload: dict[str, Any] | None,
+    ) -> float:
+        """Blocking disk writes."""
         out_dir = self.config.output_dir / path.parent.name
         out_dir.mkdir(parents=True, exist_ok=True)
-        write_start = time.perf_counter()
+        t0 = time.perf_counter()
 
-        metadata_out = metadata.copy()
         if towrite_u16 is not None:
-            metadata_out |= {
-                "deconv_min": list(map(float, self.config.m_glob.flatten())),
-                "deconv_scale": list(map(float, self.config.s_glob.flatten())),
-                "prenormalized": True,
-            }
             json_path = (out_dir / path.name).with_suffix(".deconv.json")
             json_path.write_text(json.dumps(metadata_out, indent=2))
-
-            deliverable = np.concatenate([towrite_u16, fid.astype(np.uint16, copy=False)], axis=0)
+            deliverable = np.concatenate([towrite_u16, fid_np.astype(np.uint16, copy=False)], axis=0)
+            # Use named codec instead of magic number
             tifffile.imwrite(
                 out_dir / path.name,
                 deliverable,
-                compression=22610,
-                compressionargs={"level": 0.75},
+                compression="zstd",
+                compressionargs={"level": 9},
                 metadata=metadata_out,
             )
 
@@ -364,10 +396,10 @@ class DeconvolutionTileProcessor(TileProcessor):
                     sub32 / path.name,
                     f32_payload,
                     dtype=np.float32,
-                    metadata={"dtype": "float32", **metadata},
+                    metadata={"dtype": "float32", **metadata_out},
                     compression="zlib",
+                    compressionargs={"level": 6},
                 )
-
             if self.config.save_histograms and hist_payload is not None:
                 hist_path = (sub32 / path.name).with_suffix(".histogram.csv")
                 with open(hist_path, "w", newline="") as fh:
@@ -381,34 +413,9 @@ class DeconvolutionTileProcessor(TileProcessor):
                         edges = edges_list[c]
                         counts = counts_list[c]
                         for b in range(bins):
-                            writer.writerow([
-                                c,
-                                f"{edges[b]:.8g}",
-                                f"{edges[b + 1]:.8g}",
-                                int(counts[b]),
-                            ])
+                            writer.writerow([c, f"{edges[b]:.8g}", f"{edges[b + 1]:.8g}", int(counts[b])])
 
-        if self.config.debug:
-            cp.cuda.runtime.deviceSynchronize()
-        write_elapsed = time.perf_counter() - write_start
-        logger.debug(f"[{path.name}] Write stage took: {write_elapsed:.4f}s")
-        total_elapsed = time.perf_counter() - start
-
-        gpu_elapsed = basic_elapsed + deconv_elapsed + quant_elapsed
-        bottleneck_label, bottleneck_value = max(
-            ("read", read_elapsed),
-            ("gpu", gpu_elapsed),
-            ("write", write_elapsed),
-            key=lambda item: item[1],
-        )
-        gpu_label = f"GPU{self._device_id}" if self._device_id is not None else "GPU?"
-        logger.info(
-            f"[{gpu_label}] {path.name}: read={read_elapsed:.2f}s gpu={gpu_elapsed:.2f}s "
-            f"write={write_elapsed:.2f}s total={total_elapsed:.2f}s "
-            f"bottleneck={bottleneck_label} ({bottleneck_value:.2f}s)"
-        )
-
-        return total_elapsed
+        return time.perf_counter() - t0
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,7 +423,8 @@ class _ProcessorFactory:
     config: ProcessorConfig
 
     def __call__(self, device_id: int) -> TileProcessor:
-        return DeconvolutionTileProcessor(self.config, device_id=device_id)
+        proc = DeconvolutionTileProcessor(self.config, device_id=device_id)
+        return proc
 
 
 def make_processor_factory(config: ProcessorConfig) -> ProcessorFactory:
@@ -433,7 +441,6 @@ def make_processor_factory(config: ProcessorConfig) -> ProcessorFactory:
         s_glob=None if config.s_glob is None else np.asarray(config.s_glob, dtype=np.float32),
         debug=config.debug,
     )
-
     return _ProcessorFactory(safe_config)
 
 
@@ -475,7 +482,6 @@ def filter_pending_files(
     if save_float32 or save_histograms:
         result: list[Path] = []
         out32 = out_dir.parent / "deconv32"
-
         for file in files:
             sub32 = out32 / file.parent.name
             targets: list[Path] = []
@@ -592,9 +598,7 @@ def multi_prepare(
         if inferred:
             logger.info(f"[{round_name}] Using PSF step={step} from waveform metadata.")
         else:
-            logger.warning(
-                f"[{round_name}] Could not determine PSF step from metadata; defaulting to step={step}."
-            )
+            logger.warning(f"[{round_name}] Could not determine PSF step; defaulting to step={step}.")
 
         channels = get_channels(files[0])
         basic_paths = resolve_basic_paths(
@@ -728,10 +732,7 @@ def multi_batch(
 
         channels = get_channels(files[0])
         basic_paths = resolve_basic_paths(
-            path,
-            round_name=round_name,
-            channels=channels,
-            basic_name=basic_name,
+            path, round_name=round_name, channels=channels, basic_name=basic_name
         )
 
         m_glob, s_glob = load_global_scaling(path, round_name)
@@ -749,10 +750,7 @@ def multi_batch(
             continue
 
         logger.info(
-            "[{}] {}/{} tile(s) pending after overwrite checks.",
-            round_name,
-            len(pending),
-            len(files),
+            "[{}] {}/{} tile(s) pending after overwrite checks.", round_name, len(pending), len(files)
         )
 
         config = ProcessorConfig(
@@ -856,12 +854,7 @@ def multi_run(
     logger.info(f"Using {path / 'basic'}/{basic_token}-*.pkl for BaSiC")
 
     channels = get_channels(files[0])
-    basic_paths = resolve_basic_paths(
-        path,
-        round_name=name,
-        channels=channels,
-        basic_name=basic_token,
-    )
+    basic_paths = resolve_basic_paths(path, round_name=name, channels=channels, basic_name=basic_token)
 
     m_glob, s_glob = load_global_scaling(path, name)
 
@@ -877,13 +870,8 @@ def multi_run(
         logger.info("All tiles already processed; nothing to do.")
         return
 
-    logger.info(
-        "{}/{} tile(s) pending after overwrite checks.",
-        len(pending),
-        len(files),
-    )
+    logger.info("{}/{} tile(s) pending after overwrite checks.", len(pending), len(files))
 
-    # Determine PSF step from metadata if available
     step, inferred = infer_psf_step(pending[0])
     if inferred:
         logger.info(f"[{name}] Using PSF step={step} from metadata.")
@@ -946,7 +934,6 @@ class WorkerMessage:
 
 def parse_device_spec(spec: str | Sequence[int] | None) -> list[int]:
     """Resolve a device specification into explicit CUDA device indices."""
-
     visible_env = os.environ.get("CUDA_VISIBLE_DEVICES")
     visible_mask: list[int] | None = None
     if visible_env:
@@ -1006,52 +993,142 @@ def _worker_loop(
     processor = processor_factory(device_id)
     processor.setup()
 
-    try:
+    # Inter-thread queues and coordination
+    STOP = object()
+    q_in: "pyqueue.Queue[tuple[Path, np.ndarray, np.ndarray, dict[str, Any], tuple[int, int]] | object]" = (
+        pyqueue.Queue(maxsize=2)
+    )  # read -> compute
+    q_out: "pyqueue.Queue[tuple[Path, np.ndarray, dict[str, Any], np.ndarray | None, np.ndarray | None, dict[str, Any] | None, dict[str, float]] | object]" = pyqueue.Queue(
+        maxsize=2
+    )  # compute -> write
+    stop_evt = threading.Event()
+
+    def reader() -> None:
         # Prime dispatcher credits
         for _ in range(queue_depth):
             request_queue.put(worker_id)
 
-        while True:
-            try:
-                item = task_queue.get()
-            except (EOFError, OSError):
+        try:
+            while not stop_evt.is_set():
+                try:
+                    item = task_queue.get()
+                except (EOFError, OSError):
+                    break
+                if item is None:
+                    break
+                # Immediately request another item to maintain queue depth
+                request_queue.put(worker_id)
+                try:
+                    path, nofid, fid, metadata, hw, _ = processor.read_tile(item)
+                except Exception as exc:  # noqa: BLE001
+                    import traceback
+
+                    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                    result_queue.put(
+                        WorkerMessage(worker_id=worker_id, path=item, status="error", duration=None, error=tb)
+                    )
+                    if stop_on_error:
+                        stop_evt.set()
+                        break
+                    else:
+                        continue
+                q_in.put((path, nofid, fid, metadata, hw))
+        finally:
+            q_in.put(STOP)
+
+    def compute() -> None:
+        cp.cuda.Device(device_id).use()
+        while not stop_evt.is_set():
+            job = q_in.get()
+            if job is STOP:
+                q_out.put(STOP)
                 break
-
-            if item is None:  # Sentinel
-                break
-
-            # Request another item immediately to maintain queue_depth credits.
-            request_queue.put(worker_id)
-
-            start = time.perf_counter()
+            path, nofid, fid_np, metadata, hw = job
+            t0 = time.perf_counter()
             try:
-                duration = processor.process(item)
+                towrite_u16, f32_payload, hist_payload, t_dict = processor.compute_tile(nofid, path, hw)
+                # Extend metadata with global scaling if we wrote u16
+                if towrite_u16 is not None:
+                    assert processor.config.m_glob is not None and processor.config.s_glob is not None
+                    scaling = {
+                        "deconv_min": list(map(float, processor.config.m_glob.flatten())),
+                        "deconv_scale": list(map(float, processor.config.s_glob.flatten())),
+                        "prenormalized": True,
+                    }
+                    metadata_out = metadata | scaling
+                else:
+                    metadata_out = metadata.copy()
+                elapsed = time.perf_counter() - t0
+                t_gpu = (
+                    t_dict.get("basic", 0.0)
+                    + t_dict.get("deconv", 0.0)
+                    + t_dict.get("quant", 0.0)
+                    + t_dict.get("post", 0.0)
+                )
+                logger.info(
+                    f"[GPU{device_id}] {path.name}: gpu={t_gpu:.2f}s (basic={t_dict.get('basic', 0.0):.2f}+"
+                    f"dec={t_dict.get('deconv', 0.0):.2f}+quant={t_dict.get('quant', 0.0):.2f}+post={t_dict.get('post', 0.0):.2f})"
+                    f" stage_total={elapsed:.2f}s"
+                )
+                q_out.put((path, fid_np, metadata_out, towrite_u16, f32_payload, hist_payload, t_dict))
             except Exception as exc:  # noqa: BLE001
-                duration = time.perf_counter() - start
                 import traceback
 
                 tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
                 result_queue.put(
-                    WorkerMessage(
-                        worker_id=worker_id,
-                        path=item,
-                        status="error",
-                        duration=duration,
-                        error=tb,
-                    )
+                    WorkerMessage(worker_id=worker_id, path=path, status="error", duration=None, error=tb)
                 )
                 if stop_on_error:
+                    stop_evt.set()
+                    q_out.put(STOP)
                     break
-            else:
-                elapsed = duration if duration is not None else time.perf_counter() - start
-                result_queue.put(
-                    WorkerMessage(
-                        worker_id=worker_id,
-                        path=item,
-                        status="ok",
-                        duration=elapsed,
-                    )
+            finally:
+                # help GC
+                del nofid
+
+    def writer() -> None:
+        while True:
+            job = q_out.get()
+            if job is STOP:
+                break
+            path, fid_np, metadata_out, towrite_u16, f32_payload, hist_payload, t_dict = job
+            try:
+                t_write = processor.write_tile(
+                    path, fid_np, metadata_out, towrite_u16, f32_payload, hist_payload
                 )
+                t_gpu = (
+                    t_dict.get("basic", 0.0)
+                    + t_dict.get("deconv", 0.0)
+                    + t_dict.get("quant", 0.0)
+                    + t_dict.get("post", 0.0)
+                )
+                logger.debug(f"[{path.name}] Write stage took: {t_write:.4f}s")
+                result_queue.put(
+                    WorkerMessage(worker_id=worker_id, path=path, status="ok", duration=t_gpu + t_write)
+                )
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+
+                tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+                result_queue.put(
+                    WorkerMessage(worker_id=worker_id, path=path, status="error", duration=None, error=tb)
+                )
+                if stop_on_error:
+                    stop_evt.set()
+                    break
+
+    t_reader = threading.Thread(target=reader, name="reader", daemon=True)
+    t_compute = threading.Thread(target=compute, name="compute", daemon=True)
+    t_writer = threading.Thread(target=writer, name="writer", daemon=True)
+
+    try:
+        t_reader.start()
+        t_compute.start()
+        t_writer.start()
+        # Block until threads finish (stop_evt and sentinels handle shutdown)
+        t_reader.join()
+        t_compute.join()
+        t_writer.join()
     finally:
         processor.teardown()
         result_queue.put(WorkerMessage(worker_id=worker_id, path=None, status="stopped"))
@@ -1073,10 +1150,8 @@ def run_multi_gpu(
     ``queue_depth`` outstanding paths per worker. Faster GPUs therefore receive
     more work without explicit sharding.
     """
-
     if queue_depth <= 0:
         raise ValueError("queue_depth must be positive")
-
     if not files:
         return []
 
@@ -1125,7 +1200,7 @@ def run_multi_gpu(
         while active_workers:
             try:
                 wid = request_queue.get(timeout=1.0)
-            except queue.Empty:
+            except pyqueue.Empty:
                 for proc in worker_processes:
                     if not proc.is_alive():
                         active_workers.discard(worker_processes.index(proc))
@@ -1154,7 +1229,7 @@ def run_multi_gpu(
             while True:
                 try:
                     message = result_queue.get_nowait()
-                except queue.Empty:
+                except pyqueue.Empty:
                     break
                 if message.path is not None:
                     assigned_list = assigned.get(message.worker_id, [])
@@ -1177,21 +1252,21 @@ def run_multi_gpu(
                 elif message.status == "stopped":
                     active_workers.discard(message.worker_id)
     finally:
-        # Deliver sentinel messages without risking deadlocks
+        # Ensure clean shutdown without deadlocks
         for proc, task_queue in zip(worker_processes, task_queues):
             if proc.is_alive():
                 try:
                     task_queue.put_nowait(None)
-                except queue.Full:
+                except pyqueue.Full:
                     try:
                         task_queue.close()
                         task_queue.cancel_join_thread()
-                    except Exception:  # pragma: no cover - best-effort cleanup
+                    except Exception:  # pragma: no cover
                         pass
             else:
                 try:
                     task_queue.close()
-                except Exception:  # pragma: no cover - best-effort cleanup
+                except Exception:  # pragma: no cover
                     pass
 
         for proc in worker_processes:
@@ -1201,11 +1276,11 @@ def run_multi_gpu(
                 proc.terminate()
                 proc.join(timeout=5.0)
 
-        # Drain any remaining results
+        # Drain remaining results
         while True:
             try:
                 message = result_queue.get_nowait()
-            except queue.Empty:
+            except pyqueue.Empty:
                 break
             if progress_callback is not None:
                 progress_callback(message)
@@ -1269,7 +1344,6 @@ def prepare(
     stop_on_error: bool,
 ) -> None:
     """Sample tiles and emit float32 + histogram artifacts using multi-GPU workers."""
-
     _configure_logging(debug, process_label="0")
     if debug:
         logger.info("DEBUG mode enabled. Detailed profiling logs will be generated.")
@@ -1332,7 +1406,6 @@ def batch(
     stop_on_error: bool,
 ) -> None:
     """Run multi-GPU deconvolution over rounds/ROIs."""
-
     _configure_logging(debug, process_label="0")
     if debug:
         logger.info("DEBUG mode enabled. Detailed profiling logs will be generated.")
@@ -1393,7 +1466,6 @@ def run(
     stop_on_error: bool,
 ) -> None:
     """Multi-GPU equivalent of the legacy `deconv run` command."""
-
     _configure_logging(debug, process_label="0")
     if debug:
         logger.info("DEBUG mode enabled. Detailed profiling logs will be generated.")
