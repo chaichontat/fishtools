@@ -28,9 +28,10 @@ import zarr
 from loguru import logger
 from PIL import Image
 from tifffile import imwrite
+from time import perf_counter
 
 from fishtools import IMWRITE_KWARGS
-from fishtools.utils.io import Workspace
+from fishtools.io.workspace import Workspace
 from fishtools.utils.utils import setup_logging
 
 setup_logging()
@@ -44,6 +45,10 @@ DEFAULT_ITERATIONS: tuple[int, ...] = (50, 50, 30, 20)
 QUANT_LOWER_PERCENTILE = 0.01
 QUANT_UPPER_PERCENTILE = 99.99
 QUANT_MIN_RANGE = 1e-6
+# Add a small headroom above the chosen upper percentile so that
+# a tiny fraction of very bright pixels do not saturate to 0xFFFF.
+# This does not change the recorded percentile but widens the scale used.
+QUANT_HEADROOM_FRACTION = 0.02  # 2% extra width beyond (upper - lower)
 
 # --- Utilities ---------------------------------------------------------------
 
@@ -226,7 +231,9 @@ def _quantize_to_uint16(data: np.ndarray, params: QuantizationParams) -> np.ndar
     dtype_info = np.iinfo(np.uint16)
     lower = params.lower
     upper = params.upper
-    scale = dtype_info.max / max(upper - lower, QUANT_MIN_RANGE)
+    width = max(upper - lower, QUANT_MIN_RANGE)
+    # Widen the mapping range by a small headroom to reduce saturation.
+    scale = dtype_info.max / (width * (1.0 + QUANT_HEADROOM_FRACTION))
     scaled = np.clip((_ensure_float32(data) - lower) * scale, 0.0, dtype_info.max)
     return np.round(scaled).astype(np.uint16)
 
@@ -492,72 +499,72 @@ def compute_correction_field(
     if image_yx.ndim != 2:
         raise ValueError(f"N4 expects a 2D YX image; received shape {image_yx.shape}")
     if shrink < 1:
-        raise ValueError("Shrink factor must be >= 1")
+        raise ValueError("shrink must be >= 1")
+    if spline_lowres_px <= 0:
+        raise ValueError("spline_lowres_px must be > 0")
 
-    iterations_list = list(iterations)
+    start_ts = perf_counter()
+    iters = list(iterations)
     logger.info(
-        "Computing N4 correction field (shrink={shrink}, spline_lowres_px={spline}, iterations={iters})",
+        "Starting N4 bias-field estimation (shape={shape}, shrink={shrink}, spline={spline}, iterations={iters})",
+        shape=image_yx.shape,
         shrink=shrink,
         spline=spline_lowres_px,
-        iters=iterations_list,
+        iters=iters,
     )
-
     img_full = sitk.GetImageFromArray(np.asarray(image_yx, dtype=np.float32))
+    # If you know XY spacing, set it here instead of (1,1):
     img_full.SetSpacing((1.0, 1.0))
 
+    # Downsample for fitting
     shrink_factors = [shrink] * img_full.GetDimension()
     img_small = sitk.Shrink(img_full, shrink_factors)
 
-    # Mask is the simplest brittle-free selection: foreground is any positive value.
+    # Foreground/tissue mask on the small image
+    # Start with >0; optionally replace with Otsu on a blurred image for robustness.
     mask_small = sitk.Cast(sitk.Greater(img_small, 0.0), sitk.sitkUInt8)
     if np.asarray(sitk.GetArrayViewFromImage(mask_small)).sum() == 0:
         raise ValueError("Mask is empty after thresholding >0; check the selected channel.")
 
     n4 = sitk.N4BiasFieldCorrectionImageFilter()
-    n4.SetMaximumNumberOfIterations(iterations_list)
+    n4.SetMaximumNumberOfIterations(iters)
 
-    # Translate the desired low-res spline spacing into physical units (SimpleITK requirement).
-    desired_spacing_px = float(spline_lowres_px)
-    if desired_spacing_px <= 0:
-        raise ValueError("spline_lowres_px must be > 0")
+    # Configure B-spline control point grid: spacing in *small-image pixels*
+    # Convert desired pixel spacing (small grid) to physical spacing.
+    spline_order = n4.GetSplineOrder()  # default 3
+    cps: list[int] = []
+    for d in range(img_small.GetDimension()):
+        spacing_phys = img_small.GetSpacing()[d]  # ~shrink
+        desired_phys = float(spline_lowres_px) * spacing_phys
+        physical_len = spacing_phys * img_small.GetSize()[d]
+        mesh = max(1, int(round(physical_len / max(desired_phys, 1e-6))))
+        n_ctrl_dim = mesh + spline_order  # ensures mesh >= 1
+        cps.append(n_ctrl_dim)
+    n4.SetNumberOfControlPoints(cps)  # mesh size = cps - order
 
-    # Configure BSpline grid from desired physical spacing when supported.
-    try:
-        spline_order = n4.GetSplineOrder()
-        control_points: list[int] = []
-        for dim in range(img_small.GetDimension()):
-            physical_len = img_small.GetSpacing()[dim] * img_small.GetSize()[dim]
-            n_ctrl = max(1, int(round(physical_len / desired_spacing_px)))
-            control_points.append(n_ctrl)
-        n4.SetNumberOfControlPoints(control_points)
-        logger.info("Configured N4 control points: {cp}", cp=control_points)
-    except Exception:
-        logger.warning("Failed to set control points; falling back to default spacing")
+    # Run N4 on the downsampled image and reconstruct the log-bias field at full-res
+    _ = n4.Execute(img_small, mask_small)
+    log_bias_full = sitk.Cast(n4.GetLogBiasFieldAsImage(img_full), sitk.sitkFloat32)
+    # GetArrayFromImage returns a writable numpy array; avoids read-only view issues.
+    field = sitk.GetArrayFromImage(sitk.Exp(log_bias_full)).astype(np.float32, copy=False)
 
-    # Run N4 on the downsampled image and mask
-    out_small = n4.Execute(img_small, mask_small)
-    log_bias_small = n4.GetLogBiasFieldAsImage(img_small)
-    field_small = sitk.Exp(log_bias_small)
-
-    # Upsample field to full resolution and normalize to mean 1.0 on foreground
-    field_full = sitk.Expand(field_small, shrink_factors)
-    field = np.asarray(sitk.GetArrayViewFromImage(field_full), dtype=np.float32)
-    field = field[: image_yx.shape[0], : image_yx.shape[1]]
-
-    # Normalize field to mean 1.0 over positive mask of input
-    fg_mask = np.asarray(image_yx > 0, dtype=bool)
+    # Normalize field to ~1.0 on foreground
+    fg_mask = image_yx > 0
     if not np.any(fg_mask):
         raise ValueError("Mask is empty after thresholding >0; check the selected channel.")
-    scale = float(np.mean(field[fg_mask]))
-    if not math.isfinite(scale) or scale <= 0:
+    scale = float(np.nanmedian(field[fg_mask]))  # robust center
+    if not np.isfinite(scale) or scale <= 0:
         scale = 1.0
     field /= scale
-
-    if np.any(field <= 0):
-        # Clamp extremely small or negative values to avoid division issues
-        field = np.maximum(field, np.finfo(np.float32).tiny)
-
-    return field.astype(np.float32, copy=False)
+    # Strict positivity for division stability
+    np.maximum(field, np.finfo(np.float32).tiny, out=field)
+    duration = perf_counter() - start_ts
+    logger.info(
+        "Finished N4 bias-field estimation in {duration:.2f}s (shape={shape})",
+        duration=duration,
+        shape=image_yx.shape,
+    )
+    return field
 
 
 def _validate_correction_field(field: np.ndarray) -> None:
@@ -602,7 +609,9 @@ def _write_multi_channel_field(
     if meta_extra:
         meta.update(meta_extra)
     imwrite(output_path, fields_cyx, dtype=np.float32, **IMWRITE_KWARGS, metadata=meta)
-    logger.info("Wrote correction field stack to {path} with shape {shape}", path=output_path, shape=fields_cyx.shape)
+    logger.info(
+        "Wrote correction field stack to {path} with shape {shape}", path=output_path, shape=fields_cyx.shape
+    )
     return output_path
 
 
