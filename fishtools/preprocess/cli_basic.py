@@ -17,7 +17,7 @@ from tifffile import TiffFile, imread
 
 from fishtools.io.workspace import get_channels
 from fishtools.preprocess.basic import fit_basic, plot_basic
-from fishtools.preprocess.cli_deconv import scale_deconv
+from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.plot import plot_tile_sizes
 from fishtools.preprocess.tileconfig import tiles_at_least_n_steps_from_edges
 
@@ -349,7 +349,7 @@ def run_with_extractor(
         allowed = _allowed_indices_for_roi(roi_dirname)
         idx = _parse_tile_index(f)
         is_interior = allowed is not None and idx is not None and idx in allowed
-        sz = f.lstat().st_size
+        # sz = f.lstat().st_size
         # Consider only positive sizes for percentile logic to prevent zero-valued files from
         # collapsing the threshold and letting edge tiles through inadvertently.
         # is_large = (sz > 0) and (sz >= size_thresh)

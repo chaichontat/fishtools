@@ -34,6 +34,16 @@ from fishtools.preprocess.deconv.core import (
 )
 
 
+@click.group()
+def deconvold() -> None:
+    """3D deconvolution workflows.
+
+    Includes global quantization utilities accessible as:
+    - preprocess deconv precompute
+    - preprocess deconv quantize
+    """
+
+
 def scale_deconv(
     img: np.ndarray,
     idx: int,
@@ -374,7 +384,7 @@ def _safe_delete_origin_dirs(files: list[Path], out: Path) -> None:
     shutil.rmtree(src_dir)
 
 
-@deconv.command()
+@deconvold.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.argument("name", type=str)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
@@ -491,7 +501,7 @@ def run(
         )
 
 
-@deconv.command()
+@deconvold.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.option("--roi", type=str, default=None)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
@@ -642,4 +652,4 @@ def batch(
 
 
 if __name__ == "__main__":
-    deconv()
+    deconvold()

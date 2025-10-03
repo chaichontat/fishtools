@@ -24,6 +24,7 @@ from fishtools.preprocess.deconv.backend import (
 )
 from fishtools.preprocess.deconv.basic_utils import resolve_basic_paths
 from fishtools.preprocess.deconv.discovery import infer_psf_step
+from fishtools.preprocess.deconv.helpers import safe_delete_origin_dirs
 from fishtools.preprocess.deconv.logging_utils import configure_logging
 from fishtools.preprocess.deconv.normalize import load_global_scaling
 from fishtools.preprocess.deconv.worker import (
@@ -535,10 +536,8 @@ def multi_batch(
         )
 
         if delete_origin:
-            from fishtools.preprocess.cli_deconv import _safe_delete_origin_dirs
-
             try:
-                _safe_delete_origin_dirs(files, out_dir)
+                safe_delete_origin_dirs(files, out_dir)
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"[{label}] Failed to delete origin directories: {exc}")
 
@@ -688,10 +687,8 @@ def _run_cli_scope(
         )
 
         if delete_origin:
-            from fishtools.preprocess.cli_deconv import _safe_delete_origin_dirs
-
             try:
-                _safe_delete_origin_dirs(files_to_process, out_dir)
+                safe_delete_origin_dirs(files_to_process, out_dir)
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"[{label}] Failed to delete origin directories: {exc}")
 
