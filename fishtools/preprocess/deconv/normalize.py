@@ -2,19 +2,30 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import cupy as cp
 import matplotlib
 import numpy as np
 import polars as pl
+import rich_click as click
+import tifffile
 from loguru import logger
+
+from fishtools.preprocess.deconv.hist import _quantile_from_hist
+from fishtools.utils.pretty_print import progress_bar
 
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 I_MAX = 2**16 - 1  # use 65535 unless you must reserve it
+
+
+@click.group()
+def cli() -> None:
+    """Utilities for deconvolution normalization."""
+    pass
 
 
 def _rebin_counts_to_global(
@@ -75,29 +86,6 @@ def _rebin_counts_to_global(
                 d_left, d_right = dst_edges[j], dst_edges[j + 1]
 
     return out
-
-
-def _quantile_from_hist(counts: np.ndarray, edges: np.ndarray, q: float) -> float:
-    """
-    Linear CDF interpolation within bins. `counts` length = len(edges)-1.
-    Returns approximate quantile value in the same units as edges.
-    """
-    counts = counts.astype(np.float64, copy=False)
-    total = counts.sum()
-    if total <= 0:
-        return float(edges[0])
-    cdf = np.cumsum(counts) / total
-    mids = 0.5 * (edges[:-1] + edges[1:])
-
-    idx = int(np.searchsorted(cdf, q, side="left"))
-    if idx <= 0:
-        return float(mids[0])
-    if idx >= mids.size:
-        return float(mids[-1])
-    x0, x1 = mids[idx - 1], mids[idx]
-    y0, y1 = cdf[idx - 1], cdf[idx]
-    t = 0.0 if y1 <= y0 else (q - y0) / (y1 - y0)
-    return float(x0 + t * (x1 - x0))
 
 
 def _read_histogram_csv(path: Path) -> dict[int, dict[str, np.ndarray]]:
@@ -286,9 +274,7 @@ def precompute_global_quantization(
                 ax.set_yscale("log")
             # Vertical lines at low/high cutoffs with percentile labels (only if >0)
             if q_lo[i] > 0:
-                ax.axvline(
-                    q_lo[i], color="tab:red", linestyle="--", linewidth=1.2, label=f"low {p_low_pct}%"
-                )
+                ax.axvline(q_lo[i], color="tab:red", linestyle="--", linewidth=1.2, label=f"low {p_low_pct}%")
             if q_hi[i] > 0:
                 ax.axvline(
                     q_hi[i], color="tab:green", linestyle="--", linewidth=1.2, label=f"high {p_high_pct}%"
@@ -312,6 +298,248 @@ def precompute_global_quantization(
         logger.warning(f"[{round_name}] Failed to write histogram plot: {e}")
     logger.info(f"[{round_name}] Wrote global quantization to {out_txt}")
     return m_glob, s_glob
+
+
+def _iter_float32_tiles(
+    workspace: Path,
+    round_name: str,
+    rois: Iterable[str] | None = None,
+) -> Iterable[tuple[str, Path]]:
+    """Yield (roi_name, float32_path) pairs for the requested round."""
+
+    base = workspace / "analysis" / "deconv32"
+    if not base.exists():
+        return
+
+    roi_filter = {r for r in rois} if rois else None
+    pattern = f"{round_name}--*"
+    for roi_dir in sorted(p for p in base.glob(pattern) if p.is_dir()):
+        roi_name = roi_dir.name.split("--", 1)[-1]
+        if roi_filter is not None and roi_name not in roi_filter:
+            continue
+        for tile in sorted(roi_dir.glob(f"{round_name}-*.tif")):
+            if tile.suffix.lower() != ".tif":
+                continue
+            yield roi_name, tile
+
+
+@cli.command("quantize")
+@click.argument("workspace", type=click.Path(path_type=Path))
+@click.argument("round_name", type=str)
+@click.option(
+    "--roi",
+    "rois",
+    multiple=True,
+    help="Restrict quantization to specific ROI names (repeatable).",
+)
+@click.option(
+    "--n-fids",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Number of fiducial planes appended to each raw tile.",
+)
+@click.option(
+    "--overwrite/--no-overwrite",
+    default=False,
+    show_default=True,
+    help="Overwrite existing quantized deliverables.",
+)
+def quantize_cli(
+    workspace: Path,
+    round_name: str,
+    *,
+    rois: tuple[str, ...],
+    n_fids: int,
+    overwrite: bool,
+) -> None:
+    """Quantize float32 deconvolved tiles in analysis/deconv32 to uint16 deliverables."""
+
+    if n_fids <= 0:
+        raise click.BadParameter("--n-fids must be positive.")
+
+    workspace = workspace.resolve()
+    logger.info(f"Workspace: {workspace}")
+
+    scaling_path = workspace / "analysis" / "deconv32" / "deconv_scaling" / f"{round_name}.txt"
+    if not scaling_path.exists():
+        raise click.ClickException(
+            f"Scaling file not found at {scaling_path}. Run precompute_global_quantization first."
+        )
+
+    scaling = np.loadtxt(scaling_path, dtype=np.float32).reshape(2, -1)
+    if scaling.shape[1] == 0:
+        raise click.ClickException(f"Scaling file {scaling_path} is empty or malformed.")
+
+    m_glob = scaling[0]
+    s_glob = scaling[1]
+
+    float32_tiles = list(_iter_float32_tiles(workspace, round_name, rois or None))
+    if not float32_tiles:
+        raise click.ClickException(f"No float32 tiles found for round '{round_name}' in analysis/deconv32.")
+
+    out_root = workspace / "analysis" / "deconv"
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    processed = 0
+    skipped = 0
+
+    with progress_bar(len(float32_tiles)) as advance:
+        for roi_name, float32_path in float32_tiles:
+            rel_dir = float32_path.parent.name
+            output_dir = out_root / rel_dir
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            output_path = output_dir / float32_path.name
+            if not overwrite and output_path.exists():
+                skipped += 1
+                logger.info(f"Skipping existing {output_path}")
+                advance()
+                continue
+
+            raw_path = workspace / rel_dir / float32_path.name
+            if not raw_path.exists():
+                raise click.ClickException(f"Missing raw tile required for fiducials: {raw_path}")
+
+            float32_stack = tifffile.imread(float32_path)
+            if float32_stack.ndim != 3:
+                raise click.ClickException(
+                    f"Expected 3D array in {float32_path}, got shape {float32_stack.shape}."
+                )
+
+            channels = m_glob.size
+            if float32_stack.shape[0] % channels != 0:
+                raise click.ClickException(
+                    f"Tile {float32_path} has {float32_stack.shape[0]} planes, which is not divisible by {channels} channels."
+                )
+
+            z_slices = float32_stack.shape[0] // channels
+            gpu_stack = cp.asarray(float32_stack, dtype=cp.float32)
+            reshaped = gpu_stack.reshape(z_slices, channels, float32_stack.shape[1], float32_stack.shape[2])
+
+            quantized = quantize_global(
+                reshaped,
+                m_glob,
+                s_glob,
+                i_max=I_MAX,
+                return_stats=False,
+                as_numpy=True,
+            )
+
+            with tifffile.TiffFile(raw_path) as tif:
+                try:
+                    metadata = tif.shaped_metadata[0]  # type: ignore[index]
+                except (TypeError, IndexError):
+                    metadata = tif.imagej_metadata or {}
+                raw_stack = tif.asarray()
+
+            if raw_stack.ndim != 3:
+                raise click.ClickException(f"Raw tile {raw_path} has unexpected shape {raw_stack.shape}.")
+
+            if raw_stack.shape[0] < n_fids:
+                raise click.ClickException(
+                    f"Raw tile {raw_path} has only {raw_stack.shape[0]} planes; cannot extract {n_fids} fiducials."
+                )
+
+            fid = raw_stack[-n_fids:].astype(np.uint16, copy=False)
+
+            deliverable = np.concatenate([quantized, fid], axis=0)
+
+            if metadata is None:
+                metadata_dict: Dict[str, Any] = {}
+            elif isinstance(metadata, dict):
+                metadata_dict = dict(metadata)
+            else:
+                metadata_dict = dict(metadata)  # type: ignore[arg-type]
+
+            metadata_dict.update({
+                "deconv_min": [float(x) for x in np.ravel(m_glob)],
+                "deconv_scale": [float(x) for x in np.ravel(s_glob)],
+                "prenormalized": True,
+            })
+
+            tifffile.imwrite(
+                output_path,
+                deliverable,
+                compression=22610,
+                compressionargs={"level": 0.75},
+                metadata=metadata_dict,
+            )
+
+            processed += 1
+            logger.info(f"Quantized {output_path.relative_to(workspace)} (roi={roi_name})")
+            advance()
+
+    logger.info(f"Quantization complete: {processed} written, {skipped} skipped (overwrite={overwrite}).")
+
+
+@cli.command("precompute")
+@click.argument("workspace", type=click.Path(path_type=Path))
+@click.argument("round_name", type=str)
+@click.option("--bins", type=int, default=8192, show_default=True)
+@click.option(
+    "--p-low",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=0.001,
+    show_default=True,
+    help="Lower quantile (fraction) used for global offset.",
+)
+@click.option(
+    "--p-high",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=0.99999,
+    show_default=True,
+    help="Upper quantile (fraction) defining dynamic range.",
+)
+@click.option(
+    "--gamma",
+    type=float,
+    default=1.05,
+    show_default=True,
+    help="Headroom multiplier applied to dynamic range before scaling.",
+)
+@click.option(
+    "--i-max",
+    type=int,
+    default=I_MAX,
+    show_default=True,
+    help="Maximum integer code value for quantization.",
+)
+def precompute_cli(
+    workspace: Path,
+    round_name: str,
+    *,
+    bins: int,
+    p_low: float,
+    p_high: float,
+    gamma: float,
+    i_max: int,
+) -> None:
+    """Aggregate histogram CSVs to produce global quantization parameters."""
+
+    if bins <= 0:
+        raise click.BadParameter("--bins must be positive.")
+    if not (0.0 <= p_low < p_high <= 1.0):
+        raise click.BadParameter("Require 0 <= p_low < p_high <= 1.")
+    if gamma <= 0:
+        raise click.BadParameter("--gamma must be positive.")
+    if i_max <= 0:
+        raise click.BadParameter("--i-max must be positive.")
+
+    workspace = workspace.resolve()
+    logger.info(f"Workspace: {workspace}")
+    m_glob, s_glob = precompute_global_quantization(
+        workspace,
+        round_name,
+        bins=bins,
+        p_low=p_low,
+        p_high=p_high,
+        gamma=gamma,
+        i_max=i_max,
+    )
+    logger.info(
+        f"Computed global quantization for {round_name}: m_glob shape={m_glob.shape}, s_glob shape={s_glob.shape}."
+    )
 
 
 ArrayLike = Union[np.ndarray, cp.ndarray]
@@ -404,8 +632,14 @@ def quantize_global(
 
 
 if __name__ == "__main__":
-    # Example manual invocation; keep out of import side-effects
-    precompute_global_quantization(
-        "/working/20250929_JaxA3_Coro4",
-        round_name="pi",
-    )
+    cli()
+
+
+def load_global_scaling(path: Path, round_name: str) -> tuple[np.ndarray, np.ndarray]:
+    scale_path = path / "analysis" / "deconv32" / "deconv_scaling" / f"{round_name}.txt"
+    if not scale_path.exists():
+        raise FileNotFoundError(
+            f"Missing global scaling at {scale_path}. Run 'multi_deconv prepare' to generate histogram scaling first."
+        )
+    arr = np.loadtxt(scale_path).astype(np.float32).reshape((2, -1))
+    return arr[0], arr[1]

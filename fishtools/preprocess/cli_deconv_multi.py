@@ -9,463 +9,40 @@ more tiles without static sharding.
 
 from __future__ import annotations
 
-import csv
-import hashlib
-import json
-import multiprocessing as mp
 import os
-import pickle
-import queue as pyqueue
-import signal
 import sys
-import threading
-import time
-from collections import deque
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol, Sequence
+from typing import Any
 
-import cupy as cp
 import numpy as np
 import rich_click as click
-import tifffile
 from loguru import logger
 
-from fishtools.preprocess.deconv.normalize import quantize_global
-from fishtools.utils.io import Workspace, get_channels, get_metadata
+from fishtools.preprocess.deconv import backend as _deconv_backend
+from fishtools.preprocess.deconv.basic_utils import resolve_basic_paths
+from fishtools.preprocess.deconv.discovery import infer_psf_step
+from fishtools.preprocess.deconv.logging_utils import configure_logging
+from fishtools.preprocess.deconv.normalize import load_global_scaling
+from fishtools.preprocess.deconv.worker import (
+    DEFAULT_QUEUE_DEPTH,
+    WorkerMessage,
+    parse_device_spec,
+    run_multi_gpu,
+)
+from fishtools.utils.io import Workspace, get_channels
 from fishtools.utils.pretty_print import progress_bar
 
-DEFAULT_QUEUE_DEPTH = 5
-# Prefer spawn to avoid inheriting CUDA context; fall back to forkserver if unavailable.
-try:
-    _MP_CTX = mp.get_context("spawn")
-except ValueError:  # pragma: no cover - spawn should exist, but guard anyway
-    _MP_CTX = mp.get_context("forkserver")  # pyright: ignore[reportConstantRedefinition]
-
-FORBIDDEN_PREFIXES = ("10x", "analysis", "shifts", "fid", "registered", "old", "basic")
+ProcessorConfig = _deconv_backend.ProcessorConfig
+TileProcessor = _deconv_backend.TileProcessor
+ProcessorFactory = _deconv_backend.ProcessorFactory
+DeconvolutionTileProcessor = _deconv_backend.DeconvolutionTileProcessor
+make_processor_factory = _deconv_backend.make_processor_factory
 
 
 def _configure_logging(debug: bool, *, process_label: str) -> None:
-    """Configure loguru output consistently for the CLI surface."""
-    logger.remove()
-    logger.configure(extra={"process_label": process_label})
-    prefix = "[P{extra[process_label]}]"
-    if debug:
-        log_format = (
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "<cyan>{process.name: <13}</cyan> | "
-            f"{prefix} <level>{{message}}</level>"
-        )
-        logger.add(sys.stderr, level="DEBUG", format=log_format, enqueue=True)
-    else:
-        logger.add(sys.stderr, level="INFO", format=f"{prefix} {{message}}", enqueue=True)
-
-
-def _round_sort_key(round_name: str) -> tuple[bool, str]:
-    head = round_name.split("_")[0]
-    if head.isdigit():
-        return (True, f"{int(head):08d}_{round_name}")
-    return (False, round_name)
-
-
-def discover_rounds(workspace_path: Path) -> list[str]:
-    rounds = {
-        p.name.split("--")[0]
-        for p in workspace_path.iterdir()
-        if p.is_dir() and "--" in p.name and not p.name.startswith(FORBIDDEN_PREFIXES)
-    }
-    return sorted(rounds, key=_round_sort_key)
-
-
-def infer_psf_step(tile: Path, *, default: int = 6) -> tuple[int, bool]:
-    try:
-        metadata = get_metadata(tile)
-        waveform = json.loads(metadata["waveform"])
-        step = int(waveform["params"]["step"] * 10)
-        return step, True
-    except (KeyError, json.JSONDecodeError, TypeError, ValueError):
-        return default, False
-
-
-class TileProcessor(Protocol):
-    """Protocol describing the per-worker processing contract."""
-
-    def setup(self) -> None:  # pragma: no cover - thin interface
-        """Initialize GPU resources. Called once per worker."""
-
-    def teardown(self) -> None:  # pragma: no cover - thin interface
-        """Release resources prior to worker exit."""
-
-    # Pipeline steps (used by the multi-threaded worker loop)
-    def read_tile(
-        self, path: Path
-    ) -> tuple[Path, np.ndarray, np.ndarray, dict[str, Any], tuple[int, int], int]:
-        """Read TIFF, split fid/payload, reshape payload to (-1,C,H,W) float32 on CPU."""
-        ...
-
-    def compute_tile(
-        self,
-        payload_np: np.ndarray,
-        path: Path,
-        hw: tuple[int, int],
-    ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, Any] | None, dict[str, float]]:
-        """Run GPU BaSiC + deconvolution + (optional) quantize/hist; return artifacts & timings."""
-        ...
-
-    def write_tile(
-        self,
-        path: Path,
-        fid_np: np.ndarray,
-        metadata_out: dict[str, Any],
-        towrite_u16: np.ndarray | None,
-        f32_payload: np.ndarray | None,
-        hist_payload: dict[str, Any] | None,
-    ) -> float:
-        """Write TIFF/CSV artifacts; return write seconds."""
-        ...
-
-
-ProcessorFactory = Callable[[int], TileProcessor]
-
-
-@dataclass(slots=True)
-class ProcessorConfig:
-    round_name: str
-    basic_paths: Sequence[Path]
-    output_dir: Path
-    n_fids: int
-    step: int
-    save_float32: bool
-    save_histograms: bool
-    histogram_bins: int
-    m_glob: np.ndarray | None
-    s_glob: np.ndarray | None
-    debug: bool
-
-
-class DeconvolutionTileProcessor:
-    """Concrete processor with split read/compute/write for pipelining."""
-
-    def __init__(self, config: ProcessorConfig, *, device_id: int | None = None):
-        self.config = config
-        self._darkfield: cp.ndarray | None = None
-        self._flatfield: cp.ndarray | None = None
-        self._projectors: tuple[cp.ndarray, cp.ndarray] | None = None
-        self._out32: Path | None = None
-        self._device_id = device_id
-
-    def set_device(self, device_id: int) -> None:
-        self._device_id = device_id
-
-    def _load_basics(self) -> None:
-        darks: list[np.ndarray] = []
-        flats: list[np.ndarray] = []
-        reference_shape: tuple[int, ...] | None = None
-        for pkl_path in self.config.basic_paths:
-            loaded = pickle.loads(pkl_path.read_bytes())
-            basic = loaded.get("basic") if isinstance(loaded, dict) else loaded
-            if not hasattr(basic, "darkfield") or not hasattr(basic, "flatfield"):
-                raise TypeError("BaSiC payload must expose 'darkfield' and 'flatfield'.")
-            dark = np.asarray(basic.darkfield, dtype=np.float32)
-            flat = np.asarray(basic.flatfield, dtype=np.float32)
-            if dark.shape != flat.shape:
-                raise ValueError(f"Dark/flat shape mismatch for {pkl_path}: {dark.shape} vs {flat.shape}.")
-            if reference_shape is None:
-                reference_shape = dark.shape
-            elif dark.shape != reference_shape:
-                raise ValueError("Inconsistent BaSiC profile geometry; all dark/flat fields must match.")
-            if not np.all(np.isfinite(flat)) or np.any(flat <= 0):
-                raise ValueError(f"Invalid flatfield values encountered in {pkl_path}.")
-            if not np.all(np.isfinite(dark)):
-                raise ValueError(f"Invalid darkfield values encountered in {pkl_path}.")
-            darks.append(dark)
-            flats.append(flat)
-
-        if not darks or not flats:
-            raise ValueError("No BaSiC profiles were loaded.")
-
-        darkfield_np = np.stack(darks, axis=0)[np.newaxis, ...].astype(np.float32, copy=False)
-        flatfield_np = np.stack(flats, axis=0)[np.newaxis, ...].astype(np.float32, copy=False)
-        self._darkfield = cp.asarray(darkfield_np)
-        self._flatfield = cp.asarray(flatfield_np)
-
-    def setup(self) -> None:
-        from fishtools.preprocess.cli_deconv import projectors
-
-        # Memory pools to reduce alloc/free overhead.
-        cp.cuda.set_allocator(cp.cuda.MemoryPool().malloc)
-        cp.cuda.set_pinned_memory_allocator(cp.cuda.PinnedMemoryPool().malloc)
-
-        self._load_basics()
-        self._projectors = projectors(self.config.step)
-        self.config.output_dir.mkdir(parents=True, exist_ok=True)
-        if self.config.save_float32 or self.config.save_histograms:
-            self._out32 = self.config.output_dir.parent / "deconv32"
-            self._out32.mkdir(parents=True, exist_ok=True)
-
-    def teardown(self) -> None:
-        self._darkfield = None
-        self._flatfield = None
-        self._projectors = None
-
-    # ------------------- Pipeline stages -------------------
-
-    def read_tile(
-        self, path: Path
-    ) -> tuple[Path, np.ndarray, np.ndarray, dict[str, Any], tuple[int, int], int]:
-        """Disk read + split fid/payload + reshape CPU payload to (-1,C,H,W) float32."""
-        read_start = time.perf_counter()
-        with tifffile.TiffFile(path) as tif:
-            try:
-                metadata = tif.shaped_metadata[0]  # type: ignore[index]
-            except (TypeError, IndexError):
-                metadata = tif.imagej_metadata or {}
-            image = tif.asarray()
-        read_elapsed = time.perf_counter() - read_start
-        logger.debug(f"[{path.name}] Disk read took: {read_elapsed:.4f}s")
-
-        if not isinstance(metadata, dict):
-            metadata = dict(metadata) if metadata is not None else {}
-
-        n_fids = self.config.n_fids
-        if n_fids:
-            fid = np.atleast_3d(image[-n_fids:])
-            payload = image[:-n_fids]
-        else:
-            fid = np.zeros((0, *image.shape[-2:]), dtype=image.dtype)
-            payload = image
-
-        channels = len(self.config.basic_paths)
-        if payload.ndim < 3:
-            raise ValueError(
-                f"{path} payload has insufficient dimensions {payload.shape}; expected at least 3-D."
-            )
-
-        height, width = payload.shape[-2:]
-        plane_count = int(np.prod(payload.shape[:-2]))
-        if plane_count % channels != 0:
-            raise ValueError(
-                f"{path} has {plane_count} payload planes not divisible by {channels} BaSiC channel(s)."
-            )
-
-        try:
-            nofid = payload.reshape(-1, channels, height, width).astype(np.float32, copy=False)
-        except ValueError as exc:
-            raise ValueError(
-                f"{path} unexpected shape {payload.shape} for {channels} channel(s) after removing {n_fids} fid slice(s)."
-            ) from exc
-
-        return path, nofid, fid, metadata, (height, width), channels
-
-    def compute_tile(
-        self,
-        payload_np: np.ndarray,
-        path: Path,
-        hw: tuple[int, int],
-    ) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, Any] | None, dict[str, float]]:
-        """GPU BaSiC, deconvolution and optional quantize/hist+copy."""
-        from fishtools.preprocess.cli_deconv import deconvolve_lucyrichardson_guo
-
-        # Ensure the compute thread is bound to the right device.
-        if self._device_id is not None:
-            cp.cuda.Device(self._device_id).use()
-
-        H, W = hw
-        timings: dict[str, float] = {}
-        t0 = time.perf_counter()
-
-        # H2D + BaSiC
-        t_basic0 = time.perf_counter()
-        x = cp.asarray(payload_np)
-        x -= self._darkfield  # type: ignore[operator]
-        x /= self._flatfield  # type: ignore[operator]
-        cp.clip(x, 0, None, out=x)
-        if self.config.debug:
-            cp.cuda.runtime.deviceSynchronize()
-        timings["basic"] = time.perf_counter() - t_basic0
-
-        # Deconvolution
-        t_dec0 = time.perf_counter()
-        res = deconvolve_lucyrichardson_guo(x, self._projectors, iters=1)  # type: ignore[arg-type]
-        if self.config.debug:
-            cp.cuda.runtime.deviceSynchronize()
-        timings["deconv"] = time.perf_counter() - t_dec0
-
-        # Quantization / float32 / histogram
-        towrite_u16: np.ndarray | None = None
-        f32_payload: np.ndarray | None = None
-        hist_payload: dict[str, Any] | None = None
-
-        if not self.config.save_float32:
-            if self.config.m_glob is None or self.config.s_glob is None:
-                raise ValueError("Global scaling not provided for quantisation path.")
-            t_quant0 = time.perf_counter()
-            towrite_u16 = quantize_global(
-                res, self.config.m_glob, self.config.s_glob, i_max=65535, return_stats=False, as_numpy=True
-            )
-            timings["quant"] = time.perf_counter() - t_quant0
-        else:
-            timings["quant"] = 0.0
-
-        if self.config.save_float32 or self.config.save_histograms:
-            t_post0 = time.perf_counter()
-            reshaped = res.reshape(-1, H, W)
-            f32_payload = cp.asnumpy(reshaped).astype(np.float32, copy=False)
-
-            if self.config.save_histograms:
-                digest = hashlib.blake2b(
-                    f"{self.config.round_name}:{path}".encode("utf-8"), digest_size=8
-                ).digest()
-                rng = np.random.default_rng(int.from_bytes(digest, "little"))
-                _, C, _, _ = res.shape
-                counts_list: list[np.ndarray] = []
-                edges_list: list[np.ndarray] = []
-                SZ, SY, SX = 4, 2, 2
-                off_z = int(rng.integers(SZ)) if SZ > 1 else 0
-                off_y = int(rng.integers(SY)) if SY > 1 else 0
-                off_x = int(rng.integers(SX)) if SX > 1 else 0
-
-                mins_ch = cp.min(res[off_z::SZ, :, off_y::SY, off_x::SX], axis=(0, 2, 3))
-                maxs_ch = cp.max(res[off_z::SZ, :, off_y::SY, off_x::SX], axis=(0, 2, 3))
-
-                for c in range(C):
-                    lo = float(cp.asnumpy(mins_ch[c]))
-                    hi = float(cp.asnumpy(maxs_ch[c]))
-                    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-                        lo, hi = 0.0, 1.0
-                    edges_gpu = cp.linspace(lo, hi, self.config.histogram_bins + 1, dtype=cp.float32)
-                    sample_c = res[off_z::SZ, c, off_y::SY, off_x::SX]
-                    h_gpu, _ = cp.histogram(sample_c, bins=edges_gpu)
-                    counts_list.append(cp.asnumpy(h_gpu).astype(np.int64, copy=False))
-                    edges_list.append(cp.asnumpy(edges_gpu).astype(np.float32, copy=False))
-
-                n_samp = int(res[off_z::SZ, 0, off_y::SY, off_x::SX].size)
-                hist_payload = {
-                    "C": int(C),
-                    "bins": int(self.config.histogram_bins),
-                    "counts": counts_list,
-                    "edges": edges_list,
-                    "strides": (SZ, SY, SX),
-                    "offsets": (int(off_z), int(off_y), int(off_x)),
-                    "sampled_per_channel": n_samp,
-                    "tile_shape": tuple(int(x) for x in res.shape),
-                }
-            timings["post"] = time.perf_counter() - t_post0
-        else:
-            timings["post"] = 0.0
-
-        # release GPU intermediates as early as possible
-        del res
-        del x
-
-        return towrite_u16, f32_payload, hist_payload, timings
-
-    def write_tile(
-        self,
-        path: Path,
-        fid_np: np.ndarray,
-        metadata_out: dict[str, Any],
-        towrite_u16: np.ndarray | None,
-        f32_payload: np.ndarray | None,
-        hist_payload: dict[str, Any] | None,
-    ) -> float:
-        """Blocking disk writes."""
-        out_dir = self.config.output_dir / path.parent.name
-        out_dir.mkdir(parents=True, exist_ok=True)
-        t0 = time.perf_counter()
-
-        if towrite_u16 is not None:
-            json_path = (out_dir / path.name).with_suffix(".deconv.json")
-            json_path.write_text(json.dumps(metadata_out, indent=2))
-            deliverable = np.concatenate([towrite_u16, fid_np.astype(np.uint16, copy=False)], axis=0)
-            # Use named codec instead of magic number
-            tifffile.imwrite(
-                out_dir / path.name,
-                deliverable,
-                compression="zstd",
-                compressionargs={"level": 9},
-                metadata=metadata_out,
-            )
-
-        if f32_payload is not None and self._out32 is not None:
-            sub32 = self._out32 / path.parent.name
-            sub32.mkdir(parents=True, exist_ok=True)
-            if self.config.save_float32:
-                tifffile.imwrite(
-                    sub32 / path.name,
-                    f32_payload,
-                    dtype=np.float32,
-                    metadata={"dtype": "float32", **metadata_out},
-                    compression="zlib",
-                    compressionargs={"level": 6},
-                )
-            if self.config.save_histograms and hist_payload is not None:
-                hist_path = (sub32 / path.name).with_suffix(".histogram.csv")
-                with open(hist_path, "w", newline="") as fh:
-                    writer = csv.writer(fh)
-                    writer.writerow(["channel", "bin_left", "bin_right", "count"])
-                    C = hist_payload["C"]
-                    bins = hist_payload["bins"]
-                    counts_list = hist_payload["counts"]
-                    edges_list = hist_payload["edges"]
-                    for c in range(C):
-                        edges = edges_list[c]
-                        counts = counts_list[c]
-                        for b in range(bins):
-                            writer.writerow([c, f"{edges[b]:.8g}", f"{edges[b + 1]:.8g}", int(counts[b])])
-
-        return time.perf_counter() - t0
-
-
-@dataclass(frozen=True, slots=True)
-class _ProcessorFactory:
-    config: ProcessorConfig
-
-    def __call__(self, device_id: int) -> TileProcessor:
-        proc = DeconvolutionTileProcessor(self.config, device_id=device_id)
-        return proc
-
-
-def make_processor_factory(config: ProcessorConfig) -> ProcessorFactory:
-    safe_config = ProcessorConfig(
-        round_name=config.round_name,
-        basic_paths=tuple(Path(p) for p in config.basic_paths),
-        output_dir=config.output_dir,
-        n_fids=config.n_fids,
-        step=config.step,
-        save_float32=config.save_float32,
-        save_histograms=config.save_histograms,
-        histogram_bins=config.histogram_bins,
-        m_glob=None if config.m_glob is None else np.asarray(config.m_glob, dtype=np.float32),
-        s_glob=None if config.s_glob is None else np.asarray(config.s_glob, dtype=np.float32),
-        debug=config.debug,
-    )
-    return _ProcessorFactory(safe_config)
-
-
-def resolve_basic_paths(
-    workspace: Path,
-    *,
-    round_name: str,
-    channels: Sequence[str],
-    basic_name: str | None,
-) -> list[Path]:
-    paths: list[Path] = []
-    for channel in channels:
-        primary: Path | None = None
-        if basic_name:
-            candidate = workspace / "basic" / f"{basic_name}-{channel}.pkl"
-            if candidate.exists():
-                primary = candidate
-        if primary is None:
-            fallback = workspace / "basic" / f"{round_name}-{channel}.pkl"
-            if not fallback.exists():
-                raise FileNotFoundError(f"Missing BaSiC profile for channel {channel} in round {round_name}.")
-            primary = fallback
-        paths.append(primary)
-        logger.debug(f"Loaded BaSiC profile for {channel} from {primary}")
-    return paths
+    """Thin wrapper to shared logger config preserving process labels."""
+    configure_logging(debug, process_label=process_label)
 
 
 def filter_pending_files(
@@ -503,14 +80,129 @@ def filter_pending_files(
     return result
 
 
-def load_global_scaling(path: Path, round_name: str) -> tuple[np.ndarray, np.ndarray]:
-    scale_path = path / "analysis" / "deconv32" / "deconv_scaling" / f"{round_name}.txt"
-    if not scale_path.exists():
-        raise FileNotFoundError(
-            f"Missing global scaling at {scale_path}. Run 'multi_deconv prepare' to generate histogram scaling first."
+def _run_round_tiles(
+    *,
+    path: Path,
+    round_name: str,
+    files: Sequence[Path],
+    out_dir: Path,
+    basic_name: str | None,
+    n_fids: int,
+    save_float32: bool,
+    save_histograms: bool,
+    histogram_bins: int,
+    load_scaling: bool,
+    overwrite: bool,
+    debug: bool,
+    devices: Sequence[int],
+    queue_depth: int,
+    stop_on_error: bool,
+    label: str | None,
+    psf_source: str,
+    pre_filter_log: Callable[[int], str] | None,
+    pending_log: Callable[[int, int], str],
+    skip_log: Callable[[], str],
+    failure_label: str,
+    prefix_pending: bool = True,
+    prefix_skip: bool = True,
+) -> list[WorkerMessage]:
+    """Shared round-level execution for multi-GPU deconvolution flows."""
+    file_list = list(files)
+    if not file_list:
+        return []
+
+    def _info(message: str, *, prefix: bool = True) -> None:
+        if prefix and label:
+            logger.info(f"[{label}] {message}")
+        else:
+            logger.info(message)
+
+    def _warn(message: str, *, prefix: bool = True) -> None:
+        if prefix and label:
+            logger.warning(f"[{label}] {message}")
+        else:
+            logger.warning(message)
+
+    def _error(message: str) -> None:
+        if label:
+            logger.error(f"[{label}] {message}")
+        else:
+            logger.error(message)
+
+    if pre_filter_log is not None:
+        _info(pre_filter_log(len(file_list)))
+
+    step, inferred = infer_psf_step(file_list[0])
+    if inferred:
+        _info(f"Using PSF step={step} from {psf_source}.")
+    else:
+        _warn(f"Could not determine PSF step; defaulting to step={step}.")
+
+    channels = get_channels(file_list[0])
+    basic_paths = resolve_basic_paths(path, round_name=round_name, channels=channels, basic_name=basic_name)
+
+    if load_scaling:
+        m_glob, s_glob = load_global_scaling(path, round_name)
+    else:
+        m_glob = s_glob = None
+
+    pending = filter_pending_files(
+        file_list,
+        out_dir=out_dir,
+        overwrite=overwrite,
+        save_float32=save_float32,
+        save_histograms=save_histograms,
+    )
+
+    if not pending:
+        _info(skip_log(), prefix=prefix_skip)
+        return []
+
+    _info(pending_log(len(pending), len(file_list)), prefix=prefix_pending)
+
+    config = ProcessorConfig(
+        round_name=round_name,
+        basic_paths=basic_paths,
+        output_dir=out_dir,
+        n_fids=n_fids,
+        step=step,
+        save_float32=save_float32,
+        save_histograms=save_histograms,
+        histogram_bins=histogram_bins,
+        m_glob=m_glob,
+        s_glob=s_glob,
+        debug=debug,
+    )
+
+    processor_factory = make_processor_factory(config)
+    depth = queue_depth if queue_depth > 0 else DEFAULT_QUEUE_DEPTH
+
+    failures: list[WorkerMessage]
+    with progress_bar(len(pending)) as update:
+
+        def callback(message: WorkerMessage) -> None:
+            if message.status == "ok":
+                update()
+            elif message.status == "error":
+                _error(f"Failed to process {message.path}: {message.error}")
+
+        failures = run_multi_gpu(
+            pending,
+            devices=devices,
+            processor_factory=processor_factory,
+            queue_depth=depth,
+            stop_on_error=stop_on_error,
+            progress_callback=callback,
+            debug=debug,
         )
-    arr = np.loadtxt(scale_path).astype(np.float32).reshape((2, -1))
-    return arr[0], arr[1]
+
+    if failures:
+        details = ", ".join(str(msg.path) for msg in failures if msg.path is not None)
+        if stop_on_error:
+            raise RuntimeError(f"{failure_label}: processing aborted due to failures: {details}")
+        _warn(f"Completed with failures: {details}")
+
+    return failures
 
 
 def multi_prepare(
@@ -538,7 +230,7 @@ def multi_prepare(
 
     logger.info(f"ROIs considered: {rois if rois else list(all_rois)}")
 
-    rounds_all = discover_rounds(path)
+    rounds_all = Workspace.discover_rounds(path)
     logger.info(f"Discovered rounds: {rounds_all}")
 
     rounds = rounds_all if not round_names else [r for r in round_names if r in rounds_all]
@@ -592,77 +284,30 @@ def multi_prepare(
         if not files:
             continue
 
-        logger.info(f"[{round_name}] Selected {len(files)} sampled tile(s) (pre-filter).")
-
-        step, inferred = infer_psf_step(files[0])
-        if inferred:
-            logger.info(f"[{round_name}] Using PSF step={step} from waveform metadata.")
-        else:
-            logger.warning(f"[{round_name}] Could not determine PSF step; defaulting to step={step}.")
-
-        channels = get_channels(files[0])
-        basic_paths = resolve_basic_paths(
-            path, round_name=round_name, channels=channels, basic_name=basic_name
-        )
-
-        pending = filter_pending_files(
-            files,
-            out_dir=out_dir,
-            overwrite=overwrite,
-            save_float32=True,
-            save_histograms=True,
-        )
-
-        if not pending:
-            logger.info(f"[{round_name}] No tiles require preparation after filtering.")
-            continue
-
-        logger.info(
-            "[{}] {}/{} tile(s) pending after overwrite/histogram checks.",
-            round_name,
-            len(pending),
-            len(files),
-        )
-
-        config = ProcessorConfig(
+        _run_round_tiles(
+            path=path,
             round_name=round_name,
-            basic_paths=basic_paths,
-            output_dir=out_dir,
+            files=files,
+            out_dir=out_dir,
+            basic_name=basic_name,
             n_fids=n_fids,
-            step=step,
             save_float32=True,
             save_histograms=True,
             histogram_bins=histogram_bins,
-            m_glob=None,
-            s_glob=None,
+            load_scaling=False,
+            overwrite=overwrite,
             debug=debug,
+            devices=devices,
+            queue_depth=queue_depth,
+            stop_on_error=stop_on_error,
+            label=round_name,
+            psf_source="waveform metadata",
+            pre_filter_log=lambda total: f"Selected {total} sampled tile(s) (pre-filter).",
+            pending_log=lambda pending,
+            total: f"{pending}/{total} tile(s) pending after overwrite/histogram checks.",
+            skip_log=lambda: "No tiles require preparation after filtering.",
+            failure_label=round_name,
         )
-
-        processor_factory = make_processor_factory(config)
-
-        with progress_bar(len(pending)) as update:
-
-            def callback(message: WorkerMessage) -> None:
-                if message.status == "ok":
-                    update()
-                elif message.status == "error":
-                    logger.error(f"[{round_name}] Failed to process {message.path}: {message.error}")
-
-            failures = run_multi_gpu(
-                pending,
-                devices=devices,
-                processor_factory=processor_factory,
-                queue_depth=queue_depth,
-                stop_on_error=stop_on_error,
-                progress_callback=callback,
-                debug=debug,
-            )
-
-        if failures:
-            details = ", ".join(str(msg.path) for msg in failures if msg.path is not None)
-            if stop_on_error:
-                raise RuntimeError(f"{round_name}: processing aborted due to failures: {details}")
-            logger.warning(f"[{round_name}] Completed with failures: {details}")
 
 
 def multi_batch(
@@ -687,7 +332,7 @@ def multi_batch(
     out_dir = ws.deconved
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rounds = discover_rounds(path)
+    rounds = Workspace.discover_rounds(path)
     logger.info(f"Rounds discovered: {rounds}")
 
     for round_name in rounds:
@@ -722,76 +367,29 @@ def multi_batch(
             logger.warning(f"No files found to process for round {round_name}; skipping.")
             continue
 
-        logger.info("[{}] {} candidate tile(s) before filtering.", round_name, len(files))
-
-        step, inferred = infer_psf_step(files[0])
-        if inferred:
-            logger.info(f"[{round_name}] Using PSF step={step} from metadata.")
-        else:
-            logger.warning(f"[{round_name}] Could not determine PSF step; defaulting to step={step}.")
-
-        channels = get_channels(files[0])
-        basic_paths = resolve_basic_paths(
-            path, round_name=round_name, channels=channels, basic_name=basic_name
-        )
-
-        m_glob, s_glob = load_global_scaling(path, round_name)
-
-        pending = filter_pending_files(
-            files,
-            out_dir=out_dir,
-            overwrite=overwrite,
-            save_float32=False,
-            save_histograms=False,
-        )
-
-        if not pending:
-            logger.info(f"[{round_name}] All tiles already processed; skipping.")
-            continue
-
-        logger.info(
-            "[{}] {}/{} tile(s) pending after overwrite checks.", round_name, len(pending), len(files)
-        )
-
-        config = ProcessorConfig(
+        _run_round_tiles(
+            path=path,
             round_name=round_name,
-            basic_paths=basic_paths,
-            output_dir=out_dir,
+            files=files,
+            out_dir=out_dir,
+            basic_name=basic_name,
             n_fids=n_fids,
-            step=step,
             save_float32=False,
             save_histograms=False,
             histogram_bins=8192,
-            m_glob=m_glob,
-            s_glob=s_glob,
+            load_scaling=True,
+            overwrite=overwrite,
             debug=debug,
+            devices=devices,
+            queue_depth=queue_depth,
+            stop_on_error=stop_on_error,
+            label=round_name,
+            psf_source="metadata",
+            pre_filter_log=lambda total: f"{total} candidate tile(s) before filtering.",
+            pending_log=lambda pending, total: f"{pending}/{total} tile(s) pending after overwrite checks.",
+            skip_log=lambda: "All tiles already processed; skipping.",
+            failure_label=round_name,
         )
-
-        processor_factory = make_processor_factory(config)
-
-        with progress_bar(len(pending)) as update:
-
-            def callback(message: WorkerMessage) -> None:
-                if message.status == "ok":
-                    update()
-                elif message.status == "error":
-                    logger.error(f"[{round_name}] Failed to process {message.path}: {message.error}")
-
-            failures = run_multi_gpu(
-                pending,
-                devices=devices,
-                processor_factory=processor_factory,
-                queue_depth=queue_depth,
-                stop_on_error=stop_on_error,
-                progress_callback=callback,
-                debug=debug,
-            )
-
-        if failures:
-            details = ", ".join(str(msg.path) for msg in failures if msg.path is not None)
-            if stop_on_error:
-                raise RuntimeError(f"{round_name}: processing aborted due to failures: {details}")
-            logger.warning(f"[{round_name}] Completed with failures: {details}")
 
         if delete_origin:
             from fishtools.preprocess.cli_deconv import _safe_delete_origin_dirs
@@ -853,452 +451,31 @@ def multi_run(
     basic_token = basic_name or name
     logger.info(f"Using {path / 'basic'}/{basic_token}-*.pkl for BaSiC")
 
-    channels = get_channels(files[0])
-    basic_paths = resolve_basic_paths(path, round_name=name, channels=channels, basic_name=basic_token)
-
-    m_glob, s_glob = load_global_scaling(path, name)
-
-    pending = filter_pending_files(
-        files,
-        out_dir=out_dir,
-        overwrite=overwrite,
-        save_float32=False,
-        save_histograms=False,
-    )
-
-    if not pending:
-        logger.info("All tiles already processed; nothing to do.")
-        return
-
-    logger.info("{}/{} tile(s) pending after overwrite checks.", len(pending), len(files))
-
-    step, inferred = infer_psf_step(pending[0])
-    if inferred:
-        logger.info(f"[{name}] Using PSF step={step} from metadata.")
-    else:
-        logger.warning(f"[{name}] Could not determine PSF step; defaulting to step={step}.")
-
-    config = ProcessorConfig(
+    _run_round_tiles(
+        path=path,
         round_name=name,
-        basic_paths=basic_paths,
-        output_dir=out_dir,
+        files=files,
+        out_dir=out_dir,
+        basic_name=basic_token,
         n_fids=n_fids,
-        step=step,
         save_float32=False,
         save_histograms=False,
         histogram_bins=8192,
-        m_glob=m_glob,
-        s_glob=s_glob,
+        load_scaling=True,
+        overwrite=overwrite,
         debug=debug,
+        devices=devices,
+        queue_depth=queue_depth,
+        stop_on_error=stop_on_error,
+        label=name,
+        psf_source="metadata",
+        pre_filter_log=None,
+        pending_log=lambda pending, total: f"{pending}/{total} tile(s) pending after overwrite checks.",
+        skip_log=lambda: "All tiles already processed; nothing to do.",
+        failure_label=name,
+        prefix_pending=False,
+        prefix_skip=False,
     )
-
-    processor_factory = make_processor_factory(config)
-    depth = queue_depth if queue_depth > 0 else DEFAULT_QUEUE_DEPTH
-
-    with progress_bar(len(pending)) as update:
-
-        def callback(message: WorkerMessage) -> None:
-            if message.status == "ok":
-                update()
-            elif message.status == "error":
-                logger.error(f"[{name}] Failed to process {message.path}: {message.error}")
-
-        failures = run_multi_gpu(
-            pending,
-            devices=devices,
-            processor_factory=processor_factory,
-            queue_depth=depth,
-            stop_on_error=stop_on_error,
-            progress_callback=callback,
-            debug=debug,
-        )
-
-    if failures:
-        details = ", ".join(str(msg.path) for msg in failures if msg.path is not None)
-        if stop_on_error:
-            raise RuntimeError(f"{name}: processing aborted due to failures: {details}")
-        logger.warning(f"[{name}] Completed with failures: {details}")
-
-
-WorkerStatus = Literal["ok", "error", "stopped"]
-
-
-@dataclass(slots=True)
-class WorkerMessage:
-    worker_id: int
-    path: Path | None
-    status: WorkerStatus
-    duration: float | None = None
-    error: str | None = None
-
-
-def parse_device_spec(spec: str | Sequence[int] | None) -> list[int]:
-    """Resolve a device specification into explicit CUDA device indices."""
-    visible_env = os.environ.get("CUDA_VISIBLE_DEVICES")
-    visible_mask: list[int] | None = None
-    if visible_env:
-        visible_mask = [int(item.strip()) for item in visible_env.split(",") if item.strip()]
-    try:
-        total = cp.cuda.runtime.getDeviceCount()
-    except cp.cuda.runtime.CUDARuntimeError as exc:
-        raise RuntimeError("No CUDA devices available for multi-GPU execution") from exc
-
-    if total <= 0:
-        raise RuntimeError("No CUDA devices detected")
-
-    if spec is None or spec == "auto":
-        return list(range(total))
-
-    if isinstance(spec, str):
-        items = [s.strip() for s in spec.split(",") if s.strip()]
-        result = [int(it) for it in items]
-    else:
-        result = [int(it) for it in spec]
-
-    if not result:
-        raise ValueError("Device specification resolved to an empty list")
-
-    if visible_mask is not None:
-        max_idx = len(visible_mask) - 1
-        for dev in result:
-            if dev < 0 or dev > max_idx:
-                raise ValueError(f"Device index {dev} is outside the visible range [0, {max_idx}]")
-    else:
-        for dev in result:
-            if dev < 0 or dev >= total:
-                raise ValueError(f"Device index {dev} is outside the range [0, {total - 1}]")
-
-    return result
-
-
-def _worker_loop(
-    *,
-    worker_id: int,
-    device_id: int,
-    queue_depth: int,
-    task_queue: mp.Queue,
-    request_queue: mp.Queue,
-    result_queue: mp.Queue,
-    processor_factory: ProcessorFactory,
-    stop_on_error: bool,
-    debug: bool,
-) -> None:
-    """Worker entrypoint executed in a separate process."""
-
-    _configure_logging(debug, process_label=str(worker_id + 1))
-    logger.debug(f"Worker {worker_id} starting on device {device_id} with queue depth {queue_depth}.")
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-    cp.cuda.Device(device_id).use()
-
-    processor = processor_factory(device_id)
-    processor.setup()
-
-    # Inter-thread queues and coordination
-    STOP = object()
-    q_in: "pyqueue.Queue[tuple[Path, np.ndarray, np.ndarray, dict[str, Any], tuple[int, int]] | object]" = (
-        pyqueue.Queue(maxsize=2)
-    )  # read -> compute
-    q_out: "pyqueue.Queue[tuple[Path, np.ndarray, dict[str, Any], np.ndarray | None, np.ndarray | None, dict[str, Any] | None, dict[str, float]] | object]" = pyqueue.Queue(
-        maxsize=2
-    )  # compute -> write
-    stop_evt = threading.Event()
-
-    def reader() -> None:
-        # Prime dispatcher credits
-        for _ in range(queue_depth):
-            request_queue.put(worker_id)
-
-        try:
-            while not stop_evt.is_set():
-                try:
-                    item = task_queue.get()
-                except (EOFError, OSError):
-                    break
-                if item is None:
-                    break
-                # Immediately request another item to maintain queue depth
-                request_queue.put(worker_id)
-                try:
-                    path, nofid, fid, metadata, hw, _ = processor.read_tile(item)
-                except Exception as exc:  # noqa: BLE001
-                    import traceback
-
-                    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                    result_queue.put(
-                        WorkerMessage(worker_id=worker_id, path=item, status="error", duration=None, error=tb)
-                    )
-                    if stop_on_error:
-                        stop_evt.set()
-                        break
-                    else:
-                        continue
-                q_in.put((path, nofid, fid, metadata, hw))
-        finally:
-            q_in.put(STOP)
-
-    def compute() -> None:
-        cp.cuda.Device(device_id).use()
-        while not stop_evt.is_set():
-            job = q_in.get()
-            if job is STOP:
-                q_out.put(STOP)
-                break
-            path, nofid, fid_np, metadata, hw = job
-            t0 = time.perf_counter()
-            try:
-                towrite_u16, f32_payload, hist_payload, t_dict = processor.compute_tile(nofid, path, hw)
-                # Extend metadata with global scaling if we wrote u16
-                if towrite_u16 is not None:
-                    assert processor.config.m_glob is not None and processor.config.s_glob is not None
-                    scaling = {
-                        "deconv_min": list(map(float, processor.config.m_glob.flatten())),
-                        "deconv_scale": list(map(float, processor.config.s_glob.flatten())),
-                        "prenormalized": True,
-                    }
-                    metadata_out = metadata | scaling
-                else:
-                    metadata_out = metadata.copy()
-                elapsed = time.perf_counter() - t0
-                t_gpu = (
-                    t_dict.get("basic", 0.0)
-                    + t_dict.get("deconv", 0.0)
-                    + t_dict.get("quant", 0.0)
-                    + t_dict.get("post", 0.0)
-                )
-                logger.info(
-                    f"[GPU{device_id}] {path.name}: gpu={t_gpu:.2f}s (basic={t_dict.get('basic', 0.0):.2f}+"
-                    f"dec={t_dict.get('deconv', 0.0):.2f}+quant={t_dict.get('quant', 0.0):.2f}+post={t_dict.get('post', 0.0):.2f})"
-                    f" stage_total={elapsed:.2f}s"
-                )
-                q_out.put((path, fid_np, metadata_out, towrite_u16, f32_payload, hist_payload, t_dict))
-            except Exception as exc:  # noqa: BLE001
-                import traceback
-
-                tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                result_queue.put(
-                    WorkerMessage(worker_id=worker_id, path=path, status="error", duration=None, error=tb)
-                )
-                if stop_on_error:
-                    stop_evt.set()
-                    q_out.put(STOP)
-                    break
-            finally:
-                # help GC
-                del nofid
-
-    def writer() -> None:
-        while True:
-            job = q_out.get()
-            if job is STOP:
-                break
-            path, fid_np, metadata_out, towrite_u16, f32_payload, hist_payload, t_dict = job
-            try:
-                t_write = processor.write_tile(
-                    path, fid_np, metadata_out, towrite_u16, f32_payload, hist_payload
-                )
-                t_gpu = (
-                    t_dict.get("basic", 0.0)
-                    + t_dict.get("deconv", 0.0)
-                    + t_dict.get("quant", 0.0)
-                    + t_dict.get("post", 0.0)
-                )
-                logger.debug(f"[{path.name}] Write stage took: {t_write:.4f}s")
-                result_queue.put(
-                    WorkerMessage(worker_id=worker_id, path=path, status="ok", duration=t_gpu + t_write)
-                )
-            except Exception as exc:  # noqa: BLE001
-                import traceback
-
-                tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                result_queue.put(
-                    WorkerMessage(worker_id=worker_id, path=path, status="error", duration=None, error=tb)
-                )
-                if stop_on_error:
-                    stop_evt.set()
-                    break
-
-    t_reader = threading.Thread(target=reader, name="reader", daemon=True)
-    t_compute = threading.Thread(target=compute, name="compute", daemon=True)
-    t_writer = threading.Thread(target=writer, name="writer", daemon=True)
-
-    try:
-        t_reader.start()
-        t_compute.start()
-        t_writer.start()
-        # Block until threads finish (stop_evt and sentinels handle shutdown)
-        t_reader.join()
-        t_compute.join()
-        t_writer.join()
-    finally:
-        processor.teardown()
-        result_queue.put(WorkerMessage(worker_id=worker_id, path=None, status="stopped"))
-
-
-def run_multi_gpu(
-    files: Sequence[Path],
-    *,
-    devices: Sequence[int],
-    processor_factory: ProcessorFactory,
-    queue_depth: int = DEFAULT_QUEUE_DEPTH,
-    stop_on_error: bool = True,
-    progress_callback: Callable[[WorkerMessage], None] | None = None,
-    debug: bool = False,
-) -> list[WorkerMessage]:
-    """Execute deconvolution across multiple GPUs with dynamic scheduling.
-
-    The dispatcher responds to worker credit requests, keeping at most
-    ``queue_depth`` outstanding paths per worker. Faster GPUs therefore receive
-    more work without explicit sharding.
-    """
-    if queue_depth <= 0:
-        raise ValueError("queue_depth must be positive")
-    if not files:
-        return []
-
-    logger.info(
-        f"Dispatching {len(files)} tile(s) across {len(devices)} worker(s) with queue depth {queue_depth}."
-    )
-
-    worker_processes: list[mp.Process] = []
-    task_queues: list[mp.Queue] = []
-    request_queue: mp.Queue = _MP_CTX.Queue(maxsize=max(1, queue_depth * max(len(devices), 1)))
-    result_queue: mp.Queue = _MP_CTX.Queue(maxsize=max(1, len(files) + len(devices)))
-
-    assigned: dict[int, list[Path]] = {}
-
-    # Spawn workers
-    for wid, device_id in enumerate(devices):
-        task_queue: mp.Queue = _MP_CTX.Queue(maxsize=queue_depth)
-        proc = _MP_CTX.Process(
-            target=_worker_loop,
-            kwargs={
-                "worker_id": wid,
-                "device_id": device_id,
-                "queue_depth": queue_depth,
-                "task_queue": task_queue,
-                "request_queue": request_queue,
-                "result_queue": result_queue,
-                "processor_factory": processor_factory,
-                "stop_on_error": stop_on_error,
-                "debug": debug,
-            },
-            name=f"P{wid + 1}",
-            daemon=True,
-        )
-        proc.start()
-        worker_processes.append(proc)
-        task_queues.append(task_queue)
-        assigned[wid] = []
-
-    pending_files = deque(Path(path) for path in files)
-    active_workers = set(range(len(devices)))
-    pending_stop: set[int] = set()
-    failures: list[WorkerMessage] = []
-    cancelled_paths: set[Path] = set()
-
-    try:
-        while active_workers:
-            try:
-                wid = request_queue.get(timeout=1.0)
-            except pyqueue.Empty:
-                for proc in worker_processes:
-                    if not proc.is_alive():
-                        active_workers.discard(worker_processes.index(proc))
-                continue
-
-            if wid not in active_workers:
-                continue
-
-            task_queue = task_queues[wid]
-
-            if wid in pending_stop:
-                task_queue.put(None)
-                active_workers.discard(wid)
-                continue
-
-            if not pending_files:
-                task_queue.put(None)
-                active_workers.discard(wid)
-                continue
-
-            next_path = pending_files.popleft()
-            task_queue.put(next_path)
-            assigned[wid].append(next_path)
-
-            # Drain result_queue opportunistically for progress updates
-            while True:
-                try:
-                    message = result_queue.get_nowait()
-                except pyqueue.Empty:
-                    break
-                if message.path is not None:
-                    assigned_list = assigned.get(message.worker_id, [])
-                    if message.path in assigned_list:
-                        assigned_list.remove(message.path)
-
-                if progress_callback is not None:
-                    progress_callback(message)
-
-                if message.status == "error":
-                    failures.append(message)
-                    if stop_on_error:
-                        for wid_requeue, items in assigned.items():
-                            for pending_path in items:
-                                cancelled_paths.add(pending_path)
-                            assigned[wid_requeue] = []
-                        cancelled_paths.update(pending_files)
-                        pending_files.clear()
-                        pending_stop.update(active_workers)
-                elif message.status == "stopped":
-                    active_workers.discard(message.worker_id)
-    finally:
-        # Ensure clean shutdown without deadlocks
-        for proc, task_queue in zip(worker_processes, task_queues):
-            if proc.is_alive():
-                try:
-                    task_queue.put_nowait(None)
-                except pyqueue.Full:
-                    try:
-                        task_queue.close()
-                        task_queue.cancel_join_thread()
-                    except Exception:  # pragma: no cover
-                        pass
-            else:
-                try:
-                    task_queue.close()
-                except Exception:  # pragma: no cover
-                    pass
-
-        for proc in worker_processes:
-            if proc.is_alive():
-                proc.join(timeout=10.0)
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=5.0)
-
-        # Drain remaining results
-        while True:
-            try:
-                message = result_queue.get_nowait()
-            except pyqueue.Empty:
-                break
-            if progress_callback is not None:
-                progress_callback(message)
-            if message.status == "error":
-                failures.append(message)
-
-        for cancelled in cancelled_paths:
-            failures.append(
-                WorkerMessage(
-                    worker_id=-1,
-                    path=cancelled,
-                    status="error",
-                    duration=None,
-                    error="Cancelled after earlier failure; tile not processed.",
-                )
-            )
-
-    return failures
 
 
 @click.group()
@@ -1505,9 +682,7 @@ __all__ = [
     "parse_device_spec",
     "run_multi_gpu",
     "make_processor_factory",
-    "resolve_basic_paths",
     "filter_pending_files",
-    "load_global_scaling",
     "multi_prepare",
     "multi_batch",
     "multi_run",
