@@ -11,7 +11,7 @@ from .mkprobes.utils.sequtils import gen_idt
 from .mkprobes.utils.sequtils import reverse_complement as rc
 from .utils.pretty_print import jprint, printc, progress_bar
 
-IMWRITE_KWARGS = dict(compression=22610, imagej=True, compression_args={"level": 0.65})
+IMWRITE_KWARGS = dict(compression=22610, bigtiff=True, compressionargs={"level": 0.65})
 
 
 if sys.platform != "linux":

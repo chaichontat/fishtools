@@ -501,7 +501,7 @@ def test_run_cli_delete_origin_respects_limit(tmp_path: Path, monkeypatch: pytes
         lambda spec: [0],
     )
     monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv._safe_delete_origin_dirs",
+        "fishtools.preprocess.cli_deconv_multi.safe_delete_origin_dirs",
         fake_delete,
         raising=False,
     )

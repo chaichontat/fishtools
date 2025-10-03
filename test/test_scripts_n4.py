@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import types
+from typing import Any
 
-import numpy as np
 import pytest
+import numpy as np
 import zarr
 from tifffile import imread
 
 from fishtools.preprocess import n4
+
+
+pytestmark = pytest.mark.timeout(30)
 
 
 def _create_fused_store(path: Path, data: np.ndarray) -> None:
@@ -22,7 +27,9 @@ def _create_fused_store(path: Path, data: np.ndarray) -> None:
     store[...] = data
 
 
-def test_compute_field_from_workspace_creates_correction_field(tmp_path: Path) -> None:
+def test_compute_field_from_workspace_creates_correction_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     workspace = tmp_path / "ws"
     fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
     fused_dir.mkdir(parents=True)
@@ -44,6 +51,12 @@ def test_compute_field_from_workspace_creates_correction_field(tmp_path: Path) -
         corrected_output=None,
         apply_correction=False,
         overwrite=True,
+    )
+
+    monkeypatch.setattr(
+        n4,
+        "compute_correction_field",
+        lambda *args, **kwargs: np.ones((8, 8), dtype=np.float32),
     )
 
     result = n4.compute_field_from_workspace(config)
@@ -158,6 +171,43 @@ def test_apply_correction_field_divides_by_field() -> None:
 
     expected = np.array([[1.0, 2.0], [2.0, 2.0]], dtype=np.float32)
     np.testing.assert_allclose(corrected, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_apply_correction_field_prefers_cupy_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = np.array([[4.0, 8.0], [12.0, 16.0]], dtype=np.float32)
+    field = np.array([[2.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    expected = np.array([[2.0, 4.0], [4.0, 4.0]], dtype=np.float32)
+
+    calls = {"asarray": 0, "asnumpy": 0}
+
+    class _DummyCuPy:
+        float32 = np.float32
+        ndarray = np.ndarray
+
+        def __init__(self) -> None:
+            self.cuda = types.SimpleNamespace(
+                runtime=types.SimpleNamespace(getDeviceCount=lambda: 1)
+            )
+
+        def asarray(self, arr: np.ndarray, dtype: Any | None = None) -> np.ndarray:
+            calls["asarray"] += 1
+            return np.asarray(arr, dtype=dtype) if dtype is not None else np.asarray(arr)
+
+        def asnumpy(self, arr: np.ndarray) -> np.ndarray:
+            calls["asnumpy"] += 1
+            return np.asarray(arr)
+
+    dummy_cp = _DummyCuPy()
+    # Clear cached availability decision before overriding.
+    n4._cupy_available.cache_clear()
+    monkeypatch.setattr(n4, "cp", dummy_cp)
+    monkeypatch.setattr(n4, "_cupy_available", lambda: True)
+
+    corrected = n4.apply_correction_field(image, field)
+
+    np.testing.assert_allclose(corrected, expected, rtol=1e-6, atol=1e-6)
+    assert calls["asarray"] >= 2  # field + image transfer
+    assert calls["asnumpy"] >= 1
 
 
 def test_apply_correction_field_rejects_non_positive_values() -> None:
