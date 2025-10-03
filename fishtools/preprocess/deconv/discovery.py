@@ -6,7 +6,7 @@ from typing import Tuple
 
 from loguru import logger
 
-from fishtools.utils.io import get_metadata
+from fishtools.io.workspace import get_metadata
 
 
 def infer_psf_step(tile: Path, *, default: int = 6) -> Tuple[int, bool]:

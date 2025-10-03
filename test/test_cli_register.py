@@ -8,7 +8,14 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from fishtools.preprocess.cli_register import register as register_cli
+from fishtools.preprocess.cli_register import (
+    DATA,
+    Fiducial,
+    RegisterConfig,
+    Config,
+    _run,
+    register as register_cli,
+)
 
 
 def _make_codebook(tmp_path: Path) -> Path:
@@ -194,3 +201,132 @@ def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: An
     assert seen["roi"] == "roiB"
     assert seen["idx"] == 7
     assert seen["reference"] == "7_15_23"
+
+
+def test_cli_register_run_skips_when_shifts_exist(tmp_path: Path, monkeypatch: Any) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    cb = _make_codebook(tmp_path)
+
+    shift_dir = ws / "shifts--roiA+cb"
+    shift_dir.mkdir(parents=True)
+    (shift_dir / "shifts-0042.json").write_text("{}")
+
+    called = False
+
+    def fake__run(*_: Any, **__: Any) -> None:  # type: ignore[no-untyped-def]
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(ws),
+            "42",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--reference",
+            "4_12_20",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called is False
+
+
+def test_run_internal_returns_early_when_shifts_exist(tmp_path: Path) -> None:
+    shift_dir = tmp_path / "shifts--roiA+cb"
+    shift_dir.mkdir(parents=True)
+    (shift_dir / "shifts-0007.json").write_text("{}")
+
+    cfg = Config(
+        dataPath=str(DATA),
+        exclude=None,
+        registration=RegisterConfig(
+            chromatic_shifts={
+                "650": str(DATA / "560to650.txt"),
+                "750": str(DATA / "560to750.txt"),
+            },
+            fiducial=Fiducial(
+                use_fft=False,
+                fwhm=4.0,
+                threshold=6.0,
+                priors={},
+                overrides={},
+                n_fids=2,
+            ),
+            reference="4_12_20",
+            downsample=1,
+            crop=40,
+            slices=slice(None),
+            reduce_bit_depth=0,
+            discards=None,
+        ),
+    )
+
+    _run(
+        path=tmp_path,
+        roi="roiA",
+        idx=7,
+        codebook=tmp_path / "cb.json",
+        reference="4_12_20",
+        config=cfg,
+        debug=False,
+        overwrite=False,
+        no_priors=False,
+    )
+
+    assert not (tmp_path / "registered--roiA+cb").exists()
+
+
+def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: Any) -> None:
+    base = tmp_path / "analysis" / "deconv"
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+
+    shift_dir = base / "shifts--roiA+cb"
+    shift_dir.mkdir(parents=True)
+    (shift_dir / "shifts-0001.json").write_text("{}")
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, *_: Any, **__: Any) -> None:
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], check: bool) -> Any:  # type: ignore[no-untyped-def]
+        calls.append(argv)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.subprocess.run", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--threads",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == []

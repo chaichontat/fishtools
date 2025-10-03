@@ -34,11 +34,13 @@ from rich.progress import (
 from skimage.filters import gaussian, threshold_otsu
 from sklearn.linear_model import RANSACRegressor
 
-from fishtools.utils.io import get_metadata
+from fishtools.io.workspace import get_metadata
 
 # CLI application -----------------------------------------------------------------
 
-app = click.Group(name="parallel-bleed-through-analyzer", help="Two-step pipeline for calculating bleed-through parameters.")
+app = click.Group(
+    name="parallel-bleed-through-analyzer", help="Two-step pipeline for calculating bleed-through parameters."
+)
 
 # Shared constants kept in sync with production subtraction logic.
 KEYS_560NM = set(range(0, 9)) | {25, 28, 31, 34}
@@ -99,9 +101,25 @@ def process_single_file(image_path: Path, blank_path: Path, output_dir: Path, z_
 @logger.catch
 @click.argument("analysis_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True, exists=True))
 @click.argument("preprocessed_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True))
-@click.option("--data-dir", default="registered--hippo+10xhuman", show_default=True, help="Directory name for sample images.")
-@click.option("--blank-dir", default="registered--hippo+blank", show_default=True, help="Directory name for blank images.")
-@click.option("--num-sample-images", default=10, show_default=True, help="Number of images to sample. -1 for all.", type=int)
+@click.option(
+    "--data-dir",
+    default="registered--hippo+10xhuman",
+    show_default=True,
+    help="Directory name for sample images.",
+)
+@click.option(
+    "--blank-dir",
+    default="registered--hippo+blank",
+    show_default=True,
+    help="Directory name for blank images.",
+)
+@click.option(
+    "--num-sample-images",
+    default=10,
+    show_default=True,
+    help="Number of images to sample. -1 for all.",
+    type=int,
+)
 @click.option("--z-slice", default=5, show_default=True, help="Z-slice index to use.", type=int)
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def run_preprocess(
@@ -166,13 +184,42 @@ def run_preprocess(
 @app.command("fit")
 @logger.catch
 @click.argument("analysis_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True))
-@click.argument("preprocessed_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True, exists=True))
-@click.option("--output-filename", default="robust_bleedthrough_params.csv", show_default=True, help="Name for the final output CSV file.")
-@click.option("--fit-threshold", default=120.0, show_default=True, type=float, help="Intensity threshold for fitting.")
-@click.option("--percentile", default=20.0, show_default=True, type=float, help="Percentile of signal per bin used for regression.")
-@click.option("--max-percentile", default=99.99, show_default=True, type=float, help="Upper percentile bound for blank bins.")
-@click.option("--num-bins", default=50, show_default=True, type=int, help="Number of evenly spaced blank bins.")
-@click.option("--min-bin-count", default=100, show_default=True, type=int, help="Minimum pixels per bin to keep it in the fit.")
+@click.argument(
+    "preprocessed_path", type=click.Path(path_type=Path, file_okay=False, dir_okay=True, exists=True)
+)
+@click.option(
+    "--output-filename",
+    default="robust_bleedthrough_params.csv",
+    show_default=True,
+    help="Name for the final output CSV file.",
+)
+@click.option(
+    "--fit-threshold", default=120.0, show_default=True, type=float, help="Intensity threshold for fitting."
+)
+@click.option(
+    "--percentile",
+    default=20.0,
+    show_default=True,
+    type=float,
+    help="Percentile of signal per bin used for regression.",
+)
+@click.option(
+    "--max-percentile",
+    default=99.99,
+    show_default=True,
+    type=float,
+    help="Upper percentile bound for blank bins.",
+)
+@click.option(
+    "--num-bins", default=50, show_default=True, type=int, help="Number of evenly spaced blank bins."
+)
+@click.option(
+    "--min-bin-count",
+    default=100,
+    show_default=True,
+    type=int,
+    help="Minimum pixels per bin to keep it in the fit.",
+)
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def run_fit(
     analysis_path: Path,
@@ -336,15 +383,43 @@ def _subtract_registered_channels(
 
 @app.command("fit-registered")
 @logger.catch
-@click.argument("registered_path", type=click.Path(path_type=Path, file_okay=True, dir_okay=False, exists=True))
+@click.argument(
+    "registered_path", type=click.Path(path_type=Path, file_okay=True, dir_okay=False, exists=True)
+)
 @click.argument("output_csv", type=click.Path(path_type=Path, file_okay=True, dir_okay=False))
 @click.option("--signal-channel", required=True, help="Channel name to correct.")
 @click.option("--blank-channel", required=True, help="Reference blank channel name.")
-@click.option("--fit-threshold", default=120.0, show_default=True, type=float, help="Ignore blank pixels at or below this intensity.")
-@click.option("--percentile", default=20.0, show_default=True, type=float, help="Percentile of signal per bin used for regression.")
-@click.option("--max-percentile", default=99.99, show_default=True, type=float, help="Upper percentile bound for blank bins.")
-@click.option("--num-bins", default=50, show_default=True, type=int, help="Number of evenly spaced blank bins.")
-@click.option("--min-bin-count", default=100, show_default=True, type=int, help="Minimum pixels per bin to keep it in the fit.")
+@click.option(
+    "--fit-threshold",
+    default=120.0,
+    show_default=True,
+    type=float,
+    help="Ignore blank pixels at or below this intensity.",
+)
+@click.option(
+    "--percentile",
+    default=20.0,
+    show_default=True,
+    type=float,
+    help="Percentile of signal per bin used for regression.",
+)
+@click.option(
+    "--max-percentile",
+    default=99.99,
+    show_default=True,
+    type=float,
+    help="Upper percentile bound for blank bins.",
+)
+@click.option(
+    "--num-bins", default=50, show_default=True, type=int, help="Number of evenly spaced blank bins."
+)
+@click.option(
+    "--min-bin-count",
+    default=100,
+    show_default=True,
+    type=int,
+    help="Minimum pixels per bin to keep it in the fit.",
+)
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def run_fit_registered(
     registered_path: Path,
@@ -393,20 +468,18 @@ def run_fit_registered(
         float(np.median(flat_blank[mask])),
     )
 
-    results_df = pd.DataFrame(
-        [
-            dict(
-                signal_channel=signal_channel,
-                blank_channel=blank_channel,
-                slope=slope,
-                intercept=intercept,
-                num_bins=len(bin_centers),
-                percentile=percentile,
-                max_percentile=max_percentile,
-                fit_threshold=fit_threshold,
-            )
-        ]
-    )
+    results_df = pd.DataFrame([
+        dict(
+            signal_channel=signal_channel,
+            blank_channel=blank_channel,
+            slope=slope,
+            intercept=intercept,
+            num_bins=len(bin_centers),
+            percentile=percentile,
+            max_percentile=max_percentile,
+            fit_threshold=fit_threshold,
+        )
+    ])
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     results_df.to_csv(output_csv, index=False, float_format="%.6f")
     logger.info("Saved parameters to %s", output_csv)
@@ -414,14 +487,26 @@ def run_fit_registered(
 
 @app.command("subtract-registered")
 @logger.catch
-@click.argument("registered_path", type=click.Path(path_type=Path, file_okay=True, dir_okay=False, exists=True))
+@click.argument(
+    "registered_path", type=click.Path(path_type=Path, file_okay=True, dir_okay=False, exists=True)
+)
 @click.argument("output_path", type=click.Path(path_type=Path, file_okay=True, dir_okay=False))
 @click.option("--signal-channel", required=True, help="Channel to correct.")
 @click.option("--blank-channel", required=True, help="Reference blank channel.")
-@click.option("--params-csv", type=click.Path(path_type=Path, dir_okay=False, file_okay=True), help="CSV produced by fit commands containing slope/intercept.")
+@click.option(
+    "--params-csv",
+    type=click.Path(path_type=Path, dir_okay=False, file_okay=True),
+    help="CSV produced by fit commands containing slope/intercept.",
+)
 @click.option("--slope", type=float, help="Slope to apply (overrides CSV if provided).")
 @click.option("--intercept", type=float, help="Intercept to apply (overrides CSV if provided).")
-@click.option("--clip-min", default=0.0, show_default=True, type=float, help="Lower bound after subtraction; defaults to 0.")
+@click.option(
+    "--clip-min",
+    default=0.0,
+    show_default=True,
+    type=float,
+    help="Lower bound after subtraction; defaults to 0.",
+)
 @click.option("--log-level", default="INFO", show_default=True, help="Logging level.")
 def run_subtract_registered(
     registered_path: Path,
@@ -473,14 +558,12 @@ def run_subtract_registered(
 
     metadata_out = dict(metadata)
     subtract_meta = metadata_out.get("subtract", {})
-    subtract_meta.update(
-        {
-            "signal_channel": signal_channel,
-            "blank_channel": blank_channel,
-            "slope": slope,
-            "intercept": intercept,
-        }
-    )
+    subtract_meta.update({
+        "signal_channel": signal_channel,
+        "blank_channel": blank_channel,
+        "slope": slope,
+        "intercept": intercept,
+    })
     metadata_out["subtract"] = subtract_meta
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

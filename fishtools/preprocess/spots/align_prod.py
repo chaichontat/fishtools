@@ -14,6 +14,12 @@ from itertools import chain, groupby
 from pathlib import Path
 from typing import Any, Literal, Mapping, cast
 
+import matplotlib
+
+matplotlib.use("Agg", force=True)
+import multiprocessing as mp
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
@@ -24,6 +30,15 @@ import tifffile
 import xarray as xr
 from loguru import logger
 from pydantic import BaseModel, TypeAdapter, field_validator
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from starfish import ImageStack, IntensityTable
 from starfish.core.intensity_table.decoded_intensity_table import DecodedIntensityTable
 from starfish.core.intensity_table.intensity_table_coordinates import (
@@ -40,6 +55,7 @@ from starfish.types import Axes, Features, Levels
 from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread
 
+from fishtools.io.workspace import CorruptedTiffError, Workspace
 from fishtools.preprocess.addition import ElementWiseAddition
 from fishtools.preprocess.cli_spotlook import threshold
 from fishtools.preprocess.config import (
@@ -50,6 +66,7 @@ from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.spots.align_batchoptimize import optimize
 from fishtools.preprocess.spots.overlay_spots import overlay
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
+from fishtools.utils.plot import plot_all_genes
 from fishtools.utils.pretty_print import progress_bar_threadpool
 from fishtools.utils.utils import git_hash
 
@@ -398,6 +415,8 @@ def find_threshold(
         p for p in paths if not (p.parent / SUBFOLDER / f"{p.stem}_{codebook.stem}.hp.tif").exists()
     )
 
+    # --- plotall command ---
+
     if not (path_out / "global_scale.txt").exists():
         raise ValueError("Please run align_prod optimize first.")
 
@@ -473,6 +492,317 @@ def find_threshold(
         prev_norms = json.loads(jsonfile.read_text())
         prev_norms.append(norms)
         jsonfile.write_text(json.dumps(prev_norms, indent=2))
+
+
+def _sanitize_codebook_name(codebook: str) -> str:
+    return codebook.replace("-", "_").replace(" ", "_")
+
+
+def _resolve_spots_parquet(base: Path, roi: str, codebook: str) -> Path:
+    cb_s = _sanitize_codebook_name(codebook)
+    candidates = [
+        base / "analysis" / "output" / f"{roi}+{cb_s}.parquet",
+        base / "analysis" / "output" / f"{roi}+{codebook}.parquet",
+        base / "analysis" / "deconv" / f"{roi}+{cb_s}.parquet",
+        base / "analysis" / "deconv" / f"{roi}+{codebook}.parquet",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"Could not find spots parquet for ROI '{roi}', codebook '{codebook}'.\n"
+        f"Searched: {', '.join(map(str, candidates))}"
+    )
+
+
+def _render_one_roi_plot(
+    base: Path,
+    roi: str,
+    codebook: str,
+    outdir: Path,
+    *,
+    dark: bool = False,
+    only_blank: bool = False,
+    overwrite: bool = False,
+    max_per_plot: int | None = None,
+    figure_sizes: list[tuple[float, float]] | None = None,
+    cmap: str | None = None,
+) -> list[Path]:
+    """Render and save plot(s) for one ROI.
+
+    - When max_per_plot is None, produce a single figure.
+    - When max_per_plot is a positive integer and the gene count exceeds it,
+      split across multiple figures and append ``--part{n}`` to filenames.
+    Returns a list of output paths created or found.
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+    cb_s = _sanitize_codebook_name(codebook)
+    base_name = f"plotall--{roi}+{cb_s}{'--blank' if only_blank else ''}{'--dark' if dark else ''}"
+
+    spots_path = _resolve_spots_parquet(base, roi, codebook)
+    spots_df = pl.read_parquet(spots_path)
+    genes = spots_df.get_column("target").unique().to_list()  # type: ignore[attr-defined]
+    genes = sorted(g for g in genes if isinstance(g, str))
+    if only_blank:
+        genes = [g for g in genes if g.startswith("Blank")]
+
+    outputs: list[Path] = []
+
+    if (max_per_plot is None) or (len(genes) <= max_per_plot):
+        out_png = outdir / f"{base_name}.png"
+        if not out_png.exists() or overwrite:
+            size0 = figure_sizes[0] if figure_sizes else None
+            fig, _ = plot_all_genes(spots_df, dark=dark, only_blank=only_blank, figsize=size0, cmap=cmap)
+            fig.tight_layout()
+            fig.savefig(out_png.as_posix(), dpi=200, bbox_inches="tight")
+            plt.close(fig)
+        outputs.append(out_png)
+        return outputs
+
+    # Multi-part rendering
+    n_parts = (len(genes) + max_per_plot - 1) // max_per_plot  # type: ignore[operator]
+    for idx in range(n_parts):
+        g_chunk = genes[idx * max_per_plot : (idx + 1) * max_per_plot]  # type: ignore[operator]
+        df_chunk = spots_df.filter(pl.col("target").is_in(g_chunk))
+        out_png = outdir / f"{base_name}.{idx + 1}.png"
+        if not out_png.exists() or overwrite:
+            size_i = (
+                figure_sizes[idx]
+                if (figure_sizes and idx < len(figure_sizes))
+                else (figure_sizes[-1] if figure_sizes else None)
+            )
+            fig, _ = plot_all_genes(df_chunk, dark=dark, only_blank=False, figsize=size_i, cmap=cmap)
+            fig.tight_layout()
+            fig.savefig(out_png.as_posix(), dpi=200, bbox_inches="tight")
+            plt.close(fig)
+        outputs.append(out_png)
+
+    return outputs
+
+
+@spots.command("plotall")
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str, default="*")
+@click.option(
+    "--codebook",
+    "codebook_label",
+    type=str,
+    default="cs-base",
+    help="Codebook label or path; if a path is given, the stem is used.",
+)
+@click.option("--threads", "-t", type=int, default=8, help="Max processes to render plots.")
+@click.option("--only-blank", is_flag=True, help="Plot only genes with names starting with 'Blank'.")
+@click.option("--dark", is_flag=True, help="Use dark background + magma colormap.")
+@click.option(
+    "--outdir",
+    type=click.Path(dir_okay=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Output directory for saved figures (default: analysis/output/plots).",
+)
+@click.option("--overwrite", is_flag=True, help="Overwrite existing figures if present.")
+@click.option(
+    "--max-per-plot",
+    "max_per_plot_opt",
+    type=str,
+    default=None,
+    help='Maximum genes per figure; integer or "none" for unlimited.',
+)
+@click.option(
+    "--figure-size",
+    "figure_size_opt",
+    type=str,
+    default=None,
+    help="Per-plot figure size in inches. Accepts a single size (e.g., '72x12') or a semicolon-separated list for multi-part outputs (e.g., '60x10;48x8').",
+)
+@click.option(
+    "--cmap",
+    "cmap",
+    type=str,
+    default=None,
+    help="Colormap name for hexbin plots (e.g., 'magma', 'viridis').",
+)
+def plot_all_genes_cli(
+    path: Path,
+    roi: str,
+    codebook_label: str = "cs-base",
+    threads: int = 8,
+    only_blank: bool = False,
+    dark: bool = False,
+    outdir: Path | None = None,
+    overwrite: bool = False,
+    max_per_plot_opt: str | None = None,
+    figure_size_opt: str | None = None,
+    cmap: str | None = None,
+):
+    """Plot per-gene spot distributions for one or many ROIs.
+
+    Examples:
+    - Single ROI: preprocess spots plotall /workspace cortex --codebook cs-base
+    - All ROIs:   preprocess spots plotall /workspace --codebook cs-base   (ROI omitted)
+    - Wildcard:   preprocess spots plotall /workspace * --codebook cs-base
+    """
+    ws = Workspace(path)
+    # Derive codebook name even if a full path is passed
+    cb = Path(codebook_label).stem if Path(codebook_label).exists() else codebook_label
+    click.echo(cb)
+
+    # Resolve ROIs
+    if roi in {"*", "all"}:
+        rois = ws.rois
+    else:
+        rois = ws.resolve_rois([roi])
+    if not rois:
+        raise click.ClickException("No ROIs found in workspace")
+
+    # Output directory
+    if outdir is None:
+        outdir = ws.path / "analysis" / "output" / "plots"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Dispatch per-ROI rendering jobs
+
+    # Session start log
+    t0 = time.perf_counter()
+    logger.info(
+        "[spots.plotall] started | path={} | rois={} | codebook={} | outdir={} | threads={} | only_blank={} | dark={} | overwrite={}",
+        ws.path,
+        rois,
+        cb,
+        outdir,
+        threads,
+        only_blank,
+        dark,
+        overwrite,
+    )
+
+    errors: list[str] = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]spots.plotall"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task("render", total=len(rois))
+
+        # Parse figure_size(s): allow single or semicolon-separated list
+        def _parse_figsize_one(s: str) -> tuple[float, float]:
+            s = s.strip().lower().replace("x", ",").replace(" ", ",")
+            parts = [p for p in s.split(",") if p]
+            if len(parts) != 2:
+                raise click.BadParameter("--figure-size expects WIDTHxHEIGHT (inches)")
+            try:
+                return float(parts[0]), float(parts[1])
+            except Exception:
+                raise click.BadParameter("--figure-size expects numeric WIDTH and HEIGHT")
+
+        def _parse_figsizes(opt: str | None) -> list[tuple[float, float]] | None:
+            if opt is None:
+                return None
+            if ";" in opt:
+                return [_parse_figsize_one(x) for x in opt.split(";") if x.strip()]
+            return [_parse_figsize_one(opt)]
+
+        fig_sizes = _parse_figsizes(figure_size_opt)
+        if int(threads) <= 1:
+            # Sandbox-friendly sequential path
+            for r in rois:
+                try:
+                    progress.console.log(f"[bold cyan]ROI '{r}' started")
+                    # Parse max_per_plot locally per run
+                    if max_per_plot_opt is None:
+                        mpp = None
+                    else:
+                        vv = max_per_plot_opt.strip().lower()
+                        if vv in {"none", "null", ""}:
+                            mpp = None
+                        else:
+                            try:
+                                mpp = int(vv)
+                                if mpp <= 0:
+                                    raise ValueError
+                            except Exception:
+                                raise click.BadParameter("--max-per-plot must be positive int or 'none'")
+
+                    saved = _render_one_roi_plot(
+                        ws.path,
+                        r,
+                        cb,
+                        outdir,
+                        dark=dark,
+                        only_blank=only_blank,
+                        overwrite=overwrite,
+                        max_per_plot=mpp,
+                        figure_sizes=fig_sizes,
+                        cmap=cmap,
+                    )
+                    progress.advance(task)
+                    progress.console.log(f"[bold green]ROI '{r}' completed -> {saved}")
+                except Exception as e:  # pragma: no cover
+                    progress.console.log(f"[bold red]ROI '{r}' failed: {e}")
+                    errors.append(str(e))
+        else:
+            ctx = mp.get_context("spawn")
+            # Parse once and pass into workers
+            if max_per_plot_opt is None:
+                mpp = None
+            else:
+                vv = max_per_plot_opt.strip().lower()
+                if vv in {"none", "null", ""}:
+                    mpp = None
+                else:
+                    try:
+                        mpp = int(vv)
+                        if mpp <= 0:
+                            raise ValueError
+                    except Exception:
+                        raise click.BadParameter("--max-per-plot must be positive int or 'none'")
+
+            with ProcessPoolExecutor(max_workers=max(1, int(threads)), mp_context=ctx) as ex:
+                futures = {}
+                for r in rois:
+                    progress.console.log(f"[bold cyan]ROI '{r}' submitted")
+                    fut = ex.submit(
+                        _render_one_roi_plot,
+                        ws.path,
+                        r,
+                        cb,
+                        outdir,
+                        dark=dark,
+                        only_blank=only_blank,
+                        overwrite=overwrite,
+                        max_per_plot=mpp,
+                        figure_sizes=fig_sizes,
+                        cmap=cmap,
+                    )
+                    futures[fut] = r
+
+                pending = set(futures.keys())
+                while pending:
+                    done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                    for fut in done:
+                        r = futures.get(fut, "?")
+                        try:
+                            saved = fut.result()
+                            progress.advance(task)
+                            progress.console.log(f"[bold green]ROI '{r}' completed -> {saved}")
+                        except Exception as e:  # pragma: no cover
+                            progress.console.log(f"[bold red]ROI '{r}' failed: {e}")
+                            errors.append(str(e))
+
+    if errors:
+        raise click.ClickException("; ".join(errors))
+
+    dt = time.perf_counter() - t0
+    logger.success(
+        "[spots.plotall] completed | rois_processed={} | duration={:.2f}s | outdir={}",
+        len(rois),
+        dt,
+        outdir,
+    )
 
 
 def load_2d(path: Path | str, *args, **kwargs):
@@ -1384,7 +1714,10 @@ def batch(
     stagger_jitter: float = 0.0,
 ):
     split = True  # Intentional override. --split kept for backward compatibility
-    all_paths = {p for p in path.glob(f"registered--{roi}+{codebook_path.stem}/reg*.tif")}
+    workspace = Workspace(path)
+    roi_filter = None if roi == "*" else [roi]
+    file_map, _ = workspace.registered_file_map(codebook_path.stem, rois=roi_filter)
+    all_paths = {p for paths in file_map.values() for p in paths}
     paths_in_scope = all_paths  # Start with all paths
 
     if delete_corrupted:
@@ -1393,10 +1726,11 @@ def batch(
             if i % 100 == 0:
                 logger.info(f"Checked {i}/{len(all_paths)} files.")
             try:
-                imread(p)
-            except Exception as e:
-                logger.warning(f"Error reading {p}: {e}. Deleting.")
+                Workspace.ensure_tiff_readable(p)
+            except CorruptedTiffError as error:
+                logger.warning(f"Error reading {p}: {error}. Deleting.")
                 p.unlink()
+                all_paths.discard(p)
                 continue
 
     # Filter by modification time if --since is provided

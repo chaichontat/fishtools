@@ -8,7 +8,7 @@ from typing import Iterable
 import numpy as np
 from loguru import logger
 
-from fishtools.utils.io import get_metadata
+from fishtools.io.workspace import get_metadata
 from fishtools.utils.pretty_print import progress_bar
 
 PROTEIN_PERC_MIN = 50.0
@@ -126,4 +126,3 @@ def compute_range_for_round(
     scaling_dir.mkdir(exist_ok=True)
     np.savetxt(scaling_dir / f"{round_name}.txt", np.vstack([m_glob, s_glob]))
     logger.info("[%s] Saved scaling to %s", round_name, scaling_dir / f"{round_name}.txt")
-

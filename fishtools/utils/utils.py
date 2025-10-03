@@ -1,5 +1,6 @@
 import functools
 import logging
+import os
 import subprocess
 import sys
 import types
@@ -42,6 +43,14 @@ def copy_signature_method(
     return return_func
 
 
+_DEFAULT_LOGGER_FORMAT = (
+    "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+    "<level>{level: <8}</level> | "
+    "<cyan>{name}</cyan>:<cyan>{line}</cyan> {extra[idx]} {extra[file]}| "
+    "- <level>{message}</level>"
+)
+
+
 def setup_logging():
     logger.remove()
     logger.add(
@@ -51,6 +60,74 @@ def setup_logging():
         "<level>{level: >8}</level> | "
         "<cyan>{name}</cyan> | <level>{message}</level>",
     )
+
+
+def configure_cli_logging(
+    workspace: Path | None,
+    component: str,
+    *,
+    console_level: str = "WARNING",
+    file_level: str = "WARNING",
+    rotation: str | int | None = "20 MB",
+    retention: str | int | None = "30 days",
+    extra: dict[str, str] | None = None,
+    enqueue: bool = False,
+) -> Path | None:
+    """Configure loguru sinks for CLI commands.
+
+    Ensures warning-or-higher messages are persisted to
+    ``<workspace>/analysis/logs/<component>.log`` while maintaining the
+    existing rich console formatting.
+
+    Args:
+        workspace: Root experiment directory. When ``None`` no file sink is added.
+        component: Identifier for the current CLI/component (used in filenames).
+        console_level: Minimum level emitted to stderr.
+        file_level: Minimum level persisted to the workspace log file.
+        rotation: Rotation rule passed to loguru (size string or int bytes).
+        retention: Retention rule passed to loguru.
+        extra: Optional mapping merged into logger ``extra`` context.
+        enqueue: When True, use queue-based handlers (may require semaphores).
+
+    Returns:
+        Path to the log file sink when created, else ``None``.
+    """
+
+    logger.remove()
+    # logger.configure(extra=dict(idx="", file="", component=component, **(extra or {})))
+    logger.configure(extra={"idx": "", "file": "", "component": component, **(extra or {})})
+
+    logger.add(
+        sys.stderr,
+        level=console_level,
+        format=_DEFAULT_LOGGER_FORMAT,
+        colorize=True,
+        enqueue=enqueue,
+        backtrace=False,
+        diagnose=False,
+    )
+
+    if workspace is None:
+        return None
+
+    log_root = workspace / "analysis" / "logs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    log_file = log_root / f"{component}.log"
+
+    logger.add(
+        log_file,
+        level=file_level,
+        format=_DEFAULT_LOGGER_FORMAT,
+        rotation=rotation,
+        retention=retention,
+        enqueue=enqueue,
+        backtrace=False,
+        diagnose=False,
+    )
+
+    os.environ["FISHTOOLS_ACTIVE_LOG"] = str(log_file)
+
+    return log_file
 
 
 def initialize_logger(idx: int | None = None, debug: bool = False, file: str = "") -> None:
@@ -70,16 +147,13 @@ def initialize_logger(idx: int | None = None, debug: bool = False, file: str = "
         >>> logger.info("Processing started")
         # Output: 2023-01-01 12:00:00.123 | DEBUG    | module:line 0042 | - Processing started
     """
-    logger_format = (
-        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{line}</cyan> {extra[idx]} {extra[file]}| "
-        "- <level>{message}</level>"
+    configure_cli_logging(
+        workspace=None,
+        component="cli",
+        console_level="DEBUG" if debug else "WARNING",
+        file_level="CRITICAL",  # effectively disable file sink when no workspace
+        extra={"idx": f"{idx:04d}" if idx is not None else "", "file": file},
     )
-    logger.remove()
-    if idx is not None:
-        logger.configure(extra=dict(idx=f"{idx:04d}", file=file))
-    logger.add(sys.stderr, level="DEBUG" if debug else "WARNING", format=logger_format)
 
     class InterceptHandler(logging.Handler):
         def emit(self, record: logging.LogRecord):
@@ -99,6 +173,52 @@ def initialize_logger(idx: int | None = None, debug: bool = False, file: str = "
 
     logging.basicConfig(handlers=[InterceptHandler()], level=logging.DEBUG, force=True)
     logging.getLogger("biothings").setLevel(logging.CRITICAL)
+
+
+def add_file_context(exc: BaseException, *paths: Path | str | None) -> None:
+    """Annotate exceptions with helpful path context.
+
+    Appends file path information to exception args and (when available) to
+    the PEP 678 ``Exception.add_note`` for richer error messages upstream.
+
+    This is a tiny utility used across CLIs to ensure failures include the
+    relevant filenames without coupling to specific call sites.
+
+    Example:
+        try:
+            ...
+        except Exception as e:
+            add_file_context(e, in_path, out_path)
+            raise
+    """
+
+    path_strings: list[str] = []
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            path_strings.append(str(Path(path)))
+        except TypeError:
+            path_strings.append(str(path))
+
+    if not path_strings:
+        return
+
+    prefix = ", ".join(path_strings)
+    if exc.args:
+        first, *rest = exc.args
+        if isinstance(first, str):
+            if prefix not in first:
+                exc.args = (f"{prefix}: {first}", *rest)
+        else:
+            exc.args = (f"{prefix}: {first!r}", *rest)
+    else:
+        exc.args = (f"Error while processing {prefix}",)
+
+    try:
+        exc.add_note(f"While processing file(s): {prefix}")
+    except AttributeError:
+        pass
 
 
 def check_if_posix(f: Callable[P, R]) -> Callable[P, R]:
@@ -264,7 +384,7 @@ def batch_roi(
 
             # Use Workspace to get ROIs instead of manual directory parsing
             try:
-                from fishtools.utils.io import Workspace
+                from fishtools.io.workspace import Workspace
 
                 # Convert path to Path object for type safety
                 workspace_path = Path(str(kwargs["path"]))

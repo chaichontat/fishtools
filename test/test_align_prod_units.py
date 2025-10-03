@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+import tifffile
 import xarray as xr
 
 from fishtools.preprocess.spots.align_prod import (
@@ -19,10 +20,12 @@ from fishtools.preprocess.spots.align_prod import (
     Deviations,
     InitialScale,
     append_json,
+    batch,
     create_opt_path,
     generate_subtraction_matrix,
     get_blank_channel_info,
 )
+from fishtools.utils.io import CorruptedTiffError, Workspace
 
 
 def test_get_blank_channel_info_mappings() -> None:
@@ -146,3 +149,64 @@ def test_deviations_append_and_read(tmp_path: Path) -> None:
     assert objects[1].round_num == 1
     assert objects[1].n == 42
     assert np.allclose(objects[1].deviation, dev)
+
+
+def test_batch_delete_corrupted_uses_workspace_helpers(monkeypatch, tmp_path: Path) -> None:
+    workspace_root = tmp_path / "ws"
+    registered = workspace_root / "analysis" / "deconv" / "registered--cortex+cb"
+    registered.mkdir(parents=True)
+
+    valid = registered / "reg-0000.tif"
+    tifffile.imwrite(valid, np.zeros((1, 1, 2, 2), dtype=np.uint16))
+
+    corrupted = registered / "reg-0001.tif"
+    corrupted.write_bytes(b"not-tiff")
+
+    opt_dir = workspace_root / "analysis" / "deconv" / "opt_cb"
+    opt_dir.mkdir(parents=True)
+    np.savetxt(opt_dir / "global_scale.txt", np.ones((2, 2)))
+
+    codebook_path = tmp_path / "cb.json"
+    codebook_path.write_text("{}")
+
+    checked: list[Path] = []
+
+    real_ensure = Workspace.ensure_tiff_readable
+
+    def fake_ensure(path: Path) -> None:
+        checked.append(path)
+        if path == corrupted:
+            raise CorruptedTiffError(path, ValueError("corrupted"))
+        real_ensure(path)
+
+    monkeypatch.setattr(Workspace, "ensure_tiff_readable", staticmethod(fake_ensure))
+
+    captured: list[list[Path]] = []
+
+    def fake_batch(paths: list[Path], command: str, args: list[str], **kwargs) -> None:  # type: ignore[override]
+        captured.append(list(paths))
+
+    monkeypatch.setattr("fishtools.preprocess.spots.align_prod._batch", fake_batch)
+
+    batch.callback(
+        path=workspace_root,
+        roi="cortex",
+        codebook_path=codebook_path,
+        threads=1,
+        overwrite=False,
+        simple=False,
+        split=False,
+        max_proj=0,
+        since=None,
+        delete_corrupted=True,
+        local_opt=False,
+        blank=None,
+        json_config=None,
+        stagger=0.0,
+        stagger_jitter=0.0,
+    )
+
+    assert captured, "_batch should be invoked with files to process"
+    assert captured[0] == [valid]
+    assert not corrupted.exists()
+    assert set(checked) == {valid, corrupted}

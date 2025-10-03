@@ -15,7 +15,7 @@ from loguru import logger
 from numpy.typing import NDArray
 
 from fishtools.preprocess.config import Config
-from fishtools.utils.io import Workspace
+from fishtools.io.workspace import Workspace
 
 
 @dataclass

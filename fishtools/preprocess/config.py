@@ -1,12 +1,20 @@
+from enum import Enum
 from json import JSONEncoder
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal
 
 import numpy as np
 from loguru import logger
 from pydantic import BaseModel, Field, PlainSerializer, field_validator
 
 DATA = Path("/working/fishtools/data")
+
+
+class DeconvolutionOutputMode(str, Enum):
+    """Available output encodings for deconvolution pipelines."""
+
+    U16 = "u16"
+    F32 = "float32"
 
 
 class NumpyEncoder(JSONEncoder):
@@ -227,6 +235,10 @@ class DeconvolutionConfig(BaseModel):
     threads: int = Field(default=6, description="Number of threads for deconvolution operations")
     # BaSiC correction nested under deconvolution
     basic: BasicConfig = Field(default_factory=BasicConfig, description="BaSiC correction configuration")
+    output_mode: DeconvolutionOutputMode = Field(
+        default=DeconvolutionOutputMode.U16,
+        description="Default output mode for CLI-driven deconvolution (u16 or float32).",
+    )
 
 
 class StitchingConfig(BaseModel):

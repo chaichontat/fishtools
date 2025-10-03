@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import pyparsing as pp
+from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -123,6 +124,27 @@ class TileConfiguration:
             ax.text(row["x"], row["y"], str(row["index"]), fontsize=6, ha="center", va="center")
         ax.set_aspect("equal")
 
+    # --- Selection helpers -------------------------------------------------
+    def indices_at_least_n_steps_from_edges(self, n: int) -> np.ndarray:
+        """Return tile indices at least ``n`` grid-steps from every edge.
+
+        The distance is computed in ordinal grid space defined by the unique
+        sorted ``x`` and ``y`` coordinates, not raw numeric spacing. This makes
+        the method robust to arbitrary coordinate units (e.g., pixels vs. stage
+        microns) and non-unit step sizes.
+
+        Example: if the grid is 5 by 4 (unique x count = 5, unique y count = 4)
+        and ``n=1``, only tiles with x-rank in [1, 3] and y-rank in [1, 2] are
+        returned.
+
+        Returns the values from the ``index`` column corresponding to the
+        selected tiles (not dataframe row positions).
+        """
+        xy: NDArray[np.float64] = self.df.select(["x", "y"]).to_numpy()
+        pos_idx = tiles_at_least_n_steps_from_edges(xy, n)
+        # Map dataframe row positions to tile IDs in the "index" column
+        return self.df.select("index").to_numpy().reshape(-1)[pos_idx]
+
 
 def copy_registered(reference_path: Path, actual_path: Path) -> None:
     """Copy *.registered.txt files from one directory to another.
@@ -132,3 +154,55 @@ def copy_registered(reference_path: Path, actual_path: Path) -> None:
     for file in reference_path.glob("*.registered.txt"):
         Path(actual_path).mkdir(parents=True, exist_ok=True)
         (actual_path / file.name).write_text(file.read_text())
+
+
+def tiles_at_least_n_steps_from_edges(xy: NDArray[np.floating | np.integer], n: int) -> NDArray[np.int_]:
+    """Return positions of tiles at least ``n`` steps from the edges.
+
+    Parameters
+    ----------
+    xy
+        Array of shape (N, 2) with columns ``[x, y]`` representing tile
+        locations. Values need not be integers or unit-spaced.
+    n
+        Number of grid steps from every edge required to keep a tile.
+
+    Returns
+    -------
+    np.ndarray
+        1D array of 0-based positions into ``xy`` meeting the criterion.
+
+    Notes
+    -----
+    "Steps" are measured in ordinal grid space derived from the unique sorted
+    ``x`` and ``y`` values. For example, with unique ``x`` values
+    ``[100, 200, 400]`` and unique ``y`` values ``[5, 15, 25]``, the center
+    tile has x-rank=1, y-rank=1 and is one step from each edge.
+    """
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        raise ValueError("xy must be a (N, 2) array of [x, y] coordinates")
+    if n < 0:
+        raise ValueError("n must be non-negative")
+
+    # Convert to float for consistent handling, then compute ordinal ranks
+    x = np.asarray(xy[:, 0])
+    y = np.asarray(xy[:, 1])
+
+    ux = np.unique(x)
+    uy = np.unique(y)
+
+    # Early exit: not enough interior layers to satisfy n
+    if len(ux) < 2 * n + 1 or len(uy) < 2 * n + 1:
+        return np.array([], dtype=np.int64)
+
+    x_rank_map = {v: i for i, v in enumerate(ux)}
+    y_rank_map = {v: i for i, v in enumerate(uy)}
+
+    ix = np.fromiter((x_rank_map[val] for val in x), count=len(x), dtype=np.int64)
+    iy = np.fromiter((y_rank_map[val] for val in y), count=len(y), dtype=np.int64)
+
+    dx = np.minimum(ix, (len(ux) - 1) - ix)
+    dy = np.minimum(iy, (len(uy) - 1) - iy)
+    dmin = np.minimum(dx, dy)
+
+    return np.nonzero(dmin >= n)[0]

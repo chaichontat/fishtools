@@ -1,20 +1,32 @@
+import io
 import json
 import os
 import re
 import shutil
-from contextlib import contextmanager
+import warnings
+from contextlib import contextmanager, redirect_stderr, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, overload
+from typing import Any, Callable, Iterable, Literal, overload
 
 import numpy as np
 import numpy.typing as npt
 import requests
 from loguru import logger
 from tifffile import TiffFile, imread
+from tifffile import imwrite as tifffile_imwrite
 from tqdm.auto import tqdm
 
 from fishtools.preprocess.tileconfig import TileConfiguration
+
+
+class CorruptedTiffError(RuntimeError):
+    """Raised when a TIFF file cannot be read due to corruption."""
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        super().__init__(f"File {path} is corrupted. Please check the file.")
+        self.path = path
+        self.__cause__ = cause
 
 
 def download(url: str, path: str | Path, name: str | None = None) -> None:
@@ -49,6 +61,57 @@ def download(url: str, path: str | Path, name: str | None = None) -> None:
 
 def get_file_name(url: str) -> str:
     return url.split("/")[-1]
+
+
+def safe_imwrite(
+    path: Path | str,
+    data: npt.ArrayLike,
+    *,
+    imwrite_func: Callable[..., Any] = tifffile_imwrite,
+    partial_suffix: str = ".partial",
+    mkdir: bool = True,
+    **kwargs: Any,
+) -> None:
+    """Write TIFF data atomically by using a temporary `.partial` file.
+
+    The data is first written to `<filename>.tif.partial` and only renamed to the
+    final `.tif` path after the write succeeds, ensuring readers never observe a
+    partially written TIFF. On failure the temporary file is removed.
+
+    Args:
+        path: Destination path for the final TIFF file.
+        data: Array-like payload to pass to the underlying ``imwrite`` function.
+        imwrite_func: Callable used to persist the data (defaults to ``tifffile.imwrite``).
+        partial_suffix: Suffix appended to the filename while writing.
+        mkdir: When True, create the parent directory if missing.
+        **kwargs: Additional keyword arguments forwarded to ``imwrite_func``.
+
+    Raises:
+        Exception: Propagates any exception raised by the underlying writer or rename.
+    """
+
+    final_path = Path(path)
+    if mkdir:
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+
+    partial_path = final_path.with_name(f"{final_path.name}{partial_suffix}")
+
+    if partial_path.exists():
+        partial_path.unlink()
+
+    try:
+        imwrite_func(partial_path, data, **kwargs)
+    except Exception:
+        with suppress(FileNotFoundError):
+            partial_path.unlink()
+        raise
+
+    try:
+        partial_path.replace(final_path)
+    except Exception:
+        with suppress(FileNotFoundError):
+            partial_path.unlink()
+        raise
 
 
 @contextmanager
@@ -152,7 +215,17 @@ class Workspace:
         r"^([^-]+)--([^+]+)(?:\+.*)?$"
     )  # {round}--{roi} or {round}--{roi}+{suffix}
     ROI_CODEBOOK_PATTERN = re.compile(r"^[^-]+--([^+]+)(?:\+(.+))?$")  # Extract ROI and optional codebook
-    NUMERIC_SORT_PATTERN = re.compile(r"^(\d+)_")  # For numerical sorting of rounds
+    NUMERIC_SORT_PATTERN = re.compile(r"^(\d+)_")
+    _FORBIDDEN_ROUND_PREFIXES = (
+        "10x",
+        "analysis",
+        "shifts",
+        "stitch",
+        "fid",
+        "registered",
+        "old",
+        "basic",
+    )
 
     path: Path
 
@@ -182,49 +255,45 @@ class Workspace:
 
     @property
     def rounds(self) -> list[str]:
-        """Discover and return all available imaging rounds in the workspace.
+        """Discover and return all available imaging rounds in the workspace."""
+        return self.discover_rounds(self.path)
 
-        Uses regex pattern matching for robust directory name parsing. Scans workspace
-        directories for round subdirectories following the naming convention '{round}--{roi}'.
-        Automatically filters out processing directories and sorts numerically by round identifier.
+    @staticmethod
+    def _round_sort_key(round_name: str) -> tuple[int, str]:
+        head = round_name.split("_")[0]
+        if head.isdigit():
+            return 0, f"{int(head):08d}_{round_name}"
+        return 1, round_name
 
-        Returns:
-            List of round identifiers (e.g., ['1_9_17', '2_10_18', '3_11_19'])
+    @classmethod
+    def discover_rounds(cls, workspace_path: Path | str) -> list[str]:
+        """Return sorted list of imaging rounds discovered under a workspace root."""
 
-        Raises:
-            ValueError: If no valid round directories are found
+        base = Path(workspace_path).expanduser().resolve()
+        search_roots = [base]
+        deconv_root = base / "analysis" / "deconv"
+        if deconv_root.exists():
+            search_roots.append(deconv_root)
 
-        Example:
-            >>> ws = Workspace("/experiment")
-            >>> ws.rounds  # ['1_9_17', '2_10_18', '3_11_19']
-        """
-        FORBIDDEN = {"10x", "analysis", "shifts", "stitch", "fid", "registered", "old", "basic"}
-        path = self.path if not self.deconved.exists() else self.deconved
-
-        rounds_set = set()
-        for p in path.iterdir():
-            if not p.is_dir():
+        rounds_set: set[str] = set()
+        for root in search_roots:
+            if not root.exists():
                 continue
-
-            # Use regex to parse directory names
-            match = self.ROUND_ROI_PATTERN.match(p.name)
-            if match:
+            for entry in root.iterdir():
+                if not entry.is_dir():
+                    continue
+                match = cls.ROUND_ROI_PATTERN.match(entry.name)
+                if not match:
+                    continue
                 round_name = match.group(1)
-                # Filter out forbidden prefixes
-                if not any(round_name.startswith(bad) for bad in FORBIDDEN):
-                    rounds_set.add(round_name)
+                if any(round_name.startswith(prefix) for prefix in cls._FORBIDDEN_ROUND_PREFIXES):
+                    continue
+                rounds_set.add(round_name)
 
         if not rounds_set:
-            raise ValueError(f"No round subdirectories found in {path}.")
+            raise ValueError(f"No round subdirectories found in {base}.")
 
-        # Sort numerically if possible, otherwise alphabetically
-        def sort_key(x: str) -> str:
-            numeric_match = self.NUMERIC_SORT_PATTERN.match(x)
-            if numeric_match:
-                return f"{int(numeric_match.group(1)):02d}{x[len(numeric_match.group(1)) :]}"
-            return x
-
-        return sorted(rounds_set, key=sort_key)
+        return sorted(rounds_set, key=cls._round_sort_key)
 
     @property
     def rois(self) -> list[str]:
@@ -256,6 +325,76 @@ class Workspace:
                     rois_set.add(roi_name)
 
         return sorted(rois_set)
+
+    def resolve_rois(self, rois: Iterable[str] | None = None) -> list[str]:
+        """Validate and normalize requested ROI identifiers.
+
+        Args:
+            rois: Optional iterable of ROI identifiers. If None, all available
+                ROIs in the workspace are returned.
+
+        Returns:
+            Sorted list of ROI identifiers.
+
+        Raises:
+            ValueError: If any requested ROI does not exist in the workspace.
+        """
+
+        available = set(self.rois)
+        if not rois:
+            return sorted(available)
+
+        requested = sorted({roi for roi in rois if roi})
+        unknown = [roi for roi in requested if roi not in available]
+        if unknown:
+            raise ValueError(
+                "Unknown ROI(s): {}. Available choices: {}".format(
+                    ", ".join(unknown),
+                    ", ".join(sorted(available)) or "none",
+                )
+            )
+        return requested
+
+    def registered_file_map(
+        self, codebook: str, *, rois: Iterable[str] | None = None
+    ) -> tuple[dict[str, list[Path]], list[str]]:
+        """Return registered TIFF files grouped by ROI for a codebook.
+
+        Args:
+            codebook: Codebook identifier (stem without extension).
+            rois: Optional iterable of ROI identifiers to restrict lookup.
+
+        Returns:
+            Tuple containing a mapping of ROI → list of TIFF paths and a list of
+            ROI identifiers that were requested but have no registered output.
+        """
+
+        resolved_rois = self.resolve_rois(rois)
+        mappings: dict[str, list[Path]] = {}
+        missing: list[str] = []
+
+        for roi in resolved_rois:
+            directory = self.registered(roi, codebook)
+            if directory.exists():
+                mappings[roi] = sorted(directory.glob("reg-*.tif"))
+            else:
+                missing.append(roi)
+
+        return mappings, missing
+
+    @staticmethod
+    def ensure_tiff_readable(path: Path) -> None:
+        """Raise CorruptedTiffError if a TIFF file cannot be read."""
+
+        try:
+            # Silence tifffile warnings and stderr chatter while probing
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with redirect_stderr(io.StringIO()):
+                    with TiffFile(path) as tif:
+                        tif.asarray()
+        except Exception as exc:  # pragma: no cover - exercised by callers
+            raise CorruptedTiffError(path, exc) from exc
 
     @property
     def deconved(self) -> Path:

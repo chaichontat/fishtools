@@ -30,7 +30,7 @@ from fishtools.analysis.labelimage import (
     isotropic_label_opening,
 )
 from fishtools.preprocess.tileconfig import TileConfiguration
-from fishtools.utils.io import Workspace
+from fishtools.io.workspace import Workspace
 
 # --- Configuration ---
 CONTOUR_PAD = 1

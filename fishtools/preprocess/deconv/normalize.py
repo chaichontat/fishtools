@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -14,6 +15,8 @@ from loguru import logger
 
 from fishtools.preprocess.deconv.hist import _quantile_from_hist
 from fishtools.utils.pretty_print import progress_bar
+from fishtools.utils.tiff import normalize_channel_names as _norm_channel_names
+from fishtools.utils.tiff import read_metadata_from_tif
 
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
@@ -21,11 +24,123 @@ import seaborn as sns
 
 I_MAX = 2**16 - 1  # use 65535 unless you must reserve it
 
+# Optional hardcoded overrides for upper percentile (p_high) per round and channel.
+#
+# Structure:
+#   {
+#       "<round_name>": {
+#           <channel_index>: <p_high_fraction>,  # e.g., 0.9999 means 99.99%
+#           ...
+#       },
+#       ...
+#   }
+#
+# Leave empty by default. Populate with your experiment-specific values when you
+# want automatic overrides without passing --p-high on the CLI. Channels not
+# listed fall back to the CLI/default p_high.
+P_HIGH_OVERRIDES: dict[str, dict[int, float]] = {
+    # Example (uncomment and edit to use):
+    # "1_9_17": {0: 0.9999, 1: 0.9995, 2: 0.9999},
+}
 
-@click.group()
-def cli() -> None:
-    """Utilities for deconvolution normalization."""
-    pass
+# Global name-based overrides applied when channel names are discovered in TIFF metadata.
+# Keys are matched case-insensitively after basic normalization.
+P_HIGH_NAME_OVERRIDES_GLOBAL: dict[str, float] = {
+    # Global mapping provided by user; case-insensitive matching.
+    "wga": 0.99,
+    "edu": 0.9999,
+    "brdu": 0.9999,
+    "pi": 0.999,
+}
+
+
+def _p_high_overrides_for(round_name: str) -> dict[int, float] | None:
+    """Return per-channel p_high overrides for a round if configured.
+
+    Values must be in (0, 1]. Invalid entries are ignored at use time.
+    """
+    mapping = P_HIGH_OVERRIDES.get(round_name)
+    return dict(mapping) if mapping else None
+
+
+def _first_tile_for_round(workspace: Path, round_name: str) -> Path | None:
+    for _roi, tile in _iter_float32_tiles(workspace, round_name):
+        return tile
+    return None
+
+
+def _normalize_name(name: str) -> str:
+    """Validate and canonicalize a channel name: underscore-separated, case-insensitive.
+
+    Rules:
+    - Only letters, digits, and underscores allowed
+    - Underscore is the only separator; spaces or other punctuation are invalid
+    - Returns lowercased name for matching
+    """
+    s = name.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]+", s):
+        raise click.ClickException(
+            f"Invalid channel name '{name}'. Expected only letters, digits, and underscores (_)."
+        )
+    return s.lower()
+
+
+def _p_high_by_channel_from_names(
+    workspace: Path,
+    round_name: str,
+    name_overrides: dict[str, float],
+) -> dict[int, float] | None:
+    """Resolve name-based p_high overrides to channel indices for a given round.
+
+    Looks up the first float32 tile of the round, reads channel names from metadata,
+    and maps any provided name-based overrides to indices. Returns None when names
+    cannot be determined.
+    """
+    if not name_overrides:
+        return None
+    tile = _first_tile_for_round(workspace, round_name)
+    if tile is None:
+        return None
+    try:
+        with tifffile.TiffFile(str(tile)) as tif:
+            meta = read_metadata_from_tif(tif)
+            # Determine channel count from series axes when available
+            count = None
+            try:
+                s = tif.series[0]
+                axes = getattr(s, "axes", None)
+                shape = getattr(s, "shape", None)
+                if axes and shape and "C" in axes:
+                    count = int(shape[axes.index("C")])
+                elif shape and len(shape) == 3:
+                    # Heuristic: (C, Y, X)
+                    count = int(shape[0])
+                elif shape and len(shape) == 4:
+                    # Heuristic: (Z, C, Y, X)
+                    count = int(shape[1])
+            except Exception:
+                count = None
+            if not count or count <= 0:
+                return None
+            names = _norm_channel_names(count, meta)
+    except Exception:
+        return None
+
+    if not names:
+        return None
+
+    norm_map = {_normalize_name(k): float(v) for k, v in name_overrides.items()}
+    out: dict[int, float] = {}
+    for idx, nm in enumerate(names):
+        key = _normalize_name(nm)
+        if key in norm_map:
+            val = norm_map[key]
+            if 0.0 < val <= 1.0:
+                out[idx] = val
+    return out or None
+
+
+# CLI entry points removed; this module now exposes library functions only.
 
 
 def _rebin_counts_to_global(
@@ -150,6 +265,7 @@ def precompute_global_quantization(
     p_high: float = 0.99999,  # 99.999%
     gamma: float = 1.05,
     i_max: int = I_MAX,
+    p_high_by_channel: dict[int, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Aggregate per-tile deconvolved histograms (CSV) into a global per-channel histogram,
@@ -211,17 +327,37 @@ def precompute_global_quantization(
     s_glob = np.zeros(C, dtype=np.float64)
     q_lo = np.zeros(C, dtype=np.float64)
     q_hi = np.zeros(C, dtype=np.float64)
+    # Prepare per-channel p_high to use (fall back to scalar p_high)
+    effective_p_high: dict[int, float] = {}
+    for c in channels:
+        if p_high_by_channel and c in p_high_by_channel:
+            try:
+                val = float(p_high_by_channel[c])
+            except Exception:
+                val = float(p_high)
+        else:
+            val = float(p_high)
+        # clamp to (0, 1]
+        if not (0.0 < val <= 1.0):
+            val = float(p_high)
+        effective_p_high[c] = val
+
+    # For reporting/plotting
+    used_p_high = np.zeros(C, dtype=np.float64)
+
     for i, c in enumerate(channels):
         edges = glob_edges[c]
         counts = glob_counts[c]
         lo = _quantile_from_hist(counts, edges, p_low)
-        hi = _quantile_from_hist(counts, edges, p_high)
+        p_hi_c = effective_p_high[c]
+        hi = _quantile_from_hist(counts, edges, p_hi_c)
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             logger.warning(f"[{round_name}] channel {c}: degenerate quantiles; falling back to edges.")
             lo, hi = float(edges[0]), float(edges[-1])
         m_glob[i] = lo
         q_lo[i] = lo
         q_hi[i] = hi
+        used_p_high[i] = p_hi_c
         dyn = (hi - lo) * float(gamma)
         s_glob[i] = (i_max / dyn) if dyn > 0 else 1.0
 
@@ -235,7 +371,9 @@ def precompute_global_quantization(
         "channels_indexed": channels,
         "bins": int(bins),
         "p_low": float(p_low),
-        "p_high": float(p_high),
+        "p_high": float(p_high),  # scalar default requested
+        "p_high_by_channel": {int(k): float(v) for k, v in (p_high_by_channel or {}).items()},
+        "p_high_used": [float(v) for v in used_p_high],
         "gamma": float(gamma),
         "i_max": int(i_max),
         "notes": "Aggregated per-tile deconvolved histograms with rebinning to a global grid.",
@@ -257,7 +395,11 @@ def precompute_global_quantization(
 
         # Format percentiles for legend labels (trim trailing zeros)
         p_low_pct = ("%.5f" % (p_low * 100)).rstrip("0").rstrip(".")
-        p_high_pct = ("%.5f" % (p_high * 100)).rstrip("0").rstrip(".")
+        # Per-channel high label (since it may vary)
+        p_high_pct_list = [
+            ("%.5f" % (used_p_high[i] * 100)).rstrip("0").rstrip(".") if used_p_high.size > i else ""
+            for i in range(C)
+        ]
 
         for i, c in enumerate(channels):
             ax = axes[i]
@@ -277,7 +419,11 @@ def precompute_global_quantization(
                 ax.axvline(q_lo[i], color="tab:red", linestyle="--", linewidth=1.2, label=f"low {p_low_pct}%")
             if q_hi[i] > 0:
                 ax.axvline(
-                    q_hi[i], color="tab:green", linestyle="--", linewidth=1.2, label=f"high {p_high_pct}%"
+                    q_hi[i],
+                    color="tab:green",
+                    linestyle="--",
+                    linewidth=1.2,
+                    label=f"high {p_high_pct_list[i]}%" if p_high_pct_list[i] else "high",
                 )
             ax.set_title(f"ch {c}")
             ax.set_xlabel("Intensity (log)")
@@ -323,35 +469,13 @@ def _iter_float32_tiles(
             yield roi_name, tile
 
 
-@cli.command("quantize")
-@click.argument("workspace", type=click.Path(path_type=Path))
-@click.argument("round_name", type=str)
-@click.option(
-    "--roi",
-    "rois",
-    multiple=True,
-    help="Restrict quantization to specific ROI names (repeatable).",
-)
-@click.option(
-    "--n-fids",
-    type=int,
-    default=2,
-    show_default=True,
-    help="Number of fiducial planes appended to each raw tile.",
-)
-@click.option(
-    "--overwrite/--no-overwrite",
-    default=False,
-    show_default=True,
-    help="Overwrite existing quantized deliverables.",
-)
-def quantize_cli(
+def quantize(
     workspace: Path,
     round_name: str,
     *,
-    rois: tuple[str, ...],
-    n_fids: int,
-    overwrite: bool,
+    rois: tuple[str, ...] = (),
+    n_fids: int = 2,
+    overwrite: bool = False,
 ) -> None:
     """Quantize float32 deconvolved tiles in analysis/deconv32 to uint16 deliverables."""
 
@@ -473,47 +597,15 @@ def quantize_cli(
     logger.info(f"Quantization complete: {processed} written, {skipped} skipped (overwrite={overwrite}).")
 
 
-@cli.command("precompute")
-@click.argument("workspace", type=click.Path(path_type=Path))
-@click.argument("round_name", type=str)
-@click.option("--bins", type=int, default=8192, show_default=True)
-@click.option(
-    "--p-low",
-    type=click.FloatRange(min=0.0, max=1.0),
-    default=0.001,
-    show_default=True,
-    help="Lower quantile (fraction) used for global offset.",
-)
-@click.option(
-    "--p-high",
-    type=click.FloatRange(min=0.0, max=1.0),
-    default=0.99999,
-    show_default=True,
-    help="Upper quantile (fraction) defining dynamic range.",
-)
-@click.option(
-    "--gamma",
-    type=float,
-    default=1.05,
-    show_default=True,
-    help="Headroom multiplier applied to dynamic range before scaling.",
-)
-@click.option(
-    "--i-max",
-    type=int,
-    default=I_MAX,
-    show_default=True,
-    help="Maximum integer code value for quantization.",
-)
-def precompute_cli(
+def precompute(
     workspace: Path,
     round_name: str,
     *,
-    bins: int,
-    p_low: float,
-    p_high: float,
-    gamma: float,
-    i_max: int,
+    bins: int = 8192,
+    p_low: float = 0.001,
+    p_high: float = 0.99999,
+    gamma: float = 1.05,
+    i_max: int = I_MAX,
 ) -> None:
     """Aggregate histogram CSVs to produce global quantization parameters."""
 
@@ -523,11 +615,21 @@ def precompute_cli(
         raise click.BadParameter("Require 0 <= p_low < p_high <= 1.")
     if gamma <= 0:
         raise click.BadParameter("--gamma must be positive.")
-    if i_max <= 0:
-        raise click.BadParameter("--i-max must be positive.")
 
     workspace = workspace.resolve()
     logger.info(f"Workspace: {workspace}")
+    # Apply automatic p_high overrides (priority: per-round indices > by-name global)
+    overrides = _p_high_overrides_for(round_name) or {}
+    if P_HIGH_NAME_OVERRIDES_GLOBAL:
+        by_name = _p_high_by_channel_from_names(workspace, round_name, P_HIGH_NAME_OVERRIDES_GLOBAL) or {}
+        # Merge only for channels not already specified by per-round mapping
+        for k, v in by_name.items():
+            overrides.setdefault(k, v)
+    if overrides:
+        logger.info(
+            f"[{round_name}] Applying p_high overrides for channels: "
+            + ", ".join(f"{c}->{v:.6f}" for c, v in sorted(overrides.items()))
+        )
     m_glob, s_glob = precompute_global_quantization(
         workspace,
         round_name,
@@ -536,6 +638,7 @@ def precompute_cli(
         p_high=p_high,
         gamma=gamma,
         i_max=i_max,
+        p_high_by_channel=overrides or None,
     )
     logger.info(
         f"Computed global quantization for {round_name}: m_glob shape={m_glob.shape}, s_glob shape={s_glob.shape}."
@@ -632,7 +735,7 @@ def quantize_global(
 
 
 if __name__ == "__main__":
-    cli()
+    raise SystemExit("This module provides library functions; use 'preprocess deconv' CLI.")
 
 
 def load_global_scaling(path: Path, round_name: str) -> tuple[np.ndarray, np.ndarray]:

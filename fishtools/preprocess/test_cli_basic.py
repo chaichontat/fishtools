@@ -12,6 +12,7 @@ from fishtools.preprocess.cli_basic import (
     extract_data_from_tiff,
     run_with_extractor,
 )
+from fishtools.preprocess.tileconfig import tiles_at_least_n_steps_from_edges
 
 IMG_HEIGHT = 2048
 IMG_WIDTH = 2048
@@ -259,3 +260,73 @@ class TestRunWithExtractor:
             run_with_extractor(
                 tmp_path, round_=round_name, extractor_func=mock_actual_extractor_func, plot=False, zs=(0.5,)
             )
+
+    def test_sampling_filters_to_interior_tiles_when_csv_present(
+        self,
+        tmp_path: Path,
+        mock_get_channels: MagicMock,
+        mock_basic_module_components: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        # Create 3 ROIs, each a 12x10 grid (120 tiles). Interior tiles with n=2 → (12-4)*(10-4)=8*6=48.
+        round_name = "R2"
+        rois = ["roiA", "roiB", "roiC"]
+
+        # Prepare CSVs with consistent grid coordinates and files with numeric indices
+        for roi in rois:
+            coords = []
+            for y in range(10):
+                for x in range(12):
+                    coords.append((float(x), float(y)))
+            # Write CSV as x,y pairs; order maps to index i = y*12 + x
+            (tmp_path / f"{roi}.csv").write_text("\n".join(f"{y},{x}" for x, y in coords))
+
+            d = tmp_path / f"{round_name}--{roi}"
+            d.mkdir(parents=True, exist_ok=True)
+            # Set file sizes: edges small (0B), interior large (~1KB) so that
+            # size >= 60th percentile selects interiors; OR keeps interiors anyway.
+            # 12x10 => interior count (n=2) = 48, edges = 72 per ROI
+            def is_interior(i: int) -> bool:
+                y, x = divmod(i, 12)
+                return (x >= 2 and x <= 9) and (y >= 2 and y <= 7)
+
+            for idx in range(12 * 10):
+                p = d / f"{round_name}-{idx:04d}.tif"
+                if is_interior(idx):
+                    p.write_bytes(b"1" * 1024)  # large file
+                else:
+                    p.touch()  # 0B file
+
+        mock_get_channels.return_value = ["chA", "chB"]
+
+        # Collector to introspect which files were passed into the extractor
+        captured_files = {}
+
+        def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None):
+            captured_files["files"] = list(files)
+            # Return shape (n_samples, nc, H, W)
+            return np.zeros((len(files), 2, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32)
+
+        # Make sampling deterministic: identity sample
+        mocker.patch("random.sample", side_effect=lambda x, k: list(x)[:k])
+        mocker.patch("numpy.loadtxt", return_value=None)
+
+        # Avoid pickling real/basic mocks by bypassing fit_and_save_basic
+        mocker.patch("fishtools.preprocess.cli_basic.fit_and_save_basic", return_value=[])
+        run_with_extractor(tmp_path, round_=round_name, extractor_func=fake_extractor, plot=False, zs=(0.5,))
+
+        assert "files" in captured_files
+        sampled = captured_files["files"]
+        # Expect exactly 3 * 48 = 144 interior tiles kept by OR logic and 60th percentile sizing
+        assert len(sampled) == 3 * 48
+
+        # Verify no edge indices slipped through for a representative ROI
+        # Recompute allowed for roiA
+        import pandas as pd
+
+        df = pd.read_csv(tmp_path / "roiA.csv", header=None)
+        allowed = set(tiles_at_least_n_steps_from_edges(df.iloc[:, :2].to_numpy(), n=2).tolist())
+
+        roiA_files = [p for p in sampled if p.parent.name == f"{round_name}--roiA"]
+        roiA_indices = {int(p.stem.split("-")[-1]) for p in roiA_files}
+        assert roiA_indices.issubset(allowed)

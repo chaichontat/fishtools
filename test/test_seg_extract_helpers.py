@@ -1,10 +1,11 @@
 from pathlib import Path
 
 import numpy as np
-import tifffile
 import pytest
+import tifffile
+import zarr
 
-from segmentation.extract import _append_max_from, _load_and_select
+from fishtools.segment.extract import _append_max_from, _load_and_select
 
 
 def test_append_max_from_no_dir_returns_same(tmp_path: Path) -> None:
@@ -62,3 +63,24 @@ def test_load_and_select_filters_and_clips(tmp_path: Path) -> None:
     # Implementation clips to 65530 before cast
     assert out.max() <= 65530
     assert names == ["0", "1"]
+
+
+def test_load_and_select_supports_zarr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = tmp_path / "fused.zarr"
+    arr = zarr.open(
+        store,
+        mode="w",
+        shape=(4, 8, 8, 3),
+        chunks=(2, 8, 8, 3),
+        dtype=np.uint16,
+    )
+    arr[...] = np.arange(arr.size, dtype=np.uint16).reshape(arr.shape)
+    arr.attrs["key"] = ["polyA", "reddot", "spots"]
+
+    # Avoid modifying data through unsharp filtering for deterministic assertion
+    monkeypatch.setattr("fishtools.segment.extract.unsharp_all", lambda x, **kwargs: x)
+
+    out, names = _load_and_select(store, channels="auto", crop=0, max_from_path=None, filter_first=False)
+
+    assert out.shape == (4, 2, 8, 8)  # auto selects 2 channels
+    assert names == ["polyA", "reddot"]

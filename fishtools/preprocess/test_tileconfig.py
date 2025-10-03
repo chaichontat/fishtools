@@ -7,6 +7,7 @@ import pytest
 from polars.testing import assert_frame_equal, assert_series_equal
 
 from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.preprocess.tileconfig import tiles_at_least_n_steps_from_edges
 
 
 @pytest.fixture
@@ -251,3 +252,66 @@ dim=3 # another dim line
     file_path.write_text(content)
     with pytest.raises(ValueError, match="empty or not in the expected format."):
         TileConfiguration.from_file(file_path)
+
+
+def test_tiles_at_least_n_steps_from_edges_on_unit_grid():
+    # 5x4 grid laid out row-major, x varies fastest
+    xs = np.arange(5)
+    ys = np.arange(4)
+    xy = np.array([(x, y) for y in ys for x in xs], dtype=int)
+
+    idx = tiles_at_least_n_steps_from_edges(xy, n=1)
+    # Expected: x in [1, 2, 3] and y in [1, 2]
+    expected = []
+    for y in [1, 2]:
+        for x in [1, 2, 3]:
+            expected.append(y * 5 + x)
+    assert np.array_equal(idx, np.array(expected))
+
+
+def test_tiles_at_least_n_steps_from_edges_non_unit_spacing():
+    xs = np.array([100, 200, 350])
+    ys = np.array([5, 15, 25])
+    xy = np.array([(x, y) for y in ys for x in xs], dtype=float)
+
+    idx = tiles_at_least_n_steps_from_edges(xy, n=1)
+    # Only the center tile remains in a 3x3 grid
+    assert np.array_equal(idx, np.array([4]))
+
+
+def test_tiles_at_least_n_steps_from_edges_insufficient_size():
+    xs = np.array([0, 1])
+    ys = np.array([0, 1])
+    xy = np.array([(x, y) for y in ys for x in xs], dtype=int)
+    assert tiles_at_least_n_steps_from_edges(xy, n=1).size == 0
+
+    xs = np.array([0, 1, 2])
+    ys = np.array([0, 1])
+    xy = np.array([(x, y) for y in ys for x in xs], dtype=int)
+    assert tiles_at_least_n_steps_from_edges(xy, n=1).size == 0
+
+
+def test_indices_at_least_n_steps_from_edges_tileconfig():
+    # Build a 5x4 grid with sequential tile IDs matching row-major positions
+    xs = np.arange(5)
+    ys = np.arange(4)
+    coords = [(x, y) for y in ys for x in xs]
+    idxs = np.arange(len(coords), dtype=np.uint32)
+    df = pl.DataFrame(
+        {
+            "index": idxs,
+            "x": [float(x) for x, _ in coords],
+            "y": [float(y) for _, y in coords],
+            "filename": [f"{i:04d}.tif" for i in idxs],
+        },
+        schema=pl.Schema({"index": pl.UInt32, "x": pl.Float32, "y": pl.Float32, "filename": pl.Utf8}),
+    ).select(["index", "filename", "x", "y"])
+
+    tc = TileConfiguration(df)
+    kept = tc.indices_at_least_n_steps_from_edges(1)
+
+    expected = []
+    for y in [1, 2]:
+        for x in [1, 2, 3]:
+            expected.append(y * 5 + x)
+    assert np.array_equal(kept, np.array(expected, dtype=np.uint32))

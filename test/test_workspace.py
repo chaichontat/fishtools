@@ -8,8 +8,10 @@ robustness, memory efficiency, and performance benchmarks.
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-import pytest
+
 import numpy as np
+import pytest
+import tifffile
 
 try:
     import psutil
@@ -17,7 +19,7 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
-from fishtools.utils.io import Workspace, OptimizePath
+from fishtools.utils.io import CorruptedTiffError, OptimizePath, Workspace
 
 
 class TestWorkspaceInitialization:
@@ -384,6 +386,44 @@ class TestWorkspaceProcessingDirectories:
             ws.tileconfig("cortex")
 
 
+class TestWorkspaceRegisteredArtifacts:
+    """Tests for registered TIFF discovery and validation helpers."""
+
+    def test_registered_file_map_collects_registered_files(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        registered_dir = workspace_root / "analysis" / "deconv" / "registered--cortex+cb1"
+        registered_dir.mkdir(parents=True)
+        tif_path = registered_dir / "reg-0000.tif"
+        tifffile.imwrite(tif_path, np.zeros((1, 1, 2, 2), dtype=np.uint16))
+
+        ws = Workspace(workspace_root)
+        mapping, missing = ws.registered_file_map("cb1")
+
+        assert missing == []
+        assert mapping == {"cortex": [tif_path]}
+
+    def test_registered_file_map_reports_missing_roi(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        (workspace_root / "analysis" / "deconv" / "registered--cortex+other").mkdir(parents=True)
+
+        ws = Workspace(workspace_root)
+        mapping, missing = ws.registered_file_map("cb1", rois=["cortex"])
+
+        assert mapping == {}
+        assert missing == ["cortex"]
+
+    def test_ensure_tiff_readable_detects_corruption(self, tmp_path: Path) -> None:
+        valid = tmp_path / "valid.tif"
+        tifffile.imwrite(valid, np.zeros((1, 1), dtype=np.uint16))
+        Workspace.ensure_tiff_readable(valid)  # Should not raise
+
+        corrupted = tmp_path / "corrupted.tif"
+        corrupted.write_bytes(b"not-a-tiff")
+
+        with pytest.raises(CorruptedTiffError):
+            Workspace.ensure_tiff_readable(corrupted)
+
+
 class TestWorkspaceStringRepresentation:
     """Test string representation methods."""
 
@@ -415,7 +455,7 @@ class TestWorkspaceEdgeCases:
         assert ws.path == workspace_path.resolve()
 
         # But should raise when trying to access contents
-        with pytest.raises((FileNotFoundError, OSError)):
+        with pytest.raises((FileNotFoundError, OSError, ValueError)):
             _ = ws.rounds
 
     def test_empty_directory(self):

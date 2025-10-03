@@ -25,7 +25,9 @@ if "scanpy" not in sys.modules:
         embedding=lambda *a, **k: types.SimpleNamespace(axes=[]),
         rank_genes_groups=lambda *a, **k: None,
     )
-    _sc.get = types.SimpleNamespace(rank_genes_groups_df=lambda *a, **k: types.SimpleNamespace(head=lambda n: {"names": []}))
+    _sc.get = types.SimpleNamespace(
+        rank_genes_groups_df=lambda *a, **k: types.SimpleNamespace(head=lambda n: {"names": []})
+    )
     _sc.experimental = types.SimpleNamespace(
         pp=types.SimpleNamespace(
             highly_variable_genes=lambda *a, **k: None,
@@ -36,6 +38,7 @@ if "scanpy" not in sys.modules:
 
 
 if "cupy" not in sys.modules:
+
     class _CuPyModule(types.ModuleType):
         """NumPy-backed stub providing a minimal CuPy surface for tests."""
 
@@ -61,6 +64,9 @@ if "cupy" not in sys.modules:
         def empty_like(self, *args, **kwargs):
             return np.empty_like(*args, **kwargs)
 
+        def empty(self, *args, **kwargs):
+            return np.empty(*args, **kwargs)
+
         def clip(self, *args, **kwargs):
             return np.clip(*args, **kwargs)
 
@@ -82,10 +88,36 @@ if "cupy" not in sys.modules:
     cupyx_ndimage = types.ModuleType("cupyx.scipy.ndimage")
     cupyx_ndimage.convolve = _scipy_ndimage.convolve
     cupyx_ndimage.gaussian_filter = _scipy_ndimage.gaussian_filter
+    cupyx_ndimage.zoom = _scipy_ndimage.zoom
     sys.modules["cupyx.scipy.ndimage"] = cupyx_ndimage
 
     cupyx_scipy.ndimage = cupyx_ndimage
     cupyx.scipy = cupyx_scipy
+
+    class _CudaRuntime(types.SimpleNamespace):
+        @staticmethod
+        def getDeviceCount() -> int:
+            return 1
+
+        @staticmethod
+        def deviceSynchronize() -> None:
+            return None
+
+        @staticmethod
+        def getDeviceProperties(_: int) -> dict[str, bytes]:
+            return {"name": b"FakeGPU"}
+
+    class _CudaDevice:
+        def __init__(self, idx: int):
+            self.idx = idx
+
+        def use(self) -> None:
+            return None
+
+    _cupy.cuda = types.SimpleNamespace(
+        runtime=_CudaRuntime(),
+        Device=lambda idx: _CudaDevice(idx),
+    )
 
 
 @pytest.fixture(autouse=True)

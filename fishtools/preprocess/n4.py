@@ -7,7 +7,8 @@ N4 bias-field correction for stitched mosaics.
 - Writes: correction field TIFF (CYX, float32) plus per‑channel PNGs; corrected
   fused.zarr (ZYXC, uint16). Add --debug to also write a float32 corrected Zarr.
 - Quantization: per-channel 0.01–99.99 percentiles via deterministic random
-  subsampling (≤50k samples/plane); metadata records bounds, scale, and sampling.
+  subsampling (≤50k samples/plane) with a 99.9 fallback when total samples < 2e5;
+  metadata records bounds, scale, percentiles, and sampling stats.
 - Channels are scaled independently; no cross‑channel normalization.
 
 Example:
@@ -44,6 +45,8 @@ DEFAULT_ITERATIONS: tuple[int, ...] = (50, 50, 30, 20)
 
 QUANT_LOWER_PERCENTILE = 0.01
 QUANT_UPPER_PERCENTILE = 99.99
+QUANT_FALLBACK_UPPER_PERCENTILE = 99.9
+QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE = 200_000
 QUANT_MIN_RANGE = 1e-6
 # Add a small headroom above the chosen upper percentile so that
 # a tiny fraction of very bright pixels do not saturate to 0xFFFF.
@@ -151,6 +154,7 @@ class QuantizationParams:
     observed_max: float
     lower_percentile: float
     upper_percentile: float
+    sample_count: int
 
 
 def _compute_quantization_params(
@@ -201,11 +205,26 @@ def _compute_quantization_params(
             observed_max=float(observed_max),
             lower_percentile=lower_percentile,
             upper_percentile=upper_percentile,
+            sample_count=0,
         )
 
     samples = np.concatenate(sampled_values)
-    lower = float(np.percentile(samples, lower_percentile))
-    upper = float(np.percentile(samples, upper_percentile))
+    total_samples = int(samples.size)
+    effective_lower = float(lower_percentile)
+    effective_upper = float(upper_percentile)
+    if (
+        total_samples < QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE
+        and math.isclose(upper_percentile, QUANT_UPPER_PERCENTILE)
+    ):
+        effective_upper = QUANT_FALLBACK_UPPER_PERCENTILE
+        logger.info(
+            "Falling back to upper percentile {upper} due to limited samples ({samples})",
+            upper=effective_upper,
+            samples=total_samples,
+        )
+
+    lower = float(np.percentile(samples, effective_lower))
+    upper = float(np.percentile(samples, effective_upper))
 
     if not math.isfinite(lower):
         lower = float(observed_min if math.isfinite(observed_min) else 0.0)
@@ -222,8 +241,9 @@ def _compute_quantization_params(
         upper=upper,
         observed_min=float(observed_min if math.isfinite(observed_min) else lower),
         observed_max=float(observed_max if math.isfinite(observed_max) else upper),
-        lower_percentile=lower_percentile,
-        upper_percentile=upper_percentile,
+        lower_percentile=effective_lower,
+        upper_percentile=effective_upper,
+        sample_count=total_samples,
     )
 
 
@@ -446,16 +466,33 @@ def _write_fused_corrected_zyxc(
             "observed_min": float(params.observed_min),
             "observed_max": float(params.observed_max),
             "scale": float(scale),
+            "lower_percentile": float(params.lower_percentile),
+            "upper_percentile": float(params.upper_percentile),
+            "samples": int(params.sample_count),
         })
 
+    default_quant = channel_quant[0] if channel_quant else None
     dest_attrs["quantization"] = {
-        "lower_percentile": QUANT_LOWER_PERCENTILE,
-        "upper_percentile": QUANT_UPPER_PERCENTILE,
+        "lower_percentile": (
+            float(default_quant.lower_percentile)
+            if default_quant is not None
+            else QUANT_LOWER_PERCENTILE
+        ),
+        "upper_percentile": (
+            float(default_quant.upper_percentile)
+            if default_quant is not None
+            else QUANT_UPPER_PERCENTILE
+        ),
         "channels": quant_channels,
         "dtype": "uint16",
         "sampling": {
             "strategy": "random_without_replacement",
             "max_samples": int(QUANT_MAX_SAMPLES),
+            "total_samples": (
+                int(default_quant.sample_count)
+                if default_quant is not None
+                else 0
+            ),
         },
     }
     if float_dest_path is not None:
@@ -715,8 +752,8 @@ def apply_correction_to_store(
     if float_store is not None and float_output_path is not None:
         logger.info("Float32 corrected imagery written to {path}", path=float_output_path)
     quant_meta: dict[str, Any] = {
-        "lower_percentile": QUANT_LOWER_PERCENTILE,
-        "upper_percentile": QUANT_UPPER_PERCENTILE,
+        "lower_percentile": float(quant_params.lower_percentile),
+        "upper_percentile": float(quant_params.upper_percentile),
         "lower": float(quant_params.lower),
         "upper": float(quant_params.upper),
         "observed_min": float(quant_params.observed_min),
@@ -726,6 +763,7 @@ def apply_correction_to_store(
         "sampling": {
             "strategy": "random_without_replacement",
             "max_samples": int(QUANT_MAX_SAMPLES),
+            "total_samples": int(quant_params.sample_count),
         },
     }
     if float_output_path is not None:

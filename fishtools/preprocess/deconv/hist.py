@@ -40,9 +40,15 @@ def sample_histograms(
         offsets = _choose_offsets(strides, seed=seed)
     off_z, off_y, off_x = offsets
 
+    subset = res[off_z::SZ, :, off_y::SY, off_x::SX]
+    if subset.size == 0:
+        subset = res
+        SZ = SY = SX = 1
+        off_z = off_y = off_x = 0
+
     # compute per-channel mins/maxs on the subsample
-    mins_ch = cp.min(res[off_z::SZ, :, off_y::SY, off_x::SX], axis=(0, 2, 3))  # (C,)
-    maxs_ch = cp.max(res[off_z::SZ, :, off_y::SY, off_x::SX], axis=(0, 2, 3))  # (C,)
+    mins_ch = cp.min(subset, axis=(0, 2, 3))  # (C,)
+    maxs_ch = cp.max(subset, axis=(0, 2, 3))  # (C,)
 
     counts_list: list[np.ndarray] = []
     edges_list: list[np.ndarray] = []
@@ -53,12 +59,12 @@ def sample_histograms(
         if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
             lo, hi = 0.0, 1.0
         edges_gpu = cp.linspace(lo, hi, int(bins) + 1, dtype=cp.float32)
-        sample_c = res[off_z::SZ, c, off_y::SY, off_x::SX]
+        sample_c = subset[:, c, :, :]
         h_gpu, _ = cp.histogram(sample_c, bins=edges_gpu)
         counts_list.append(cp.asnumpy(h_gpu).astype(np.int64, copy=False))
         edges_list.append(cp.asnumpy(edges_gpu).astype(np.float32, copy=False))
 
-    n_samp = int(res[off_z::SZ, 0, off_y::SY, off_x::SX].size)
+    n_samp = int(subset[:, 0, :, :].size)
     payload = {
         "C": int(C),
         "bins": int(bins),

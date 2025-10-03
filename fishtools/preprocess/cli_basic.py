@@ -8,15 +8,18 @@ from typing import Protocol
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import rich_click as click
 import seaborn as sns
 from basicpy import BaSiC
 from loguru import logger
 from tifffile import TiffFile, imread
 
+from fishtools.io.workspace import get_channels
 from fishtools.preprocess.basic import fit_basic, plot_basic
 from fishtools.preprocess.cli_deconv import scale_deconv
-from fishtools.utils.io import get_channels
+from fishtools.preprocess.plot import plot_tile_sizes
+from fishtools.preprocess.tileconfig import tiles_at_least_n_steps_from_edges
 
 sns.set_theme()
 
@@ -212,6 +215,7 @@ def run_with_extractor(
     round_: str | None,
     extractor_func: DataExtractor,
     plot: bool = True,
+    plot_selected: bool = False,
     zs: Collection[float] = (0.5,),
 ):
     """
@@ -274,9 +278,87 @@ def run_with_extractor(
         logger.warning(f"Not enough files ({len(files)}) for {path}. Result may be unreliable.")
     import random
 
-    files = random.sample(files, k=min(1000, len(files)))
+    # Filter sampling to tiles that are at least 2 steps from edges (per ROI)
+    def _parse_tile_index(p: Path) -> int | None:
+        stem = p.stem
+        # Prefer last hyphen-delimited token if numeric, else whole stem if numeric
+        parts = stem.split("-")
+        for token in reversed(parts):
+            if token.isdigit():
+                try:
+                    return int(token)
+                except ValueError:
+                    return None
+        # Fallback: no numeric token
+        return None
+
+    def _roi_base_from_dirname(dirname: str) -> str | None:
+        # Expect pattern: "<round>--<roi>[--suffix]" → extract <roi> (strip any extra suffix)
+        if "--" not in dirname:
+            return None
+        roi_part = dirname.split("--", 1)[1]
+        # If extra suffixes present (e.g., "roi--basic"), strip them for CSV lookup
+        return roi_part.split("--", 1)[0]
+
+    # Build allowed index sets per ROI (from <roi>.csv when available)
+    allowed_by_roi: dict[str, set[int]] = {}
+
+    def _allowed_indices_for_roi(roi_dirname: str) -> set[int] | None:
+        roi_base = _roi_base_from_dirname(roi_dirname)
+        if roi_base is None:
+            return None
+        if roi_base in allowed_by_roi:
+            return allowed_by_roi[roi_base]
+
+        csv_path = path / f"{roi_base}.csv"
+        if not csv_path.exists():
+            logger.warning(
+                f"CSV for ROI '{roi_base}' not found at {csv_path}. Skipping edge-based filtering for this ROI."
+            )
+            allowed_by_roi[roi_base] = None  # type: ignore[assignment]
+            return None
+
+        try:
+            df = pd.read_csv(csv_path, header=None)
+            # Use first two columns as x,y
+            xy = df.iloc[:, :2].to_numpy()
+            idx = tiles_at_least_n_steps_from_edges(xy, n=2)
+            allowed = set(int(i) for i in idx.tolist())
+            allowed_by_roi[roi_base] = allowed
+            return allowed
+        except Exception as e:
+            logger.warning(
+                f"Failed to compute interior tiles for ROI '{roi_base}': {e}. Not filtering this ROI."
+            )
+            allowed_by_roi[roi_base] = None  # type: ignore[assignment]
+            return None
+
+    # Compute 60th percentile size across all candidate files
+    sizes = np.array([f.lstat().st_size for f in files], dtype=np.int64)
+    pos = sizes[sizes > 0]
+    if pos.size:
+        size_thresh = float(np.percentile(pos, 60))
+    else:
+        # No positive sizes detected; disable size-based selection
+        size_thresh = float("inf")
+
+    # Apply OR filter: interior (n>=2) OR size >= 60th percentile
+    filtered_files: list[Path] = []
+    for f in files:
+        roi_dirname = f.parent.name
+        allowed = _allowed_indices_for_roi(roi_dirname)
+        idx = _parse_tile_index(f)
+        is_interior = allowed is not None and idx is not None and idx in allowed
+        sz = f.lstat().st_size
+        # Consider only positive sizes for percentile logic to prevent zero-valued files from
+        # collapsing the threshold and letting edge tiles through inadvertently.
+        # is_large = (sz > 0) and (sz >= size_thresh)
+        if is_interior:
+            filtered_files.append(f)
+
+    files = random.sample(filtered_files, k=min(1000, len(filtered_files)))
     logger.info(
-        f"Using {len(files)} files. Min size: {min(f.lstat().st_size for f in files)}. Max size: {max(f.lstat().st_size for f in files)}"
+        f"Using {len(files)} files. Size p60 (nonzero)={size_thresh:.0f}. Min size: {min(f.lstat().st_size for f in files)}. Max size: {max(f.lstat().st_size for f in files)}"
     )
 
     # Load deconvolution scaling if available
@@ -284,6 +366,62 @@ def run_with_extractor(
     deconv_meta = np.loadtxt(deconv_path) if deconv_path.exists() else None
     if deconv_meta is not None:
         logger.warning("Using deconvolution scaling. Should not use for normal workflow.")
+
+    # Diagnostics plot: per-ROI tile grid colored by size with selected samples marked
+    try:
+        by_roi: dict[str, list[Path]] = {}
+        for f in files:
+            by_roi.setdefault(f.parent.name, []).append(f)
+
+        for roi_dir, roi_files in by_roi.items():
+            roi_base = _roi_base_from_dirname(roi_dir)
+            if roi_base is None:
+                continue
+            csv_path = path / f"{roi_base}.csv"
+            if not csv_path.exists():
+                continue
+            # Build sizes per CSV index, and selected index set for overlay
+            df = pd.read_csv(csv_path, header=None)
+            xy = df.iloc[:, :2].to_numpy()
+            sizes_all = np.zeros(len(df), dtype=np.float64)
+
+            # Gather all candidate files in this ROI to populate size map
+            roi_all_files = sorted((path / f"{(round_ or 'all')}--{roi_base}").glob("*.tif"))
+            # Fallback: if constructed folder name doesn't exist (legacy), use parent of selected files
+            if not roi_all_files:
+                roi_all_files = sorted((Path(roi_files[0]).parent).glob("*.tif"))
+
+            for p in roi_all_files:
+                idx = _parse_tile_index(p)
+                if idx is not None and 0 <= idx < len(sizes_all):
+                    try:
+                        sizes_all[idx] = p.lstat().st_size
+                    except FileNotFoundError:
+                        sizes_all[idx] = 0
+
+            selected_idx = set()
+            for p in roi_files:
+                idx = _parse_tile_index(p)
+                if idx is not None and 0 <= idx < len(df):
+                    selected_idx.add(idx)
+
+            if plot_selected:
+                ax = plot_tile_sizes(
+                    xy,
+                    sizes_all,
+                    selected=selected_idx,
+                    title=f"{round_ or 'all'} — {roi_base} (selected={len(selected_idx)})",
+                    show_colorbar=True,
+                    annotate="selected",
+                    fontsize=6,
+                )
+                (basic_dir / f"{(round_ or 'all')}--{roi_base}-sampling.png").parent.mkdir(exist_ok=True)
+                plt.savefig(
+                    basic_dir / f"{(round_ or 'all')}--{roi_base}-sampling.png", dpi=150, bbox_inches="tight"
+                )
+                plt.close(ax.figure)
+    except Exception as e:
+        logger.warning(f"Sampling plot generation failed: {e}")
 
     # Extract data using the provided extractor function
     data = extractor_func(files, zs, deconv_meta, nc=len(channels), max_files=1000 if round_ else 1000)

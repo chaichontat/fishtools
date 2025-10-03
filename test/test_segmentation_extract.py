@@ -7,11 +7,12 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import tifffile
+import zarr
 from tifffile import imwrite as real_imwrite
 from typer.testing import CliRunner
 
+from fishtools.segment import extract
 from fishtools.utils.io import Workspace
-import segmentation.extract as extract
 
 
 def _write_4d_tif(path: Path, arr: np.ndarray) -> None:
@@ -62,6 +63,42 @@ def _make_workspace(
     _write_4d_tif(f, arr)
     files.append(f)
     return root, reg_dir, files
+
+
+def _make_workspace_with_fused_zarr(
+    tmp_path: Path, roi: str = "cortex", cb: str = "cb1"
+) -> tuple[Path, Path, np.ndarray]:
+    root = tmp_path / "workspace"
+    fused_dir = root / "analysis" / "deconv" / f"stitch--{roi}+{cb}"
+    fused_dir.mkdir(parents=True, exist_ok=True)
+    store = fused_dir / "fused.zarr"
+
+    z, y, x, c = 4, 12, 14, 3
+    data = np.arange(z * y * x * c, dtype=np.uint16).reshape(z, y, x, c)
+    arr = zarr.open(store, mode="w", shape=(z, y, x, c), chunks=(1, y, x, c), dtype=np.uint16)
+    arr[...] = data
+    arr.attrs["key"] = ["polyA", "reddot", "spots"]
+    return root, store, data
+
+
+def _make_workspace_with_tiff_and_zarr(
+    tmp_path: Path, roi: str = "cortex", cb: str = "cb1"
+) -> tuple[Path, np.ndarray, np.ndarray]:
+    root = tmp_path / "workspace"
+
+    reg_dir = root / "analysis" / "deconv" / f"registered--{roi}+{cb}"
+    z, c, y, x = 3, 2, 8, 10
+    tiff_data = (np.ones((z, c, y, x), dtype=np.uint16) * 1111)
+    _write_4d_tif(reg_dir / "reg-000.tif", tiff_data)
+
+    fused_dir = root / "analysis" / "deconv" / f"stitch--{roi}+{cb}"
+    fused_dir.mkdir(parents=True, exist_ok=True)
+    store = fused_dir / "fused.zarr"
+    zarr_data = np.arange(z * y * x * c, dtype=np.uint16).reshape(z, y, x, c)
+    arr = zarr.open(store, mode="w", shape=zarr_data.shape, chunks=(1, y, x, c), dtype=np.uint16)
+    arr[...] = zarr_data
+    arr.attrs["key"] = ["polyA", "reddot"]
+    return root, tiff_data, zarr_data
 
 
 def _make_parameterized_workspace(
@@ -120,8 +157,8 @@ def _make_parameterized_workspace(
     return root, reg_dir, files, arr
 
 
-@patch("segmentation.extract.imwrite")
-@patch("segmentation.extract.unsharp_all")
+@patch("fishtools.segment.extract.imwrite")
+@patch("fishtools.segment.extract.unsharp_all")
 def test_cmd_extract_z_basic(mock_unsharp, mock_imwrite, tmp_path: Path) -> None:
     # Mock unsharp_mask to return input unchanged
     mock_unsharp.side_effect = lambda img, **kwargs: img
@@ -206,7 +243,103 @@ def test_cmd_extract_z_basic(mock_unsharp, mock_imwrite, tmp_path: Path) -> None
         assert arr.dtype == np.uint16
 
 
-@patch("segmentation.extract.unsharp_all")
+@patch("fishtools.segment.extract.unsharp_all")
+def test_cmd_extract_z_from_zarr(mock_unsharp, tmp_path: Path) -> None:
+    mock_unsharp.side_effect = lambda img, **kwargs: img
+
+    roi = "roiZarr"
+    cb = "cb1"
+    root, _store, data = _make_workspace_with_fused_zarr(tmp_path, roi=roi, cb=cb)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        extract.app,
+        [
+            "z",
+            str(root),
+            roi,
+            cb,
+            "--channels",
+            "auto",
+            "--threads",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    ws = Workspace(root)
+    out_dir = ws.segment(roi, cb) / "extract_z"
+    outs = sorted(out_dir.glob("*_z*.tif"))
+    assert len(outs) == data.shape[0]
+
+    first = tifffile.imread(outs[0])
+    expected = np.moveaxis(data[0, :, :, :2], -1, 0)  # (C,Y,X)
+    np.testing.assert_array_equal(first, expected)
+
+
+@patch("fishtools.segment.extract.unsharp_all")
+def test_cmd_extract_z_with_zarr_flag_prefers_zarr(mock_unsharp, tmp_path: Path) -> None:
+    mock_unsharp.side_effect = lambda img, **kwargs: img
+
+    roi = "roiCombo"
+    cb = "cb1"
+    root, _tiff_data, zarr_data = _make_workspace_with_tiff_and_zarr(tmp_path, roi=roi, cb=cb)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        extract.app,
+        [
+            "z",
+            str(root),
+            roi,
+            cb,
+            "--channels",
+            "0,1",
+            "--threads",
+            "1",
+            "--zarr",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    ws = Workspace(root)
+    out_dir = ws.segment(roi, cb) / "extract_z"
+    outs = sorted(out_dir.glob("*_z*.tif"))
+    assert outs, "No output files produced"
+
+    first = tifffile.imread(outs[0])
+    expected = np.moveaxis(zarr_data[0, :, :, :2], -1, 0)
+    np.testing.assert_array_equal(first, expected)
+
+
+@patch("fishtools.segment.extract.unsharp_all")
+def test_cmd_extract_z_with_zarr_flag_requires_store(mock_unsharp, tmp_path: Path) -> None:
+    mock_unsharp.side_effect = lambda img, **kwargs: img
+
+    roi = "roiMissing"
+    cb = "cb1"
+    root, _reg_dir, _files = _make_workspace(tmp_path, roi=roi, cb=cb)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        extract.app,
+        [
+            "z",
+            str(root),
+            roi,
+            cb,
+            "--channels",
+            "0,1",
+            "--threads",
+            "1",
+            "--zarr",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Requested Zarr input" in result.output
+
+
+@patch("fishtools.segment.extract.unsharp_all")
 def test_cmd_extract_ortho_basic(mock_unsharp, tmp_path: Path) -> None:
     # Mock unsharp_mask to return input unchanged
     mock_unsharp.side_effect = lambda img, **kwargs: img
@@ -428,7 +561,7 @@ def test_resolve_channels_with_names(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("dz", [1, 2, 3])
-@patch("segmentation.extract.unsharp_all")
+@patch("fishtools.segment.extract.unsharp_all")
 def test_extract_z_dz_parameter(mock_unsharp, tmp_path: Path, dz: int) -> None:
     """Test that dz parameter correctly controls Z-slice extraction interval."""
     mock_unsharp.side_effect = lambda img, **kwargs: img
@@ -504,8 +637,8 @@ def test_extract_z_dz_parameter(mock_unsharp, tmp_path: Path, dz: int) -> None:
             )
 
 
-@patch("segmentation.extract.imwrite")
-@patch("segmentation.extract.unsharp_all")
+@patch("fishtools.segment.extract.imwrite")
+@patch("fishtools.segment.extract.unsharp_all")
 def test_wrong_slice_extraction_should_fail(
     mock_unsharp, mock_imwrite, tmp_path: Path
 ) -> None:

@@ -12,16 +12,22 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+import fishtools.preprocess.cli_register as cli_register_module
+from fishtools.preprocess import downsample as downsample_module
 import numpy as np
 import pytest
 from numpy.typing import NDArray
+from scipy import ndimage
+from types import SimpleNamespace
 
 from fishtools.preprocess.cli_register import (
+    apply_deconv_scaling,
     get_rois,
     parse_nofids,
     sort_key,
     spillover_correction,
 )
+from fishtools.preprocess.downsample import gpu_downsample_xy
 
 # Test constants
 TEST_IMAGE_SIZE = (10, 100, 100)  # z, y, x
@@ -179,6 +185,86 @@ class TestSortKey:
         for input_tuple, expected in edge_cases:
             result = sort_key(input_tuple)
             assert result == expected
+
+
+class TestApplyDeconvScaling:
+    """Unit tests for apply_deconv_scaling helper"""
+
+    def test_apply_deconv_scaling_calls_scale_for_non_prenormalized(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Images without prenormalized metadata should use scale_deconv."""
+
+        img = np.ones((2, 3, 4), dtype=np.float32)
+        global_scaling = np.array([[0.2], [2.0]], dtype=np.float32)
+        metadata = {"deconv_scale": [1.0], "deconv_min": [0.0]}
+
+        def fake_scale(
+            img_in: NDArray[np.float32],
+            idx: int,
+            *,
+            name: str | None,
+            global_deconv_scaling: NDArray[np.float32],
+            metadata: dict[str, Any],
+            debug: bool,
+        ) -> NDArray[np.float32]:
+            assert idx == 0
+            assert name == "img-0"
+            assert global_deconv_scaling is global_scaling
+            assert metadata is metadata_dict
+            assert not debug
+            return img_in + 1.0
+
+        metadata_dict = metadata
+        monkeypatch.setattr(
+            cli_register_module,
+            "scale_deconv",
+            fake_scale,
+        )
+
+        result = apply_deconv_scaling(
+            img,
+            idx=0,
+            orig_name="img-0",
+            global_deconv_scaling=global_scaling,
+            metadata=metadata_dict,
+            debug=False,
+        )
+
+        np.testing.assert_array_equal(result, img + 1.0)
+
+    def test_apply_deconv_scaling_skips_when_prenormalized(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Images tagged prenormalized should bypass scale_deconv entirely."""
+
+        img = np.full((2, 3, 4), 5.0, dtype=np.float32)
+        global_scaling = np.array([[0.1], [1.5]], dtype=np.float32)
+        metadata = {
+            "deconv_scale": [1.0],
+            "deconv_min": [0.0],
+            "prenormalized": True,
+        }
+
+        def fail_scale(*_: Any, **__: Any) -> NDArray[np.float32]:
+            raise AssertionError("scale_deconv must not be invoked for prenormalized images")
+
+        monkeypatch.setattr(
+            cli_register_module,
+            "scale_deconv",
+            fail_scale,
+        )
+
+        result = apply_deconv_scaling(
+            img,
+            idx=0,
+            orig_name="img-0",
+            global_deconv_scaling=global_scaling,
+            metadata=metadata,
+            debug=True,
+        )
+
+        assert result is img
 
 
 class TestParseNofids:
@@ -541,3 +627,112 @@ class TestRegisterUtilsEdgeCases:
 
         # Clean up
         large_array[0, 0, 50, 50] = original_value
+
+
+class TestGpuDownsample:
+    """Unit tests for GPU-powered downsampling utilities."""
+
+    def test_downsample_requires_gpu(self, monkeypatch: Any) -> None:
+        """Ensure we fail fast when no CUDA device is available."""
+
+        fake_cuda = SimpleNamespace(runtime=SimpleNamespace(getDeviceCount=lambda: 0))
+        fake_cp = SimpleNamespace(
+            float32=np.float32,
+            uint16=np.uint16,
+            cuda=fake_cuda,
+            asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+            asnumpy=lambda arr: np.asarray(arr),
+            clip=lambda arr, a_min, a_max: np.clip(arr, a_min, a_max),
+            empty=lambda shape, dtype=np.float32: np.empty(shape, dtype=dtype),
+        )
+
+        monkeypatch.setattr(downsample_module, "cp", fake_cp)
+
+        with pytest.raises(RuntimeError, match="CUDA-capable GPU"):
+            gpu_downsample_xy(np.zeros((1, 4, 4), dtype=np.float32), crop=0, factor=1)
+
+    def test_downsample_xy_gpu_matches_numpy_reference(self, monkeypatch: Any) -> None:
+        """Validate CuPy pipeline (patched) matches NumPy reference implementation."""
+
+        fake_cuda = SimpleNamespace(runtime=SimpleNamespace(getDeviceCount=lambda: 1))
+
+        def fake_asarray(arr: NDArray[np.float32], dtype: Any | None = None) -> NDArray[np.float32]:
+            return np.asarray(arr, dtype=dtype)
+
+        fake_cp = SimpleNamespace(
+            float32=np.float32,
+            uint16=np.uint16,
+            cuda=fake_cuda,
+            asarray=fake_asarray,
+            asnumpy=lambda arr: np.asarray(arr),
+            clip=lambda arr, a_min, a_max: np.clip(arr, a_min, a_max),
+            empty=lambda shape, dtype=np.float32: np.empty(shape, dtype=dtype),
+        )
+
+        monkeypatch.setattr(downsample_module, "cp", fake_cp)
+        monkeypatch.setattr(
+            downsample_module,
+            "cp_zoom",
+            lambda arr, zoom, output, order, mode, grid_mode: ndimage.zoom(
+                arr,
+                zoom,
+                output=output,
+                order=order,
+                mode=mode,
+                grid_mode=grid_mode,
+            ),
+        )
+
+        data = np.arange(64, dtype=np.float32).reshape(1, 8, 8)
+        result = gpu_downsample_xy(
+            data,
+            crop=2,
+            factor=2,
+            clip_range=(0, 65534),
+            output_dtype=np.uint16,
+        )
+
+        cropped = data[:, 2:-2, 2:-2]
+        target_shape = (cropped.shape[0], cropped.shape[1] // 2, cropped.shape[2] // 2)
+        reference = ndimage.zoom(
+            cropped,
+            (1.0, 0.5, 0.5),
+            output=np.empty(target_shape, dtype=np.float32),
+            order=3,
+            mode="reflect",
+            grid_mode=True,
+        )
+        reference = np.clip(reference, 0, 65534).astype(np.uint16)
+
+        np.testing.assert_array_equal(result, reference)
+        assert result.dtype == np.uint16
+
+    def test_downsample_xy_gpu_factor_one(self, monkeypatch: Any) -> None:
+        """Factor of 1 should only crop while still using the CuPy pipeline."""
+
+        fake_cuda = SimpleNamespace(runtime=SimpleNamespace(getDeviceCount=lambda: 1))
+
+        fake_cp = SimpleNamespace(
+            float32=np.float32,
+            uint16=np.uint16,
+            cuda=fake_cuda,
+            asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+            asnumpy=lambda arr: np.asarray(arr),
+            clip=lambda arr, a_min, a_max: np.clip(arr, a_min, a_max),
+            empty=lambda shape, dtype=np.float32: np.empty(shape, dtype=dtype),
+        )
+
+        monkeypatch.setattr(downsample_module, "cp", fake_cp)
+
+        data = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
+        result = gpu_downsample_xy(
+            data,
+            crop=1,
+            factor=1,
+            clip_range=(0, 65534),
+            output_dtype=np.uint16,
+        )
+        expected = np.clip(data[:, 1:-1, 1:-1], 0, 65534).astype(np.uint16)
+
+        np.testing.assert_array_equal(result, expected)
+        assert result.dtype == np.uint16

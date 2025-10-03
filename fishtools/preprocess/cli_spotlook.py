@@ -19,8 +19,8 @@ from rich.text import Text
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
+from fishtools.io.workspace import Codebook, Workspace
 from fishtools.preprocess.config import SpotThresholdParams
-from fishtools.utils.io import Codebook, Workspace
 from fishtools.utils.plot import (
     DARK_PANEL_STYLE,
     add_scale_bar,

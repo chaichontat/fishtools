@@ -4,6 +4,7 @@ from typing import Annotated
 
 import typer
 
+from fishtools.segment.extract import cmd_extract as extract_cmd
 from fishtools.segment.train import TrainConfig, run_train
 
 app = typer.Typer()
@@ -44,6 +45,16 @@ def train(
 
 @app.command("run", help="Run a model")
 def run(): ...
+
+
+# Register the extract command directly from the submodule function.
+# This avoids double-nesting ("segment extract extract") and follows the
+# Typer multi-file pattern where a function defined elsewhere can be added
+# as a command of the top-level app.
+app.command(
+    "extract",
+    help="Export training-ready slices from registered stacks (mode: z|ortho)",
+)(extract_cmd)
 
 
 def main():

@@ -2,24 +2,40 @@ import time
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import ndimage
 from click.testing import CliRunner
 from pydantic import BaseModel
-from tifffile import TiffFileError, imwrite
+from tifffile import TiffFile, TiffFileError, imwrite
 
 from fishtools.preprocess.cli_stitch import (
     copy_registered,
     create_tile_config,
+    extract,
     extract_channel,
+    final_stitch,
     run_imagej,
     stitch,
     walk_fused,
+    _label_for_max_from,
 )
+from fishtools.preprocess import downsample as downsample_module
 from fishtools.preprocess.tileconfig import TileConfiguration
+
+
+def read_metadata(path: Path) -> dict[str, Any]:
+    with TiffFile(path) as tif:
+        shaped = getattr(tif, "shaped_metadata", None)
+        if shaped:
+            meta = dict(shaped[0])
+        else:
+            meta = dict(tif.imagej_metadata or {})
+    return meta
 
 
 class SyntheticStitchDataset(BaseModel):
@@ -394,6 +410,18 @@ class TestImageExtraction:
         # But verify the data is approximately the same
         np.testing.assert_allclose(extracted, test_data[1], rtol=0.05, atol=50)
 
+    def test_extract_channel_metadata_propagation(self, tmp_path: Path) -> None:
+        data = np.arange(2 * 8 * 8, dtype=np.uint16).reshape(2, 8, 8)
+        input_file = tmp_path / "meta_input.tif"
+        output_file = tmp_path / "meta_output.tif"
+        imwrite(input_file, data, metadata={"axes": "CYX", "key": ["bitA", "bitB"]})
+
+        extract_channel(input_file, output_file, idx=1)
+
+        meta = read_metadata(output_file)
+        assert meta.get("axes") == "YX"
+        assert meta.get("key") == ["bitB"]
+
     @pytest.mark.parametrize("edge_value", [0, 65535, 32768])  # uint16 edge cases
     def test_extract_channel_edge_intensity_values(self, edge_value: int, tmp_path: Path):
         """Test extraction with edge intensity values (min, max, mid-range)"""
@@ -477,7 +505,7 @@ class TestImageExtraction:
         # Allow for small differences due to compression
         np.testing.assert_allclose(extracted, expected_max_proj, rtol=0.05, atol=50)
 
-    def test_extract_channel_with_trim_and_downsample(self, tmp_path: Path):
+    def test_extract_channel_with_trim_and_downsample(self, tmp_path: Path, monkeypatch: Any):
         """Test extraction with trim and downsample options"""
         # Create larger test data as a single page (since idx=0 will be used)
         test_data = np.random.randint(1000, 5000, (128, 128), dtype=np.uint16)
@@ -485,6 +513,31 @@ class TestImageExtraction:
         output_file = tmp_path / "output_trimmed.tif"
 
         imwrite(input_file, test_data)
+
+        fake_cuda = SimpleNamespace(runtime=SimpleNamespace(getDeviceCount=lambda: 1))
+        fake_cp = SimpleNamespace(
+            float32=np.float32,
+            uint16=np.uint16,
+            cuda=fake_cuda,
+            asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
+            asnumpy=lambda arr: np.asarray(arr),
+            clip=lambda arr, a_min, a_max: np.clip(arr, a_min, a_max),
+            empty=lambda shape, dtype=np.float32: np.empty(shape, dtype=dtype),
+        )
+
+        monkeypatch.setattr(downsample_module, "cp", fake_cp)
+        monkeypatch.setattr(
+            downsample_module,
+            "cp_zoom",
+            lambda arr, zoom, output, order, mode, grid_mode: ndimage.zoom(
+                arr,
+                zoom,
+                output=output,
+                order=order,
+                mode=mode,
+                grid_mode=grid_mode,
+            ),
+        )
 
         # Extract with trim=10 and downsample=2, specify idx=0 for single-page TIFF
         extract_channel(input_file, output_file, idx=0, trim=10, downsample=2)
@@ -547,6 +600,45 @@ class TestImageExtraction:
         # Should raise ValueError for negative trim
         with pytest.raises(ValueError, match="Trim must be positive"):
             extract_channel(input_file, output_file, trim=-5)
+
+    def test_extract_metadata_propagation(self, tmp_path: Path) -> None:
+        data = np.arange(2 * 3 * 8 * 8, dtype=np.uint16).reshape(2, 3, 8, 8)
+        input_file = tmp_path / "round-0001.tif"
+        imwrite(input_file, data, metadata={"axes": "ZCYX", "key": ["dapi", "bit1", "bit2"]})
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        extract(input_file, out_dir, channels=[1, 2], downsample=1)
+
+        first_channel = out_dir / "00" / "00" / "0001.tif"
+        second_channel = out_dir / "00" / "01" / "0001.tif"
+
+        assert first_channel.exists()
+        assert second_channel.exists()
+
+        meta_first = read_metadata(first_channel)
+        meta_second = read_metadata(second_channel)
+
+        assert meta_first.get("key") == ["bit1"]
+        assert meta_first.get("processing") is not None
+
+        assert meta_second.get("key") == ["bit2"]
+        assert meta_second.get("processing") is not None
+
+
+class TestMaxFromLabelling:
+    def test_label_for_max_from_none(self) -> None:
+        assert _label_for_max_from(None) is None
+
+    def test_label_for_max_from_with_channel_metadata(self, tmp_path: Path) -> None:
+        target = tmp_path / "max.tif"
+        imwrite(target, np.ones((2, 4, 4), dtype=np.uint16), metadata={"axes": "CYX", "key": ["dapi", "bit1"]})
+        assert _label_for_max_from(target) == "max_from:dapi+bit1"
+
+    def test_label_for_max_from_without_metadata(self, tmp_path: Path) -> None:
+        target = tmp_path / "plain.tif"
+        imwrite(target, np.ones((4, 4), dtype=np.uint16))
+        assert _label_for_max_from(target) == "max_from:plain"
 
 
 class TestStitchingWorkflow:
@@ -795,9 +887,9 @@ class TestErrorHandling:
         # Exact behavior depends on implementation, but shouldn't crash
         assert isinstance(result.exit_code, int)
 
-    def test_corrupted_tile_configuration(
-        self, synthetic_stitch_dataset: SyntheticStitchDataset, mock_imagej_success
-    ):
+def test_corrupted_tile_configuration(
+    synthetic_stitch_dataset: SyntheticStitchDataset, mock_imagej_success
+):
         """Test handling of corrupted tile configuration files"""
         # Create corrupted tile configuration
         corrupted_config = synthetic_stitch_dataset.base_path / "corrupted_config.txt"
@@ -818,6 +910,24 @@ class TestErrorHandling:
 
         # Should fail with meaningful error
         assert result.exit_code != 0
+
+
+class TestFinalStitchMetadata:
+    def test_final_stitch_metadata_propagation(self, tmp_path: Path) -> None:
+        channel_dir = tmp_path / "00"
+        channel_dir.mkdir()
+        tc = TileConfiguration.from_pos(pd.DataFrame({0: [0.0], 1: [0.0]}))
+        tc.write(channel_dir / "TileConfiguration1.registered.txt")
+
+        imwrite(channel_dir / "fused_1.tif", np.ones((8, 8), dtype=np.uint16))
+
+        final_stitch(channel_dir, 1, channel_name="bitX")
+
+        fused_file = channel_dir / "fused.tif"
+        assert fused_file.exists()
+
+        meta = read_metadata(fused_file)
+        assert meta.get("key") == ["bitX"]
 
 
 if __name__ == "__main__":

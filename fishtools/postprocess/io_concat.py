@@ -16,7 +16,7 @@ from typing import Mapping, MutableMapping, Sequence
 import polars as pl
 from loguru import logger
 
-from fishtools.utils.io import Workspace
+from fishtools.io.workspace import Workspace
 
 __all__ = [
     "ConcatDataError",
@@ -90,11 +90,7 @@ def load_ident_tables(spec: ConcatDataSpec) -> dict[tuple[str, str], pl.DataFram
     missing: list[str] = []
     for roi in spec.rois:
         for codebook in spec.analysis_codebooks:
-            chunks_dir = (
-                spec.stitch_root
-                / f"stitch--{roi}+{spec.seg_codebook}"
-                / f"chunks+{codebook}"
-            )
+            chunks_dir = spec.stitch_root / f"stitch--{roi}+{spec.seg_codebook}" / f"chunks+{codebook}"
             files = _matching_files(chunks_dir, "ident_*.parquet")
             if not files:
                 missing.append(f"{roi}+{codebook}")
@@ -114,9 +110,7 @@ def load_ident_tables(spec: ConcatDataSpec) -> dict[tuple[str, str], pl.DataFram
             schema_names = lazy.collect_schema().names()
 
             if "label" not in schema_names:
-                raise ConcatDataError(
-                    f"Identification parquet missing 'label' column: {chunks_dir}"
-                )
+                raise ConcatDataError(f"Identification parquet missing 'label' column: {chunks_dir}")
 
             if "spot_id" in schema_names:
                 lazy = lazy.with_columns(pl.col("spot_id").cast(pl.UInt32))
@@ -152,11 +146,7 @@ def load_intensity_tables(
     missing: list[str] = []
 
     for roi in spec.rois:
-        intensity_dir = (
-            spec.stitch_root
-            / f"stitch--{roi}+{spec.seg_codebook}"
-            / f"intensity_{channel}"
-        )
+        intensity_dir = spec.stitch_root / f"stitch--{roi}+{spec.seg_codebook}" / f"intensity_{channel}"
         files = _matching_files(intensity_dir, "intensity-*.parquet")
         if not files:
             missing.append(roi)
@@ -175,9 +165,7 @@ def load_intensity_tables(
         schema_names = lazy.collect_schema().names()
 
         if "label" not in schema_names:
-            raise ConcatDataError(
-                f"Intensity parquet missing 'label' column: {intensity_dir}"
-            )
+            raise ConcatDataError(f"Intensity parquet missing 'label' column: {intensity_dir}")
 
         lazy = lazy.with_columns([
             (pl.col("z").cast(pl.Utf8) + pl.lit(roi) + pl.col("label").cast(pl.Utf8)).alias("roilabelz"),
@@ -191,9 +179,7 @@ def load_intensity_tables(
         results[roi] = df
 
     if required and len(results) != len(spec.rois):
-        raise ConcatDataError(
-            "No intensity files found for: " + ", ".join(sorted(set(missing)))
-        )
+        raise ConcatDataError("No intensity files found for: " + ", ".join(sorted(set(missing))))
 
     if missing and not required:
         logger.info(
@@ -259,11 +245,7 @@ def load_polygon_tables(
     missing: list[str] = []
 
     for roi in spec.rois:
-        chunks_dir = (
-            spec.stitch_root
-            / f"stitch--{roi}+{spec.seg_codebook}"
-            / f"chunks+{target_codebook}"
-        )
+        chunks_dir = spec.stitch_root / f"stitch--{roi}+{spec.seg_codebook}" / f"chunks+{target_codebook}"
         files = _matching_files(chunks_dir, "polygons_*.parquet")
         if not files:
             missing.append(roi)
@@ -283,16 +265,10 @@ def load_polygon_tables(
         required = {"label", "centroid_x", "centroid_y", "area"}
         missing_cols = sorted(required - set(schema_names))
         if missing_cols:
-            raise ConcatDataError(
-                f"Polygon parquet missing required columns {missing_cols}: {chunks_dir}"
-            )
+            raise ConcatDataError(f"Polygon parquet missing required columns {missing_cols}: {chunks_dir}")
 
         lazy = lazy.with_columns(
-            (
-                pl.col("z").cast(pl.Utf8)
-                + pl.lit(roi)
-                + pl.col("label").cast(pl.Utf8)
-            ).alias("roilabelz")
+            (pl.col("z").cast(pl.Utf8) + pl.lit(roi) + pl.col("label").cast(pl.Utf8)).alias("roilabelz")
         ).drop("path")
 
         df = lazy.sort("z").collect()
@@ -439,13 +415,11 @@ def arrange_rois(
         y_offset = grid_row * (max_height + padding) - row["min_y"]
         roi_offsets[roi] = (float(x_offset), float(y_offset))
 
-    offset_df = pl.DataFrame(
-        {
-            "roi": list(roi_offsets.keys()),
-            "x_offset": [offset[0] for offset in roi_offsets.values()],
-            "y_offset": [offset[1] for offset in roi_offsets.values()],
-        }
-    )
+    offset_df = pl.DataFrame({
+        "roi": list(roi_offsets.keys()),
+        "x_offset": [offset[0] for offset in roi_offsets.values()],
+        "y_offset": [offset[1] for offset in roi_offsets.values()],
+    })
 
     arranged = (
         polygons.join(offset_df, on="roi", how="left")

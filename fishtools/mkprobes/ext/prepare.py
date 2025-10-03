@@ -12,7 +12,7 @@ import polars as pl
 import pyfastx
 from loguru import logger as log
 
-from fishtools.utils.io import download, get_file_name, set_cwd
+from fishtools.io.workspace import download, get_file_name, set_cwd
 from fishtools.utils.utils import check_if_exists, check_if_posix, run_process
 
 from ..utils._alignment import gen_fasta, jellyfish

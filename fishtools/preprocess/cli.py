@@ -5,6 +5,7 @@ from .cli_deconv import deconv
 from .cli_inspect import inspect_cli
 from .cli_register import register
 from .cli_stitch import stitch
+from .cli_verify import verify
 from .spots.align_prod import spots
 
 
@@ -70,6 +71,7 @@ main.add_command(registerv1)
 main.add_command(stitch)
 main.add_command(spots)
 main.add_command(inspect_cli)
+main.add_command(verify)
 
 if __name__ == "__main__":
     main()

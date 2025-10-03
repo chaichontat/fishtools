@@ -8,11 +8,14 @@ import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
+import polars as pl
 import scanpy as sc
+from loguru import logger
 from matplotlib.axes import Axes
 from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.ticker import FuncFormatter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 
@@ -36,6 +39,44 @@ DARK_PANEL_STYLE = {
     "xtick.color": "#e5e7eb",
     "ytick.color": "#e5e7eb",
 }
+
+SI_PREFIXES: list[tuple[float, str]] = [
+    (1e24, "Y"),  # yotta
+    (1e21, "Z"),  # zetta
+    (1e18, "E"),  # exa
+    (1e15, "P"),  # peta
+    (1e12, "T"),  # tera
+    (1e9, "G"),  # giga
+    (1e6, "M"),  # mega
+    (1e3, "k"),  # kilo
+]
+
+
+def format_si(x: float) -> str:
+    """Format a number using an SI prefix without spaces or trailing .0.
+
+    Examples: 950 -> "950", 1500 -> "1.5k", 1000 -> "1k", 1_000_000 -> "1M".
+    """
+    if not np.isfinite(x):
+        return ""
+    sign = "-" if x < 0 else ""
+    ax = abs(x)
+    factor, prefix = 1.0, ""
+    for f, p in SI_PREFIXES:
+        if ax >= f:
+            factor, prefix = f, p
+            break
+    scaled = ax / factor
+    if np.isclose(scaled, round(scaled)):
+        num = f"{int(round(scaled))}"
+    else:
+        num = f"{scaled:.1f}".rstrip("0").rstrip(".")
+    return f"{sign}{num}{prefix}"
+
+
+def si_tick_formatter() -> FuncFormatter:
+    """Return a Matplotlib `FuncFormatter` that applies `format_si` to tick values."""
+    return FuncFormatter(lambda x, _pos: format_si(x))
 
 
 def configure_dark_axes(
@@ -404,3 +445,50 @@ def plot_embedding(
         axes.append(ax)
 
     return fig, axes
+
+
+def plot_all_genes(
+    spots: pl.DataFrame,
+    *,
+    dark: bool = False,
+    only_blank: bool = False,
+    figsize: tuple[float, float] | None = None,
+    cmap: str | None = None,
+):
+    genes = spots.group_by("target").len().sort("len", descending=True)["target"]
+    genes = spots["target"].unique()
+    genes = filter(lambda x: x.startswith("Blank"), genes) if only_blank else genes
+    genes = sorted(genes)
+
+    nrows = int(np.ceil(len(genes) / 20))
+    with mpl.rc_context({
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Arial", "DejaVu Sans"],
+    }):
+        default_size = (72, int(2.4 * nrows))
+        fig, axs = plt.subplots(
+            ncols=20,
+            nrows=nrows,
+            figsize=figsize or default_size,
+            dpi=160,
+            facecolor="black" if dark else "white",
+        )
+    axs = axs.flatten()
+    for ax, gene in zip(axs, genes):
+        selected = spots.filter(pl.col("target") == gene)
+        if not len(selected):
+            logger.warning(f"No spots found for {gene}")
+            continue
+        ax.set_aspect("equal")
+        ax.set_title(gene, fontsize=16, color="white" if dark else "black")
+        ax.axis("off")
+        use_hexbin = dark or (cmap is not None)
+        if use_hexbin:
+            ax.hexbin(selected["x"], selected["y"], gridsize=250, cmap=cmap or "magma")
+        else:
+            ax.scatter(selected["x"], selected["y"], s=2000 / len(selected), alpha=0.1)
+
+    for ax in axs.flat:
+        if not ax.has_data():
+            fig.delaxes(ax)
+    return fig, axs

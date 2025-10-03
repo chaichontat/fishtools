@@ -20,7 +20,7 @@ from loguru import logger
 from rich.console import Console
 from rich.logging import RichHandler
 
-from fishtools.utils.io import Workspace, get_channels, get_metadata
+from fishtools.io.workspace import Workspace, get_channels, get_metadata
 from fishtools.utils.pretty_print import progress_bar
 from fishtools.preprocess.deconv.range_utils import (
     DEFAULT_PERCENTILE_OVERRIDES as RANGE_DEFAULT_PERCENTILE_OVERRIDES,
@@ -125,7 +125,6 @@ def high_pass_filter(
 
 projectors = load_projectors_cached
 rescale = core_rescale
-
 
 
 def _run(
