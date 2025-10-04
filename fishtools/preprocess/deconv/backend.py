@@ -161,11 +161,23 @@ class Float32HistBackend:
         if artifacts.f32_payload is None or artifacts.hist_payload is None:
             raise RuntimeError("Float32HistBackend expected float32 payload and histogram data.")
 
+        payload = artifacts.f32_payload
+        if fid_np.size:
+            fid_float = fid_np.astype(np.float32, copy=False)
+            payload = np.concatenate([payload, fid_float], axis=0)
+
+        metadata = {
+            "dtype": "float32",
+            "fid_planes": int(fid_np.shape[0]),
+            "fid_source_dtype": str(fid_np.dtype),
+            **metadata_out,
+        }
+
         safe_imwrite(
             sub32 / path.name,
-            artifacts.f32_payload,
+            payload,
             dtype=np.float32,
-            metadata={"dtype": "float32", **metadata_out},
+            metadata=metadata,
             compression="zlib",
             compressionargs={"level": 6},
         )

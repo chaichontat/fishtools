@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import sys
+from typing import Literal
+
 from loguru import logger
 
 
-def configure_logging(debug: bool, *, process_label: str | None = None) -> None:
+def configure_logging(
+    debug: bool,
+    *,
+    process_label: str | None = None,
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO",
+    use_console: bool = True,
+) -> None:
     """Configure loguru consistently for CLI commands.
 
     - INFO by default with simple message format
@@ -18,7 +26,7 @@ def configure_logging(debug: bool, *, process_label: str | None = None) -> None:
     else:
         prefix = ""
 
-    if debug:
+    if debug and level == "DEBUG":
         log_format = (
             "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
             "<level>{level: <8}</level> | "
@@ -29,5 +37,13 @@ def configure_logging(debug: bool, *, process_label: str | None = None) -> None:
         logger.add("profiling_{time}.log", level="DEBUG", format=log_format, enqueue=True)
         logger.debug("Debug logging configured (with profiling sink).")
     else:
-        logger.add(sys.stderr, level="INFO", format=f"{prefix}{{message}}", enqueue=True)
+        if use_console:
+            # Route parent logs through the shared Console to cooperate with Rich Progress
+            from fishtools.utils.pretty_print import get_shared_console
 
+            def _sink(message: str) -> None:
+                get_shared_console().print(message, end="")
+
+            logger.add(_sink, level=level, format=f"{prefix}{{message}}", enqueue=False)
+        else:
+            logger.add(sys.stderr, level=level, format=f"{prefix}{{message}}", enqueue=True)

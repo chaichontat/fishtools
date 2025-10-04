@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import re
 import signal
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Literal, Sequence
 
 import cupy as cp
 import numpy as np
@@ -17,8 +18,8 @@ from fishtools.preprocess.deconv.backend import (
     DeconvolutionTileProcessor,
     Float32HistBackend,
     OutputBackend,
-    OutputBackendFactory,
     ProcessorConfig,
+    ProcessorFactory,
     U16PrenormBackend,
     make_processor_factory,
 )
@@ -161,24 +162,14 @@ def quantize(
 
 
 __all__ = [
-    "DEFAULT_QUEUE_DEPTH",
-    "DeconvolutionTileProcessor",
-    "ProcessorConfig",
-    "OutputBackendFactory",
-    "OutputBackend",
-    "WorkerMessage",
-    "_MP_CTX",
-    "build_backend_factory",
-    "filter_pending_files",
-    "load_global_scaling",
-    "make_processor_factory",
-    "multi_batch",
-    "multi_prepare",
+    "deconv",
+    "precompute",
+    "quantize",
+    "prepare",
+    "run",
+    "easy",
     "multi_run",
-    "parse_device_spec",
-    "run_multi_gpu",
-    "cp",
-    "signal",
+    "multi_prepare",
 ]
 
 
@@ -228,6 +219,21 @@ def _is_candidate_tile(path: Path) -> bool:
     )
 
 
+def _parse_roi(directory_name: str) -> str | None:
+    parts = directory_name.split("--", 1)
+    return parts[1] if len(parts) == 2 else None
+
+
+_TILE_INDEX_RE = re.compile(r".*-(\d+)$")
+
+
+def _parse_tile_index(stem: str) -> int | None:
+    match = _TILE_INDEX_RE.match(stem)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def _collect_round_tiles(
     root: Path,
     round_name: str,
@@ -245,13 +251,11 @@ def _collect_round_tiles(
         for ref_tile in root.glob(ref_pattern):
             if not _is_candidate_tile(ref_tile):
                 continue
-            roi_name_parts = ref_tile.parent.name.split("--", 1)
-            if len(roi_name_parts) != 2:
+            roi_name = _parse_roi(ref_tile.parent.name)
+            if roi_name is None:
                 continue
-            roi_name = roi_name_parts[1]
-            try:
-                tile_idx = int(ref_tile.stem.split("-")[1])
-            except (IndexError, ValueError):
+            tile_idx = _parse_tile_index(ref_tile.stem)
+            if tile_idx is None:
                 continue
             ref_indices.setdefault(roi_name, set()).add(tile_idx)
 
@@ -265,21 +269,15 @@ def _collect_round_tiles(
     for tile in sorted(root.glob(pattern)):
         if not _is_candidate_tile(tile):
             continue
-        roi_parts = tile.parent.name.split("--", 1)
-        if len(roi_parts) != 2:
+        roi_name = _parse_roi(tile.parent.name)
+        if roi_name is None:
             continue
-        roi_name = roi_parts[1]
         if roi_filter and roi_name not in roi_filter:
             continue
         if ref_round is not None:
+            tile_idx = _parse_tile_index(tile.stem)
             allowed = ref_indices.get(roi_name)
-            if not allowed:
-                continue
-            try:
-                tile_idx = int(tile.stem.split("-")[1])
-            except (IndexError, ValueError):
-                continue
-            if tile_idx not in allowed:
+            if tile_idx is None or not allowed or tile_idx not in allowed:
                 continue
         tiles.append(tile)
 
@@ -290,9 +288,9 @@ def _normalize_mode(value: str | DeconvolutionOutputMode) -> DeconvolutionOutput
     if isinstance(value, DeconvolutionOutputMode):
         return value
     normalized = value.lower()
-    if normalized in {"float32", "f32", "float32_hist", "f32hist"}:
+    if normalized in {"float32", "f32"}:
         return DeconvolutionOutputMode.F32
-    if normalized in {"u16", "uint16", "u16_prenorm", "prenorm"}:
+    if normalized == "u16":
         return DeconvolutionOutputMode.U16
     raise click.BadParameter(f"Unknown backend '{value}'. Expected one of: float32, u16.")
 
@@ -300,23 +298,13 @@ def _normalize_mode(value: str | DeconvolutionOutputMode) -> DeconvolutionOutput
 # ------------------------------ Backend choice ------------------------------ #
 
 
-def build_backend_factory(mode: str | DeconvolutionOutputMode) -> OutputBackendFactory:
-    """Return a picklable factory for OutputBackend.
-
-    Avoid lambdas/locals so multiprocessing can pickle the factory across processes.
-    """
-    resolved = _normalize_mode(mode)
-    if resolved is DeconvolutionOutputMode.F32:
-        return _make_float32_backend
-    return _make_u16_backend
+_BACKEND_CLASSES: dict[DeconvolutionOutputMode, type[OutputBackend]] = {
+    DeconvolutionOutputMode.F32: Float32HistBackend,
+    DeconvolutionOutputMode.U16: U16PrenormBackend,
+}
 
 
-def _make_float32_backend(cfg: ProcessorConfig) -> OutputBackend:
-    return Float32HistBackend(cfg)
-
-
-def _make_u16_backend(cfg: ProcessorConfig) -> OutputBackend:
-    return U16PrenormBackend(cfg)
+# ------------------------------ Backend choice ------------------------------ #
 
 
 # ------------------------------ Pending filtering ------------------------------ #
@@ -327,24 +315,14 @@ def filter_pending_files(
     *,
     out_dir: Path,
     overwrite: bool,
-    backend: OutputBackend | None = None,
-    mode: DeconvolutionOutputMode = DeconvolutionOutputMode.U16,
+    backend: OutputBackend,
 ) -> list[Path]:
     if overwrite:
         return list(files)
 
     pending: list[Path] = []
-    root32 = out_dir.parent / "deconv32"
     for f in files:
-        if backend is not None:
-            targets = backend.expected_targets(out_dir, f)
-        else:
-            targets: list[Path]
-            if mode is DeconvolutionOutputMode.F32:
-                float_target = root32 / f.parent.name / f.name
-                targets = [float_target, float_target.with_suffix(".histogram.csv")]
-            else:
-                targets = [out_dir / f.parent.name / f.name]
+        targets = backend.expected_targets(out_dir, f)
         if any(not t.exists() for t in targets):
             pending.append(f)
 
@@ -428,15 +406,14 @@ def _prepare_round_plan(
         debug=debug,
     )
 
-    backend_factory = build_backend_factory(mode)
-    backend_for_filter = backend_factory(config)
+    backend_cls = _BACKEND_CLASSES[mode]
+    backend_for_filter = backend_cls(config)
 
     pending = filter_pending_files(
         file_list,
         out_dir=out_dir,
         overwrite=overwrite,
         backend=backend_for_filter,
-        mode=mode,
     )
 
     if not pending:
@@ -445,7 +422,7 @@ def _prepare_round_plan(
     else:
         prefixed.info(f"{len(pending)}/{len(file_list)} tile(s) pending after overwrite checks.")
 
-    processor_factory = make_processor_factory(config, backend_factory=backend_factory)
+    processor_factory = make_processor_factory(config, backend_factory=backend_cls)
 
     return _RoundProcessingPlan(
         label=label,
@@ -567,6 +544,147 @@ def _run_round_tiles(
     )
 
 
+# ------------------------------ Shared planning helper ------------------------------ #
+
+
+def _plan_and_execute(
+    *,
+    path: Path,
+    rounds: Sequence[str],
+    rois: Sequence[str] | None,
+    ref_round: str | None,
+    limit: int | None,
+    limit_scope: Literal["total", "per_roi"],
+    basic_name: str,
+    n_fids: int,
+    histogram_bins: int,
+    load_scaling: bool,
+    overwrite: bool,
+    debug: bool,
+    devices: Sequence[int],
+    stop_on_error: bool,
+    mode: DeconvolutionOutputMode,
+    delete_origin: bool,
+    progress: ProgressUpdater | None = None,
+) -> list[WorkerMessage]:
+    workspace = Workspace(path)
+    out_dir = workspace.deconved
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    available_rois = tuple(sorted(workspace.rois))
+    if rois is None:
+        scope_rois = available_rois
+    else:
+        scope_rois = tuple(rois)
+
+    plans: list[_RoundProcessingPlan] = []
+    for round_token in rounds:
+        prefixed = _PrefixedLogger(round_token)
+        basic_token = basic_name or round_token
+        prefixed.info(f"Using {(path / 'basic') / f'{basic_token}-*.pkl'} for BaSiC")
+
+        if not scope_rois:
+            prefixed.warning("No ROIs available; skipping round.")
+            continue
+
+        files_to_process: list[Path] = []
+        total_assigned = 0
+        for roi in scope_rois:
+            roi_files = _collect_round_tiles(path, round_token, rois=[roi], ref_round=ref_round)
+            if not roi_files:
+                prefixed.warning(f"No files found for ROI '{roi}'; skipping.")
+                continue
+
+            if limit is not None:
+                if limit_scope == "per_roi":
+                    limited = roi_files[:limit]
+                    if len(limited) < len(roi_files):
+                        prefixed.info(
+                            f"Applying limit={limit} to ROI '{roi}': processing {len(limited)} of {len(roi_files)} tile(s)."
+                        )
+                    roi_files = limited
+                else:
+                    remaining = limit - total_assigned
+                    if remaining <= 0:
+                        break
+                    if len(roi_files) > remaining:
+                        prefixed.info(
+                            f"Applying limit={limit}: processing {remaining} tile(s) from ROI '{roi}'."
+                        )
+                        roi_files = roi_files[:remaining]
+                    total_assigned += len(roi_files)
+
+            files_to_process.extend(roi_files)
+
+            if limit_scope == "total" and limit is not None and total_assigned >= limit:
+                break
+
+        if not files_to_process:
+            prefixed.warning("No files discovered for requested ROI scope; skipping round.")
+            continue
+
+        plan = _prepare_round_plan(
+            path=path,
+            round_name=round_token,
+            files=files_to_process,
+            out_dir=out_dir,
+            basic_name=basic_token,
+            n_fids=n_fids,
+            histogram_bins=histogram_bins,
+            load_scaling=load_scaling,
+            overwrite=overwrite,
+            debug=debug,
+            label=round_token,
+            mode=mode,
+            prefixed=prefixed,
+        )
+
+        if plan is not None:
+            plans.append(plan)
+
+    if not plans:
+        logger.warning("No files found to process. Exiting.")
+        return []
+
+    total_pending = sum(len(plan.pending) for plan in plans)
+    if total_pending == 0:
+        logger.info("All selected tiles are already processed; nothing to do.")
+        if delete_origin:
+            for plan in plans:
+                try:
+                    safe_delete_origin_dirs(plan.files, out_dir)
+                except Exception as exc:  # noqa: BLE001
+                    plan.prefixed.error(f"Failed to delete origin directories: {exc}")
+        return []
+
+    failures: list[WorkerMessage] = []
+
+    def _execute(plan: _RoundProcessingPlan, progress_callback: ProgressUpdater | None) -> None:
+        plan_failures = _execute_round_plan(
+            plan,
+            devices=devices,
+            stop_on_error=stop_on_error,
+            debug=debug,
+            progress=progress_callback,
+        )
+        failures.extend(plan_failures)
+        if delete_origin:
+            try:
+                safe_delete_origin_dirs(plan.files, out_dir)
+            except Exception as exc:  # noqa: BLE001
+                plan.prefixed.error(f"Failed to delete origin directories: {exc}")
+
+    if progress is None:
+        with progress_bar(total_pending) as shared_progress:
+            for plan in plans:
+                _execute(plan, shared_progress)
+    else:
+        for plan in plans:
+            _execute(plan, progress)
+
+    return failures
+
+
 # ------------------------------ Programmatic helper ------------------------------ #
 
 
@@ -593,32 +711,18 @@ def multi_run(
     if configure_logging:
         _configure_logging(debug, process_label=process_label)
 
-    ref_round = str(ref) if ref is not None else None
-    files = _collect_round_tiles(path, round_name, ref_round=ref_round)
-
-    if limit is not None:
-        files = files[:limit]
-
-    logger.info(f"Total: {len(files)} at {path}/{round_name}*" + (f" limited to {limit}" if limit else ""))
-
-    if not files:
-        logger.warning("No files found to process. Exiting.")
-        return []
-
-    basic_token = basic_name or round_name
-    logger.info(f"Using {path / 'basic'}/{basic_token}-*.pkl for BaSiC")
-
-    out_dir = path / "analysis" / "deconv"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     mode = _normalize_mode(backend)
 
-    return _run_round_tiles(
+    ref_round = str(ref) if ref is not None else None
+
+    failures = _plan_and_execute(
         path=path,
-        round_name=round_name,
-        files=files,
-        out_dir=out_dir,
-        basic_name=basic_token,
+        rounds=[round_name],
+        rois=None,
+        ref_round=ref_round,
+        limit=limit,
+        limit_scope="total",
+        basic_name=basic_name,
         n_fids=n_fids,
         histogram_bins=histogram_bins,
         load_scaling=True,
@@ -626,9 +730,11 @@ def multi_run(
         debug=debug,
         devices=list(devices),
         stop_on_error=stop_on_error,
-        label=round_name,
         mode=mode,
+        delete_origin=False,
     )
+
+    return failures
 
 
 def multi_prepare(
@@ -672,9 +778,11 @@ def multi_prepare(
         logger.warning("No candidate tiles found for sampling. Exiting.")
         return
 
+    if not (0.0 < percent <= 1.0):
+        raise click.ClickException("--percent must be in (0, 1].")
+
     rng = np.random.default_rng(seed)
-    sample_count = max(min(num_tiles, len(candidates)), int(len(candidates) * percent))
-    sample_count = min(sample_count, len(candidates))
+    sample_count = min(max(int(len(candidates) * percent), num_tiles), len(candidates))
     idx = rng.choice(len(candidates), size=sample_count, replace=False)
     sampled = [candidates[i] for i in idx]
 
@@ -683,7 +791,7 @@ def multi_prepare(
         round_token = file.name.split("-")[0]
         by_round.setdefault(round_token, []).append(file)
 
-    out_dir = path / "analysis" / "deconv"
+    out_dir = ws.deconved
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mode = _normalize_mode(backend)
@@ -711,167 +819,6 @@ def multi_prepare(
             label=round_name,
             mode=mode,
         )
-
-
-def multi_batch(
-    path: Path,
-    *,
-    ref: str | Path | None,
-    overwrite: bool,
-    n_fids: int,
-    basic_name: str | None,
-    delete_origin: bool,
-    debug: bool,
-    devices: Sequence[int],
-    stop_on_error: bool,
-    backend: str = _DEFAULT_OUTPUT_MODE.value,
-    histogram_bins: int = 8192,
-    configure_logging: bool = False,
-    process_label: str = "0",
-) -> None:
-    if configure_logging:
-        _configure_logging(debug, process_label=process_label)
-
-    ws = Workspace(path)
-    rois = ws.rois
-    if not rois:
-        raise click.ClickException("No ROIs found.")
-
-    rounds = Workspace.discover_rounds(path)
-    if not rounds:
-        raise click.ClickException("No rounds discovered in workspace.")
-
-    out_dir = ws.deconved
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    mode = _normalize_mode(backend)
-
-    ref_round = str(ref) if ref is not None else None
-    basic_token = basic_name or "all"
-
-    for round_name in rounds:
-        label = round_name
-        files = _collect_round_tiles(path, round_name, rois=rois, ref_round=ref_round)
-        if not files:
-            logger.warning(f"[{label}] No files found to process; skipping.")
-            continue
-
-        _run_round_tiles(
-            path=path,
-            round_name=round_name,
-            files=files,
-            out_dir=out_dir,
-            basic_name=basic_token,
-            n_fids=n_fids,
-            histogram_bins=histogram_bins,
-            load_scaling=True,
-            overwrite=overwrite,
-            debug=debug,
-            devices=list(devices),
-            stop_on_error=stop_on_error,
-            label=label,
-            mode=mode,
-        )
-
-        if delete_origin:
-            try:
-                safe_delete_origin_dirs(files, out_dir)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"[{label}] Failed to delete origin directories: {exc}")
-
-
-@deconv.command()
-@click.argument("path", type=click.Path(path_type=Path))
-@click.option("--ref", type=click.Path(path_type=Path), default=None)
-@click.option("--overwrite", is_flag=True)
-@click.option("--n-fids", type=int, default=2, show_default=True)
-@click.option("--basic-name", type=str, default="all", show_default=True)
-@click.option("--delete-origin", is_flag=True)
-@click.option("--debug", is_flag=True)
-@click.option("--multi-gpu", is_flag=True, help="Use the multi-GPU scheduler.")
-@click.option("--devices", type=str, default="auto", show_default=True)
-@click.option(
-    "--stop-on-error/--continue-on-error",
-    default=True,
-    show_default=True,
-    help="Stop all workers after the first failure.",
-)
-@click.option(
-    "--backend",
-    type=click.Choice(["u16", "float32"]),
-    default=_DEFAULT_OUTPUT_MODE.value,
-    show_default=True,
-)
-@click.option("--histogram-bins", type=int, default=8192, show_default=True)
-def batch(
-    path: Path,
-    *,
-    ref: Path | None,
-    overwrite: bool,
-    n_fids: int,
-    basic_name: str,
-    delete_origin: bool,
-    debug: bool,
-    multi_gpu: bool,
-    devices: str,
-    stop_on_error: bool,
-    backend: str,
-    histogram_bins: int,
-) -> None:
-    """Process all rounds/ROIs; retains legacy semantics for tests."""
-
-    _configure_logging(debug, process_label="0")
-
-    use_multi = multi_gpu or getattr(_run, "_is_placeholder", False)
-
-    if use_multi:
-        try:
-            device_list = parse_device_spec(devices)
-        except Exception as exc:  # noqa: BLE001
-            raise click.ClickException(str(exc)) from exc
-
-        multi_batch(
-            path,
-            ref=ref,
-            overwrite=overwrite,
-            n_fids=n_fids,
-            basic_name=basic_name,
-            delete_origin=delete_origin,
-            debug=debug,
-            devices=device_list,
-            stop_on_error=stop_on_error,
-            backend=backend,
-            histogram_bins=histogram_bins,
-            configure_logging=False,
-            process_label="0",
-        )
-        return
-
-    # Legacy/test path leveraged by unit tests that monkeypatch _run.
-    ref_round = ref.name if ref is not None else None
-    out_dir = path / "analysis" / "deconv"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    rounds = sorted({p.name.split("--")[0] for p in path.iterdir() if "--" in p.name and p.is_dir()})
-
-    for round_name in rounds:
-        files = _collect_round_tiles(path, round_name, rois=None, ref_round=ref_round)
-        if not files:
-            logger.warning(f"[{round_name}] No files found to process; skipping.")
-            continue
-
-        try:
-            step, _ = infer_psf_step(files[0])
-        except Exception:  # noqa: BLE001
-            step = 6
-
-        _run(files, out_dir, {}, overwrite, n_fids, step=step, debug=debug)
-
-        if delete_origin:
-            try:
-                safe_delete_origin_dirs(files, out_dir)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"[{round_name}] Failed to delete origin directories: {exc}")
 
 
 # ---------- prepare ----------
@@ -1024,85 +971,29 @@ def run(
         raise click.ClickException(f"ROI '{roi_name}' not found in {path}.")
 
     mode = _normalize_mode(backend)
-    out_dir = workspace.deconved
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     ref_token = ref_round
     if ref_token is not None and ref_token not in all_rounds:
         raise click.ClickException(f"Reference round '{ref_token}' not found in {path}.")
 
-    plans: list[_RoundProcessingPlan] = []
-    for round_token in selected_rounds:
-        prefixed = _PrefixedLogger(round_token)
-        basic_token = basic_name or round_token
-        prefixed.info(f"Using {(path / 'basic') / f'{basic_token}-*.pkl'} for BaSiC")
-
-        files_to_process: list[Path] = []
-        for roi in selected_rois:
-            roi_files = _collect_round_tiles(path, round_token, rois=[roi], ref_round=ref_token)
-            if not roi_files:
-                prefixed.warning(f"No files found for ROI '{roi}'; skipping.")
-                continue
-
-            if limit is not None:
-                limited = roi_files[:limit]
-                if len(limited) < len(roi_files):
-                    prefixed.info(
-                        f"Applying limit={limit} to ROI '{roi}': processing {len(limited)} of {len(roi_files)} tile(s)."
-                    )
-                roi_files = limited
-
-            files_to_process.extend(roi_files)
-
-        if not files_to_process:
-            prefixed.warning("No files discovered for requested ROI scope; skipping round.")
-            continue
-
-        plan = _prepare_round_plan(
-            path=path,
-            round_name=round_token,
-            files=files_to_process,
-            out_dir=out_dir,
-            basic_name=basic_token,
-            n_fids=n_fids,
-            histogram_bins=histogram_bins,
-            load_scaling=True,
-            overwrite=overwrite,
-            debug=debug,
-            label=round_token,
-            mode=mode,
-            prefixed=prefixed,
-        )
-
-        if plan is not None:
-            plans.append(plan)
-
-    total_pending = sum(len(plan.pending) for plan in plans)
-    if total_pending == 0:
-        logger.info("All selected tiles are already processed; nothing to do.")
-        if delete_origin:
-            for plan in plans:
-                try:
-                    safe_delete_origin_dirs(plan.files, out_dir)
-                except Exception as exc:  # noqa: BLE001
-                    plan.prefixed.error(f"Failed to delete origin directories: {exc}")
-        return
-
-    with progress_bar(total_pending) as shared_progress:
-        for plan in plans:
-            _execute_round_plan(
-                plan,
-                devices=device_list,
-                stop_on_error=stop_on_error,
-                debug=debug,
-                progress=shared_progress,
-            )
-
-            if delete_origin:
-                try:
-                    safe_delete_origin_dirs(plan.files, out_dir)
-                except Exception as exc:  # noqa: BLE001
-                    plan.prefixed.error(f"Failed to delete origin directories: {exc}")
+    _plan_and_execute(
+        path=path,
+        rounds=selected_rounds,
+        rois=selected_rois,
+        ref_round=ref_token,
+        limit=limit,
+        limit_scope="per_roi",
+        basic_name=basic_name,
+        n_fids=n_fids,
+        histogram_bins=histogram_bins,
+        load_scaling=True,
+        overwrite=overwrite,
+        debug=debug,
+        devices=device_list,
+        stop_on_error=stop_on_error,
+        mode=mode,
+        delete_origin=delete_origin,
+    )
 
 
 @deconv.command()
@@ -1114,7 +1005,7 @@ def easy(path: Path, round_name: str | None):
     rounds = [round_name] if round_name else Workspace.discover_rounds(path)
     for round_ in rounds:
         subprocess.run(["preprocess", "deconv", "prepare", str(path), round_], check=True)
-        subprocess.run(["preprocess", "deconv", "precompute", str(path)], check=True)
+        subprocess.run(["preprocess", "deconv", "precompute", str(path), round_], check=True)
         subprocess.run(["preprocess", "deconv", "run", str(path), round_], check=True)
 
 

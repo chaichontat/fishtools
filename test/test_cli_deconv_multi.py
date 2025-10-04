@@ -6,11 +6,12 @@ import types
 from pathlib import Path
 
 import json
+
 import numpy as np
 import pytest
 import tifffile
 
-from fishtools.preprocess.cli_deconv_multi import (
+from fishtools.preprocess.cli_deconv import (
     DeconvolutionTileProcessor,
     ProcessorConfig,
     filter_pending_files,
@@ -21,6 +22,7 @@ from fishtools.preprocess.cli_deconv_multi import (
     parse_device_spec,
     run_multi_gpu,
 )
+from fishtools.preprocess.deconv.backend import Float32HistBackend, OutputArtifacts, U16PrenormBackend
 from fishtools.preprocess.config import DeconvolutionOutputMode
 
 
@@ -164,11 +166,25 @@ def test_filter_pending_files_uint16(tmp_path: Path):
     file_pending.parent.mkdir(parents=True)
     file_pending.touch()
 
+    config = ProcessorConfig(
+        round_name="r1",
+        basic_paths=(),
+        output_dir=out_dir,
+        n_fids=2,
+        step=6,
+        mode=DeconvolutionOutputMode.U16,
+        histogram_bins=8192,
+        m_glob=None,
+        s_glob=None,
+        debug=False,
+    )
+    backend = U16PrenormBackend(config)
+
     pending = filter_pending_files(
         [file_done, file_pending],
         out_dir=out_dir,
         overwrite=False,
-        mode=DeconvolutionOutputMode.U16,
+        backend=backend,
     )
 
     assert pending == [file_pending]
@@ -190,11 +206,25 @@ def test_filter_pending_files_float32(tmp_path: Path):
     file_pending = tmp_path / "r2--roiA" / "r2-0002.tif"
     file_pending.touch()
 
+    config = ProcessorConfig(
+        round_name="r2",
+        basic_paths=(),
+        output_dir=out_dir,
+        n_fids=2,
+        step=6,
+        mode=DeconvolutionOutputMode.F32,
+        histogram_bins=8192,
+        m_glob=None,
+        s_glob=None,
+        debug=False,
+    )
+    backend = Float32HistBackend(config)
+
     pending = filter_pending_files(
         [file_done, file_pending],
         out_dir=out_dir,
         overwrite=False,
-        mode=DeconvolutionOutputMode.F32,
+        backend=backend,
     )
 
     assert pending == [file_pending]
@@ -272,6 +302,69 @@ def test_deconvolution_processor_dynamic_geometry(tmp_path: Path, monkeypatch):
     with tifffile.TiffFile(float32_path) as tif:
         arr = tif.asarray()
     assert arr.shape == (channels * 2, height, width)
+
+
+def test_float32_backend_appends_fiducials(tmp_path: Path) -> None:
+    round_name = "rFid"
+    roi = "roi"
+    tile_path = tmp_path / f"{round_name}--{roi}" / f"{round_name}-0000.tif"
+    tile_path.parent.mkdir(parents=True)
+
+    height = width = 8
+    payload_planes = 3
+    n_fids = 2
+
+    config = ProcessorConfig(
+        round_name=round_name,
+        basic_paths=(),
+        output_dir=tmp_path / "analysis" / "deconv",
+        n_fids=n_fids,
+        step=1,
+        mode=DeconvolutionOutputMode.F32,
+        histogram_bins=32,
+        m_glob=None,
+        s_glob=None,
+        debug=False,
+    )
+
+    backend = Float32HistBackend(config)
+    backend.setup(types.SimpleNamespace(config=config))
+
+    f32_payload = np.arange(payload_planes * height * width, dtype=np.float32).reshape(
+        payload_planes, height, width
+    )
+    fid = np.arange(n_fids * height * width, dtype=np.uint16).reshape(n_fids, height, width)
+
+    artifacts = OutputArtifacts(
+        f32_payload=f32_payload,
+        hist_payload={
+            "C": 1,
+            "bins": 1,
+            "counts": [np.array([0])],
+            "edges": [np.array([0.0, 1.0])],
+        },
+    )
+
+    backend.write(
+        tile_path,
+        fid,
+        metadata_out={"foo": "bar"},
+        artifacts=artifacts,
+        out_dir=config.output_dir,
+    )
+
+    out32 = config.output_dir.parent / "deconv32" / tile_path.parent.name / tile_path.name
+    assert out32.exists()
+
+    with tifffile.TiffFile(out32) as tif:
+        stack = tif.asarray()
+        meta = tif.imagej_metadata or tif.shaped_metadata[0]  # type: ignore[index]
+
+    assert stack.shape == (payload_planes + n_fids, height, width)
+    np.testing.assert_array_equal(stack[:payload_planes], f32_payload)
+    np.testing.assert_array_equal(stack[-n_fids:], fid.astype(np.float32))
+    assert meta["fid_planes"] == n_fids
+    assert meta["fid_source_dtype"] == "uint16"
 
 
 def test_deconvolution_histogram_deterministic(tmp_path: Path, monkeypatch):
@@ -365,11 +458,11 @@ def test_run_multi_gpu_stop_on_error_cancels_remaining(tmp_path: Path, monkeypat
             target=target, kwargs=kwargs, daemon=daemon, **extra
         ),
     )
-    monkeypatch.setattr("fishtools.preprocess.cli_deconv_multi._MP_CTX", dummy_ctx)
-    monkeypatch.setattr("fishtools.preprocess.cli_deconv_multi._configure_logging", lambda *a, **k: None)
-    monkeypatch.setattr("fishtools.preprocess.cli_deconv_multi.signal.signal", lambda *a, **k: None)
+    monkeypatch.setattr("fishtools.preprocess.cli_deconv._MP_CTX", dummy_ctx)
+    monkeypatch.setattr("fishtools.preprocess.cli_deconv._configure_logging", lambda *a, **k: None)
+    monkeypatch.setattr("fishtools.preprocess.cli_deconv.signal.signal", lambda *a, **k: None)
     monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv_multi.cp.cuda",
+        "fishtools.preprocess.cli_deconv.cp.cuda",
         types.SimpleNamespace(
             runtime=types.SimpleNamespace(getDeviceCount=lambda: 1, CUDARuntimeError=RuntimeError),
             Device=lambda _: types.SimpleNamespace(use=lambda: None),
@@ -413,120 +506,3 @@ def test_multi_run_end_to_end(minimal_workspace: tuple[Path, str, str]):
     u16_path = workspace / "analysis" / "deconv" / f"{round_name}--{roi}" / f"{round_name}-0000.tif"
     f32_path = workspace / "analysis" / "deconv32" / f"{round_name}--{roi}" / f"{round_name}-0000.tif"
     assert u16_path.exists() or f32_path.exists()
-
-
-def test_run_cli_progressive_scoping_all_rois(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    workspace = tmp_path / "workspace"
-    for roi in ("roiA", "roiB"):
-        tile_dir = workspace / f"r1--{roi}"
-        tile_dir.mkdir(parents=True)
-        (tile_dir / "r1-0000.tif").touch()
-
-    calls: list[tuple[str, list[Path]]] = []
-
-    def fake_run_round_tiles(**kwargs):  # type: ignore[no-untyped-def]
-        label = kwargs.get("label")
-        files = kwargs.get("files", [])
-        calls.append((label, list(files)))
-        return []
-
-    monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv_multi._run_round_tiles",
-        fake_run_round_tiles,
-    )
-    monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv_multi.parse_device_spec",
-        lambda spec: [0],
-    )
-    monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv_multi._configure_logging",
-        lambda *args, **kwargs: None,
-    )
-
-    from fishtools.preprocess.cli_deconv_multi import run as run_cmd
-
-    run_cmd.callback(  # type: ignore[call-arg]
-        workspace,
-        "*",
-        roi_name="*",
-        ref_round=None,
-        limit=None,
-        backend="u16",
-        histogram_bins=8192,
-        overwrite=False,
-        delete_origin=False,
-        n_fids=2,
-        basic_name="all",
-        debug=False,
-        devices="auto",
-        stop_on_error=True,
-    )
-
-    labels = {label for label, _ in calls}
-    assert labels == {"r1/roiA", "r1/roiB"}
-    for label, files in calls:
-        assert label in labels
-        assert all(path.name.startswith("r1-") for path in files)
-
-
-def test_run_cli_delete_origin_respects_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    workspace = tmp_path / "workspace"
-    tile_dir = workspace / "r1--roiA"
-    tile_dir.mkdir(parents=True)
-    files = [tile_dir / f"r1-{idx:04d}.tif" for idx in range(2)]
-    for file in files:
-        file.touch()
-
-    processed: list[list[Path]] = []
-
-    def fake_run_round_tiles(**kwargs):  # type: ignore[no-untyped-def]
-        processed.append(list(kwargs.get("files", [])))
-        return []
-
-    deleted: list[list[Path]] = []
-
-    def fake_delete(orig: list[Path], out_dir: Path) -> None:
-        deleted.append(list(orig))
-
-    monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv_multi._run_round_tiles",
-        fake_run_round_tiles,
-    )
-    monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv_multi._configure_logging",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv_multi.parse_device_spec",
-        lambda spec: [0],
-    )
-    monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv_multi.safe_delete_origin_dirs",
-        fake_delete,
-        raising=False,
-    )
-
-    from fishtools.preprocess.cli_deconv_multi import _run_cli_scope
-    from fishtools.io.workspace import Workspace
-
-    _run_cli_scope(
-        path=workspace,
-        roi="roiA",
-        rounds=("r1",),
-        ref_round=None,
-        limit=1,
-        mode=DeconvolutionOutputMode.U16,
-        histogram_bins=8192,
-        overwrite=False,
-        n_fids=2,
-        basic_name="all",
-        debug=False,
-        devices=[0],
-        stop_on_error=True,
-        delete_origin=True,
-        workspace=Workspace(workspace),
-    )
-
-    assert len(processed) == 1
-    assert [f.name for f in processed[0]] == ["r1-0000.tif"]
-    assert deleted and [f.name for f in deleted[0]] == ["r1-0000.tif"]

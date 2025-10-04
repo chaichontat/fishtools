@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fishtools.preprocess.cli_deconv_multi import build_backend_factory
+from fishtools.preprocess.cli_deconv import _BACKEND_CLASSES
 from fishtools.preprocess.deconv.backend import ProcessorConfig, make_processor_factory
 from fishtools.preprocess.config import DeconvolutionOutputMode
 
@@ -25,7 +25,7 @@ def _dummy_config(tmp_path: Path) -> ProcessorConfig:
 
 
 def test_build_backend_factory_float32_pickles(tmp_path: Path):
-    factory = build_backend_factory("float32")
+    factory = _BACKEND_CLASSES[DeconvolutionOutputMode.F32]
     # Top-level function should pickle fine.
     pickle.dumps(factory)
 
@@ -35,7 +35,7 @@ def test_build_backend_factory_float32_pickles(tmp_path: Path):
 
 
 def test_build_backend_factory_u16_pickles(tmp_path: Path):
-    factory = build_backend_factory("u16")
+    factory = _BACKEND_CLASSES[DeconvolutionOutputMode.U16]
     pickle.dumps(factory)
 
     cfg = _dummy_config(tmp_path)
@@ -53,4 +53,3 @@ def test_build_backend_factory_u16_pickles(tmp_path: Path):
     )
     pf = make_processor_factory(cfg, backend_factory=factory)
     pickle.dumps(pf)
-

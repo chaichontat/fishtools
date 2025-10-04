@@ -18,6 +18,7 @@ from tifffile import imwrite as tifffile_imwrite
 from tqdm.auto import tqdm
 
 from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.utils.tiff import normalize_channel_names, read_metadata_from_tif
 
 
 class CorruptedTiffError(RuntimeError):
@@ -227,6 +228,8 @@ class Workspace:
         "basic",
     )
 
+    _PLACEHOLDER_CHANNEL = re.compile(r"^channel_\d+$", re.IGNORECASE)
+
     path: Path
 
     def __str__(self) -> str:
@@ -325,6 +328,112 @@ class Workspace:
                     rois_set.add(roi_name)
 
         return sorted(rois_set)
+
+    @staticmethod
+    def _split_round_tokens(value: str) -> list[str]:
+        """Tokenize a round/tile stem using repository naming conventions."""
+
+        base = value
+        for sep in ("--", "+"):
+            if sep in base:
+                base = base.split(sep, 1)[0]
+        if "-" in base:
+            base = base.split("-", 1)[0]
+        tokens = [part for part in base.replace("-", "_").split("_") if part]
+        return tokens
+
+    def _first_deconv32_tile(self, round_name: str, roi: str | None = None) -> Path | None:
+        base = self.path / "analysis" / "deconv32"
+        if not base.exists():
+            return None
+
+        pattern = f"{round_name}--*"
+        roi_filter = roi
+
+        for roi_dir in sorted(p for p in base.glob(pattern) if p.is_dir()):
+            current_roi = roi_dir.name.split("--", 1)[-1]
+            if roi_filter and not current_roi.startswith(roi_filter):
+                continue
+            for tile in sorted(roi_dir.glob(f"{round_name}-*.tif")):
+                if tile.suffix.lower() == ".tif":
+                    return tile
+        return None
+
+    @staticmethod
+    def _channel_names_from_metadata(tile: Path) -> list[str] | None:
+        try:
+            with TiffFile(tile) as tif:
+                metadata = read_metadata_from_tif(tif)
+                count: int | None = None
+                try:
+                    series = tif.series[0]
+                except Exception:
+                    series = None  # pragma: no cover - missing series
+                axes = getattr(series, "axes", None) if series is not None else None
+                shape = getattr(series, "shape", None) if series is not None else None
+
+                if isinstance(axes, str) and shape:
+                    axes_upper = axes.upper()
+                    if "C" in axes_upper:
+                        count = int(shape[axes_upper.index("C")])
+                elif axes is None and shape:
+                    if len(shape) == 3:
+                        count = int(shape[0])
+                    elif len(shape) == 4:
+                        count = int(shape[1])
+
+                if not count or count <= 0:
+                    return None
+
+                names = normalize_channel_names(count, metadata)
+        except Exception:
+            return None
+
+        if not names:
+            return None
+        return list(names)
+
+    def infer_channel_names(
+        self,
+        round_name: str,
+        *,
+        roi: str | None = None,
+        prefer_metadata: bool = True,
+    ) -> list[str] | None:
+        """Attempt to infer ordered channel names for a round.
+
+        Priority:
+        1. Explicit TIFF metadata from the first float32 tile in analysis/deconv32
+        2. Tokens parsed from the round name (e.g., wga_brdu → ["wga", "brdu"])
+        3. Tokens parsed from the tile stem prior to the index suffix
+
+        Placeholder names (channel_0, channel_1, …) are ignored.
+        Returns None when no informative names can be resolved.
+        """
+
+        candidates: list[list[str]] = []
+        tile = self._first_deconv32_tile(round_name, roi)
+
+        if prefer_metadata and tile is not None:
+            names = self._channel_names_from_metadata(tile)
+            if names:
+                candidates.append(names)
+
+        tokens_round = self._split_round_tokens(round_name)
+        if tokens_round:
+            candidates.append(tokens_round)
+
+        if tile is not None:
+            tokens_tile = self._split_round_tokens(tile.stem)
+            if tokens_tile:
+                candidates.append(tokens_tile)
+
+        for seq in candidates:
+            filtered = [name for name in seq if not self._PLACEHOLDER_CHANNEL.fullmatch(name)]
+            if filtered:
+                return filtered
+
+        return None
 
     def resolve_rois(self, rois: Iterable[str] | None = None) -> list[str]:
         """Validate and normalize requested ROI identifiers.

@@ -1,12 +1,57 @@
 import random
+import signal
 import sys
 import types
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
 import pytest
 import tifffile
 from scipy import ndimage as _scipy_ndimage
+
+
+_DEFAULT_TIMEOUT_SECONDS = 30
+
+
+class _TestTimeoutError(RuntimeError):
+    """Raised when a test exceeds the allotted runtime."""
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item):
+    timeout_marker = item.get_closest_marker("timeout")
+    timeout = None
+    if timeout_marker is not None:
+        if timeout_marker.args:
+            timeout = float(timeout_marker.args[0])
+        else:
+            timeout = float(timeout_marker.kwargs.get("seconds", _DEFAULT_TIMEOUT_SECONDS))
+    if timeout is None:
+        yield
+        return
+    if not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _signal_handler(signum, frame):  # pragma: no cover - relies on OS signals
+        raise _TestTimeoutError(f"Test exceeded {timeout:.1f} seconds")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    with suppress(AttributeError):
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+    signal.signal(signal.SIGALRM, _signal_handler)
+    with suppress(AttributeError):
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        outcome = yield
+    finally:
+        with suppress(AttributeError):
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+    exc_info = outcome.excinfo
+    if exc_info is not None and issubclass(exc_info[0], _TestTimeoutError):
+        pytest.fail(str(exc_info[1]), pytrace=False)
 
 # Lightweight stub for heavy optional dependency 'scanpy' used in import-time
 # paths (e.g., fishtools.postprocess). This avoids importing the real package

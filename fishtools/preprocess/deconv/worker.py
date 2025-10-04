@@ -38,12 +38,14 @@ class WorkerMessage:
     status: WorkerStatus
     duration: float | None = None
     error: str | None = None
+    device: int | None = None
+    stages: dict[str, float] | None = None
 
 
 def configure_worker_logging(debug: bool, *, process_label: str) -> None:
-    """Configure logging for a worker or coordinating process."""
-
-    configure_logging(debug, process_label=process_label)
+    """Configure logging for a worker process (keep quiet to avoid progress redraws)."""
+    # Force WARNING level in workers to prevent INFO logs interleaving with Progress.
+    configure_logging(False, process_label=process_label, level="WARNING", use_console=False)
 
 
 def parse_device_spec(spec: str | Sequence[int] | None) -> list[int]:
@@ -138,7 +140,7 @@ def _worker_loop(
                         break
                     continue
                 result_queue.put(
-                    WorkerMessage(worker_id=worker_id, path=item, status="ok", duration=duration)
+                    WorkerMessage(worker_id=worker_id, path=item, status="ok", duration=duration, device=device_id)
                 )
         finally:
             processor.teardown()
@@ -195,18 +197,7 @@ def _worker_loop(
             t0 = time.perf_counter()
             try:
                 artifacts, metadata_out, t_dict = processor.compute_tile(nofid, path, hw, metadata)
-                elapsed = time.perf_counter() - t0
-                t_gpu = (
-                    t_dict.get("basic", 0.0)
-                    + t_dict.get("deconv", 0.0)
-                    + t_dict.get("quant", 0.0)
-                    + t_dict.get("post", 0.0)
-                )
-                logger.info(
-                    f"[GPU{device_id}] {path.name}: gpu={t_gpu:.2f}s (basic={t_dict.get('basic', 0.0):.2f}+"
-                    f"dec={t_dict.get('deconv', 0.0):.2f}+quant={t_dict.get('quant', 0.0):.2f}+post={t_dict.get('post', 0.0):.2f})"
-                    f" stage_total={elapsed:.2f}s"
-                )
+                # Forward timing dict; logging occurs in parent process.
                 q_out.put((path, fid_np, metadata_out, artifacts, t_dict))
             except Exception as exc:  # noqa: BLE001
                 import traceback
@@ -238,7 +229,14 @@ def _worker_loop(
                 )
                 logger.debug(f"[{path.name}] Write stage took: {t_write:.4f}s")
                 result_queue.put(
-                    WorkerMessage(worker_id=worker_id, path=path, status="ok", duration=t_gpu + t_write)
+                    WorkerMessage(
+                        worker_id=worker_id,
+                        path=path,
+                        status="ok",
+                        duration=t_gpu + t_write,
+                        device=device_id,
+                        stages=t_dict,
+                    )
                 )
             except Exception as exc:  # noqa: BLE001
                 import traceback
@@ -318,7 +316,7 @@ def run_multi_gpu(
                     if stop_on_error:
                         break
                     continue
-                msg = WorkerMessage(worker_id=0, path=path, status="ok", duration=duration)
+                msg = WorkerMessage(worker_id=0, path=path, status="ok", duration=duration, device=device_id)
                 if progress_callback is not None:
                     progress_callback(msg)
         finally:

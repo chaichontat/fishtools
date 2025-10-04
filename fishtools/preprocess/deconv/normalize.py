@@ -13,16 +13,16 @@ import rich_click as click
 import tifffile
 from loguru import logger
 
+from fishtools.io.workspace import Workspace
 from fishtools.preprocess.deconv.hist import _quantile_from_hist
 from fishtools.utils.pretty_print import progress_bar
-from fishtools.utils.tiff import normalize_channel_names as _norm_channel_names
-from fishtools.utils.tiff import read_metadata_from_tif
 
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 I_MAX = 2**16 - 1  # use 65535 unless you must reserve it
+_STANDARD_P_HIGH = 0.99999  # for log highlighting of deviations
 
 # Optional hardcoded overrides for upper percentile (p_high) per round and channel.
 #
@@ -63,12 +63,6 @@ def _p_high_overrides_for(round_name: str) -> dict[int, float] | None:
     return dict(mapping) if mapping else None
 
 
-def _first_tile_for_round(workspace: Path, round_name: str) -> Path | None:
-    for _roi, tile in _iter_float32_tiles(workspace, round_name):
-        return tile
-    return None
-
-
 def _normalize_name(name: str) -> str:
     """Validate and canonicalize a channel name: underscore-separated, case-insensitive.
 
@@ -98,45 +92,23 @@ def _p_high_by_channel_from_names(
     """
     if not name_overrides:
         return None
-    tile = _first_tile_for_round(workspace, round_name)
-    if tile is None:
-        return None
-    try:
-        with tifffile.TiffFile(str(tile)) as tif:
-            meta = read_metadata_from_tif(tif)
-            # Determine channel count from series axes when available
-            count = None
-            try:
-                s = tif.series[0]
-                axes = getattr(s, "axes", None)
-                shape = getattr(s, "shape", None)
-                if axes and shape and "C" in axes:
-                    count = int(shape[axes.index("C")])
-                elif shape and len(shape) == 3:
-                    # Heuristic: (C, Y, X)
-                    count = int(shape[0])
-                elif shape and len(shape) == 4:
-                    # Heuristic: (Z, C, Y, X)
-                    count = int(shape[1])
-            except Exception:
-                count = None
-            if not count or count <= 0:
-                return None
-            names = _norm_channel_names(count, meta)
-    except Exception:
-        return None
-
+    norm_map = {_normalize_name(k): float(v) for k, v in name_overrides.items()}
+    ws = Workspace(workspace)
+    names = ws.infer_channel_names(round_name)
     if not names:
         return None
 
-    norm_map = {_normalize_name(k): float(v) for k, v in name_overrides.items()}
     out: dict[int, float] = {}
     for idx, nm in enumerate(names):
-        key = _normalize_name(nm)
+        try:
+            key = _normalize_name(nm)
+        except click.ClickException:
+            continue
         if key in norm_map:
             val = norm_map[key]
             if 0.0 < val <= 1.0:
                 out[idx] = val
+
     return out or None
 
 
@@ -342,6 +314,51 @@ def precompute_global_quantization(
             val = float(p_high)
         effective_p_high[c] = val
 
+    override_channels: set[int] = set()
+    for k in p_high_by_channel or {}:
+        try:
+            override_channels.add(int(k))
+        except (TypeError, ValueError):
+            continue
+    high_parts = []
+    for c in channels:
+        suffix = " (override)" if c in override_channels else ""
+        high_parts.append(f"ch{c}={effective_p_high[c]:.6f}{suffix}")
+    high_details = ", ".join(high_parts)
+    if high_details:
+        logger.info(f"[{round_name}] Percentile range: p_low={p_low:.6f}, p_high per channel: {high_details}")
+
+    # Highlight deviations from standard p_high and mark overrides prominently
+    try:
+        inferred_names = Workspace(path).infer_channel_names(round_name) or []
+    except Exception:
+        inferred_names = []
+    nonstd: list[str] = []
+    all_same = True
+    first_val: float | None = None
+    for c in channels:
+        val = float(effective_p_high[c])
+        if first_val is None:
+            first_val = val
+        elif abs(val - first_val) > 1e-12:
+            all_same = False
+        if abs(val - _STANDARD_P_HIGH) > 5e-7:
+            nm = inferred_names[c] if c < len(inferred_names) else ""
+            label = (
+                f"ch{c}{f'({nm})' if nm else ''}={val:.6f}{' (override)' if c in override_channels else ''}"
+            )
+            nonstd.append(label)
+    if nonstd:
+        if all_same and len(nonstd) == len(channels) and first_val is not None:
+            logger.warning(
+                f"[{round_name}] Non-standard p_high on all channels: {first_val:.6f} (standard={_STANDARD_P_HIGH:.5f})."
+            )
+        else:
+            logger.warning(
+                f"[{round_name}] Non-standard p_high detected (standard={_STANDARD_P_HIGH:.5f}): "
+                + ", ".join(nonstd)
+            )
+
     # For reporting/plotting
     used_p_high = np.zeros(C, dtype=np.float64)
 
@@ -382,7 +399,6 @@ def precompute_global_quantization(
     # --- Save a logarithmic histogram plot (counts on log-scale) ---
     try:
         out_png = scale_dir / f"{round_name}.hist.png"
-        logger.info(f"[{round_name}] Histogram plot path: {out_png}")
         # Use standard seaborn styling
         sns.set_style("whitegrid")
 
@@ -521,24 +537,37 @@ def quantize(
                 advance()
                 continue
 
-            raw_path = workspace / rel_dir / float32_path.name
-            if not raw_path.exists():
-                raise click.ClickException(f"Missing raw tile required for fiducials: {raw_path}")
+            with tifffile.TiffFile(float32_path) as tif:
+                try:
+                    metadata = tif.shaped_metadata[0]  # type: ignore[index]
+                except (TypeError, IndexError):
+                    metadata = tif.imagej_metadata or {}
+                float32_stack = tif.asarray()
 
-            float32_stack = tifffile.imread(float32_path)
             if float32_stack.ndim != 3:
                 raise click.ClickException(
                     f"Expected 3D array in {float32_path}, got shape {float32_stack.shape}."
                 )
 
+            if n_fids:
+                if float32_stack.shape[0] < n_fids:
+                    raise click.ClickException(
+                        f"Float32 tile {float32_path} has only {float32_stack.shape[0]} planes; cannot extract {n_fids} fiducials."
+                    )
+                fid_stack_f32 = float32_stack[-n_fids:]
+                payload_stack = float32_stack[:-n_fids]
+            else:
+                fid_stack_f32 = np.zeros((0, *float32_stack.shape[1:]), dtype=np.float32)
+                payload_stack = float32_stack
+
             channels = m_glob.size
-            if float32_stack.shape[0] % channels != 0:
+            if payload_stack.shape[0] % channels != 0:
                 raise click.ClickException(
-                    f"Tile {float32_path} has {float32_stack.shape[0]} planes, which is not divisible by {channels} channels."
+                    f"Tile {float32_path} payload has {payload_stack.shape[0]} planes, which is not divisible by {channels} channels."
                 )
 
-            z_slices = float32_stack.shape[0] // channels
-            gpu_stack = cp.asarray(float32_stack, dtype=cp.float32)
+            z_slices = payload_stack.shape[0] // channels
+            gpu_stack = cp.asarray(payload_stack, dtype=cp.float32)
             reshaped = gpu_stack.reshape(z_slices, channels, float32_stack.shape[1], float32_stack.shape[2])
 
             quantized = quantize_global(
@@ -550,22 +579,7 @@ def quantize(
                 as_numpy=True,
             )
 
-            with tifffile.TiffFile(raw_path) as tif:
-                try:
-                    metadata = tif.shaped_metadata[0]  # type: ignore[index]
-                except (TypeError, IndexError):
-                    metadata = tif.imagej_metadata or {}
-                raw_stack = tif.asarray()
-
-            if raw_stack.ndim != 3:
-                raise click.ClickException(f"Raw tile {raw_path} has unexpected shape {raw_stack.shape}.")
-
-            if raw_stack.shape[0] < n_fids:
-                raise click.ClickException(
-                    f"Raw tile {raw_path} has only {raw_stack.shape[0]} planes; cannot extract {n_fids} fiducials."
-                )
-
-            fid = raw_stack[-n_fids:].astype(np.uint16, copy=False)
+            fid = (np.rint(np.clip(fid_stack_f32, 0.0, float(I_MAX)))).astype(np.uint16, copy=False)
 
             deliverable = np.concatenate([quantized, fid], axis=0)
 
@@ -580,6 +594,8 @@ def quantize(
                 "deconv_min": [float(x) for x in np.ravel(m_glob)],
                 "deconv_scale": [float(x) for x in np.ravel(s_glob)],
                 "prenormalized": True,
+                "dtype": "uint16",
+                "fid_planes": int(fid.shape[0]),
             })
 
             tifffile.imwrite(
@@ -626,10 +642,16 @@ def precompute(
         for k, v in by_name.items():
             overrides.setdefault(k, v)
     if overrides:
-        logger.info(
-            f"[{round_name}] Applying p_high overrides for channels: "
-            + ", ".join(f"{c}->{v:.6f}" for c, v in sorted(overrides.items()))
-        )
+        try:
+            names = Workspace(workspace).infer_channel_names(round_name) or []
+        except Exception:
+            names = []
+        items: list[str] = []
+        for c, v in sorted(overrides.items()):
+            c_int = int(c)
+            nm = names[c_int] if c_int < len(names) else ""
+            items.append(f"ch{c_int}{f'({nm})' if nm else ''}->{v:.6f}")
+        logger.info(f"[{round_name}] OVERRIDE p_high applied: " + ", ".join(items))
     m_glob, s_glob = precompute_global_quantization(
         workspace,
         round_name,

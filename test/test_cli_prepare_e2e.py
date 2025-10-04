@@ -82,7 +82,7 @@ def test_cli_prepare_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     _patch_deconv_stubs(monkeypatch, channels=C, height=H, width=W)
 
     # Run CLI via Click runner using positional rounds
-    from fishtools.preprocess.cli_deconv_multi import multi_deconv
+    from fishtools.preprocess.cli_deconv import deconv as multi_deconv
 
     runner = CliRunner()
     result = runner.invoke(
