@@ -62,3 +62,26 @@ def compose_metadata(
         metadata.update(extra)
     return metadata
 
+
+def get_metadata(file: "Path") -> dict[str, Any]:
+    """Return shaped or ImageJ metadata from a TIFF path.
+
+    Raises AttributeError when no metadata is found.
+    """
+    with TiffFile(file) as tif:
+        try:
+            meta = tif.shaped_metadata[0]  # type: ignore[index]
+        except KeyError as exc:  # pragma: no cover - exercised by callers
+            raise AttributeError("No metadata found.") from exc
+    return meta
+
+
+def get_channels(file: "Path") -> list[str]:
+    meta = get_metadata(file)
+    waveform = meta.get("waveform")
+    if isinstance(waveform, str):
+        import json
+
+        waveform = json.loads(waveform)
+    powers = (waveform or {}).get("params", {}).get("powers", {})
+    return [name[-3:] for name in powers]

@@ -19,15 +19,16 @@ from rich.text import Text
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
-from fishtools.io.workspace import Codebook, Workspace
+from fishtools.io.codebook import Codebook
+from fishtools.io.workspace import Workspace
 from fishtools.preprocess.config import SpotThresholdParams
+from fishtools.utils.logging import configure_cli_logging, initialize_logger
 from fishtools.utils.plot import (
     DARK_PANEL_STYLE,
     add_scale_bar,
     configure_dark_axes,
     si_tick_formatter,
 )
-from fishtools.utils.utils import configure_cli_logging, initialize_logger
 
 console = Console()
 

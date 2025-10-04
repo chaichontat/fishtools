@@ -1,24 +1,30 @@
 import io
-import json
-import os
 import re
-import shutil
 import warnings
-from contextlib import contextmanager, redirect_stderr, suppress
+from contextlib import redirect_stderr, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, overload
 
 import numpy as np
 import numpy.typing as npt
-import requests
 from loguru import logger
 from tifffile import TiffFile, imread
 from tifffile import imwrite as tifffile_imwrite
-from tqdm.auto import tqdm
 
+from fishtools.io.codebook import Codebook
 from fishtools.preprocess.tileconfig import TileConfiguration
-from fishtools.utils.tiff import normalize_channel_names, read_metadata_from_tif
+from fishtools.utils.fs import download, get_file_name, set_cwd
+from fishtools.utils.tiff import (
+    get_channels as _ft_get_channels,
+)
+from fishtools.utils.tiff import (
+    get_metadata as _ft_get_metadata,
+)
+from fishtools.utils.tiff import (
+    normalize_channel_names,
+    read_metadata_from_tif,
+)
 
 
 class CorruptedTiffError(RuntimeError):
@@ -28,40 +34,6 @@ class CorruptedTiffError(RuntimeError):
         super().__init__(f"File {path} is corrupted. Please check the file.")
         self.path = path
         self.__cause__ = cause
-
-
-def download(url: str, path: str | Path, name: str | None = None) -> None:
-    with requests.get(url, stream=True, allow_redirects=True, timeout=30) as r:
-        if r.status_code >= 400:
-            r.raise_for_status()
-            raise RuntimeError(f"Request to {url} returned status code {r.status_code}")
-
-        size = int(r.headers.get("Content-Length", 0))
-        if name is None:
-            name = url.split("/")[-1]
-
-        path = Path(path).expanduser().resolve()
-        path.mkdir(parents=True, exist_ok=True)
-        path = path / name
-        if path.exists():
-            if size == path.stat().st_size:
-                logger.info(f"File {path} already exists. Skipping.")
-                return
-            else:
-                logger.warning(f"File {path} already exists but size is different. Redownloading.")
-        else:
-            logger.info(f"Downloading {url}")
-
-        with tqdm.wrapattr(r.raw, "read", total=size) as r_raw:
-            with open(f"{path}.tmp", "wb") as f:
-                shutil.copyfileobj(r_raw, f)
-                os.rename(f"{path}.tmp", path)
-
-    logger.info(f"Finished downloading {url}")
-
-
-def get_file_name(url: str) -> str:
-    return url.split("/")[-1]
 
 
 def safe_imwrite(
@@ -115,17 +87,6 @@ def safe_imwrite(
         raise
 
 
-@contextmanager
-def set_cwd(path: Path):
-    cwd = Path.cwd()
-    try:
-        Path(path).mkdir(exist_ok=True, parents=True)
-        os.chdir(path)
-        yield
-    finally:
-        os.chdir(cwd)
-
-
 @dataclass
 class OptimizePath:
     path: Path
@@ -139,31 +100,7 @@ class OptimizePath:
         return self.path / "global_scale.txt"
 
 
-@dataclass
-class Codebook:
-    path: Path
-
-    def __post_init__(self):
-        self.path = Path(self.path)
-        self.codebook = json.loads(self.path.read_text())
-
-    @property
-    def name(self):
-        return self.path.stem
-
-    def to_dataframe(self, bits_as_list: bool = False):
-        import polars as pl
-
-        df = (pl.DataFrame(self.codebook).transpose(include_header=True)).rename({"column": "target"})
-
-        if not bits_as_list:
-            return df.rename({"column_0": "bit0", "column_1": "bit1", "column_2": "bit2"})
-
-        return df.with_columns(
-            concat_list=pl.concat_list("column_0", "column_1", "column_2")
-            .cast(pl.List(pl.UInt8))
-            .alias("bits")
-        )
+# Re-export Codebook for backward compatibility (imported above)
 
 
 @dataclass
@@ -175,28 +112,33 @@ class Workspace:
 
     Directory Structure:
         workspace/
-        ├── {round}--{roi}/                    # Raw imaging data
+        ├── {round}--{roi}/                        # Raw imaging data
         │   ├── {round}-0001.tif
         │   └── {round}-0002.tif
+        ├── stitch--{roi}/                         # ROI-level tile config directory
+        │   └── TileConfiguration.registered.txt   # ImageJ Grid/Collection config
         └── analysis/
             ├── deconv/
-            │   ├── {round}--{roi}/            # Deconvolved images
+            │   ├── {round}--{roi}/                # Deconvolved images
             │   ├── registered--{roi}+{codebook}/  # Registration results
-            │   ├── stitch--{roi}/             # Stitching results
-            │   ├── segment--{roi}+{codebook}/ # Segmentation results
-            │   ├── shifts--{roi}+{codebook}/  # Registration shifts
+            │   ├── stitch--{roi}/                 # ROI-level stitched outputs
+            │   ├── stitch--{roi}+{codebook}/      # ROI+codebook stitched outputs
+            │   ├── segment--{roi}+{codebook}/     # Segmentation results
+            │   ├── shifts--{roi}+{codebook}/      # Registration shifts
             │   │   └── shifts-0001.json
-            │   ├── fids--{roi}/               # Fiducial markers
+            │   ├── fids--{roi}/                   # Fiducial markers
             │   │   └── fids-0001.tif
-            │   └── opt_{codebook}/            # Optimization results
+            │   └── opt_{codebook}/                # Optimization results
             │       ├── mse.txt
             │       └── global_scale.txt
-            └── output/                        # Final analysis output
+            └── output/                            # Final analysis output
 
     CLI Pipeline & I/O:
         deconv:     {round}--{roi}/*.tif → analysis/deconv/{round}--{roi}/*.tif
         register:   analysis/deconv/{round}--{roi}/ → analysis/deconv/registered--{roi}+{codebook}/
-        stitch:     analysis/deconv/registered--{roi}+{codebook}/ → analysis/deconv/stitch--{roi}/
+        stitch:
+            - Tile configuration is written/read at workspace_root/stitch--{roi}/
+            - Stitched outputs: analysis/deconv/stitch--{roi}[+{codebook}]/
         spotlook:   analysis/deconv/registered--{roi}+{codebook}/ → analysis/output/
 
     Key Methods:
@@ -590,25 +532,50 @@ class Workspace:
         return path
 
     def stitch(self, roi: str, codebook: str | None = None) -> Path:
-        """Return path to stitching results directory.
+        """Return path to stitched output directory (ROI or ROI+codebook).
+
+        Naming and location semantics:
+        - Tile configuration (TileConfiguration.registered.txt) is ROI-specific and
+          lives at the workspace root under ``stitch--{roi}/``.
+        - Stitched outputs are ROI+codebook-specific and live under
+          ``analysis/deconv/stitch--{roi}+{codebook}/``.
+
+        This accessor returns the stitched output directory. Use
+        :meth:`tileconfig_dir` or :meth:`tileconfig` to access the ROI-level
+        tile configuration.
 
         Args:
             roi: Region of interest identifier
             codebook: Optional codebook name for registration-based stitching
 
         Returns:
-            Path to stitched image directory
+            Path to stitched image/output directory
 
         Example:
-            >>> ws.stitch('cortex')  # PosixPath('...deconv/stitch--cortex')
-            >>> ws.stitch('cortex', 'cb_v1')  # PosixPath('...deconv/stitch--cortex+cb_v1')
+            >>> ws.stitch('cortex')  # PosixPath('.../analysis/deconv/stitch--cortex')
+            >>> ws.stitch('cortex', 'cb_v1')  # PosixPath('.../analysis/deconv/stitch--cortex+cb_v1')
         """
         if codebook is None:
             return self.deconved / f"stitch--{roi}"
         return self.deconved / f"stitch--{roi}+{codebook}"
 
+    def tileconfig_dir(self, roi: str) -> Path:
+        """Return the ROI-level directory containing the TileConfiguration file.
+
+        Location: ``<workspace_root>/stitch--{roi}/``
+
+        Note: This directory is separate from stitched outputs (which live
+        under ``analysis/deconv/stitch--{roi}[+{codebook}]``).
+        """
+        return self.path / f"stitch--{roi}"
+
     def tileconfig(self, roi: str) -> "TileConfiguration":
-        """Load tile configuration for stitched images.
+        """Load the ROI-level TileConfiguration.
+
+        Reads from ``<workspace_root>/stitch--{roi}/TileConfiguration.registered.txt``.
+        For backward compatibility, if the file is not present at the workspace
+        root, a secondary lookup is attempted under
+        ``analysis/deconv/stitch--{roi}/``.
 
         Args:
             roi: Region of interest identifier
@@ -617,18 +584,23 @@ class Workspace:
             TileConfiguration object with registered tile positions
 
         Raises:
-            FileNotFoundError: If stitching has not been performed yet
+            FileNotFoundError: If no TileConfiguration could be located
 
         Example:
             >>> config = ws.tileconfig('cortex')
             >>> print(config.tiles)  # Access tile positions
         """
-        try:
-            return TileConfiguration.from_file(
-                self.path / f"stitch--{roi}" / "TileConfiguration.registered.txt"
-            )
-        except FileNotFoundError:
-            raise FileNotFoundError("Haven't stitch/registered yet. Run preprocess stitch register first.")
+        # Primary (documented) location: workspace root
+        primary = self.tileconfig_dir(roi) / "TileConfiguration.registered.txt"
+        if primary.exists():
+            return TileConfiguration.from_file(primary)
+
+        # Fallback: historical location under analysis/deconv
+        fallback = self.deconved / f"stitch--{roi}" / "TileConfiguration.registered.txt"
+        if fallback.exists():
+            return TileConfiguration.from_file(fallback)
+
+        raise FileNotFoundError("Haven't stitch/registered yet. Run preprocess stitch register first.")
 
     def segment(self, roi: str, codebook: str) -> Path:
         """Return path to segmentation results directory.
@@ -665,17 +637,9 @@ class Workspace:
         return OptimizePath(self.deconved / f"opt_{codebook}")
 
 
-def get_metadata(file: Path):
-    with TiffFile(file) as tif:
-        try:
-            meta = tif.shaped_metadata[0]  # type: ignore
-        except KeyError:
-            raise AttributeError("No metadata found.")
-    return meta
+def get_metadata(file: Path):  # re-export from utils.tiff
+    return _ft_get_metadata(file)
 
 
-def get_channels(file: Path):
-    meta = get_metadata(file)
-    waveform = json.loads(meta["waveform"])
-    powers = waveform["params"]["powers"]
-    return [name[-3:] for name in powers]
+def get_channels(file: Path):  # re-export from utils.tiff
+    return _ft_get_channels(file)

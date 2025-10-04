@@ -6,6 +6,7 @@ from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
+import line_profiler as line_profiler
 import numpy as np
 import rich_click as click
 import tifffile
@@ -14,6 +15,7 @@ from pydantic import ValidationError
 from scipy.ndimage import shift
 from tifffile import TiffFile  # For test-time patching expectations
 
+from fishtools.gpu.memory import release_all as gpu_release_all
 from fishtools.io.image import Image
 from fishtools.io.workspace import Workspace
 from fishtools.preprocess.chromatic import Affine
@@ -26,11 +28,9 @@ from fishtools.preprocess.config import (
 from fishtools.preprocess.deconv.core import PRENORMALIZED
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
-from fishtools.gpu.memory import release_all as gpu_release_all
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
-from fishtools.utils.pretty_print import progress_bar_threadpool
 from fishtools.utils.logging import setup_workspace_logging
-import line_profiler as line_profiler
+from fishtools.utils.pretty_print import progress_bar_threadpool
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
@@ -518,7 +518,9 @@ def _run(
                 try:
                     gpu_release_all()
                 except Exception:
-                    logger.opt(exception=True).debug("GPU cleanup failed in cli_register downsample; continuing.")
+                    logger.opt(exception=True).debug(
+                        "GPU cleanup failed in cli_register downsample; continuing."
+                    )
         else:
             transformed_img = np.clip(img, 0, 65534).astype(np.uint16)
 
@@ -733,7 +735,7 @@ def batch(
             idxs.append(idx)
 
         if not idxs:
-            logger.warning(f"Skipping {ref}--{roi}, existing registration outputs or shifts detected.")
+            logger.warning(f"Skipping {ref}--{roi}, all tiles are registered and --overwrite not given.")
             continue
 
         with progress_bar_threadpool(len(idxs), threads=threads) as submit:

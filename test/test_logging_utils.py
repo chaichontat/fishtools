@@ -1,6 +1,6 @@
 from loguru import logger
 
-from fishtools.utils.utils import configure_cli_logging
+from fishtools.utils.logging import configure_cli_logging
 
 
 def test_configure_cli_logging_creates_workspace_log(tmp_path):
