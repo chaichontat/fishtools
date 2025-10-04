@@ -17,13 +17,14 @@ from tifffile import TiffFile  # For test-time patching expectations
 from fishtools.io.image import Image
 from fishtools.io.workspace import Workspace
 from fishtools.preprocess.chromatic import Affine
-from fishtools.preprocess.cli_deconv import scale_deconv
 from fishtools.preprocess.config import (
     Config,
     Fiducial,
     NumpyEncoder,
     RegisterConfig,
 )
+from fishtools.preprocess.deconv.core import PRENORMALIZED
+from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
 from fishtools.utils.pretty_print import progress_bar_threadpool
@@ -148,7 +149,7 @@ def apply_deconv_scaling(
 ) -> np.ndarray:
     """Apply deconvolution rescaling unless input is already prenormalized."""
 
-    if metadata.get("prenormalized"):
+    if metadata.get(PRENORMALIZED):
         if debug:
             logger.debug(f"Skipping deconvolution scaling for {orig_name}: metadata prenormalized flag set.")
         return img
@@ -168,7 +169,7 @@ __all__ = ["Image"]
 
 def run_fiducial(
     path: Path,
-    fids: dict[str, np.ndarray],
+    fids: Annotated[dict[str, np.ndarray], "Dict of {name: yx image}"],
     codebook_name: str,
     config: Config,
     *,
@@ -181,6 +182,9 @@ def run_fiducial(
     logger.info("Aligning fiducials")
 
     prior_mapping: dict[str, str] = {}
+
+    configured_priors = dict(config.registration.fiducial.priors or {})
+    derived_priors: dict[str, tuple[float, float]] = {}
 
     if (
         not config.registration.fiducial.use_fft
@@ -197,23 +201,37 @@ def run_fiducial(
             for name, shift_dict in shift_dicts.items():
                 if shift_dict.residual < 0.3:
                     _priors[name].append(shift_dict.shifts)
-        logger.debug(f"Using priors from {len(shifts_existing)} existing shifts.")
-        config.registration.fiducial.priors = {
-            name: tuple(np.median(np.array(shifts), axis=0)) for name, shifts in _priors.items()
-        }
-        logger.debug(config.registration.fiducial.priors)
-
-    if config.registration.fiducial.priors is not None:
-        for name, sh in config.registration.fiducial.priors.items():
-            for file in fids:
-                if file.startswith(name):
-                    fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
-                    prior_mapping[name] = file
-                    break
-            else:
-                raise ValueError(
-                    f"{idx}: Searched {list(fids.keys())}. Could not find file that starts with {name} for prior shift."
+        if _priors:
+            medianized = {
+                name: tuple(np.median(np.array(shifts), axis=0)) for name, shifts in _priors.items()
+            }
+            unmatched = {name for name in medianized if not any(fid.startswith(name) for fid in fids)}
+            if unmatched:
+                logger.debug(
+                    "Dropping %s derived priors without matching fid tiles: %s",
+                    len(unmatched),
+                    sorted(unmatched),
                 )
+            derived_priors = {name: shift for name, shift in medianized.items() if name not in unmatched}
+            logger.debug(
+                "Using priors derived from %s existing shifts: %s",
+                len(shifts_existing),
+                derived_priors,
+            )
+
+    effective_priors = configured_priors.copy()
+    effective_priors.update(derived_priors)
+
+    for name, sh in effective_priors.items():
+        for file in fids:
+            if file.startswith(name):
+                fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
+                prior_mapping[name] = file
+                break
+        else:
+            raise ValueError(
+                f"{idx}: Detected priors: {effective_priors}. Could not find file that starts with {name} for prior shift. "
+            )
 
     if config.registration.fiducial.overrides is not None:
         for name, sh in config.registration.fiducial.overrides.items():
@@ -273,8 +291,8 @@ def run_fiducial(
             metadata={"axes": "CYX"},
         )
 
-    if config.registration.fiducial.priors is not None:
-        for name, sh in config.registration.fiducial.priors.items():
+    if effective_priors:
+        for name, sh in effective_priors.items():
             if (
                 not config.registration.fiducial.overrides
                 or name not in config.registration.fiducial.overrides
@@ -350,32 +368,42 @@ def _run(
     shifts = {}
 
     cb = json.loads(Path(codebook).read_text())
-    bits_cb = set(chain.from_iterable(cb.values()))
-    # reference = config.registration.reference
-    folders = {
-        p
-        for p in Path(path).glob(f"*--{roi}")
-        if p.is_dir()
-        and not any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
-        and set(p.name.split("--")[0].split("_")) & set(map(str, bits_cb | set(reference.split("_"))))
-    }
+    bits_cb = {str(bit) for bit in chain.from_iterable(cb.values())}
 
-    # Convert file name to bit
-    _imgs: list[Image] = [
-        Image.from_file(
-            file,
+    ws = Workspace(path)
+    round_tokens = bits_cb | {token for token in reference.split("_") if token}
+    candidate_rounds = []
+    for round_name in ws.rounds:
+        tokens = set(ws._split_round_tokens(round_name))
+        if tokens & round_tokens and not any(round_name.startswith(bad) for bad in FORBIDDEN_PREFIXES):
+            candidate_rounds.append(round_name)
+
+    imgs: dict[str, Image] = {}
+    for round_name in candidate_rounds:
+        tile_path = ws.img(round_name, roi, idx)
+        if not tile_path.exists():
+            continue
+        img = Image.from_file(
+            tile_path,
             discards=config.registration and config.registration.discards,
             n_fids=config.registration.fiducial.n_fids,
         )
-        for file in chain.from_iterable(p.glob(f"*-{idx:04d}.tif") for p in folders)
-        if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
-    ]
-    imgs = {img.name: img for img in _imgs}
-    del _imgs
+        if any(round_name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or [])):
+            continue
+        imgs[img.name] = img
 
     logger.debug(f"{len(imgs)} files: {list(imgs)}")
     if not imgs:
         raise FileNotFoundError(f"No files found in {path} with index {idx}")
+
+    available_bits = {str(bit) for img in imgs.values() for bit in img.bits}
+    missing_bits = sorted(bits_cb - available_bits)
+    if missing_bits:
+        raise FileNotFoundError(
+            "Missing registered tiles for bits "
+            f"{missing_bits} (ROI={roi}, index={idx:04d}). "
+            "Ensure required rounds are present under analysis/deconv."
+        )
 
     if not shifts:
         shifts = run_fiducial(
@@ -399,9 +427,16 @@ def _run(
 
     channels: dict[str, str] = {}
     for img in imgs.values():
-        channels |= dict(zip(img.bits, [p[-3:] for p in img.powers]))
+        channels |= {str(bit): str(channel)[-3:] for bit, channel in zip(img.bits, img.powers)}
 
     assert all(v.isdigit() for v in channels.values())
+
+    missing_channels = [bit for bit in bits_cb if bit not in channels]
+    if missing_channels:
+        raise ValueError(
+            "Missing channel metadata for bits "
+            f"{sorted(missing_channels)}. Available bit channels: {sorted(channels)}"
+        )
 
     logger.debug(f"Channels: {channels}")
 
@@ -432,9 +467,8 @@ def _run(
     ref = None
 
     affine = Affine(As=As, ats=ats)
-    bits_cb = sorted(set(map(str, bits_cb)) & set(bits))
-    for i, bit in enumerate(bits_cb):
-        bit = str(bit)
+    bits_cb_sorted = sorted(bits_cb & set(bits))
+    for i, bit in enumerate(bits_cb_sorted):
         img = bits[bit]
         del bits[bit]
         c = str(channels[bit])
@@ -442,6 +476,7 @@ def _run(
         orig_name, orig_idx = bit_name_mapping[bit]
         img = collapse_z(img, config.registration.slices).astype(np.float32)
         metadata = imgs[orig_name].metadata
+
         img = apply_deconv_scaling(
             img,
             idx=orig_idx,
@@ -486,7 +521,10 @@ def _run(
         )
 
     sample = next(iter(transformed.values()))
-    out = np.zeros((sample.shape[0], len(transformed), sample.shape[1], sample.shape[2]), dtype=np.uint16)
+    out = np.zeros(
+        (sample.shape[0], len(transformed), sample.shape[1], sample.shape[2]),
+        dtype=np.uint16,
+    )
 
     # Sort by channel
     for i, (k, v) in enumerate(items := sorted(transformed.items(), key=sort_key)):
@@ -642,7 +680,7 @@ def batch(
     # idxs = None
     # use_custom_idx = idxs is not None
     ws = Workspace(path.parent.parent)
-    logger.info(f"Found {ws.rois}")
+    logger.info(f"Found ROIs: {ws.rois}")
 
     codebook_name = codebook.stem
 
@@ -663,8 +701,7 @@ def batch(
             idx = int(name.stem.split("-")[1])
             if not overwrite:
                 reg_exists = (path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif").exists()
-                shift_json = _shift_json_path(path, roi, idx, codebook_name)
-                if reg_exists or shift_json.exists():
+                if reg_exists:
                     continue
             idxs.append(idx)
 

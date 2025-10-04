@@ -12,6 +12,8 @@ from tifffile import imread
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 PSF_FILENAME = "PSF GL.tif"
 
+PRENORMALIZED = "prenormalized"
+
 if not DATA_DIR.joinpath(PSF_FILENAME).exists():
     raise FileNotFoundError(f"Missing PSF reference: {DATA_DIR / PSF_FILENAME}")
 
@@ -164,3 +166,88 @@ def deconvolve_lucyrichardson_guo(
 
 def rescale(img: cp.ndarray, scale: float) -> np.ndarray:
     return ((img - img.min()) * scale).get().astype(np.uint16)
+
+
+def _rfft_convolve3d_wrap(
+    x: cp.ndarray,
+    H: cp.ndarray,
+) -> cp.ndarray:
+    """
+    Fast 3D circular convolution via RFFT along the last three axes.
+    H must be the RFFT of the (ifftshifted, padded) kernel with shape:
+      (..., Z, Y, X//2 + 1) matching x's last-3 axes after rfftn.
+    Broadcast over any leading/batch dims in x.
+    """
+    # FFT along last 3 axes
+    Xf = cp.fft.rfftn(x, axes=(-3, -2, -1))
+    Xf *= H  # in-place spectral multiply to minimize temporaries
+    y = cp.fft.irfftn(Xf, s=x.shape[-3:], axes=(-3, -2, -1))
+    # Cast back exactly to x's dtype (CuPy may upcast float16 to float32 internally)
+    if y.dtype != x.dtype:
+        y = y.astype(x.dtype, copy=False)
+    return y
+
+
+def _kernel_rfft_for_shape(
+    kernel: cp.ndarray,
+    out_spatial_shape: tuple[int, int, int],
+) -> cp.ndarray:
+    """
+    Prepare the kernel's spectrum for circular convolution on a given spatial shape.
+    We ifftshift the kernel so its center is at the zero-phase origin, then RFFT to the image shape.
+    Returns complex spectrum with shape (Z, Y, X//2 + 1).
+    """
+    # Move kernel center to origin for circular convolution
+    k0 = cp.fft.ifftshift(kernel)
+    # Pad/truncate to the target spatial shape before RFFT
+    H = cp.fft.rfftn(k0, s=out_spatial_shape, axes=(-3, -2, -1))
+    return H
+
+
+def deconvolve_lucyrichardson_guo_fft(
+    img: cp.ndarray,
+    projectors: tuple[cp.ndarray, cp.ndarray],
+    iters: int = 1,
+) -> cp.ndarray:
+    """
+    Single-iteration Lucy–Richardson (Guo-style) step using the fastest possible
+    3D FFT-based circular convolution for a 7x31x31 kernel. Ignores edge effects.
+    Convolution is applied along the last three axes; leading dims (if any) are treated as batch.
+    """
+    if img.dtype not in (cp.float32, cp.float16):
+        raise ValueError("Image must be float32 or float16")
+
+    forward_projector, backward_projector = projectors
+
+    # Validate the expected 3D kernel shape (7x31x31), but don't hard-code it.
+    if forward_projector.ndim != 3 or backward_projector.ndim != 3:
+        raise ValueError("Projectors must be 3D kernels (Z, Y, X)")
+    if any(s % 2 == 0 for s in forward_projector.shape) or any(s % 2 == 0 for s in backward_projector.shape):
+        # Circular conv does not *require* odd sizes, but LR typically assumes centered PSFs.
+        # Keeping the check helps catch accidental off-center kernels.
+        pass
+
+    if iters > 1:
+        raise NotImplementedError("Only single-iteration supported")
+
+    # Initial estimate (same as your code)
+    estimate = cp.clip(img, EPS, None)
+
+    # Precompute the kernel spectra once (fast, kernels are tiny).
+    # Shape of the spatial conv domain (last three axes only):
+    zyx = img.shape[-3:]
+    Hf = _kernel_rfft_for_shape(forward_projector, zyx)
+    Hb = _kernel_rfft_for_shape(backward_projector, zyx)
+
+    # 1) filtered_estimate = estimate (*) forward (circular)
+    filtered_estimate = _rfft_convolve3d_wrap(estimate, Hf)
+    cp.clip(filtered_estimate, EPS, I_MAX, out=filtered_estimate)
+
+    # 2) img <- img / filtered_estimate (in place to save memory)
+    cp.divide(img, filtered_estimate, out=img)
+
+    # 3) estimate <- estimate * [ img (*) backward ]  (circular)
+    tmp = _rfft_convolve3d_wrap(img, Hb)
+    cp.multiply(estimate, tmp, out=estimate)
+
+    return estimate

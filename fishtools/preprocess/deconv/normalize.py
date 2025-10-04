@@ -590,12 +590,13 @@ def quantize(
             else:
                 metadata_dict = dict(metadata)  # type: ignore[arg-type]
 
+            for extrakey in ("dtype", "axes", "fid_planes", "fid_source_dtype"):
+                metadata_dict.pop(extrakey, None)
+
             metadata_dict.update({
                 "deconv_min": [float(x) for x in np.ravel(m_glob)],
                 "deconv_scale": [float(x) for x in np.ravel(s_glob)],
                 "prenormalized": True,
-                "dtype": "uint16",
-                "fid_planes": int(fid.shape[0]),
             })
 
             tifffile.imwrite(

@@ -15,7 +15,6 @@ from rich.logging import RichHandler
 from fishtools.io.workspace import Workspace, get_channels
 from fishtools.preprocess.config import DeconvolutionConfig, DeconvolutionOutputMode
 from fishtools.preprocess.deconv.backend import (
-    DeconvolutionTileProcessor,
     Float32HistBackend,
     OutputBackend,
     ProcessorConfig,
@@ -46,7 +45,6 @@ from fishtools.preprocess.deconv.worker import (
     parse_device_spec,
     run_multi_gpu,
 )
-from fishtools.preprocess.deconv.worker import MP_CONTEXT as _MP_CTX
 from fishtools.utils.pretty_print import get_shared_console, progress_bar
 
 logger.remove()
@@ -998,14 +996,15 @@ def run(
 
 @deconv.command()
 @click.argument("path", type=click.Path(path_type=Path))
-@click.argument("round_name", type=str)
+@click.argument("round_name", type=str, required=False)
 def easy(path: Path, round_name: str | None):
     import subprocess
 
     rounds = [round_name] if round_name else Workspace.discover_rounds(path)
     for round_ in rounds:
-        subprocess.run(["preprocess", "deconv", "prepare", str(path), round_], check=True)
-        subprocess.run(["preprocess", "deconv", "precompute", str(path), round_], check=True)
+        if not (path / "analysis" / "deconv32" / "deconv_scaling" / f"{round_}.txt").exists():
+            subprocess.run(["preprocess", "deconv", "prepare", str(path), round_], check=True)
+            subprocess.run(["preprocess", "deconv", "precompute", str(path), round_], check=True)
         subprocess.run(["preprocess", "deconv", "run", str(path), round_], check=True)
 
 
