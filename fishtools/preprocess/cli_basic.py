@@ -1,4 +1,6 @@
+import json
 import pickle
+import re
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -15,11 +17,12 @@ from basicpy import BaSiC
 from loguru import logger
 from tifffile import TiffFile, imread
 
-from fishtools.io.workspace import get_channels
+from fishtools.io.workspace import Workspace, get_channels
 from fishtools.preprocess.basic import fit_basic, plot_basic
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.plot import plot_tile_sizes
 from fishtools.preprocess.tileconfig import tiles_at_least_n_steps_from_edges
+from fishtools.utils.logging import setup_workspace_logging
 
 sns.set_theme()
 
@@ -33,6 +36,137 @@ class DataExtractor(Protocol):
         max_files: int = 800,
         nc: int | None = None,
     ) -> np.ndarray: ...
+
+
+# ----------------------
+# Sampling helpers
+# ----------------------
+
+_ROUND_TOKEN = re.compile(r"^[^\-]+--")
+
+
+def _parse_tile_index(p: Path) -> int | None:
+    stem = p.stem
+    parts = stem.split("-")
+    for token in reversed(parts):
+        if token.isdigit():
+            try:
+                return int(token)
+            except ValueError:
+                return None
+    return None
+
+
+def _roi_base_from_dirname(dirname: str) -> str | None:
+    # Reuse Workspace's robust pattern to parse ROI from directory names
+    m = Workspace.ROI_CODEBOOK_PATTERN.match(dirname)
+    return m.group(1) if m else None
+
+
+def _allowed_indices_for_roi(
+    base_path: Path, roi_dirname: str, cache: dict[str, set[int] | None]
+) -> set[int] | None:
+    roi_base = _roi_base_from_dirname(roi_dirname)
+    if roi_base is None:
+        return None
+    if roi_base in cache:
+        return cache[roi_base]
+
+    csv_path = base_path / f"{roi_base}.csv"
+    if not csv_path.exists():
+        logger.warning(
+            f"CSV for ROI '{roi_base}' not found at {csv_path}. Skipping edge-based filtering for this ROI."
+        )
+        cache[roi_base] = None
+        return None
+
+    try:
+        df = pd.read_csv(csv_path, header=None)
+        xy = df.iloc[:, :2].to_numpy()
+        idx = tiles_at_least_n_steps_from_edges(xy, n=2)
+        allowed = set(int(i) for i in idx.tolist())
+        cache[roi_base] = allowed
+        return allowed
+    except Exception as e:  # pragma: no cover - defensive path
+        logger.warning(f"Failed to compute interior tiles for ROI '{roi_base}': {e}. Not filtering this ROI.")
+        cache[roi_base] = None
+        return None
+
+
+def _round_name_from_parent(parent_name: str) -> str:
+    return parent_name.split("--", 1)[0] if "--" in parent_name else parent_name
+
+
+def _is_canonical_round(sample_file: Path) -> bool:
+    try:
+        ch = get_channels(sample_file)
+        return len(ch) == 3 and all(c.isdigit() for c in ch)
+    except Exception:
+        # Fallback: use round name token pattern like 1_9_17
+        round_token = _round_name_from_parent(sample_file.parent.name)
+        return bool(re.fullmatch(r"\d+_\d+_\d+", round_token))
+
+
+def sample_canonical_unique_tiles(path: Path) -> tuple[list[Path], list[str]]:
+    """Return interior tiles from canonical rounds without duplicate tiles.
+
+    Canonical rounds are those whose channel names are numeric and exactly 3 long
+    (e.g., 560/650/750). Duplicates are removed by (roi, tile-index) so that the
+    same tile coordinate is not sampled twice across rounds.
+
+    Returns:
+        (files, extra_rounds)
+        files: deduplicated interior tile paths
+        extra_rounds: non-canonical rounds encountered (for separate handling)
+    """
+    # Discover rounds via Workspace to centralize naming logic
+    rounds = Workspace.discover_rounds(path)
+    round_to_sample: dict[str, Path] = {}
+    for r in rounds:
+        # pick a representative tile under r--*/
+        first = next(iter(sorted(path.glob(f"{r}--*/*.tif"))), None)
+        if first is not None:
+            round_to_sample[r] = first
+
+    canonical_rounds: set[str] = set()
+    for r, f in round_to_sample.items():
+        if _is_canonical_round(f):
+            canonical_rounds.add(r)
+
+    all_rounds = set(round_to_sample.keys())
+    extra_rounds = sorted(all_rounds - canonical_rounds)
+
+    # Collect all tiles from canonical rounds
+    candidates: list[Path] = []
+    for r in sorted(canonical_rounds):
+        candidates.extend(sorted(path.glob(f"{r}--*/*.tif")))
+
+    # Prefer non "--basic" sources when deduplicating
+    candidates.sort(key=lambda p: ("--basic" in p.as_posix(), p.as_posix()))
+
+    # Build interior filter caches per ROI
+    allowed_by_roi: dict[str, set[int] | None] = {}
+
+    # De-duplicate by (roi_base, tile_index)
+    seen: set[tuple[str, int]] = set()
+    unique_interior: list[Path] = []
+
+    for f in candidates:
+        roi_dirname = f.parent.name
+        allowed = _allowed_indices_for_roi(path, roi_dirname, allowed_by_roi)
+        idx = _parse_tile_index(f)
+        if allowed is None or idx is None or idx not in allowed:
+            continue  # enforce 2-step-from-edge rule
+        roi_base = _roi_base_from_dirname(roi_dirname)
+        if roi_base is None:
+            continue
+        key = (roi_base, idx)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_interior.append(f)
+
+    return unique_interior, extra_rounds
 
 
 def extract_data_from_tiff(
@@ -217,6 +351,8 @@ def run_with_extractor(
     plot: bool = True,
     plot_selected: bool = False,
     zs: Collection[float] = (0.5,),
+    *,
+    seed: int | None = None,
 ):
     """
     Generic function to run processing with a specific data extractor.
@@ -240,29 +376,21 @@ def run_with_extractor(
     if not all(0 <= z <= 1 for z in zs):
         raise ValueError("zs must be between 0 and 1.")
 
-    # Get rounds with 3 channels bits
-    files = sorted(path.glob(f"{round_}--*/*.tif" if round_ else "*_*_*--*/*.tif"))
-
+    # Get rounds/tiles. When round_ is None → sample canonical rounds with dedup & 2-step margin.
     if not round_:
-        import re
-
-        regex = re.compile(r"\d+_\d+_\d+")
-        files = [f for f in files if regex.match(f.stem.split("--")[0])]
-
-        already = set(p.parent.name.split("--")[0] for p in files)
-        logger.warning(f"No round specified. Sampling from {sorted(already)}.")
-        extra_rounds = sorted(
-            s
-            for s in set(p.name.split("--")[0] for p in path.glob("*--*")) - already
-            if not all(c.isdigit() for c in s.split("_")) and len(list(path.glob(f"{s}--*/*.tif")))
-        )
+        files, extra_rounds = sample_canonical_unique_tiles(path)
         if extra_rounds:
-            logger.info(f"Will run {extra_rounds} separately due to an atypical channel layout.")
+            logger.info(
+                f"Will run {extra_rounds} separately due to an atypical/non-canonical channel layout."
+            )
+        logger.warning(
+            f"No round specified. Sampling from {sorted({p.parent.name.split('--')[0] for p in files})}."
+        )
     else:
+        files = sorted(path.glob(f"{round_}--*/*.tif"))
         extra_rounds = []
-
-    # Put --basic files last. These are extra files taken in random places for BaSiC training.
-    files.sort(key=lambda x: ("--basic" in str(x), str(x)))
+        # Put --basic files last. These are extra files taken in random places for BaSiC training.
+        files.sort(key=lambda x: ("--basic" in str(x), str(x)))
 
     channels = get_channels(files[0])
     if not round_ and channels != ["560", "650", "750"]:
@@ -278,60 +406,13 @@ def run_with_extractor(
         logger.warning(f"Not enough files ({len(files)}) for {path}. Result may be unreliable.")
     import random
 
-    # Filter sampling to tiles that are at least 2 steps from edges (per ROI)
-    def _parse_tile_index(p: Path) -> int | None:
-        stem = p.stem
-        # Prefer last hyphen-delimited token if numeric, else whole stem if numeric
-        parts = stem.split("-")
-        for token in reversed(parts):
-            if token.isdigit():
-                try:
-                    return int(token)
-                except ValueError:
-                    return None
-        # Fallback: no numeric token
-        return None
-
-    def _roi_base_from_dirname(dirname: str) -> str | None:
-        # Expect pattern: "<round>--<roi>[--suffix]" → extract <roi> (strip any extra suffix)
-        if "--" not in dirname:
-            return None
-        roi_part = dirname.split("--", 1)[1]
-        # If extra suffixes present (e.g., "roi--basic"), strip them for CSV lookup
-        return roi_part.split("--", 1)[0]
+    rng = random.Random(seed) if seed is not None else random
 
     # Build allowed index sets per ROI (from <roi>.csv when available)
-    allowed_by_roi: dict[str, set[int]] = {}
+    allowed_by_roi: dict[str, set[int] | None] = {}
 
-    def _allowed_indices_for_roi(roi_dirname: str) -> set[int] | None:
-        roi_base = _roi_base_from_dirname(roi_dirname)
-        if roi_base is None:
-            return None
-        if roi_base in allowed_by_roi:
-            return allowed_by_roi[roi_base]
-
-        csv_path = path / f"{roi_base}.csv"
-        if not csv_path.exists():
-            logger.warning(
-                f"CSV for ROI '{roi_base}' not found at {csv_path}. Skipping edge-based filtering for this ROI."
-            )
-            allowed_by_roi[roi_base] = None  # type: ignore[assignment]
-            return None
-
-        try:
-            df = pd.read_csv(csv_path, header=None)
-            # Use first two columns as x,y
-            xy = df.iloc[:, :2].to_numpy()
-            idx = tiles_at_least_n_steps_from_edges(xy, n=2)
-            allowed = set(int(i) for i in idx.tolist())
-            allowed_by_roi[roi_base] = allowed
-            return allowed
-        except Exception as e:
-            logger.warning(
-                f"Failed to compute interior tiles for ROI '{roi_base}': {e}. Not filtering this ROI."
-            )
-            allowed_by_roi[roi_base] = None  # type: ignore[assignment]
-            return None
+    def _allowed_indices_for_roi_local(roi_dirname: str) -> set[int] | None:
+        return _allowed_indices_for_roi(path, roi_dirname, allowed_by_roi)
 
     # Compute 60th percentile size across all candidate files
     sizes = np.array([f.lstat().st_size for f in files], dtype=np.int64)
@@ -346,7 +427,7 @@ def run_with_extractor(
     filtered_files: list[Path] = []
     for f in files:
         roi_dirname = f.parent.name
-        allowed = _allowed_indices_for_roi(roi_dirname)
+        allowed = _allowed_indices_for_roi_local(roi_dirname)
         idx = _parse_tile_index(f)
         is_interior = allowed is not None and idx is not None and idx in allowed
         # sz = f.lstat().st_size
@@ -356,7 +437,24 @@ def run_with_extractor(
         if is_interior:
             filtered_files.append(f)
 
-    files = random.sample(filtered_files, k=min(1000, len(filtered_files)))
+    files = rng.sample(filtered_files, k=min(1000, len(filtered_files)))
+    # Print sample names
+    show_n = min(10, len(files))
+    if show_n:
+        logger.info("Sample tiles ({} of {}): {}", show_n, len(files), [p.name for p in files[:show_n]])
+
+    # Group-by reporting
+    counts: dict[str, int] = {}
+    if not round_:
+        for p in files:
+            key = p.parent.name.split("--", 1)[0]
+            counts[key] = counts.get(key, 0) + 1
+        logger.info("Sampled counts by round: {}", dict(sorted(counts.items())))
+    else:
+        for p in files:
+            key = _roi_base_from_dirname(p.parent.name) or p.parent.name
+            counts[key] = counts.get(key, 0) + 1
+        logger.info("Sampled counts by ROI: {}", dict(sorted(counts.items())))
     logger.info(
         f"Using {len(files)} files. Size p60 (nonzero)={size_thresh:.0f}. Min size: {min(f.lstat().st_size for f in files)}. Max size: {max(f.lstat().st_size for f in files)}"
     )
@@ -366,6 +464,34 @@ def run_with_extractor(
     deconv_meta = np.loadtxt(deconv_path) if deconv_path.exists() else None
     if deconv_meta is not None:
         logger.warning("Using deconvolution scaling. Should not use for normal workflow.")
+
+    # Save sampling manifest to JSON
+    try:
+        sampled_rel: list[str] = []
+        for p in files:
+            try:
+                sampled_rel.append(str(p.relative_to(path)))
+            except ValueError:
+                sampled_rel.append(p.as_posix())
+
+        sampling_json = {
+            "round": round_ or "all",
+            "seed": seed,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "channels": channels,
+            "n_candidates": int(len(filtered_files)),
+            "n_selected": int(len(files)),
+            "sampled_tiles": sampled_rel,
+        }
+        if not round_:
+            sampling_json["extra_rounds"] = extra_rounds
+            sampling_json["counts_by_round"] = dict(sorted(counts.items()))
+        else:
+            sampling_json["counts_by_roi"] = dict(sorted(counts.items()))
+
+        (basic_dir / f"{round_ or 'all'}-sampling.json").write_text(json.dumps(sampling_json, indent=2))
+    except Exception as e:
+        logger.warning(f"Failed to write sampling manifest: {e}")
 
     # Diagnostics plot: per-ROI tile grid colored by size with selected samples marked
     try:
@@ -445,14 +571,24 @@ def basic(): ...
 @click.argument("round_", type=str)
 @click.option("--zs", type=str, default="0.5")
 @click.option("--overwrite", is_flag=True)
-def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5"):
+@click.option("--seed", type=int, default=None, help="Random seed for sampling (optional)")
+def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5", seed: int | None = None):
+    # Workspace-scoped logging to {workspace}/analysis/logs; compatible with progress bars
+    setup_workspace_logging(path, component="preprocess.basic.run", file=round_)
     if not overwrite and list((path / "basic").glob(f"{round_}*")):
         logger.info(f"Basic already run for {round_} in {path}. Use --overwrite to re-run.")
         return
     z_values = tuple(map(float, zs.split(",")))
     extractor = extract_data_from_registered if round_ == "registered" else extract_data_from_tiff
 
-    return run_with_extractor(path, round_ if round_ != "all" else None, extractor, plot=False, zs=z_values)
+    return run_with_extractor(
+        path,
+        round_ if round_ != "all" else None,
+        extractor,
+        plot=False,
+        zs=z_values,
+        seed=seed,
+    )
 
 
 @basic.command()
@@ -460,10 +596,15 @@ def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5"):
 @click.option("--overwrite", is_flag=True)
 @click.option("--threads", "-t", type=int, default=1)
 @click.option("--zs", type=str, default="0.5")
-def batch(path: Path, overwrite: bool = False, threads: int = 1, zs: str = "0.5"):
+@click.option("--seed", type=int, default=None, help="Random seed for sampling (optional)")
+def batch(path: Path, overwrite: bool = False, threads: int = 1, zs: str = "0.5", seed: int | None = None):
+    setup_workspace_logging(path, component="preprocess.basic.batch", file="batch")
     rounds = sorted({p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name})
     with ThreadPoolExecutor(threads) as exc:
-        futs = [exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs) for r in rounds]  # type: ignore
+        futs = [
+            exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs, seed=seed)
+            for r in rounds  # type: ignore
+        ]
         for fut in as_completed(futs):
             fut.result()
 
