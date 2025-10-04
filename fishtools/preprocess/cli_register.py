@@ -26,9 +26,11 @@ from fishtools.preprocess.config import (
 from fishtools.preprocess.deconv.core import PRENORMALIZED
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
+from fishtools.gpu.memory import release_all as gpu_release_all
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
 from fishtools.utils.pretty_print import progress_bar_threadpool
-from fishtools.utils.utils import initialize_logger
+from fishtools.utils.logging import setup_workspace_logging
+import line_profiler as line_profiler
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
@@ -66,11 +68,13 @@ for λ in ["650", "750"]:
     ats[λ] = t
 
 
+@line_profiler.profile
 def spillover_correction(spillee: np.ndarray, spiller: np.ndarray, corr: float):
     scaled = spiller * corr
     return np.where(spillee >= scaled, spillee - scaled, 0)
 
 
+@line_profiler.profile
 def parse_nofids(
     nofids: dict[str, np.ndarray],
     shifts: dict[str, np.ndarray],
@@ -138,6 +142,7 @@ def sort_key(x: tuple[str, np.ndarray]) -> int | str:
         return x[0]
 
 
+@line_profiler.profile
 def apply_deconv_scaling(
     img: np.ndarray,
     *,
@@ -167,6 +172,7 @@ def apply_deconv_scaling(
 __all__ = ["Image"]
 
 
+@line_profiler.profile
 def run_fiducial(
     path: Path,
     fids: Annotated[dict[str, np.ndarray], "Dict of {name: yx image}"],
@@ -319,6 +325,7 @@ def run_fiducial(
     return shifts
 
 
+@line_profiler.profile
 def _run(
     path: Path,
     roi: str,
@@ -499,13 +506,19 @@ def _run(
             img = img[:, crop:-crop, crop:-crop]
 
         if downsample > 1:
-            transformed_img = gpu_downsample_xy(
-                img,
-                crop=0,
-                factor=downsample,
-                clip_range=(0, 65534),
-                output_dtype=np.uint16,
-            )
+            try:
+                transformed_img = gpu_downsample_xy(
+                    img,
+                    crop=0,
+                    factor=downsample,
+                    clip_range=(0, 65534),
+                    output_dtype=np.uint16,
+                )
+            finally:
+                try:
+                    gpu_release_all()
+                except Exception:
+                    logger.opt(exception=True).debug("GPU cleanup failed in cli_register downsample; continuing.")
         else:
             transformed_img = np.clip(img, 0, 65534).astype(np.uint16)
 
@@ -587,6 +600,7 @@ def register(): ...
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--overwrite", is_flag=True)
 @click.option("--no-priors", is_flag=True)
+@line_profiler.profile
 def run(
     path: Path,
     idx: int,
@@ -610,7 +624,18 @@ def run(
         threshold: σ above median to call fiducial spots. Defaults to 6.
         fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
     """
-    initialize_logger(idx, debug)
+    # Workspace-scoped logging: write all logs (not progress bars) to
+    # {workspace}/analysis/logs/preprocess.register.log
+    setup_workspace_logging(
+        path,
+        component="preprocess.register",
+        idx=idx,
+        file=roi,
+        debug=debug,
+        # Console stays quiet unless --debug; file captures INFO+ by default
+        console_level="WARNING",
+        file_level="INFO",
+    )
 
     rois = get_rois(path, roi)
     codebook_name = codebook.stem
@@ -679,6 +704,8 @@ def batch(
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
+    # Enable logging for the batch driver itself
+    setup_workspace_logging(path, component="preprocess.register.batch", file="batch")
     ws = Workspace(path.parent.parent)
     logger.info(f"Found ROIs: {ws.rois}")
 

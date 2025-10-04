@@ -8,10 +8,12 @@ from typing import Any, Iterable
 import numpy as np
 import numpy.typing as npt
 from loguru import logger
+import line_profiler as line_profiler
 
 __all__ = ["scale_deconv", "safe_delete_origin_dirs"]
 
 
+@line_profiler.profile
 def scale_deconv(
     img: npt.NDArray[np.float32],
     idx: int,
@@ -97,4 +99,3 @@ def safe_delete_origin_dirs(files: Iterable[Path], out: Path) -> None:
 
         logger.info("Deleting origin folder %s", src_dir)
         shutil.rmtree(src_dir)
-

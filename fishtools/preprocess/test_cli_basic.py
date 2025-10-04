@@ -5,12 +5,14 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 from pytest_mock import MockerFixture
+import pandas as pd
 from tifffile import imwrite
 
 from fishtools.preprocess.cli_basic import (
     extract_data_from_registered,
     extract_data_from_tiff,
     run_with_extractor,
+    sample_canonical_unique_tiles,
 )
 from fishtools.preprocess.tileconfig import tiles_at_least_n_steps_from_edges
 
@@ -330,3 +332,122 @@ class TestRunWithExtractor:
         roiA_files = [p for p in sampled if p.parent.name == f"{round_name}--roiA"]
         roiA_indices = {int(p.stem.split("-")[-1]) for p in roiA_files}
         assert roiA_indices.issubset(allowed)
+
+
+def test_sample_canonical_unique_tiles_deduplicates_and_filters(tmp_path: Path, mocker: MockerFixture) -> None:
+    # Build one ROI grid 12x10 → interior (n=2) = 48 indices
+    roi = "roiA"
+    coords = []
+    for y in range(10):
+        for x in range(12):
+            coords.append((float(x), float(y)))
+    (tmp_path / f"{roi}.csv").write_text("\n".join(f"{y},{x}" for x, y in coords))
+
+    rounds = ["1_2_3", "4_5_6"]  # canonical numeric rounds
+    weird = "wga_brdu_dapi"  # non-canonical
+
+    def is_interior(i: int) -> bool:
+        y, x = divmod(i, 12)
+        return (x >= 2 and x <= 9) and (y >= 2 and y <= 7)
+
+    for r in rounds:
+        d = tmp_path / f"{r}--{roi}"
+        d.mkdir(parents=True, exist_ok=True)
+        for idx in range(12 * 10):
+            p = d / f"{r}-{idx:04d}.tif"
+            if is_interior(idx):
+                p.write_bytes(b"1")
+            else:
+                p.touch()
+
+    # Add a non-canonical round with a few tiles
+    wd = tmp_path / f"{weird}--{roi}"
+    wd.mkdir(parents=True, exist_ok=True)
+    (wd / f"{weird}-0000.tif").write_bytes(b"1")
+
+    # Mock get_channels depending on round token derived from parent dir
+    def fake_get_channels(sample_file: Path) -> list[str]:
+        parent = sample_file.parent.name
+        round_token = parent.split("--", 1)[0]
+        if round_token in rounds:
+            return ["560", "650", "750"]
+        return ["wga", "brdu", "dapi"]
+
+    mocker.patch("fishtools.preprocess.cli_basic.get_channels", side_effect=fake_get_channels)
+
+    files, extra = sample_canonical_unique_tiles(tmp_path)
+
+    # Non-canonical should be reported
+    assert weird in extra
+
+    # Dedup: only 48 unique interior indices across 2 canonical rounds
+    assert len(files) == 48
+
+    # All returned files belong to canonical rounds and are interior indices
+    df = pd.read_csv(tmp_path / f"{roi}.csv", header=None)
+    allowed = set(tiles_at_least_n_steps_from_edges(df.iloc[:, :2].to_numpy(), n=2).tolist())
+    seen = set()
+    for p in files:
+        assert any(p.as_posix().startswith((tmp_path / f"{r}--{roi}").as_posix()) for r in rounds)
+        idx = int(p.stem.split("-")[-1])
+        assert idx in allowed
+        key = (roi, idx)
+        assert key not in seen
+        seen.add(key)
+
+
+def test_run_writes_sampling_json(tmp_path: Path, mocker: MockerFixture) -> None:
+    # One ROI grid 12x10 → 48 interior indices
+    roi = "roiA"
+    round_name = "R3"
+    coords = []
+    for y in range(10):
+        for x in range(12):
+            coords.append((float(x), float(y)))
+    (tmp_path / f"{roi}.csv").write_text("\n".join(f"{y},{x}" for x, y in coords))
+
+    d = tmp_path / f"{round_name}--{roi}"
+    d.mkdir(parents=True, exist_ok=True)
+
+    def is_interior(i: int) -> bool:
+        y, x = divmod(i, 12)
+        return (x >= 2 and x <= 9) and (y >= 2 and y <= 7)
+
+    for idx in range(12 * 10):
+        p = d / f"{round_name}-{idx:04d}.tif"
+        if is_interior(idx):
+            p.write_bytes(b"1")
+        else:
+            p.touch()
+
+    # Channels for this round (3-channel canonical)
+    mocker.patch("fishtools.preprocess.cli_basic.get_channels", return_value=["560", "650", "750"])
+
+    # Deterministic sampling
+    seed = 7
+
+    # Mock extractor and fit to avoid heavy work
+    mocker.patch(
+        "fishtools.preprocess.cli_basic.fit_and_save_basic",
+        return_value=[],
+    )
+
+    def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None):
+        # Return array with correct nc
+        n = len(files)
+        c = nc or 3
+        return np.zeros((n, c, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32)
+
+    mocker.patch("numpy.loadtxt", return_value=None)
+
+    run_with_extractor(tmp_path, round_name, fake_extractor, plot=False, zs=(0.5,), seed=seed)
+
+    manifest = tmp_path / "basic" / f"{round_name}-sampling.json"
+    assert manifest.exists()
+    payload = json.loads(manifest.read_text())
+    assert payload["round"] == round_name
+    assert payload["seed"] == seed
+    assert payload["channels"] == ["560", "650", "750"]
+    assert isinstance(payload["sampled_tiles"], list)
+    # Exactly the interior count
+    assert len(payload["sampled_tiles"]) == 48

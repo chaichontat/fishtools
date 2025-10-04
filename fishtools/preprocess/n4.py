@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from time import perf_counter
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 import SimpleITK as sitk
@@ -29,11 +31,20 @@ import zarr
 from loguru import logger
 from PIL import Image
 from tifffile import imwrite
-from time import perf_counter
+
+try:  # pragma: no cover - exercised via monkeypatch in tests
+    import cupy as cp
+except Exception:  # pragma: no cover - runtime fallback when CuPy unavailable
+    cp = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - typing aid
+    from cupy import ndarray as cupy_ndarray  # type: ignore[import-not-found]
+else:
+    cupy_ndarray = Any
 
 from fishtools import IMWRITE_KWARGS
 from fishtools.io.workspace import Workspace
-from fishtools.utils.utils import setup_logging
+from fishtools.utils.logging import setup_logging
 
 setup_logging()
 
@@ -118,6 +129,42 @@ def _float_store_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}_float32{path.suffix}")
 
 
+@lru_cache(maxsize=1)
+def _cupy_available() -> bool:
+    """Return True when CuPy is importable and at least one device is accessible."""
+
+    if cp is None:
+        return False
+    try:
+        cuda = getattr(cp, "cuda", None)
+        runtime = getattr(cuda, "runtime", None) if cuda is not None else None
+        if runtime is not None:
+            device_count = runtime.getDeviceCount()  # type: ignore[attr-defined]
+            if isinstance(device_count, int) and device_count <= 0:
+                return False
+        # Validate we can allocate on the selected backend (GPU or NumPy stub).
+        _ = cp.asarray([0.0], dtype=cp.float32)
+    except Exception:
+        return False
+    return True
+
+
+def _prepare_gpu_field(field: np.ndarray) -> cupy_ndarray | None:
+    """Transfer a correction field to GPU memory when CuPy is available."""
+
+    if not _cupy_available():
+        return None
+    # Let any transfer error surface to the caller; no silent CPU fallback here.
+    return cp.asarray(_ensure_float32(field), dtype=cp.float32)
+
+
+def _cupy_to_numpy(array: cupy_ndarray) -> np.ndarray:
+    if cp is None:
+        return np.asarray(array, dtype=np.float32)
+    # Propagate errors instead of converting via a CPU fallback path.
+    return np.asarray(cp.asnumpy(array), dtype=np.float32)
+
+
 @dataclass(slots=True)
 class N4RuntimeConfig:
     workspace: Path
@@ -175,14 +222,18 @@ def _compute_quantization_params(
         arr = np.asarray(plane, dtype=np.float32)
         if arr.size == 0:
             continue
-        plane_min = float(np.min(arr))
-        plane_max = float(np.max(arr))
+        finite_mask = np.isfinite(arr)
+        if not np.any(finite_mask):
+            continue
+        finite_values = arr[finite_mask]
+        plane_min = float(np.min(finite_values))
+        plane_max = float(np.max(finite_values))
         if plane_min < observed_min:
             observed_min = plane_min
         if plane_max > observed_max:
             observed_max = plane_max
 
-        flat = arr.ravel()
+        flat = finite_values.ravel()
         if flat.size <= QUANT_MAX_SAMPLES:
             sampled = flat
         else:
@@ -212,9 +263,8 @@ def _compute_quantization_params(
     total_samples = int(samples.size)
     effective_lower = float(lower_percentile)
     effective_upper = float(upper_percentile)
-    if (
-        total_samples < QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE
-        and math.isclose(upper_percentile, QUANT_UPPER_PERCENTILE)
+    if total_samples < QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE and math.isclose(
+        upper_percentile, QUANT_UPPER_PERCENTILE
     ):
         effective_upper = QUANT_FALLBACK_UPPER_PERCENTILE
         logger.info(
@@ -377,10 +427,7 @@ def _write_fused_corrected_zyxc(
         z_sel = list(range(z_dim))
 
     logger.info(
-        "Preparing fused correction with channels=%s over Z planes=%s (debug=%s)",
-        channels,
-        z_sel,
-        debug,
+        f"Preparing fused correction with channels={channels} over Z planes={z_sel} (debug={debug})",
     )
 
     dest_path = output_path if output_path is not None else fused_path.parent / "fused_n4.zarr"
@@ -420,28 +467,43 @@ def _write_fused_corrected_zyxc(
     for field_arr in field_arrays:
         _validate_correction_field(field_arr)
     channel_quant: list[QuantizationParams] = []
+    gpu_fields: list[cupy_ndarray | None] = []
 
     for channel_idx, field_arr in zip(channels, field_arrays):
+        field_gpu = _prepare_gpu_field(field_arr)
+        gpu_fields.append(field_gpu)
 
         def _supplier() -> Iterator[np.ndarray]:
             for zi in z_sel:
                 yield _apply_correction_field_prepared(
                     np.asarray(src[zi, :, :, channel_idx], dtype=np.float32),
                     field_arr,
+                    field_gpu=field_gpu,
                 )
 
         params = _compute_quantization_params(_supplier)
         channel_quant.append(params)
 
     for ci, (ch, field_arr, params) in enumerate(zip(channels, field_arrays, channel_quant)):
+        field_gpu = gpu_fields[ci]
         for zi, z_slot in enumerate(z_sel):
             corrected = _apply_correction_field_prepared(
                 np.asarray(src[z_slot, :, :, ch], dtype=np.float32),
                 field_arr,
+                field_gpu=field_gpu,
             )
             if float_dest is not None:
                 float_dest[zi, :, :, ci] = corrected
             dest[zi, :, :, ci] = _quantize_to_uint16(corrected, params)
+
+        if field_gpu is not None and _cupy_available():
+            memory_pool_getter = getattr(cp, "get_default_memory_pool", None)
+            if callable(memory_pool_getter):
+                try:
+                    memory_pool_getter().free_all_blocks()
+                except Exception:
+                    logger.opt(exception=True).debug("Unable to release CuPy memory pool; continuing.")
+        gpu_fields[ci] = None
 
     src_attrs: dict[str, Any] = {}
     try:
@@ -474,25 +536,17 @@ def _write_fused_corrected_zyxc(
     default_quant = channel_quant[0] if channel_quant else None
     dest_attrs["quantization"] = {
         "lower_percentile": (
-            float(default_quant.lower_percentile)
-            if default_quant is not None
-            else QUANT_LOWER_PERCENTILE
+            float(default_quant.lower_percentile) if default_quant is not None else QUANT_LOWER_PERCENTILE
         ),
         "upper_percentile": (
-            float(default_quant.upper_percentile)
-            if default_quant is not None
-            else QUANT_UPPER_PERCENTILE
+            float(default_quant.upper_percentile) if default_quant is not None else QUANT_UPPER_PERCENTILE
         ),
         "channels": quant_channels,
         "dtype": "uint16",
         "sampling": {
             "strategy": "random_without_replacement",
             "max_samples": int(QUANT_MAX_SAMPLES),
-            "total_samples": (
-                int(default_quant.sample_count)
-                if default_quant is not None
-                else 0
-            ),
+            "total_samples": (int(default_quant.sample_count) if default_quant is not None else 0),
         },
     }
     if float_dest_path is not None:
@@ -616,14 +670,25 @@ def _validate_correction_field(field: np.ndarray) -> None:
 
 
 def apply_correction_field(image_yx: np.ndarray, field_yx: np.ndarray) -> np.ndarray:
-    _validate_correction_field(field_yx)
-    img = _ensure_float32(image_yx)
-    return img / field_yx
+    field_f32 = _ensure_float32(field_yx)
+    _validate_correction_field(field_f32)
+    field_gpu = _prepare_gpu_field(field_f32)
+    return _apply_correction_field_prepared(image_yx, field_f32, field_gpu=field_gpu)
 
 
-def _apply_correction_field_prepared(image_yx: np.ndarray, field_f32: np.ndarray) -> np.ndarray:
+def _apply_correction_field_prepared(
+    image_yx: np.ndarray,
+    field_f32: np.ndarray,
+    *,
+    field_gpu: cupy_ndarray | None = None,
+) -> np.ndarray:
     # Caller guarantees validation and float32 casting of field
-    return _ensure_float32(image_yx) / field_f32
+    img = _ensure_float32(image_yx)
+    if field_gpu is not None and _cupy_available():
+        img_gpu = cp.asarray(img, dtype=cp.float32)
+        corrected_gpu = img_gpu / field_gpu
+        return _cupy_to_numpy(corrected_gpu)
+    return img / field_f32
 
 
 def _write_multi_channel_field(
@@ -706,10 +771,15 @@ def apply_correction_to_store(
 
     field_f = _ensure_float32(field)
     _validate_correction_field(field_f)
+    field_gpu = _prepare_gpu_field(field_f)
 
     def _supplier() -> Iterator[np.ndarray]:
         for _, src_idx in plane_mappings:
-            yield _apply_correction_field_prepared(_load_plane(src_idx), field_f)
+            yield _apply_correction_field_prepared(
+                _load_plane(src_idx),
+                field_f,
+                field_gpu=field_gpu,
+            )
 
     quant_params = _compute_quantization_params(_supplier)
     dtype_info = np.iinfo(np.uint16)
@@ -743,10 +813,22 @@ def apply_correction_to_store(
         )
 
     for dest_idx, src_idx in plane_mappings:
-        corrected = _apply_correction_field_prepared(_load_plane(src_idx), field_f)
+        corrected = _apply_correction_field_prepared(
+            _load_plane(src_idx),
+            field_f,
+            field_gpu=field_gpu,
+        )
         if float_store is not None:
             float_store[dest_idx, :, :, 0] = corrected
         corrected_store[dest_idx, :, :, 0] = _quantize_to_uint16(corrected, quant_params)
+
+    if field_gpu is not None and _cupy_available():
+        memory_pool_getter = getattr(cp, "get_default_memory_pool", None)
+        if callable(memory_pool_getter):
+            try:
+                memory_pool_getter().free_all_blocks()
+            except Exception:
+                logger.opt(exception=True).debug("Unable to release CuPy memory pool; continuing.")
 
     logger.info("Corrected imagery written to {path}", path=output_path)
     if float_store is not None and float_output_path is not None:
