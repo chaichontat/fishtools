@@ -46,7 +46,7 @@ from fishtools.preprocess.deconv.worker import (
     run_multi_gpu,
 )
 from fishtools.preprocess.deconv.worker import MP_CONTEXT as _MP_CTX
-from fishtools.utils.pretty_print import progress_bar
+from fishtools.utils.pretty_print import get_shared_console, progress_bar
 
 logger.remove()
 logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
@@ -189,7 +189,13 @@ ProgressUpdater = Callable[[], int]
 
 
 def _configure_logging(debug: bool, *, process_label: str) -> None:
-    configure_logging(debug, process_label=process_label)
+    # Parent logs route through the shared Console to avoid progress duplication.
+    configure_logging(
+        debug,
+        process_label=process_label,
+        level=("DEBUG" if debug else "INFO"),
+        use_console=True,
+    )
 
 
 class _PrefixedLogger:
@@ -470,8 +476,24 @@ def _execute_round_plan(
         def callback(message: WorkerMessage) -> None:
             if message.status == "ok":
                 update()
+                # Render per-tile timing above the shared progress bar without duplicating bars
+                if message.path is not None and message.stages is not None:
+                    s = message.stages
+                    gpu = (
+                        s.get("basic", 0.0) + s.get("deconv", 0.0) + s.get("quant", 0.0) + s.get("post", 0.0)
+                    )
+                    dev = message.device if message.device is not None else "?"
+                    get_shared_console().print(
+                        f"[P{message.worker_id + 1}] [GPU{dev}] {message.path.name}: "
+                        f"gpu={gpu:.2f}s (basic={s.get('basic', 0.0):.2f}+"
+                        f"dec={s.get('deconv', 0.0):.2f}+quant={s.get('quant', 0.0):.2f}+post={s.get('post', 0.0):.2f}) "
+                        f"stage_total={(message.duration or gpu):.2f}s"
+                    )
             elif message.status == "error":
-                prefixed.error(f"Failed to process {message.path}: {message.error}")
+                # Print errors above the progress bar as well
+                get_shared_console().print(
+                    f"[bold red]Failed to process {getattr(message.path, 'name', '<unknown>')}: {message.error}[/bold red]"
+                )
 
         return run_multi_gpu(
             pending,
@@ -798,7 +820,7 @@ def batch(
 ) -> None:
     """Process all rounds/ROIs; retains legacy semantics for tests."""
 
-    configure_logging(debug, console=console)
+    _configure_logging(debug, process_label="0")
 
     use_multi = multi_gpu or getattr(_run, "_is_placeholder", False)
 

@@ -21,6 +21,15 @@ from rich.progress import (
 from rich.syntax import Syntax
 
 
+# A single console shared by progress bars and any ad-hoc prints while a Live display is active.
+# Using the same Console prevents duplicate/redrawn bars when printing logs.
+_SHARED_CONSOLE = Console()
+
+
+def get_shared_console() -> Console:
+    return _SHARED_CONSOLE
+
+
 @contextmanager
 def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
     """Progress bar.
@@ -41,6 +50,7 @@ def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
         TimeElapsedColumn(),
         TextColumn("•"),
         TimeRemainingColumn(),
+        console=_SHARED_CONSOLE,
     ) as p:
         lock = threading.RLock()
         track = iter(p.track(range(n)))
