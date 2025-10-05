@@ -45,6 +45,7 @@ else:
 from fishtools import IMWRITE_KWARGS
 from fishtools.io.workspace import Workspace
 from fishtools.utils.logging import setup_logging
+from fishtools.utils.pretty_print import progress_bar
 
 setup_logging()
 
@@ -484,26 +485,29 @@ def _write_fused_corrected_zyxc(
         params = _compute_quantization_params(_supplier)
         channel_quant.append(params)
 
-    for ci, (ch, field_arr, params) in enumerate(zip(channels, field_arrays, channel_quant)):
-        field_gpu = gpu_fields[ci]
-        for zi, z_slot in enumerate(z_sel):
-            corrected = _apply_correction_field_prepared(
-                np.asarray(src[z_slot, :, :, ch], dtype=np.float32),
-                field_arr,
-                field_gpu=field_gpu,
-            )
-            if float_dest is not None:
-                float_dest[zi, :, :, ci] = corrected
-            dest[zi, :, :, ci] = _quantize_to_uint16(corrected, params)
+    total_steps = max(1, len(channels) * len(z_sel))
+    with progress_bar(total_steps) as advance:
+        for ci, (ch, field_arr, params) in enumerate(zip(channels, field_arrays, channel_quant)):
+            field_gpu = gpu_fields[ci]
+            for zi, z_slot in enumerate(z_sel):
+                corrected = _apply_correction_field_prepared(
+                    np.asarray(src[z_slot, :, :, ch], dtype=np.float32),
+                    field_arr,
+                    field_gpu=field_gpu,
+                )
+                if float_dest is not None:
+                    float_dest[zi, :, :, ci] = corrected
+                dest[zi, :, :, ci] = _quantize_to_uint16(corrected, params)
+                advance()
 
-        if field_gpu is not None and _cupy_available():
-            memory_pool_getter = getattr(cp, "get_default_memory_pool", None)
-            if callable(memory_pool_getter):
-                try:
-                    memory_pool_getter().free_all_blocks()
-                except Exception:
-                    logger.opt(exception=True).debug("Unable to release CuPy memory pool; continuing.")
-        gpu_fields[ci] = None
+            if field_gpu is not None and _cupy_available():
+                memory_pool_getter = getattr(cp, "get_default_memory_pool", None)
+                if callable(memory_pool_getter):
+                    try:
+                        memory_pool_getter().free_all_blocks()
+                    except Exception:
+                        logger.opt(exception=True).debug("Unable to release CuPy memory pool; continuing.")
+            gpu_fields[ci] = None
 
     src_attrs: dict[str, Any] = {}
     try:

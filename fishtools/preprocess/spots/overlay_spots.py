@@ -29,8 +29,8 @@ from fishtools.analysis.labelimage import (
     isotropic_label_dilation,
     isotropic_label_opening,
 )
-from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.io.workspace import Workspace
+from fishtools.preprocess.tileconfig import TileConfiguration
 
 # --- Configuration ---
 CONTOUR_PAD = 1
@@ -920,7 +920,7 @@ def overlay(
                         input_dir,
                         segmentation_name,
                         spots,
-                        path / f"stitch--{roi}/TileConfiguration.registered.txt",
+                        ws.tileconfig_dir(roi) / "TileConfiguration.registered.txt",
                         i,
                         opening_radius,
                         closing_radius,

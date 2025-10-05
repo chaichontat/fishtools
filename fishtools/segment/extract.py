@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -12,12 +12,13 @@ import tifffile
 import typer
 import zarr
 from loguru import logger
+from numpy.random import Generator
 from scipy.ndimage import zoom
 from tifffile import imread, imwrite
 
-from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.io.workspace import Workspace
-from fishtools.utils.pretty_print import progress_bar_threadpool
+from fishtools.preprocess.segmentation import unsharp_all
+from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
 
 """Extract utilities and Typer command callback.
 
@@ -276,6 +277,7 @@ def _iter_registered_files(reg_dir: Path) -> Iterable[Path]:
 
 
 FILE_NAME = "fused.zarr"
+ZARR_TILE_SIZE = 512
 
 
 def _discover_registered_inputs(
@@ -431,6 +433,73 @@ def cmd_extract(
     logger.info(f"Using {len(files)} registered {'file' if len(files) == 1 else 'files'}")
     logger.info(f"Max-from: {max_from_path if max_from_path else 'None'}")
 
+    if files and all(_is_zarr_path(f) for f in files) and mode == "z":
+        rng = np.random.default_rng()
+        tile_jobs: list[tuple[Path, object, list[tuple[int, int]], list[str] | None, list[int]]] = []
+        total_outputs = 0
+        for f in files:
+            vol, names_all = _open_volume(f)
+            tile_origins = _compute_tile_origins(
+                vol.shape,
+                tile_size=ZARR_TILE_SIZE,
+                n_tiles=n,
+                crop=crop,
+            )
+            z_candidates = list(range(0, vol.shape[0], dz))
+            if not z_candidates:
+                raise ValueError("No Z indices available after applying dz to fused Zarr volume.")
+            total_outputs += len(tile_origins)
+            tile_jobs.append((f, vol, tile_origins, names_all, z_candidates))
+
+        logger.info(f"Tracking {total_outputs} output files from Zarr input(s)")
+
+        with progress_bar(total_outputs) as progress_update:
+            for f, vol, tile_origins, names_all, z_candidates in tile_jobs:
+                _process_zarr_tiles(
+                    f,
+                    vol,
+                    names_all,
+                    tile_origins,
+                    out,
+                    channels,
+                    crop,
+                    z_candidates,
+                    max_from_path,
+                    rng,
+                    progress_update,
+                )
+        return
+
+    if files and all(_is_zarr_path(f) for f in files) and mode == "ortho":
+        rng = np.random.default_rng()
+        ortho_jobs: list[tuple[Path, object, list[str] | None, list[int], list[int]]] = []
+        total_outputs = 0
+        for f in files:
+            vol, names_all = _open_volume(f)
+            y_positions = _sample_positions(vol.shape[1], crop=crop, count=n, rng=rng)
+            x_positions = _sample_positions(vol.shape[2], crop=crop, count=n, rng=rng)
+            total_outputs += len(y_positions) + len(x_positions)
+            ortho_jobs.append((f, vol, names_all, y_positions, x_positions))
+
+        logger.info(f"Tracking {total_outputs} ortho outputs from Zarr input(s)")
+
+        with progress_bar(total_outputs) as progress_update:
+            for f, vol, names_all, y_positions, x_positions in ortho_jobs:
+                _process_zarr_ortho(
+                    f,
+                    vol,
+                    names_all,
+                    y_positions,
+                    x_positions,
+                    out,
+                    channels,
+                    crop,
+                    anisotropy,
+                    max_from_path,
+                    progress_update,
+                )
+        return
+
     with progress_bar_threadpool(len(files), threads=threads, stop_on_exception=True) as submit:
         if mode == "z":
             for f in files:
@@ -502,6 +571,8 @@ def _process_file_to_z_slices(
     dz: int,
     n: int | None,
     max_from_path: Path | None,
+    *,
+    progress: Callable[[], None] | None = None,
 ) -> None:
     """Extract individual Z-slices as CYX TIFF files with specified step size.
 
@@ -551,6 +622,8 @@ def _process_file_to_z_slices(
         )
         out_file = out_dir / f"{file.stem}_z{i:02d}.tif"
         _write_tiff(out_file, cyx_u16, axes="CYX", names=out_names, channels_arg=channels)
+        if progress is not None:
+            progress()
 
 
 def _process_file_to_ortho(
@@ -561,6 +634,8 @@ def _process_file_to_ortho(
     n: int,
     anisotropy: int,
     max_from_path: Path | None,
+    *,
+    progress: Callable[[], None] | None = None,
 ) -> None:
     """Generate orthogonal ZX/ZY projections with Z-axis scaling for anisotropy correction.
 
@@ -611,6 +686,8 @@ def _process_file_to_ortho(
         czx = zoom(czx, (1, anisotropy, 1), order=1)  # scale Z only
         out_file = out_dir / f"{file.stem}_orthozx-{yi}.tif"
         _write_tiff(out_file, czx, axes="CZX", names=out_names, channels_arg=channels)
+        if progress is not None:
+            progress()
 
     # ZY slabs (fixed X)
     for xi in x_positions:
@@ -629,6 +706,208 @@ def _process_file_to_ortho(
         czy = zoom(czy, (1, anisotropy, 1), order=1)
         out_file = out_dir / f"{file.stem}_orthozy-{xi}.tif"
         _write_tiff(out_file, czy, axes="CZY", names=out_names, channels_arg=channels)
+        if progress is not None:
+            progress()
+
+
+def _sample_positions(length: int, *, crop: int, count: int, rng: Generator) -> list[int]:
+    start = crop
+    end = length - crop
+    if end <= start:
+        raise ValueError("Image after cropping is empty.")
+
+    population = np.arange(start, end)
+    if not population.size:
+        raise ValueError("No positions available after cropping.")
+
+    if count >= population.size:
+        return population.tolist()
+
+    choices = rng.choice(population, size=count, replace=False)
+    return sorted(int(v) for v in choices)
+
+
+def _compute_tile_origins(
+    shape: tuple[int, int, int, int],
+    *,
+    tile_size: int,
+    n_tiles: int | None,
+    crop: int,
+) -> list[tuple[int, int]]:
+    _z, y_len, x_len, _ = shape
+    if y_len < tile_size + 2 * crop or x_len < tile_size + 2 * crop:
+        raise ValueError("Zarr volume spatial dimensions are smaller than the requested 512×512 tile size.")
+
+    start_y = crop
+    start_x = crop
+    max_y = y_len - crop - tile_size
+    max_x = x_len - crop - tile_size
+    if max_y < start_y or max_x < start_x:
+        raise ValueError("Tile cropping leaves no valid region to sample.")
+
+    y_range = max_y - start_y + 1
+    x_range = max_x - start_x + 1
+    total_positions = y_range * x_range
+    desired = n_tiles or 50
+    desired = min(desired, total_positions)
+    idxs = np.linspace(0, total_positions - 1, desired, dtype=int)
+    idxs = np.unique(idxs)
+    if idxs.size < desired:
+        extras = np.setdiff1d(np.arange(total_positions), idxs, assume_unique=False)[: desired - idxs.size]
+        idxs = np.sort(np.concatenate([idxs, extras]))
+
+    origins: list[tuple[int, int]] = []
+    for idx in idxs:
+        offset_y = idx // x_range
+        offset_x = idx % x_range
+        origins.append((start_y + int(offset_y), start_x + int(offset_x)))
+    return origins
+
+
+def _format_tile_filename(
+    stem: str,
+    z_index: int,
+    y0: int,
+    x0: int,
+    *,
+    coord_width: int,
+) -> str:
+    return f"{stem}_y{y0:0{coord_width}d}_x{x0:0{coord_width}d}_z{z_index:02d}.tif"
+
+
+def _process_zarr_tiles(
+    file: Path,
+    vol: object,
+    names_all: list[str] | None,
+    tile_origins: list[tuple[int, int]],
+    out_dir: Path,
+    channels: str | None,
+    crop: int,
+    z_candidates: list[int],
+    max_from_path: Path | None,
+    rng: Generator,
+    progress: Callable[[], None],
+) -> None:
+    chsel = _parse_channels(channels, names_all)
+    base_names = _resolve_output_names(chsel, channels)
+
+    other_vol = None
+    if max_from_path:
+        target = (
+            max_from_path
+            if _is_zarr_path(max_from_path)
+            else (max_from_path / file.name if max_from_path.is_dir() else max_from_path)
+        )
+        if target.exists():
+            other_vol, _ = _open_volume(target)
+
+    out_names = [*base_names, "max_from"] if other_vol is not None else base_names
+    coord_width = len(str(max(vol.shape[1], vol.shape[2])))
+
+    for y0, x0 in tile_origins:
+        y_slice = slice(y0, y0 + ZARR_TILE_SIZE)
+        x_slice = slice(x0, x0 + ZARR_TILE_SIZE)
+        # Sample a single Z plane per tile using the shared RNG for reproducibility.
+        z_index = int(rng.choice(z_candidates))
+        plane = vol[z_index, y_slice, x_slice, :]
+        other_max = None
+        if other_vol is not None:
+            other_tile = other_vol[z_index, y_slice, x_slice, :]
+            other_max = other_tile.max(axis=2)
+
+        cyx_u16 = _prep_slab(
+            plane,
+            ch_idx=chsel.indices,
+            channel_axis=2,
+            crop_slices=None,
+            filter_before=True,
+            append_max=other_max,
+        )
+
+        out_name = _format_tile_filename(
+            file.stem,
+            z_index,
+            y0,
+            x0,
+            coord_width=coord_width,
+        )
+        _write_tiff(
+            out_dir / out_name,
+            cyx_u16,
+            axes="CYX",
+            names=out_names,
+            channels_arg=channels,
+        )
+        progress()
+
+
+def _process_zarr_ortho(
+    file: Path,
+    vol: object,
+    names_all: list[str] | None,
+    y_positions: list[int],
+    x_positions: list[int],
+    out_dir: Path,
+    channels: str | None,
+    crop: int,
+    anisotropy: int,
+    max_from_path: Path | None,
+    progress: Callable[[], None],
+) -> None:
+    chsel = _parse_channels(channels, names_all)
+    base_names = _resolve_output_names(chsel, channels)
+
+    other_vol = None
+    if max_from_path:
+        target = (
+            max_from_path
+            if _is_zarr_path(max_from_path)
+            else (max_from_path / file.name if max_from_path.is_dir() else max_from_path)
+        )
+        if target.exists():
+            other_vol, _ = _open_volume(target)
+
+    out_names = [*base_names, "max_from"] if other_vol is not None else base_names
+
+    z_len, y_len, x_len, _ = vol.shape
+    y_slice = slice(crop, y_len - crop) if crop > 0 else slice(None)
+    x_slice = slice(crop, x_len - crop) if crop > 0 else slice(None)
+
+    for yi in y_positions:
+        slab = vol[:, yi, x_slice, :]
+        other_max = None
+        if other_vol is not None:
+            other_max = other_vol[:, yi, x_slice, :].max(axis=2)
+        czx = _prep_slab(
+            slab,
+            ch_idx=chsel.indices,
+            channel_axis=2,
+            crop_slices=None,
+            filter_before=False,
+            append_max=other_max,
+        )
+        czx = zoom(czx, (1, anisotropy, 1), order=1)
+        out_file = out_dir / f"{file.stem}_orthozx-{yi}.tif"
+        _write_tiff(out_file, czx, axes="CZX", names=out_names, channels_arg=channels)
+        progress()
+
+    for xi in x_positions:
+        slab = vol[:, y_slice, xi, :]
+        other_max = None
+        if other_vol is not None:
+            other_max = other_vol[:, y_slice, xi, :].max(axis=2)
+        czy = _prep_slab(
+            slab,
+            ch_idx=chsel.indices,
+            channel_axis=2,
+            crop_slices=None,
+            filter_before=False,
+            append_max=other_max,
+        )
+        czy = zoom(czy, (1, anisotropy, 1), order=1)
+        out_file = out_dir / f"{file.stem}_orthozy-{xi}.tif"
+        _write_tiff(out_file, czy, axes="CZY", names=out_names, channels_arg=channels)
+        progress()
 
 
 app = typer.Typer(help="Internal helper exposing cmd_extract for tests.")

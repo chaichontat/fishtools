@@ -1,18 +1,32 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 import tifffile
-import zarr
 from tifffile import imwrite as real_imwrite
 from typer.testing import CliRunner
 
 from fishtools.segment import extract
 from fishtools.utils.io import Workspace
+
+
+ORIG_DEFAULT_RNG = np.random.default_rng
+
+
+class MockZarrArray:
+    def __init__(self, data: np.ndarray, *, channel_names: list[str]):
+        self._data = data
+        self.shape = data.shape
+        self.ndim = data.ndim
+        self.attrs = {"key": channel_names}
+
+    def __getitem__(self, item):
+        return self._data[item]
 
 
 def _write_4d_tif(path: Path, arr: np.ndarray) -> None:
@@ -66,39 +80,46 @@ def _make_workspace(
 
 
 def _make_workspace_with_fused_zarr(
-    tmp_path: Path, roi: str = "cortex", cb: str = "cb1"
-) -> tuple[Path, Path, np.ndarray]:
+    tmp_path: Path,
+    roi: str = "cortex",
+    cb: str = "cb1",
+    *,
+    spatial_shape: tuple[int, int] = (600, 640),
+) -> tuple[Path, Path, np.ndarray, list[str]]:
     root = tmp_path / "workspace"
     fused_dir = root / "analysis" / "deconv" / f"stitch--{roi}+{cb}"
-    fused_dir.mkdir(parents=True, exist_ok=True)
-    store = fused_dir / "fused.zarr"
+    store = fused_dir / extract.FILE_NAME
+    store.mkdir(parents=True, exist_ok=True)
 
-    z, y, x, c = 4, 12, 14, 3
+    z, c = 4, 3
+    y, x = spatial_shape
     data = np.arange(z * y * x * c, dtype=np.uint16).reshape(z, y, x, c)
-    arr = zarr.open(store, mode="w", shape=(z, y, x, c), chunks=(1, y, x, c), dtype=np.uint16)
-    arr[...] = data
-    arr.attrs["key"] = ["polyA", "reddot", "spots"]
-    return root, store, data
+    channel_names = ["polyA", "reddot", "spots"]
+    return root, store, data, channel_names
 
 
 def _make_workspace_with_tiff_and_zarr(
-    tmp_path: Path, roi: str = "cortex", cb: str = "cb1"
-) -> tuple[Path, np.ndarray, np.ndarray]:
+    tmp_path: Path,
+    roi: str = "cortex",
+    cb: str = "cb1",
+    *,
+    spatial_shape: tuple[int, int] = (600, 640),
+) -> tuple[Path, np.ndarray, np.ndarray, list[str]]:
     root = tmp_path / "workspace"
 
     reg_dir = root / "analysis" / "deconv" / f"registered--{roi}+{cb}"
-    z, c, y, x = 3, 2, 8, 10
+    z, c = 3, 2
+    y, x = spatial_shape
     tiff_data = (np.ones((z, c, y, x), dtype=np.uint16) * 1111)
     _write_4d_tif(reg_dir / "reg-000.tif", tiff_data)
 
     fused_dir = root / "analysis" / "deconv" / f"stitch--{roi}+{cb}"
     fused_dir.mkdir(parents=True, exist_ok=True)
-    store = fused_dir / "fused.zarr"
+    store = fused_dir / extract.FILE_NAME
+    store.mkdir(parents=True, exist_ok=True)
     zarr_data = np.arange(z * y * x * c, dtype=np.uint16).reshape(z, y, x, c)
-    arr = zarr.open(store, mode="w", shape=zarr_data.shape, chunks=(1, y, x, c), dtype=np.uint16)
-    arr[...] = zarr_data
-    arr.attrs["key"] = ["polyA", "reddot"]
-    return root, tiff_data, zarr_data
+    channel_names = ["polyA", "reddot"]
+    return root, tiff_data, zarr_data, channel_names
 
 
 def _make_parameterized_workspace(
@@ -177,23 +198,15 @@ def test_cmd_extract_z_basic(mock_unsharp, mock_imwrite, tmp_path: Path) -> None
         tmp_path, roi="roiA", cb="cb1", pattern="z_unique"
     )
 
-    runner = CliRunner()
-    result = runner.invoke(
-        extract.app,
-        [
-            "z",
-            str(root),
-            "roiA",
-            "cb1",
-            "--channels",
-            "0,1",
-            "--threads",
-            "1",
-            "--dz",
-            "1",
-        ],
+    extract.cmd_extract(
+        "z",
+        root,
+        roi="roiA",
+        codebook="cb1",
+        channels="0,1",
+        threads=1,
+        dz=1,
     )
-    assert result.exit_code == 0, result.output
 
     ws = Workspace(root)
     out_dir = ws.segment("roiA", "cb1") / "extract_z"
@@ -243,47 +256,10 @@ def test_cmd_extract_z_basic(mock_unsharp, mock_imwrite, tmp_path: Path) -> None
         assert arr.dtype == np.uint16
 
 
-@patch("fishtools.segment.extract.unsharp_all")
-def test_cmd_extract_z_from_zarr(mock_unsharp, tmp_path: Path) -> None:
-    mock_unsharp.side_effect = lambda img, **kwargs: img
-
-    roi = "roiZarr"
-    cb = "cb1"
-    root, _store, data = _make_workspace_with_fused_zarr(tmp_path, roi=roi, cb=cb)
-
-    runner = CliRunner()
-    result = runner.invoke(
-        extract.app,
-        [
-            "z",
-            str(root),
-            roi,
-            cb,
-            "--channels",
-            "auto",
-            "--threads",
-            "1",
-        ],
+def test_cli_extract_z_smoke(tmp_path: Path) -> None:
+    root, _reg_dir, _files, _expected = _make_parameterized_workspace(
+        tmp_path, roi="roi_cli_z", cb="cb1", pattern="gradient"
     )
-    assert result.exit_code == 0, result.output
-
-    ws = Workspace(root)
-    out_dir = ws.segment(roi, cb) / "extract_z"
-    outs = sorted(out_dir.glob("*_z*.tif"))
-    assert len(outs) == data.shape[0]
-
-    first = tifffile.imread(outs[0])
-    expected = np.moveaxis(data[0, :, :, :2], -1, 0)  # (C,Y,X)
-    np.testing.assert_array_equal(first, expected)
-
-
-@patch("fishtools.segment.extract.unsharp_all")
-def test_cmd_extract_z_with_zarr_flag_prefers_zarr(mock_unsharp, tmp_path: Path) -> None:
-    mock_unsharp.side_effect = lambda img, **kwargs: img
-
-    roi = "roiCombo"
-    cb = "cb1"
-    root, _tiff_data, zarr_data = _make_workspace_with_tiff_and_zarr(tmp_path, roi=roi, cb=cb)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -291,24 +267,367 @@ def test_cmd_extract_z_with_zarr_flag_prefers_zarr(mock_unsharp, tmp_path: Path)
         [
             "z",
             str(root),
-            roi,
-            cb,
+            "--roi",
+            "roi_cli_z",
+            "--codebook",
+            "cb1",
             "--channels",
             "0,1",
             "--threads",
             "1",
-            "--zarr",
+            "--dz",
+            "1",
         ],
     )
     assert result.exit_code == 0, result.output
 
     ws = Workspace(root)
+    out_dir = ws.segment("roi_cli_z", "cb1") / "extract_z"
+    assert out_dir.exists()
+    assert any(out_dir.glob("*.tif"))
+
+
+@patch("fishtools.segment.extract.imwrite")
+@patch("fishtools.segment.extract.unsharp_all")
+def test_cmd_extract_z_from_zarr(
+    mock_unsharp, mock_imwrite, tmp_path: Path
+) -> None:
+    mock_unsharp.side_effect = lambda img, **kwargs: img
+
+    roi = "roiZarr"
+    cb = "cb1"
+    root, store, data, channel_names = _make_workspace_with_fused_zarr(
+        tmp_path,
+        roi=roi,
+        cb=cb,
+        spatial_shape=(64, 72),
+    )
+
+    captured: dict[str, np.ndarray] = {}
+
+    def capture_imwrite(file_path, arr, **kwargs):
+        captured[Path(file_path).name] = arr.copy()
+        return real_imwrite(file_path, arr, **kwargs)
+
+    mock_imwrite.side_effect = capture_imwrite
+
+    tile_size = 32
+    default_rng = ORIG_DEFAULT_RNG
+
+    def fake_rng(*args, **kwargs):
+        return default_rng(0)
+
+    mock_zarr = MockZarrArray(data, channel_names=channel_names)
+
+    with patch.object(extract, "ZARR_TILE_SIZE", tile_size), patch(
+        "fishtools.segment.extract._open_zarr_array", side_effect=lambda *_: mock_zarr
+    ), patch("numpy.random.default_rng", side_effect=fake_rng):
+        extract.cmd_extract(
+            "z",
+            root,
+            roi=roi,
+            codebook=cb,
+            channels="auto",
+            threads=1,
+            n=2,
+        )
+
+    ws = Workspace(root)
     out_dir = ws.segment(roi, cb) / "extract_z"
-    outs = sorted(out_dir.glob("*_z*.tif"))
+    outs = sorted(out_dir.glob("*.tif"))
+
+    tile_origins = extract._compute_tile_origins(
+        data.shape,
+        tile_size=tile_size,
+        n_tiles=2,
+        crop=0,
+    )
+    z_candidates = list(range(0, data.shape[0], 1))
+    expected_rng = default_rng(0)
+    sampled = [int(expected_rng.choice(z_candidates)) for _ in tile_origins]
+    coord_width = len(str(max(data.shape[1], data.shape[2])))
+
+    expected_names = [
+        f"fused_y{y0:0{coord_width}d}_x{x0:0{coord_width}d}_z{zi:02d}.tif"
+        for (y0, x0), zi in zip(tile_origins, sampled)
+    ]
+    assert [p.name for p in outs] == expected_names
+
+    first_name = expected_names[0]
+    first = captured[first_name]
+    (y0, x0), z0 = tile_origins[0], sampled[0]
+    expected = np.moveaxis(
+        data[z0, y0 : y0 + tile_size, x0 : x0 + tile_size, :2],
+        -1,
+        0,
+    )
+    expected = np.clip(expected, 0, 65530).astype(np.uint16)
+    np.testing.assert_array_equal(first, expected)
+
+
+@patch("fishtools.segment.extract.imwrite")
+@patch("fishtools.segment.extract.unsharp_all")
+def test_cmd_extract_ortho_from_zarr_random_positions(
+    mock_unsharp, mock_imwrite, tmp_path: Path
+) -> None:
+    mock_unsharp.side_effect = lambda img, **kwargs: img
+
+    roi = "roiZarrOrtho"
+    cb = "cb1"
+    root, store, data, channel_names = _make_workspace_with_fused_zarr(
+        tmp_path,
+        roi=roi,
+        cb=cb,
+        spatial_shape=(64, 80),
+    )
+
+    captured: dict[str, np.ndarray] = {}
+
+    def capture_imwrite(file_path, arr, **kwargs):
+        captured[Path(file_path).name] = arr.copy()
+        return real_imwrite(file_path, arr, **kwargs)
+
+    mock_imwrite.side_effect = capture_imwrite
+
+    default_rng = ORIG_DEFAULT_RNG
+
+    def fake_rng(*args, **kwargs):
+        return default_rng(0)
+
+    mock_zarr = MockZarrArray(data, channel_names=channel_names)
+
+    with patch(
+        "fishtools.segment.extract._open_zarr_array", side_effect=lambda *_: mock_zarr
+    ), patch("numpy.random.default_rng", side_effect=fake_rng):
+        extract.cmd_extract(
+            "ortho",
+            root,
+            roi=roi,
+            codebook=cb,
+            channels="auto",
+            threads=1,
+            n=3,
+            anisotropy=2,
+        )
+
+    ws = Workspace(root)
+    out_dir = ws.segment(roi, cb) / "extract_ortho"
+    outs = sorted(out_dir.glob("*.tif"))
+    assert outs, "No ortho outputs produced"
+
+    expected_rng = default_rng(0)
+    expected_y = extract._sample_positions(data.shape[1], crop=0, count=3, rng=expected_rng)
+    expected_x = extract._sample_positions(data.shape[2], crop=0, count=3, rng=expected_rng)
+
+    zx_names = [f"fused_orthozx-{y}.tif" for y in expected_y]
+    zy_names = [f"fused_orthozy-{x}.tif" for x in expected_x]
+    assert sorted(p.name for p in outs if "orthozx" in p.name) == sorted(zx_names)
+    assert sorted(p.name for p in outs if "orthozy" in p.name) == sorted(zy_names)
+
+    sample_name = zx_names[0]
+    sample_arr = captured[sample_name]
+    assert sample_arr.shape[0] == 2  # channels
+    assert sample_arr.shape[1] == data.shape[0] * 2  # anisotropy scaling
+    assert sample_arr.shape[2] == data.shape[2]
+    assert sample_arr.dtype == np.uint16
+
+
+@patch("fishtools.segment.extract.progress_bar")
+@patch("fishtools.segment.extract.unsharp_all")
+def test_cmd_extract_z_from_zarr_tracks_progress(
+    mock_unsharp, mock_progress_bar, tmp_path: Path
+) -> None:
+    mock_unsharp.side_effect = lambda img, **kwargs: img
+
+    calls: dict[str, int | None] = {"total": None, "count": 0}
+
+    @contextmanager
+    def fake_progress(n: int):
+        calls["total"] = n
+
+        def _increment() -> None:
+            calls["count"] = int(calls["count"]) + 1
+
+        yield _increment
+
+    mock_progress_bar.side_effect = fake_progress
+
+    roi = "roiZarrProgress"
+    cb = "cb1"
+    root, store, data, channel_names = _make_workspace_with_fused_zarr(
+        tmp_path,
+        roi=roi,
+        cb=cb,
+        spatial_shape=(64, 72),
+    )
+
+    tile_size = 32
+    mock_zarr = MockZarrArray(data, channel_names=channel_names)
+    default_rng = ORIG_DEFAULT_RNG
+
+    def fake_rng(*args, **kwargs):
+        return default_rng(0)
+
+    with patch.object(extract, "ZARR_TILE_SIZE", tile_size), patch(
+        "fishtools.segment.extract._open_zarr_array", side_effect=lambda *_: mock_zarr
+    ), patch("numpy.random.default_rng", side_effect=fake_rng):
+        extract.cmd_extract(
+            "z",
+            root,
+            roi=roi,
+            codebook=cb,
+            channels="auto",
+            threads=1,
+            n=3,
+        )
+
+        tile_origins = extract._compute_tile_origins(
+            data.shape,
+            tile_size=tile_size,
+            n_tiles=3,
+            crop=0,
+        )
+        expected_outputs = len(tile_origins)
+
+    assert calls["total"] == expected_outputs
+    assert calls["count"] == expected_outputs
+
+
+@patch("fishtools.segment.extract.progress_bar")
+@patch("fishtools.segment.extract.unsharp_all")
+def test_cmd_extract_ortho_from_zarr_tracks_progress(
+    mock_unsharp, mock_progress_bar, tmp_path: Path
+) -> None:
+    mock_unsharp.side_effect = lambda img, **kwargs: img
+
+    calls: dict[str, int | None] = {"total": None, "count": 0}
+
+    @contextmanager
+    def fake_progress(n: int):
+        calls["total"] = n
+
+        def _increment() -> None:
+            calls["count"] = int(calls["count"]) + 1
+
+        yield _increment
+
+    mock_progress_bar.side_effect = fake_progress
+
+    roi = "roiZarrOrthoProgress"
+    cb = "cb1"
+    root, store, data, channel_names = _make_workspace_with_fused_zarr(
+        tmp_path,
+        roi=roi,
+        cb=cb,
+        spatial_shape=(64, 80),
+    )
+
+    default_rng = ORIG_DEFAULT_RNG
+
+    def fake_rng(*args, **kwargs):
+        return default_rng(0)
+
+    mock_zarr = MockZarrArray(data, channel_names=channel_names)
+
+    with patch(
+        "fishtools.segment.extract._open_zarr_array", side_effect=lambda *_: mock_zarr
+    ), patch("numpy.random.default_rng", side_effect=fake_rng):
+        extract.cmd_extract(
+            "ortho",
+            root,
+            roi=roi,
+            codebook=cb,
+            channels="auto",
+            threads=1,
+            n=4,
+            anisotropy=2,
+        )
+
+        expected_rng = default_rng(0)
+        expected_y = extract._sample_positions(data.shape[1], crop=0, count=4, rng=expected_rng)
+        expected_x = extract._sample_positions(data.shape[2], crop=0, count=4, rng=expected_rng)
+        expected_outputs = len(expected_y) + len(expected_x)
+
+    assert calls["total"] == expected_outputs
+    assert calls["count"] == expected_outputs
+
+
+@patch("fishtools.segment.extract.imwrite")
+@patch("fishtools.segment.extract.unsharp_all")
+def test_cmd_extract_z_with_zarr_flag_prefers_zarr(
+    mock_unsharp, mock_imwrite, tmp_path: Path
+) -> None:
+    mock_unsharp.side_effect = lambda img, **kwargs: img
+
+    roi = "roiCombo"
+    cb = "cb1"
+    root, _tiff_data, zarr_data, channel_names = _make_workspace_with_tiff_and_zarr(
+        tmp_path,
+        roi=roi,
+        cb=cb,
+        spatial_shape=(64, 72),
+    )
+
+    captured: dict[str, np.ndarray] = {}
+
+    def capture_imwrite(file_path, arr, **kwargs):
+        captured[Path(file_path).name] = arr.copy()
+        return real_imwrite(file_path, arr, **kwargs)
+
+    mock_imwrite.side_effect = capture_imwrite
+
+    tile_size = 32
+    default_rng = ORIG_DEFAULT_RNG
+
+    def fake_rng(*args, **kwargs):
+        return default_rng(0)
+
+    mock_zarr = MockZarrArray(zarr_data, channel_names=channel_names)
+
+    with patch.object(extract, "ZARR_TILE_SIZE", tile_size), patch(
+        "fishtools.segment.extract._open_zarr_array", side_effect=lambda *_: mock_zarr
+    ), patch("numpy.random.default_rng", side_effect=fake_rng):
+        extract.cmd_extract(
+            "z",
+            root,
+            roi=roi,
+            codebook=cb,
+            channels="0,1",
+            threads=1,
+            use_zarr=True,
+            n=2,
+        )
+
+    ws = Workspace(root)
+    out_dir = ws.segment(roi, cb) / "extract_z"
+    outs = sorted(out_dir.glob("*.tif"))
     assert outs, "No output files produced"
 
-    first = tifffile.imread(outs[0])
-    expected = np.moveaxis(zarr_data[0, :, :, :2], -1, 0)
+    tile_origins = extract._compute_tile_origins(
+        zarr_data.shape,
+        tile_size=tile_size,
+        n_tiles=2,
+        crop=0,
+    )
+    coord_width = len(str(max(zarr_data.shape[1], zarr_data.shape[2])))
+    z_candidates = list(range(0, zarr_data.shape[0]))
+    expected_rng = default_rng(0)
+    sampled = [int(expected_rng.choice(z_candidates)) for _ in tile_origins]
+    expected_names = [
+        f"fused_y{y0:0{coord_width}d}_x{x0:0{coord_width}d}_z{zi:02d}.tif"
+        for (y0, x0), zi in zip(tile_origins, sampled)
+    ]
+    assert [p.name for p in outs] == expected_names
+
+    first_name = expected_names[0]
+    first = captured[first_name]
+    (y0, x0), z0 = tile_origins[0], sampled[0]
+    expected = np.moveaxis(
+        zarr_data[z0, y0 : y0 + tile_size, x0 : x0 + tile_size, :2],
+        -1,
+        0,
+    )
+    expected = np.clip(expected, 0, 65530).astype(np.uint16)
     np.testing.assert_array_equal(first, expected)
 
 
@@ -320,23 +639,16 @@ def test_cmd_extract_z_with_zarr_flag_requires_store(mock_unsharp, tmp_path: Pat
     cb = "cb1"
     root, _reg_dir, _files = _make_workspace(tmp_path, roi=roi, cb=cb)
 
-    runner = CliRunner()
-    result = runner.invoke(
-        extract.app,
-        [
+    with pytest.raises(FileNotFoundError, match="Requested Zarr input"):
+        extract.cmd_extract(
             "z",
-            str(root),
-            roi,
-            cb,
-            "--channels",
-            "0,1",
-            "--threads",
-            "1",
-            "--zarr",
-        ],
-    )
-    assert result.exit_code != 0
-    assert "Requested Zarr input" in result.output
+            root,
+            roi=roi,
+            codebook=cb,
+            channels="0,1",
+            threads=1,
+            use_zarr=True,
+        )
 
 
 @patch("fishtools.segment.extract.unsharp_all")
@@ -349,27 +661,17 @@ def test_cmd_extract_ortho_basic(mock_unsharp, tmp_path: Path) -> None:
     )
     out = tmp_path / "ortho_out"
 
-    runner = CliRunner()
-    result = runner.invoke(
-        extract.app,
-        [
-            "ortho",
-            str(root),
-            "roiB",
-            "cb1",
-            "--out",
-            str(out),
-            "--channels",
-            "0,1",
-            "--threads",
-            "1",
-            "--n",
-            "2",
-            "--anisotropy",
-            "3",  # Use smaller value for easier verification
-        ],
+    extract.cmd_extract(
+        "ortho",
+        root,
+        roi="roiB",
+        codebook="cb1",
+        out=out,
+        channels="0,1",
+        threads=1,
+        n=2,
+        anisotropy=3,
     )
-    assert result.exit_code == 0, result.output
 
     outs = sorted(out.glob("*.tif"))
     # Expect 2 positions × (zx, zy) = 4 files
@@ -430,23 +732,15 @@ def test_extract_z_stride_and_positions(tmp_path: Path) -> None:
     f = reg / "reg-000.tif"
     _write_4d_tif(f, arr)
 
-    runner = CliRunner()
-    res = runner.invoke(
-        extract.app,
-        [
-            "z",
-            str(root),
-            roi,
-            cb,
-            "--channels",
-            "0,1",
-            "--dz",
-            "2",
-            "--threads",
-            "1",
-        ],
+    extract.cmd_extract(
+        "z",
+        root,
+        roi=roi,
+        codebook=cb,
+        channels="0,1",
+        dz=2,
+        threads=1,
     )
-    assert res.exit_code == 0, res.output
 
     ws = Workspace(root)
     out_dir = ws.segment(roi, cb) / "extract_z"
@@ -483,25 +777,16 @@ def test_extract_ortho_positions_values_anis1(tmp_path: Path) -> None:
             base[zi, :, :, pos] = 45000
     _write_4d_tif(reg / "reg-000.tif", base)
 
-    runner = CliRunner()
-    res = runner.invoke(
-        extract.app,
-        [
-            "ortho",
-            str(root),
-            roi,
-            cb,
-            "--channels",
-            "0,1",
-            "--n",
-            "2",
-            "--anisotropy",
-            "1",
-            "--threads",
-            "1",
-        ],
+    extract.cmd_extract(
+        "ortho",
+        root,
+        roi=roi,
+        codebook=cb,
+        channels="0,1",
+        n=2,
+        anisotropy=1,
+        threads=1,
     )
-    assert res.exit_code == 0, res.output
 
     # Expected positions are evenly spaced between 10% and 90% of Y
     # Default output location under segment dir
@@ -522,6 +807,39 @@ def test_extract_ortho_positions_values_anis1(tmp_path: Path) -> None:
             assert (a_zy[0, zi, :] > 0).all() and (a_zy[1, zi, :] > 0).all()
 
 
+def test_cli_extract_ortho_smoke(tmp_path: Path) -> None:
+    root, _reg_dir, _files, _expected = _make_parameterized_workspace(
+        tmp_path, roi="roi_cli_ortho", cb="cb1", pattern="gradient"
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        extract.app,
+        [
+            "ortho",
+            str(root),
+            "--roi",
+            "roi_cli_ortho",
+            "--codebook",
+            "cb1",
+            "--channels",
+            "0,1",
+            "--threads",
+            "1",
+            "--n",
+            "2",
+            "--anisotropy",
+            "2",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    ws = Workspace(root)
+    out_dir = ws.segment("roi_cli_ortho", "cb1") / "extract_ortho"
+    assert out_dir.exists()
+    assert any(out_dir.glob("*.tif"))
+
+
 def test_resolve_channels_with_names(tmp_path: Path) -> None:
     # Create a stack with channel names in shaped metadata
     root, reg_dir, files = _make_workspace(tmp_path, roi="roiC", cb="cb1")
@@ -530,24 +848,16 @@ def test_resolve_channels_with_names(tmp_path: Path) -> None:
     # Overwrite with names in metadata
     tifffile.imwrite(f, arr, metadata={"axes": "ZCYX", "key": ["polyA", "reddot"]})
 
-    runner = CliRunner()
     # Name-based channels
-    result = runner.invoke(
-        extract.app,
-        [
-            "z",
-            str(root),
-            "roiC",
-            "cb1",
-            "--channels",
-            "polyA,reddot",
-            "--threads",
-            "1",
-            "--dz",
-            "1",
-        ],
+    extract.cmd_extract(
+        "z",
+        root,
+        roi="roiC",
+        codebook="cb1",
+        channels="polyA,reddot",
+        threads=1,
+        dz=1,
     )
-    assert result.exit_code == 0, result.output
     ws = Workspace(root)
     out_dir = ws.segment("roiC", "cb1") / "extract_z"
     out = sorted(out_dir.glob("*_z0000.tif"))[0]
@@ -570,23 +880,15 @@ def test_extract_z_dz_parameter(mock_unsharp, tmp_path: Path, dz: int) -> None:
         tmp_path, roi="roiDZ", cb="cb1", pattern="z_unique"
     )
 
-    runner = CliRunner()
-    result = runner.invoke(
-        extract.app,
-        [
-            "z",
-            str(root),
-            "roiDZ",
-            "cb1",
-            "--channels",
-            "0,1",
-            "--dz",
-            str(dz),
-            "--threads",
-            "1",
-        ],
+    extract.cmd_extract(
+        "z",
+        root,
+        roi="roiDZ",
+        codebook="cb1",
+        channels="0,1",
+        dz=dz,
+        threads=1,
     )
-    assert result.exit_code == 0, result.output
 
     ws = Workspace(root)
     out_dir = ws.segment("roiDZ", "cb1") / "extract_z"
@@ -670,23 +972,15 @@ def test_wrong_slice_extraction_should_fail(
         tmp_path, roi="roiFAIL", cb="cb1", pattern="z_unique"
     )
 
-    runner = CliRunner()
-    result = runner.invoke(
-        extract.app,
-        [
-            "z",
-            str(root),
-            "roiFAIL",
-            "cb1",
-            "--channels",
-            "0,1",
-            "--threads",
-            "1",
-            "--dz",
-            "1",
-        ],
+    extract.cmd_extract(
+        "z",
+        root,
+        roi="roiFAIL",
+        codebook="cb1",
+        channels="0,1",
+        threads=1,
+        dz=1,
     )
-    assert result.exit_code == 0  # Command should succeed
 
     # Now verify that our test would catch the corruption
     ws = Workspace(root)
@@ -733,25 +1027,16 @@ def test_max_from_cli_appends_and_sets_metadata(tmp_path: Path) -> None:
         file_aux, (np.arange(z * c * y * x, dtype=np.uint16).reshape(z, c, y, x))
     )
 
-    runner = CliRunner()
-    result = runner.invoke(
-        extract.app,
-        [
-            "z",
-            str(root),
-            roi,
-            cb_main,
-            "--channels",
-            "0,1",
-            "--max-from",
-            cb_aux,
-            "--threads",
-            "1",
-            "--dz",
-            "1",
-        ],
+    extract.cmd_extract(
+        "z",
+        root,
+        roi=roi,
+        codebook=cb_main,
+        channels="0,1",
+        max_from=cb_aux,
+        threads=1,
+        dz=1,
     )
-    assert result.exit_code == 0, result.output
     ws = Workspace(root)
     out_dir = ws.segment(roi, cb_main) / "extract_z"
     outs = sorted(out_dir.glob("*_z*.tif"))

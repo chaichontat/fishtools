@@ -73,12 +73,12 @@ class Fiducial(BaseModel):
         description="Use FFT to find fiducial spots. Overrides everything else.",
     )
     fwhm: float = Field(
-        default=4.0,
+        default=4.5,
         gt=0.1,  # Must be positive
         description="Full width at half maximum for fiducial spot detection. The higher this is, the more spots will be detected.",
     )
     threshold: float = Field(
-        default=3.0,
+        default=4.0,
         gt=0.0,  # Must be positive
         description="Threshold for fiducial spot detection in standard deviation above the median.",
     )
@@ -90,7 +90,7 @@ class Fiducial(BaseModel):
         default=None,
         description="Overrides for fiducial spot detection. Name must match round name.",
     )
-    n_fids: int = Field(default=2, ge=1, description="Number of fiducial frames in each image.")
+    n_fids: int = Field(default=2, ge=0, description="Number of fiducial frames in each image.")
     detailed: FiducialDetailedConfig = Field(
         default_factory=FiducialDetailedConfig,
         description="Detailed fiducial processing parameters",
@@ -120,6 +120,11 @@ class RegisterConfig(BaseModel):
     reference: str = Field(default="4_12_20", description="Reference round to align others to.")
     # Moved from HardwareConfig - threads used specifically for registration
     threads: int = Field(default=15, description="Number of threads for registration operations")
+    gpu_affine: bool = Field(
+        default=False,
+        description=("Enable GPU-based shift/affine in registration (opt-in). Falls back to CPU on error."),
+    )
+
     discards: dict[str, list[str]] | None = Field(
         None,
         description="In case of duplicated key(s), discard the ones from the file in value.",

@@ -693,8 +693,8 @@ def multi_run(
     ref: str | Path | None,
     limit: int | None,
     backend: str = _PREPARE_DEFAULT_MODE.value,
-    histograms: bool = False,
     histogram_bins: int = 8192,
+    skip_quantized: bool = False,
     overwrite: bool,
     n_fids: int,
     basic_name: str,
@@ -711,6 +711,12 @@ def multi_run(
 
     mode = _normalize_mode(backend)
 
+    if skip_quantized and mode is DeconvolutionOutputMode.U16:
+        logger.info("multi_run: skip_quantized requested; switching backend to float32 outputs.")
+        mode = DeconvolutionOutputMode.F32
+
+    load_scaling = mode is DeconvolutionOutputMode.U16 and not skip_quantized
+
     ref_round = str(ref) if ref is not None else None
 
     failures = _plan_and_execute(
@@ -723,7 +729,7 @@ def multi_run(
         basic_name=basic_name,
         n_fids=n_fids,
         histogram_bins=histogram_bins,
-        load_scaling=True,
+        load_scaling=load_scaling,
         overwrite=overwrite,
         debug=debug,
         devices=list(devices),
@@ -919,6 +925,12 @@ def prepare(
     show_default=True,
     help="Stop all workers after the first failure.",
 )
+@click.option(
+    "--skip-quantized/--include-quantized",
+    default=False,
+    show_default=True,
+    help="Skip writing uint16 deliverables so quantize can run separately.",
+)
 def run(
     path: Path,
     round_name: str | None,
@@ -935,6 +947,7 @@ def run(
     debug: bool,
     devices: str,
     stop_on_error: bool,
+    skip_quantized: bool,
 ) -> None:
     """Run multi-GPU deconvolution across selected rounds and ROIs."""
     _configure_logging(debug, process_label="0")
@@ -970,6 +983,18 @@ def run(
 
     mode = _normalize_mode(backend)
 
+    if skip_quantized:
+        if mode is DeconvolutionOutputMode.U16:
+            logger.info(
+                "Skipping quantized deliverables; forcing float32 backend so "
+                "'preprocess deconv quantize' can run independently."
+            )
+            mode = DeconvolutionOutputMode.F32
+        else:
+            logger.info("Skipping quantized deliverables; float32 backend already active.")
+
+    load_scaling = mode is DeconvolutionOutputMode.U16 and not skip_quantized
+
     ref_token = ref_round
     if ref_token is not None and ref_token not in all_rounds:
         raise click.ClickException(f"Reference round '{ref_token}' not found in {path}.")
@@ -984,7 +1009,7 @@ def run(
         basic_name=basic_name,
         n_fids=n_fids,
         histogram_bins=histogram_bins,
-        load_scaling=True,
+        load_scaling=load_scaling,
         overwrite=overwrite,
         debug=debug,
         devices=device_list,

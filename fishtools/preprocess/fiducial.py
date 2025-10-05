@@ -405,18 +405,21 @@ def handle_exception(
     Returns:
         Adjusted (sigma, fwhm) parameters
     """
-    logger.warning(f"{exc.__class__.__name__}. σ threshold: {local_σ} FWHM: {local_fwhm}")
+    log_message = f"{exc.__class__.__name__}. σ threshold: {local_σ} FWHM: {local_fwhm}"
     if isinstance(exc, NotEnoughSpots):
+        logger.debug(log_message)
         if local_σ > min_threshold_sigma:
             local_σ -= threshold_step
         else:
             local_fwhm += threshold_step
     elif isinstance(exc, TooManySpots):
+        logger.warning(log_message)
         local_σ += threshold_step
         while (local_σ, local_fwhm) in tried:
             local_fwhm += threshold_step
             logger.warning(f"Trying with larger FWHM. σ threshold: {local_σ}, FWHM: {local_fwhm}")
     elif isinstance(exc, DriftTooLarge) or isinstance(exc, ResidualTooLarge):
+        logger.warning(log_message)
         local_σ += threshold_step
         if (local_σ, local_fwhm) in tried and local_fwhm >= min_fwhm:
             local_fwhm -= threshold_step
@@ -426,6 +429,7 @@ def handle_exception(
             logger.warning(f"Trying with smaller FWHM. σ threshold: {local_σ}, FWHM: {local_fwhm}")
 
     else:
+        logger.warning(log_message)
         raise exc
     return local_σ, local_fwhm
 
@@ -482,7 +486,7 @@ def individual_align_fiducial(
                     f"Too many spots ({len(fixed)} > {detailed_config.max_spots}) found on the reference image. Please increase threshold_sigma or reduce FWHM."
                 )
         except NotEnoughSpots:
-            logger.warning(
+            logger.debug(
                 "Not enough spots found on reference image. Trying to find spots with lower threshold."
             )
             thr -= detailed_config.threshold_step

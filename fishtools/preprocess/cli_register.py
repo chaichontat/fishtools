@@ -4,7 +4,7 @@ import subprocess
 from collections import defaultdict
 from itertools import chain
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Mapping, Sequence
 
 import line_profiler as line_profiler
 import numpy as np
@@ -18,6 +18,7 @@ from tifffile import TiffFile  # For test-time patching expectations
 from fishtools.gpu.memory import release_all as gpu_release_all
 from fishtools.io.image import Image
 from fishtools.io.workspace import Workspace
+from fishtools.preprocess import gpu_affine
 from fishtools.preprocess.chromatic import Affine
 from fishtools.preprocess.config import (
     Config,
@@ -30,7 +31,7 @@ from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
 from fishtools.utils.logging import setup_workspace_logging
-from fishtools.utils.pretty_print import progress_bar_threadpool
+from fishtools.utils.pretty_print import get_shared_console, progress_bar_threadpool
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
@@ -339,19 +340,17 @@ def _run(
     no_priors: bool = False,
 ):
     codebook_name = Path(codebook).stem
-    shift_json = _shift_json_path(path, roi, idx, codebook_name)
+    registered_path = path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif"
 
-    if not overwrite and shift_json.exists():
-        logger.info(f"Skipping {roi}/{idx:04d}: existing shift file at {shift_json.relative_to(path)}.")
+    if not overwrite and registered_path.exists():
+        logger.info(
+            f"Skipping {roi}/{idx:04d}: existing registered file at {registered_path.relative_to(path)}."
+        )
         return
 
     logger.info("Reading files")
     out_path = path / f"registered--{roi}+{codebook_name}"
     out_path.mkdir(exist_ok=True, parents=True)
-
-    if not overwrite and (out_path / f"reg-{idx:04d}.tif").exists():
-        logger.info(f"Skipping {idx}")
-        return
 
     # path_prevfids = out_path / "_fids" / f"_fids-{idx:04d}.tif"
     # if path_prevfids.exists():
@@ -499,7 +498,39 @@ def _run(
 
         # Within-tile alignment. Chromatic corrections.
         logger.debug(f"{bit}: before affine channel={c}, shiftpx={-bits_shifted[bit]}")
-        img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
+        # Optional GPU path
+        if config.registration.gpu_affine and (c in Affine.IGNORE or c == "560"):
+            try:
+                img = gpu_affine.translate_zyx_linear(
+                    img,
+                    (float(-bits_shifted[bit][0]), float(-bits_shifted[bit][1])),
+                    cval=100.0,
+                    use_gpu=True,
+                )
+            except Exception:
+                logger.opt(exception=True).debug("GPU translate failed; falling back to CPU.")
+                img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
+        elif config.registration.gpu_affine:
+            mat = As.get(c[-3:], None)
+            trans = ats.get(c[-3:], None)
+            if mat is None or trans is None:
+                img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
+            else:
+                try:
+                    img = gpu_affine.affine_zyx_linear(
+                        img,
+                        A=mat[:2, :2] if mat.shape == (3, 3) else mat,
+                        t=trans,
+                        shift_dy_dx=(float(-bits_shifted[bit][0]), float(-bits_shifted[bit][1])),
+                        cval=100.0,
+                        use_gpu=True,
+                    )
+                except Exception:
+                    logger.opt(exception=True).debug("GPU affine failed; falling back to CPU.")
+                    img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
+        else:
+            # CPU path for both reference and non-reference channels
+            img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
         crop = config.registration.crop
         downsample = config.registration.downsample
         if crop:
@@ -598,10 +629,11 @@ def register(): ...
 @click.option("--roi", type=str, default="*")
 @click.option("--reference", "-r", type=str, default="4_12_20")
 @click.option("--debug", is_flag=True)
-@click.option("--threshold", type=float, default=5.0)
+@click.option("--threshold", type=float, default=3.0)
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--overwrite", is_flag=True)
 @click.option("--no-priors", is_flag=True)
+@click.option("--gpu-affine", is_flag=True, help="Use GPU for shift/affine (opt-in)")
 @line_profiler.profile
 def run(
     path: Path,
@@ -614,6 +646,7 @@ def run(
     threshold: float = 6,
     fwhm: float = 4,
     no_priors: bool = False,
+    gpu_affine: bool = False,
 ):
     """Preprocess image sets before spot calling.
 
@@ -643,9 +676,16 @@ def run(
     codebook_name = codebook.stem
 
     for roi in rois:
-        shift_json = _shift_json_path(path, roi, idx, codebook_name)
-        if not overwrite and shift_json.exists():
-            logger.info(f"Skipping {roi}/{idx:04d}: existing shift file at {shift_json.relative_to(path)}.")
+        # Only skip when the final registered output exists. Relying on the
+        # presence of a shifts JSON alone can cause us to skip erroneously
+        # (e.g., after an interrupted run that wrote shifts but not the
+        # registered stack). Align behavior with the batch driver, which also
+        # checks for the registered output.
+        reg_path = path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif"
+        if not overwrite and reg_path.exists():
+            logger.info(
+                f"Skipping {roi}/{idx:04d}: existing registered file at {reg_path.relative_to(path)}."
+            )
             continue
         _run(
             path,
@@ -677,6 +717,7 @@ def run(
                     slices=slice(None),
                     reduce_bit_depth=0,
                     discards=None,
+                    gpu_affine=gpu_affine,
                 ),
             ),
             overwrite=overwrite,
@@ -741,7 +782,7 @@ def batch(
         with progress_bar_threadpool(len(idxs), threads=threads) as submit:
             for i in idxs:
                 submit(
-                    subprocess.run,
+                    _run_child_cli,
                     [
                         "preprocess",
                         "register",
@@ -755,6 +796,7 @@ def batch(
                         ref,
                         f"--roi={roi}",
                         *(["--overwrite"] if overwrite else []),
+                        # "--gpu-affine",
                     ],
                     check=True,
                 )
@@ -765,4 +807,48 @@ register.add_command(batch)
 if __name__ == "__main__":
     register()
 
-# %%
+
+def _run_child_cli(
+    argv: Sequence[str],
+    *,
+    check: bool = True,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[None]:
+    """Execute a CLI subprocess streaming output through the shared Console.
+
+    Streaming each line through ``get_shared_console`` keeps Rich's progress bar
+    rendering stable while the child command logs at INFO/DEBUG.  The helper is
+    intentionally synchronous—callers should dispatch it via the
+    ``progress_bar_threadpool`` when concurrency is required.
+    """
+
+    console = get_shared_console()
+    process = subprocess.Popen(
+        list(argv),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=cwd,
+        env=env,
+    )
+
+    try:
+        assert process.stdout is not None  # for mypy; PIPE guarantees stdout is set
+        for line in process.stdout:
+            if not line:
+                continue
+            console.print(line.rstrip("\n"), markup=False, soft_wrap=False)
+    except KeyboardInterrupt:
+        process.terminate()
+        raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+
+    returncode = process.wait()
+    if check and returncode:
+        raise subprocess.CalledProcessError(returncode, list(argv))
+
+    return subprocess.CompletedProcess(list(argv), returncode)

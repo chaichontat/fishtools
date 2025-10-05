@@ -10,6 +10,29 @@ import json
 import numpy as np
 import pytest
 import tifffile
+import cupy as cp
+
+
+def _install_cuda_stub() -> None:
+    runtime = types.SimpleNamespace(
+        getDeviceCount=lambda: 1,
+        CUDARuntimeError=RuntimeError,
+    )
+    dummy_stream = types.SimpleNamespace(synchronize=lambda: None)
+
+    def _event_factory():
+        return types.SimpleNamespace(record=lambda *args, **kwargs: None, synchronize=lambda: None)
+
+    cp.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
+        runtime=runtime,
+        get_current_stream=lambda: dummy_stream,
+        Event=lambda: _event_factory(),
+        get_elapsed_time=lambda start, end: 0.0,
+        Device=lambda _: types.SimpleNamespace(use=lambda: None),
+    )
+
+
+_install_cuda_stub()
 
 from fishtools.preprocess.cli_deconv import (
     DeconvolutionTileProcessor,
@@ -20,6 +43,7 @@ from fishtools.preprocess.cli_deconv import (
     multi_run,
     _DEFAULT_OUTPUT_MODE,
     parse_device_spec,
+    run,
     run_multi_gpu,
 )
 from fishtools.preprocess.deconv.backend import Float32HistBackend, OutputArtifacts, U16PrenormBackend
@@ -130,15 +154,18 @@ def minimal_workspace(tmp_path: Path) -> tuple[Path, str, str]:
 
 @pytest.fixture(autouse=True)
 def stub_cupy_cuda(monkeypatch):
-    import cupy as cp
-
-    runtime = types.SimpleNamespace(
-        getDeviceCount=lambda: 1,
-        CUDARuntimeError=RuntimeError,
-    )
-    cuda = types.SimpleNamespace(runtime=runtime)
-    monkeypatch.setattr(cp, "cuda", cuda, raising=False)
+    _install_cuda_stub()
+    monkeypatch.setattr(cp, "cuda", cp.cuda, raising=False)
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+
+
+def _workspace_with_tile(base: Path, *, round_name: str = "r1", roi: str = "roiA") -> Path:
+    workspace = base / "workspace"
+    tile_dir = workspace / f"{round_name}--{roi}"
+    tile_dir.mkdir(parents=True, exist_ok=True)
+    payload = np.zeros((1, 8, 8), dtype=np.uint16)
+    tifffile.imwrite(tile_dir / f"{round_name}-0000.tif", payload)
+    return workspace
 
 
 def test_parse_device_spec_auto(monkeypatch):
@@ -150,6 +177,103 @@ def test_parse_device_spec_subset(monkeypatch):
     monkeypatch.setattr("cupy.cuda.runtime.getDeviceCount", lambda: 4)
     os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
     assert parse_device_spec("0,2") == [0, 2]
+
+
+def test_run_skip_quantized_forces_float32(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = _workspace_with_tile(tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def _fake_plan_execute(**kwargs):
+        captured.update(mode=kwargs["mode"], load_scaling=kwargs["load_scaling"])
+        return []
+
+    monkeypatch.setattr("fishtools.preprocess.cli_deconv._plan_and_execute", _fake_plan_execute)
+
+    run.callback(
+        workspace,
+        "r1",
+        roi_name="*",
+        ref_round=None,
+        limit=None,
+        backend="u16",
+        histogram_bins=8192,
+        overwrite=False,
+        delete_origin=False,
+        n_fids=2,
+        basic_name="all",
+        debug=False,
+        devices="auto",
+        stop_on_error=True,
+        skip_quantized=True,
+    )
+
+    assert captured["mode"] is DeconvolutionOutputMode.F32
+    assert captured["load_scaling"] is False
+
+
+def test_run_float32_skips_scaling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = _workspace_with_tile(tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def _fake_plan_execute(**kwargs):
+        captured.update(mode=kwargs["mode"], load_scaling=kwargs["load_scaling"])
+        return []
+
+    monkeypatch.setattr("fishtools.preprocess.cli_deconv._plan_and_execute", _fake_plan_execute)
+
+    run.callback(
+        workspace,
+        "r1",
+        roi_name="*",
+        ref_round=None,
+        limit=None,
+        backend="float32",
+        histogram_bins=8192,
+        overwrite=False,
+        delete_origin=False,
+        n_fids=2,
+        basic_name="all",
+        debug=False,
+        devices="auto",
+        stop_on_error=True,
+        skip_quantized=False,
+    )
+
+    assert captured["mode"] is DeconvolutionOutputMode.F32
+    assert captured["load_scaling"] is False
+
+
+def test_multi_run_skip_quantized_switches_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    workspace = _workspace_with_tile(tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def _fake_plan_execute(**kwargs):
+        captured.update(mode=kwargs["mode"], load_scaling=kwargs["load_scaling"])
+        return []
+
+    monkeypatch.setattr("fishtools.preprocess.cli_deconv._plan_and_execute", _fake_plan_execute)
+
+    multi_run(
+        workspace,
+        "r1",
+        ref=None,
+        limit=None,
+        backend="u16",
+        histogram_bins=1024,
+        skip_quantized=True,
+        overwrite=True,
+        n_fids=0,
+        basic_name="all",
+        debug=False,
+        devices=[0],
+        stop_on_error=True,
+    )
+
+    assert captured["mode"] is DeconvolutionOutputMode.F32
+    assert captured["load_scaling"] is False
 
 
 def test_filter_pending_files_uint16(tmp_path: Path):

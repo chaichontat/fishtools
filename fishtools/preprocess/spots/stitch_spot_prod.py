@@ -11,6 +11,7 @@ from rtree import index
 from tifffile import imread
 
 from fishtools.analysis.spots import load_spots, load_spots_simple
+from fishtools.io.workspace import Workspace
 from fishtools.preprocess.stitching import (
     Cells,
     Crosses,
@@ -37,9 +38,7 @@ def _parse_filename(x: str):
 
 
 def load_coords(path: Path, roi: str):
-    coords = TileConfiguration.from_file(
-        Path(path.parent / f"stitch--{roi}" / "TileConfiguration.registered.txt")
-    ).df
+    coords = Workspace(path).tileconfig(roi).df
     if len(coords) != len(coords.unique(subset=["x", "y"], maintain_order=True)):
         logger.warning("Duplicates found in TileConfiguration.registered.txt")
         coords = coords.unique(subset=["x", "y"], maintain_order=True)
