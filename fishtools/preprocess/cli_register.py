@@ -173,7 +173,7 @@ class Image:
     bits: list[str]
     powers: dict[str, float]
     metadata: dict[str, Any]
-    global_deconv_scaling: np.ndarray
+    global_deconv_scaling: np.ndarray | None
     basic: Callable[[], dict[str, BaSiC] | None]
 
     CHANNELS = [f"ilm{n}" for n in ["405", "488", "560", "650", "750"]]
@@ -205,12 +205,13 @@ class Image:
                     metadata = tif.shaped_metadata[0]  # type: ignore
                 except IndexError:
                     metadata = tif.imagej_metadata
-            except (
-                IndexError
-            ) as e:  # tifffile throws IndexError if the file is truncated
+                # tifffile throws IndexError if the file is truncated
+            except IndexError as e:
                 raise Exception(
                     f"File {path} is corrupted. Please check the file."
                 ) from e
+            assert metadata is not None
+
         try:
             waveform = (
                 metadata["waveform"]
@@ -239,16 +240,20 @@ class Image:
                 f"{path}: Expected {len(bits)} channels, got {len(powers)}"
             )
 
-        try:
-            global_deconv_scaling = (
-                np.loadtxt(path.parent.parent / "deconv_scaling" / f"{name}.txt")
-                .astype(np.float32)
-                .reshape((2, -1))
-            )
-        except FileNotFoundError:
-            raise ValueError(
-                f"No deconv_scaling found for {name} and prenormalized not set."
-            )
+        prenormalized = metadata.get("prenormalized", False)
+        if not prenormalized:
+            try:
+                global_deconv_scaling = (
+                    np.loadtxt(path.parent.parent / "deconv_scaling" / f"{name}.txt")
+                    .astype(np.float32)
+                    .reshape((2, -1))
+                )
+            except FileNotFoundError:
+                raise ValueError(
+                    f"No deconv_scaling found for {name} and prenormalized not set."
+                )
+        else:
+            global_deconv_scaling = None
 
         nofid = img[:-n_fids].reshape(-1, len(powers), 2048, 2048)
 
@@ -262,7 +267,11 @@ class Image:
             keeps = list(sorted(set(range(len(bits))) - set(to_discard_idxs)))
             nofid = nofid[:, keeps]
             bits = [bits[i] for i in keeps]
-            global_deconv_scaling = global_deconv_scaling[:, keeps]
+            global_deconv_scaling = (
+                global_deconv_scaling[:, keeps]
+                if global_deconv_scaling is not None
+                else None
+            )
             assert len(_bits) == nofid.shape[1]
 
         path_basic = path.parent.parent / "basic" / f"{name}.pkl"
@@ -494,7 +503,7 @@ def _run(
 
     cb = json.loads(Path(codebook).read_text())
     bits_cb = set(chain.from_iterable(cb.values()))
-    # reference = config.registration.reference
+
     folders = {
         p
         for p in Path(path).glob(f"*--{roi}")
@@ -592,14 +601,19 @@ def _run(
         orig_name, orig_idx = bit_name_mapping[bit]
         img = collapse_z(img, config.registration.slices).astype(np.float32)
         metadata = imgs[orig_name].metadata
-        img = apply_deconv_scaling(
-            img,
-            idx=orig_idx,
-            orig_name=orig_name,
-            global_deconv_scaling=imgs[orig_name].global_deconv_scaling,
-            metadata=metadata,
-            debug=debug,
-        )
+
+        if not metadata.get("prenormalized"):
+            scaling = imgs[orig_name].global_deconv_scaling
+            assert scaling is not None
+            img = apply_deconv_scaling(
+                img,
+                idx=orig_idx,
+                orig_name=orig_name,
+                global_deconv_scaling=scaling,
+                metadata=metadata,
+                debug=debug,
+            )
+            del scaling
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.

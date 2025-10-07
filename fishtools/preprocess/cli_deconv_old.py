@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterable
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +32,6 @@ def deconv() -> None:
     """3D deconvolution workflows.
 
     Includes global quantization utilities accessible as:
-    - preprocess deconv precompute
-    - preprocess deconv quantize
     """
 
 
@@ -72,20 +71,128 @@ def scale_deconv(
     return np.clip(scaled, 0, 65534)
 
 
-def _compute_range(
+def _get_percentiles_for_round(
+    round_name: str,
+    default_perc_min: float,
+    default_perc_scale: float,
+    max_rna_bit: int,
+    override: dict[str, tuple[float, float]] | None = None,
+) -> tuple[list[float], list[float]]:
+    """Determines the percentile values for min and scale based on the round name components."""
+    percentile_mins: list[float] = []
+    percentile_scales: list[float] = []
+    override = override or {}
+
+    bits = round_name.split("_")
+    for bit in bits:
+        if bit in override:
+            min_val, scale_val = override[bit]
+            logger.info(f"Using override for bit '{bit}' to {override[bit]} in round '{round_name}'.")
+            percentile_mins.append(min_val)
+            percentile_scales.append(scale_val)
+            continue
+
+        is_rna_bit = (bit.isdigit() and int(bit) <= max_rna_bit) or re.match(r"^b\d{3}$", bit)
+        if not is_rna_bit:
+            # Protein staining often has bright flare spots.
+            logger.info(
+                f"Bit '{bit}' in round '{round_name}' is non-numeric or exceeds max_rna_bit ({max_rna_bit}). "
+                f"Using protein percentiles: min={PROTEIN_PERC_MIN}, scale={PROTEIN_PERC_SCALE}."
+            )
+        percentile_mins.append(PROTEIN_PERC_MIN if not is_rna_bit else default_perc_min)
+        percentile_scales.append(PROTEIN_PERC_SCALE if not is_rna_bit else default_perc_scale)
+    return percentile_mins, percentile_scales
+
+
+@deconv.command()
+@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
+@click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
+@click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
+@click.option("--overwrite", is_flag=True)
+@click.option("--override", type=str, multiple=True)
+@click.option("--max-rna-bit", type=int, default=36)
+def compute_range(
     path: Path,
-    round_: str,
-    *,
-    perc_min: float | list[float] = 0.1,
-    perc_scale: float | list[float] = 0.1,
+    perc_min: float = 0.1,
+    perc_scale: float = 0.1,
+    overwrite: bool = False,
+    max_rna_bit: int = 36,
+    override: list[str] | None = None,
 ):
-    """Backward-compatible wrapper around range_utils.compute_range_for_round."""
-    compute_range_for_round(
-        path,
-        round_,
-        perc_min=perc_min,
-        perc_scale=perc_scale,
-    )
+    """
+    Find the scaling factors of all images in the children sub-folder of `path`.
+    Run this on the entire workspace. See `_compute_range` for more details.
+
+    Args:
+        path: The root path containing round subdirectories (e.g., 'path/analysis/deconv').
+        perc_min: Default percentile for calculating the minimum intensity value for RNA bits.
+        perc_scale: Default percentile for calculating the scaling factor for RNA bits.
+        overwrite: If True, recompute and overwrite existing scaling files.
+        max_rna_bit: The maximum integer value considered an RNA bit. Others are treated differently (e.g., protein).
+    """
+    if "deconv" not in path.resolve().as_posix():
+        raise ValueError(f"This command must be run within a 'deconv' directory. Path provided: {path}")
+
+    ws = Workspace(path)
+    override = override or []
+    rounds = ws.rounds
+
+    available_bits = set(chain.from_iterable(round_name.split("_") for round_name in rounds))
+
+    try:
+        user_override_dict = {
+            (parts := v.split(","))[0]: (float(parts[1]), float(parts[2])) for v in override
+        }
+    except ValueError:
+        raise ValueError("Override must be in the format 'bit,min,scale'.")
+    del override
+
+    missing_bits = set(user_override_dict) - available_bits
+    if missing_bits:
+        raise ValueError("Overridden bits must exist.")
+
+    # override_dict = DEFAULT_PERCENTILE_OVERRIDES.copy()
+    # override_dict.update(user_override_dict)
+
+    logger.info(f"Found rounds: {rounds}")
+    scaling_dir = path / "deconv_scaling"
+    scaling_dir.mkdir(exist_ok=True)
+
+    for round_name in rounds:
+        scaling_file = scaling_dir / f"{round_name}.txt"
+        if not overwrite and scaling_file.exists():
+            logger.info(f"Scaling file for {round_name} already exists. Skipping.")
+            continue
+
+        # Skip rounds that do not have any deconvolution JSON sidecars
+        json_sidecars = list(path.glob(f"{round_name}*/*.deconv.json"))
+        if not json_sidecars:
+            logger.warning(
+                f"Skipping {round_name}: no '.deconv.json' files found under {path}. Expected for prenormalized tiles."
+            )
+            continue
+
+        try:
+            logger.info(f"Processing {round_name}")
+            percentile_mins, percentile_scales = _get_percentiles_for_round(
+                round_name, perc_min, perc_scale, max_rna_bit
+            )
+
+            compute_range_for_round(
+                path,
+                round_name,
+                perc_min=percentile_mins,
+                perc_scale=percentile_scales,
+            )
+
+        except FileNotFoundError:
+            logger.warning(f"No .tif files found for round {round_name} in {path}. Skipping.")
+        except AttributeError as e:
+            logger.error(f"Metadata error processing {round_name}: {e}. Skipping.")
+        except ValueError as e:
+            logger.error(f"Value error processing {round_name}: {e}. Skipping.")
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred while processing {round_name}: {e}. Skipping.")
 
 
 logger.remove()
