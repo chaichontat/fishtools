@@ -5,7 +5,6 @@ import sys
 import threading
 import time
 from collections.abc import Iterable
-from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -21,21 +20,14 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from fishtools.io.workspace import Workspace, get_channels, get_metadata
+from fishtools.preprocess.deconv.core import deconvolve_lucyrichardson_guo, load_projectors_cached
+from fishtools.preprocess.deconv.core import rescale as core_rescale
+from fishtools.preprocess.deconv.range_utils import compute_range_for_round
 from fishtools.utils.pretty_print import progress_bar
-from fishtools.preprocess.deconv.range_utils import (
-    DEFAULT_PERCENTILE_OVERRIDES as RANGE_DEFAULT_PERCENTILE_OVERRIDES,
-    compute_range_for_round,
-    get_percentiles_for_round,
-)
-from fishtools.preprocess.deconv.core import (
-    load_projectors_cached,
-    deconvolve_lucyrichardson_guo,
-    rescale as core_rescale,
-)
 
 
 @click.group()
-def deconvold() -> None:
+def deconv() -> None:
     """3D deconvolution workflows.
 
     Includes global quantization utilities accessible as:
@@ -384,7 +376,7 @@ def _safe_delete_origin_dirs(files: list[Path], out: Path) -> None:
     shutil.rmtree(src_dir)
 
 
-@deconvold.command()
+@deconv.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.argument("name", type=str)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
@@ -501,7 +493,7 @@ def run(
         )
 
 
-@deconvold.command()
+@deconv.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.option("--roi", type=str, default=None)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
@@ -652,4 +644,4 @@ def batch(
 
 
 if __name__ == "__main__":
-    deconvold()
+    deconv()

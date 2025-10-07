@@ -16,11 +16,11 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+import click
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import tifffile
-import click
 from loguru import logger
 from matplotlib.figure import Figure
 from rich.progress import (

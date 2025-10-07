@@ -192,11 +192,16 @@ class Workspace:
             path: Path to workspace root or any subdirectory within workspace
             deconved: Unused parameter (backward compatibility)
         """
-        path = Path(path).expanduser().resolve()
-        if "analysis/deconv" in path.as_posix():
-            self.path = path.parent.parent
-        else:
-            self.path = path
+        oripath = path = Path(path).expanduser().resolve()
+        stepped_up = 0
+        while True:
+            if stepped_up > 2:
+                raise ValueError(f"Path {oripath} is not a valid FISH experiment workspace.")
+            if any(p.suffix == ".DONE" for p in path.iterdir() if p.is_file()):
+                break
+            path = path.parent
+            stepped_up += 1
+        self.path = path
 
     @property
     def rounds(self) -> list[str]:
@@ -433,6 +438,32 @@ class Workspace:
 
         return mappings, missing
 
+    def registered_codebooks(self, *, rois: Iterable[str] | None = None) -> list[str]:
+        """Enumerate registered codebooks present in the workspace.
+
+        Args:
+            rois: Optional iterable of ROI identifiers to restrict the search.
+
+        Returns:
+            Sorted list of unique codebook identifiers discovered under
+            ``analysis/deconv/registered--{roi}+{codebook}``.
+        """
+
+        resolved_rois = self.resolve_rois(rois)
+        discovered: set[str] = set()
+
+        for roi in resolved_rois:
+            prefix = f"registered--{roi}+"
+            for entry in self.deconved.glob(f"{prefix}*"):
+                if not entry.is_dir():
+                    continue
+                _, _, suffix = entry.name.partition("+")
+                if not suffix:
+                    continue
+                discovered.add(suffix)
+
+        return sorted(discovered)
+
     @staticmethod
     def ensure_tiff_readable(path: Path) -> None:
         """Raise CorruptedTiffError if a TIFF file cannot be read."""
@@ -559,15 +590,47 @@ class Workspace:
             return self.deconved / f"stitch--{roi}"
         return self.deconved / f"stitch--{roi}+{codebook}"
 
+    def fids(self, roi: str) -> Path:
+        """Return path to fiducial marker directory for a given ROI."""
+
+        return self.deconved / f"fids--{roi}"
+
+    def fid(self, roi: str, idx: int | str) -> Path:
+        """Return path to a fiducial TIFF for the specified ROI and tile index."""
+
+        if isinstance(idx, int):
+            suffix = f"{idx:04d}"
+        else:
+            idx_str = str(idx)
+            suffix = f"{int(idx_str):04d}" if idx_str.isdigit() else idx_str
+        return self.fids(roi) / f"fids-{suffix}.tif"
+
+    def tile_positions_csv(self, roi: str, *, position_file: Path | None = None) -> Path:
+        """Resolve the CSV containing tile positions for a given ROI."""
+
+        if position_file is not None:
+            return position_file
+
+        candidates = [
+            self.deconved / f"{roi}.csv",
+            self.path / f"{roi}.csv",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        raise FileNotFoundError(
+            "Tile position CSV not found; provide --position_file or place "
+            f"{roi}.csv in {self.deconved} or {self.path}."
+        )
+
     def tileconfig_dir(self, roi: str) -> Path:
         """Return the ROI-level directory containing the TileConfiguration file.
-
-        Location: ``<workspace_root>/stitch--{roi}/``
 
         Note: This directory is separate from stitched outputs (which live
         under ``analysis/deconv/stitch--{roi}[+{codebook}]``).
         """
-        return self.path / f"stitch--{roi}"
+        return self.deconved / f"stitch--{roi}"
 
     def tileconfig(self, roi: str) -> "TileConfiguration":
         """Load the ROI-level TileConfiguration.
@@ -590,17 +653,13 @@ class Workspace:
             >>> config = ws.tileconfig('cortex')
             >>> print(config.tiles)  # Access tile positions
         """
-        # Primary (documented) location: workspace root
-        primary = self.tileconfig_dir(roi) / "TileConfiguration.registered.txt"
-        if primary.exists():
-            return TileConfiguration.from_file(primary)
+        file = self.deconved / f"stitch--{roi}" / "TileConfiguration.registered.txt"
+        if file.exists():
+            return TileConfiguration.from_file(file)
 
-        # Fallback: historical location under analysis/deconv
-        fallback = self.deconved / f"stitch--{roi}" / "TileConfiguration.registered.txt"
-        if fallback.exists():
-            return TileConfiguration.from_file(fallback)
-
-        raise FileNotFoundError("Haven't stitch/registered yet. Run preprocess stitch register first.")
+        raise FileNotFoundError(
+            f"No registered TileConfig found at {file}. Run preprocess stitch register first."
+        )
 
     def segment(self, roi: str, codebook: str) -> Path:
         """Return path to segmentation results directory.

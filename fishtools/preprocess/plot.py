@@ -108,12 +108,15 @@ def plot_tile_sizes(
         # Map indices to ranks and plot a hollow red square overlay
         sel_rr = rr[sel]
         sel_cc = cc[sel]
-        ax.scatter(sel_cc, sel_rr, s=100, facecolors="none", edgecolors=selected_color, linewidths=0.8, marker="s")
+        ax.scatter(
+            sel_cc, sel_rr, s=100, facecolors="none", edgecolors=selected_color, linewidths=0.8, marker="s"
+        )
 
     # Optionally annotate indices
     if annotate_mode != "none":
         try:
             import matplotlib.patheffects as pe
+
             effects = [pe.withStroke(linewidth=1.2, foreground="white")]
         except Exception:
             effects = None

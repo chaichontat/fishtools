@@ -26,10 +26,10 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 import SimpleITK as sitk
-import typer
 import zarr
 from loguru import logger
 from PIL import Image
+from skimage import filters
 from tifffile import imwrite
 
 try:  # pragma: no cover - exercised via monkeypatch in tests
@@ -48,10 +48,6 @@ from fishtools.utils.logging import setup_logging
 from fishtools.utils.pretty_print import progress_bar
 
 setup_logging()
-
-app = typer.Typer(
-    help="Run N4 bias-field correction against stitched mosaics and export the correction field."
-)
 
 DEFAULT_ITERATIONS: tuple[int, ...] = (50, 50, 30, 20)
 
@@ -123,6 +119,102 @@ def _ensure_float32(arr: np.ndarray) -> np.ndarray:
     return np.asarray(arr, dtype=np.float32)
 
 
+def _resolve_threshold_function(name: str) -> tuple[Callable[[np.ndarray], Any], str]:
+    """Return a skimage.filters threshold function and its resolved name."""
+
+    attr: Callable[[np.ndarray], Any] | None = None
+    resolved_name = name.strip()
+    if resolved_name:
+        attr = getattr(filters, resolved_name, None)
+        if attr is None and not resolved_name.startswith("threshold_"):
+            candidate = f"threshold_{resolved_name}"
+            attr = getattr(filters, candidate, None)
+            if attr is not None:
+                resolved_name = candidate
+    if attr is None or not callable(attr):
+        raise ValueError(
+            f"Unknown threshold method '{name}'. Available methods include: "
+            f"{', '.join(sorted(fn for fn in dir(filters) if fn.startswith('threshold_')))}"
+        )
+    return attr, resolved_name
+
+
+def _empty_mask_message(threshold: float | str | None, *, resolved_name: str | None = None) -> str:
+    if threshold is None:
+        return "Mask is empty after thresholding >0; check the selected channel."
+    if isinstance(threshold, (int, float)):
+        return f"Mask is empty after thresholding > {float(threshold)}; check the selected channel."
+    name = resolved_name if resolved_name is not None else str(threshold)
+    return f"Mask is empty after applying skimage.filters.{name}; check the selected channel."
+
+
+def _compute_threshold_mask(
+    image: np.ndarray,
+    threshold: float | str | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Generate a boolean foreground mask plus metadata for the chosen threshold."""
+
+    data = _ensure_float32(image)
+    data = np.where(np.isfinite(data), data, 0.0)
+
+    if threshold is None:
+        return data > 0.0, {"kind": "default_gt_zero", "value": 0.0}
+
+    if isinstance(threshold, (int, float)):
+        value = float(threshold)
+        return data > value, {"kind": "numeric", "value": value}
+
+    func, resolved_name = _resolve_threshold_function(str(threshold).strip())
+    threshold_result = func(data)
+    threshold_array = np.asarray(threshold_result, dtype=np.float32)
+
+    if threshold_array.shape not in [(), data.shape]:
+        raise ValueError(
+            "Threshold function '{name}' returned shape {returned}, expected scalar or {expected}.".format(
+                name=resolved_name,
+                returned=threshold_array.shape,
+                expected=data.shape,
+            )
+        )
+
+    if threshold_array.shape == ():
+        scalar_value = float(threshold_array)
+        meta: dict[str, Any] = {
+            "kind": "method",
+            "function": resolved_name,
+            "result": {"type": "scalar", "value": scalar_value},
+        }
+        mask = data > scalar_value
+    else:
+        finite = np.isfinite(threshold_array)
+        if not np.any(finite):
+            raise ValueError(
+                f"Threshold function '{resolved_name}' produced no finite values for the mask decision."
+            )
+        summary = {
+            "type": "array",
+            "min": float(np.nanmin(threshold_array)),
+            "max": float(np.nanmax(threshold_array)),
+        }
+        meta = {
+            "kind": "method",
+            "function": resolved_name,
+            "result": summary,
+        }
+        mask = data > threshold_array
+
+    return mask.astype(bool, copy=False), meta
+
+
+def _summarize_threshold_spec(threshold: float | str | None) -> dict[str, Any]:
+    if threshold is None:
+        return {"kind": "default_gt_zero", "value": 0.0}
+    if isinstance(threshold, (int, float)):
+        return {"kind": "numeric", "value": float(threshold)}
+    _, resolved_name = _resolve_threshold_function(str(threshold).strip())
+    return {"kind": "method", "function": resolved_name}
+
+
 QUANT_MAX_SAMPLES = 50_000
 
 
@@ -186,6 +278,7 @@ class N4RuntimeConfig:
     # or CLI option. Existing single-channel behavior remains unchanged.
     channels: tuple[int, ...] | None = None
     debug: bool = False
+    threshold: float | str | None = None
 
 
 @dataclass(slots=True)
@@ -590,6 +683,7 @@ def compute_correction_field(
     shrink: int,
     spline_lowres_px: float,
     iterations: Iterable[int] = DEFAULT_ITERATIONS,
+    threshold: float | str | None = None,
 ) -> np.ndarray:
     if image_yx.ndim != 2:
         raise ValueError(f"N4 expects a 2D YX image; received shape {image_yx.shape}")
@@ -615,11 +709,13 @@ def compute_correction_field(
     shrink_factors = [shrink] * img_full.GetDimension()
     img_small = sitk.Shrink(img_full, shrink_factors)
 
-    # Foreground/tissue mask on the small image
-    # Start with >0; optionally replace with Otsu on a blurred image for robustness.
-    mask_small = sitk.Cast(sitk.Greater(img_small, 0.0), sitk.sitkUInt8)
-    if np.asarray(sitk.GetArrayViewFromImage(mask_small)).sum() == 0:
-        raise ValueError("Mask is empty after thresholding >0; check the selected channel.")
+    # Foreground/tissue mask on the small image using the configured threshold.
+    mask_small_array, mask_small_meta = _compute_threshold_mask(sitk.GetArrayFromImage(img_small), threshold)
+    if not np.any(mask_small_array):
+        raise ValueError(_empty_mask_message(threshold, resolved_name=mask_small_meta.get("function")))
+    mask_small_image = sitk.GetImageFromArray(mask_small_array.astype(np.uint8, copy=False))
+    mask_small_image.CopyInformation(img_small)
+    mask_small = sitk.Cast(mask_small_image, sitk.sitkUInt8)
 
     n4 = sitk.N4BiasFieldCorrectionImageFilter()
     n4.SetMaximumNumberOfIterations(iters)
@@ -644,9 +740,9 @@ def compute_correction_field(
     field = sitk.GetArrayFromImage(sitk.Exp(log_bias_full)).astype(np.float32, copy=False)
 
     # Normalize field to ~1.0 on foreground
-    fg_mask = image_yx > 0
+    fg_mask, mask_meta = _compute_threshold_mask(image_yx, threshold)
     if not np.any(fg_mask):
-        raise ValueError("Mask is empty after thresholding >0; check the selected channel.")
+        raise ValueError(_empty_mask_message(threshold, resolved_name=mask_meta.get("function")))
     scale = float(np.nanmedian(field[fg_mask]))  # robust center
     if not np.isfinite(scale) or scale <= 0:
         scale = 1.0
@@ -908,6 +1004,7 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
             shrink=config.shrink,
             spline_lowres_px=config.spline_lowres_px,
             iterations=config.iterations,
+            threshold=config.threshold,
         )
 
         # Resolve channel tag from metadata (fallback to index)
@@ -928,6 +1025,7 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
             "spline_lowres_px": float(config.spline_lowres_px),
             "iterations": list(config.iterations),
             "z_index": (int(config.z_index) if config.z_index is not None else None),
+            "threshold": _summarize_threshold_spec(config.threshold),
         },
     }
     written_field = _write_multi_channel_field(
@@ -965,6 +1063,7 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
                 "spline_lowres_px": float(config.spline_lowres_px),
                 "iterations": list(config.iterations),
                 "z_index": (int(config.z_index) if config.z_index is not None else None),
+                "threshold": _summarize_threshold_spec(config.threshold),
             },
             output_path=corrected_output,
             debug=config.debug,
@@ -995,6 +1094,7 @@ def compute_field_from_workspace(config: N4RuntimeConfig) -> N4Result:
         shrink=config.shrink,
         spline_lowres_px=config.spline_lowres_px,
         iterations=config.iterations,
+        threshold=config.threshold,
     )
 
     # Write as multi-channel field (C=1) with consistent naming
@@ -1011,6 +1111,7 @@ def compute_field_from_workspace(config: N4RuntimeConfig) -> N4Result:
             "spline_lowres_px": float(config.spline_lowres_px),
             "iterations": list(config.iterations),
             "z_index": (int(config.z_index) if config.z_index is not None else None),
+            "threshold": _summarize_threshold_spec(config.threshold),
         },
     }
     written_field = _write_multi_channel_field(
@@ -1039,6 +1140,7 @@ def compute_field_from_workspace(config: N4RuntimeConfig) -> N4Result:
                 "spline_lowres_px": float(config.spline_lowres_px),
                 "iterations": list(config.iterations),
                 "z_index": (int(config.z_index) if config.z_index is not None else None),
+                "threshold": _summarize_threshold_spec(config.threshold),
             },
             output_path=corrected_output,
             debug=config.debug,
@@ -1047,61 +1149,27 @@ def compute_field_from_workspace(config: N4RuntimeConfig) -> N4Result:
     return N4Result(field_path=written_field, corrected_path=corrected_path)
 
 
-@app.command()
-def main(
-    workspace: Path = typer.Argument(..., exists=True, dir_okay=True, file_okay=False),
-    roi: str = typer.Argument(..., help="ROI name"),
-    codebook: str = typer.Option(..., "--codebook", help="Codebook used in the stitch path name."),
-    channels: str | None = typer.Option(
-        None,
-        "--channels",
-        help=(
-            "Comma-separated channel names to correct (case-insensitive). "
-            "Defaults to all channels. If channel names are unavailable, numeric indices are accepted."
-        ),
-    ),
-    shrink: int = typer.Option(4, min=1, help="Downsample factor applied before running N4."),
-    spline_lowres_px: float = typer.Option(
-        128.0,
-        help="Desired spline control-point spacing on the downsampled grid (in pixels).",
-    ),
-    z_index: int | None = typer.Option(
-        None,
-        help="Z index (0-based) of the plane used to compute the 2D N4 field (required).",
-    ),
-    output: Path | None = typer.Option(
-        None,
-        help="Optional output path for the multi-channel correction field (defaults to stitch/n4-fields).",
-    ),
-    corrected_output: Path | None = typer.Option(
-        None,
-        help="Optional output path for corrected imagery (defaults to 'fused_n4.zarr').",
-    ),
-    apply: bool = typer.Option(
-        True,
-        "--apply/--field-only",
-        help="Apply the correction field to imagery (enabled by default).",
-    ),
-    overwrite: bool = typer.Option(False, help="Overwrite outputs if they already exist."),
-    single_plane: bool = typer.Option(
-        False,
-        "--single-plane",
-        help="Only correct the single Z plane specified by --z-index (useful for debugging).",
-    ),
-    debug: bool = typer.Option(
-        False,
-        "--debug",
-        help="Write float32 debug outputs alongside quantized corrections.",
-    ),
-) -> None:
-    # Enforce the current algorithm's contract: we always compute the field from one Z plane.
+def run_cli_workflow(
+    *,
+    workspace: Path,
+    roi: str,
+    codebook: str,
+    channels: str | None,
+    shrink: int,
+    spline_lowres_px: float,
+    z_index: int | None,
+    threshold: str | None,
+    field_output: Path | None,
+    corrected_output: Path | None,
+    apply_correction: bool,
+    overwrite: bool,
+    single_plane: bool,
+    debug: bool,
+) -> list[N4Result]:
+    """Shared CLI workflow for Click- and Typer-based entrypoints."""
+
     if z_index is None:
-        typer.secho(
-            "Error: --z-index is required (field is computed from one Z plane).",
-            err=True,
-            fg=typer.colors.RED,
-        )
-        raise typer.Exit(code=1)
+        raise ValueError("--z-index is required (field is computed from one Z plane).")
 
     logger.info(
         "Invoked CLI with workspace={workspace}, roi={roi}, codebook={codebook}, channels={channels}",
@@ -1111,76 +1179,89 @@ def main(
         channels=channels,
     )
 
-    # Resolve fused path and channel names/count
     fused_path = _resolve_fused_path(workspace, roi, codebook)
     arr = zarr.open_array(fused_path, mode="r")
     if arr.ndim != 4:
-        typer.secho(
-            f"Error: expected fused.zarr to be 4D with axes ZYXC; got ndim={arr.ndim} and shape={arr.shape}",
-            err=True,
-            fg=typer.colors.RED,
+        raise ValueError(
+            f"Expected fused.zarr to be 4D with axes ZYXC; found ndim={arr.ndim} and shape={arr.shape}"
         )
-        raise typer.Exit(code=1)
+
     c_count = int(arr.shape[-1])
+    if c_count <= 0:
+        raise ValueError("fused.zarr reports zero channels; cannot compute N4 correction field.")
+
     name_list = _read_channel_names_from_zarr(fused_path) or [f"channel_{i}" for i in range(c_count)]
 
-    # Parse channel selection: default all; else match names case-insensitively
     if channels is None or not channels.strip():
-        selected_indices = list(range(c_count))
+        selected_indices: list[int] = list(range(c_count))
     else:
-        tokens = [t.strip() for t in channels.split(",") if t.strip()]
-        name_to_idx = {n.lower(): i for i, n in enumerate(name_list)}
-        selected_indices: list[int] = []
-        for t in tokens:
-            idx = name_to_idx.get(t.lower())
+        tokens = [token.strip() for token in channels.split(",") if token.strip()]
+        name_to_idx = {name.lower(): idx for idx, name in enumerate(name_list)}
+        selected_indices = []
+        for token in tokens:
+            idx = name_to_idx.get(token.lower())
             if idx is None:
-                # Fallback: allow numeric
                 try:
-                    idx = int(t)
-                except ValueError:
-                    typer.secho(
-                        f"Unknown channel '{t}'. Available: {', '.join(name_list)}",
-                        err=True,
-                        fg=typer.colors.RED,
+                    idx = int(token)
+                except ValueError as exc:
+                    available = (
+                        ", ".join(name_list) if name_list else ", ".join(str(i) for i in range(c_count))
                     )
-                    raise typer.Exit(code=1)
+                    raise ValueError(f"Unknown channel '{token}'. Available: {available}") from exc
             if idx < 0 or idx >= c_count:
-                typer.secho(f"Channel index out of range: {idx}", err=True, fg=typer.colors.RED)
-                raise typer.Exit(code=1)
+                raise ValueError(f"Channel index out of range: {idx}")
             if idx not in selected_indices:
                 selected_indices.append(idx)
+
+    if not selected_indices:
+        raise ValueError("No channels selected; specify --channels or ensure fused.zarr has channels.")
+
+    threshold_value: float | str | None = None
+    if threshold is not None and threshold.strip():
+        token = threshold.strip()
+        try:
+            numeric_value = float(token)
+        except ValueError:
+            try:
+                _resolve_threshold_function(token)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            threshold_value = token
+        else:
+            if not math.isfinite(numeric_value):
+                raise ValueError("Threshold must be a finite numeric value.")
+            threshold_value = numeric_value
 
     config = N4RuntimeConfig(
         workspace=workspace,
         roi=roi,
         codebook=codebook,
-        channel=selected_indices[0] if selected_indices else 0,
+        channel=selected_indices[0],
         shrink=shrink,
         spline_lowres_px=spline_lowres_px,
         z_index=z_index,
         iterations=DEFAULT_ITERATIONS,
-        field_output=output,
+        field_output=field_output,
         corrected_output=corrected_output,
-        apply_correction=apply,
+        apply_correction=apply_correction,
         overwrite=overwrite,
         correct_single_plane=single_plane,
         channels=tuple(selected_indices),
         debug=debug,
+        threshold=threshold_value,
     )
 
-    try:
-        results = compute_fields_from_workspace(config)
-    except Exception as exc:  # pragma: no cover - CLI convenience
-        logger.exception("N4 workflow failed")
-        typer.secho(f"Error: {exc}", err=True, fg=typer.colors.RED)
-        raise typer.Exit(code=1) from exc
-
-    # Single aggregate result
-    res = results[0]
-    typer.echo(f"Correction field saved to {res.field_path}")
-    if res.corrected_path is not None:
-        typer.echo(f"Corrected imagery saved to {res.corrected_path}")
+    return compute_fields_from_workspace(config)
 
 
-if __name__ == "__main__":
-    app()
+__all__ = [
+    "N4RuntimeConfig",
+    "N4Result",
+    "DEFAULT_ITERATIONS",
+    "compute_correction_field",
+    "compute_field_from_workspace",
+    "compute_fields_from_workspace",
+    "apply_correction_field",
+    "apply_correction_to_store",
+    "run_cli_workflow",
+]

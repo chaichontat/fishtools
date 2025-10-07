@@ -276,7 +276,7 @@ def _iter_registered_files(reg_dir: Path) -> Iterable[Path]:
     return files
 
 
-FILE_NAME = "fused.zarr"
+FILE_NAME = "fused_n4.zarr"
 ZARR_TILE_SIZE = 512
 
 

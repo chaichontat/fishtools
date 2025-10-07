@@ -241,14 +241,15 @@ def precompute_global_quantization(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Aggregate per-tile deconvolved histograms (CSV) into a global per-channel histogram,
-    compute (m_glob, s_glob), and write them to analysis/deconv/deconv_scaling/<round>.txt.
+    compute (m_glob, s_glob), and write them to analysis/deconv_scaling/<round>.txt.
 
     Returns:
         m_glob: (C,) float64
         s_glob: (C,) float64  (includes gamma)
     """
     path = Path(path)
-    scale_dir = path / "analysis" / "deconv32" / "deconv_scaling"
+    # Save global scaling outside deconv32 artifacts, at analysis/deconv_scaling
+    scale_dir = path / "analysis" / "deconv_scaling"
     scale_dir.mkdir(parents=True, exist_ok=True)
     out_txt = scale_dir / f"{round_name}.txt"
     out_json = scale_dir / f"{round_name}.json"
@@ -501,7 +502,7 @@ def quantize(
     workspace = workspace.resolve()
     logger.info(f"Workspace: {workspace}")
 
-    scaling_path = workspace / "analysis" / "deconv32" / "deconv_scaling" / f"{round_name}.txt"
+    scaling_path = workspace / "analysis" / "deconv_scaling" / f"{round_name}.txt"
     if not scaling_path.exists():
         raise click.ClickException(
             f"Scaling file not found at {scaling_path}. Run precompute_global_quantization first."
@@ -762,7 +763,7 @@ if __name__ == "__main__":
 
 
 def load_global_scaling(path: Path, round_name: str) -> tuple[np.ndarray, np.ndarray]:
-    scale_path = path / "analysis" / "deconv32" / "deconv_scaling" / f"{round_name}.txt"
+    scale_path = path / "analysis" / "deconv_scaling" / f"{round_name}.txt"
     if not scale_path.exists():
         raise FileNotFoundError(
             f"Missing global scaling at {scale_path}. Run 'multi_deconv prepare' to generate histogram scaling first."

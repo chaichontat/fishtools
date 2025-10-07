@@ -1,24 +1,25 @@
 # %%
 import json
+import pickle
 import subprocess
 from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Annotated, Any
 
-import line_profiler as line_profiler
 import numpy as np
 import rich_click as click
 import tifffile
+import toml
+from basicpy import BaSiC
 from loguru import logger
 from pydantic import ValidationError
+from scipy import ndimage
 from scipy.ndimage import shift
-from tifffile import TiffFile  # For test-time patching expectations
+from tifffile import TiffFile
 
-from fishtools.gpu.memory import release_all as gpu_release_all
-from fishtools.io.image import Image
-from fishtools.io.workspace import Workspace
-from fishtools.preprocess import gpu_affine
 from fishtools.preprocess.chromatic import Affine
 from fishtools.preprocess.config import (
     Config,
@@ -26,21 +27,14 @@ from fishtools.preprocess.config import (
     NumpyEncoder,
     RegisterConfig,
 )
-from fishtools.preprocess.deconv.core import PRENORMALIZED
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
-from fishtools.utils.logging import setup_workspace_logging
-from fishtools.utils.pretty_print import get_shared_console, progress_bar_threadpool
+from fishtools.utils.io import Workspace
+from fishtools.utils.logging import initialize_logger
+from fishtools.utils.pretty_print import progress_bar_threadpool
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
-
-
-def _shift_json_path(base: Path, roi: str, idx: int, codebook_name: str) -> Path:
-    """Return the expected shifts JSON path for a ROI/index/codebook trio."""
-
-    return base / f"shifts--{roi}+{codebook_name}" / f"shifts-{idx:04d}.json"
-
 
 if TYPE_CHECKING:
     pass
@@ -69,13 +63,11 @@ for λ in ["650", "750"]:
     ats[λ] = t
 
 
-@line_profiler.profile
 def spillover_correction(spillee: np.ndarray, spiller: np.ndarray, corr: float):
     scaled = spiller * corr
     return np.where(spillee >= scaled, spillee - scaled, 0)
 
 
-@line_profiler.profile
 def parse_nofids(
     nofids: dict[str, np.ndarray],
     shifts: dict[str, np.ndarray],
@@ -143,7 +135,6 @@ def sort_key(x: tuple[str, np.ndarray]) -> int | str:
         return x[0]
 
 
-@line_profiler.profile
 def apply_deconv_scaling(
     img: np.ndarray,
     *,
@@ -155,9 +146,11 @@ def apply_deconv_scaling(
 ) -> np.ndarray:
     """Apply deconvolution rescaling unless input is already prenormalized."""
 
-    if metadata.get(PRENORMALIZED):
+    if metadata.get("prenormalized"):
         if debug:
-            logger.debug(f"Skipping deconvolution scaling for {orig_name}: metadata prenormalized flag set.")
+            logger.debug(
+                f"Skipping deconvolution scaling for {orig_name}: metadata prenormalized flag set."
+            )
         return img
 
     return scale_deconv(
@@ -170,13 +163,152 @@ def apply_deconv_scaling(
     )
 
 
-__all__ = ["Image"]
+@dataclass
+class Image:
+    name: str
+    idx: int
+    nofid: np.ndarray
+    fid: np.ndarray
+    fid_raw: np.ndarray
+    bits: list[str]
+    powers: dict[str, float]
+    metadata: dict[str, Any]
+    global_deconv_scaling: np.ndarray
+    basic: Callable[[], dict[str, BaSiC] | None]
+
+    CHANNELS = [f"ilm{n}" for n in ["405", "488", "560", "650", "750"]]
+
+    @classmethod
+    def from_file(
+        cls,
+        path: Path,
+        *,
+        discards: dict[str, list[str]] | None = None,
+        n_fids: int = 1,
+    ):
+        stem = path.stem
+        name, idx = stem.split("-")
+        bits = name.split("_")
+        if discards is None:
+            discards = {}
+
+        to_discard_idxs = []
+        for k, v in discards.items():
+            if k in bits and name in v:
+                logger.debug(f"Discarding {k} (index {bits.index(k)}) from {stem}.")
+                to_discard_idxs.append(bits.index(k))
+
+        with TiffFile(path) as tif:
+            try:
+                img = tif.asarray()
+                try:
+                    metadata = tif.shaped_metadata[0]  # type: ignore
+                except IndexError:
+                    metadata = tif.imagej_metadata
+            except (
+                IndexError
+            ) as e:  # tifffile throws IndexError if the file is truncated
+                raise Exception(
+                    f"File {path} is corrupted. Please check the file."
+                ) from e
+        try:
+            waveform = (
+                metadata["waveform"]
+                if isinstance(metadata["waveform"], dict)
+                else json.loads(metadata["waveform"])
+            )
+        except KeyError:
+            waveform = toml.load(path.with_name(f"{path.name.split('-')[0]}.toml"))
+
+        counts = {key: sum(waveform[key]["sequence"]) for key in cls.CHANNELS}
+
+        # To remove ilm from, say, ilm405.
+
+        powers = {
+            key[3:]: waveform[key]["power"]
+            for key in cls.CHANNELS
+            if (key == "ilm405" and counts[key] > n_fids)
+            or (key != "ilm405" and counts[key])
+        }
+
+        if waveform.get("params"):
+            powers = waveform["params"]["powers"]
+
+        if len(powers) != len(bits):
+            raise ValueError(
+                f"{path}: Expected {len(bits)} channels, got {len(powers)}"
+            )
+
+        try:
+            global_deconv_scaling = (
+                np.loadtxt(path.parent.parent / "deconv_scaling" / f"{name}.txt")
+                .astype(np.float32)
+                .reshape((2, -1))
+            )
+        except FileNotFoundError:
+            raise ValueError(
+                f"No deconv_scaling found for {name} and prenormalized not set."
+            )
+
+        nofid = img[:-n_fids].reshape(-1, len(powers), 2048, 2048)
+
+        if to_discard_idxs:
+            _bits = name.split("_")
+            power_keys = list(powers.keys())
+            for _idx_d in to_discard_idxs:
+                _bits.pop(_idx_d)
+                del powers[power_keys[_idx_d]]
+            name = "_".join(_bits)
+            keeps = list(sorted(set(range(len(bits))) - set(to_discard_idxs)))
+            nofid = nofid[:, keeps]
+            bits = [bits[i] for i in keeps]
+            global_deconv_scaling = global_deconv_scaling[:, keeps]
+            assert len(_bits) == nofid.shape[1]
+
+        path_basic = path.parent.parent / "basic" / f"{name}.pkl"
+        if path_basic.exists():
+
+            def b():
+                basic = pickle.loads(path_basic.read_bytes())
+                return dict(zip(bits, basic.values()))
+
+            basic = b
+        else:
+            # raise Exception(f"No basic template found at {path_basic}")
+            basic = lambda: None
+
+        fids_raw = np.atleast_3d(img[-n_fids:]).max(axis=0)
+        return cls(
+            name=name,
+            idx=int(idx),
+            nofid=nofid,
+            fid=cls.loG_fids(fids_raw),
+            fid_raw=fids_raw,
+            bits=bits,
+            powers=powers,
+            metadata=metadata,
+            global_deconv_scaling=global_deconv_scaling,
+            basic=basic,
+        )
+
+    @staticmethod
+    def loG_fids(fid: np.ndarray):
+        if len(fid.shape) == 3:
+            fid = fid.max(axis=0)
+
+        temp = -ndimage.gaussian_laplace(fid.astype(np.float32).copy(), sigma=3)  # type: ignore
+        temp -= temp.min()
+        percs = np.percentile(temp, [1, 99.99])
+
+        if percs[1] - percs[0] == 0:
+            raise ValueError("Uniform image")
+        temp = (temp - percs[0]) / (percs[1] - percs[0])
+        return temp
 
 
-@line_profiler.profile
 def run_fiducial(
     path: Path,
-    fids: Annotated[dict[str, np.ndarray], "Dict of {name: yx image}"],
+    fids: dict[str, np.ndarray],
     codebook_name: str,
     config: Config,
     *,
@@ -190,12 +322,14 @@ def run_fiducial(
 
     prior_mapping: dict[str, str] = {}
 
-    configured_priors = dict(config.registration.fiducial.priors or {})
-    derived_priors: dict[str, tuple[float, float]] = {}
-
     if (
         not config.registration.fiducial.use_fft
-        and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
+        and len(
+            shifts_existing := sorted(
+                (path / f"shifts--{roi}+{codebook_name}").glob("*.json")
+            )
+        )
+        > 10
         and not no_priors
     ):
         _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
@@ -208,37 +342,24 @@ def run_fiducial(
             for name, shift_dict in shift_dicts.items():
                 if shift_dict.residual < 0.3:
                     _priors[name].append(shift_dict.shifts)
-        if _priors:
-            medianized = {
-                name: tuple(np.median(np.array(shifts), axis=0)) for name, shifts in _priors.items()
-            }
-            unmatched = {name for name in medianized if not any(fid.startswith(name) for fid in fids)}
-            if unmatched:
-                logger.debug(
-                    "Dropping %s derived priors without matching fid tiles: %s",
-                    len(unmatched),
-                    sorted(unmatched),
+        logger.debug(f"Using priors from {len(shifts_existing)} existing shifts.")
+        config.registration.fiducial.priors = {
+            name: tuple(np.median(np.array(shifts), axis=0))
+            for name, shifts in _priors.items()
+        }
+        logger.debug(config.registration.fiducial.priors)
+
+    if config.registration.fiducial.priors is not None:
+        for name, sh in config.registration.fiducial.priors.items():
+            for file in fids:
+                if file.startswith(name):
+                    fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
+                    prior_mapping[name] = file
+                    break
+            else:
+                raise ValueError(
+                    f"{idx}: Searched {list(fids.keys())}. Could not find file that starts with {name} for prior shift."
                 )
-            derived_priors = {name: shift for name, shift in medianized.items() if name not in unmatched}
-            logger.debug(
-                "Using priors derived from %s existing shifts: %s",
-                len(shifts_existing),
-                derived_priors,
-            )
-
-    effective_priors = configured_priors.copy()
-    effective_priors.update(derived_priors)
-
-    for name, sh in effective_priors.items():
-        for file in fids:
-            if file.startswith(name):
-                fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
-                prior_mapping[name] = file
-                break
-        else:
-            raise ValueError(
-                f"{idx}: Detected priors: {effective_priors}. Could not find file that starts with {name} for prior shift. "
-            )
 
     if config.registration.fiducial.overrides is not None:
         for name, sh in config.registration.fiducial.overrides.items():
@@ -249,7 +370,9 @@ def run_fiducial(
                     prior_mapping[name] = file
                     break
             else:
-                raise ValueError(f"Could not find file that starts with {name} for override shift.")
+                raise ValueError(
+                    f"Could not find file that starts with {name} for override shift."
+                )
 
     # Write reference fiducial
     (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
@@ -298,8 +421,8 @@ def run_fiducial(
             metadata={"axes": "CYX"},
         )
 
-    if effective_priors:
-        for name, sh in effective_priors.items():
+    if config.registration.fiducial.priors is not None:
+        for name, sh in config.registration.fiducial.priors.items():
             if (
                 not config.registration.fiducial.overrides
                 or name not in config.registration.fiducial.overrides
@@ -316,7 +439,9 @@ def run_fiducial(
             "residual": residuals[k],
             "corr": 1.0
             if reference == k
-            else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1],
+            else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[
+                0, 1
+            ],
         }
         for k in fids
     })
@@ -326,7 +451,6 @@ def run_fiducial(
     return shifts
 
 
-@line_profiler.profile
 def _run(
     path: Path,
     roi: str,
@@ -339,18 +463,13 @@ def _run(
     overwrite: bool = False,
     no_priors: bool = False,
 ):
-    codebook_name = Path(codebook).stem
-    registered_path = path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif"
-
-    if not overwrite and registered_path.exists():
-        logger.info(
-            f"Skipping {roi}/{idx:04d}: existing registered file at {registered_path.relative_to(path)}."
-        )
-        return
-
     logger.info("Reading files")
-    out_path = path / f"registered--{roi}+{codebook_name}"
+    out_path = path / f"registered--{roi}+{Path(codebook).stem}"
     out_path.mkdir(exist_ok=True, parents=True)
+
+    if not overwrite and (out_path / f"reg-{idx:04d}.tif").exists():
+        logger.info(f"Skipping {idx}")
+        return
 
     # path_prevfids = out_path / "_fids" / f"_fids-{idx:04d}.tif"
     # if path_prevfids.exists():
@@ -374,48 +493,45 @@ def _run(
     shifts = {}
 
     cb = json.loads(Path(codebook).read_text())
-    bits_cb = {str(bit) for bit in chain.from_iterable(cb.values())}
+    bits_cb = set(chain.from_iterable(cb.values()))
+    # reference = config.registration.reference
+    folders = {
+        p
+        for p in Path(path).glob(f"*--{roi}")
+        if p.is_dir()
+        and not any(
+            p.name.startswith(bad)
+            for bad in FORBIDDEN_PREFIXES + (config.exclude or [])
+        )
+        and set(p.name.split("--")[0].split("_"))
+        & set(map(str, bits_cb | set(reference.split("_"))))
+    }
 
-    ws = Workspace(path)
-    round_tokens = bits_cb | {token for token in reference.split("_") if token}
-    candidate_rounds = []
-    for round_name in ws.rounds:
-        tokens = set(ws._split_round_tokens(round_name))
-        if tokens & round_tokens and not any(round_name.startswith(bad) for bad in FORBIDDEN_PREFIXES):
-            candidate_rounds.append(round_name)
-
-    imgs: dict[str, Image] = {}
-    for round_name in candidate_rounds:
-        tile_path = ws.img(round_name, roi, idx)
-        if not tile_path.exists():
-            continue
-        img = Image.from_file(
-            tile_path,
+    # Convert file name to bit
+    _imgs: list[Image] = [
+        Image.from_file(
+            file,
             discards=config.registration and config.registration.discards,
             n_fids=config.registration.fiducial.n_fids,
         )
-        if any(round_name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or [])):
-            continue
-        imgs[img.name] = img
+        for file in chain.from_iterable(p.glob(f"*-{idx:04d}.tif") for p in folders)
+        if not any(
+            file.parent.name.startswith(bad)
+            for bad in FORBIDDEN_PREFIXES + (config.exclude or [])
+        )
+    ]
+    imgs = {img.name: img for img in _imgs}
+    del _imgs
 
     logger.debug(f"{len(imgs)} files: {list(imgs)}")
     if not imgs:
         raise FileNotFoundError(f"No files found in {path} with index {idx}")
 
-    available_bits = {str(bit) for img in imgs.values() for bit in img.bits}
-    missing_bits = sorted(bits_cb - available_bits)
-    if missing_bits:
-        raise FileNotFoundError(
-            "Missing registered tiles for bits "
-            f"{missing_bits} (ROI={roi}, index={idx:04d}). "
-            "Ensure required rounds are present under analysis/deconv."
-        )
-
     if not shifts:
         shifts = run_fiducial(
             path,
             {name: img.fid for name, img in imgs.items()},
-            codebook_name,
+            Path(codebook).stem,
             config,
             roi=roi,
             reference=reference,
@@ -433,16 +549,9 @@ def _run(
 
     channels: dict[str, str] = {}
     for img in imgs.values():
-        channels |= {str(bit): str(channel)[-3:] for bit, channel in zip(img.bits, img.powers)}
+        channels |= dict(zip(img.bits, [p[-3:] for p in img.powers]))
 
     assert all(v.isdigit() for v in channels.values())
-
-    missing_channels = [bit for bit in bits_cb if bit not in channels]
-    if missing_channels:
-        raise ValueError(
-            "Missing channel metadata for bits "
-            f"{sorted(missing_channels)}. Available bit channels: {sorted(channels)}"
-        )
 
     logger.debug(f"Channels: {channels}")
 
@@ -473,8 +582,9 @@ def _run(
     ref = None
 
     affine = Affine(As=As, ats=ats)
-    bits_cb_sorted = sorted(bits_cb & set(bits))
-    for i, bit in enumerate(bits_cb_sorted):
+    bits_cb = sorted(set(map(str, bits_cb)) & set(bits))
+    for i, bit in enumerate(bits_cb):
+        bit = str(bit)
         img = bits[bit]
         del bits[bit]
         c = str(channels[bit])
@@ -482,7 +592,6 @@ def _run(
         orig_name, orig_idx = bit_name_mapping[bit]
         img = collapse_z(img, config.registration.slices).astype(np.float32)
         metadata = imgs[orig_name].metadata
-
         img = apply_deconv_scaling(
             img,
             idx=orig_idx,
@@ -498,60 +607,20 @@ def _run(
 
         # Within-tile alignment. Chromatic corrections.
         logger.debug(f"{bit}: before affine channel={c}, shiftpx={-bits_shifted[bit]}")
-        # Optional GPU path
-        if config.registration.gpu_affine and (c in Affine.IGNORE or c == "560"):
-            try:
-                img = gpu_affine.translate_zyx_linear(
-                    img,
-                    (float(-bits_shifted[bit][0]), float(-bits_shifted[bit][1])),
-                    cval=100.0,
-                    use_gpu=True,
-                )
-            except Exception:
-                logger.opt(exception=True).debug("GPU translate failed; falling back to CPU.")
-                img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
-        elif config.registration.gpu_affine:
-            mat = As.get(c[-3:], None)
-            trans = ats.get(c[-3:], None)
-            if mat is None or trans is None:
-                img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
-            else:
-                try:
-                    img = gpu_affine.affine_zyx_linear(
-                        img,
-                        A=mat[:2, :2] if mat.shape == (3, 3) else mat,
-                        t=trans,
-                        shift_dy_dx=(float(-bits_shifted[bit][0]), float(-bits_shifted[bit][1])),
-                        cval=100.0,
-                        use_gpu=True,
-                    )
-                except Exception:
-                    logger.opt(exception=True).debug("GPU affine failed; falling back to CPU.")
-                    img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
-        else:
-            # CPU path for both reference and non-reference channels
-            img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
+        img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
         crop = config.registration.crop
         downsample = config.registration.downsample
         if crop:
             img = img[:, crop:-crop, crop:-crop]
 
         if downsample > 1:
-            try:
-                transformed_img = gpu_downsample_xy(
-                    img,
-                    crop=0,
-                    factor=downsample,
-                    clip_range=(0, 65534),
-                    output_dtype=np.uint16,
-                )
-            finally:
-                try:
-                    gpu_release_all()
-                except Exception:
-                    logger.opt(exception=True).debug(
-                        "GPU cleanup failed in cli_register downsample; continuing."
-                    )
+            transformed_img = gpu_downsample_xy(
+                img,
+                crop=0,
+                factor=downsample,
+                clip_range=(0, 65534),
+                output_dtype=np.uint16,
+            )
         else:
             transformed_img = np.clip(img, 0, 65534).astype(np.uint16)
 
@@ -623,18 +692,20 @@ def register(): ...
 
 
 @register.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path)
+)
 @click.argument("idx", type=int)
-@click.option("--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path))
+@click.option(
+    "--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path)
+)
 @click.option("--roi", type=str, default="*")
 @click.option("--reference", "-r", type=str, default="4_12_20")
 @click.option("--debug", is_flag=True)
-@click.option("--threshold", type=float, default=3.0)
+@click.option("--threshold", type=float, default=5.0)
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--overwrite", is_flag=True)
 @click.option("--no-priors", is_flag=True)
-@click.option("--gpu-affine", is_flag=True, help="Use GPU for shift/affine (opt-in)")
-@line_profiler.profile
 def run(
     path: Path,
     idx: int,
@@ -646,7 +717,6 @@ def run(
     threshold: float = 6,
     fwhm: float = 4,
     no_priors: bool = False,
-    gpu_affine: bool = False,
 ):
     """Preprocess image sets before spot calling.
 
@@ -659,34 +729,11 @@ def run(
         threshold: σ above median to call fiducial spots. Defaults to 6.
         fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
     """
-    # Workspace-scoped logging: write all logs (not progress bars) to
-    # {workspace}/analysis/logs/preprocess.register.log
-    setup_workspace_logging(
-        path,
-        component="preprocess.register",
-        idx=idx,
-        file=roi,
-        debug=debug,
-        # Console stays quiet unless --debug; file captures INFO+ by default
-        console_level="WARNING",
-        file_level="INFO",
-    )
+    initialize_logger(idx, debug)
 
     rois = get_rois(path, roi)
-    codebook_name = codebook.stem
 
     for roi in rois:
-        # Only skip when the final registered output exists. Relying on the
-        # presence of a shifts JSON alone can cause us to skip erroneously
-        # (e.g., after an interrupted run that wrote shifts but not the
-        # registered stack). Align behavior with the batch driver, which also
-        # checks for the registered output.
-        reg_path = path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif"
-        if not overwrite and reg_path.exists():
-            logger.info(
-                f"Skipping {roi}/{idx:04d}: existing registered file at {reg_path.relative_to(path)}."
-            )
-            continue
         _run(
             path,
             roi,
@@ -717,7 +764,6 @@ def run(
                     slices=slice(None),
                     reduce_bit_depth=0,
                     discards=None,
-                    gpu_affine=gpu_affine,
                 ),
             ),
             overwrite=overwrite,
@@ -747,12 +793,8 @@ def batch(
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
-    # Enable logging for the batch driver itself
-    setup_workspace_logging(path, component="preprocess.register.batch", file="batch")
     ws = Workspace(path.parent.parent)
-    logger.info(f"Found ROIs: {ws.rois}")
-
-    codebook_name = codebook.stem
+    logger.info(f"Found {ws.rois}")
 
     if ref is None:
         if "2_10_18" in ws.rounds:
@@ -766,23 +808,24 @@ def batch(
         names = sorted({name for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")})
         if not len(names):
             raise ValueError(f"No images found for {ref}--{roi}")
-        idxs: list[int] = []
-        for name in names:
-            idx = int(name.stem.split("-")[1])
-            if not overwrite:
-                reg_exists = (path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif").exists()
-                if reg_exists:
-                    continue
-            idxs.append(idx)
+        idxs = [
+            int(name.stem.split("-")[1])
+            for name in names
+            if overwrite
+            or not (
+                path
+                / f"registered--{roi}+{codebook.stem}/reg-{name.stem.split('-')[1]}.tif"
+            ).exists()
+        ]
 
         if not idxs:
-            logger.warning(f"Skipping {ref}--{roi}, all tiles are registered and --overwrite not given.")
+            logger.warning(f"Skipping {ref}--{roi}, already registered.")
             continue
 
         with progress_bar_threadpool(len(idxs), threads=threads) as submit:
             for i in idxs:
                 submit(
-                    _run_child_cli,
+                    subprocess.run,
                     [
                         "preprocess",
                         "register",
@@ -796,7 +839,6 @@ def batch(
                         ref,
                         f"--roi={roi}",
                         *(["--overwrite"] if overwrite else []),
-                        # "--gpu-affine",
                     ],
                     check=True,
                 )
@@ -807,48 +849,4 @@ register.add_command(batch)
 if __name__ == "__main__":
     register()
 
-
-def _run_child_cli(
-    argv: Sequence[str],
-    *,
-    check: bool = True,
-    cwd: Path | None = None,
-    env: Mapping[str, str] | None = None,
-) -> subprocess.CompletedProcess[None]:
-    """Execute a CLI subprocess streaming output through the shared Console.
-
-    Streaming each line through ``get_shared_console`` keeps Rich's progress bar
-    rendering stable while the child command logs at INFO/DEBUG.  The helper is
-    intentionally synchronous—callers should dispatch it via the
-    ``progress_bar_threadpool`` when concurrency is required.
-    """
-
-    console = get_shared_console()
-    process = subprocess.Popen(
-        list(argv),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        cwd=cwd,
-        env=env,
-    )
-
-    try:
-        assert process.stdout is not None  # for mypy; PIPE guarantees stdout is set
-        for line in process.stdout:
-            if not line:
-                continue
-            console.print(line.rstrip("\n"), markup=False, soft_wrap=False)
-    except KeyboardInterrupt:
-        process.terminate()
-        raise
-    finally:
-        if process.stdout is not None:
-            process.stdout.close()
-
-    returncode = process.wait()
-    if check and returncode:
-        raise subprocess.CalledProcessError(returncode, list(argv))
-
-    return subprocess.CompletedProcess(list(argv), returncode)
+# %%

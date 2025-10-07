@@ -60,15 +60,28 @@ def resolve_basic_paths(
     paths: list[Path] = []
     for channel in channels:
         primary: Path | None = None
+        # If the user provided a name explicitly, honor it (only that name).
         if basic_name:
             candidate = workspace / "basic" / f"{basic_name}-{channel}.pkl"
             if candidate.exists():
                 primary = candidate
-        if primary is None:
-            fallback = workspace / "basic" / f"{round_name}-{channel}.pkl"
-            if not fallback.exists():
-                raise FileNotFoundError(f"Missing BaSiC profile for channel {channel} in round {round_name}.")
-            primary = fallback
+            else:
+                raise FileNotFoundError(f"BaSiC profile not found: {candidate} (explicit --basic-name).")
+
+        else:
+            # Auto mode: prefer round-specific prefix, then fall back to 'all'.
+            preferred = workspace / "basic" / f"{round_name}-{channel}.pkl"
+            fallback_all = workspace / "basic" / f"all-{channel}.pkl"
+            if preferred.exists():
+                primary = preferred
+            elif fallback_all.exists():
+                primary = fallback_all
+            else:
+                raise FileNotFoundError(
+                    "Missing BaSiC profile for channel "
+                    f"{channel}: tried {preferred.name} then {fallback_all.name}."
+                )
+
         paths.append(primary)
         logger.debug(f"Loaded BaSiC profile for {channel} from {primary}")
     return paths

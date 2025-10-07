@@ -419,7 +419,11 @@ class DeconvolutionTileProcessor:
         plane_count = int(np.prod(payload.shape[:-2]))
         if plane_count % channels != 0:
             raise ValueError(
-                f"{path} has {plane_count} payload planes not divisible by {channels} BaSiC channel(s)."
+                (
+                    f"{path} has {plane_count} payload planes not divisible by {channels} BaSiC channel(s). "
+                    "This typically indicates a channel inference mismatch. Verify TIFF metadata (waveform→params→powers) "
+                    "and fallback logic, or pass the correct --basic-name so that the number of BaSiC profiles matches the data."
+                )
             )
 
         try:
