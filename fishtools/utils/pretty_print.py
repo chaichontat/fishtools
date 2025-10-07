@@ -283,6 +283,7 @@ def progress_bar_threadpool(
                     task_args = getattr(f, "_args", "N/A")
                     task_kwargs = getattr(f, "_kwargs", "N/A")
                     logger.error(f"Task raised an exception: {e} (args={task_args}, kwargs={task_kwargs})")
+                    logger.exception(e)
                     exceptions_encountered.append(e)
 
                     if stop_on_exception:
