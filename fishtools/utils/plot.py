@@ -1,8 +1,9 @@
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
-import cmocean  # colormap, do not remove
-import colorcet as cc  # colormap, do not remove
+import cmocean  # colormap, do not remove  # noqa: F401
+import colorcet as cc  # colormap, do not remove  # noqa: F401
 import matplotlib as mpl
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
@@ -188,6 +189,7 @@ def add_scale_bar(
     font_size: int | None = None,
     color: str = "black",
     label_top: bool = False,
+    **kwargs: Any,
 ) -> Axes:
     """
     Adds a scale bar to a matplotlib Axes object.
@@ -233,9 +235,66 @@ def add_scale_bar(
         color=color,
         fontproperties=fontprops,
         label_top=label_top,
+        **kwargs,
     )
     ax.add_artist(scalebar)
     return ax
+
+
+def scatter_spots(
+    ax: Axes,
+    spots_df: pl.DataFrame,
+    *,
+    x_col: str,
+    y_col: str,
+    max_points: int | None = None,
+    point_size: float = 0.1,
+    alpha: float = 0.3,
+    include_scale_bar: bool = False,
+    scale_bar_length: float | None = None,
+    scale_bar_label: str | None = None,
+    title: str | None = None,
+    empty_message: str = "No spots",
+    facecolor: str | None = None,
+) -> None:
+    """Render a downsampled scatter of spots on the provided axis."""
+    ax.set_aspect("equal")
+    # ax.axis("off")
+
+    total_spots = spots_df.height
+    if total_spots == 0:
+        ax.text(
+            0.5,
+            0.5,
+            empty_message,
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            color=DARK_PANEL_STYLE["text.color"],
+        )
+        if title:
+            ax.set_title(title, color=DARK_PANEL_STYLE["axes.titlecolor"])
+        return
+
+    stride = 1
+    if max_points is not None and max_points > 0:
+        stride = max(1, math.ceil(total_spots / max_points))
+
+    x_data = spots_df[x_col].to_numpy()[::stride]
+    y_data = spots_df[y_col].to_numpy()[::stride]
+    scatter = ax.scatter(x_data, y_data, s=point_size, alpha=alpha)
+    if facecolor is not None:
+        scatter.set_facecolor(facecolor)
+
+    if include_scale_bar:
+        if scale_bar_length is None or scale_bar_label is None:
+            raise ValueError(
+                "scale_bar_length and scale_bar_label are required when include_scale_bar is True."
+            )
+        add_scale_bar(ax, scale_bar_length, scale_bar_label)
+
+    if title:
+        ax.set_title(title, color=DARK_PANEL_STYLE["axes.titlecolor"])
 
 
 def _generate_hsv_colors(n_colors: int, start_idx: int = 0):

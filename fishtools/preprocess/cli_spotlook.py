@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,8 +26,8 @@ from fishtools.preprocess.config import SpotThresholdParams
 from fishtools.utils.logging import configure_cli_logging, initialize_logger
 from fishtools.utils.plot import (
     DARK_PANEL_STYLE,
-    add_scale_bar,
     configure_dark_axes,
+    scatter_spots,
     si_tick_formatter,
 )
 
@@ -59,13 +60,26 @@ class ThresholdCurve:
 
 @dataclass(slots=True)
 class ROIThresholdContext:
-    """Cached per-ROI artifacts between the preparation and execution phases."""
+    """Cached per-ROI artifacts between the preparation and execution phases.
+
+    Columns expected in ``spots`` and ``spots_final``
+    - ``x``, ``y``: global mosaic pixel coordinates (preferred for spatial plots).
+    - ``x_local``, ``y_local``: tile‑local coordinates (may be present from loaders).
+    - ``area``: connected‑component area in pixels.
+    - ``norm``: L2 norm of spot intensity vector across rounds×channels.
+    - ``distance``: decode metric distance to the assigned target.
+    - ``target``: decoded gene label; blanks typically start with ``"Blank"``.
+    - ``x_``, ``y_``: feature‑space axes created by spotlook for thresholding;
+      not spatial (see ``_apply_initial_filters`` for definitions).
+    - Additional columns like ``bit0``, ``bit1`` may appear after codebook join.
+    """
 
     spots: pl.DataFrame
     contours: QuadContourSet
     interpolator: RegularGridInterpolator
     curve: ThresholdCurve
     artifact_paths: dict[str, Path | None]
+    spots_final: pl.DataFrame | None = None  # Filled after final filtering
 
 
 def build_spotlook_params(
@@ -118,7 +132,22 @@ def create_shimmer_text(text: str, style: str = "cyan") -> Text:
 
 
 def count_by_gene(spots: pl.DataFrame) -> pl.DataFrame:
-    """Counts spots per gene, adding metadata for plotting."""
+    """
+    Count spots per target and attach plotting metadata.
+
+    Input expectations
+    - ``spots`` contains at least ``target`` and optionally codebook join columns
+      (``bit0``, ``bit1``, ``bit2``).
+
+    Output columns
+    - ``target`` (Utf8): Target/gene.
+    - ``count`` (UInt32): Number of spots for the target.
+    - ``bit0``, ``bit1``, ``bit2`` (UInt8): First observed bit/channel ids for
+      this target (copied from joined codebook; may be null if join not present).
+    - ``is_blank`` (Boolean): True when target name starts with ``"Blank"``.
+    - ``color`` (Utf8): Convenience color label (``"red"`` for blanks,
+      ``"blue"`` otherwise) for scree plots.
+    """
     return (
         spots.group_by("target")
         .agg([
@@ -139,6 +168,80 @@ def save_figure(fig: Figure, output_dir: Path, name: str, roi: str, codebook: st
     fig.savefig(filename.as_posix(), dpi=300, bbox_inches="tight")
     logger.debug(f"Saved plot: {filename}")
     plt.close(fig)
+
+
+def _save_combined_spots_plot(
+    contexts: dict[str, ROIThresholdContext],
+    output_dir: Path,
+    codebook: str,
+    params: SpotThresholdParams,
+) -> Path | None:
+    """Create a grid of downsampled spot plots across ROIs."""
+    if not contexts:
+        raise ValueError("No ROIs available to plot.")
+
+    n_rois = len(contexts)
+    grid = int(math.ceil(math.sqrt(n_rois)))
+    n_cols = max(1, min(grid, 12))
+    n_rows = int(math.ceil(n_rois / n_cols))
+
+    fig_width = 4 * n_cols
+    fig_height = 4 * n_rows
+
+    logger.debug(
+        "CombSpots grid: rois=%d, rows=%d, cols=%d, size=(%.2f in, %.2f in) @ %d dpi (~%dx%d px)",
+        n_rois,
+        n_rows,
+        n_cols,
+        fig_width,
+        fig_height,
+        params.dpi,
+        int(fig_width * params.dpi),
+        int(fig_height * params.dpi),
+    )
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height), dpi=params.dpi)
+    axes = np.atleast_1d(axes).ravel()
+    ordered_rois = sorted(contexts)
+
+    scale_bar_length = params.scale_bar_um / params.pixel_size_um
+
+    for idx, (ax, roi) in enumerate(zip(axes, ordered_rois)):
+        ctx = contexts[roi]
+        # Prefer final filtered spots; fall back to pre-threshold if needed (tests/mock contexts)
+        spots = ctx.spots_final if ctx.spots_final is not None else ctx.spots
+        title = f"Filtered spots for {roi} (n={spots.height:,})"
+        # Use the same spatial orientation as the single-ROI plot
+        x_col = "y" if "y" in spots.columns else "y_"
+        y_col = "x" if "x" in spots.columns else "x_"
+        scatter_spots(
+            ax,
+            spots,
+            x_col=x_col,
+            y_col=y_col,
+            max_points=params.subsample,
+            include_scale_bar=(idx == 0),
+            scale_bar_length=scale_bar_length if idx == 0 else None,
+            scale_bar_label=f"{params.scale_bar_um} μm" if idx == 0 else None,
+            title=title,
+        )
+
+    for ax in axes:
+        if not ax.has_data():
+            fig.delaxes(ax)
+
+    fig.suptitle(f"Spots Overview — {codebook}", color=DARK_PANEL_STYLE["axes.titlecolor"])
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+    combined_path = (output_dir / f"spots_all--{codebook}.png").resolve()
+    # Clamp DPI to avoid exceeding Agg backend limits (~65535 px on a side)
+    max_inches = max(fig_width, fig_height)
+    max_safe_dpi = int(65535 // max(1, max_inches))
+    save_dpi = min(int(params.dpi), max_safe_dpi)
+    fig.savefig(combined_path.as_posix(), dpi=save_dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.debug(f"Saved combined spots overview: {combined_path}")
+    return combined_path
 
 
 def _label_contour_levels(contour_set: QuadContourSet, max_level_index: int = 10) -> None:
@@ -205,7 +308,18 @@ def _render_hexbin_panel(
 
 
 def _load_spots_data(path: Path, roi: str, codebook: Codebook) -> pl.DataFrame | None:
-    """Loads spot data from a parquet file for a single ROI."""
+    """
+    Load decoded spots for a ROI and enrich with convenience columns.
+
+    Adds
+    - ``roi`` (Utf8): The ROI identifier used to load the file.
+    - ``is_blank`` (Boolean): Targets flagged by name (``startswith("Blank")``).
+    - ``bit0``/``bit1``/``bit2`` (UInt8): From the codebook join on ``target``.
+
+    Passes through the core spatial/QC columns that exist in the parquet, e.g.,
+    ``x``, ``y``, ``z``, ``area``, ``distance``, ``norm``, ``tile``,
+    ``passes_thresholds`` (see module ``fishtools.analysis.spots``).
+    """
     spots_path = path / f"registered--{roi}+{codebook.name}" / f"decoded-{codebook.name}" / "spots.parquet"
     if not spots_path.exists():
         logger.warning(f"Spots file not found for ROI {roi}, skipping: {spots_path}")
@@ -227,7 +341,19 @@ def _apply_initial_filters(
     rng: np.random.Generator,
     params: SpotThresholdParams,
 ) -> pl.DataFrame:
-    """Applies initial area/norm filters and engineers features for density analysis."""
+    """
+    Apply basic filters and add feature-space axes used for density analysis.
+
+    Returns a DataFrame that includes two engineered columns:
+    - ``x_`` = ``area ** (1/3)`` plus small jitter (feature-space, not spatial)
+    - ``y_`` = ``log10(norm * (1 - distance))`` (feature-space)
+
+    Important
+    - These ``x_``/``y_`` columns are not tile-local pixel coordinates. Tile-local
+      spatial coordinates, when present in decoded data produced by
+      ``preprocess spots batch``/``stitch``, are named ``x_local`` and
+      ``y_local``. Global mosaic coordinates are named ``x`` and ``y``.
+    """
     logger.debug("Applying initial filters and engineering features...")
     spots_ = spots.filter(
         pl.col("area").is_between(params.area_min, params.area_max) & pl.col("norm").gt(params.norm_threshold)
@@ -320,7 +446,9 @@ def _calculate_density_map(
         removed = before - binned_counts.height
         if removed:
             logger.debug(
-                "Removed %d sparse bins (< %d spots) before smoothing", removed, params.min_spots_per_bin
+                "Removed %d sparse bins (< %d spots) before smoothing",
+                removed,
+                params.min_spots_per_bin,
             )
 
     Z = np.zeros_like(X, dtype=float)
@@ -388,7 +516,10 @@ def _create_spots_contours_figure(
         )
         return
 
-    with sns.axes_style("dark", rc=DARK_PANEL_STYLE), sns.plotting_context(rc={"axes.titlesize": 14}):
+    with (
+        sns.axes_style("dark", rc=DARK_PANEL_STYLE),
+        sns.plotting_context(rc={"axes.titlesize": 14}),
+    ):
         fig, axes = plt.subplots(
             1,
             2,
@@ -465,7 +596,13 @@ def _save_threshold_plot(
     """Persist the per-ROI threshold selection plot."""
     sns.set_theme()
     fig_thresh, ax1 = plt.subplots(figsize=params.figsize_thresh, dpi=params.dpi)
-    ax1.plot(curve.levels, curve.spot_counts, color="g", linestyle="-", label="Remaining Spots")
+    ax1.plot(
+        curve.levels,
+        curve.spot_counts,
+        color="g",
+        linestyle="-",
+        label="Remaining Spots",
+    )
     ax1.set_xlabel("Threshold Contour Level")
     ax1.set_ylabel("Number of Spots", color="g")
     ax1.tick_params(axis="y", labelcolor="g")
@@ -474,7 +611,13 @@ def _save_threshold_plot(
     ax1.set_ylim(0, None)  # type: ignore[arg-type]
 
     ax2 = ax1.twinx()
-    ax2.plot(curve.levels, curve.blank_proportions, color="r", linestyle="--", label="Blank Proportion")
+    ax2.plot(
+        curve.levels,
+        curve.blank_proportions,
+        color="r",
+        linestyle="--",
+        label="Blank Proportion",
+    )
     ax2.set_ylabel("Blank Proportion", color="r")
     ax2.tick_params(axis="y", labelcolor="r")
 
@@ -510,7 +653,14 @@ def _save_combined_threshold_plot(
 
     style_handles = [
         Line2D([0], [0], color="gray", linestyle="-", linewidth=2, label="Remaining Spots"),
-        Line2D([0], [0], color="gray", linestyle="--", linewidth=2, label="Blank Proportion"),
+        Line2D(
+            [0],
+            [0],
+            color="gray",
+            linestyle="--",
+            linewidth=2,
+            label="Blank Proportion",
+        ),
     ]
 
     ax1.set_xlabel("Threshold Contour Level")
@@ -518,15 +668,16 @@ def _save_combined_threshold_plot(
     # Apply SI-prefix formatting without spaces and without unnecessary trailing .0
     ax1.yaxis.set_major_formatter(si_tick_formatter())
     ax2.set_ylabel("Blank Proportion")
+    ax1.set_ylim(bottom=0)
     ax1.set_title(f"Threshold Selection Curves | Codebook {codebook}")
 
     legend1 = ax1.legend(handles=roi_handles, title="ROI", loc="upper right")
-    legend2 = ax1.legend(handles=style_handles, title=None, loc="lower right")
+    ax1.legend(handles=style_handles, title=None, loc="lower right")
     ax1.add_artist(legend1)
 
     fig.tight_layout()
     combined_path = (output_dir / f"threshold_selection_all+{codebook}.png").resolve()
-    fig.savefig(combined_path.as_posix(), dpi=300, bbox_inches="tight")
+    fig.savefig(combined_path.as_posix(), dpi=params.dpi, bbox_inches="tight")
     plt.close(fig)
     logger.debug(f"Saved plot: {combined_path}")
     return combined_path
@@ -592,9 +743,18 @@ def _prompt_threshold_levels(
 
 
 def _apply_final_filter(
-    spots_: pl.DataFrame, interp_func: RegularGridInterpolator, contours: QuadContourSet, threshold_level: int
+    spots_: pl.DataFrame,
+    interp_func: RegularGridInterpolator,
+    contours: QuadContourSet,
+    threshold_level: int,
 ) -> pl.DataFrame:
-    """Applies the final density-based filter to the spot data."""
+    """Apply the final density-based filter to the spot data.
+
+    Temporary columns
+    - ``point_density``: interpolated density value at each spot in feature
+      space (based on ``x_``, ``y_``); added for filtering and dropped in the
+      saved parquet.
+    """
     logger.debug(f"Applying final filter at threshold level: {threshold_level}")
     final_threshold_value = contours.levels[threshold_level]  # type: ignore
     point_densities = interp_func(spots_.select(["y_", "x_"]).to_numpy())
@@ -609,18 +769,29 @@ def _apply_final_filter(
 
 
 def _generate_final_outputs(
-    spots_ok: pl.DataFrame, output_dir: Path, roi: str, codebook: str, params: SpotThresholdParams
+    spots_ok: pl.DataFrame,
+    output_dir: Path,
+    roi: str,
+    codebook: str,
+    params: SpotThresholdParams,
 ):
     """Generates all final plots and saves the filtered data for a single ROI."""
     logger.debug("Generating final plots and saving data...")
     # Final Spots Spatial Plot
     fig_spots, ax = plt.subplots(figsize=params.figsize_spots, dpi=params.dpi)
-    subsample = max(1, len(spots_ok) // params.subsample)
-    ax.scatter(spots_ok["y"][::subsample], spots_ok["x"][::subsample], s=0.1, alpha=0.3)
-    ax.set_aspect("equal")
-    ax.axis("off")
-    add_scale_bar(ax, params.scale_bar_um / params.pixel_size_um, f"{params.scale_bar_um} μm")
-    ax.set_title(f"Filtered Spots for ROI {roi} (n={len(spots_ok):,})")
+    x_col = "y" if "y" in spots_ok.columns else "y_"
+    y_col = "x" if "x" in spots_ok.columns else "x_"
+    scatter_spots(
+        ax,
+        spots_ok,
+        x_col=x_col,
+        y_col=y_col,
+        max_points=params.subsample,
+        include_scale_bar=True,
+        scale_bar_length=params.scale_bar_um / params.pixel_size_um,
+        scale_bar_label=f"{params.scale_bar_um} μm",
+        title=f"Filtered spots for {roi} (n={len(spots_ok):,})",
+    )
     save_figure(fig_spots, output_dir, "spots_final", roi, codebook)
 
     # Save blank counts
@@ -646,7 +817,8 @@ def _generate_final_outputs(
     ax_scree.set_xlabel("Gene")
     ax_scree.set_ylabel("Count (log scale)")
     ax_scree.set_title(
-        f"Gene Counts for {codebook} | ROI {roi} (n={total_spots:,}, {blank_prop:.1%} blank)", loc="left"
+        f"{codebook} | ROI {roi} (n={total_spots:,}, {blank_prop:.2%} blank)",
+        loc="left",
     )
     fig_scree.tight_layout()
     save_figure(fig_scree, output_dir, "scree_final", roi, codebook)
@@ -664,7 +836,12 @@ def _generate_final_outputs(
 @click.argument(
     "path",
     type=click.Path(
-        exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True, path_type=Path
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+        path_type=Path,
     ),
 )
 @click.option(
@@ -672,7 +849,12 @@ def _generate_final_outputs(
     "-c",
     "codebook_path",
     type=click.Path(
-        exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True, path_type=Path
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+        path_type=Path,
     ),
     required=True,
     help="Name of the codebook (stem of the .json file).",
@@ -855,11 +1037,13 @@ def threshold(
 
         logger.debug(f"Applying final density-based filter at level {chosen_level} for ROI {roi}...")
         logger.debug("Interpolating densities for %d candidate spots", len(ctx.spots))
-        spots_final = _apply_final_filter(ctx.spots, ctx.interpolator, ctx.contours, chosen_level)
+        ctx.spots_final = _apply_final_filter(ctx.spots, ctx.interpolator, ctx.contours, chosen_level)
 
         logger.debug("Generating plots and saving results...")
-        _generate_final_outputs(spots_final, output_dir, roi, codebook.name, params)
+        _generate_final_outputs(ctx.spots_final, output_dir, roi, codebook.name, params)
 
         logger.debug(f"Finished ROI {roi} ({i}/{len(active_rois)})")
+
+    _save_combined_spots_plot(contexts, output_dir, codebook.name, params)
 
     logger.debug("All specified ROIs have been processed.")

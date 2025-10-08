@@ -18,6 +18,17 @@ class Codebook:
         return self.path.stem
 
     def to_dataframe(self, bits_as_list: bool = False):
+        """
+        Return a Polars DataFrame view of this codebook.
+
+        Columns
+        - target (Utf8): Gene/target name in the codebook.
+        - bit0, bit1, bit2 (UInt8): When ``bits_as_list=False`` (default), three
+          integer bit/channel identifiers indicating which channels define the
+          target. The project’s codebooks encode up to three bits per target.
+        - bits (List[UInt8]): When ``bits_as_list=True``, a single list column
+          containing the bit identifiers for the target; replaces ``bit0..2``.
+        """
         import polars as pl
 
         df = (pl.DataFrame(self.codebook).transpose(include_header=True)).rename({"column": "target"})

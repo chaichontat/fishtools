@@ -1,6 +1,7 @@
 import json
 import pickle
 import queue
+import re
 import sys
 import threading
 import time
@@ -69,6 +70,11 @@ def scale_deconv(
         logger.warning(f"Scaled image {name} has all negative values.")
 
     return np.clip(scaled, 0, 65534)
+
+
+# Defaults aligned with 0576d01 for protein stains
+PROTEIN_PERC_MIN = 50.0
+PROTEIN_PERC_SCALE = 50.0
 
 
 def _get_percentiles_for_round(
@@ -274,7 +280,6 @@ def _run(
 
                 fid = np.atleast_3d(img[-n_fids:])
                 nofid = img[:-n_fids].reshape(-1, len(bits), 2048, 2048).astype(cp.float32)
-                print(nofid.shape)
                 nofid = cp.asarray(nofid)
             except ValueError as e:
                 raise Exception(f"File {file.resolve()} is corrupted. Please check the file.") from e
