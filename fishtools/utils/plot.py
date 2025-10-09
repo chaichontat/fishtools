@@ -551,3 +551,21 @@ def plot_all_genes(
         if not ax.has_data():
             fig.delaxes(ax)
     return fig, axs
+
+
+def micron_tick_formatter(pixel_size_um: float = 0.108, *, round_: int = 1) -> FuncFormatter:
+    """Return a formatter that renders pixel tick values in micrometers."""
+    if pixel_size_um <= 0:
+        raise ValueError("pixel_size_um must be positive to format tick labels in micrometers.")
+
+    def _format(value: float, _pos: int) -> str:
+        print("_format", value, _pos, pixel_size_um)
+        if not np.isfinite(value):
+            raise ValueError("Non-finite value cannot be formatted.")
+        micron_value = value * pixel_size_um
+        if abs(micron_value) < 1e-9:
+            return "0"
+
+        return str(round(micron_value, round_))
+
+    return FuncFormatter(_format)

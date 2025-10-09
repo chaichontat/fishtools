@@ -27,6 +27,7 @@ from fishtools.utils.logging import configure_cli_logging, initialize_logger
 from fishtools.utils.plot import (
     DARK_PANEL_STYLE,
     configure_dark_axes,
+    micron_tick_formatter,
     scatter_spots,
     si_tick_formatter,
 )
@@ -162,11 +163,20 @@ def count_by_gene(spots: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def save_figure(fig: Figure, output_dir: Path, name: str, roi: str, codebook: str):
+def save_figure(fig: Figure, output_dir: Path, name: str, roi: str, codebook: str, log_level: str = "DEBUG"):
     """Saves a matplotlib figure to the output directory with a standardized name for a single ROI."""
     filename = output_dir / f"{name}--{roi}+{codebook}.png"
     fig.savefig(filename.as_posix(), dpi=300, bbox_inches="tight")
-    logger.debug(f"Saved plot: {filename}")
+    _log = None
+    if log_level == "DEBUG":
+        _log = logger.debug
+    elif log_level == "INFO":
+        _log = logger.info
+    elif log_level == "WARNING":
+        _log = logger.warning
+    else:
+        raise ValueError(f"Unsupported log level: {log_level}")
+    _log(f"Saved {name}: {filename}")
     plt.close(fig)
 
 
@@ -688,6 +698,8 @@ def _prompt_threshold_levels(
     contexts: dict[str, ROIThresholdContext],
     output_dir: Path,
     codebook: str,
+    *,
+    combined_spots_path: Path | None = None,
 ) -> dict[str, int]:
     """Prompt for comma-separated threshold levels across all ROIs."""
 
@@ -709,6 +721,8 @@ def _prompt_threshold_levels(
 
     lines.append("")
     lines.append(f"Combined plot: {combined_plot_path.resolve()}")
+    if combined_spots_path is not None:
+        lines.append(f"Combined spots: {combined_spots_path}")
     lines.append("")
     lines.append("Enter threshold levels for each ROI (comma-separated) in the order shown below:")
     for roi in ordered_rois:
@@ -719,18 +733,22 @@ def _prompt_threshold_levels(
     lines.append("Please enter the threshold levels now (comma-separated integers):")
 
     def _validate(value: str) -> bool | str:
-        values = [part.strip() for part in value.split(",") if part.strip()]
+        values = [part.strip() for part in value.split(",")]
         if len(values) != len(ordered_rois):
             return f"Expected {len(ordered_rois)} comma-separated values."
-        try:
-            levels = [int(part) for part in values]
-        except ValueError:
-            return "Thresholds must be integers."
 
-        for roi, level in zip(ordered_rois, levels):
+        levels: list[int] = []
+        for roi, raw_level in zip(ordered_rois, values):
+            if raw_level == "":
+                return f"ROI {roi}: level is required."
+            try:
+                level = int(raw_level)
+            except ValueError:
+                return f"ROI {roi}: level must be an integer."
             max_level = contexts[roi].curve.max_level
             if not 0 <= level <= max_level:
                 return f"ROI {roi}: level must be between 0 and {max_level}."
+            levels.append(level)
         return True
 
     response = questionary.text("\n".join(lines), validate=_validate).ask()
@@ -792,7 +810,17 @@ def _generate_final_outputs(
         scale_bar_label=f"{params.scale_bar_um} μm",
         title=f"Filtered spots for {roi} (n={len(spots_ok):,})",
     )
-    save_figure(fig_spots, output_dir, "spots_final", roi, codebook)
+
+    if {"x", "y"}.issubset(spots_ok.columns):
+        formatter = micron_tick_formatter(params.pixel_size_um)
+        ax.xaxis.set_major_formatter(formatter)
+        ax.yaxis.set_major_formatter(formatter)
+        ax.set_xlabel("X (µm)")
+        ax.set_ylabel("Y (µm)")
+    else:
+        ax.set_xlabel(x_col)
+        ax.set_ylabel(y_col)
+    save_figure(fig_spots, output_dir, "spots_final", roi, codebook, log_level="INFO")
 
     # Save blank counts
     per_gene_final = count_by_gene(spots_ok)
@@ -821,7 +849,7 @@ def _generate_final_outputs(
         loc="left",
     )
     fig_scree.tight_layout()
-    save_figure(fig_scree, output_dir, "scree_final", roi, codebook)
+    save_figure(fig_scree, output_dir, "scree_final", roi, codebook, log_level="INFO")
 
     # Save final filtered data
     output_parquet = output_dir / f"{roi}+{codebook}.parquet"
@@ -1044,6 +1072,8 @@ def threshold(
 
         logger.debug(f"Finished ROI {roi} ({i}/{len(active_rois)})")
 
-    _save_combined_spots_plot(contexts, output_dir, codebook.name, params)
+    combined_spots_all = _save_combined_spots_plot(contexts, output_dir, codebook.name, params)
+
+    logger.info(f"Saved combined spots overview: {combined_spots_all.absolute()}")
 
     logger.debug("All specified ROIs have been processed.")

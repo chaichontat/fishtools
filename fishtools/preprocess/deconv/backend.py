@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,12 +24,15 @@ from fishtools.io.workspace import safe_imwrite
 from fishtools.preprocess.config import DeconvolutionOutputMode
 
 from .basic_utils import load_basic_profiles
-from .core import PRENORMALIZED, deconvolve_lucyrichardson_guo, load_projectors_cached
+from .core import PRENORMALIZED, deconvolve_lucyrichardson_guo, projectors
 from .hist import sample_histograms
 from .normalize import quantize_global
 from .profiling_utils import GpuTimer
 
 timer = GpuTimer()
+
+
+LEGACY_PERCENTILES = (0.1, 99.999)
 
 
 @dataclass(slots=True)
@@ -95,6 +99,49 @@ class OutputBackend(Protocol):
 
 # The CLI passes one of these in.
 OutputBackendFactory = Callable[[ProcessorConfig], OutputBackend]
+
+
+def legacy_per_tile_quantize(
+    res: cp.ndarray,
+    hw: tuple[int, int],
+    *,
+    percentile_low: float = LEGACY_PERCENTILES[0],
+    percentile_high: float = LEGACY_PERCENTILES[1],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Legacy per-tile percentile-based quantization used by cli_deconv_old."""
+
+    height, width = hw
+    if height <= 0 or width <= 0:
+        raise ValueError(f"Invalid tile dimensions hw={hw}")
+
+    payload = cp.asarray(res, dtype=cp.float32)
+    if payload.ndim == 3:
+        payload = payload[:, cp.newaxis, ...]
+    elif payload.ndim != 4:
+        raise ValueError(
+            "Expected deconvolution output with 3D or 4D shape (z[, c], y, x) for legacy quantization."
+        )
+
+    if payload.shape[-2:] != (height, width):
+        raise ValueError(f"Legacy quantization mismatch: payload spatial dims {payload.shape[-2:]} != {hw}.")
+
+    mins = cp.percentile(payload, percentile_low, axis=(0, 2, 3))
+    maxs = cp.percentile(payload, percentile_high, axis=(0, 2, 3))
+
+    mins = mins.astype(cp.float32, copy=False).reshape(1, -1, 1, 1)
+    maxs = maxs.astype(cp.float32, copy=False).reshape(1, -1, 1, 1)
+
+    scale = cp.float32(65534.0) / cp.maximum(maxs - mins, cp.float32(1e-20))
+    scale = scale.reshape(1, -1, 1, 1)
+
+    scaled = cp.clip((payload - mins) * scale, 0.0, 65534.0)
+    towrite = scaled.astype(cp.uint16).reshape(-1, height, width)
+
+    mins_host = cp.asnumpy(mins.reshape(-1)).astype(np.float32, copy=False)
+    scale_host = cp.asnumpy(scale.reshape(-1)).astype(np.float32, copy=False)
+    towrite_host = cp.asnumpy(towrite)
+
+    return towrite_host, mins_host, scale_host
 
 
 class Float32HistBackend:
@@ -273,6 +320,71 @@ class U16PrenormBackend:
         return time.perf_counter() - t0
 
 
+class LegacyPerTileU16Backend:
+    """Per-tile percentile quantization backend emulating cli_deconv_old outputs."""
+
+    def __init__(self, config: ProcessorConfig):
+        self.config = config
+        self._out_dir: Path | None = None
+
+    def expected_targets(self, out_dir: Path, src: Path) -> Sequence[Path]:
+        return [out_dir / src.parent.name / src.name]
+
+    def setup(self, processor: "DeconvolutionTileProcessor") -> None:
+        self._out_dir = processor.config.output_dir
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+
+    def postprocess(
+        self,
+        res: cp.ndarray,
+        path: Path,  # noqa: ARG002
+        hw: tuple[int, int],
+    ) -> tuple[OutputArtifacts, dict[str, Any], dict[str, float]]:
+        t0 = time.perf_counter()
+        towrite_u16, mins, scales = legacy_per_tile_quantize(res, hw)
+        quant_time = time.perf_counter() - t0
+        meta_patch = {
+            "deconv_min": [float(val) for val in mins],
+            "deconv_scale": [float(val) for val in scales],
+        }
+        timings = {"quant": quant_time, "post": 0.0}
+        return OutputArtifacts(towrite_u16=towrite_u16), meta_patch, timings
+
+    def write(
+        self,
+        path: Path,
+        fid_np: np.ndarray,
+        metadata_out: dict[str, Any],
+        artifacts: OutputArtifacts,
+        out_dir: Path,
+    ) -> float:
+        if artifacts.towrite_u16 is None:
+            raise RuntimeError("LegacyPerTileU16Backend: expected u16 payload, found None.")
+        if self._out_dir is None:
+            raise RuntimeError("LegacyPerTileU16Backend: setup was not called before write.")
+
+        t0 = time.perf_counter()
+        roi_dir = self._out_dir / path.parent.name
+        roi_dir.mkdir(parents=True, exist_ok=True)
+
+        deliverable = np.concatenate(
+            [artifacts.towrite_u16, fid_np.astype(np.uint16, copy=False)],
+            axis=0,
+        )
+        safe_imwrite(
+            roi_dir / path.name,
+            deliverable,
+            compression=22610,
+            compressionargs={"level": 0.75},
+            metadata=metadata_out,
+        )
+
+        sidecar = (roi_dir / path.name).with_suffix(".deconv.json")
+        sidecar.write_text(json.dumps(metadata_out, indent=2))
+
+        return time.perf_counter() - t0
+
+
 class TileProcessor(Protocol):
     """Per-worker processing contract."""
 
@@ -367,7 +479,7 @@ class DeconvolutionTileProcessor:
             name="basic_correct_clip",
         )
 
-        self._projectors = load_projectors_cached(self.config.step)
+        self._projectors = projectors(self.config.step)
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Backend selection: prefer explicit factory; else fallback to legacy behavior

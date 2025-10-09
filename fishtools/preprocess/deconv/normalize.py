@@ -21,7 +21,7 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-I_MAX = 2**16 - 1  # use 65535 unless you must reserve it
+I_MAX = 2**16 - 2  # use 65535 unless you must reserve it
 _STANDARD_P_HIGH = 0.99999  # for log highlighting of deviations
 
 # Optional hardcoded overrides for upper percentile (p_high) per round and channel.
@@ -677,7 +677,7 @@ def quantize_global(
     m_glob: np.ndarray,
     s_glob: np.ndarray,
     *,
-    i_max: int = 2**16 - 1,  # use 65535; set 65534 if you reserve 65535
+    i_max: int = 2**16 - 2,  # use 65535; set 65534 if you reserve 65535
     return_stats: bool = False,
     as_numpy: bool = True,
 ) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:

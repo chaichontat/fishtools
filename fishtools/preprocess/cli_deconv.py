@@ -15,6 +15,7 @@ from fishtools.io.workspace import Workspace, get_channels
 from fishtools.preprocess.config import DeconvolutionConfig, DeconvolutionOutputMode
 from fishtools.preprocess.deconv.backend import (
     Float32HistBackend,
+    LegacyPerTileU16Backend,
     OutputBackend,
     ProcessorConfig,
     ProcessorFactory,
@@ -22,9 +23,6 @@ from fishtools.preprocess.deconv.backend import (
     make_processor_factory,
 )
 from fishtools.preprocess.deconv.basic_utils import resolve_basic_paths
-from fishtools.preprocess.deconv.core import (
-    load_projectors_cached,
-)
 from fishtools.preprocess.deconv.core import rescale as core_rescale
 from fishtools.preprocess.deconv.discovery import infer_psf_step
 from fishtools.preprocess.deconv.helpers import safe_delete_origin_dirs
@@ -47,12 +45,9 @@ from fishtools.preprocess.deconv.worker import (
 from fishtools.utils.pretty_print import get_shared_console, progress_bar
 
 logger.remove()
-logger.configure(
-    handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}]
-)
+logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
 
 
-projectors = load_projectors_cached
 rescale = core_rescale
 
 
@@ -261,9 +256,7 @@ def _collect_round_tiles(
         if roi_filter:
             for roi_name in roi_filter:
                 if roi_name not in ref_indices:
-                    logger.warning(
-                        f"No reference files found for {ref_round}--{roi_name}. Skipping ROI."
-                    )
+                    logger.warning(f"No reference files found for {ref_round}--{roi_name}. Skipping ROI.")
 
     tiles: list[Path] = []
     pattern = f"{round_name}--*/{round_name}-*.tif"
@@ -293,9 +286,9 @@ def _normalize_mode(value: str | DeconvolutionOutputMode) -> DeconvolutionOutput
         return DeconvolutionOutputMode.F32
     if normalized == "u16":
         return DeconvolutionOutputMode.U16
-    raise click.BadParameter(
-        f"Unknown backend '{value}'. Expected one of: float32, u16."
-    )
+    if normalized in {"legacy", "old", "u16_tile"}:
+        return DeconvolutionOutputMode.LEGACY
+    raise click.BadParameter(f"Unknown backend '{value}'. Expected one of: float32, u16, legacy.")
 
 
 # ------------------------------ Backend choice ------------------------------ #
@@ -304,6 +297,7 @@ def _normalize_mode(value: str | DeconvolutionOutputMode) -> DeconvolutionOutput
 _BACKEND_CLASSES: dict[DeconvolutionOutputMode, type[OutputBackend]] = {
     DeconvolutionOutputMode.F32: Float32HistBackend,
     DeconvolutionOutputMode.U16: U16PrenormBackend,
+    DeconvolutionOutputMode.LEGACY: LegacyPerTileU16Backend,
 }
 
 
@@ -331,9 +325,7 @@ def filter_pending_files(
 
     skipped = len(files) - len(pending)
     if skipped:
-        logger.info(
-            f"Skipping {skipped} tile(s) already satisfied by existing artifacts."
-        )
+        logger.info(f"Skipping {skipped} tile(s) already satisfied by existing artifacts.")
     return pending
 
 
@@ -420,6 +412,7 @@ def _prepare_round_plan(
         s_glob=s_glob,
         debug=debug,
     )
+    logger.info(config)
 
     backend_cls = _BACKEND_CLASSES[mode]
     backend_for_filter = backend_cls(config)
@@ -435,9 +428,7 @@ def _prepare_round_plan(
         prefixed.info("All tiles already processed; skipping.")
 
     else:
-        prefixed.info(
-            f"{len(pending)}/{len(file_list)} tile(s) pending after overwrite checks."
-        )
+        prefixed.info(f"{len(pending)}/{len(file_list)} tile(s) pending after overwrite checks.")
 
     processor_factory = make_processor_factory(config, backend_factory=backend_cls)
 
@@ -474,10 +465,7 @@ def _execute_round_plan(
                 if message.path is not None and message.stages is not None:
                     s = message.stages
                     gpu = (
-                        s.get("basic", 0.0)
-                        + s.get("deconv", 0.0)
-                        + s.get("quant", 0.0)
-                        + s.get("post", 0.0)
+                        s.get("basic", 0.0) + s.get("deconv", 0.0) + s.get("quant", 0.0) + s.get("post", 0.0)
                     )
                     dev = message.device if message.device is not None else "?"
                     get_shared_console().print(
@@ -511,9 +499,7 @@ def _execute_round_plan(
     if failures:
         details = ", ".join(str(msg.path) for msg in failures if msg.path is not None)
         if stop_on_error:
-            raise RuntimeError(
-                f"{plan.label or 'run'}: processing aborted due to failures: {details}"
-            )
+            raise RuntimeError(f"{plan.label or 'run'}: processing aborted due to failures: {details}")
         prefixed.warning(f"Completed with failures: {details}")
 
     return failures
@@ -617,9 +603,7 @@ def _plan_and_execute(
         files_to_process: list[Path] = []
         total_assigned = 0
         for roi in scope_rois:
-            roi_files = _collect_round_tiles(
-                path, round_token, rois=[roi], ref_round=ref_round
-            )
+            roi_files = _collect_round_tiles(path, round_token, rois=[roi], ref_round=ref_round)
             if not roi_files:
                 prefixed.warning(f"No files found for ROI '{roi}'; skipping.")
                 continue
@@ -649,9 +633,7 @@ def _plan_and_execute(
                 break
 
         if not files_to_process:
-            prefixed.warning(
-                "No files discovered for requested ROI scope; skipping round."
-            )
+            prefixed.warning("No files discovered for requested ROI scope; skipping round.")
             continue
 
         plan = _prepare_round_plan(
@@ -690,9 +672,7 @@ def _plan_and_execute(
 
     failures: list[WorkerMessage] = []
 
-    def _execute(
-        plan: _RoundProcessingPlan, progress_callback: ProgressUpdater | None
-    ) -> None:
+    def _execute(plan: _RoundProcessingPlan, progress_callback: ProgressUpdater | None) -> None:
         plan_failures = _execute_round_plan(
             plan,
             devices=devices,
@@ -727,7 +707,7 @@ def multi_run(
     *,
     ref: str | Path | None,
     limit: int | None,
-    backend: str = _PREPARE_DEFAULT_MODE.value,
+    mode: str = _PREPARE_DEFAULT_MODE.value,
     histogram_bins: int = 8192,
     skip_quantized: bool = False,
     overwrite: bool,
@@ -744,15 +724,13 @@ def multi_run(
     if configure_logging:
         _configure_logging(debug, process_label=process_label)
 
-    mode = _normalize_mode(backend)
+    selected_mode = _normalize_mode(mode)
 
-    if skip_quantized and mode is DeconvolutionOutputMode.U16:
-        logger.info(
-            "multi_run: skip_quantized requested; switching backend to float32 outputs."
-        )
-        mode = DeconvolutionOutputMode.F32
+    if skip_quantized and selected_mode is DeconvolutionOutputMode.U16:
+        logger.info("multi_run: skip_quantized requested; switching backend to float32 outputs.")
+        selected_mode = DeconvolutionOutputMode.F32
 
-    load_scaling = mode is DeconvolutionOutputMode.U16 and not skip_quantized
+    load_scaling = selected_mode is DeconvolutionOutputMode.U16 and not skip_quantized
 
     ref_round = str(ref) if ref is not None else None
 
@@ -771,7 +749,7 @@ def multi_run(
         debug=debug,
         devices=list(devices),
         stop_on_error=stop_on_error,
-        mode=mode,
+        mode=selected_mode,
         delete_origin=False,
     )
 
@@ -787,7 +765,7 @@ def multi_prepare(
     round_names: Sequence[str] | tuple[str, ...],
     seed: int,
     histogram_bins: int,
-    backend: str = _DEFAULT_OUTPUT_MODE.value,
+    mode: str = _DEFAULT_OUTPUT_MODE.value,
     overwrite: bool,
     n_fids: int,
     basic_name: str | None,
@@ -804,18 +782,12 @@ def multi_prepare(
     all_rois = ws.rois
     selected_rois = list(all_rois) if not roi else [r for r in roi if r in all_rois]
     if roi and not selected_rois:
-        raise click.ClickException(
-            "No matching ROIs found for the provided --roi filters."
-        )
+        raise click.ClickException("No matching ROIs found for the provided --roi filters.")
 
     rounds_all = Workspace.discover_rounds(path)
-    selected_rounds = (
-        rounds_all if not round_names else [r for r in round_names if r in rounds_all]
-    )
+    selected_rounds = rounds_all if not round_names else [r for r in round_names if r in rounds_all]
     if round_names and not selected_rounds:
-        raise click.ClickException(
-            "No matching rounds found for the provided --round filters."
-        )
+        raise click.ClickException("No matching rounds found for the provided --round filters.")
 
     candidates: list[Path] = []
     for round_name in selected_rounds:
@@ -841,7 +813,7 @@ def multi_prepare(
     out_dir = ws.deconved
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    mode = _normalize_mode(backend)
+    selected_mode = _normalize_mode(mode)
 
     for round_name, files in sorted(by_round.items()):
         if not files:
@@ -864,7 +836,7 @@ def multi_prepare(
             devices=list(devices),
             stop_on_error=stop_on_error,
             label=round_name,
-            mode=mode,
+            mode=selected_mode,
         )
 
 
@@ -881,8 +853,9 @@ def multi_prepare(
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--histogram-bins", type=int, default=8192, show_default=True)
 @click.option(
+    "--mode",
     "--backend",
-    type=click.Choice(["float32", "u16"]),
+    type=click.Choice(["float32", "u16", "legacy"]),
     default=_PREPARE_DEFAULT_MODE.value,
     show_default=True,
 )
@@ -893,9 +866,7 @@ def multi_prepare(
     type=str,
     default=None,
     show_default=False,
-    help=(
-        "BaSiC profile prefix. If omitted, uses round-specific prefix first then falls back to 'all'."
-    ),
+    help=("BaSiC profile prefix. If omitted, uses round-specific prefix first then falls back to 'all'."),
 )
 @click.option("--debug", is_flag=True)
 @click.option("--devices", type=str, default="auto", show_default=True)
@@ -914,7 +885,7 @@ def prepare(
     roi: tuple[str, ...],
     seed: int,
     histogram_bins: int,
-    backend: str,
+    mode: str,
     overwrite: bool,
     n_fids: int,
     basic_name: str | None,
@@ -936,7 +907,7 @@ def prepare(
         round_names=tuple(rounds),
         seed=seed,
         histogram_bins=histogram_bins,
-        backend=backend,
+        mode=mode,
         overwrite=overwrite,
         n_fids=n_fids,
         basic_name=basic_name,
@@ -958,8 +929,9 @@ def prepare(
 @click.option("--ref", "ref_round", type=str, default=None)
 @click.option("--limit", type=int, default=None)
 @click.option(
+    "--mode",
     "--backend",
-    type=click.Choice(["u16", "float32"]),
+    type=click.Choice(["u16", "float32", "legacy"]),
     default=_DEFAULT_OUTPUT_MODE.value,
     show_default=True,
 )
@@ -972,9 +944,7 @@ def prepare(
     type=str,
     default=None,
     show_default=False,
-    help=(
-        "BaSiC profile prefix. If omitted, uses round-specific prefix first then falls back to 'all'."
-    ),
+    help=("BaSiC profile prefix. If omitted, uses round-specific prefix first then falls back to 'all'."),
 )
 @click.option("--debug", is_flag=True)
 @click.option("--devices", type=str, default="auto", show_default=True)
@@ -997,7 +967,7 @@ def run(
     roi_name: str,
     ref_round: str | None,
     limit: int | None,
-    backend: str,
+    mode: str,
     histogram_bins: int,
     overwrite: bool,
     delete_origin: bool,
@@ -1040,27 +1010,23 @@ def run(
     else:
         raise click.ClickException(f"ROI '{roi_name}' not found in {path}.")
 
-    mode = _normalize_mode(backend)
+    selected_mode = _normalize_mode(mode)
 
     if skip_quantized:
-        if mode is DeconvolutionOutputMode.U16:
+        if selected_mode is DeconvolutionOutputMode.U16:
             logger.info(
                 "Skipping quantized deliverables; forcing float32 backend so "
                 "'preprocess deconv quantize' can run independently."
             )
-            mode = DeconvolutionOutputMode.F32
+            selected_mode = DeconvolutionOutputMode.F32
         else:
-            logger.info(
-                "Skipping quantized deliverables; float32 backend already active."
-            )
+            logger.info("Skipping quantized deliverables; float32 backend already active.")
 
-    load_scaling = mode is DeconvolutionOutputMode.U16 and not skip_quantized
+    load_scaling = selected_mode is DeconvolutionOutputMode.U16 and not skip_quantized
 
     ref_token = ref_round
     if ref_token is not None and ref_token not in all_rounds:
-        raise click.ClickException(
-            f"Reference round '{ref_token}' not found in {path}."
-        )
+        raise click.ClickException(f"Reference round '{ref_token}' not found in {path}.")
 
     _plan_and_execute(
         path=path,
@@ -1077,7 +1043,7 @@ def run(
         debug=debug,
         devices=device_list,
         stop_on_error=stop_on_error,
-        mode=mode,
+        mode=selected_mode,
         delete_origin=delete_origin,
     )
 
@@ -1091,12 +1057,8 @@ def easy(path: Path, round_name: str | None):
     rounds = [round_name] if round_name else Workspace.discover_rounds(path)
     for round_ in rounds:
         if not (path / "analysis" / "deconv_scaling" / f"{round_}.txt").exists():
-            subprocess.run(
-                ["preprocess", "deconvnew", "prepare", str(path), round_], check=True
-            )
-            subprocess.run(
-                ["preprocess", "deconvnew", "precompute", str(path), round_], check=True
-            )
+            subprocess.run(["preprocess", "deconvnew", "prepare", str(path), round_], check=True)
+            subprocess.run(["preprocess", "deconvnew", "precompute", str(path), round_], check=True)
 
         with ThreadPoolExecutor() as executor:
             promises = [

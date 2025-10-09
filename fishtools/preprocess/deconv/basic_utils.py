@@ -23,8 +23,6 @@ def load_basic_profiles(paths: Sequence[Path]) -> tuple[cp.ndarray, cp.ndarray]:
         loaded = pickle.loads(pkl_path.read_bytes())  # type: ignore[name-defined]
         basic = loaded.get("basic") if isinstance(loaded, dict) else loaded
         assert basic
-        if not hasattr(basic, "darkfield") or not hasattr(basic, "flatfield"):
-            raise TypeError("BaSiC payload must expose 'darkfield' and 'flatfield'.")
 
         dark = np.asarray(basic.darkfield, dtype=np.float32)
         flat = np.asarray(basic.flatfield, dtype=np.float32)
@@ -35,10 +33,6 @@ def load_basic_profiles(paths: Sequence[Path]) -> tuple[cp.ndarray, cp.ndarray]:
             reference_shape = dark.shape
         elif dark.shape != reference_shape:
             raise ValueError("Inconsistent BaSiC profile geometry; all profiles must match.")
-        if not np.all(np.isfinite(flat)) or np.any(flat <= 0):
-            raise ValueError(f"Invalid flatfield values encountered in {pkl_path}.")
-        if not np.all(np.isfinite(dark)):
-            raise ValueError(f"Invalid darkfield values encountered in {pkl_path}.")
         darks.append(dark)
         flats.append(flat)
 

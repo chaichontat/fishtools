@@ -15,6 +15,7 @@ class DeconvolutionOutputMode(str, Enum):
 
     U16 = "u16"
     F32 = "float32"
+    LEGACY = "legacy"
 
 
 class NumpyEncoder(JSONEncoder):
