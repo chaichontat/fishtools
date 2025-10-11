@@ -27,9 +27,12 @@ Uses ImageJ Grid/Collection stitching for accurate tile alignment and supports
 large-scale datasets through efficient memory management and parallelization.
 """
 
+import json
 import shutil
+from collections.abc import Iterable
 from itertools import chain
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Sequence
 
 import numpy as np
@@ -57,8 +60,8 @@ from fishtools.preprocess.n4 import run_cli_workflow
 from fishtools.preprocess.stitching import walk_fused as _walk_fused
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.preprocess.tileconfig import copy_registered as _copy_registered
-from fishtools.utils.logging import setup_workspace_logging
-from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
+from fishtools.utils.logging import CONSOLE_SKIP_EXTRA, setup_workspace_logging
+from fishtools.utils.pretty_print import get_shared_console, progress_bar, progress_bar_threadpool
 from fishtools.utils.tiff import compose_metadata as compose_meta
 from fishtools.utils.tiff import normalize_channel_names as norm_names
 from fishtools.utils.tiff import read_metadata_from_tif
@@ -107,6 +110,81 @@ def _label_for_max_from(path: Path | None) -> str | None:
     except Exception:
         pass
     return label
+
+
+def _resolve_codebook_path(ws: Workspace, codebook: str) -> Path:
+    """Locate the JSON file backing a codebook stem inside a workspace."""
+
+    candidates = [
+        ws.path / "codebooks" / f"{codebook}.json",
+        ws.deconved / "codebooks" / f"{codebook}.json",
+        ws.path / f"{codebook}.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    search_list = ", ".join(str(p) for p in candidates)
+    raise ValueError(
+        f"Codebook JSON for '{codebook}' not found. Looked under: {search_list}. "
+        "Ensure the codebook JSON is present in the workspace."
+    )
+
+
+def _load_codebook_channels(ws: Workspace, codebook: str) -> set[str]:
+    """Parse the set of channel identifiers used by a codebook."""
+
+    path = _resolve_codebook_path(ws, codebook)
+    try:
+        payload = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:  # pragma: no cover - invalid user file
+        raise ValueError(f"Failed to parse codebook JSON at {path}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected codebook JSON at {path} to be an object mapping targets to channels.")
+
+    channels: set[str] = set()
+    for value in payload.values():
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                if item is None:
+                    raise ValueError(f"Codebook {path} contains null channel entries.")
+                channels.add(str(item))
+        else:
+            if value is None:
+                raise ValueError(f"Codebook {path} contains null channel entries.")
+            channels.add(str(value))
+
+    if not channels:
+        raise ValueError(f"Codebook '{codebook}' did not define any channels.")
+
+    return channels
+
+
+def _collect_registered_channels(
+    img_paths: Sequence[Path],
+    expected: set[str],
+) -> set[str]:
+    """Accumulate channel identifiers present in registered TIFF metadata."""
+
+    discovered: set[str] = set()
+    for img_path in img_paths:
+        with TiffFile(img_path) as tif:
+            metadata = _read_tiff_metadata(tif)
+        raw_keys = metadata.get("key")
+        if raw_keys is None:
+            continue
+        if isinstance(raw_keys, str):
+            discovered.add(raw_keys)
+        elif isinstance(raw_keys, Iterable):
+            for key in raw_keys:
+                discovered.add(str(key))
+        else:
+            discovered.add(str(raw_keys))
+
+        if expected and expected.issubset(discovered):
+            break
+
+    return discovered
 
 
 def create_tile_config(
@@ -400,6 +478,30 @@ def register(
         raise ValueError(f"No registered images at {registered_dir.resolve()} found.")
 
     imgs = sorted(f for f in registered_dir.glob("*.tif") if not f.name.endswith(".hp.tif"))
+    if not imgs:
+        raise ValueError(f"No registered TIFF files found under {registered_dir}.")
+    codebook_channels = _load_codebook_channels(ws, codebook)
+    registered_channels = _collect_registered_channels(imgs, expected=codebook_channels)
+
+    if not registered_channels:
+        raise ValueError(
+            f"Registered tiles for ROI '{roi}' with codebook '{codebook}' are missing TIFF metadata "
+            "'key'; unable to validate channel coverage."
+        )
+
+    missing_channels = sorted(codebook_channels - registered_channels)
+    if missing_channels:
+        observed = ", ".join(sorted(registered_channels)) or "none"
+        missing = ", ".join(missing_channels)
+        raise ValueError(
+            f"Registered tiles for ROI '{roi}' with codebook '{codebook}' are missing channel(s): "
+            f"{missing}. Observed channels: {observed}."
+        )
+
+    logger.debug(
+        f"Validated codebook channels for roi={roi}, codebook={codebook}: {sorted(registered_channels)}"
+    )
+
     out_path = ws.stitch(roi)
     out_path.mkdir(exist_ok=True)
 
@@ -834,10 +936,29 @@ def fuse(
         raise ValueError(f"No images found at {path_img.resolve()}")
     logger.info(f"Found {len(files)} images at {path_img.resolve()}")
 
+    skip_extract = not overwrite
+
     if overwrite and path.exists():
         for p in path.iterdir():
             if p.is_dir():
                 shutil.rmtree(p)
+
+    correct_count = len(list(path_img.glob("reg*.tif")))
+
+    if skip_extract:
+        try:
+            folders_existing = list(chain.from_iterable(walk_fused(path).values()))
+        except ValueError:
+            skip_extract = False
+        else:
+            for folder in folders_existing:
+                current_count = len([p for p in folder.glob("*.tif") if p.stem.isdigit()])
+                if current_count != correct_count:
+                    logger.info(
+                        f"Incorrect number of files in {folder} ({current_count} != {correct_count}). Running extract."
+                    )
+                    skip_extract = False
+                    break
 
     if tile_config is None:
         tile_config = ws.tileconfig_dir(roi) / "TileConfiguration.registered.txt"
@@ -894,22 +1015,6 @@ def fuse(
         tileconfig = tileconfig.drop(list(needed - imgs))
         logger.warning(f"Not all images are present in {path_img}. Missing: {needed - imgs}. Dropping.")
 
-    skip_extract = True
-    correct_count = len(list(path_img.glob("reg*.tif")))
-
-    try:
-        folders = list(chain.from_iterable(walk_fused(path).values()))
-    except ValueError:
-        skip_extract = False
-    else:
-        for folder in folders:
-            if (_cnt := len([p for p in folder.glob("*.tif") if p.stem.isdigit()])) != correct_count:
-                logger.info(
-                    f"Incorrect number of files in {folder} ({_cnt} != {correct_count}). Running extract."
-                )
-                skip_extract = False
-                break
-
     # When using pre-exported fields, enforce ds=1 for alignment
     if (field_low_zarr or field_range_zarr) and int(downsample) != 1:
         raise ValueError("When --field-low-zarr/--field-range-zarr are provided, please set --downsample 1.")
@@ -918,32 +1023,46 @@ def fuse(
     if (field_low_zarr is None) ^ (field_range_zarr is None):
         raise ValueError("Provide both --field-low-zarr and --field-range-zarr (or neither).")
 
-    if overwrite or not skip_extract:
+    if skip_extract:
+        logger.info(f"Reusing previously extracted tiles at {path}. Use --overwrite to regenerate.")
+    else:
         logger.info(f"Found {len(files)} files. Extracting channel {channels} to {path}")
-    with progress_bar_threadpool(len(files), threads=threads, stop_on_exception=True) as submit:
-        for file in files:
-            submit(
-                extract,
-                file,
-                path,
-                downsample=downsample,
-                subsample_z=subsample_z,
-                is_2d=is_2d,
-                channels=channel_indices.copy(),
-                max_proj=max_proj,
-                max_from=ws.registered(roi, max_from) / file.name if max_from else None,
-                sc=sc,
-                workspace_root=ws.path,
-                roi_for_ws=roi,
-                debug=debug,
-                field_low_zarr=field_low_zarr,
-                field_range_zarr=field_range_zarr,
-            )
+        with progress_bar_threadpool(len(files), threads=threads, stop_on_exception=True) as submit:
+            for file in files:
+                submit(
+                    extract,
+                    file,
+                    path,
+                    downsample=downsample,
+                    subsample_z=subsample_z,
+                    is_2d=is_2d,
+                    channels=channel_indices.copy(),
+                    max_proj=max_proj,
+                    max_from=ws.registered(roi, max_from) / file.name if max_from else None,
+                    sc=sc,
+                    workspace_root=ws.path,
+                    roi_for_ws=roi,
+                    debug=debug,
+                    field_low_zarr=field_low_zarr,
+                    field_range_zarr=field_range_zarr,
+                )
 
     def run_folder(folder: Path, capture_output: bool = False):
+        def log_progress(message: str) -> None:
+            if capture_output:
+                logger.info(message)
+            else:
+                get_shared_console().log(message)
+                logger.bind(**{CONSOLE_SKIP_EXTRA: True}).info(message)
+
         for i in range(split):
             tileconfig[i * n : (i + 1) * n].write(folder / f"TileConfiguration{i + 1}.registered.txt")
             try:
+                start = perf_counter()
+                log_progress(
+                    f"Starting ImageJ fuse run for {folder} using TileConfiguration{i + 1}.registered.txt "
+                    f"(split_index={i + 1}, capture_output={capture_output})"
+                )
                 run_imagej(
                     folder,
                     name=f"TileConfiguration{i + 1}",
@@ -954,22 +1073,32 @@ def fuse(
                 logger.critical(f"Error running ImageJ for {folder}: {e}")
                 raise e
             Path(folder / "img_t1_z1_c1").rename(folder / f"fused_{folder.name}-{i + 1}.tif")
+            duration = perf_counter() - start
+            log_progress(f"Completed ImageJ fuse run for {folder} chunk {i + 1}/{split} in {duration:.2f}s")
 
     # Get all folders without subfolders
     folders = list(chain.from_iterable(walk_fused(path).values()))
 
     logger.info(f"Calling ImageJ on {len(folders)} folders.")
-    with progress_bar_threadpool(len(folders), threads=threads, stop_on_exception=True) as submit:
-        for folder in folders:
-            if not folder.is_dir():
-                raise Exception("Invalid folder")
-            if not folder.name.isdigit():
-                raise ValueError(f"Invalid folder name {folder.name}. No external folders allowed.")
+    to_runs = []
+    for folder in folders:
+        if not folder.is_dir():
+            raise Exception("Invalid folder")
+        if not folder.name.isdigit():
+            raise ValueError(f"Invalid folder name {folder.name}. No external folders allowed.")
 
-            existings = list(folder.glob("fused*"))
-            if existings and not overwrite:
-                logger.warning(f"{existings} already exists. Skipping this folder.")
-                continue
+        existings = list(folder.glob("fused*"))
+        if existings and not overwrite:
+            logger.warning(f"{existings} already exists. Skipping this folder.")
+            continue
+        to_runs.append(folder)
+
+    if not len(to_runs):
+        logger.warning("No folders to run.")
+        return
+
+    with progress_bar_threadpool(len(to_runs), threads=threads, stop_on_exception=True) as submit:
+        for folder in to_runs:
             submit(run_folder, folder, capture_output=not debug)
 
     if split > 1:

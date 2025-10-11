@@ -215,6 +215,17 @@ class Workspace:
             return 0, f"{int(head):08d}_{round_name}"
         return 1, round_name
 
+    @property
+    def analysis(self) -> Path:
+        """Return path to analysis directory."""
+        return self.path / "analysis"
+
+    def deconv_scaling(self, round_: str | None = None) -> Path:
+        """Return path to deconvolution scaling directory."""
+        if round_ is not None:
+            return self.analysis / "deconv_scaling" / f"{round_}.txt"
+        return self.analysis / "deconv_scaling"
+
     @classmethod
     def discover_rounds(cls, workspace_path: Path | str) -> list[str]:
         """Return sorted list of imaging rounds discovered under a workspace root."""
@@ -239,6 +250,9 @@ class Workspace:
                 if any(round_name.startswith(prefix) for prefix in cls._FORBIDDEN_ROUND_PREFIXES):
                     continue
                 rounds_set.add(round_name)
+
+        if "_bleach" in rounds_set:
+            rounds_set.remove("_bleach")
 
         if not rounds_set:
             raise ValueError(f"No round subdirectories found in {base}.")

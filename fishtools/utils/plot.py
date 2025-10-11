@@ -559,7 +559,6 @@ def micron_tick_formatter(pixel_size_um: float = 0.108, *, round_: int = 1) -> F
         raise ValueError("pixel_size_um must be positive to format tick labels in micrometers.")
 
     def _format(value: float, _pos: int) -> str:
-        print("_format", value, _pos, pixel_size_um)
         if not np.isfinite(value):
             raise ValueError("Non-finite value cannot be formatted.")
         micron_value = value * pixel_size_um

@@ -184,6 +184,7 @@ class Image:
         discards: dict[str, list[str]] | None = None,
         n_fids: int = 1,
     ):
+        ws = Workspace(path.parent.parent)
         stem = path.stem
         name, idx = stem.split("-")
         bits = name.split("_")
@@ -237,9 +238,7 @@ class Image:
         if not prenormalized:
             try:
                 global_deconv_scaling = (
-                    np.loadtxt(path.parent.parent / "deconv_scaling" / f"{name}.txt")
-                    .astype(np.float32)
-                    .reshape((2, -1))
+                    np.loadtxt(ws.deconv_scaling(name)).astype(np.float32).reshape((2, -1))
                 )
             except FileNotFoundError:
                 raise ValueError(f"No deconv_scaling found for {name} and prenormalized not set.")
@@ -764,6 +763,7 @@ def run(
 @click.option("--threshold", type=float, default=6, help="Threshold value")
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
 @click.option("--overwrite", is_flag=True)
+@click.option("--debug", is_flag=True)
 def batch(
     path: Path,
     ref: str | None,
@@ -772,6 +772,7 @@ def batch(
     threshold: int,
     threads: int,
     overwrite: bool,
+    debug: bool,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
@@ -801,7 +802,7 @@ def batch(
             logger.warning(f"Skipping {ref}--{roi}, already registered.")
             continue
 
-        with progress_bar_threadpool(len(idxs), threads=threads) as submit:
+        with progress_bar_threadpool(len(idxs), threads=threads, debug=debug) as submit:
             for i in idxs:
                 submit(
                     subprocess.run,

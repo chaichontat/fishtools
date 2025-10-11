@@ -8,6 +8,8 @@ from typing import Any
 
 from loguru import logger
 
+CONSOLE_SKIP_EXTRA = "_skip_console_sink"
+
 # Unified log line format for console and file sinks
 _DEFAULT_LOGGER_FORMAT = (
     "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
@@ -41,7 +43,7 @@ def configure_cli_logging(
     file_level: str = "INFO",
     rotation: str | int | None = "20 MB",
     retention: str | int | None = "30 days",
-    extra: dict[str, str] | None = None,
+    extra: dict[str, Any] | None = None,
     enqueue: bool = False,
     use_shared_console: bool = True,
 ) -> Path | None:
@@ -53,7 +55,11 @@ def configure_cli_logging(
     """
 
     logger.remove()
-    logger.configure(extra={"idx": "", "file": "", "component": component, **(extra or {})})
+    combined_extra: dict[str, str | bool]
+    combined_extra = {"idx": "", "file": "", "component": component, CONSOLE_SKIP_EXTRA: False}
+    if extra:
+        combined_extra.update(extra)
+    logger.configure(extra=combined_extra)
 
     if use_shared_console:
         # Route console logs through the shared Rich Console so they play nicely
@@ -67,10 +73,15 @@ def configure_cli_logging(
         console_format = (
             "{time:HH:mm:ss} | {level: >8} | [{extra[component]}] {extra[idx]} {extra[file]} - {message}"
         )
+
+        def _console_filter(record: dict[str, Any]) -> bool:
+            return not record["extra"].get(CONSOLE_SKIP_EXTRA, False)
+
         logger.add(
             _sink,
             level=console_level,
             format=console_format,
+            filter=_console_filter,
             enqueue=False,
             backtrace=False,
             diagnose=False,
@@ -154,7 +165,7 @@ def setup_workspace_logging(
     file_level: str = "INFO",
     rotation: str | int | None = "20 MB",
     retention: str | int | None = "30 days",
-    extra: dict[str, str] | None = None,
+    extra: dict[str, Any] | None = None,
     enqueue: bool = False,
     use_shared_console: bool = True,
 ) -> Path:

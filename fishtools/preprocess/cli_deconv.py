@@ -852,13 +852,6 @@ def multi_prepare(
 @click.option("--roi", type=str, multiple=True)
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--histogram-bins", type=int, default=8192, show_default=True)
-@click.option(
-    "--mode",
-    "--backend",
-    type=click.Choice(["float32", "u16", "legacy"]),
-    default=_PREPARE_DEFAULT_MODE.value,
-    show_default=True,
-)
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2, show_default=True)
 @click.option(
@@ -885,7 +878,6 @@ def prepare(
     roi: tuple[str, ...],
     seed: int,
     histogram_bins: int,
-    mode: str,
     overwrite: bool,
     n_fids: int,
     basic_name: str | None,
@@ -907,7 +899,7 @@ def prepare(
         round_names=tuple(rounds),
         seed=seed,
         histogram_bins=histogram_bins,
-        mode=mode,
+        mode=_PREPARE_DEFAULT_MODE.value,
         overwrite=overwrite,
         n_fids=n_fids,
         basic_name=basic_name,
@@ -997,7 +989,11 @@ def run(
         raise click.ClickException("No ROIs found in workspace.")
 
     if round_name is None or round_name == "*":
-        selected_rounds = tuple(all_rounds)
+        selected_rounds = (
+            tuple(all_rounds)
+            if mode != "legacy"
+            else [r for r in all_rounds if all(x.isdigit() for x in r.split("_")) and len(r.split("_")) == 3]
+        )
     elif round_name in all_rounds:
         selected_rounds = (round_name,)
     else:
