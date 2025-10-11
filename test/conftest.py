@@ -1,7 +1,7 @@
 import random
 import signal
-import time
 import sys
+import time
 import types
 from contextlib import suppress
 from pathlib import Path
@@ -9,9 +9,53 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-from scipy import fft as _scipy_fft
 from scipy import ndimage as _scipy_ndimage
 from scipy import sparse as _scipy_sparse
+
+try:  # pragma: no cover - optional dependency hook
+    from skimage.transform import downscale_local_mean as _skimage_downscale_local_mean  # type: ignore
+except Exception:  # pragma: no cover - keep tests running without scikit-image
+
+    def _skimage_downscale_local_mean(  # type: ignore[override]
+        image: np.ndarray,
+        factors,
+        *,
+        cval: float = 0.0,
+        clip: bool = True,
+        **_: object,
+    ) -> np.ndarray:
+        """Fallback approximation of scikit-image's downscale_local_mean."""
+
+        arr = np.asarray(image, dtype=np.float32)
+        if np.isscalar(factors):
+            factors = (int(factors),) * arr.ndim
+        else:
+            factors = tuple(int(f) for f in factors)
+
+        if len(factors) != arr.ndim:
+            raise ValueError("Factors must match input dimensionality.")
+
+        trimmed_slices = tuple(slice(0, (dim // factor) * factor) for dim, factor in zip(arr.shape, factors))
+        arr = arr[trimmed_slices]
+
+        new_shape = tuple(dim // factor for dim, factor in zip(arr.shape, factors))
+        reshape_dims: list[int] = []
+        for new_dim, factor in zip(new_shape, factors):
+            reshape_dims.extend([new_dim, factor])
+
+        if not reshape_dims:
+            return arr.copy()
+
+        arr = arr.reshape(tuple(reshape_dims))
+        axes = tuple(range(1, len(reshape_dims), 2))
+        downscaled = arr.mean(axis=axes)
+
+        if clip:
+            min_val = np.min(arr)
+            max_val = np.max(arr)
+            downscaled = np.clip(downscaled, min_val, max_val)
+
+        return downscaled.astype(np.float32, copy=False)
 
 
 _DEFAULT_TIMEOUT_SECONDS = 30

@@ -1,6 +1,7 @@
 # %%
 import json
 import pickle
+import shutil
 import subprocess
 from collections import defaultdict
 from collections.abc import Callable
@@ -123,6 +124,40 @@ def _run_child_cli(argv: list[str], *, check: bool = True):
     """Wrapper around subprocess.run for easy monkeypatching in tests."""
 
     return subprocess.run(argv, check=check)
+
+
+def _copy_codebook_to_workspace(cli_path: Path, codebook_path: Path) -> Path:
+    """Materialize the provided codebook inside the workspace for reproducibility.
+
+    Args:
+        cli_path: Path value provided to the register CLI (typically analysis/deconv).
+        codebook_path: Source codebook file to replicate inside the workspace.
+
+    Returns:
+        Destination path of the codebook inside ``ws.deconved / codebooks``.
+    """
+
+    workspace = Workspace(cli_path)
+    codebooks_dir = workspace.deconved / "codebooks"
+    codebooks_dir.mkdir(parents=True, exist_ok=True)
+
+    source = Path(codebook_path)
+    destination = codebooks_dir / source.name
+
+    source_resolved = source.resolve(strict=True)
+    destination_resolved = destination.resolve(strict=False)
+    if source_resolved == destination_resolved:
+        logger.debug(f"Codebook already present at workspace destination {destination_resolved}")
+        return destination
+
+    try:
+        shutil.copy2(source, destination)
+    except shutil.SameFileError:
+        logger.debug(f"Codebook already present at workspace destination {destination_resolved}")
+    else:
+        logger.debug(f"Copied codebook from {source_resolved} to {destination_resolved}")
+
+    return destination
 
 
 def sort_key(x: tuple[str, np.ndarray]) -> int | str:
@@ -458,12 +493,7 @@ def _run(
     logger.info("Reading files")
     codebook_name = Path(codebook).stem
     out_path = path / f"registered--{roi}+{codebook_name}"
-    shift_file = path / f"shifts--{roi}+{codebook_name}" / f"shifts-{idx:04d}.json"
     reg_file = out_path / f"reg-{idx:04d}.tif"
-
-    if not overwrite and shift_file.exists():
-        logger.info(f"Skipping {idx}: shifts already present at {shift_file}")
-        return
 
     if not overwrite and reg_file.exists():
         logger.info(f"Skipping {idx}")
@@ -727,6 +757,11 @@ def run(
     codebook_name = codebook.stem
 
     for roi in rois:
+        reg_file = path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif"
+        if not overwrite and reg_file.exists():
+            logger.info(f"Skipping {idx}: registration already present at {reg_file}")
+            continue
+
         log_file_tag = f"{roi}+{codebook_name}+{idx:04d}"
         setup_cli_logging(
             path,
@@ -798,6 +833,7 @@ def batch(
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
+    codebook = _copy_codebook_to_workspace(path, codebook)
     codebook_name = codebook.stem
     setup_cli_logging(
         path,

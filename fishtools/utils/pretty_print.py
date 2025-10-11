@@ -23,6 +23,8 @@ from rich.progress import (
 )
 from rich.syntax import Syntax
 
+from fishtools.utils.logging import CONSOLE_SKIP_EXTRA
+
 # A single console shared by progress bars and any ad-hoc prints while a Live display is active.
 # Using the same Console prevents duplicate/redrawn bars when printing logs.
 _SHARED_CONSOLE = Console()
@@ -208,6 +210,23 @@ def progress_bar_threadpool(
     executor_cm = ThreadPoolExecutor(threads) if manage_executor else nullcontext(executor)
 
     with progress_bar(n) as callback, executor_cm as exc:
+        console = get_shared_console()
+        console_logger = logger.bind(**{CONSOLE_SKIP_EXTRA: True})
+
+        def log_to_console(
+            level: str,
+            message: str,
+            *,
+            color: str | None = None,
+            exception: Exception | None = None,
+        ) -> None:
+            """Emit a message above the progress bar without forcing a redraw."""
+
+            styled = f"[{color}]{message}[/]" if color else message
+            console.log(styled)
+
+            target = console_logger.opt(exception=exception) if exception else console_logger
+            getattr(target, level)(message)
 
         def signal_handler(signum: int, frame: FrameType | None) -> None:
             # Avoid using the logger inside signal handlers (Loguru is not re-entrant)
@@ -283,9 +302,8 @@ def progress_bar_threadpool(
                     # Log the exception regardless
                     task_args = getattr(f, "_args", "N/A")
                     task_kwargs = getattr(f, "_kwargs", "N/A")
-                    logger.error(f"Task raised an exception: {e} (args={task_args}, kwargs={task_kwargs})")
-                    if debug:
-                        logger.exception(e)
+                    message = f"Task raised an exception: {e} (args={task_args}, kwargs={task_kwargs})"
+                    log_to_console("error", message, color="bold red", exception=e if debug else None)
                     exceptions_encountered.append(e)
 
                     if stop_on_exception:
@@ -313,7 +331,11 @@ def progress_bar_threadpool(
             if stop_on_exception and exceptions_encountered:
                 raise exceptions_encountered[0]
             elif not stop_on_exception and exceptions_encountered:
-                logger.warning(f"Finished processing with {len(exceptions_encountered)} errors.")
+                log_to_console(
+                    "warning",
+                    f"Finished processing with {len(exceptions_encountered)} errors.",
+                    color="yellow",
+                )
 
         finally:
             # Ensure original signal handler is restored

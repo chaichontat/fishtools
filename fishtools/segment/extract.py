@@ -304,17 +304,15 @@ def _discover_registered_inputs(
     roi: str,
     codebook: str,
     *,
-    prefer_zarr: bool = False,
     require_zarr: bool = False,
 ) -> list[Path]:
     fused_zarr = ws.stitch(roi, codebook) / FILE_NAME
 
-    if prefer_zarr or require_zarr:
+    if require_zarr:
         if fused_zarr.exists():
             logger.debug(f"Using fused Zarr at {fused_zarr}")
             return [fused_zarr]
-        if require_zarr:
-            raise FileNotFoundError(f"Requested Zarr input but fused store not found at {fused_zarr}.")
+        raise FileNotFoundError(f"Requested Zarr input but fused store not found at {fused_zarr}.")
 
     reg_dir = ws.registered(roi, codebook)
     try:
@@ -342,9 +340,9 @@ def cmd_extract(
         typer.Argument(help="Workspace root", exists=True, file_okay=False, dir_okay=True, resolve_path=True),
     ],
     roi: Annotated[
-        str,
+        str | None,
         typer.Option("--roi", "-r", help="ROI name (e.g., cortex)", rich_help_panel="Inputs"),
-    ] = ...,
+    ] = None,
     codebook: Annotated[
         str,
         typer.Option("--codebook", "-c", help="Registration codebook", rich_help_panel="Inputs"),
@@ -410,58 +408,105 @@ def cmd_extract(
     if upscale <= 0:
         raise typer.BadParameter("--upscale must be positive.")
 
-    ws = Workspace(path)
-    reg_dir = ws.registered(roi, codebook)
-    if out is None:
-        out = ws.segment(roi, codebook) / ("extract_z" if mode == "z" else "extract_ortho")
-    out.mkdir(parents=True, exist_ok=True)
+    if use_zarr and max_from is not None:
+        raise typer.BadParameter("--max-from cannot be used together with --zarr inputs.")
 
-    logger.info(f"Input: {reg_dir}")
-    logger.info(f"Output: {out}")
-    logger.info(f"Upscale factor: {upscale}")
+    ws = Workspace(path)
+
+    if roi is not None:
+        rois = ws.resolve_rois([roi])
+    else:
+        if not ws.rois:
+            raise FileNotFoundError("Workspace contains no ROIs.")
+        rois = ws.resolve_rois(ws.rois)
+
+    for idx, current_roi in enumerate(rois):
+        roi_out = out
+        if out is not None and len(rois) > 1:
+            roi_out = out / current_roi
+
+        _extract_single_roi(
+            ws=ws,
+            roi=current_roi,
+            codebook=codebook,
+            mode=mode,
+            out=roi_out,
+            dz=dz,
+            n=n,
+            anisotropy=anisotropy,
+            channels=channels,
+            crop=crop,
+            threads=threads,
+            upscale=upscale,
+            seed=None if seed is None else seed + idx,
+            every=every,
+            max_from=max_from,
+            use_zarr=use_zarr,
+        )
+
+
+def _extract_single_roi(
+    *,
+    ws: Workspace,
+    roi: str,
+    codebook: str,
+    mode: str,
+    out: Path | None,
+    dz: int,
+    n: int,
+    anisotropy: int,
+    channels: str | None,
+    crop: int,
+    threads: int,
+    upscale: float,
+    seed: int | None,
+    every: int,
+    max_from: str | None,
+    use_zarr: bool,
+) -> None:
+    reg_dir = ws.registered(roi, codebook)
+    out_dir = out
+    if out_dir is None:
+        out_dir = ws.segment(roi, codebook) / ("extract_z" if mode == "z" else "extract_ortho")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"[{roi}] Input: {reg_dir}")
+    logger.info(f"[{roi}] Output: {out_dir}")
+    logger.info(f"[{roi}] Upscale factor: {upscale}")
 
     inputs = _discover_registered_inputs(
         ws,
         roi,
         codebook,
-        prefer_zarr=use_zarr,
         require_zarr=use_zarr,
     )
     files = inputs[::every]
-    # When n is set, downsample files uniformly across size-sorted list
     if n and len(files) > n:
         import numpy as _np
 
         idxs = _np.linspace(0, len(files) - 1, n, dtype=int)
         idxs = _np.unique(idxs)
         files = [files[i] for i in idxs]
-        logger.info(f"Uniform file sampling: {len(files)} of {len(inputs)} across sizes")
+        logger.info(f"[{roi}] Uniform file sampling: {len(files)} of {len(inputs)} across sizes")
     if not files:
-        raise FileNotFoundError("No registered inputs matched the selection criteria.")
+        raise FileNotFoundError(f"[{roi}] No registered inputs matched the selection criteria.")
 
     max_from_path: Path | None = None
     if max_from:
-        candidate_dir = ws.registered(roi, max_from)
-        fused_candidate = ws.stitch(roi, max_from) / FILE_NAME
+        max_from_path = ws.registered(roi, max_from)
+        if not max_from_path.exists():
+            raise FileNotFoundError(f"[{roi}] --max-from codebook not found: {max_from_path}")
 
-        if use_zarr:
-            if fused_candidate.exists():
-                max_from_path = fused_candidate
-            else:
-                raise FileNotFoundError(
-                    f"--max-from requested {max_from} but no fused Zarr at {fused_candidate}."
-                )
-        else:
-            tif_candidates = list(candidate_dir.glob("reg-*.tif")) if candidate_dir.exists() else []
-            if tif_candidates:
-                max_from_path = candidate_dir
-            elif fused_candidate.exists():
-                max_from_path = fused_candidate
-            elif candidate_dir.exists():
-                max_from_path = candidate_dir  # keep legacy behaviour even if empty to raise later
+        missing = [
+            str((max_from_path / f.name).resolve()) for f in files if not (max_from_path / f.name).exists()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"[{roi}] --max-from is missing registered file(s): {', '.join(sorted(missing))}"
+            )
 
-    logger.info(f"Using {len(files)} registered {'file' if len(files) == 1 else 'files'}")
-    logger.info(f"Max-from: {max_from_path if max_from_path else 'None'}")
+    logger.info(f"[{roi}] Using {len(files)} registered {'file' if len(files) == 1 else 'files'}")
+    logger.info(f"[{roi}] Max-from: {max_from_path if max_from_path else 'None'}")
 
     if files and all(_is_zarr_path(f) for f in files) and mode == "z":
         tile_jobs: list[tuple[Path, object, list[tuple[int, int]], list[str] | None, list[int]]] = []
@@ -476,11 +521,11 @@ def cmd_extract(
             )
             z_candidates = list(range(0, vol.shape[0], dz))
             if not z_candidates:
-                raise ValueError("No Z indices available after applying dz to fused Zarr volume.")
+                raise ValueError(f"[{roi}] No Z indices available after applying dz to fused Zarr volume.")
             total_outputs += len(tile_origins) * len(z_candidates)
             tile_jobs.append((f, vol, tile_origins, names_all, z_candidates))
 
-        logger.info(f"Tracking {total_outputs} output files from Zarr input(s)")
+        logger.info(f"[{roi}] Tracking {total_outputs} output files from Zarr input(s)")
 
         with progress_bar(total_outputs) as progress_update:
             for f, vol, tile_origins, names_all, z_candidates in tile_jobs:
@@ -489,7 +534,7 @@ def cmd_extract(
                     vol,
                     names_all,
                     tile_origins,
-                    out,
+                    out_dir,
                     channels,
                     crop,
                     z_candidates,
@@ -501,7 +546,7 @@ def cmd_extract(
 
     if files and all(_is_zarr_path(f) for f in files) and mode == "ortho":
         rng = np.random.default_rng(seed)
-        logger.info(f"Random seed: {seed if seed is not None else 'system entropy'}")
+        logger.info(f"[{roi}] Random seed: {seed if seed is not None else 'system entropy'}")
         ortho_jobs: list[tuple[Path, object, list[str] | None, list[int], list[int]]] = []
         total_outputs = 0
         for f in files:
@@ -511,7 +556,7 @@ def cmd_extract(
             total_outputs += len(y_positions) + len(x_positions)
             ortho_jobs.append((f, vol, names_all, y_positions, x_positions))
 
-        logger.info(f"Tracking {total_outputs} ortho outputs from Zarr input(s)")
+        logger.info(f"[{roi}] Tracking {total_outputs} ortho outputs from Zarr input(s)")
 
         with progress_bar(total_outputs) as progress_update:
             for f, vol, names_all, y_positions, x_positions in ortho_jobs:
@@ -521,7 +566,7 @@ def cmd_extract(
                     names_all,
                     y_positions,
                     x_positions,
-                    out,
+                    out_dir,
                     channels,
                     crop,
                     anisotropy,
@@ -534,10 +579,30 @@ def cmd_extract(
     with progress_bar_threadpool(len(files), threads=threads, stop_on_exception=True) as submit:
         if mode == "z":
             for f in files:
-                submit(_process_file_to_z_slices, f, out, channels, crop, dz, n, max_from_path, upscale)
+                submit(
+                    _process_file_to_z_slices,
+                    f,
+                    out_dir,
+                    channels,
+                    crop,
+                    dz,
+                    n,
+                    max_from_path,
+                    upscale,
+                )
         else:
             for f in files:
-                submit(_process_file_to_ortho, f, out, channels, crop, n, anisotropy, max_from_path, upscale)
+                submit(
+                    _process_file_to_ortho,
+                    f,
+                    out_dir,
+                    channels,
+                    crop,
+                    n,
+                    anisotropy,
+                    max_from_path,
+                    upscale,
+                )
 
 
 # ---------- Logging helpers ----------
@@ -1007,9 +1072,9 @@ def _app_entrypoint(
         typer.Argument(help="Workspace root", exists=True, file_okay=False, dir_okay=True, resolve_path=True),
     ],
     roi: Annotated[
-        str,
+        str | None,
         typer.Option("--roi", "-r", help="ROI name (e.g., cortex)", rich_help_panel="Inputs"),
-    ] = ...,
+    ] = None,
     codebook: Annotated[
         str,
         typer.Option("--codebook", "-c", help="Registration codebook", rich_help_panel="Inputs"),

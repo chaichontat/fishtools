@@ -8,6 +8,8 @@ from typing import Any
 
 from loguru import logger
 
+from fishtools.io.workspace import Workspace
+
 CONSOLE_SKIP_EXTRA = "_skip_console_sink"
 
 # Unified log line format for console and file sinks
@@ -190,3 +192,93 @@ def setup_workspace_logging(
     )
     assert log_file is not None
     return log_file
+
+
+def resolve_workspace_root(path: Path | str) -> tuple[Path, bool]:
+    """Resolve a path to the nearest workspace root.
+
+    Args:
+        path: Candidate path pointing to a workspace, analysis subdir, or file inside.
+
+    Returns:
+        A tuple ``(root, has_analysis)`` where ``root`` is the resolved directory that best
+        represents the workspace root, and ``has_analysis`` indicates whether an ``analysis``
+        subdirectory was found during resolution.
+    """
+
+    resolved = Path(path).expanduser().resolve()
+    base = resolved if resolved.is_dir() else resolved.parent
+
+    try:
+        workspace = Workspace(base)
+    except (NotADirectoryError, ValueError):
+        for candidate in (base, *base.parents):
+            analysis_dir = candidate / "analysis"
+            if analysis_dir.is_dir():
+                return candidate, True
+        return base, False
+
+    workspace_root = workspace.path
+    has_analysis = workspace.analysis.is_dir()
+    return workspace_root, has_analysis
+
+
+def setup_cli_logging(
+    path: Path | None,
+    *,
+    component: str,
+    file: str,
+    idx: int | None = None,
+    debug: bool = False,
+    extra: dict[str, Any] | None = None,
+    console_level: str | None = None,
+    file_level: str | None = None,
+    rotation: str | int | None = "20 MB",
+    retention: str | int | None = "30 days",
+    enqueue: bool = False,
+    use_shared_console: bool = True,
+) -> Path | None:
+    """Configure CLI logging with workspace-aware file sinks when available.
+
+    When ``path`` resolves to a workspace (determined by locating an ``analysis`` directory),
+    this function delegates to :func:`setup_workspace_logging` so logs are written under
+    ``analysis/logs``. Otherwise it falls back to console-only logging via
+    :func:`initialize_logger` and :func:`configure_cli_logging`.
+    """
+
+    extra_payload = dict(extra or {})
+    if idx is not None:
+        extra_payload.setdefault("idx", f"{idx:04d}")
+
+    desired_console = console_level or ("DEBUG" if debug else "INFO")
+    desired_file = file_level or ("DEBUG" if debug else "INFO")
+
+    if path is not None:
+        workspace_root, found = resolve_workspace_root(path)
+        if found:
+            return setup_workspace_logging(
+                workspace_root,
+                component=component,
+                idx=idx,
+                file=file,
+                debug=debug,
+                console_level=desired_console,
+                file_level=desired_file,
+                rotation=rotation,
+                retention=retention,
+                extra=extra_payload,
+                enqueue=enqueue,
+                use_shared_console=use_shared_console,
+            )
+
+    initialize_logger(idx=idx, debug=debug)
+    configure_cli_logging(
+        workspace=None,
+        component=component,
+        console_level=desired_console,
+        file_level="CRITICAL",
+        extra=extra_payload,
+        enqueue=enqueue,
+        use_shared_console=use_shared_console,
+    )
+    return None
