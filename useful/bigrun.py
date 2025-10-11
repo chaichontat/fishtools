@@ -11,9 +11,10 @@ from shlex import split
 from typing import Any
 
 import rich_click as click
-from fishtools.utils.io import Workspace
 from prefect import flow, task
 from prefect.logging import get_run_logger
+
+from fishtools.utils.io import Workspace
 
 
 @contextmanager
@@ -98,14 +99,14 @@ def check(conditions: list[Callable[..., bool]]) -> bool:
 
 @flow(name="Deconv")
 def deconv():
-    execute_script("preprocess deconvold batch . --basic-name=all")
+    execute_script("preprocess deconv batch . --basic-name=all")
     with setwd("analysis/deconv"):
-        execute_script("preprocess deconvold compute-range . --overwrite")
+        execute_script("preprocess deconv compute-range . --overwrite")
 
 
 @flow(name="Register")
 def register(ws: Workspace, codebook: Path, threads: int):
-    execute_script("preprocess deconvold compute-range . --overwrite")
+    execute_script("preprocess deconv compute-range . --overwrite")
     execute_script(f"preprocess register batch . --codebook={codebook} --threads={threads}")
 
 
