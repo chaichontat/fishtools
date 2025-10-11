@@ -6,8 +6,11 @@ Tools for FISH analysis
 
 ## Installation
 
+There are two environment files. One for
+
 ```sh
-mamba env create -n fishtools -f environment.yml
+mamba env create -n fishtools -f environment_rsc_rapids_25.04.yml
+mamba env update -n fishtools -f environment.yml
 ```
 
 `mamba` is a drop-in replacement for `conda` that is faster and more reliable.

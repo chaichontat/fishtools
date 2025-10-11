@@ -14,6 +14,7 @@ import polars as pl
 import pytest
 import tifffile
 import xarray as xr
+from fishtools.utils.io import CorruptedTiffError, Workspace
 
 from fishtools.preprocess.spots.align_prod import (
     Deviation,
@@ -25,7 +26,6 @@ from fishtools.preprocess.spots.align_prod import (
     generate_subtraction_matrix,
     get_blank_channel_info,
 )
-from fishtools.utils.io import CorruptedTiffError, Workspace
 
 
 def test_get_blank_channel_info_mappings() -> None:
@@ -50,20 +50,28 @@ def test_generate_subtraction_matrix_shapes_and_values() -> None:
     keys = ["1", "9", "17", "25", "26", "27"]
 
     # Provide coefficients for all required numeric channel_key values
-    coefs = pl.DataFrame(
-        {
-            "channel_key": [1, 9, 17, 25, 26, 27],
-            "slope": [1.0, 0.5, 2.0, 1.0, 1.0, 1.0],
-            "intercept": [0.0, 0.0, 0.0, 10.0, -5.0, 0.0],
-        }
-    )
+    coefs = pl.DataFrame({
+        "channel_key": [1, 9, 17, 25, 26, 27],
+        "slope": [1.0, 0.5, 2.0, 1.0, 1.0, 1.0],
+        "intercept": [0.0, 0.0, 0.0, 10.0, -5.0, 0.0],
+    })
 
     out = generate_subtraction_matrix(blanks, coefs, keys)
     assert tuple(out.dims) == ("r", "c", "z", "y", "x")
     assert out.shape == (1, len(keys), 2, 4, 4)
 
     # Returned matrix is negated and floored at zero before negation -> values <= 0
-    np.testing.assert_array_less(out.to_numpy(), 1e-6)  # strictly negative or ~0
+    out_np = np.asarray(out.data)
+    np.testing.assert_array_less(out_np, 1e-6)  # strictly negative or ~0
+
+    blanks_np = np.asarray(blanks.data)
+    # Channel 0 (key "1") should equal the negated blank values for slope=1, intercept=0
+    np.testing.assert_allclose(np.asarray(out.sel(c=0).data), -blanks_np[:, 0], rtol=1e-6, atol=1e-6)
+
+    # Channel 3 (key "25") maps back to blank index 0 with a positive intercept of 10
+    intercept_offset = 10.0 / 65535.0
+    expected_channel3 = -(blanks_np[:, 0] + intercept_offset)
+    np.testing.assert_allclose(np.asarray(out.sel(c=3).data), expected_channel3, rtol=1e-6, atol=1e-6)
 
     # Missing parameters should raise a clear error for the specific key
     with pytest.raises(ValueError, match="channel key '999'"):

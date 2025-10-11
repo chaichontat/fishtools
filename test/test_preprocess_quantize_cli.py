@@ -39,7 +39,7 @@ def test_quantize_cli_produces_uint16_deliverable(tmp_path: Path) -> None:
     deconv32_dir = workspace / "analysis" / "deconv32" / f"{round_name}--{roi}"
     deconv32_dir.mkdir(parents=True, exist_ok=True)
 
-    scaling_dir = workspace / "analysis" / "deconv32" / "deconv_scaling"
+    scaling_dir = workspace / "analysis" / "deconv_scaling"
     scaling_dir.mkdir(parents=True, exist_ok=True)
 
     m_glob = np.array([10.0, 100.0], dtype=np.float32)
@@ -155,7 +155,7 @@ def test_precompute_cli_writes_scaling_artifacts(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
 
-    scale_dir = tmp_path / "analysis" / "deconv32" / "deconv_scaling"
+    scale_dir = tmp_path / "analysis" / "deconv_scaling"
     txt_path = scale_dir / f"{round_name}.txt"
     png_path = scale_dir / f"{round_name}.hist.png"
     assert txt_path.exists()
@@ -176,7 +176,7 @@ def test_quantize_cli_reads_only_fid_planes(tmp_path: Path, monkeypatch) -> None
     deconv32_dir = workspace / "analysis" / "deconv32" / f"{round_name}--{roi}"
     deconv32_dir.mkdir(parents=True, exist_ok=True)
 
-    scaling_dir = workspace / "analysis" / "deconv32" / "deconv_scaling"
+    scaling_dir = workspace / "analysis" / "deconv_scaling"
     scaling_dir.mkdir(parents=True, exist_ok=True)
 
     m_glob = np.array([1.0, 2.0], dtype=np.float32)

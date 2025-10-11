@@ -1,5 +1,6 @@
 import json
 import pickle
+import time
 from pathlib import Path
 
 import numpy as np
@@ -44,8 +45,53 @@ def stub_cupy_cuda(monkeypatch):
         class CUDARuntimeError(RuntimeError):
             pass
 
-    cuda = type("_Cuda", (), {"runtime": _Runtime()})
+    class _Stream:
+        def synchronize(self) -> None:
+            return None
+
+    class _Event:
+        def __init__(self) -> None:
+            self._timestamp: float | None = None
+
+        def record(self, *_args, **_kwargs) -> None:
+            self._timestamp = time.perf_counter()
+
+        def synchronize(self) -> None:
+            return None
+
+        @property
+        def timestamp(self) -> float:
+            if self._timestamp is None:
+                return time.perf_counter()
+            return self._timestamp
+
+    _stream = _Stream()
+
+    def _get_elapsed_time(start: _Event, end: _Event) -> float:
+        return max(0.0, (end.timestamp - start.timestamp) * 1_000.0)
+
+    cuda = type(
+        "_Cuda",
+        (),
+        {
+            "runtime": _Runtime(),
+            "Stream": _Stream,
+            "Event": _Event,
+            "get_current_stream": lambda: _stream,
+            "get_elapsed_time": _get_elapsed_time,
+            "Device": lambda _idx: type("_Device", (), {"use": lambda self: None})(),
+        },
+    )
     monkeypatch.setattr(cp, "cuda", cuda, raising=False)
+
+    def _elementwise_kernel(*_args, **_kwargs):
+        def _kernel(x, df, inv_ff, out):
+            np.maximum((x - df) * inv_ff, 0.0, out=out)
+            return out
+
+        return _kernel
+
+    monkeypatch.setattr(cp, "ElementwiseKernel", _elementwise_kernel, raising=False)
 
 
 def _patch_deconv_stubs(monkeypatch, channels: int, height: int, width: int) -> None:
@@ -103,3 +149,18 @@ def test_cli_prepare_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     # Float32 artifacts should exist
     f32 = workspace / "analysis" / "deconv32" / f"{round_name}--{roi}" / f"{round_name}-0000.tif"
     assert f32.exists()
+
+    with tifffile.TiffFile(f32) as tif:
+        payload = tif.asarray()
+        assert payload.dtype == np.float32
+        assert payload.shape == (C * 2, H, W)
+        metadata_raw = tif.pages[0].tags["ImageDescription"].value
+    metadata_payload = json.loads(metadata_raw)
+    assert metadata_payload["dtype"] == "float32"
+    assert metadata_payload["fid_planes"] == 0
+
+    hist_path = f32.with_suffix(".histogram.csv")
+    assert hist_path.exists()
+    rows = hist_path.read_text().strip().splitlines()
+    assert rows[0].strip() == "channel,bin_left,bin_right,count"
+    assert len(rows) > C  # at least one row per channel

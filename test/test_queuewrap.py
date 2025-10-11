@@ -1,5 +1,5 @@
-import os
 import getpass
+import os
 import signal
 import socket
 import subprocess
@@ -10,13 +10,6 @@ from multiprocessing.managers import BaseManager
 from typing import Any
 
 import pytest
-
-# Skip the entire module if sockets cannot be created in this environment
-try:
-    _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _s.close()
-except PermissionError:  # pragma: no cover - environment specific
-    pytest.skip("Skipping queuewrap tests: socket creation not permitted in sandbox.", allow_module_level=True)
 
 
 def _free_port() -> int:
@@ -70,12 +63,14 @@ def wait_until_removed(q: Any, item_id: str, timeout: float = 2.0) -> bool:
 def wait_for_output(proc: subprocess.Popen, expected_text: str, timeout: float = 2.0) -> bool:
     """Wait for specific output from a subprocess."""
     import select
+
     deadline = time.time() + timeout
     buffer = ""
 
     # Make stdout non-blocking for efficient polling
     import fcntl
     import os as os_module
+
     flags = fcntl.fcntl(proc.stdout.fileno(), fcntl.F_GETFL)
     fcntl.fcntl(proc.stdout.fileno(), fcntl.F_SETFL, flags | os_module.O_NONBLOCK)
 
@@ -164,13 +159,11 @@ def clear_queue(server):
 
 def _run_client(server, args, timeout=3):  # Reduced default timeout from 5s
     env = os.environ.copy()
-    env.update(
-        {
-            "SCHED_HOST": server["host"],
-            "SCHED_PORT": str(server["port"]),
-            "SCHED_AUTHKEY": server["authkey"].decode(),
-        }
-    )
+    env.update({
+        "SCHED_HOST": server["host"],
+        "SCHED_PORT": str(server["port"]),
+        "SCHED_AUTHKEY": server["authkey"].decode(),
+    })
     p = subprocess.Popen(
         [sys.executable, "-m", "fishtools.queuing.client", *args],
         stdout=subprocess.PIPE,
@@ -234,13 +227,11 @@ def test_waits_until_anchor_removed_then_runs(server):
     q.put("ANCHOR")
 
     env = os.environ.copy()
-    env.update(
-        {
-            "SCHED_HOST": server["host"],
-            "SCHED_PORT": str(server["port"]),
-            "SCHED_AUTHKEY": server["authkey"].decode(),
-        }
-    )
+    env.update({
+        "SCHED_HOST": server["host"],
+        "SCHED_PORT": str(server["port"]),
+        "SCHED_AUTHKEY": server["authkey"].decode(),
+    })
 
     p = subprocess.Popen(
         [
@@ -284,13 +275,11 @@ def test_interrupt_while_waiting_removes_entry(server):
     q.put("ANCHOR")
 
     env = os.environ.copy()
-    env.update(
-        {
-            "SCHED_HOST": server["host"],
-            "SCHED_PORT": str(server["port"]),
-            "SCHED_AUTHKEY": server["authkey"].decode(),
-        }
-    )
+    env.update({
+        "SCHED_HOST": server["host"],
+        "SCHED_PORT": str(server["port"]),
+        "SCHED_AUTHKEY": server["authkey"].decode(),
+    })
 
     p = subprocess.Popen(
         [
@@ -332,13 +321,11 @@ def test_interrupt_while_waiting_removes_entry(server):
 def test_multi_client_exclusive_run(tmp_path, server):
     user = getpass.getuser()
     env = os.environ.copy()
-    env.update(
-        {
-            "SCHED_HOST": server["host"],
-            "SCHED_PORT": str(server["port"]),
-            "SCHED_AUTHKEY": server["authkey"].decode(),
-        }
-    )
+    env.update({
+        "SCHED_HOST": server["host"],
+        "SCHED_PORT": str(server["port"]),
+        "SCHED_AUTHKEY": server["authkey"].decode(),
+    })
 
     # Start A with shorter sleep
     pA = subprocess.Popen(
@@ -407,13 +394,11 @@ def test_multi_client_exclusive_run(tmp_path, server):
 def test_sigkill_head_removal_allows_next(server):
     user = getpass.getuser()
     env = os.environ.copy()
-    env.update(
-        {
-            "SCHED_HOST": server["host"],
-            "SCHED_PORT": str(server["port"]),
-            "SCHED_AUTHKEY": server["authkey"].decode(),
-        }
-    )
+    env.update({
+        "SCHED_HOST": server["host"],
+        "SCHED_PORT": str(server["port"]),
+        "SCHED_AUTHKEY": server["authkey"].decode(),
+    })
 
     # A acquires head and sleeps; B waits behind A
     pA = subprocess.Popen(
@@ -484,13 +469,11 @@ def test_sigkill_head_removal_allows_next(server):
 def test_killed_waiting_client_removed(server):
     user = getpass.getuser()
     env = os.environ.copy()
-    env.update(
-        {
-            "SCHED_HOST": server["host"],
-            "SCHED_PORT": str(server["port"]),
-            "SCHED_AUTHKEY": server["authkey"].decode(),
-        }
-    )
+    env.update({
+        "SCHED_HOST": server["host"],
+        "SCHED_PORT": str(server["port"]),
+        "SCHED_AUTHKEY": server["authkey"].decode(),
+    })
 
     # A grabs head; B queues then is SIGKILLed while waiting
     pA = subprocess.Popen(

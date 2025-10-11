@@ -18,7 +18,9 @@ def _write_hist_csv(directory: Path, round_name: str, rows: list[tuple[int, floa
             handle.write(f"{channel},{bin_left},{bin_right},{count}\n")
 
 
-def test_precompute_applies_name_overrides_when_tile_lacks_channel_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_precompute_applies_name_overrides_when_tile_lacks_channel_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     round_name = "wga_brdu"
     roi = "roi1"
     override_dir = tmp_path / "analysis" / "deconv32" / f"{round_name}--{roi}"
@@ -56,7 +58,7 @@ def test_precompute_applies_name_overrides_when_tile_lacks_channel_metadata(tmp_
     # Scalar default intentionally differs from overrides to expose mismatches
     normalize.precompute(tmp_path, round_name, bins=32, p_low=0.001, p_high=0.5, gamma=1.0)
 
-    meta_path = tmp_path / "analysis" / "deconv32" / "deconv_scaling" / f"{round_name}.json"
+    meta_path = tmp_path / "analysis" / "deconv_scaling" / f"{round_name}.json"
     metadata = json.loads(meta_path.read_text(encoding="utf-8"))
 
     assert metadata["p_high_used"] == pytest.approx([0.90, 0.85])

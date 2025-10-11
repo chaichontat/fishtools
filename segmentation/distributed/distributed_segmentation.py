@@ -23,12 +23,13 @@ import tifffile
 import typer
 import yaml
 import zarr
+from fishtools.segment.normalize import calc_percentile
 from loguru import logger
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
 from fishtools.preprocess.config import NumpyEncoder
-from fishtools.preprocess.segmentation import calc_percentile, unsharp_all
+from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.utils.pretty_print import progress_bar
 
 # logger.remove()
@@ -863,7 +864,7 @@ def distributed_eval(
 
     timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     worker_logs_dirname = f"dask_worker_logs_{timestamp}"
-    worker_logs_dir = input_zarr.parent / worker_logs_dirname
+    worker_logs_dir = Path(input_zarr.path).parent / worker_logs_dirname
     worker_logs_dir.mkdir()
 
     if "diameter" not in eval_kwargs.keys():
@@ -1073,7 +1074,7 @@ def adjacent_faces(
     return face_pairs
 
 
-def block_face_adjacency_graph(faces: list[NDArray[Any]], nlabels: int) -> scipy.sparse._matrix.csr_matrix:
+def block_face_adjacency_graph(faces: list[NDArray[Any]], nlabels: int):
     """Shrink labels in face plane, then find which labels touch across the
     face boundary"""
     # FIX float parameters
@@ -1170,7 +1171,7 @@ def main(
     Expected folder structure:
     - path/fused.zarr (input image data)
     - path/config.json (segmentation parameters)
-    - path/normalization.json (optional, auto-generated if missing)
+    - path/normalization.json (auto-generated if missing)
 
     Output files:
     - path/output_segmentation.zarr (segmentation results)
@@ -1182,8 +1183,9 @@ def main(
         exit()
 
     # ---- 1. Configuration ----
-    path = Path(path)
-    zarr_input_path = path / "fused.zarr"
+    path_zarr = path
+    path = Path(path).parent
+    zarr_input_path = path_zarr
     zarr_output_path = path / "output_segmentation.zarr"
     temporary_directory = path / "cellpose_temp"
     (zarr_output_path.parent / "segmentation.done").unlink(missing_ok=True)

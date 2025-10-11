@@ -10,7 +10,9 @@ from click.testing import CliRunner
 from fishtools.preprocess.cli import main as preprocess
 
 
-def _write_hist_csv(dirpath: Path, round_name: str, roi: str, rows: list[tuple[int, float, float, int]]) -> None:
+def _write_hist_csv(
+    dirpath: Path, round_name: str, roi: str, rows: list[tuple[int, float, float, int]]
+) -> None:
     target = dirpath / "analysis" / "deconv32" / f"{round_name}--{roi}"
     target.mkdir(parents=True, exist_ok=True)
     csv_path = target / f"{round_name}-0001.histogram.csv"
@@ -52,7 +54,7 @@ def test_deconv_normalize_precompute(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
 
-    scale_dir = tmp_path / "analysis" / "deconv32" / "deconv_scaling"
+    scale_dir = tmp_path / "analysis" / "deconv_scaling"
     txt_path = scale_dir / f"{round_name}.txt"
     png_path = scale_dir / f"{round_name}.hist.png"
     assert txt_path.exists()
@@ -73,7 +75,7 @@ def test_deconv_normalize_quantize(tmp_path: Path) -> None:
     deconv32_dir = workspace / "analysis" / "deconv32" / f"{round_name}--{roi}"
     deconv32_dir.mkdir(parents=True, exist_ok=True)
 
-    scaling_dir = workspace / "analysis" / "deconv32" / "deconv_scaling"
+    scaling_dir = workspace / "analysis" / "deconv_scaling"
     scaling_dir.mkdir(parents=True, exist_ok=True)
 
     m_glob = np.array([10.0, 100.0], dtype=np.float32)
@@ -98,9 +100,7 @@ def test_deconv_normalize_quantize(tmp_path: Path) -> None:
     tifffile.imwrite(float32_path, float32_payload, dtype=np.float32, metadata={"dtype": "float32"})
 
     fid_planes = np.arange(n_fids * height * width, dtype=np.uint16).reshape(n_fids, height, width)
-    raw_payload = np.concatenate(
-        [np.zeros_like(float32_payload, dtype=np.uint16), fid_planes], axis=0
-    )
+    raw_payload = np.concatenate([np.zeros_like(float32_payload, dtype=np.uint16), fid_planes], axis=0)
     raw_metadata = {
         "waveform": json.dumps({"params": {"powers": ["bit001", "bit002"]}}),
         "channel_names": ["wga", "edu"],

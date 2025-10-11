@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from click.testing import CliRunner
+
 from fishtools.preprocess.spots.align_batchoptimize import optimize as optimize_cmd
 
 
@@ -24,13 +24,17 @@ def workspace(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_optimize_invokes_subcommands_without_blank(monkeypatch: Any, workspace: Path, tmp_path: Path) -> None:
+def test_optimize_invokes_subcommands_without_blank(
+    monkeypatch: Any, workspace: Path, tmp_path: Path
+) -> None:
     calls: list[_Call] = []
 
     def fake_run(args: list[Any], check: bool, capture_output: bool):  # type: ignore[no-untyped-def]
         calls.append(_Call([str(a) for a in args]))
+
         class _R:  # minimal stub
             returncode = 0
+
         return _R()
 
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -77,8 +81,10 @@ def test_optimize_includes_blank_when_provided(monkeypatch: Any, workspace: Path
 
     def fake_run(args: list[Any], check: bool, capture_output: bool):  # type: ignore[no-untyped-def]
         calls.append(_Call([str(a) for a in args]))
+
         class _R:
             returncode = 0
+
         return _R()
 
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -122,8 +128,10 @@ def test_optimize_forwards_config(monkeypatch: Any, workspace: Path, tmp_path: P
 
     def fake_run(args: list[Any], check: bool, capture_output: bool):  # type: ignore[no-untyped-def]
         calls.append(_Call([str(a) for a in args]))
+
         class _R:
             returncode = 0
+
         return _R()
 
     monkeypatch.setattr("subprocess.run", fake_run)

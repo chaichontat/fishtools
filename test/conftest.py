@@ -8,8 +8,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from scipy import fft as _scipy_fft
 from scipy import ndimage as _scipy_ndimage
-
+from skimage.transform import downscale_local_mean as _skimage_downscale_local_mean
 
 _DEFAULT_TIMEOUT_SECONDS = 30
 
@@ -52,6 +53,7 @@ def pytest_runtest_call(item: pytest.Item):
     exc_info = outcome.excinfo
     if exc_info is not None and issubclass(exc_info[0], _TestTimeoutError):
         pytest.fail(str(exc_info[1]), pytrace=False)
+
 
 # Lightweight stub for heavy optional dependency 'scanpy' used in import-time
 # paths (e.g., fishtools.postprocess). This avoids importing the real package
@@ -115,6 +117,12 @@ if "cupy" not in sys.modules:
         def clip(self, *args, **kwargs):
             return np.clip(*args, **kwargs)
 
+        def ElementwiseKernel(self, *args, **kwargs):  # type: ignore[invalid-name]
+            def _kernel(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("ElementwiseKernel stub invoked in tests; GPU path not supported.")
+
+            return _kernel
+
         def asnumpy(self, array, *args, **kwargs):
             return np.asarray(array, *args, **kwargs)
 
@@ -134,10 +142,34 @@ if "cupy" not in sys.modules:
     cupyx_ndimage.convolve = _scipy_ndimage.convolve
     cupyx_ndimage.gaussian_filter = _scipy_ndimage.gaussian_filter
     cupyx_ndimage.zoom = _scipy_ndimage.zoom
+    cupyx_ndimage.rank_filter = _scipy_ndimage.rank_filter
+    cupyx_ndimage.uniform_filter = _scipy_ndimage.uniform_filter
     sys.modules["cupyx.scipy.ndimage"] = cupyx_ndimage
 
     cupyx_scipy.ndimage = cupyx_ndimage
+    cupyx_scipy.sparse = cupyx_scipy_sparse
+
+    cupyx_scipy_fft = types.ModuleType("cupyx.scipy.fft")
+    cupyx_scipy_fft.fftn = _scipy_fft.fftn
+    cupyx_scipy_fft.ifftn = _scipy_fft.ifftn
+    cupyx_scipy_fft.fftfreq = _scipy_fft.fftfreq
+    cupyx_scipy_fft.rfftn = _scipy_fft.rfftn
+    cupyx_scipy_fft.irfftn = _scipy_fft.irfftn
+    sys.modules["cupyx.scipy.fft"] = cupyx_scipy_fft
+    cupyx_scipy.fft = cupyx_scipy_fft
+
     cupyx.scipy = cupyx_scipy
+
+if "cucim" not in sys.modules:
+    cucim = types.ModuleType("cucim")
+    cucim_skimage = types.ModuleType("cucim.skimage")
+    cucim_transform = types.ModuleType("cucim.skimage.transform")
+    cucim_transform.downscale_local_mean = _skimage_downscale_local_mean
+    sys.modules["cucim"] = cucim
+    sys.modules["cucim.skimage"] = cucim_skimage
+    sys.modules["cucim.skimage.transform"] = cucim_transform
+    cucim.skimage = cucim_skimage
+    cucim_skimage.transform = cucim_transform
 
     class _CudaRuntime(types.SimpleNamespace):
         @staticmethod

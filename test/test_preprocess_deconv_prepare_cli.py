@@ -24,4 +24,3 @@ def test_deconv_prepare_accepts_roi_positional(tmp_path: Path) -> None:
         ],
     )
     assert result.exit_code == 0, result.output
-

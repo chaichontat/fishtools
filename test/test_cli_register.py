@@ -10,10 +10,12 @@ from click.testing import CliRunner
 
 from fishtools.preprocess.cli_register import (
     DATA,
+    Config,
     Fiducial,
     RegisterConfig,
-    Config,
     _run,
+)
+from fishtools.preprocess.cli_register import (
     register as register_cli,
 )
 

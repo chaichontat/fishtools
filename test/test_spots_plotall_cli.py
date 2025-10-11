@@ -15,13 +15,11 @@ def _make_workspace(tmp_path: Path, rois: list[str]) -> None:
 
 
 def _write_parquet(tmp_path: Path, roi: str, codebook_sanitized: str) -> Path:
-    spots = pl.DataFrame(
-        {
-            "x": [10.0, 20.0, 30.0],
-            "y": [5.0, 15.0, 25.0],
-            "target": ["GeneA", "GeneB", "Blank-1"],
-        }
-    )
+    spots = pl.DataFrame({
+        "x": [10.0, 20.0, 30.0],
+        "y": [5.0, 15.0, 25.0],
+        "target": ["GeneA", "GeneB", "Blank-1"],
+    })
     out = tmp_path / "analysis" / "output" / f"{roi}+{codebook_sanitized}.parquet"
     spots.write_parquet(out)
     return out

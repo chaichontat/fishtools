@@ -17,13 +17,12 @@ import xarray as xr
 from numpy.testing import assert_allclose, assert_array_almost_equal
 
 from fishtools.preprocess.spots.align_prod import (
-    load_codebook,
-    initial,
     generate_subtraction_matrix,
     get_blank_channel_info,
+    initial,
     load_2d,
+    load_codebook,
 )
-
 
 # ============================================================================
 # REAL TEST DATA GENERATORS (Not mocks!)
@@ -36,7 +35,7 @@ def create_realistic_fish_image(
     spot_intensity: float = 5000.0,
     background: float = 500.0,
     noise_std: float = 100.0,
-    seed: int = 42
+    seed: int = 42,
 ) -> np.ndarray:
     """
     Create a realistic FISH image with known spot positions.
@@ -51,9 +50,9 @@ def create_realistic_fish_image(
     # Generate random spot positions
     spot_positions = []
     for _ in range(num_spots):
-        sz = np.random.randint(1, max(2, z-1))
-        sy = np.random.randint(10, max(11, y-10))
-        sx = np.random.randint(10, max(11, x-10))
+        sz = np.random.randint(1, max(2, z - 1))
+        sy = np.random.randint(10, max(11, y - 10))
+        sx = np.random.randint(10, max(11, x - 10))
         spot_positions.append((sz, sy, sx))
 
         # Add 3D Gaussian spot to random channels
@@ -79,7 +78,7 @@ def save_test_tiff(path: Path, data: np.ndarray, metadata: dict[str, Any] | None
         metadata = {"key": list(range(1, data.shape[1] + 1))}
 
     with tifffile.TiffWriter(path) as tif:
-        tif.write(data, metadata=metadata, photometric='minisblack')
+        tif.write(data, metadata=metadata, photometric="minisblack")
 
 
 # ============================================================================
@@ -109,8 +108,7 @@ class TestRealComputations:
 
         # Measure channel intensities before scaling
         channel_means_before = [test_data[:, i].mean() for i in range(4)]
-        ratios_before = [channel_means_before[i] / channel_means_before[0]
-                         for i in range(4)]
+        ratios_before = [channel_means_before[i] / channel_means_before[0] for i in range(4)]
 
         # This is where we'd apply actual scaling if we had the real ImageStack
         # For now, simulate the expected behavior
@@ -120,10 +118,8 @@ class TestRealComputations:
 
         # Measure after scaling
         channel_means_after = [scaled_data[:, i].mean() for i in range(4)]
-        expected_ratios = [ratios_before[i] * scale_factors[i] / scale_factors[0]
-                          for i in range(4)]
-        actual_ratios = [channel_means_after[i] / channel_means_after[0]
-                        for i in range(4)]
+        expected_ratios = [ratios_before[i] * scale_factors[i] / scale_factors[0] for i in range(4)]
+        actual_ratios = [channel_means_after[i] / channel_means_after[0] for i in range(4)]
 
         # Verify scaling worked as expected
         assert_array_almost_equal(actual_ratios, expected_ratios, decimal=2)
@@ -145,23 +141,21 @@ class TestRealComputations:
             channel_data.append(data)
 
             # Calculate expected 1st and 99.99th percentiles
-            expected_percentiles.append([
-                np.percentile(data, 1),
-                np.percentile(data, 99.99)
-            ])
+            expected_percentiles.append([np.percentile(data, 1), np.percentile(data, 99.99)])
 
         # Stack into format expected by initial()
         test_data = np.stack(channel_data).reshape(1, 4, 1, 100, 100).astype(np.float32)
 
         # Create mock that returns our test data
         from unittest.mock import MagicMock
+
         import xarray as xr
 
         mock_stack = MagicMock()
         mock_reduced = MagicMock()
         mock_reduced.xarray = xr.DataArray(
             test_data.squeeze(axis=(0, 2)),  # Remove r and z dimensions
-            dims=["c", "y", "x"]
+            dims=["c", "y", "x"],
         )
         mock_stack.reduce.return_value = mock_reduced
 
@@ -183,23 +177,22 @@ class TestRealComputations:
         # Create known blank values
         blank_values = 100.0
         blanks = xr.DataArray(
-            np.full((1, 3, 2, 10, 10), blank_values, dtype=np.float32),
-            dims=["r", "c", "z", "y", "x"]
+            np.full((1, 3, 2, 10, 10), blank_values, dtype=np.float32), dims=["r", "c", "z", "y", "x"]
         )
 
         # Define precise transformation parameters
         coefs = pl.DataFrame({
             "channel_key": [1, 9, 17],
             "slope": [1.0, 2.0, 0.5],
-            "intercept": [0.0, 1000.0, -500.0]
+            "intercept": [0.0, 1000.0, -500.0],
         })
 
         keys = ["1", "9", "17"]
 
         # Calculate expected results manually
-        expected_ch0 = -(blank_values * 1.0 + 0.0/65535)
-        expected_ch1 = -(blank_values * 2.0 + 1000.0/65535)
-        expected_ch2 = -(blank_values * 0.5 - 500.0/65535)
+        expected_ch0 = -(blank_values * 1.0 + 0.0 / 65535)
+        expected_ch1 = -(blank_values * 2.0 + 1000.0 / 65535)
+        expected_ch2 = -(blank_values * 0.5 - 500.0 / 65535)
 
         # Run actual function
         result = generate_subtraction_matrix(blanks, coefs, keys)
@@ -229,14 +222,10 @@ class TestRealComputations:
         cb_path.write_text(json.dumps(realistic_codebook))
 
         # Create bit mapping for 24 bits (typical for 3-color, 8-round FISH)
-        bit_mapping = {str(i): i-1 for i in range(1, 25)}
+        bit_mapping = {str(i): i - 1 for i in range(1, 25)}
 
         # Load and verify
-        cb, used_bits, names, arr_zeroblank = load_codebook(
-            cb_path,
-            bit_mapping,
-            exclude={"Malat1-201"}
-        )
+        cb, used_bits, names, arr_zeroblank = load_codebook(cb_path, bit_mapping, exclude={"Malat1-201"})
 
         # Verify structure
         assert len(names) == 6  # 4 genes + 2 blanks
@@ -284,16 +273,12 @@ class TestRealIntegration:
     def test_codebook_to_array_pipeline(self, tmp_path: Path):
         """Test the complete codebook loading and array generation pipeline."""
         # Create test codebook
-        codebook_data = {
-            "GeneA": [1, 3, 5],
-            "GeneB": [2, 4, 6],
-            "Blank": [7, 8]
-        }
+        codebook_data = {"GeneA": [1, 3, 5], "GeneB": [2, 4, 6], "Blank": [7, 8]}
 
         cb_path = tmp_path / "test_cb.json"
         cb_path.write_text(json.dumps(codebook_data))
 
-        bit_mapping = {str(i): i-1 for i in range(1, 10)}
+        bit_mapping = {str(i): i - 1 for i in range(1, 10)}
 
         # Load codebook
         cb, used_bits, names, arr_zeroblank = load_codebook(cb_path, bit_mapping)
@@ -305,14 +290,17 @@ class TestRealIntegration:
 
         # Verify array structure matches codebook
         # This tests the actual bit-to-array conversion logic
-        expected_array = np.array([
-            [1, 0, 1, 0, 1, 0, 0, 0],  # GeneA: bits 1,3,5
-            [0, 1, 0, 1, 0, 1, 0, 0],  # GeneB: bits 2,4,6
-            [0, 0, 0, 0, 0, 0, 1, 1],  # Blank: bits 7,8
-        ], dtype=bool)
+        expected_array = np.array(
+            [
+                [1, 0, 1, 0, 1, 0, 0, 0],  # GeneA: bits 1,3,5
+                [0, 1, 0, 1, 0, 1, 0, 0],  # GeneB: bits 2,4,6
+                [0, 0, 0, 0, 0, 0, 1, 1],  # Blank: bits 7,8
+            ],
+            dtype=bool,
+        )
 
         # Extract actual array from codebook
-        if hasattr(cb, 'to_numpy'):
+        if hasattr(cb, "to_numpy"):
             actual = cb.to_numpy()
         else:
             actual = cb.values
@@ -380,14 +368,13 @@ class TestProperties:
         # Property: Blank subtraction should always subtract (negative values)
         for _ in range(10):  # Test multiple random cases
             blanks = xr.DataArray(
-                np.random.rand(1, 3, 2, 5, 5).astype(np.float32) * 1000,
-                dims=["r", "c", "z", "y", "x"]
+                np.random.rand(1, 3, 2, 5, 5).astype(np.float32) * 1000, dims=["r", "c", "z", "y", "x"]
             )
 
             coefs = pl.DataFrame({
                 "channel_key": [1, 9, 17],
                 "slope": np.random.rand(3) * 2,  # Random positive slopes
-                "intercept": np.random.randn(3) * 100  # Random intercepts
+                "intercept": np.random.randn(3) * 100,  # Random intercepts
             })
 
             result = generate_subtraction_matrix(blanks, coefs, ["1", "9", "17"])
@@ -407,16 +394,12 @@ class TestSnapshots:
     def test_codebook_snapshot(self, tmp_path: Path):
         """Test that codebook loading produces consistent output."""
         # Fixed test case for regression detection
-        codebook_data = {
-            "Gene1": [1, 2, 3],
-            "Gene2": [4, 5, 6],
-            "Blank1": [7, 8]
-        }
+        codebook_data = {"Gene1": [1, 2, 3], "Gene2": [4, 5, 6], "Blank1": [7, 8]}
 
         cb_path = tmp_path / "snapshot_cb.json"
         cb_path.write_text(json.dumps(codebook_data))
 
-        bit_mapping = {str(i): i-1 for i in range(1, 10)}
+        bit_mapping = {str(i): i - 1 for i in range(1, 10)}
 
         cb, used_bits, names, arr_zeroblank = load_codebook(cb_path, bit_mapping)
 

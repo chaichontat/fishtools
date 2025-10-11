@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from pathlib import Path
 import types
+from pathlib import Path
 from typing import Any
 
-import pytest
 import numpy as np
+import pytest
 import zarr
 from tifffile import imread
 
 from fishtools.preprocess import n4
-
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -141,7 +140,9 @@ def test_compute_field_from_workspace_applies_correction(tmp_path: Path) -> None
         assert quant["upper_percentile"] == pytest.approx(n4.QUANT_UPPER_PERCENTILE)
 
     float_store = zarr.open_array(
-        result.corrected_path.with_name(f"{result.corrected_path.stem}_float32{result.corrected_path.suffix}"),
+        result.corrected_path.with_name(
+            f"{result.corrected_path.stem}_float32{result.corrected_path.suffix}"
+        ),
         mode="r",
     )
     assert float_store.shape == corrected.shape
@@ -160,6 +161,28 @@ def test_compute_correction_field_requires_positive_mask() -> None:
             image,
             shrink=1,
             spline_lowres_px=16.0,
+        )
+
+
+def test_compute_correction_field_numeric_threshold_empty_mask() -> None:
+    image = np.ones((4, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match=r"> 10.0; check the selected channel"):
+        n4.compute_correction_field(
+            image,
+            shrink=1,
+            spline_lowres_px=4.0,
+            threshold=10.0,
+        )
+
+
+def test_compute_correction_field_method_threshold_empty_mask() -> None:
+    image = np.zeros((8, 8), dtype=np.float32)
+    with pytest.raises(ValueError, match=r"skimage\.filters\.threshold_otsu"):
+        n4.compute_correction_field(
+            image,
+            shrink=1,
+            spline_lowres_px=8.0,
+            threshold="otsu",
         )
 
 
@@ -185,9 +208,7 @@ def test_apply_correction_field_prefers_cupy_when_available(monkeypatch: pytest.
         ndarray = np.ndarray
 
         def __init__(self) -> None:
-            self.cuda = types.SimpleNamespace(
-                runtime=types.SimpleNamespace(getDeviceCount=lambda: 1)
-            )
+            self.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCount=lambda: 1))
 
         def asarray(self, arr: np.ndarray, dtype: Any | None = None) -> np.ndarray:
             calls["asarray"] += 1
@@ -224,12 +245,10 @@ def test_apply_correction_to_store_outputs_corrected_zarr(tmp_path: Path) -> Non
     fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
     fused_dir.mkdir(parents=True)
 
-    base = np.stack(
-        [
-            np.full((8, 8), 100.0, dtype=np.float32),
-            np.full((8, 8), 50.0, dtype=np.float32),
-        ]
-    )
+    base = np.stack([
+        np.full((8, 8), 100.0, dtype=np.float32),
+        np.full((8, 8), 50.0, dtype=np.float32),
+    ])
     field = np.linspace(1.0, 2.0, 64, dtype=np.float32).reshape(8, 8)
     biased = base * field
     data = np.stack([biased, biased], axis=-1)  # duplicate channel for unrelated data
@@ -273,6 +292,57 @@ def test_apply_correction_to_store_outputs_corrected_zarr(tmp_path: Path) -> Non
     )
 
 
+def test_compute_fields_from_workspace_records_threshold_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "ws"
+    fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
+    fused_dir.mkdir(parents=True)
+
+    data = np.zeros((1, 6, 6, 1), dtype=np.uint16)
+    data[..., 0] = 50
+    _create_fused_store(fused_dir, data)
+
+    config = n4.N4RuntimeConfig(
+        workspace=workspace,
+        roi="roi",
+        codebook="cb",
+        channel=0,
+        shrink=1,
+        spline_lowres_px=8.0,
+        z_index=0,
+        field_output=fused_dir / "field.tif",
+        corrected_output=None,
+        apply_correction=False,
+        overwrite=True,
+        threshold="otsu",
+    )
+
+    monkeypatch.setattr(
+        n4,
+        "compute_correction_field",
+        lambda *args, **kwargs: np.ones((6, 6), dtype=np.float32),
+    )
+
+    captured_meta: dict[str, Any] = {}
+    original_imwrite = n4.imwrite
+
+    def _spy_imwrite(path: Path, data: Any, **kwargs: Any) -> None:
+        metadata = kwargs.get("metadata")
+        if isinstance(metadata, dict):
+            captured_meta.update(metadata)
+        original_imwrite(path, data, **kwargs)
+
+    monkeypatch.setattr(n4, "imwrite", _spy_imwrite)
+
+    result = n4.compute_fields_from_workspace(config)
+    assert result[0].field_path.exists()
+
+    assert "n4" in captured_meta
+    threshold_meta = captured_meta["n4"].get("threshold")
+    assert threshold_meta == {"kind": "method", "function": "threshold_otsu"}
+
+
 def test_apply_correction_to_store_float_debug_preserves_outlier(tmp_path: Path) -> None:
     fused_path = tmp_path / "fused.zarr"
     fused = zarr.open_array(
@@ -302,6 +372,7 @@ def test_apply_correction_to_store_float_debug_preserves_outlier(tmp_path: Path)
 
     assert quant[0, 1, 1, 0] == dtype_info.max  # clipped in uint16
     assert float_store[0, 1, 1, 0] == pytest.approx(1000.0, rel=1e-6)
-    assert quant.attrs["quantization"]["float_store"] == result.with_name(
-        f"{result.stem}_float32{result.suffix}"
-    ).name
+    assert (
+        quant.attrs["quantization"]["float_store"]
+        == result.with_name(f"{result.stem}_float32{result.suffix}").name
+    )

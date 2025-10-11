@@ -9,6 +9,7 @@ import pytest
 from matplotlib.legend import Legend
 from matplotlib.figure import Figure
 from scipy.interpolate import RegularGridInterpolator
+from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 
 from fishtools.preprocess.cli_spotlook import (
     ROIThresholdContext,
@@ -17,6 +18,7 @@ from fishtools.preprocess.cli_spotlook import (
     _compute_contour_levels,
     _prompt_threshold_levels,
     _save_combined_threshold_plot,
+    _save_combined_spots_plot,
 )
 from fishtools.utils.plot import format_si
 from fishtools.preprocess.config import SpotThresholdParams
@@ -108,7 +110,14 @@ def test_prompt_threshold_levels_enforces_order_and_ranges(monkeypatch, tmp_path
     )
 
     contexts = {"roi_a": context_a, "roi_b": context_b}
-    result = _prompt_threshold_levels(["roi_a", "roi_b"], contexts, tmp_path, "cb1")
+    combined_path = (tmp_path / "spots_all--cb1.png").resolve()
+    result = _prompt_threshold_levels(
+        ["roi_a", "roi_b"],
+        contexts,
+        tmp_path,
+        "cb1",
+        combined_spots_path=combined_path,
+    )
 
     assert result == {"roi_a": 2, "roi_b": 0}
 
@@ -116,7 +125,10 @@ def test_prompt_threshold_levels_enforces_order_and_ranges(monkeypatch, tmp_path
     assert "roi_a: 0-5" in message
     assert "roi_b: 0-2" in message
     assert message.index("Generated artifacts:") < message.index("Combined plot:")
-    assert message.index("Combined plot:") < message.index("Enter threshold levels")
+    combined_line = f"Combined spots: {combined_path}"
+    assert combined_line in message
+    assert message.index("Combined plot:") < message.index(combined_line)
+    assert message.index(combined_line) < message.index("Enter threshold levels")
     prompt_line = "Please enter the threshold levels now (comma-separated integers):"
     assert prompt_line in message
     assert message.index("Enter threshold levels") < message.index(prompt_line)
@@ -124,8 +136,91 @@ def test_prompt_threshold_levels_enforces_order_and_ranges(monkeypatch, tmp_path
     validator = captured["validate"]
     assert callable(validator)
     assert "Expected" in validator("2")  # type: ignore[index]
+    assert "required" in validator("2, ")  # type: ignore[index]
     assert "ROI roi_a" in validator("6,0")  # type: ignore[index]
     assert validator("2,0") is True  # type: ignore[index]
+
+
+def test_save_combined_spots_plot_creates_grid(monkeypatch, tmp_path: Path) -> None:
+    params = SpotThresholdParams(subsample=5, figsize_spots=(4.0, 4.0), dpi=100)
+    interpolator = _make_interpolator()
+    contours = types.SimpleNamespace(levels=np.linspace(0.0, 1.0, 6))
+    curve = ThresholdCurve(levels=[1], spot_counts=[10], blank_proportions=[0.1], max_level=5)
+
+    contexts: dict[str, ROIThresholdContext] = {}
+    for idx in range(3):
+        spots = pl.DataFrame({"x": np.arange(20) + idx, "y": np.arange(20)})
+        contexts[f"roi_{idx}"] = ROIThresholdContext(
+            spots=spots,
+            contours=contours,  # type: ignore[arg-type]
+            interpolator=interpolator,
+            curve=curve,
+            artifact_paths={},
+        )
+
+    captured: dict[str, object] = {}
+
+    def fake_savefig(self, path, *args, **kwargs):  # noqa: ANN001
+        captured.update({"fig": self, "path": Path(path)})
+
+    monkeypatch.setattr(Figure, "savefig", fake_savefig, raising=False)
+
+    path = _save_combined_spots_plot(contexts, tmp_path, "cb1", params)
+
+    expected_path = (tmp_path / "spots_all--cb1.png").resolve()
+    assert path == expected_path
+    assert captured["path"] == expected_path
+
+    fig: Figure = captured["fig"]  # type: ignore[assignment]
+    assert len(fig.axes) == 3
+
+    for idx, ax in enumerate(fig.axes):
+        scatter = ax.collections[0]
+        assert len(scatter.get_offsets()) == 5
+        scale_bars = [artist for artist in ax.artists if isinstance(artist, AnchoredSizeBar)]
+        if idx == 0:
+            assert scale_bars, f"Expected scale bar on axis {idx}"
+        else:
+            assert not scale_bars, f"Unexpected scale bar on axis {idx}"
+
+    assert fig._suptitle is not None  # type: ignore[attr-defined]
+    assert fig._suptitle.get_text() == "Spots Overview — cb1"  # type: ignore[attr-defined]
+
+
+def test_save_combined_spots_plot_clamps_dpi(monkeypatch, tmp_path: Path) -> None:
+    # Extremely high requested DPI would exceed the Agg backend pixel limit
+    params = SpotThresholdParams(subsample=10, dpi=20000)
+    interpolator = _make_interpolator()
+    contours = types.SimpleNamespace(levels=np.linspace(0.0, 1.0, 6))
+    curve = ThresholdCurve(levels=[1], spot_counts=[10], blank_proportions=[0.1], max_level=5)
+
+    spots = pl.DataFrame({"x": np.arange(10), "y": np.arange(10)})
+    contexts: dict[str, ROIThresholdContext] = {
+        "roi_0": ROIThresholdContext(
+            spots=spots,
+            contours=contours,  # type: ignore[arg-type]
+            interpolator=interpolator,
+            curve=curve,
+            artifact_paths={},
+        )
+    }
+
+    captured: dict[str, object] = {}
+
+    def fake_savefig(self, path, *args, **kwargs):  # noqa: ANN001
+        captured.update({"fig": self, "path": Path(path), "dpi": kwargs.get("dpi")})
+
+    monkeypatch.setattr(Figure, "savefig", fake_savefig, raising=False)
+
+    path = _save_combined_spots_plot(contexts, tmp_path, "cb1", params)
+
+    expected_path = (tmp_path / "spots_all--cb1.png").resolve()
+    assert path == expected_path
+    assert captured["path"] == expected_path
+
+    # With 1 panel of 4x4 inches, the maximum safe dpi is floor(65535/4) == 16383
+    assert isinstance(captured["dpi"], int)
+    assert captured["dpi"] <= 16383
 
 
 def test_save_combined_threshold_plot_sets_line_styles(monkeypatch, tmp_path: Path) -> None:
@@ -150,6 +245,7 @@ def test_save_combined_threshold_plot_sets_line_styles(monkeypatch, tmp_path: Pa
     ax_counts, ax_blank = fig.axes
     assert all(line.get_linestyle() == "-" for line in ax_counts.lines)
     assert all(line.get_linestyle() == "--" for line in ax_blank.lines)
+    assert ax_counts.get_ylim()[0] == 0
 
     roi_legends = [artist for artist in ax_counts.artists if isinstance(artist, Legend)]
     assert roi_legends, "Expected ROI legend to be attached to the axis"

@@ -12,13 +12,6 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import tifffile
-
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-
 from fishtools.utils.io import CorruptedTiffError, OptimizePath, Workspace
 
 
@@ -335,26 +328,26 @@ class TestWorkspaceProcessingDirectories:
         segment_path = ws.segment("cortex", "codebook_v1")
         expected_path = workspace_path / "analysis" / "deconv" / "segment--cortex+codebook_v1"
         assert segment_path == expected_path
-    
+
     def test_opt_path_construction(self):
         """Test opt method constructs correct paths with underscore pattern."""
         workspace_path = Path("/test")
         ws = Workspace(workspace_path)
-        
+
         opt_path = ws.opt("ebe_tricycle_targets")
         expected_path = workspace_path / "analysis" / "deconv" / "opt_ebe_tricycle_targets"
         assert opt_path.path == expected_path
         assert isinstance(opt_path, OptimizePath)
-    
+
     def test_opt_properties_access(self):
         """Test OptimizePath properties are accessible with real codebook names."""
         workspace_path = Path("/test")
         ws = Workspace(workspace_path)
-        
+
         opt_path = ws.opt("ebe_devprobeset_targets")
         mse_path = opt_path.mse
         scaling_path = opt_path.scaling_factor
-        
+
         base_path = workspace_path / "analysis" / "deconv" / "opt_ebe_devprobeset_targets"
         assert mse_path == base_path / "mse.txt"
         assert scaling_path == base_path / "global_scale.txt"
@@ -382,8 +375,53 @@ class TestWorkspaceProcessingDirectories:
         workspace_path = Path("/test")
         ws = Workspace(workspace_path)
 
-        with pytest.raises(FileNotFoundError, match="Haven't stitch/registered yet"):
+        with pytest.raises(FileNotFoundError, match="No registered TileConfig found at"):
             ws.tileconfig("cortex")
+
+
+class TestWorkspaceFiducialsAndPositions:
+    """Tests for fiducial and tile position helpers."""
+
+    def test_fids_directory_path(self):
+        workspace_path = Path("/test")
+        ws = Workspace(workspace_path)
+
+        expected = workspace_path / "analysis" / "deconv" / "fids--cortex"
+        assert ws.fids("cortex") == expected
+
+    def test_fid_path_accepts_int_and_str(self):
+        workspace_path = Path("/test")
+        ws = Workspace(workspace_path)
+
+        base = workspace_path / "analysis" / "deconv" / "fids--cortex"
+        assert ws.fid("cortex", 3) == base / "fids-0003.tif"
+        assert ws.fid("cortex", "0012") == base / "fids-0012.tif"
+
+    def test_tile_positions_csv_prefers_override(self, tmp_path: Path):
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        override = tmp_path / "custom.csv"
+        override.write_text("0,0,0\n", encoding="utf-8")
+
+        ws = Workspace(workspace_root)
+        assert ws.tile_positions_csv("cortex", position_file=override) == override
+
+    def test_tile_positions_csv_from_workspace_root(self, tmp_path: Path):
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        csv_path = workspace_root / "cortex.csv"
+        csv_path.write_text("0,0,0\n", encoding="utf-8")
+
+        ws = Workspace(workspace_root)
+        assert ws.tile_positions_csv("cortex") == csv_path
+
+    def test_tile_positions_csv_missing_raises(self, tmp_path: Path):
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+
+        ws = Workspace(workspace_root)
+        with pytest.raises(FileNotFoundError, match="Tile position CSV not found"):
+            ws.tile_positions_csv("cortex")
 
 
 class TestWorkspaceRegisteredArtifacts:
@@ -411,6 +449,29 @@ class TestWorkspaceRegisteredArtifacts:
 
         assert mapping == {}
         assert missing == ["cortex"]
+
+    def test_registered_codebooks_discovers_unique_sorted(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        base = workspace_root / "analysis" / "deconv"
+        (base / "registered--cortex+cb2").mkdir(parents=True)
+        (base / "registered--cortex+cb1").mkdir(parents=True)
+        (base / "registered--hippocampus+cb3").mkdir(parents=True)
+        (base / "registered--hippocampus+cb1").mkdir(parents=True)
+
+        ws = Workspace(workspace_root)
+
+        assert ws.registered_codebooks() == ["cb1", "cb2", "cb3"]
+
+    def test_registered_codebooks_filters_by_rois(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        base = workspace_root / "analysis" / "deconv"
+        (base / "registered--cortex+cb1").mkdir(parents=True)
+        (base / "registered--hippocampus+cb2").mkdir(parents=True)
+        (workspace_root / "1_0_0--striatum").mkdir(parents=True)
+
+        ws = Workspace(workspace_root)
+
+        assert ws.registered_codebooks(rois=["striatum"]) == []
 
     def test_ensure_tiff_readable_detects_corruption(self, tmp_path: Path) -> None:
         valid = tmp_path / "valid.tif"

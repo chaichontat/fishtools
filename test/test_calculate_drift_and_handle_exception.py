@@ -39,14 +39,12 @@ class TestCalculateDrift:
         idx = 0
         for y in [20, 50, 80]:
             for x in [20, 50, 80]:
-                ref_data.append(
-                    {
-                        "idx": idx,
-                        "xcentroid": float(x),
-                        "ycentroid": float(y),
-                        "mag": -10.0 - np.random.random() * 2,  # Magnitude: more negative = brighter
-                    }
-                )
+                ref_data.append({
+                    "idx": idx,
+                    "xcentroid": float(x),
+                    "ycentroid": float(y),
+                    "mag": -10.0 - np.random.random() * 2,  # Magnitude: more negative = brighter
+                })
                 idx += 1
 
         return pl.DataFrame(ref_data)
@@ -77,15 +75,13 @@ class TestCalculateDrift:
             x_noise = np.random.normal(0, noise_std) if noise_std > 0 else 0
             y_noise = np.random.normal(0, noise_std) if noise_std > 0 else 0
 
-            target_data.append(
-                {
-                    "idx": i,
-                    "xcentroid": row["xcentroid"] + dx + x_noise,
-                    "ycentroid": row["ycentroid"] + dy + y_noise,
-                    "mag": row["mag"]
-                    - np.random.random() * 0.5,  # Slight magnitude variation (more negative = brighter)
-                }
-            )
+            target_data.append({
+                "idx": i,
+                "xcentroid": row["xcentroid"] + dx + x_noise,
+                "ycentroid": row["ycentroid"] + dy + y_noise,
+                "mag": row["mag"]
+                - np.random.random() * 0.5,  # Slight magnitude variation (more negative = brighter)
+            })
 
         return pl.DataFrame(target_data)
 
@@ -207,14 +203,12 @@ class TestCalculateDrift:
         # Make them dimmer so use_brightest can filter them out
         outlier_data = []
         for i in range(5):
-            outlier_data.append(
-                {
-                    "idx": len(target_points) + i,
-                    "xcentroid": 150.0 + np.random.random() * 20,  # Far from main cluster
-                    "ycentroid": 150.0 + np.random.random() * 20,
-                    "mag": -5.0,  # Much dimmer magnitude (less negative = dimmer)
-                }
-            )
+            outlier_data.append({
+                "idx": len(target_points) + i,
+                "xcentroid": 150.0 + np.random.random() * 20,  # Far from main cluster
+                "ycentroid": 150.0 + np.random.random() * 20,
+                "mag": -5.0,  # Much dimmer magnitude (less negative = dimmer)
+            })
 
         target_with_outliers = pl.concat([target_points, pl.DataFrame(outlier_data)])
 
@@ -265,14 +259,12 @@ class TestCalculateDrift:
         # Create many target points to trigger warning
         large_target_data = []
         for i in range(1200):  # > 1000 to trigger warning
-            large_target_data.append(
-                {
-                    "idx": i,
-                    "xcentroid": np.random.random() * 100,
-                    "ycentroid": np.random.random() * 100,
-                    "mag": -10.0 - np.random.random(),  # Bright magnitude
-                }
-            )
+            large_target_data.append({
+                "idx": i,
+                "xcentroid": np.random.random() * 100,
+                "ycentroid": np.random.random() * 100,
+                "mag": -10.0 - np.random.random(),  # Bright magnitude
+            })
 
         large_target_points = pl.DataFrame(large_target_data)
 
@@ -303,14 +295,12 @@ class TestCalculateDrift:
         for i in range(5):
             # Most points have main_drift, one outlier
             drift_x = main_drift if i < 4 else main_drift + 10.0
-            target_data.append(
-                {
-                    "idx": i,
-                    "xcentroid": float(i * 10) + drift_x,
-                    "ycentroid": 20.0,
-                    "mag": -10.0,
-                }
-            )
+            target_data.append({
+                "idx": i,
+                "xcentroid": float(i * 10) + drift_x,
+                "ycentroid": 20.0,
+                "mag": -10.0,
+            })
 
         target_points = pl.DataFrame(target_data)
 
@@ -533,6 +523,26 @@ class TestHandleException:
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
         exc = NotEnoughSpots("Not enough spots found")
+
+        with (
+            patch("fishtools.preprocess.fiducial.logger.debug") as mock_debug,
+            patch("fishtools.preprocess.fiducial.logger.warning") as mock_warning,
+        ):
+            handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
+
+            mock_debug.assert_called_once()
+            debug_msg = mock_debug.call_args[0][0]
+            assert "NotEnoughSpots" in debug_msg
+            assert str(initial_sigma) in debug_msg
+            assert str(initial_fwhm) in debug_msg
+            mock_warning.assert_not_called()
+
+    def test_handle_exception_logging_behavior_warning(self) -> None:
+        """Test that other exceptions continue to emit warnings."""
+        initial_sigma = 3.0
+        initial_fwhm = 4.0
+        tried_set: set[tuple[float, float]] = set()
+        exc = TooManySpots("Too many spots found")
 
         with patch("fishtools.preprocess.fiducial.logger.warning") as mock_warning:
             handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)

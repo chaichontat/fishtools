@@ -5,18 +5,21 @@ from typing import Any
 
 import numpy as np
 import pytest
-from PIL import Image
 import zarr
+from PIL import Image
 
 from fishtools.preprocess import n4
 
 
 def test_normalize_to_uint8_by_percentile_handles_nans_and_clamps(tmp_path: Path) -> None:
     # Arrange: include NaN/Inf and a wide range
-    arr = np.array([
-        [np.nan, 0.0, 1.0, 2.0],
-        [3.0, 4.0, np.inf, 5.0],
-    ], dtype=np.float32)
+    arr = np.array(
+        [
+            [np.nan, 0.0, 1.0, 2.0],
+            [3.0, 4.0, np.inf, 5.0],
+        ],
+        dtype=np.float32,
+    )
 
     # Act
     out = n4._normalize_to_uint8_by_percentile(arr, 1.0, 99.0)

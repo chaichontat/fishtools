@@ -6,7 +6,9 @@ import numpy as np
 from fishtools.preprocess.deconv.normalize import precompute_global_quantization
 
 
-def _write_hist_csv(dirpath: Path, round_name: str, roi: str, tile: str, rows: list[tuple[int, float, float, int]]):
+def _write_hist_csv(
+    dirpath: Path, round_name: str, roi: str, tile: str, rows: list[tuple[int, float, float, int]]
+):
     d = dirpath / "analysis" / "deconv32" / f"{round_name}--{roi}"
     d.mkdir(parents=True, exist_ok=True)
     fp = d / f"{tile}{round_name}-0001.histogram.csv"

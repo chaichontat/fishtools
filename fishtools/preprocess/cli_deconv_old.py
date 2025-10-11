@@ -21,17 +21,21 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from fishtools.io.workspace import Workspace, get_channels, get_metadata
-from fishtools.utils.pretty_print import progress_bar
+from fishtools.preprocess.deconv.core import (
+    deconvolve_lucyrichardson_guo,
+    load_projectors_cached,
+)
+from fishtools.preprocess.deconv.core import (
+    rescale as core_rescale,
+)
 from fishtools.preprocess.deconv.range_utils import (
     DEFAULT_PERCENTILE_OVERRIDES as RANGE_DEFAULT_PERCENTILE_OVERRIDES,
+)
+from fishtools.preprocess.deconv.range_utils import (
     compute_range_for_round,
     get_percentiles_for_round,
 )
-from fishtools.preprocess.deconv.core import (
-    load_projectors_cached,
-    deconvolve_lucyrichardson_guo,
-    rescale as core_rescale,
-)
+from fishtools.utils.pretty_print import progress_bar
 
 
 @click.group()
@@ -87,13 +91,59 @@ def _compute_range(
     perc_min: float | list[float] = 0.1,
     perc_scale: float | list[float] = 0.1,
 ):
-    """Backward-compatible wrapper around range_utils.compute_range_for_round."""
-    compute_range_for_round(
-        path,
-        round_,
-        perc_min=perc_min,
-        perc_scale=perc_scale,
-    )
+    """
+    Find the min and scale of the deconvolution for all files in a directory.
+    The reverse scaling equation is:
+                 s_global
+        scaled = -------- * img + s_global * (min - m_global)
+                  scale
+    Hence we want scale_global to be as low as possible
+    and min_global to be as high as possible.
+    """
+    ws = Workspace(path)
+    files = sorted(ws.deconved.glob(f"{round_}*/*.tif"))
+    n_c = len(round_.split("_"))
+
+    files = [u for p in files if (u := p.with_suffix(".deconv.json")).exists()]
+    n = len(files)
+
+    deconv_min = np.zeros((n, n_c))
+    deconv_scale = np.zeros((n, n_c))
+    logger.info(f"Found {n} files")
+    if not files:
+        logger.warning(f"No files found in {ws.deconved / f'{round_}*'}. Skipping.")
+        return
+
+    with progress_bar(len(files)) as pbar:
+        for i, f in enumerate(files):
+            meta = json.loads(f.read_text())
+
+            try:
+                deconv_min[i, :] = meta["deconv_min"]
+                deconv_scale[i, :] = meta["deconv_scale"]
+            except KeyError:
+                raise AttributeError("No deconv metadata found.")
+            pbar()
+
+    logger.info(f"Calculating percentiles: {perc_min, perc_scale}")
+
+    if isinstance(perc_min, float) and isinstance(perc_scale, float):
+        m_ = np.percentile(deconv_min, perc_min, axis=0)
+        s_ = np.percentile(deconv_scale, perc_scale, axis=0)
+    elif isinstance(perc_min, list) and isinstance(perc_scale, list):
+        m_, s_ = np.zeros(n_c), np.zeros(n_c)
+        for i in range(n_c):
+            m_[i] = np.percentile(deconv_min[:, i], perc_min[i])
+            s_[i] = np.percentile(deconv_scale[:, i], perc_scale[i])
+    else:
+        raise ValueError("perc_min and perc_scale must be either float or list of floats.")
+
+    if np.any(m_ == 0) or np.any(s_ == 0):
+        raise ValueError("Found a channel with min=0. This is not allowed.")
+
+    ws.deconv_scaling().mkdir(exist_ok=True)
+    np.savetxt(ws.deconv_scaling(round_), np.vstack([m_, s_]))
+    logger.info(f"Saved to {ws.deconv_scaling(round_)}")
 
 
 logger.remove()

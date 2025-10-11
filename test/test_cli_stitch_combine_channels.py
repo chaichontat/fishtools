@@ -46,7 +46,11 @@ def mock_zarr_ops(monkeypatch: Any):
         return arr
 
     def mock_open_array(path: Path, mode: str = "r", **kwargs):
-        return store.get(path) or MockZarrArray(kwargs.get("shape", (1, 1, 1, 1)), kwargs.get("chunks", (1, 1, 1, 1)), kwargs.get("dtype", np.uint16))
+        return store.get(path) or MockZarrArray(
+            kwargs.get("shape", (1, 1, 1, 1)),
+            kwargs.get("chunks", (1, 1, 1, 1)),
+            kwargs.get("dtype", np.uint16),
+        )
 
     monkeypatch.setattr("zarr.create_array", mock_create_array)
     monkeypatch.setattr("zarr.open_array", mock_open_array)
@@ -65,7 +69,9 @@ def _make_stitch_tree(base: Path, roi: str, codebook: str, z: int, c: int, size:
     return stitch_path
 
 
-def _install_registered_with_names(base: Path, roi: str, codebook: str, names: list[str] | None, monkeypatch: Any) -> None:
+def _install_registered_with_names(
+    base: Path, roi: str, codebook: str, names: list[str] | None, monkeypatch: Any
+) -> None:
     reg_dir = base / "analysis" / "deconv" / f"registered--{roi}+{codebook}"
     reg_dir.mkdir(parents=True, exist_ok=True)
     tif = reg_dir / "dummy.tif"
@@ -97,7 +103,14 @@ def _install_registered_with_names(base: Path, roi: str, codebook: str, names: l
         (4, ["a", "b", "c", "d"], ["a", "b", "c", "d"]),  # equal lengths
     ],
 )
-def test_combine_channel_variants(tmp_path: Path, monkeypatch: Any, mock_zarr_ops, c: int, meta_names: list[str] | None, expect_names: list[str] | None) -> None:
+def test_combine_channel_variants(
+    tmp_path: Path,
+    monkeypatch: Any,
+    mock_zarr_ops,
+    c: int,
+    meta_names: list[str] | None,
+    expect_names: list[str] | None,
+) -> None:
     base = tmp_path / "ws"
     roi = "roi1"
     cb = "cb1"
@@ -118,6 +131,7 @@ def test_combine_channel_variants(tmp_path: Path, monkeypatch: Any, mock_zarr_op
 
     # Validate zarr shape
     import zarr
+
     z = zarr.open_array(stitch_path / "fused.zarr", mode="r")
     assert z.shape == (2, 16, 16, c)
 
