@@ -23,7 +23,7 @@ from scipy.ndimage import gaussian_filter
 from fishtools.io.codebook import Codebook
 from fishtools.io.workspace import Workspace
 from fishtools.preprocess.config import SpotThresholdParams
-from fishtools.utils.logging import configure_cli_logging, initialize_logger
+from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import (
     DARK_PANEL_STYLE,
     configure_dark_axes,
@@ -936,13 +936,14 @@ def threshold(
     """
     Process spot data for each ROI individually with an interactive threshold selection step.
     """
-    initialize_logger()
-    # Raise console verbosity to INFO for a clean, minimal UX.
-    configure_cli_logging(
-        workspace=None,
-        component="spotlook",
-        console_level="INFO",
-        file_level="CRITICAL",
+    setup_cli_logging(
+        path,
+        component="preprocess.spotlook.threshold",
+        file=f"spotlook-threshold-{codebook_path.stem}",
+        extra={
+            "codebook": codebook_path.stem,
+            "roi": ",".join(rois) if rois else "all",
+        },
     )
 
     if output_dir is None:

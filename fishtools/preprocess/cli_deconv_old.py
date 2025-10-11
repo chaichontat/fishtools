@@ -1,9 +1,7 @@
-import functools
 import json
 import pickle
 import queue
 import re
-import sys
 import threading
 import time
 from collections.abc import Iterable
@@ -13,21 +11,36 @@ from typing import Any
 
 import cupy as cp
 import numpy as np
-import numpy.typing as npt
 import pyfiglet
 import rich_click as click
 import tifffile
 from basicpy import BaSiC
 from loguru import logger
 from rich.console import Console
-from rich.logging import RichHandler
-from tifffile import imread
 
 from fishtools.preprocess.deconv.core import deconvolve_lucyrichardson_guo, projectors
-from fishtools.utils.io import Workspace, get_channels, get_metadata
+from fishtools.utils.io import Workspace, get_channels, get_metadata, safe_imwrite
+from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar
 
 DATA = Path(__file__).parent.parent.parent / "data"
+
+
+def _setup_cli_logging(
+    workspace: Path,
+    *,
+    component: str,
+    file_tag: str,
+    debug: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> Path | None:
+    return setup_cli_logging(
+        workspace,
+        component=component,
+        file=file_tag,
+        debug=debug,
+        extra=extra,
+    )
 
 
 def scale_deconv(
@@ -128,8 +141,6 @@ def _compute_range(
     logger.info(f"Saved to {ws.deconv_scaling(round_)}")
 
 
-logger.remove()
-logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
 console = Console()
 
 
@@ -200,6 +211,17 @@ def compute_range(
         overwrite: If True, recompute and overwrite existing scaling files.
         max_rna_bit: The maximum integer value considered an RNA bit. Others are treated differently (e.g., protein).
     """
+    _setup_cli_logging(
+        path,
+        component="preprocess.deconv.compute_range",
+        file_tag="compute_range",
+        extra={
+            "perc_min": perc_min,
+            "perc_scale": perc_scale,
+            "overwrite": overwrite,
+        },
+    )
+
     if "deconv" not in path.resolve().as_posix():
         raise ValueError(f"This command must be run within a 'deconv' directory. Path provided: {path}")
 
@@ -345,7 +367,7 @@ def _run(
 
             (sub / file.name).with_suffix(".deconv.json").write_text(json.dumps(metadata, indent=2))
 
-            tifffile.imwrite(
+            safe_imwrite(
                 sub / file.name,
                 np.concatenate([towrite, fid], axis=0),
                 compression=22610,
@@ -490,20 +512,27 @@ def run(
         overwrite: Overwrite existing deconvolved images.
         n_fid: Number of fiducial frames.
     """
+    _setup_cli_logging(
+        path,
+        component="preprocess.deconv.run",
+        file_tag=f"run-{name}",
+        debug=debug,
+        extra={
+            "round": name,
+            "ref": ref.name if isinstance(ref, Path) else None,
+            "overwrite": overwrite,
+        },
+    )
+
     if debug:
-        logger.remove()
         log_format = (
             "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
             "<level>{level: <8}</level> | "
             "<cyan>{thread.name: <13}</cyan> | "
             "<level>{message}</level>"
         )
-        logger.add(sys.stderr, level="DEBUG", format=log_format)
         logger.add("profiling_{time}.log", level="DEBUG", format=log_format, enqueue=True)
-        logger.info("DEBUG mode enabled. Detailed profiling logs will be generated.")
-    else:
-        logger.remove()
-        logger.add(sys.stderr, level="INFO", format="{message}")
+        logger.debug("DEBUG mode enabled. Detailed profiling logs will be generated.")
 
     console.print(f"[magenta]{pyfiglet.figlet_format('3D Deconv', font='slant')}[/magenta]")
 
@@ -601,20 +630,27 @@ def batch(
     basic_name: str | None = "all",
     debug: bool = False,
 ):
+    _setup_cli_logging(
+        path,
+        component="preprocess.deconv.batch",
+        file_tag="batch",
+        debug=debug,
+        extra={
+            "roi": roi or "all",
+            "ref": ref.name if isinstance(ref, Path) else None,
+            "overwrite": overwrite,
+        },
+    )
+
     if debug:
-        logger.remove()
         log_format = (
             "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
             "<level>{level: <8}</level> | "
             "<cyan>{thread.name: <13}</cyan> | "
             "<level>{message}</level>"
         )
-        logger.add(sys.stderr, level="DEBUG", format=log_format)
         logger.add("profiling_{time}.log", level="DEBUG", format=log_format, enqueue=True)
-        logger.info("DEBUG mode enabled. Detailed profiling logs will be generated.")
-    else:
-        logger.remove()
-        logger.add(sys.stderr, level="INFO", format="{message}")
+        logger.debug("DEBUG mode enabled. Detailed profiling logs will be generated.")
 
     ws = Workspace(path)
     rois = ws.rois

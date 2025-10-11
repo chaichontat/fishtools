@@ -22,7 +22,7 @@ from fishtools.preprocess.basic import fit_basic, plot_basic
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.plot import plot_tile_sizes
 from fishtools.preprocess.tileconfig import tiles_at_least_n_steps_from_edges
-from fishtools.utils.logging import setup_workspace_logging
+from fishtools.utils.logging import setup_cli_logging
 
 sns.set_theme()
 
@@ -574,7 +574,12 @@ def basic(): ...
 @click.option("--seed", type=int, default=None, help="Random seed for sampling (optional)")
 def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5", seed: int | None = None):
     # Workspace-scoped logging to {workspace}/analysis/logs; compatible with progress bars
-    setup_workspace_logging(path, component="preprocess.basic.run", file=round_)
+    setup_cli_logging(
+        path,
+        component="preprocess.basic.run",
+        file=f"basic-{round_}",
+        extra={"round": round_},
+    )
     if not overwrite and list((path / "basic").glob(f"{round_}*")):
         logger.info(f"Basic already run for {round_} in {path}. Use --overwrite to re-run.")
         return
@@ -598,7 +603,12 @@ def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5", se
 @click.option("--zs", type=str, default="0.5")
 @click.option("--seed", type=int, default=None, help="Random seed for sampling (optional)")
 def batch(path: Path, overwrite: bool = False, threads: int = 1, zs: str = "0.5", seed: int | None = None):
-    setup_workspace_logging(path, component="preprocess.basic.batch", file="batch")
+    setup_cli_logging(
+        path,
+        component="preprocess.basic.batch",
+        file="basic-batch",
+        extra={"threads": threads, "overwrite": overwrite},
+    )
     rounds = sorted({p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name})
     with ThreadPoolExecutor(threads) as exc:
         futs = [

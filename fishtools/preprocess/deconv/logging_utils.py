@@ -12,6 +12,7 @@ def configure_logging(
     process_label: str | None = None,
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO",
     use_console: bool = True,
+    preserve_existing: bool = False,
 ) -> None:
     """Configure loguru consistently for CLI commands.
 
@@ -19,6 +20,13 @@ def configure_logging(
     - DEBUG adds timestamped rich format and a profiling file sink
     - Optional process label prefix for multi-process displays
     """
+    if preserve_existing:
+        if process_label is not None:
+            existing = dict(logger._core.extra)  # type: ignore[attr-defined]
+            existing["process_label"] = process_label
+            logger.configure(extra=existing)
+        return
+
     logger.remove()
     if process_label is not None:
         logger.configure(extra={"process_label": process_label})

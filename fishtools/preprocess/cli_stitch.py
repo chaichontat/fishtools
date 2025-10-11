@@ -40,10 +40,10 @@ import pandas as pd
 import rich_click as click
 from loguru import logger
 from PIL import Image
-from tifffile import TiffFile, TiffFileError, imread, imwrite
+from tifffile import TiffFile, TiffFileError, imread
 
 from fishtools.gpu.memory import release_all as gpu_release_all
-from fishtools.io.workspace import Workspace
+from fishtools.io.workspace import Workspace, safe_imwrite
 from fishtools.preprocess.config import StitchingConfig
 from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.downsample import gpu_downsample_xy
@@ -60,7 +60,7 @@ from fishtools.preprocess.n4 import run_cli_workflow
 from fishtools.preprocess.stitching import walk_fused as _walk_fused
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.preprocess.tileconfig import copy_registered as _copy_registered
-from fishtools.utils.logging import CONSOLE_SKIP_EXTRA, setup_workspace_logging
+from fishtools.utils.logging import CONSOLE_SKIP_EXTRA, setup_cli_logging
 from fishtools.utils.pretty_print import get_shared_console, progress_bar, progress_bar_threadpool
 from fishtools.utils.tiff import compose_metadata as compose_meta
 from fishtools.utils.tiff import normalize_channel_names as norm_names
@@ -341,7 +341,7 @@ def extract_channel(
         # Remove None values to keep metadata clean
         metadata_out = {k: v for k, v in metadata_out.items() if v is not None}
         try:
-            imwrite(
+            safe_imwrite(
                 out,
                 img,
                 compression=22610,
@@ -382,7 +382,12 @@ def stitch():
 def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int, json_config: Path | None):
     # Workspace-scoped logging; logs to {workspace}/analysis/logs while
     # cooperating with Rich progress bars via the shared Console
-    setup_workspace_logging(path, component="preprocess.stitch.register-simple", file="register_simple")
+    setup_cli_logging(
+        path,
+        component="preprocess.stitch.register-simple",
+        file="stitch-register-simple",
+        extra={"downsample": downsample, "fuse": fuse},
+    )
     sc: StitchingConfig | None = None
     if json_config:
         try:
@@ -445,7 +450,12 @@ def register(
     threshold: float | None = None,
     json_config: Path | None = None,
 ):
-    setup_workspace_logging(path, component="preprocess.stitch.register", file=roi)
+    setup_cli_logging(
+        path,
+        component="preprocess.stitch.register",
+        file=f"stitch-register-{roi}",
+        extra={"roi": roi, "codebook": codebook},
+    )
     sc: StitchingConfig | None = None
     if json_config:
         try:
@@ -738,7 +748,7 @@ def extract(
                 )
                 metadata_out = {k: v for k, v in metadata_out.items() if v is not None}
                 try:
-                    imwrite(
+                    safe_imwrite(
                         target,
                         img[i],
                         compression=22610,
@@ -828,7 +838,7 @@ def extract(
                 )
                 metadata_out = {k: v for k, v in metadata_out.items() if v is not None}
                 try:
-                    imwrite(
+                    safe_imwrite(
                         target,
                         img[i, j],
                         compression=22610,
@@ -918,7 +928,12 @@ def fuse(
     field_low_zarr: Path | None = None,
     field_range_zarr: Path | None = None,
 ):
-    setup_workspace_logging(path, component="preprocess.stitch.fuse", file=f"{roi}+{codebook}")
+    setup_cli_logging(
+        path,
+        component="preprocess.stitch.fuse",
+        file=f"stitch-fuse-{roi}+{codebook}",
+        extra={"roi": roi, "codebook": codebook, "threads": threads},
+    )
     ws = Workspace(path)
     sc: StitchingConfig | None = None
     if json_config:
@@ -1120,7 +1135,12 @@ def numpy_array_to_zarr(write_path: Path | str, array: np.ndarray, chunks: tuple
 @click.option("--overwrite", is_flag=True)
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwrite: bool = True):
-    setup_workspace_logging(path, component="preprocess.stitch.combine", file=f"{roi}+{codebook}")
+    setup_cli_logging(
+        path,
+        component="preprocess.stitch.combine",
+        file=f"stitch-combine-{roi}+{codebook}",
+        extra={"roi": roi, "codebook": codebook, "chunk_size": chunk_size},
+    )
     import zarr
 
     from fishtools.io.workspace import Workspace
@@ -1332,7 +1352,12 @@ def n4(
 ) -> None:
     """Run N4 bias-field correction against stitched mosaics."""
 
-    setup_workspace_logging(path, component="preprocess.stitch.n4", file=f"{roi}+{codebook}")
+    setup_cli_logging(
+        path,
+        component="preprocess.stitch.n4",
+        file=f"stitch-n4-{roi}+{codebook}",
+        extra={"roi": roi, "codebook": codebook},
+    )
 
     try:
         results = run_cli_workflow(
@@ -1390,7 +1415,12 @@ def run(
     channels: str = "-3,-2,-1",
     subsample_z: int = 1,
 ):
-    setup_workspace_logging(path, component="preprocess.stitch.run", file=roi)
+    setup_cli_logging(
+        path,
+        component="preprocess.stitch.run",
+        file=f"stitch-run-{roi}",
+        extra={"roi": roi, "codebook": codebook},
+    )
     register.callback(path, roi=roi, position_file=None, fid=True)
     fuse.callback(
         path,
@@ -1450,7 +1480,7 @@ def final_stitch(
     )
     metadata_out = {k: v for k, v in metadata_out.items() if v is not None}
     level = sc.compression_levels.get("high", 0.8) if sc else 0.8
-    imwrite(
+    safe_imwrite(
         path / "fused.tif",
         out,
         compression=22610,

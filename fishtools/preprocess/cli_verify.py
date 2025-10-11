@@ -8,6 +8,7 @@ from loguru import logger
 from tqdm.auto import tqdm
 
 from fishtools.io.workspace import CorruptedTiffError, Workspace
+from fishtools.utils.logging import setup_cli_logging
 
 
 @click.group()
@@ -40,6 +41,16 @@ def verify_codebook(path: Path, codebook: Path, rois: tuple[str, ...]) -> None:
 
     workspace = Workspace(path)
     codebook_name = codebook.stem
+
+    setup_cli_logging(
+        workspace.path,
+        component="preprocess.verify.codebook",
+        file=f"verify-codebook-{codebook_name}",
+        extra={
+            "codebook": codebook_name,
+            "roi": ",".join(rois) if rois else "all",
+        },
+    )
 
     if rois:
         try:
@@ -118,6 +129,14 @@ def verify_path(paths: tuple[Path, ...], no_delete: bool) -> None:
 
     if not paths:
         raise click.BadParameter("Provide at least one PATH to scan.")
+
+    primary_path = paths[0] if paths else None
+    setup_cli_logging(
+        primary_path,
+        component="preprocess.verify.path",
+        file="verify-path",
+        extra={"no_delete": no_delete},
+    )
 
     # Aggregate and de-duplicate discovered TIFFs while preserving order
     seen: set[Path] = set()

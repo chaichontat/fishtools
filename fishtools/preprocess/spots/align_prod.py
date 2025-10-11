@@ -6,13 +6,12 @@ import random
 import re
 import shutil
 import subprocess
-import sys
 import time
 import warnings
 from datetime import timedelta
 from itertools import chain, groupby
 from pathlib import Path
-from typing import Any, Literal, Mapping, cast
+from typing import Any, Literal, Mapping, Sequence, cast
 
 import matplotlib
 
@@ -51,7 +50,7 @@ from starfish.core.types import Axes, Coordinates, CoordinateValue
 from starfish.experiment.builder import FetchedTile, TileFetcher
 from starfish.image import Filter
 from starfish.spots import DecodeSpots, FindSpots
-from starfish.types import Axes, Features, Levels
+from starfish.types import Features, Levels
 from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread
 
@@ -67,6 +66,7 @@ from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.spots.align_batchoptimize import optimize
 from fishtools.preprocess.spots.overlay_spots import overlay
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
+from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import plot_all_genes
 from fishtools.utils.pretty_print import progress_bar_threadpool
 from fishtools.utils.utils import git_hash
@@ -270,6 +270,29 @@ def load_codebook(
 def spots(): ...
 
 
+def _sanitize_tag(part: str | None) -> str:
+    if part is None:
+        return ""
+    return str(part).replace("/", "_").replace(" ", "-")
+
+
+def _make_tag(*parts: str | None) -> str:
+    cleaned = [p for p in (_sanitize_tag(part) for part in parts) if p]
+    return "-".join(cleaned) if cleaned else "spots"
+
+
+def _setup_command_logging(
+    path: Path | None,
+    *,
+    component: str,
+    file_tag: str,
+    debug: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    payload = {k: v for k, v in (extra or {}).items() if v is not None}
+    setup_cli_logging(path, component=component, file=file_tag, debug=debug, extra=payload)
+
+
 def _batch(
     paths: list[Path],
     mode: str,
@@ -369,6 +392,17 @@ def step_optimize(
     blank: str | None = None,
     json_config: Path | None = None,
 ):
+    _setup_command_logging(
+        path,
+        component="preprocess.spots.step_optimize",
+        file_tag=_make_tag("step-optimize", roi, codebook_path.stem, f"r{round_num}" if round_num else None),
+        extra={
+            "roi": roi,
+            "round": round_num,
+            "codebook": codebook_path.stem,
+            "overwrite": overwrite,
+        },
+    )
     wd = path / f"opt_{codebook_path.stem}{f'+{roi}' if roi != '*' else ''}"
     if round_num > 0 and not (wd / "percentiles.json").exists():
         raise Exception("Please run `fishtools find-threshold` first.")
@@ -432,6 +466,17 @@ def find_threshold(
     blank: str | None = None,
     json_config: Path | None = None,
 ):
+    _setup_command_logging(
+        path,
+        component="preprocess.spots.find_threshold",
+        file_tag=_make_tag("find-threshold", roi, codebook.stem, f"r{round_num}"),
+        extra={
+            "roi": roi,
+            "round": round_num,
+            "codebook": codebook.stem,
+            "overwrite": overwrite,
+        },
+    )
     SUBFOLDER = "_highpassed"
     paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
     path_out = path / (f"opt_{codebook.stem}" + (f"+{roi}" if roi != "*" else ""))
@@ -695,9 +740,21 @@ def plot_all_genes_cli(
     - All ROIs:   preprocess spots plotall /workspace --codebook cs-base   (ROI omitted)
     - Wildcard:   preprocess spots plotall /workspace * --codebook cs-base
     """
+    cb_stem = Path(codebook_label).stem if Path(codebook_label).exists() else codebook_label
+    _setup_command_logging(
+        path,
+        component="preprocess.spots.plotall",
+        file_tag=_make_tag("plotall", roi, cb_stem),
+        extra={
+            "roi": roi,
+            "codebook": cb_stem,
+            "threads": threads,
+            "overwrite": overwrite,
+        },
+    )
     ws = Workspace(path)
     # Derive codebook name even if a full path is passed
-    cb = Path(codebook_label).stem if Path(codebook_label).exists() else codebook_label
+    cb = cb_stem
     click.echo(cb)
 
     # Resolve ROIs
@@ -929,6 +986,18 @@ def combine(path: Path, roi: str, codebook_path: Path, batch_size: int, round_nu
         codebook_path
         round_num: starts from 0.
     """
+    _setup_command_logging(
+        path,
+        component="preprocess.spots.combine",
+        file_tag=_make_tag("combine", roi, codebook_path.stem, f"r{round_num}"),
+        extra={
+            "roi": roi,
+            "round": round_num,
+            "codebook": codebook_path.stem,
+            "batch_size": batch_size,
+        },
+    )
+
     selected = sample_imgs(
         path,
         codebook_path.stem,
@@ -1334,9 +1403,21 @@ def run(
     This will use the latest scaling factors calculated from the previous step to decode.
     """
     debug = debug or (os.environ.get("DEBUG", "0") == "1")
-    if debug:
-        logger.remove()
-        logger.add(sys.stderr, level="INFO")
+    workspace_hint = path.parent.parent.parent if path.is_file() else path
+    _setup_command_logging(
+        workspace_hint,
+        component="preprocess.spots.run",
+        file_tag=_make_tag("run", path.stem, codebook_path.stem, roi or "all"),
+        debug=debug,
+        extra={
+            "roi": roi,
+            "round": round_num,
+            "split": split,
+            "calc_deviations": calc_deviations,
+            "blank": blank,
+            "highpass_only": highpass_only,
+        },
+    )
 
     # Defaults for parameters now typically provided via JSON
     subsample_z: int = 1
@@ -1460,7 +1541,7 @@ def run(
     _roi, _codebook = match.groups()
 
     _slc_blank = tuple(np.s_[::subsample_z, :]) + tuple(split_slice)
-    stack_blank = (
+    _stack_blank = (
         make_fetcher(
             path.parent.parent / f"registered--{_roi}+{blank}" / path.name,
             _slc_blank,
@@ -1488,7 +1569,7 @@ def run(
     logger.debug(f"Running GHP with sigma {ghp.sigma}")
 
     imgs: ImageStack = ghp.run(stack)
-    # blanks: ImageStack | None = ghp.run(stack_blank) if stack_blank is not None else None
+    # blanks: ImageStack | None = ghp.run(_stack_blank) if _stack_blank is not None else None
 
     # --- Blank subtraction ---
     # if blanks is not None:
@@ -1767,6 +1848,19 @@ def batch(
     stagger: float = 0.0,
     stagger_jitter: float = 0.0,
 ):
+    _setup_command_logging(
+        path,
+        component="preprocess.spots.batch",
+        file_tag=_make_tag("batch", roi, codebook_path.stem),
+        extra={
+            "roi": roi,
+            "codebook": codebook_path.stem,
+            "threads": threads,
+            "overwrite": overwrite,
+            "simple": simple,
+            "local_opt": local_opt,
+        },
+    )
     split = True  # Intentional override. --split kept for backward compatibility
     workspace = Workspace(path)
     roi_filter = None if roi == "*" else [roi]
@@ -1905,9 +1999,12 @@ def plot_decoded(spots):
 # %%
 
 
-def plot_bits(spots):
+def plot_bits(spots, bits: Sequence[int], codebook: Mapping[str, Sequence[int]]):
     reference = np.zeros((len(spots), max(bits) + 1))
-    for i, arr in enumerate(list(map(cb.get, spots.target.values))):
+    for i, target in enumerate(spots.target.values):
+        arr = codebook.get(target)
+        if arr is None:
+            continue
         for a in arr:
             reference[i, a - 1] = 1
 

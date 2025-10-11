@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sys
-import types
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +32,28 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
 
     called: dict[str, Any] = {}
 
+    log_calls: list[dict[str, Any]] = []
+
+    def fake_setup_workspace_logging(
+        workspace_path: Path,
+        *,
+        component: str,
+        file: str,
+        idx: int | None = None,
+        debug: bool = False,
+        extra: dict[str, Any] | None = None,
+        **_: Any,
+    ) -> Path:
+        log_calls.append({
+            "workspace": workspace_path,
+            "component": component,
+            "file": file,
+            "idx": idx,
+            "debug": debug,
+            "extra": extra or {},
+        })
+        return workspace_path / "analysis" / "logs" / f"{file}.log"
+
     # Stub heavy internal pipeline to avoid I/O
     def fake__run(
         path: Path,
@@ -60,6 +80,10 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
         })
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+    monkeypatch.setattr(
+        "fishtools.preprocess.cli_register.setup_workspace_logging",
+        fake_setup_workspace_logging,
+    )
 
     runner = CliRunner()
     result = runner.invoke(

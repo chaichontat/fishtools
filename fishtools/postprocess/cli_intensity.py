@@ -13,6 +13,8 @@ from loguru import logger
 from rich.console import Console
 from rich.table import Table
 
+from fishtools.utils.logging import setup_cli_logging
+
 from .intensity_config import (
     IntensityExtractionConfig,
     load_intensity_config,
@@ -166,32 +168,32 @@ def extract_intensity(
 ) -> None:
     """
     Extract intensity measurements from segmentation masks.
-    
+
     This command processes Zarr-format segmentation masks and intensity images
     to extract region properties including area, centroid, and intensity statistics.
-    
+
     **Examples:**
-    
+
     Basic usage with configuration file:
-    
+
         fishtools postprocess extract-intensity --config intensity_config.toml
-    
+
     Override specific parameters:
-    
+
         fishtools postprocess extract-intensity \\
             --config intensity_config.toml \\
             --roi roi2 \\
             --channel cfse \\
             --max-workers 8
-    
+
     Dry run to validate configuration:
-    
+
         fishtools postprocess extract-intensity \\
             --config intensity_config.toml \\
             --dry-run
-    
+
     **Configuration File Format:**
-    
+
     ```toml
     workspace_path = "/path/to/experiment"
     roi = "roi1"
@@ -202,7 +204,7 @@ def extract_intensity(
     segmentation_name = "output_segmentation.zarr"
     intensity_name = "input_image.zarr"
     ```
-    
+
     The command will create parquet files in the output directory with extracted
     region properties for each Z-slice of the segmentation mask.
     """
@@ -216,11 +218,39 @@ def extract_intensity(
 
     console = Console()
 
+    console_level = "ERROR" if quiet else ("DEBUG" if verbose else "INFO")
+    file_level = "DEBUG" if verbose else "INFO"
+    setup_cli_logging(
+        workspace or config.parent,
+        component="postprocess.intensity.extract",
+        file=f"intensity-{config.stem}",
+        debug=verbose,
+        extra={
+            "dry_run": dry_run,
+            "quiet": quiet,
+        },
+        console_level=console_level,
+        file_level=file_level,
+    )
+
     try:
         # Load configuration with overrides
         logger.info(f"Loading configuration from {config}")
         extraction_config = load_intensity_config(
             config, workspace_override=workspace, roi_override=roi, channel_override=channel
+        )
+
+        setup_cli_logging(
+            extraction_config.workspace_path,
+            component="postprocess.intensity.extract",
+            file=f"intensity-{extraction_config.workspace_path.name}",
+            debug=verbose,
+            extra={
+                "roi": extraction_config.roi,
+                "channel": extraction_config.channel,
+            },
+            console_level=console_level,
+            file_level=file_level,
         )
 
         # Apply additional overrides
@@ -261,7 +291,7 @@ def extract_intensity(
 
         # Success message
         if not quiet:
-            console.print(f"\n[bold green]✓[/bold green] Intensity extraction completed successfully!")
+            console.print("\n[bold green]✓[/bold green] Intensity extraction completed successfully!")
             console.print(f"Output saved to: {extraction_config.output_directory}")
 
         logger.info("Intensity extraction completed successfully")

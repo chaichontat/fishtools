@@ -4,12 +4,11 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import numpy as np
 import rich_click as click
 from loguru import logger
-from rich.logging import RichHandler
 
 from fishtools.io.workspace import Workspace, get_channels
 from fishtools.preprocess.config import DeconvolutionConfig, DeconvolutionOutputMode
@@ -42,11 +41,8 @@ from fishtools.preprocess.deconv.worker import (
     parse_device_spec,
     run_multi_gpu,
 )
+from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import get_shared_console, progress_bar
-
-logger.remove()
-logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
-
 
 rescale = core_rescale
 
@@ -104,6 +100,12 @@ def precompute(
     i_max: int,
 ) -> None:
     """Aggregate histograms to produce global quantization parameters."""
+    _setup_cli_logging(
+        workspace,
+        component="preprocess.deconv.precompute",
+        file_tag=f"precompute-{round_name}",
+        extra={"round": round_name},
+    )
     _normalize_precompute(
         workspace,
         round_name,
@@ -146,6 +148,13 @@ def quantize(
     overwrite: bool,
 ) -> None:
     """Quantize deconvolved float32 tiles to uint16 deliverables using global scaling."""
+    roi_tag = "-".join(sorted(rois)) if rois else "all"
+    _setup_cli_logging(
+        workspace,
+        component="preprocess.deconv.quantize",
+        file_tag=f"quantize-{round_name}",
+        extra={"round": round_name, "roi": roi_tag, "overwrite": overwrite},
+    )
     _normalize_quantize(
         workspace,
         round_name,
@@ -173,6 +182,23 @@ _PREPARE_DEFAULT_MODE = DeconvolutionOutputMode.F32
 ProgressUpdater = Callable[[], int]
 
 
+def _setup_cli_logging(
+    workspace: Path,
+    *,
+    component: str,
+    file_tag: str,
+    debug: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> Path | None:
+    return setup_cli_logging(
+        workspace,
+        component=component,
+        file=file_tag,
+        debug=debug,
+        extra=extra,
+    )
+
+
 def _configure_logging(debug: bool, *, process_label: str) -> None:
     # Parent logs route through the shared Console to avoid progress duplication.
     configure_logging(
@@ -180,6 +206,7 @@ def _configure_logging(debug: bool, *, process_label: str) -> None:
         process_label=process_label,
         level=("DEBUG" if debug else "INFO"),
         use_console=True,
+        preserve_existing=True,
     )
 
 
@@ -886,6 +913,15 @@ def prepare(
     stop_on_error: bool,
 ) -> None:
     """Sample tiles and emit artifacts using multi-GPU workers."""
+    rounds_tag = "-".join(rounds) if rounds else "all"
+    roi_tag = "-".join(roi) if roi else "all"
+    _setup_cli_logging(
+        path,
+        component="preprocess.deconv.prepare",
+        file_tag=f"prepare-{rounds_tag}",
+        debug=debug,
+        extra={"rounds": rounds_tag, "roi": roi_tag},
+    )
     try:
         device_list = parse_device_spec(devices)
     except Exception as exc:  # noqa: BLE001
@@ -971,6 +1007,14 @@ def run(
     skip_quantized: bool,
 ) -> None:
     """Run multi-GPU deconvolution across selected rounds and ROIs."""
+    round_tag = round_name or "all"
+    _setup_cli_logging(
+        path,
+        component="preprocess.deconv.run",
+        file_tag=f"run-{round_tag}",
+        debug=debug,
+        extra={"round": round_tag, "roi": roi_name, "mode": mode},
+    )
     _configure_logging(debug, process_label="0")
 
     try:
@@ -1048,6 +1092,14 @@ def run(
 @click.argument("path", type=click.Path(path_type=Path))
 @click.argument("round_name", type=str, required=False)
 def easy(path: Path, round_name: str | None):
+    round_tag = round_name or "all"
+    _setup_cli_logging(
+        path,
+        component="preprocess.deconv.easy",
+        file_tag=f"easy-{round_tag}",
+        debug=False,
+        extra={"round": round_tag},
+    )
     import subprocess
 
     rounds = [round_name] if round_name else Workspace.discover_rounds(path)

@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
 import rich_click as click
-import tifffile
 import toml
 from basicpy import BaSiC
 from loguru import logger
@@ -30,8 +29,8 @@ from fishtools.preprocess.config import (
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
-from fishtools.utils.io import Workspace
-from fishtools.utils.logging import initialize_logger
+from fishtools.utils.io import Workspace, safe_imwrite
+from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar_threadpool
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
@@ -118,6 +117,12 @@ def parse_nofids(
             out_shift[bit] = shift_
 
     return out, out_shift, bit_name_mapping
+
+
+def _run_child_cli(argv: list[str], *, check: bool = True):
+    """Wrapper around subprocess.run for easy monkeypatching in tests."""
+
+    return subprocess.run(argv, check=check)
 
 
 def sort_key(x: tuple[str, np.ndarray]) -> int | str:
@@ -365,8 +370,8 @@ def run_fiducial(
 
     # Write reference fiducial
     (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
-    crop, downsample = config.registration.crop, config.registration.downsample
-    tifffile.imwrite(
+    crop = config.registration.crop
+    safe_imwrite(
         fid_path / f"fids-{idx:04d}.tif",
         fids[reference][crop:-crop, crop:-crop],
         compression=22610,
@@ -377,7 +382,7 @@ def run_fiducial(
     _fids_path = path / f"registered--{roi}+{codebook_name}" / "_fids"
     _fids_path.mkdir(exist_ok=True, parents=True)
 
-    tifffile.imwrite(
+    safe_imwrite(
         _fids_path / f"_fids-{idx:04d}.tif",
         np.stack([v for v in fids.values()]),
         compression=22610,
@@ -401,7 +406,7 @@ def run_fiducial(
     shifted = {k: shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()}
 
     if debug:
-        tifffile.imwrite(
+        safe_imwrite(
             path / f"fids_shifted-{idx:04d}.tif",
             # Prior shifts already applied.
             np.stack(list(shifted.values())),
@@ -451,12 +456,20 @@ def _run(
     no_priors: bool = False,
 ):
     logger.info("Reading files")
-    out_path = path / f"registered--{roi}+{Path(codebook).stem}"
-    out_path.mkdir(exist_ok=True, parents=True)
+    codebook_name = Path(codebook).stem
+    out_path = path / f"registered--{roi}+{codebook_name}"
+    shift_file = path / f"shifts--{roi}+{codebook_name}" / f"shifts-{idx:04d}.json"
+    reg_file = out_path / f"reg-{idx:04d}.tif"
 
-    if not overwrite and (out_path / f"reg-{idx:04d}.tif").exists():
+    if not overwrite and shift_file.exists():
+        logger.info(f"Skipping {idx}: shifts already present at {shift_file}")
+        return
+
+    if not overwrite and reg_file.exists():
         logger.info(f"Skipping {idx}")
         return
+
+    out_path.mkdir(exist_ok=True, parents=True)
 
     # path_prevfids = out_path / "_fids" / f"_fids-{idx:04d}.tif"
     # if path_prevfids.exists():
@@ -511,7 +524,7 @@ def _run(
         shifts = run_fiducial(
             path,
             {name: img.fid for name, img in imgs.items()},
-            Path(codebook).stem,
+            codebook_name,
             config,
             roi=roi,
             reference=reference,
@@ -638,7 +651,7 @@ def _run(
 
     # (path / "down2").mkdir(exist_ok=True)
 
-    tifffile.imwrite(
+    safe_imwrite(
         out_path / f"reg-{idx:04d}.tif",
         out,
         compression=22610,
@@ -691,7 +704,7 @@ def run(
     path: Path,
     idx: int,
     codebook: Path,
-    roi: str,
+    roi: str | None,
     debug: bool = False,
     reference: str = "4_12_20",
     overwrite: bool = False,
@@ -710,11 +723,20 @@ def run(
         threshold: σ above median to call fiducial spots. Defaults to 6.
         fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
     """
-    initialize_logger(idx, debug)
-
     rois = get_rois(path, roi)
+    codebook_name = codebook.stem
 
     for roi in rois:
+        log_file_tag = f"{roi}+{codebook_name}+{idx:04d}"
+        setup_cli_logging(
+            path,
+            component="preprocess.register.run",
+            file=log_file_tag,
+            idx=idx,
+            debug=debug,
+            extra={"roi": roi, "codebook": codebook_name},
+        )
+
         _run(
             path,
             roi,
@@ -776,6 +798,14 @@ def batch(
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
+    codebook_name = codebook.stem
+    setup_cli_logging(
+        path,
+        component="preprocess.register.batch",
+        file=f"register-batch-{codebook_name}",
+        debug=debug,
+        extra={"codebook": codebook_name},
+    )
     ws = Workspace(path.parent.parent)
     logger.info(f"Found {ws.rois}")
 
@@ -805,7 +835,7 @@ def batch(
         with progress_bar_threadpool(len(idxs), threads=threads, debug=debug) as submit:
             for i in idxs:
                 submit(
-                    subprocess.run,
+                    _run_child_cli,
                     [
                         "preprocess",
                         "register",

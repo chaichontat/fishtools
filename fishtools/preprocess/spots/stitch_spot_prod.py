@@ -14,10 +14,10 @@ coordinates) during interactive thresholding.
 """
 
 import re
-import sys
 from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, wait
 from multiprocessing import get_context
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import rich_click as click
@@ -34,10 +34,23 @@ from fishtools.preprocess.stitching import (
     generate_cells,
     get_exclusive_area,
 )
+from fishtools.utils.logging import resolve_workspace_root, setup_cli_logging
 
 FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.(pkl|parquet)")
 OUT_SUFFIX = "_deduped.parquet"
-logger.configure(handlers=[{"sink": sys.stderr}])
+
+
+def _setup_command_logging(
+    path: Path,
+    *,
+    roi: str,
+    codebook: Path,
+    debug: bool = False,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    tag = f"stitch-spots-{roi}-{codebook.stem}"
+    payload = {"roi": roi, "codebook": codebook.stem, **({} if extra is None else extra)}
+    setup_cli_logging(path, component="preprocess.spots.stitch", file=tag, debug=debug, extra=payload)
 
 
 def gen_out(path: Path):
@@ -189,6 +202,21 @@ def stitch(
     ``x_``/``y_`` columns here; those names are reserved by ``cli_spotlook`` for
     non-spatial, feature-space plots.
     """
+    workspace_root, _ = resolve_workspace_root(path_wd)
+    roi_label = _roi if _roi not in {"*", "all"} else "all"
+    _setup_command_logging(
+        workspace_root,
+        roi=roi_label,
+        codebook=codebook,
+        extra={
+            "no_filter": no_filter,
+            "overwrite": overwrite,
+            "simple": simple,
+            "no_split": no_split,
+            "threads": threads,
+        },
+    )
+
     if path_wd.name.startswith("registered--"):
         raise ValueError("Path must be the main working directory, not registered.")
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -137,7 +138,13 @@ def _resolve_output_names(chsel: ChannelSelection, channels: str | None) -> list
 
 
 def _write_tiff(
-    path: Path, data: np.ndarray, axes: str, names: list[str] | None, channels_arg: str | None
+    path: Path,
+    data: np.ndarray,
+    axes: str,
+    names: list[str] | None,
+    channels_arg: str | None,
+    *,
+    upscale: float,
 ) -> None:
     imwrite(
         path,
@@ -146,9 +153,21 @@ def _write_tiff(
             "axes": axes,
             "channel_names": names,
             "channels_arg": channels_arg,
+            "upscale": upscale,
         },
         **TIFF_KWARGS,  # type: ignore
     )
+
+
+def _resize_uint16(data: np.ndarray, factors: tuple[float, ...]) -> np.ndarray:
+    """Resize data with scipy.ndimage.zoom, preserving uint16 output."""
+
+    if all(math.isclose(f, 1.0, abs_tol=1e-9, rel_tol=1e-9) for f in factors):
+        # Ensure dtype consistency without extra work when no scaling requested.
+        return data.astype(np.uint16, copy=False)
+
+    resized = zoom(data.astype(np.float32, copy=False), factors, order=1)
+    return np.clip(np.rint(resized), 0, 65530).astype(np.uint16)
 
 
 def _prep_slab(
@@ -356,6 +375,11 @@ def cmd_extract(
     ] = None,
     crop: Annotated[int, typer.Option("--crop", help="Trim pixels at borders", min=0)] = 0,
     threads: Annotated[int, typer.Option("--threads", "-t", help="Parallel workers", min=1, max=64)] = 8,
+    upscale: Annotated[
+        float | None,
+        typer.Option("--upscale", help="Additional spatial upscale factor applied before saving.", min=0.1),
+    ] = None,
+    seed: Annotated[int | None, typer.Option("--seed", help="Random seed for sampling.")] = None,
     every: Annotated[int, typer.Option("--every", help="Process every Nth file by size", min=1)] = 1,
     max_from: Annotated[
         str | None, typer.Option("--max-from", help="Append max across channels from this codebook")
@@ -381,6 +405,11 @@ def cmd_extract(
     if mode == "ortho" and dz != 1:
         raise typer.BadParameter("--dz parameter is only valid for 'z' mode.")
 
+    if upscale is None:
+        upscale = 1.0
+    if upscale <= 0:
+        raise typer.BadParameter("--upscale must be positive.")
+
     ws = Workspace(path)
     reg_dir = ws.registered(roi, codebook)
     if out is None:
@@ -389,6 +418,7 @@ def cmd_extract(
 
     logger.info(f"Input: {reg_dir}")
     logger.info(f"Output: {out}")
+    logger.info(f"Upscale factor: {upscale}")
 
     inputs = _discover_registered_inputs(
         ws,
@@ -434,7 +464,6 @@ def cmd_extract(
     logger.info(f"Max-from: {max_from_path if max_from_path else 'None'}")
 
     if files and all(_is_zarr_path(f) for f in files) and mode == "z":
-        rng = np.random.default_rng()
         tile_jobs: list[tuple[Path, object, list[tuple[int, int]], list[str] | None, list[int]]] = []
         total_outputs = 0
         for f in files:
@@ -448,7 +477,7 @@ def cmd_extract(
             z_candidates = list(range(0, vol.shape[0], dz))
             if not z_candidates:
                 raise ValueError("No Z indices available after applying dz to fused Zarr volume.")
-            total_outputs += len(tile_origins)
+            total_outputs += len(tile_origins) * len(z_candidates)
             tile_jobs.append((f, vol, tile_origins, names_all, z_candidates))
 
         logger.info(f"Tracking {total_outputs} output files from Zarr input(s)")
@@ -465,13 +494,14 @@ def cmd_extract(
                     crop,
                     z_candidates,
                     max_from_path,
-                    rng,
+                    upscale,
                     progress_update,
                 )
         return
 
     if files and all(_is_zarr_path(f) for f in files) and mode == "ortho":
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(seed)
+        logger.info(f"Random seed: {seed if seed is not None else 'system entropy'}")
         ortho_jobs: list[tuple[Path, object, list[str] | None, list[int], list[int]]] = []
         total_outputs = 0
         for f in files:
@@ -496,6 +526,7 @@ def cmd_extract(
                     crop,
                     anisotropy,
                     max_from_path,
+                    upscale,
                     progress_update,
                 )
         return
@@ -503,10 +534,10 @@ def cmd_extract(
     with progress_bar_threadpool(len(files), threads=threads, stop_on_exception=True) as submit:
         if mode == "z":
             for f in files:
-                submit(_process_file_to_z_slices, f, out, channels, crop, dz, n, max_from_path)
+                submit(_process_file_to_z_slices, f, out, channels, crop, dz, n, max_from_path, upscale)
         else:
             for f in files:
-                submit(_process_file_to_ortho, f, out, channels, crop, n, anisotropy, max_from_path)
+                submit(_process_file_to_ortho, f, out, channels, crop, n, anisotropy, max_from_path, upscale)
 
 
 # ---------- Logging helpers ----------
@@ -571,6 +602,7 @@ def _process_file_to_z_slices(
     dz: int,
     n: int | None,
     max_from_path: Path | None,
+    upscale: float,
     *,
     progress: Callable[[], None] | None = None,
 ) -> None:
@@ -620,8 +652,16 @@ def _process_file_to_z_slices(
             filter_before=True,
             append_max=other_max,
         )
+        cyx_u16 = _resize_uint16(cyx_u16, (1.0, upscale, upscale))
         out_file = out_dir / f"{file.stem}_z{i:02d}.tif"
-        _write_tiff(out_file, cyx_u16, axes="CYX", names=out_names, channels_arg=channels)
+        _write_tiff(
+            out_file,
+            cyx_u16,
+            axes="CYX",
+            names=out_names,
+            channels_arg=channels,
+            upscale=upscale,
+        )
         if progress is not None:
             progress()
 
@@ -634,6 +674,7 @@ def _process_file_to_ortho(
     n: int,
     anisotropy: int,
     max_from_path: Path | None,
+    upscale: float,
     *,
     progress: Callable[[], None] | None = None,
 ) -> None:
@@ -683,9 +724,16 @@ def _process_file_to_ortho(
             filter_before=False,
             append_max=other_max,
         )  # (C,Z,X)
-        czx = zoom(czx, (1, anisotropy, 1), order=1)  # scale Z only
+        czx = _resize_uint16(czx, (1.0, anisotropy * upscale, upscale))
         out_file = out_dir / f"{file.stem}_orthozx-{yi}.tif"
-        _write_tiff(out_file, czx, axes="CZX", names=out_names, channels_arg=channels)
+        _write_tiff(
+            out_file,
+            czx,
+            axes="CZX",
+            names=out_names,
+            channels_arg=channels,
+            upscale=upscale,
+        )
         if progress is not None:
             progress()
 
@@ -703,9 +751,16 @@ def _process_file_to_ortho(
             filter_before=False,
             append_max=other_max,
         )  # (C,Z,Y)
-        czy = zoom(czy, (1, anisotropy, 1), order=1)
+        czy = _resize_uint16(czy, (1.0, anisotropy * upscale, upscale))
         out_file = out_dir / f"{file.stem}_orthozy-{xi}.tif"
-        _write_tiff(out_file, czy, axes="CZY", names=out_names, channels_arg=channels)
+        _write_tiff(
+            out_file,
+            czy,
+            axes="CZY",
+            names=out_names,
+            channels_arg=channels,
+            upscale=upscale,
+        )
         if progress is not None:
             progress()
 
@@ -785,7 +840,7 @@ def _process_zarr_tiles(
     crop: int,
     z_candidates: list[int],
     max_from_path: Path | None,
-    rng: Generator,
+    upscale: float,
     progress: Callable[[], None],
 ) -> None:
     chsel = _parse_channels(channels, names_all)
@@ -807,38 +862,54 @@ def _process_zarr_tiles(
     for y0, x0 in tile_origins:
         y_slice = slice(y0, y0 + ZARR_TILE_SIZE)
         x_slice = slice(x0, x0 + ZARR_TILE_SIZE)
-        # Sample a single Z plane per tile using the shared RNG for reproducibility.
-        z_index = int(rng.choice(z_candidates))
-        plane = vol[z_index, y_slice, x_slice, :]
-        other_max = None
-        if other_vol is not None:
-            other_tile = other_vol[z_index, y_slice, x_slice, :]
-            other_max = other_tile.max(axis=2)
+        skipped_for_tile = 0
+        for z_index in z_candidates:
+            plane = vol[z_index, y_slice, x_slice, :]
+            zero_tile = np.any(plane == 0)
+            other_max = None
+            if other_vol is not None:
+                other_tile = other_vol[z_index, y_slice, x_slice, :]
+                if not zero_tile:
+                    zero_tile = np.any(other_tile == 0)
+                if not zero_tile:
+                    other_max = other_tile.max(axis=2)
 
-        cyx_u16 = _prep_slab(
-            plane,
-            ch_idx=chsel.indices,
-            channel_axis=2,
-            crop_slices=None,
-            filter_before=True,
-            append_max=other_max,
-        )
+            if zero_tile:
+                skipped_for_tile += 1
+                progress()
+                continue
 
-        out_name = _format_tile_filename(
-            file.stem,
-            z_index,
-            y0,
-            x0,
-            coord_width=coord_width,
-        )
-        _write_tiff(
-            out_dir / out_name,
-            cyx_u16,
-            axes="CYX",
-            names=out_names,
-            channels_arg=channels,
-        )
-        progress()
+            cyx_u16 = _prep_slab(
+                plane,
+                ch_idx=chsel.indices,
+                channel_axis=2,
+                crop_slices=None,
+                filter_before=True,
+                append_max=other_max,
+            )
+            cyx_u16 = _resize_uint16(cyx_u16, (1.0, upscale, upscale))
+
+            out_name = _format_tile_filename(
+                file.stem,
+                z_index,
+                y0,
+                x0,
+                coord_width=coord_width,
+            )
+            _write_tiff(
+                out_dir / out_name,
+                cyx_u16,
+                axes="CYX",
+                names=out_names,
+                channels_arg=channels,
+                upscale=upscale,
+            )
+            progress()
+
+        if skipped_for_tile:
+            logger.debug(
+                f"Skipped {skipped_for_tile} z-slice(s) in tile ({y0},{x0}) of {file.name} due to zeros."
+            )
 
 
 def _process_zarr_ortho(
@@ -852,6 +923,7 @@ def _process_zarr_ortho(
     crop: int,
     anisotropy: int,
     max_from_path: Path | None,
+    upscale: float,
     progress: Callable[[], None],
 ) -> None:
     chsel = _parse_channels(channels, names_all)
@@ -886,9 +958,16 @@ def _process_zarr_ortho(
             filter_before=False,
             append_max=other_max,
         )
-        czx = zoom(czx, (1, anisotropy, 1), order=1)
+        czx = _resize_uint16(czx, (1.0, anisotropy * upscale, upscale))
         out_file = out_dir / f"{file.stem}_orthozx-{yi}.tif"
-        _write_tiff(out_file, czx, axes="CZX", names=out_names, channels_arg=channels)
+        _write_tiff(
+            out_file,
+            czx,
+            axes="CZX",
+            names=out_names,
+            channels_arg=channels,
+            upscale=upscale,
+        )
         progress()
 
     for xi in x_positions:
@@ -904,9 +983,16 @@ def _process_zarr_ortho(
             filter_before=False,
             append_max=other_max,
         )
-        czy = zoom(czy, (1, anisotropy, 1), order=1)
+        czy = _resize_uint16(czy, (1.0, anisotropy * upscale, upscale))
         out_file = out_dir / f"{file.stem}_orthozy-{xi}.tif"
-        _write_tiff(out_file, czy, axes="CZY", names=out_names, channels_arg=channels)
+        _write_tiff(
+            out_file,
+            czy,
+            axes="CZY",
+            names=out_names,
+            channels_arg=channels,
+            upscale=upscale,
+        )
         progress()
 
 
@@ -954,6 +1040,11 @@ def _app_entrypoint(
     ] = None,
     crop: Annotated[int, typer.Option("--crop", help="Trim pixels at borders", min=0)] = 0,
     threads: Annotated[int, typer.Option("--threads", "-t", help="Parallel workers", min=1, max=64)] = 8,
+    upscale: Annotated[
+        float | None,
+        typer.Option("--upscale", help="Additional spatial upscale factor applied before saving.", min=0.1),
+    ] = None,
+    seed: Annotated[int | None, typer.Option("--seed", help="Random seed for sampling.")] = None,
     every: Annotated[int, typer.Option("--every", help="Process every Nth file by size", min=1)] = 1,
     max_from: Annotated[
         str | None, typer.Option("--max-from", help="Append max across channels from this codebook")
@@ -979,6 +1070,8 @@ def _app_entrypoint(
         channels=channels,
         crop=crop,
         threads=threads,
+        upscale=upscale,
+        seed=seed,
         every=every,
         max_from=max_from,
         use_zarr=use_zarr,
