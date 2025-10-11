@@ -55,6 +55,7 @@ from starfish.types import Axes, Features, Levels
 from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile, imread
 
+from fishtools.gpu.memory import release_all as _gpu_release_all
 from fishtools.io.workspace import CorruptedTiffError, Workspace
 from fishtools.preprocess.addition import ElementWiseAddition
 from fishtools.preprocess.cli_spotlook import threshold
@@ -77,6 +78,34 @@ if GPU:
 else:
     from starfish import Codebook
 # from fishtools.gpu.codebook import Codebook
+
+# Optional CuPy import for GPU acceleration (used in find_threshold)
+try:  # pragma: no cover - availability depends on runtime
+    import cupy as cp  # type: ignore
+except Exception:  # pragma: no cover - tests run CPU path
+    cp = None  # type: ignore[assignment]
+
+
+def _cupy_available() -> bool:
+    """Return True when CuPy is importable and at least one device is accessible.
+
+    Follows the defensive pattern used in fishtools.preprocess.n4 to avoid
+    surprising crashes on hosts without CUDA.
+    """
+    if cp is None:
+        return False
+    try:
+        cuda = getattr(cp, "cuda", None)
+        runtime = getattr(cuda, "runtime", None) if cuda is not None else None
+        if runtime is not None:
+            count = runtime.getDeviceCount()  # type: ignore[attr-defined]
+            if not isinstance(count, int) or count < 1:
+                return False
+        # Validate simple allocation on the active backend
+        _ = cp.asarray([0.0], dtype=cp.float32)
+    except Exception:
+        return False
+    return True
 
 
 os.environ["TQDM_DISABLE"] = "1"
@@ -457,31 +486,56 @@ def find_threshold(
         percentile = 40.0
 
     try:
-        mins = np.loadtxt(path_out / "global_min.txt", dtype=float).reshape(1, -1, 1, 1)
-        global_scale = np.atleast_3d(np.loadtxt(path_out / "global_scale.txt", dtype=float))[
-            round_num
-        ].reshape(1, -1, 1, 1)
+        mins_np = np.loadtxt(path_out / "global_min.txt", dtype=np.float32).reshape(1, -1, 1, 1)
+        global_scale_np = (
+            np.atleast_3d(np.loadtxt(path_out / "global_scale.txt", dtype=np.float32))[round_num]
+            .reshape(1, -1, 1, 1)
+            .astype(np.float32, copy=False)
+        )
         logger.info(f"Using global scale from round {round_num}")
     except IndexError:
         raise ValueError(
             f"Round {round_num} not found. Please run align_prod optimize with the round_number first."
         )
 
-    for p in sorted(highpasses[:50]):
-        logger.debug(f"Processing {p.parent.name}/{p.name}")
-        # import cupy as cp
+    use_gpu = GPU and _cupy_available()
+    if use_gpu:
+        logger.info("find-threshold: Using GPU for percentile computation")
+        mins_dev = cp.asarray(mins_np, dtype=cp.float32)
+        scale_dev = cp.asarray(global_scale_np, dtype=cp.float32)
+    else:
+        mins_dev = None  # type: ignore[assignment]
+        scale_dev = None  # type: ignore[assignment]
 
-        img = tifffile.imread(p)[:, :, :1024, :1024]  # type: ignore
-        if max_proj:
-            img = img.max(axis=0)
-        # img = cp.asarray(img)
-        # img *= cp.asarray(global_scale)
-        img -= mins
-        img *= global_scale
+    try:
+        for p in sorted(highpasses[:50]):
+            logger.debug(f"Processing {p.parent.name}/{p.name}")
 
-        norm = np.linalg.norm(img, axis=1)
-        del img
-        norms[p.parent.parent.name + "-" + p.name] = float(np.percentile(norm, percentile))
+            # Load and lightly downsample spatially to control memory; keep float32
+            img_np = tifffile.imread(p).astype(np.float32)[:, :, :1024:2, :1024:2]  # ZCYX
+            if max_proj:
+                img_np = img_np.max(axis=0)  # CYX
+
+            if use_gpu:
+                img_dev = cp.asarray(img_np, dtype=cp.float32)
+                img_dev = img_dev - mins_dev  # broadcast
+                img_dev = img_dev * scale_dev
+                # Match historical behavior: axis=1 (channel) even when max_proj reduces dims
+                norm_dev = cp.linalg.norm(img_dev, axis=1)
+                val = float(cp.asnumpy(cp.percentile(norm_dev, percentile)))
+                del img_dev, norm_dev  # explicit free before next iteration
+            else:
+                img_np = img_np - mins_np
+                img_np = img_np * global_scale_np
+                norm_np = np.linalg.norm(img_np, axis=1)
+                val = float(np.percentile(norm_np, percentile))
+                del img_np, norm_np
+
+            norms[p.parent.parent.name + "-" + p.name] = val
+    finally:
+        if use_gpu:
+            # Best‑effort: free pools between large batches
+            _gpu_release_all()
 
     path_out.mkdir(exist_ok=True)
 

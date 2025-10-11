@@ -93,7 +93,7 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
 def run_train(name: str, path: Path, train_config: TrainConfig):
     logger.info(f"Started training {name} with paths: {train_config.training_paths}")
 
-    logger.info(f"Loading training data")
+    logger.info("Loading training data")
     out2 = concat_output(
         path,
         train_config.training_paths,

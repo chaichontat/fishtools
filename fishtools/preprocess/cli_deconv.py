@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import re
-import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Sequence
 
-import cupy as cp
 import numpy as np
 import rich_click as click
 from loguru import logger
@@ -15,8 +14,8 @@ from rich.logging import RichHandler
 from fishtools.io.workspace import Workspace, get_channels
 from fishtools.preprocess.config import DeconvolutionConfig, DeconvolutionOutputMode
 from fishtools.preprocess.deconv.backend import (
-    DeconvolutionTileProcessor,
     Float32HistBackend,
+    LegacyPerTileU16Backend,
     OutputBackend,
     ProcessorConfig,
     ProcessorFactory,
@@ -24,9 +23,6 @@ from fishtools.preprocess.deconv.backend import (
     make_processor_factory,
 )
 from fishtools.preprocess.deconv.basic_utils import resolve_basic_paths
-from fishtools.preprocess.deconv.core import (
-    load_projectors_cached,
-)
 from fishtools.preprocess.deconv.core import rescale as core_rescale
 from fishtools.preprocess.deconv.discovery import infer_psf_step
 from fishtools.preprocess.deconv.helpers import safe_delete_origin_dirs
@@ -46,19 +42,17 @@ from fishtools.preprocess.deconv.worker import (
     parse_device_spec,
     run_multi_gpu,
 )
-from fishtools.preprocess.deconv.worker import MP_CONTEXT as _MP_CTX
 from fishtools.utils.pretty_print import get_shared_console, progress_bar
 
 logger.remove()
 logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level": "INFO"}])
 
 
-projectors = load_projectors_cached
 rescale = core_rescale
 
 
 @click.group()
-def deconv() -> None:
+def deconvnew() -> None:
     """3D deconvolution workflows.
 
     Includes global quantization utilities accessible as:
@@ -67,7 +61,7 @@ def deconv() -> None:
     """
 
 
-@deconv.command("precompute")
+@deconvnew.command("precompute")
 @click.argument("workspace", type=click.Path(path_type=Path))
 @click.argument("round_name", type=str)
 @click.option("--bins", type=int, default=8192, show_default=True)
@@ -121,7 +115,7 @@ def precompute(
     )
 
 
-@deconv.command("quantize")
+@deconvnew.command("quantize")
 @click.argument("workspace", type=click.Path(path_type=Path))
 @click.argument("round_name", type=str)
 @click.option(
@@ -162,7 +156,7 @@ def quantize(
 
 
 __all__ = [
-    "deconv",
+    "deconvnew",
     "precompute",
     "quantize",
     "prepare",
@@ -292,7 +286,9 @@ def _normalize_mode(value: str | DeconvolutionOutputMode) -> DeconvolutionOutput
         return DeconvolutionOutputMode.F32
     if normalized == "u16":
         return DeconvolutionOutputMode.U16
-    raise click.BadParameter(f"Unknown backend '{value}'. Expected one of: float32, u16.")
+    if normalized in {"legacy", "old", "u16_tile"}:
+        return DeconvolutionOutputMode.LEGACY
+    raise click.BadParameter(f"Unknown backend '{value}'. Expected one of: float32, u16, legacy.")
 
 
 # ------------------------------ Backend choice ------------------------------ #
@@ -301,6 +297,7 @@ def _normalize_mode(value: str | DeconvolutionOutputMode) -> DeconvolutionOutput
 _BACKEND_CLASSES: dict[DeconvolutionOutputMode, type[OutputBackend]] = {
     DeconvolutionOutputMode.F32: Float32HistBackend,
     DeconvolutionOutputMode.U16: U16PrenormBackend,
+    DeconvolutionOutputMode.LEGACY: LegacyPerTileU16Backend,
 }
 
 
@@ -380,7 +377,17 @@ def _prepare_round_plan(
     else:
         prefixed.warning(f"Could not determine PSF step; defaulting to step={step}.")
 
-    channels = get_channels(file_list[0])
+    # Resolve BaSiC lookup channels: MUST be wavelengths to match `{name}-{wavelength}.pkl`
+    # Prefer explicit wavelengths from TIFF metadata (waveform→powers),
+    # only fall back to workspace heuristics when absent.
+    ws = Workspace(path)
+    channels = get_channels(file_list[0]) or ws.infer_channel_names(round_name)
+    if not channels:
+        # Final fallback: derive from round token segments (e.g., 1_9_17 → 3 channels)
+        # Use positional placeholder names to avoid coupling with unknown semantics.
+        token_count = max(1, len(round_name.split("_")))
+        channels = [f"channel_{i}" for i in range(token_count)]
+
     basic_paths = resolve_basic_paths(
         path,
         round_name=round_name,
@@ -405,6 +412,7 @@ def _prepare_round_plan(
         s_glob=s_glob,
         debug=debug,
     )
+    logger.info(config)
 
     backend_cls = _BACKEND_CLASSES[mode]
     backend_for_filter = backend_cls(config)
@@ -555,7 +563,7 @@ def _plan_and_execute(
     ref_round: str | None,
     limit: int | None,
     limit_scope: Literal["total", "per_roi"],
-    basic_name: str,
+    basic_name: str | None,
     n_fids: int,
     histogram_bins: int,
     load_scaling: bool,
@@ -580,8 +588,13 @@ def _plan_and_execute(
     plans: list[_RoundProcessingPlan] = []
     for round_token in rounds:
         prefixed = _PrefixedLogger(round_token)
-        basic_token = basic_name or round_token
-        prefixed.info(f"Using {(path / 'basic') / f'{basic_token}-*.pkl'} for BaSiC")
+        if basic_name:
+            prefixed.info(f"Using {(path / 'basic') / f'{basic_name}-*.pkl'} for BaSiC")
+        else:
+            prefixed.info(
+                "Auto-selecting BaSiC profiles: prefer "
+                f"{(path / 'basic') / f'{round_token}-*.pkl'} then 'all-*.pkl'."
+            )
 
         if not scope_rois:
             prefixed.warning("No ROIs available; skipping round.")
@@ -628,7 +641,7 @@ def _plan_and_execute(
             round_name=round_token,
             files=files_to_process,
             out_dir=out_dir,
-            basic_name=basic_token,
+            basic_name=basic_name,  # None triggers round→all fallback in resolver
             n_fids=n_fids,
             histogram_bins=histogram_bins,
             load_scaling=load_scaling,
@@ -694,12 +707,12 @@ def multi_run(
     *,
     ref: str | Path | None,
     limit: int | None,
-    backend: str = _PREPARE_DEFAULT_MODE.value,
-    histograms: bool = False,
+    mode: str = _PREPARE_DEFAULT_MODE.value,
     histogram_bins: int = 8192,
+    skip_quantized: bool = False,
     overwrite: bool,
     n_fids: int,
-    basic_name: str,
+    basic_name: str | None,
     debug: bool,
     devices: Sequence[int],
     stop_on_error: bool,
@@ -711,7 +724,13 @@ def multi_run(
     if configure_logging:
         _configure_logging(debug, process_label=process_label)
 
-    mode = _normalize_mode(backend)
+    selected_mode = _normalize_mode(mode)
+
+    if skip_quantized and selected_mode is DeconvolutionOutputMode.U16:
+        logger.info("multi_run: skip_quantized requested; switching backend to float32 outputs.")
+        selected_mode = DeconvolutionOutputMode.F32
+
+    load_scaling = selected_mode is DeconvolutionOutputMode.U16 and not skip_quantized
 
     ref_round = str(ref) if ref is not None else None
 
@@ -725,12 +744,12 @@ def multi_run(
         basic_name=basic_name,
         n_fids=n_fids,
         histogram_bins=histogram_bins,
-        load_scaling=True,
+        load_scaling=load_scaling,
         overwrite=overwrite,
         debug=debug,
         devices=list(devices),
         stop_on_error=stop_on_error,
-        mode=mode,
+        mode=selected_mode,
         delete_origin=False,
     )
 
@@ -746,10 +765,10 @@ def multi_prepare(
     round_names: Sequence[str] | tuple[str, ...],
     seed: int,
     histogram_bins: int,
-    backend: str = _DEFAULT_OUTPUT_MODE.value,
+    mode: str = _DEFAULT_OUTPUT_MODE.value,
     overwrite: bool,
     n_fids: int,
-    basic_name: str,
+    basic_name: str | None,
     debug: bool,
     devices: Sequence[int],
     stop_on_error: bool,
@@ -794,7 +813,7 @@ def multi_prepare(
     out_dir = ws.deconved
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    mode = _normalize_mode(backend)
+    selected_mode = _normalize_mode(mode)
 
     for round_name, files in sorted(by_round.items()):
         if not files:
@@ -817,14 +836,14 @@ def multi_prepare(
             devices=list(devices),
             stop_on_error=stop_on_error,
             label=round_name,
-            mode=mode,
+            mode=selected_mode,
         )
 
 
 # ---------- prepare ----------
 
 
-@deconv.command()
+@deconvnew.command()
 @click.argument("path", type=click.Path(path_type=Path))
 # Accept zero or more round names as a positional argument.
 @click.argument("rounds", nargs=-1)
@@ -833,15 +852,15 @@ def multi_prepare(
 @click.option("--roi", type=str, multiple=True)
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--histogram-bins", type=int, default=8192, show_default=True)
-@click.option(
-    "--backend",
-    type=click.Choice(["float32", "u16"]),
-    default=_PREPARE_DEFAULT_MODE.value,
-    show_default=True,
-)
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2, show_default=True)
-@click.option("--basic-name", type=str, default="all", show_default=True)
+@click.option(
+    "--basic-name",
+    type=str,
+    default=None,
+    show_default=False,
+    help=("BaSiC profile prefix. If omitted, uses round-specific prefix first then falls back to 'all'."),
+)
 @click.option("--debug", is_flag=True)
 @click.option("--devices", type=str, default="auto", show_default=True)
 @click.option(
@@ -859,10 +878,9 @@ def prepare(
     roi: tuple[str, ...],
     seed: int,
     histogram_bins: int,
-    backend: str,
     overwrite: bool,
     n_fids: int,
-    basic_name: str,
+    basic_name: str | None,
     debug: bool,
     devices: str,
     stop_on_error: bool,
@@ -881,7 +899,7 @@ def prepare(
         round_names=tuple(rounds),
         seed=seed,
         histogram_bins=histogram_bins,
-        backend=backend,
+        mode=_PREPARE_DEFAULT_MODE.value,
         overwrite=overwrite,
         n_fids=n_fids,
         basic_name=basic_name,
@@ -896,15 +914,16 @@ def prepare(
 # ---------- run (progressive scoping) ----------
 
 
-@deconv.command()
+@deconvnew.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.argument("round_name", type=str, required=False)
 @click.option("--roi", "roi_name", type=str, default="*")
 @click.option("--ref", "ref_round", type=str, default=None)
 @click.option("--limit", type=int, default=None)
 @click.option(
+    "--mode",
     "--backend",
-    type=click.Choice(["u16", "float32"]),
+    type=click.Choice(["u16", "float32", "legacy"]),
     default=_DEFAULT_OUTPUT_MODE.value,
     show_default=True,
 )
@@ -912,7 +931,13 @@ def prepare(
 @click.option("--overwrite", is_flag=True)
 @click.option("--delete-origin", is_flag=True)
 @click.option("--n-fids", type=int, default=2, show_default=True)
-@click.option("--basic-name", type=str, default="all", show_default=True)
+@click.option(
+    "--basic-name",
+    type=str,
+    default=None,
+    show_default=False,
+    help=("BaSiC profile prefix. If omitted, uses round-specific prefix first then falls back to 'all'."),
+)
 @click.option("--debug", is_flag=True)
 @click.option("--devices", type=str, default="auto", show_default=True)
 @click.option(
@@ -921,6 +946,12 @@ def prepare(
     show_default=True,
     help="Stop all workers after the first failure.",
 )
+@click.option(
+    "--skip-quantized/--include-quantized",
+    default=False,
+    show_default=True,
+    help="Skip writing uint16 deliverables so quantize can run separately.",
+)
 def run(
     path: Path,
     round_name: str | None,
@@ -928,15 +959,16 @@ def run(
     roi_name: str,
     ref_round: str | None,
     limit: int | None,
-    backend: str,
+    mode: str,
     histogram_bins: int,
     overwrite: bool,
     delete_origin: bool,
     n_fids: int,
-    basic_name: str,
+    basic_name: str | None,
     debug: bool,
     devices: str,
     stop_on_error: bool,
+    skip_quantized: bool,
 ) -> None:
     """Run multi-GPU deconvolution across selected rounds and ROIs."""
     _configure_logging(debug, process_label="0")
@@ -957,7 +989,11 @@ def run(
         raise click.ClickException("No ROIs found in workspace.")
 
     if round_name is None or round_name == "*":
-        selected_rounds = tuple(all_rounds)
+        selected_rounds = (
+            tuple(all_rounds)
+            if mode != "legacy"
+            else [r for r in all_rounds if all(x.isdigit() for x in r.split("_")) and len(r.split("_")) == 3]
+        )
     elif round_name in all_rounds:
         selected_rounds = (round_name,)
     else:
@@ -970,7 +1006,19 @@ def run(
     else:
         raise click.ClickException(f"ROI '{roi_name}' not found in {path}.")
 
-    mode = _normalize_mode(backend)
+    selected_mode = _normalize_mode(mode)
+
+    if skip_quantized:
+        if selected_mode is DeconvolutionOutputMode.U16:
+            logger.info(
+                "Skipping quantized deliverables; forcing float32 backend so "
+                "'preprocess deconv quantize' can run independently."
+            )
+            selected_mode = DeconvolutionOutputMode.F32
+        else:
+            logger.info("Skipping quantized deliverables; float32 backend already active.")
+
+    load_scaling = selected_mode is DeconvolutionOutputMode.U16 and not skip_quantized
 
     ref_token = ref_round
     if ref_token is not None and ref_token not in all_rounds:
@@ -986,28 +1034,44 @@ def run(
         basic_name=basic_name,
         n_fids=n_fids,
         histogram_bins=histogram_bins,
-        load_scaling=True,
+        load_scaling=load_scaling,
         overwrite=overwrite,
         debug=debug,
         devices=device_list,
         stop_on_error=stop_on_error,
-        mode=mode,
+        mode=selected_mode,
         delete_origin=delete_origin,
     )
 
 
-@deconv.command()
+@deconvnew.command()
 @click.argument("path", type=click.Path(path_type=Path))
-@click.argument("round_name", type=str)
+@click.argument("round_name", type=str, required=False)
 def easy(path: Path, round_name: str | None):
     import subprocess
 
     rounds = [round_name] if round_name else Workspace.discover_rounds(path)
     for round_ in rounds:
-        subprocess.run(["preprocess", "deconv", "prepare", str(path), round_], check=True)
-        subprocess.run(["preprocess", "deconv", "precompute", str(path), round_], check=True)
-        subprocess.run(["preprocess", "deconv", "run", str(path), round_], check=True)
+        if not (path / "analysis" / "deconv_scaling" / f"{round_}.txt").exists():
+            subprocess.run(["preprocess", "deconvnew", "prepare", str(path), round_], check=True)
+            subprocess.run(["preprocess", "deconvnew", "precompute", str(path), round_], check=True)
+
+        with ThreadPoolExecutor() as executor:
+            promises = [
+                executor.submit(
+                    subprocess.run,
+                    ["preprocess", "deconvnew", "quantize", str(path), round_],
+                    check=True,
+                ),
+                executor.submit(
+                    subprocess.run,
+                    ["preprocess", "deconvnew", "run", str(path), round_],
+                    check=True,
+                ),
+            ]
+            for fut in as_completed(promises):
+                fut.result()
 
 
 if __name__ == "__main__":
-    deconv()
+    deconvnew()

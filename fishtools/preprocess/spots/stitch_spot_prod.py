@@ -1,3 +1,18 @@
+"""
+Stitch decoded spot tiles into a per-ROI parquet with global coordinates.
+
+Coordinate conventions used throughout this module:
+- Each decoded tile provides spot locations in its own tile-local frame
+  (``x_local``, ``y_local`` when loaded through ``fishtools.analysis.spots``).
+- Using the tile configuration (ImageJ-style ``TileConfiguration.registered.txt``),
+  we transform tile-local coordinates into global mosaic coordinates and
+  materialize them as ``x`` and ``y`` in the output parquet.
+
+This module does not create ``x_``/``y_`` columns. In this codebase, those
+names are used in ``cli_spotlook`` for feature-space axes (not spatial
+coordinates) during interactive thresholding.
+"""
+
 import re
 import sys
 from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, wait
@@ -11,6 +26,7 @@ from rtree import index
 from tifffile import imread
 
 from fishtools.analysis.spots import load_spots, load_spots_simple
+from fishtools.io.workspace import Workspace
 from fishtools.preprocess.stitching import (
     Cells,
     Crosses,
@@ -18,7 +34,6 @@ from fishtools.preprocess.stitching import (
     generate_cells,
     get_exclusive_area,
 )
-from fishtools.preprocess.tileconfig import TileConfiguration
 
 FILENAME = re.compile(r"reg-(\d+)(?:-(\d+))?\.(pkl|parquet)")
 OUT_SUFFIX = "_deduped.parquet"
@@ -33,13 +48,14 @@ def _parse_filename(x: str):
     match = FILENAME.match(x)
     if not match:
         raise ValueError(f"Could not parse {x}")
-    return {"idx": int(match.group(1)), "split": int(match.group(2)) if match.group(2) else None}
+    return {
+        "idx": int(match.group(1)),
+        "split": int(match.group(2)) if match.group(2) else None,
+    }
 
 
 def load_coords(path: Path, roi: str):
-    coords = TileConfiguration.from_file(
-        Path(path.parent / f"stitch--{roi}" / "TileConfiguration.registered.txt")
-    ).df
+    coords = Workspace(path).tileconfig(roi).df
     if len(coords) != len(coords.unique(subset=["x", "y"], maintain_order=True)):
         logger.warning("Duplicates found in TileConfiguration.registered.txt")
         coords = coords.unique(subset=["x", "y"], maintain_order=True)
@@ -56,6 +72,15 @@ def load_splits(
     cut: int = 1024,
     simple: bool = False,
 ):
+    """
+    Load one decoded split, add tile offset, and return a DataFrame containing
+    both tile-local (``x_local``, ``y_local``) and global (``x``, ``y``)
+    coordinates.
+
+    The global coordinates incorporate the per-tile stage offsets from the
+    tile configuration and, combined across all tiles, form a single mosaic
+    coordinate system for the ROI.
+    """
     idx, split = _parse_filename(path.name).values()
     c = coords.filter(pl.col("index") == idx).row(0, named=True)
 
@@ -113,6 +138,12 @@ def process(
     filter_: bool = True,
     simple: bool = False,
 ) -> pl.DataFrame | None:
+    """Filter a decoded tile's spots to its exclusive area and write parquet.
+
+    The input DataFrame carries both tile-local and global coordinates (see
+    ``load_splits``). The written parquet preserves the global ``x``/``y`` for
+    downstream stitching and visualization.
+    """
     try:
         df = load_splits(path_pickle, curr, coords, size=size, filter_=filter_, simple=simple)
     except Exception as e:
@@ -126,9 +157,15 @@ def process(
 
 
 @click.command()
-@click.argument("path_wd", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument(
+    "path_wd",
+    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
+)
 @click.argument("_roi", type=str, default="*")
-@click.option("--codebook", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option(
+    "--codebook",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
 @click.option("--no-filter", is_flag=True)
 @click.option("--overwrite", is_flag=True)
 @click.option("--simple", is_flag=True)
@@ -144,6 +181,14 @@ def stitch(
     no_split: bool = False,
     threads: int = 8,
 ):
+    """
+    Consolidate decoded per-tile spot files into ROI-level parquet outputs.
+
+    Output files at ``analysis/deconv/registered--{roi}+{codebook}/decoded-{codebook}/``
+    contain global mosaic coordinates in columns ``x`` and ``y``. There are no
+    ``x_``/``y_`` columns here; those names are reserved by ``cli_spotlook`` for
+    non-spatial, feature-space plots.
+    """
     if path_wd.name.startswith("registered--"):
         raise ValueError("Path must be the main working directory, not registered.")
 
@@ -162,10 +207,10 @@ def stitch(
         path = path_wd / f"registered--{roi}"
         path_cb = path / ("decoded-" + codebook.stem)
         try:
-            coords = load_coords(path, roi.split("+")[0])
+            coords = load_coords(path_wd, roi.split("+")[0])
         except FileNotFoundError:
             logger.error(
-                f"Could not find {path / f'stitch--{roi}' / 'TileConfiguration.registered.txt'}. Skipping {roi}."
+                f"Could not find {path_wd / f'stitch--{roi}' / 'TileConfiguration.registered.txt'}. Skipping {roi}."
             )
             continue
 

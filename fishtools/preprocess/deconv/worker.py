@@ -20,7 +20,7 @@ from loguru import logger
 from fishtools.preprocess.deconv.backend import OutputArtifacts, ProcessorFactory, TileProcessor
 from fishtools.preprocess.deconv.logging_utils import configure_logging
 
-DEFAULT_QUEUE_DEPTH = 5
+DEFAULT_QUEUE_DEPTH = 2
 
 try:
     MP_CONTEXT = mp.get_context("spawn")
@@ -140,7 +140,9 @@ def _worker_loop(
                         break
                     continue
                 result_queue.put(
-                    WorkerMessage(worker_id=worker_id, path=item, status="ok", duration=duration, device=device_id)
+                    WorkerMessage(
+                        worker_id=worker_id, path=item, status="ok", duration=duration, device=device_id
+                    )
                 )
         finally:
             processor.teardown()
@@ -150,8 +152,8 @@ def _worker_loop(
     q_in: "pyqueue.Queue[tuple[Path, np.ndarray, np.ndarray, dict[str, Any], tuple[int, int]] | object]" = (
         pyqueue.Queue(maxsize=2)
     )
-    q_out: "pyqueue.Queue[tuple[Path, np.ndarray, dict[str, Any], OutputArtifacts, dict[str, float]] | object]" = (
-        pyqueue.Queue(maxsize=2)
+    q_out: "pyqueue.Queue[tuple[Path, np.ndarray, dict[str, Any], OutputArtifacts, dict[str, float]] | object]" = pyqueue.Queue(
+        maxsize=2
     )
     stop_evt = threading.Event()
 
@@ -375,14 +377,28 @@ def run_multi_gpu(
 
             task_queue = task_queues[wid]
 
+            # If a worker has been asked to stop (e.g., after an error or when
+            # no files remain), send the sentinel but DO NOT remove it from the
+            # active set yet. We wait for a formal "stopped" message or the
+            # process to exit to ensure all in-flight tasks drain cleanly.
             if wid in pending_stop:
-                task_queue.put(None)
-                active_workers.discard(wid)
+                try:
+                    task_queue.put_nowait(None)
+                except pyqueue.Full:
+                    task_queue.put(None)
                 continue
 
+            # No more files to dispatch: transition this worker into a
+            # draining state and send a single stop signal. We keep the worker
+            # in the active set until it reports "stopped" (or the process
+            # exits), which prevents premature shutdown while its pipeline
+            # finishes any already-queued tiles.
             if not pending_files:
-                task_queue.put(None)
-                active_workers.discard(wid)
+                pending_stop.add(wid)
+                try:
+                    task_queue.put_nowait(None)
+                except pyqueue.Full:
+                    task_queue.put(None)
                 continue
 
             next_path = pending_files.popleft()

@@ -1,9 +1,29 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
 from tifffile import TiffFile
+
+
+def _safe_dict_from_mapping(mapping: dict) -> dict:
+    """Return a plain dict from a mapping, resilient to concurrent mutation.
+
+    Some TIFF readers expose dict-like metadata structures that may be
+    populated lazily and mutate during iteration when accessed from
+    multiple threads. This helper attempts a safe copy.
+    """
+    try:
+        return dict(mapping)
+    except RuntimeError as e:
+        if "dictionary changed size during iteration" in str(e):
+            try:
+                keys = list(mapping.keys())
+                return {k: mapping.get(k) for k in keys}
+            except Exception:
+                return {}
+        raise
 
 
 def read_metadata_from_tif(tif: TiffFile) -> dict[str, Any]:
@@ -14,10 +34,13 @@ def read_metadata_from_tif(tif: TiffFile) -> dict[str, Any]:
     try:
         shaped = getattr(tif, "shaped_metadata", None)
         if shaped:
-            return dict(shaped[0])
-    except (IndexError, KeyError, TypeError):
+            return _safe_dict_from_mapping(shaped[0])
+    except (IndexError, KeyError, TypeError, RuntimeError):
         ...
-    return dict(tif.imagej_metadata or {})
+    try:
+        return _safe_dict_from_mapping(tif.imagej_metadata or {})
+    except Exception:
+        return {}
 
 
 def normalize_channel_names(count: int, metadata: dict[str, Any]) -> list[str]:
@@ -62,3 +85,26 @@ def compose_metadata(
         metadata.update(extra)
     return metadata
 
+
+def get_metadata(file: "Path") -> dict[str, Any]:
+    """Return shaped or ImageJ metadata from a TIFF path.
+
+    Raises AttributeError when no metadata is found.
+    """
+    with TiffFile(file) as tif:
+        try:
+            meta = tif.shaped_metadata[0]  # type: ignore[index]
+        except KeyError as exc:  # pragma: no cover - exercised by callers
+            raise AttributeError("No metadata found.") from exc
+    return meta
+
+
+def get_channels(file: "Path") -> list[str]:
+    meta = get_metadata(file)
+    waveform = meta.get("waveform")
+    if isinstance(waveform, str):
+        import json
+
+        waveform = json.loads(waveform)
+    powers = (waveform or {}).get("params", {}).get("powers", {})
+    return [name[-3:] for name in powers]

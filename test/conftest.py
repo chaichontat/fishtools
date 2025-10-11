@@ -1,5 +1,6 @@
 import random
 import signal
+import time
 import sys
 import types
 from contextlib import suppress
@@ -9,6 +10,7 @@ import numpy as np
 import pytest
 import tifffile
 from scipy import ndimage as _scipy_ndimage
+from scipy import sparse as _scipy_sparse
 
 
 _DEFAULT_TIMEOUT_SECONDS = 30
@@ -136,7 +138,15 @@ if "cupy" not in sys.modules:
     cupyx_ndimage.zoom = _scipy_ndimage.zoom
     sys.modules["cupyx.scipy.ndimage"] = cupyx_ndimage
 
+    cupyx_scipy_sparse = types.ModuleType("cupyx.scipy.sparse")
+    cupyx_scipy_sparse.csc_matrix = _scipy_sparse.csc_matrix
+    cupyx_scipy_sparse.csr_matrix = _scipy_sparse.csr_matrix
+    cupyx_scipy_sparse.coo_matrix = _scipy_sparse.coo_matrix
+    cupyx_scipy_sparse.spmatrix = _scipy_sparse.spmatrix
+    sys.modules["cupyx.scipy.sparse"] = cupyx_scipy_sparse
+
     cupyx_scipy.ndimage = cupyx_ndimage
+    cupyx_scipy.sparse = cupyx_scipy_sparse
     cupyx.scipy = cupyx_scipy
 
     class _CudaRuntime(types.SimpleNamespace):
@@ -159,9 +169,43 @@ if "cupy" not in sys.modules:
         def use(self) -> None:
             return None
 
+    class _CudaStream:
+        def synchronize(self) -> None:
+            return None
+
+    class _CudaEvent:
+        def __init__(self) -> None:
+            self._timestamp: float | None = None
+
+        def record(self, stream: _CudaStream | None = None) -> None:
+            del stream
+            self._timestamp = time.perf_counter()
+
+        def synchronize(self) -> None:
+            return None
+
+        @property
+        def timestamp(self) -> float:
+            if self._timestamp is None:
+                return time.perf_counter()
+            return self._timestamp
+
+    _current_stream = _CudaStream()
+
+    def _get_current_stream() -> _CudaStream:
+        return _current_stream
+
+    def _get_elapsed_time(start: _CudaEvent, end: _CudaEvent) -> float:
+        return max(0.0, (end.timestamp - start.timestamp) * 1_000.0)
+
     _cupy.cuda = types.SimpleNamespace(
         runtime=_CudaRuntime(),
         Device=lambda idx: _CudaDevice(idx),
+        Stream=_CudaStream,
+        Event=_CudaEvent,
+        get_current_stream=_get_current_stream,
+        get_elapsed_time=_get_elapsed_time,
+        nvtx=types.SimpleNamespace(RangePush=lambda *_args, **_kwargs: None, RangePop=lambda: None),
     )
 
 

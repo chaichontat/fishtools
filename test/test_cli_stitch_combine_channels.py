@@ -106,13 +106,6 @@ def test_combine_channel_variants(tmp_path: Path, monkeypatch: Any, mock_zarr_op
     if meta_names is not None:
         _install_registered_with_names(base, roi, cb, meta_names, monkeypatch)
 
-    # Speed up: monkeypatch percentile sampling to avoid heavy filtering work
-    def _fast_sample(arr_like, channels, block=(16, 16), n=30, low=5, high=99.5, seed=0):  # type: ignore[no-untyped-def]
-        ccount = len(channels)
-        return np.tile([[low, high]], (ccount, 1)), np.empty((0, 2, ccount))
-
-    monkeypatch.setattr("fishtools.preprocess.cli_stitch.sample_percentiles", _fast_sample)
-
     # Run combine (direct callback due to @batch_roi)
     combine.callback(path=base / "analysis" / "deconv", roi=roi, codebook=cb, chunk_size=8)
 
@@ -127,7 +120,5 @@ def test_combine_channel_variants(tmp_path: Path, monkeypatch: Any, mock_zarr_op
     else:
         assert list(z.attrs.get("key")) == expect_names
 
-    # Validate normalization.json present and shape matches C
-    norm = json.loads((stitch_path / "normalization.json").read_text())
-    arr = np.asarray(norm["lowhigh_unsharp"])  # type: ignore[index]
-    assert arr.shape == (c, 2)
+    # Normalization is no longer computed during combine; file should not exist
+    assert not (stitch_path / "normalization.json").exists()
