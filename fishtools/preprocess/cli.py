@@ -1,8 +1,9 @@
 import rich_click as click
 
 from .cli_basic import basic
-from .cli_deconv import deconv
-from .cli_deconv_old import deconvold
+from .cli_correct_illum import correct_illum
+from .cli_deconv import deconvnew
+from .cli_deconv_old import deconv
 from .cli_inspect import inspect_cli
 from .cli_register import register
 from .cli_stitch import stitch
@@ -66,14 +67,15 @@ def main():
 
 
 main.add_command(basic)
+main.add_command(deconvnew)
 main.add_command(deconv)
-main.add_command(deconvold)
 main.add_command(register)
 main.add_command(registerv1)
 main.add_command(stitch)
 main.add_command(spots)
 main.add_command(inspect_cli)
 main.add_command(verify)
+main.add_command(correct_illum)
 
 if __name__ == "__main__":
     main()

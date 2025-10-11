@@ -6,6 +6,8 @@ import pandas as pd
 import polars as pl
 import pyparsing as pp
 from numpy.typing import NDArray
+from shapely.geometry import Point, box
+from shapely.ops import unary_union
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -144,6 +146,69 @@ class TileConfiguration:
         pos_idx = tiles_at_least_n_steps_from_edges(xy, n)
         # Map dataframe row positions to tile IDs in the "index" column
         return self.df.select("index").to_numpy().reshape(-1)[pos_idx]
+
+
+def interior_indices_geometry(xy: NDArray[np.floating | np.integer], n: int) -> NDArray[np.int_]:
+    """Geometry-backed interior selector using Shapely.
+
+    - Builds a polygonal mosaic footprint by unioning axis-aligned boxes
+      centered at each tile with half-sizes based on median grid steps.
+    - Returns indices of points whose Euclidean distance to the footprint
+      boundary is at least ``(n - 0.5) * step`` where ``step`` is the
+      minimum median step across X and Y. This aligns with the ordinal
+      interpretation: tiles one layer in have distance ~= 0.5·step.
+
+    Args:
+        xy: (N,2) array of tile centers.
+        n: non-negative integer layer count.
+
+    Returns:
+        np.ndarray of positions into ``xy`` meeting the criterion.
+    """
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        raise ValueError("xy must be a (N, 2) array of [x, y] coordinates")
+    if n < 0:
+        raise ValueError("n must be non-negative")
+    if n == 0:
+        return np.arange(len(xy), dtype=np.int64)
+
+    x = np.asarray(xy[:, 0], dtype=float)
+    y = np.asarray(xy[:, 1], dtype=float)
+    ux = np.unique(x)
+    uy = np.unique(y)
+
+    # Need at least (2n+1) unique layers per axis to have an n-step interior
+    if len(ux) < 2 * n + 1 or len(uy) < 2 * n + 1:
+        return np.array([], dtype=np.int64)
+
+    dxs = np.diff(np.sort(ux))
+    dys = np.diff(np.sort(uy))
+    dxs = dxs[dxs > 0]
+    dys = dys[dys > 0]
+    if dxs.size == 0 or dys.size == 0:
+        return np.array([], dtype=np.int64)
+    stepx = float(np.median(dxs))
+    stepy = float(np.median(dys))
+    step = float(min(stepx, stepy))
+    if not np.isfinite(step) or step <= 0:
+        return np.array([], dtype=np.int64)
+
+    hx, hy = stepx / 2.0, stepy / 2.0
+    # Build (multi)polygon footprint. To ensure adjacent tiles fuse into a single
+    # polygon (removing internal shared edges), we enlarge slightly then shrink.
+    eps = 1e-6 * max(stepx, stepy)
+    enlarged = [box(xi - hx, yi - hy, xi + hx, yi + hy).buffer(eps) for xi, yi in zip(x, y)]
+    footprint = unary_union(enlarged)
+
+    # Morphological erosion by (n - 0.5) steps on the fused footprint
+    thresh = (n - 0.5) * step
+    eroded = footprint.buffer(-(eps + thresh))
+
+    keep: list[int] = []
+    for i, (xi, yi) in enumerate(zip(x, y)):
+        if eroded.contains(Point(float(xi), float(yi))):
+            keep.append(i)
+    return np.asarray(keep, dtype=np.int64)
 
 
 def copy_registered(reference_path: Path, actual_path: Path) -> None:

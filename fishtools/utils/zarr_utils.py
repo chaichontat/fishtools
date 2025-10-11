@@ -17,4 +17,3 @@ def numpy_array_to_zarr(write_path: Path | str, array: np.ndarray, chunks: tuple
     )
     zarr_array[...] = array
     return zarr_array
-

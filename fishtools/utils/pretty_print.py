@@ -1,8 +1,11 @@
 import json
+import os
 import signal
+import subprocess
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import FrameType
 from typing import Any, Callable, Concatenate, Generator, ParamSpec, Protocol, TypeVar
 
@@ -19,7 +22,6 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 from rich.syntax import Syntax
-
 
 # A single console shared by progress bars and any ad-hoc prints while a Live display is active.
 # Using the same Console prevents duplicate/redrawn bars when printing logs.
@@ -81,8 +83,87 @@ T = TypeVar("T")
 class TaskCancelledException(Exception): ...
 
 
+# Global cancellation event exposed so long-running tasks can poll cooperatively
+_GLOBAL_CANCEL = threading.Event()
+
+
+def get_cancel_event() -> threading.Event:
+    """Return a process-wide cancellation event set on SIGINT.
+
+    Long-running worker functions should periodically check this event and
+    exit early when it becomes set to ensure prompt shutdown.
+    """
+    return _GLOBAL_CANCEL
+
+
+# Track child subprocesses so we can terminate their process groups on SIGINT
+_SUBPROCESSES_LOCK = threading.RLock()
+_SUBPROCESSES: set["subprocess.Popen[Any]"] = set()
+
+
+def register_subprocess(p: "subprocess.Popen[Any]") -> None:
+    with _SUBPROCESSES_LOCK:
+        _SUBPROCESSES.add(p)
+
+
+def unregister_subprocess(p: "subprocess.Popen[Any]") -> None:
+    with _SUBPROCESSES_LOCK:
+        _SUBPROCESSES.discard(p)
+
+
+def kill_registered_subprocesses(sig: int = signal.SIGTERM, grace_seconds: float = 2.0) -> None:
+    """Send signal to all tracked subprocesses (entire groups when possible).
+
+    Attempts SIGTERM first and escalates to SIGKILL after a short grace period
+    for any processes still alive.
+    """
+    procs: list["subprocess.Popen[Any]"]
+    with _SUBPROCESSES_LOCK:
+        procs = list(_SUBPROCESSES)
+
+    # First pass: try graceful termination
+    for p in procs:
+        try:
+            if os.name == "posix":
+                os.killpg(os.getpgid(p.pid), sig)
+            else:
+                # Prefer CTRL_BREAK_EVENT to terminate the whole process group
+                try:
+                    p.send_signal(signal.CTRL_BREAK_EVENT)
+                except Exception:
+                    p.terminate()
+        except Exception:
+            ...
+
+    # Give processes a brief window to exit
+    deadline = time.time() + grace_seconds
+    for p in procs:
+        while time.time() < deadline:
+            if p.poll() is not None:
+                break
+            time.sleep(0.1)
+
+    # Second pass: force kill anything still running
+    for p in procs:
+        if p.poll() is None:
+            try:
+                if os.name == "posix":
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                else:
+                    p.kill()
+            except Exception:
+                ...
+
+
 @contextmanager
-def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = False):
+def progress_bar_threadpool(
+    n: int,
+    *,
+    threads: int,
+    stop_on_exception: bool = False,
+    executor: ThreadPoolExecutor | None = None,
+    debug: bool = False,
+):
     """Creates a thread pool with a progress bar that handles graceful shutdown.
 
     Args:
@@ -91,6 +172,9 @@ def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = F
         stop_on_exception: If True (default), stops all processing immediately
             when any task raises an exception. If False, continues processing
             other tasks and logs exceptions.
+        executor: Optional pre-configured executor. When provided, the caller
+            remains responsible for its lifecycle. This allows sharing a thread
+            pool across multiple progress contexts.
 
     Returns:
         submit: Function to submit tasks to the thread pool. Has signature:
@@ -120,14 +204,30 @@ def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = F
     should_terminate = threading.Event()
     exceptions_encountered: list[Exception] = []
 
-    with progress_bar(n) as callback, ThreadPoolExecutor(threads) as exc:
+    manage_executor = executor is None
+    executor_cm = ThreadPoolExecutor(threads) if manage_executor else nullcontext(executor)
+
+    with progress_bar(n) as callback, executor_cm as exc:
 
         def signal_handler(signum: int, frame: FrameType | None) -> None:
-            logger.info("\nShutting down...")
+            # Avoid using the logger inside signal handlers (Loguru is not re-entrant)
+            try:
+                os.write(2, b"\nShutting down...\n")
+            except Exception:
+                ...
             should_terminate.set()
+            _GLOBAL_CANCEL.set()
+            try:
+                kill_registered_subprocesses()
+            except Exception:
+                ...
             for fut in futs:
                 fut.cancel()
-            exc.shutdown(wait=False, cancel_futures=True)
+            # Defer full executor shutdown to the normal control flow
+            try:
+                exc.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                ...
 
         prior_handler = signal.signal(signal.SIGINT, signal_handler)
 
@@ -184,6 +284,8 @@ def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = F
                     task_args = getattr(f, "_args", "N/A")
                     task_kwargs = getattr(f, "_kwargs", "N/A")
                     logger.error(f"Task raised an exception: {e} (args={task_args}, kwargs={task_kwargs})")
+                    if debug:
+                        logger.exception(e)
                     exceptions_encountered.append(e)
 
                     if stop_on_exception:
@@ -205,6 +307,9 @@ def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = F
 
             # After loop finishes, if stop_on_exception was True and we had errors,
             # raise the first one encountered to signal failure.
+            if should_terminate.is_set():
+                # Propagate cancellation to callers so higher levels can stop
+                raise TaskCancelledException("Cancelled by SIGINT")
             if stop_on_exception and exceptions_encountered:
                 raise exceptions_encountered[0]
             elif not stop_on_exception and exceptions_encountered:
@@ -213,14 +318,16 @@ def progress_bar_threadpool(n: int, *, threads: int, stop_on_exception: bool = F
         finally:
             # Ensure original signal handler is restored
             signal.signal(signal.SIGINT, prior_handler)
+            _GLOBAL_CANCEL.clear()
             # Ensure executor is shut down cleanly, cancelling any remaining futures
             # if termination was signaled. The context manager (`with ThreadPoolExecutor...`)
             # also calls shutdown, but calling it explicitly ensures cancellation
             # logic is triggered if `should_terminate` was set.
-            if should_terminate.is_set():
-                exc.shutdown(wait=True, cancel_futures=True)  # Wait for cancellations
-            else:
-                exc.shutdown(wait=True)  # Wait for normal completion
+            if manage_executor:
+                if should_terminate.is_set():
+                    exc.shutdown(wait=True, cancel_futures=True)
+                else:
+                    exc.shutdown(wait=True)
 
 
 console = Console()

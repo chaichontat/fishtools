@@ -1,6 +1,8 @@
+import functools
 import json
 import pickle
 import queue
+import re
 import sys
 import threading
 import time
@@ -19,33 +21,13 @@ from basicpy import BaSiC
 from loguru import logger
 from rich.console import Console
 from rich.logging import RichHandler
+from tifffile import imread
 
-from fishtools.io.workspace import Workspace, get_channels, get_metadata
-from fishtools.preprocess.deconv.core import (
-    deconvolve_lucyrichardson_guo,
-    load_projectors_cached,
-)
-from fishtools.preprocess.deconv.core import (
-    rescale as core_rescale,
-)
-from fishtools.preprocess.deconv.range_utils import (
-    DEFAULT_PERCENTILE_OVERRIDES as RANGE_DEFAULT_PERCENTILE_OVERRIDES,
-)
-from fishtools.preprocess.deconv.range_utils import (
-    compute_range_for_round,
-    get_percentiles_for_round,
-)
+from fishtools.preprocess.deconv.core import deconvolve_lucyrichardson_guo, projectors
+from fishtools.utils.io import Workspace, get_channels, get_metadata
 from fishtools.utils.pretty_print import progress_bar
 
-
-@click.group()
-def deconvold() -> None:
-    """3D deconvolution workflows.
-
-    Includes global quantization utilities accessible as:
-    - preprocess deconv precompute
-    - preprocess deconv quantize
-    """
+DATA = Path(__file__).parent.parent.parent / "data"
 
 
 def scale_deconv(
@@ -151,40 +133,116 @@ logger.configure(handlers=[{"sink": RichHandler(), "format": "{message}", "level
 console = Console()
 
 
-def high_pass_filter(
-    img: npt.NDArray[Any],
-    σ: tuple[float, ...] = (3.0, 3.0, 3.0),
-    dtype: npt.DTypeLike = np.float32,
-) -> npt.NDArray:
+@click.group()
+def deconv(): ...
+
+
+PROTEIN_PERC_MIN = 50
+PROTEIN_PERC_SCALE = 50
+
+
+def _get_percentiles_for_round(
+    round_name: str,
+    default_perc_min: float,
+    default_perc_scale: float,
+    max_rna_bit: int,
+    override: dict[str, tuple[float, float]] | None = None,
+) -> tuple[list[float], list[float]]:
+    """Determines the percentile values for min and scale based on the round name components."""
+    percentile_mins: list[float] = []
+    percentile_scales: list[float] = []
+    override = override or {}
+
+    bits = round_name.split("_")
+    for bit in bits:
+        if bit in override:
+            min_val, scale_val = override[bit]
+            logger.info(f"Using override for bit '{bit}' to {override[bit]} in round '{round_name}'.")
+            percentile_mins.append(min_val)
+            percentile_scales.append(scale_val)
+            continue
+
+        is_rna_bit = (bit.isdigit() and int(bit) <= max_rna_bit) or re.match(r"^b\d{3}$", bit)
+        if not is_rna_bit:
+            # Protein staining often has bright flare spots.
+            logger.info(
+                f"Bit '{bit}' in round '{round_name}' is non-numeric or exceeds max_rna_bit ({max_rna_bit}). "
+                f"Using protein percentiles: min={PROTEIN_PERC_MIN}, scale={PROTEIN_PERC_SCALE}."
+            )
+        percentile_mins.append(PROTEIN_PERC_MIN if not is_rna_bit else default_perc_min)
+        percentile_scales.append(PROTEIN_PERC_SCALE if not is_rna_bit else default_perc_scale)
+    return percentile_mins, percentile_scales
+
+
+@deconv.command()
+@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
+@click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
+@click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
+@click.option("--overwrite", is_flag=True)
+@click.option("--override", type=str, multiple=True)
+@click.option("--max-rna-bit", type=int, default=36)
+def compute_range(
+    path: Path,
+    perc_min: float = 0.1,
+    perc_scale: float = 0.1,
+    overwrite: bool = False,
+    max_rna_bit: int = 36,
+    override: list[str] | None = None,
+):
     """
+    Find the scaling factors of all images in the children sub-folder of `path`.
+    Run this on the entire workspace. See `_compute_range` for more details.
+
     Args:
-        image: the input image to be filtered
-        windowSize: the size of the Gaussian kernel to use.
-        sigma: the sigma of the Gaussian.
-
-    Returns:
-        the high pass filtered image. The returned image is the same type
-        as the input image.
+        path: The root path containing round subdirectories (e.g., 'path/analysis/deconv').
+        perc_min: Default percentile for calculating the minimum intensity value for RNA bits.
+        perc_scale: Default percentile for calculating the scaling factor for RNA bits.
+        overwrite: If True, recompute and overwrite existing scaling files.
+        max_rna_bit: The maximum integer value considered an RNA bit. Others are treated differently (e.g., protein).
     """
-    from cupyx.scipy.ndimage import gaussian_filter
+    if "deconv" not in path.resolve().as_posix():
+        raise ValueError(f"This command must be run within a 'deconv' directory. Path provided: {path}")
 
-    img = cp.asarray(img)
-    lowpass = cp.zeros_like(img)
-    for c in range(img.shape[1]):
-        lowpass[:, c] = gaussian_filter(img[:, c], sigma=σ, cval=0, truncate=4.0)
+    ws = Workspace(path)
+    override = override or []
+    rounds = ws.rounds
+    try:
+        override_dict = {(parts := v.split(","))[0]: (float(parts[1]), float(parts[2])) for v in override}
+    except ValueError:
+        raise ValueError("Override must be in the format 'bit,min,scale'.")
+    del override
 
-    # img = img.astype(dtype)
-    # window_size = int(2 * np.ceil(2 * σ) + 1)
-    # lowpass = cv2.GaussianBlur(img, (window_size, window_size), σ, borderType=cv2.BORDER_REPLICATE)
-    img -= lowpass
-    del lowpass
-    img = cp.clip(img, 0, None)
+    if not len(set(override_dict) & set(chain.from_iterable(map(lambda x: x.split("_"), rounds)))) == len(
+        override_dict
+    ):
+        raise ValueError("Overridden bits must exist.")
 
-    return img
+    logger.info(f"Found rounds: {rounds}")
+    scaling_dir = path / "deconv_scaling"
+    scaling_dir.mkdir(exist_ok=True)
 
+    for round_name in rounds:
+        scaling_file = scaling_dir / f"{round_name}.txt"
+        if not overwrite and scaling_file.exists():
+            logger.info(f"Scaling file for {round_name} already exists. Skipping.")
+            continue
 
-projectors = load_projectors_cached
-rescale = core_rescale
+        try:
+            logger.info(f"Processing {round_name}")
+            percentile_mins, percentile_scales = _get_percentiles_for_round(
+                round_name, perc_min, perc_scale, max_rna_bit, override=override_dict
+            )
+
+            _compute_range(path, round_name, perc_min=percentile_mins, perc_scale=percentile_scales)
+
+        except FileNotFoundError:
+            logger.warning(f"No .tif files found for round {round_name} in {path}. Skipping.")
+        except AttributeError as e:
+            logger.error(f"Metadata error processing {round_name}: {e}. Skipping.")
+        except ValueError as e:
+            logger.error(f"Value error processing {round_name}: {e}. Skipping.")
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred while processing {round_name}: {e}. Skipping.")
 
 
 def _run(
@@ -240,6 +298,9 @@ def _run(
                 )
                 profiles.append((darkfield, flatfield))
 
+            # print(nofid[5, 0, 1024:1026, 1024:1026])
+            # print(profiles[0][0][0, 0, 1024:1026, 1024:1026])
+            # print(profiles[0][1][0, 0, 1024:1026, 1024:1026])
             nofid -= profiles[0][0]
             nofid /= profiles[0][1]
             cp.clip(nofid, 0, None, out=nofid)
@@ -330,7 +391,12 @@ def _run(
 
                 # Deconvolution
                 t_deconv_start = time.perf_counter()
+                print(img_gpu[5, 0, 1024:1026, 1024:1026])
+                print(step)
+                print(projectors(step)[0].flatten()[1000:1005])
                 res = deconvolve_lucyrichardson_guo(img_gpu, projectors(step), iters=1)
+                print(res[5, 0, 1024:1026, 1024:1026])
+
                 if debug:
                     cp.cuda.runtime.deviceSynchronize()
                 t_deconv_end = time.perf_counter()
@@ -389,52 +455,7 @@ def _run(
     thread_write.join()
 
 
-def _safe_delete_origin_dirs(files: list[Path], out: Path) -> None:
-    """Delete input round folders when all inputs have corresponding outputs.
-
-    This function groups the processed input files by their parent directory
-    (e.g., `<workspace>/<round>--<roi>`). For each such folder, it verifies
-    that the corresponding output directory exists at `out/<round>--<roi>` and
-    that every input basename has a matching output file. Only then is the
-    input folder removed.
-
-    Args:
-        files: List of input `.tif` files that were processed.
-        out:   Base output directory (typically `path/analysis/deconv`).
-    """
-    import shutil
-
-    if not files:
-        return
-
-    by_parent: dict[Path, list[Path]] = {}
-    for f in files:
-        by_parent.setdefault(f.parent, []).append(f)
-
-    for src_dir, src_files in by_parent.items():
-        dst_dir = out / src_dir.name
-        if not dst_dir.exists():
-            logger.warning(f"Skip delete: destination {dst_dir} does not exist for {src_dir}.")
-            continue
-
-        # Ensure every input has a corresponding output file
-        missing = [s for s in src_files if not (dst_dir / s.name).exists()]
-        if missing:
-            logger.warning(
-                f"Skip delete: {src_dir} has {len(missing)} inputs without outputs (e.g., {missing[0].name})."
-            )
-            continue
-
-        # Extra safety: ensure we are not about to delete within 'analysis'
-        if "analysis" in src_dir.parts:
-            logger.error(f"Refusing to delete source in analysis tree: {src_dir}")
-            continue
-
-        logger.info(f"Deleting origin folder: {src_dir}")
-    shutil.rmtree(src_dir)
-
-
-@deconvold.command()
+@deconv.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.argument("name", type=str)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
@@ -540,27 +561,35 @@ def run(
                 )
         basic_list.append(loaded["basic"] if isinstance(loaded, dict) else loaded)
 
-        basics = {name: basic_list}
-        _run(
-            files,
-            path / "analysis" / "deconv",
-            basics,
-            overwrite=overwrite,
-            n_fids=n_fids,
-            debug=debug,
-        )
+    meta = get_metadata(files[0])
+    channels = get_channels(files[0])
+    try:
+        waveform = json.loads(meta["waveform"])
+        step = int(waveform["params"]["step"] * 10)
+        logger.info(f"Using PSF step={step} from waveform metadata.")
+    except (KeyError, json.JSONDecodeError):
+        step = 6
+        logger.warning("Could not determine step from metadata, using default step=6.")
+
+    basics = {name: basic_list}
+    _run(
+        files,
+        path / "analysis" / "deconv",
+        basics,
+        overwrite=overwrite,
+        n_fids=n_fids,
+        debug=debug,
+        step=step,
+    )
 
 
-@deconvold.command()
+@deconv.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.option("--roi", type=str, default=None)
 @click.option("--ref", type=click.Path(path_type=Path), default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--n-fids", type=int, default=2)
 @click.option("--basic-name", type=str)
-@click.option(
-    "--delete-origin", is_flag=True, help="Delete source round folders after successful deconvolution."
-)
 @click.option("--debug", is_flag=True)
 def batch(
     path: Path,
@@ -570,7 +599,6 @@ def batch(
     overwrite: bool,
     n_fids: int,
     basic_name: str | None = "all",
-    delete_origin: bool = False,
     debug: bool = False,
 ):
     if debug:
@@ -692,14 +720,6 @@ def batch(
             debug=debug,
         )
 
-        # Optionally delete origin folders once outputs exist for all inputs
-        if delete_origin:
-            try:
-                _safe_delete_origin_dirs(files, out)
-            except Exception as e:
-                logger.error(f"Failed to delete origin folders for round {r}: {e}")
-                # Do not raise; continue with other rounds
-
 
 if __name__ == "__main__":
-    deconvold()
+    deconv()

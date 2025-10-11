@@ -114,16 +114,16 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
 
     calls: list[list[str]] = []
 
-    def fake_run(argv: list[str], check: bool):  # type: ignore[no-untyped-def]
+    def fake_run(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
         assert check is True
         calls.append(argv)
 
-        class _R:  # minimal CompletedProcess-like shim
+        class _R:  # Minimal CompletedProcess-like shim
             returncode = 0
 
         return _R()
 
-    monkeypatch.setattr("fishtools.preprocess.cli_register.subprocess.run", fake_run)
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
     runner = CliRunner()
     result = runner.invoke(

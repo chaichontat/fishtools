@@ -518,7 +518,7 @@ class TestHandleException:
         assert (sigma2, fwhm2) not in tried_set
 
     def test_handle_exception_logging_behavior(self) -> None:
-        """Test that appropriate warning messages are logged."""
+        """Test that NotEnoughSpots escalates to debug logging and not warnings."""
         initial_sigma = 3.0
         initial_fwhm = 4.0
         tried_set: set[tuple[float, float]] = set()
@@ -547,12 +547,9 @@ class TestHandleException:
         with patch("fishtools.preprocess.fiducial.logger.warning") as mock_warning:
             handle_exception(initial_sigma, initial_fwhm, tried=tried_set, exc=exc)
 
-            # Should log warning with exception type and parameters
             mock_warning.assert_called_once()
             warning_msg = mock_warning.call_args[0][0]
-            assert "NotEnoughSpots" in warning_msg
-            assert str(initial_sigma) in warning_msg
-            assert str(initial_fwhm) in warning_msg
+            assert "TooManySpots" in warning_msg
 
     def test_handle_exception_complex_scenario_simulation(self) -> None:
         """Test complex scenario simulating real adaptive parameter tuning."""

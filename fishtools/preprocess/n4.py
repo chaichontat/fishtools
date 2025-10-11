@@ -19,27 +19,35 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from time import perf_counter
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 import SimpleITK as sitk
-import typer
 import zarr
 from loguru import logger
 from PIL import Image
+from skimage import filters
 from tifffile import imwrite
-from time import perf_counter
+
+try:  # pragma: no cover - exercised via monkeypatch in tests
+    import cupy as cp
+except Exception:  # pragma: no cover - runtime fallback when CuPy unavailable
+    cp = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:  # pragma: no cover - typing aid
+    from cupy import ndarray as cupy_ndarray  # type: ignore[import-not-found]
+else:
+    cupy_ndarray = Any
 
 from fishtools import IMWRITE_KWARGS
 from fishtools.io.workspace import Workspace
-from fishtools.utils.utils import setup_logging
+from fishtools.utils.logging import setup_logging
+from fishtools.utils.pretty_print import progress_bar
 
 setup_logging()
-
-app = typer.Typer(
-    help="Run N4 bias-field correction against stitched mosaics and export the correction field."
-)
 
 DEFAULT_ITERATIONS: tuple[int, ...] = (50, 50, 30, 20)
 
@@ -111,11 +119,143 @@ def _ensure_float32(arr: np.ndarray) -> np.ndarray:
     return np.asarray(arr, dtype=np.float32)
 
 
+def _resolve_threshold_function(name: str) -> tuple[Callable[[np.ndarray], Any], str]:
+    """Return a skimage.filters threshold function and its resolved name."""
+
+    attr: Callable[[np.ndarray], Any] | None = None
+    resolved_name = name.strip()
+    if resolved_name:
+        attr = getattr(filters, resolved_name, None)
+        if attr is None and not resolved_name.startswith("threshold_"):
+            candidate = f"threshold_{resolved_name}"
+            attr = getattr(filters, candidate, None)
+            if attr is not None:
+                resolved_name = candidate
+    if attr is None or not callable(attr):
+        raise ValueError(
+            f"Unknown threshold method '{name}'. Available methods include: "
+            f"{', '.join(sorted(fn for fn in dir(filters) if fn.startswith('threshold_')))}"
+        )
+    return attr, resolved_name
+
+
+def _empty_mask_message(threshold: float | str | None, *, resolved_name: str | None = None) -> str:
+    if threshold is None:
+        return "Mask is empty after thresholding >0; check the selected channel."
+    if isinstance(threshold, (int, float)):
+        return f"Mask is empty after thresholding > {float(threshold)}; check the selected channel."
+    name = resolved_name if resolved_name is not None else str(threshold)
+    return f"Mask is empty after applying skimage.filters.{name}; check the selected channel."
+
+
+def _compute_threshold_mask(
+    image: np.ndarray,
+    threshold: float | str | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Generate a boolean foreground mask plus metadata for the chosen threshold."""
+
+    data = _ensure_float32(image)
+    data = np.where(np.isfinite(data), data, 0.0)
+
+    if threshold is None:
+        return data > 0.0, {"kind": "default_gt_zero", "value": 0.0}
+
+    if isinstance(threshold, (int, float)):
+        value = float(threshold)
+        return data > value, {"kind": "numeric", "value": value}
+
+    func, resolved_name = _resolve_threshold_function(str(threshold).strip())
+    threshold_result = func(data)
+    threshold_array = np.asarray(threshold_result, dtype=np.float32)
+
+    if threshold_array.shape not in [(), data.shape]:
+        raise ValueError(
+            "Threshold function '{name}' returned shape {returned}, expected scalar or {expected}.".format(
+                name=resolved_name,
+                returned=threshold_array.shape,
+                expected=data.shape,
+            )
+        )
+
+    if threshold_array.shape == ():
+        scalar_value = float(threshold_array)
+        meta: dict[str, Any] = {
+            "kind": "method",
+            "function": resolved_name,
+            "result": {"type": "scalar", "value": scalar_value},
+        }
+        mask = data > scalar_value
+    else:
+        finite = np.isfinite(threshold_array)
+        if not np.any(finite):
+            raise ValueError(
+                f"Threshold function '{resolved_name}' produced no finite values for the mask decision."
+            )
+        summary = {
+            "type": "array",
+            "min": float(np.nanmin(threshold_array)),
+            "max": float(np.nanmax(threshold_array)),
+        }
+        meta = {
+            "kind": "method",
+            "function": resolved_name,
+            "result": summary,
+        }
+        mask = data > threshold_array
+
+    return mask.astype(bool, copy=False), meta
+
+
+def _summarize_threshold_spec(threshold: float | str | None) -> dict[str, Any]:
+    if threshold is None:
+        return {"kind": "default_gt_zero", "value": 0.0}
+    if isinstance(threshold, (int, float)):
+        return {"kind": "numeric", "value": float(threshold)}
+    _, resolved_name = _resolve_threshold_function(str(threshold).strip())
+    return {"kind": "method", "function": resolved_name}
+
+
 QUANT_MAX_SAMPLES = 50_000
 
 
 def _float_store_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}_float32{path.suffix}")
+
+
+@lru_cache(maxsize=1)
+def _cupy_available() -> bool:
+    """Return True when CuPy is importable and at least one device is accessible."""
+
+    if cp is None:
+        return False
+    try:
+        cuda = getattr(cp, "cuda", None)
+        runtime = getattr(cuda, "runtime", None) if cuda is not None else None
+        if runtime is not None:
+            device_count = runtime.getDeviceCount()  # type: ignore[attr-defined]
+            if isinstance(device_count, int) and device_count <= 0:
+                return False
+        # Validate we can allocate on the selected backend (GPU or NumPy stub).
+        _ = cp.asarray([0.0], dtype=cp.float32)
+    except Exception:
+        return False
+    return True
+
+
+def _prepare_gpu_field(field: np.ndarray) -> cupy_ndarray | None:
+    """Transfer a correction field to GPU memory when CuPy is available."""
+
+    if not _cupy_available():
+        return None
+    # Let any transfer error surface to the caller; no silent CPU fallback here.
+    return cp.asarray(_ensure_float32(field), dtype=cp.float32)
+
+
+def _cupy_to_numpy(array: cupy_ndarray) -> np.ndarray:
+    if cp is None:
+        return np.asarray(array, dtype=np.float32)
+    # Propagate errors instead of converting via a CPU fallback path.
+    return np.asarray(cp.asnumpy(array), dtype=np.float32)
 
 
 @dataclass(slots=True)
@@ -138,6 +278,7 @@ class N4RuntimeConfig:
     # or CLI option. Existing single-channel behavior remains unchanged.
     channels: tuple[int, ...] | None = None
     debug: bool = False
+    threshold: float | str | None = None
 
 
 @dataclass(slots=True)
@@ -175,14 +316,18 @@ def _compute_quantization_params(
         arr = np.asarray(plane, dtype=np.float32)
         if arr.size == 0:
             continue
-        plane_min = float(np.min(arr))
-        plane_max = float(np.max(arr))
+        finite_mask = np.isfinite(arr)
+        if not np.any(finite_mask):
+            continue
+        finite_values = arr[finite_mask]
+        plane_min = float(np.min(finite_values))
+        plane_max = float(np.max(finite_values))
         if plane_min < observed_min:
             observed_min = plane_min
         if plane_max > observed_max:
             observed_max = plane_max
 
-        flat = arr.ravel()
+        flat = finite_values.ravel()
         if flat.size <= QUANT_MAX_SAMPLES:
             sampled = flat
         else:
@@ -212,9 +357,8 @@ def _compute_quantization_params(
     total_samples = int(samples.size)
     effective_lower = float(lower_percentile)
     effective_upper = float(upper_percentile)
-    if (
-        total_samples < QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE
-        and math.isclose(upper_percentile, QUANT_UPPER_PERCENTILE)
+    if total_samples < QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE and math.isclose(
+        upper_percentile, QUANT_UPPER_PERCENTILE
     ):
         effective_upper = QUANT_FALLBACK_UPPER_PERCENTILE
         logger.info(
@@ -377,10 +521,7 @@ def _write_fused_corrected_zyxc(
         z_sel = list(range(z_dim))
 
     logger.info(
-        "Preparing fused correction with channels=%s over Z planes=%s (debug=%s)",
-        channels,
-        z_sel,
-        debug,
+        f"Preparing fused correction with channels={channels} over Z planes={z_sel} (debug={debug})",
     )
 
     dest_path = output_path if output_path is not None else fused_path.parent / "fused_n4.zarr"
@@ -420,28 +561,46 @@ def _write_fused_corrected_zyxc(
     for field_arr in field_arrays:
         _validate_correction_field(field_arr)
     channel_quant: list[QuantizationParams] = []
+    gpu_fields: list[cupy_ndarray | None] = []
 
     for channel_idx, field_arr in zip(channels, field_arrays):
+        field_gpu = _prepare_gpu_field(field_arr)
+        gpu_fields.append(field_gpu)
 
         def _supplier() -> Iterator[np.ndarray]:
             for zi in z_sel:
                 yield _apply_correction_field_prepared(
                     np.asarray(src[zi, :, :, channel_idx], dtype=np.float32),
                     field_arr,
+                    field_gpu=field_gpu,
                 )
 
         params = _compute_quantization_params(_supplier)
         channel_quant.append(params)
 
-    for ci, (ch, field_arr, params) in enumerate(zip(channels, field_arrays, channel_quant)):
-        for zi, z_slot in enumerate(z_sel):
-            corrected = _apply_correction_field_prepared(
-                np.asarray(src[z_slot, :, :, ch], dtype=np.float32),
-                field_arr,
-            )
-            if float_dest is not None:
-                float_dest[zi, :, :, ci] = corrected
-            dest[zi, :, :, ci] = _quantize_to_uint16(corrected, params)
+    total_steps = max(1, len(channels) * len(z_sel))
+    with progress_bar(total_steps) as advance:
+        for ci, (ch, field_arr, params) in enumerate(zip(channels, field_arrays, channel_quant)):
+            field_gpu = gpu_fields[ci]
+            for zi, z_slot in enumerate(z_sel):
+                corrected = _apply_correction_field_prepared(
+                    np.asarray(src[z_slot, :, :, ch], dtype=np.float32),
+                    field_arr,
+                    field_gpu=field_gpu,
+                )
+                if float_dest is not None:
+                    float_dest[zi, :, :, ci] = corrected
+                dest[zi, :, :, ci] = _quantize_to_uint16(corrected, params)
+                advance()
+
+            if field_gpu is not None and _cupy_available():
+                memory_pool_getter = getattr(cp, "get_default_memory_pool", None)
+                if callable(memory_pool_getter):
+                    try:
+                        memory_pool_getter().free_all_blocks()
+                    except Exception:
+                        logger.opt(exception=True).debug("Unable to release CuPy memory pool; continuing.")
+            gpu_fields[ci] = None
 
     src_attrs: dict[str, Any] = {}
     try:
@@ -474,25 +633,17 @@ def _write_fused_corrected_zyxc(
     default_quant = channel_quant[0] if channel_quant else None
     dest_attrs["quantization"] = {
         "lower_percentile": (
-            float(default_quant.lower_percentile)
-            if default_quant is not None
-            else QUANT_LOWER_PERCENTILE
+            float(default_quant.lower_percentile) if default_quant is not None else QUANT_LOWER_PERCENTILE
         ),
         "upper_percentile": (
-            float(default_quant.upper_percentile)
-            if default_quant is not None
-            else QUANT_UPPER_PERCENTILE
+            float(default_quant.upper_percentile) if default_quant is not None else QUANT_UPPER_PERCENTILE
         ),
         "channels": quant_channels,
         "dtype": "uint16",
         "sampling": {
             "strategy": "random_without_replacement",
             "max_samples": int(QUANT_MAX_SAMPLES),
-            "total_samples": (
-                int(default_quant.sample_count)
-                if default_quant is not None
-                else 0
-            ),
+            "total_samples": (int(default_quant.sample_count) if default_quant is not None else 0),
         },
     }
     if float_dest_path is not None:
@@ -532,6 +683,7 @@ def compute_correction_field(
     shrink: int,
     spline_lowres_px: float,
     iterations: Iterable[int] = DEFAULT_ITERATIONS,
+    threshold: float | str | None = None,
 ) -> np.ndarray:
     if image_yx.ndim != 2:
         raise ValueError(f"N4 expects a 2D YX image; received shape {image_yx.shape}")
@@ -557,11 +709,13 @@ def compute_correction_field(
     shrink_factors = [shrink] * img_full.GetDimension()
     img_small = sitk.Shrink(img_full, shrink_factors)
 
-    # Foreground/tissue mask on the small image
-    # Start with >0; optionally replace with Otsu on a blurred image for robustness.
-    mask_small = sitk.Cast(sitk.Greater(img_small, 0.0), sitk.sitkUInt8)
-    if np.asarray(sitk.GetArrayViewFromImage(mask_small)).sum() == 0:
-        raise ValueError("Mask is empty after thresholding >0; check the selected channel.")
+    # Foreground/tissue mask on the small image using the configured threshold.
+    mask_small_array, mask_small_meta = _compute_threshold_mask(sitk.GetArrayFromImage(img_small), threshold)
+    if not np.any(mask_small_array):
+        raise ValueError(_empty_mask_message(threshold, resolved_name=mask_small_meta.get("function")))
+    mask_small_image = sitk.GetImageFromArray(mask_small_array.astype(np.uint8, copy=False))
+    mask_small_image.CopyInformation(img_small)
+    mask_small = sitk.Cast(mask_small_image, sitk.sitkUInt8)
 
     n4 = sitk.N4BiasFieldCorrectionImageFilter()
     n4.SetMaximumNumberOfIterations(iters)
@@ -586,9 +740,9 @@ def compute_correction_field(
     field = sitk.GetArrayFromImage(sitk.Exp(log_bias_full)).astype(np.float32, copy=False)
 
     # Normalize field to ~1.0 on foreground
-    fg_mask = image_yx > 0
+    fg_mask, mask_meta = _compute_threshold_mask(image_yx, threshold)
     if not np.any(fg_mask):
-        raise ValueError("Mask is empty after thresholding >0; check the selected channel.")
+        raise ValueError(_empty_mask_message(threshold, resolved_name=mask_meta.get("function")))
     scale = float(np.nanmedian(field[fg_mask]))  # robust center
     if not np.isfinite(scale) or scale <= 0:
         scale = 1.0
@@ -616,14 +770,25 @@ def _validate_correction_field(field: np.ndarray) -> None:
 
 
 def apply_correction_field(image_yx: np.ndarray, field_yx: np.ndarray) -> np.ndarray:
-    _validate_correction_field(field_yx)
-    img = _ensure_float32(image_yx)
-    return img / field_yx
+    field_f32 = _ensure_float32(field_yx)
+    _validate_correction_field(field_f32)
+    field_gpu = _prepare_gpu_field(field_f32)
+    return _apply_correction_field_prepared(image_yx, field_f32, field_gpu=field_gpu)
 
 
-def _apply_correction_field_prepared(image_yx: np.ndarray, field_f32: np.ndarray) -> np.ndarray:
+def _apply_correction_field_prepared(
+    image_yx: np.ndarray,
+    field_f32: np.ndarray,
+    *,
+    field_gpu: cupy_ndarray | None = None,
+) -> np.ndarray:
     # Caller guarantees validation and float32 casting of field
-    return _ensure_float32(image_yx) / field_f32
+    img = _ensure_float32(image_yx)
+    if field_gpu is not None and _cupy_available():
+        img_gpu = cp.asarray(img, dtype=cp.float32)
+        corrected_gpu = img_gpu / field_gpu
+        return _cupy_to_numpy(corrected_gpu)
+    return img / field_f32
 
 
 def _write_multi_channel_field(
@@ -706,10 +871,15 @@ def apply_correction_to_store(
 
     field_f = _ensure_float32(field)
     _validate_correction_field(field_f)
+    field_gpu = _prepare_gpu_field(field_f)
 
     def _supplier() -> Iterator[np.ndarray]:
         for _, src_idx in plane_mappings:
-            yield _apply_correction_field_prepared(_load_plane(src_idx), field_f)
+            yield _apply_correction_field_prepared(
+                _load_plane(src_idx),
+                field_f,
+                field_gpu=field_gpu,
+            )
 
     quant_params = _compute_quantization_params(_supplier)
     dtype_info = np.iinfo(np.uint16)
@@ -743,10 +913,22 @@ def apply_correction_to_store(
         )
 
     for dest_idx, src_idx in plane_mappings:
-        corrected = _apply_correction_field_prepared(_load_plane(src_idx), field_f)
+        corrected = _apply_correction_field_prepared(
+            _load_plane(src_idx),
+            field_f,
+            field_gpu=field_gpu,
+        )
         if float_store is not None:
             float_store[dest_idx, :, :, 0] = corrected
         corrected_store[dest_idx, :, :, 0] = _quantize_to_uint16(corrected, quant_params)
+
+    if field_gpu is not None and _cupy_available():
+        memory_pool_getter = getattr(cp, "get_default_memory_pool", None)
+        if callable(memory_pool_getter):
+            try:
+                memory_pool_getter().free_all_blocks()
+            except Exception:
+                logger.opt(exception=True).debug("Unable to release CuPy memory pool; continuing.")
 
     logger.info("Corrected imagery written to {path}", path=output_path)
     if float_store is not None and float_output_path is not None:
@@ -822,6 +1004,7 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
             shrink=config.shrink,
             spline_lowres_px=config.spline_lowres_px,
             iterations=config.iterations,
+            threshold=config.threshold,
         )
 
         # Resolve channel tag from metadata (fallback to index)
@@ -842,6 +1025,7 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
             "spline_lowres_px": float(config.spline_lowres_px),
             "iterations": list(config.iterations),
             "z_index": (int(config.z_index) if config.z_index is not None else None),
+            "threshold": _summarize_threshold_spec(config.threshold),
         },
     }
     written_field = _write_multi_channel_field(
@@ -879,6 +1063,7 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
                 "spline_lowres_px": float(config.spline_lowres_px),
                 "iterations": list(config.iterations),
                 "z_index": (int(config.z_index) if config.z_index is not None else None),
+                "threshold": _summarize_threshold_spec(config.threshold),
             },
             output_path=corrected_output,
             debug=config.debug,
@@ -909,6 +1094,7 @@ def compute_field_from_workspace(config: N4RuntimeConfig) -> N4Result:
         shrink=config.shrink,
         spline_lowres_px=config.spline_lowres_px,
         iterations=config.iterations,
+        threshold=config.threshold,
     )
 
     # Write as multi-channel field (C=1) with consistent naming
@@ -925,6 +1111,7 @@ def compute_field_from_workspace(config: N4RuntimeConfig) -> N4Result:
             "spline_lowres_px": float(config.spline_lowres_px),
             "iterations": list(config.iterations),
             "z_index": (int(config.z_index) if config.z_index is not None else None),
+            "threshold": _summarize_threshold_spec(config.threshold),
         },
     }
     written_field = _write_multi_channel_field(
@@ -953,6 +1140,7 @@ def compute_field_from_workspace(config: N4RuntimeConfig) -> N4Result:
                 "spline_lowres_px": float(config.spline_lowres_px),
                 "iterations": list(config.iterations),
                 "z_index": (int(config.z_index) if config.z_index is not None else None),
+                "threshold": _summarize_threshold_spec(config.threshold),
             },
             output_path=corrected_output,
             debug=config.debug,
@@ -961,61 +1149,27 @@ def compute_field_from_workspace(config: N4RuntimeConfig) -> N4Result:
     return N4Result(field_path=written_field, corrected_path=corrected_path)
 
 
-@app.command()
-def main(
-    workspace: Path = typer.Argument(..., exists=True, dir_okay=True, file_okay=False),
-    roi: str = typer.Argument(..., help="ROI name"),
-    codebook: str = typer.Option(..., "--codebook", help="Codebook used in the stitch path name."),
-    channels: str | None = typer.Option(
-        None,
-        "--channels",
-        help=(
-            "Comma-separated channel names to correct (case-insensitive). "
-            "Defaults to all channels. If channel names are unavailable, numeric indices are accepted."
-        ),
-    ),
-    shrink: int = typer.Option(4, min=1, help="Downsample factor applied before running N4."),
-    spline_lowres_px: float = typer.Option(
-        128.0,
-        help="Desired spline control-point spacing on the downsampled grid (in pixels).",
-    ),
-    z_index: int | None = typer.Option(
-        None,
-        help="Z index (0-based) of the plane used to compute the 2D N4 field (required).",
-    ),
-    output: Path | None = typer.Option(
-        None,
-        help="Optional output path for the multi-channel correction field (defaults to stitch/n4-fields).",
-    ),
-    corrected_output: Path | None = typer.Option(
-        None,
-        help="Optional output path for corrected imagery (defaults to 'fused_n4.zarr').",
-    ),
-    apply: bool = typer.Option(
-        True,
-        "--apply/--field-only",
-        help="Apply the correction field to imagery (enabled by default).",
-    ),
-    overwrite: bool = typer.Option(False, help="Overwrite outputs if they already exist."),
-    single_plane: bool = typer.Option(
-        False,
-        "--single-plane",
-        help="Only correct the single Z plane specified by --z-index (useful for debugging).",
-    ),
-    debug: bool = typer.Option(
-        False,
-        "--debug",
-        help="Write float32 debug outputs alongside quantized corrections.",
-    ),
-) -> None:
-    # Enforce the current algorithm's contract: we always compute the field from one Z plane.
+def run_cli_workflow(
+    *,
+    workspace: Path,
+    roi: str,
+    codebook: str,
+    channels: str | None,
+    shrink: int,
+    spline_lowres_px: float,
+    z_index: int | None,
+    threshold: str | None,
+    field_output: Path | None,
+    corrected_output: Path | None,
+    apply_correction: bool,
+    overwrite: bool,
+    single_plane: bool,
+    debug: bool,
+) -> list[N4Result]:
+    """Shared CLI workflow for Click- and Typer-based entrypoints."""
+
     if z_index is None:
-        typer.secho(
-            "Error: --z-index is required (field is computed from one Z plane).",
-            err=True,
-            fg=typer.colors.RED,
-        )
-        raise typer.Exit(code=1)
+        raise ValueError("--z-index is required (field is computed from one Z plane).")
 
     logger.info(
         "Invoked CLI with workspace={workspace}, roi={roi}, codebook={codebook}, channels={channels}",
@@ -1025,76 +1179,89 @@ def main(
         channels=channels,
     )
 
-    # Resolve fused path and channel names/count
     fused_path = _resolve_fused_path(workspace, roi, codebook)
     arr = zarr.open_array(fused_path, mode="r")
     if arr.ndim != 4:
-        typer.secho(
-            f"Error: expected fused.zarr to be 4D with axes ZYXC; got ndim={arr.ndim} and shape={arr.shape}",
-            err=True,
-            fg=typer.colors.RED,
+        raise ValueError(
+            f"Expected fused.zarr to be 4D with axes ZYXC; found ndim={arr.ndim} and shape={arr.shape}"
         )
-        raise typer.Exit(code=1)
+
     c_count = int(arr.shape[-1])
+    if c_count <= 0:
+        raise ValueError("fused.zarr reports zero channels; cannot compute N4 correction field.")
+
     name_list = _read_channel_names_from_zarr(fused_path) or [f"channel_{i}" for i in range(c_count)]
 
-    # Parse channel selection: default all; else match names case-insensitively
     if channels is None or not channels.strip():
-        selected_indices = list(range(c_count))
+        selected_indices: list[int] = list(range(c_count))
     else:
-        tokens = [t.strip() for t in channels.split(",") if t.strip()]
-        name_to_idx = {n.lower(): i for i, n in enumerate(name_list)}
-        selected_indices: list[int] = []
-        for t in tokens:
-            idx = name_to_idx.get(t.lower())
+        tokens = [token.strip() for token in channels.split(",") if token.strip()]
+        name_to_idx = {name.lower(): idx for idx, name in enumerate(name_list)}
+        selected_indices = []
+        for token in tokens:
+            idx = name_to_idx.get(token.lower())
             if idx is None:
-                # Fallback: allow numeric
                 try:
-                    idx = int(t)
-                except ValueError:
-                    typer.secho(
-                        f"Unknown channel '{t}'. Available: {', '.join(name_list)}",
-                        err=True,
-                        fg=typer.colors.RED,
+                    idx = int(token)
+                except ValueError as exc:
+                    available = (
+                        ", ".join(name_list) if name_list else ", ".join(str(i) for i in range(c_count))
                     )
-                    raise typer.Exit(code=1)
+                    raise ValueError(f"Unknown channel '{token}'. Available: {available}") from exc
             if idx < 0 or idx >= c_count:
-                typer.secho(f"Channel index out of range: {idx}", err=True, fg=typer.colors.RED)
-                raise typer.Exit(code=1)
+                raise ValueError(f"Channel index out of range: {idx}")
             if idx not in selected_indices:
                 selected_indices.append(idx)
+
+    if not selected_indices:
+        raise ValueError("No channels selected; specify --channels or ensure fused.zarr has channels.")
+
+    threshold_value: float | str | None = None
+    if threshold is not None and threshold.strip():
+        token = threshold.strip()
+        try:
+            numeric_value = float(token)
+        except ValueError:
+            try:
+                _resolve_threshold_function(token)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            threshold_value = token
+        else:
+            if not math.isfinite(numeric_value):
+                raise ValueError("Threshold must be a finite numeric value.")
+            threshold_value = numeric_value
 
     config = N4RuntimeConfig(
         workspace=workspace,
         roi=roi,
         codebook=codebook,
-        channel=selected_indices[0] if selected_indices else 0,
+        channel=selected_indices[0],
         shrink=shrink,
         spline_lowres_px=spline_lowres_px,
         z_index=z_index,
         iterations=DEFAULT_ITERATIONS,
-        field_output=output,
+        field_output=field_output,
         corrected_output=corrected_output,
-        apply_correction=apply,
+        apply_correction=apply_correction,
         overwrite=overwrite,
         correct_single_plane=single_plane,
         channels=tuple(selected_indices),
         debug=debug,
+        threshold=threshold_value,
     )
 
-    try:
-        results = compute_fields_from_workspace(config)
-    except Exception as exc:  # pragma: no cover - CLI convenience
-        logger.exception("N4 workflow failed")
-        typer.secho(f"Error: {exc}", err=True, fg=typer.colors.RED)
-        raise typer.Exit(code=1) from exc
-
-    # Single aggregate result
-    res = results[0]
-    typer.echo(f"Correction field saved to {res.field_path}")
-    if res.corrected_path is not None:
-        typer.echo(f"Corrected imagery saved to {res.corrected_path}")
+    return compute_fields_from_workspace(config)
 
 
-if __name__ == "__main__":
-    app()
+__all__ = [
+    "N4RuntimeConfig",
+    "N4Result",
+    "DEFAULT_ITERATIONS",
+    "compute_correction_field",
+    "compute_field_from_workspace",
+    "compute_fields_from_workspace",
+    "apply_correction_field",
+    "apply_correction_to_store",
+    "run_cli_workflow",
+]

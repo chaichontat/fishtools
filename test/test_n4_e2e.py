@@ -5,7 +5,6 @@ import pytest
 
 from fishtools.preprocess import n4
 
-
 pytestmark = pytest.mark.timeout(30)
 
 

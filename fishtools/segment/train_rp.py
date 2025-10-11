@@ -1,3 +1,4 @@
+# %%
 from pathlib import Path
 from typing import Any, cast
 
@@ -93,7 +94,7 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
 def run_train(name: str, path: Path, train_config: TrainConfig):
     logger.info(f"Started training {name} with paths: {train_config.training_paths}")
 
-    logger.info("Loading training data")
+    logger.info(f"Loading training data")
     out2 = concat_output(
         path,
         train_config.training_paths,
@@ -104,3 +105,6 @@ def run_train(name: str, path: Path, train_config: TrainConfig):
     logger.info(f"Training data loaded: {len(out2[0])} images")
     model_path, train_losses, test_losses = _train(out2, path, train_config=train_config, name=name)
     return train_config.model_copy(update=dict(train_losses=train_losses.tolist()))
+
+
+# %%

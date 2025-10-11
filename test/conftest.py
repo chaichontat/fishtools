@@ -1,5 +1,6 @@
 import random
 import signal
+import time
 import sys
 import types
 from contextlib import suppress
@@ -10,7 +11,8 @@ import pytest
 import tifffile
 from scipy import fft as _scipy_fft
 from scipy import ndimage as _scipy_ndimage
-from skimage.transform import downscale_local_mean as _skimage_downscale_local_mean
+from scipy import sparse as _scipy_sparse
+
 
 _DEFAULT_TIMEOUT_SECONDS = 30
 
@@ -146,18 +148,15 @@ if "cupy" not in sys.modules:
     cupyx_ndimage.uniform_filter = _scipy_ndimage.uniform_filter
     sys.modules["cupyx.scipy.ndimage"] = cupyx_ndimage
 
+    cupyx_scipy_sparse = types.ModuleType("cupyx.scipy.sparse")
+    cupyx_scipy_sparse.csc_matrix = _scipy_sparse.csc_matrix
+    cupyx_scipy_sparse.csr_matrix = _scipy_sparse.csr_matrix
+    cupyx_scipy_sparse.coo_matrix = _scipy_sparse.coo_matrix
+    cupyx_scipy_sparse.spmatrix = _scipy_sparse.spmatrix
+    sys.modules["cupyx.scipy.sparse"] = cupyx_scipy_sparse
+
     cupyx_scipy.ndimage = cupyx_ndimage
     cupyx_scipy.sparse = cupyx_scipy_sparse
-
-    cupyx_scipy_fft = types.ModuleType("cupyx.scipy.fft")
-    cupyx_scipy_fft.fftn = _scipy_fft.fftn
-    cupyx_scipy_fft.ifftn = _scipy_fft.ifftn
-    cupyx_scipy_fft.fftfreq = _scipy_fft.fftfreq
-    cupyx_scipy_fft.rfftn = _scipy_fft.rfftn
-    cupyx_scipy_fft.irfftn = _scipy_fft.irfftn
-    sys.modules["cupyx.scipy.fft"] = cupyx_scipy_fft
-    cupyx_scipy.fft = cupyx_scipy_fft
-
     cupyx.scipy = cupyx_scipy
 
 if "cucim" not in sys.modules:
@@ -191,9 +190,43 @@ if "cucim" not in sys.modules:
         def use(self) -> None:
             return None
 
+    class _CudaStream:
+        def synchronize(self) -> None:
+            return None
+
+    class _CudaEvent:
+        def __init__(self) -> None:
+            self._timestamp: float | None = None
+
+        def record(self, stream: _CudaStream | None = None) -> None:
+            del stream
+            self._timestamp = time.perf_counter()
+
+        def synchronize(self) -> None:
+            return None
+
+        @property
+        def timestamp(self) -> float:
+            if self._timestamp is None:
+                return time.perf_counter()
+            return self._timestamp
+
+    _current_stream = _CudaStream()
+
+    def _get_current_stream() -> _CudaStream:
+        return _current_stream
+
+    def _get_elapsed_time(start: _CudaEvent, end: _CudaEvent) -> float:
+        return max(0.0, (end.timestamp - start.timestamp) * 1_000.0)
+
     _cupy.cuda = types.SimpleNamespace(
         runtime=_CudaRuntime(),
         Device=lambda idx: _CudaDevice(idx),
+        Stream=_CudaStream,
+        Event=_CudaEvent,
+        get_current_stream=_get_current_stream,
+        get_elapsed_time=_get_elapsed_time,
+        nvtx=types.SimpleNamespace(RangePush=lambda *_args, **_kwargs: None, RangePop=lambda: None),
     )
 
 

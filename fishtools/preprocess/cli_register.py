@@ -1,7 +1,10 @@
 # %%
 import json
+import pickle
 import subprocess
 from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -9,34 +12,29 @@ from typing import TYPE_CHECKING, Annotated, Any
 import numpy as np
 import rich_click as click
 import tifffile
+import toml
+from basicpy import BaSiC
 from loguru import logger
 from pydantic import ValidationError
+from scipy import ndimage
 from scipy.ndimage import shift
-from tifffile import TiffFile  # For test-time patching expectations
+from tifffile import TiffFile
 
-from fishtools.io.image import Image
-from fishtools.io.workspace import Workspace
 from fishtools.preprocess.chromatic import Affine
-from fishtools.preprocess.cli_deconv import scale_deconv
 from fishtools.preprocess.config import (
     Config,
     Fiducial,
     NumpyEncoder,
     RegisterConfig,
 )
+from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
+from fishtools.utils.io import Workspace
+from fishtools.utils.logging import initialize_logger
 from fishtools.utils.pretty_print import progress_bar_threadpool
-from fishtools.utils.utils import initialize_logger
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
-
-
-def _shift_json_path(base: Path, roi: str, idx: int, codebook_name: str) -> Path:
-    """Return the expected shifts JSON path for a ROI/index/codebook trio."""
-
-    return base / f"shifts--{roi}+{codebook_name}" / f"shifts-{idx:04d}.json"
-
 
 if TYPE_CHECKING:
     pass
@@ -163,7 +161,146 @@ def apply_deconv_scaling(
     )
 
 
-__all__ = ["Image"]
+@dataclass
+class Image:
+    name: str
+    idx: int
+    nofid: np.ndarray
+    fid: np.ndarray
+    fid_raw: np.ndarray
+    bits: list[str]
+    powers: dict[str, float]
+    metadata: dict[str, Any]
+    global_deconv_scaling: np.ndarray | None
+    basic: Callable[[], dict[str, BaSiC] | None]
+
+    CHANNELS = [f"ilm{n}" for n in ["405", "488", "560", "650", "750"]]
+
+    @classmethod
+    def from_file(
+        cls,
+        path: Path,
+        *,
+        discards: dict[str, list[str]] | None = None,
+        n_fids: int = 1,
+    ):
+        ws = Workspace(path.parent.parent)
+        stem = path.stem
+        name, idx = stem.split("-")
+        bits = name.split("_")
+        if discards is None:
+            discards = {}
+
+        to_discard_idxs = []
+        for k, v in discards.items():
+            if k in bits and name in v:
+                logger.debug(f"Discarding {k} (index {bits.index(k)}) from {stem}.")
+                to_discard_idxs.append(bits.index(k))
+
+        with TiffFile(path) as tif:
+            try:
+                img = tif.asarray()
+                try:
+                    metadata = tif.shaped_metadata[0]  # type: ignore
+                except IndexError:
+                    metadata = tif.imagej_metadata
+                # tifffile throws IndexError if the file is truncated
+            except IndexError as e:
+                raise Exception(f"File {path} is corrupted. Please check the file.") from e
+            assert metadata is not None
+
+        try:
+            waveform = (
+                metadata["waveform"]
+                if isinstance(metadata["waveform"], dict)
+                else json.loads(metadata["waveform"])
+            )
+        except KeyError:
+            waveform = toml.load(path.with_name(f"{path.name.split('-')[0]}.toml"))
+
+        counts = {key: sum(waveform[key]["sequence"]) for key in cls.CHANNELS}
+
+        # To remove ilm from, say, ilm405.
+
+        powers = {
+            key[3:]: waveform[key]["power"]
+            for key in cls.CHANNELS
+            if (key == "ilm405" and counts[key] > n_fids) or (key != "ilm405" and counts[key])
+        }
+
+        if waveform.get("params"):
+            powers = waveform["params"]["powers"]
+
+        if len(powers) != len(bits):
+            raise ValueError(f"{path}: Expected {len(bits)} channels, got {len(powers)}")
+
+        prenormalized = metadata.get("prenormalized", False)
+        if not prenormalized:
+            try:
+                global_deconv_scaling = (
+                    np.loadtxt(ws.deconv_scaling(name)).astype(np.float32).reshape((2, -1))
+                )
+            except FileNotFoundError:
+                raise ValueError(f"No deconv_scaling found for {name} and prenormalized not set.")
+        else:
+            global_deconv_scaling = None
+
+        nofid = img[:-n_fids].reshape(-1, len(powers), 2048, 2048)
+
+        if to_discard_idxs:
+            _bits = name.split("_")
+            power_keys = list(powers.keys())
+            for _idx_d in to_discard_idxs:
+                _bits.pop(_idx_d)
+                del powers[power_keys[_idx_d]]
+            name = "_".join(_bits)
+            keeps = list(sorted(set(range(len(bits))) - set(to_discard_idxs)))
+            nofid = nofid[:, keeps]
+            bits = [bits[i] for i in keeps]
+            global_deconv_scaling = (
+                global_deconv_scaling[:, keeps] if global_deconv_scaling is not None else None
+            )
+            assert len(_bits) == nofid.shape[1]
+
+        path_basic = path.parent.parent / "basic" / f"{name}.pkl"
+        if path_basic.exists():
+
+            def b():
+                basic = pickle.loads(path_basic.read_bytes())
+                return dict(zip(bits, basic.values()))
+
+            basic = b
+        else:
+            # raise Exception(f"No basic template found at {path_basic}")
+            basic = lambda: None
+
+        fids_raw = np.atleast_3d(img[-n_fids:]).max(axis=0)
+        return cls(
+            name=name,
+            idx=int(idx),
+            nofid=nofid,
+            fid=cls.loG_fids(fids_raw),
+            fid_raw=fids_raw,
+            bits=bits,
+            powers=powers,
+            metadata=metadata,
+            global_deconv_scaling=global_deconv_scaling,
+            basic=basic,
+        )
+
+    @staticmethod
+    def loG_fids(fid: np.ndarray):
+        if len(fid.shape) == 3:
+            fid = fid.max(axis=0)
+
+        temp = -ndimage.gaussian_laplace(fid.astype(np.float32).copy(), sigma=3)  # type: ignore
+        temp -= temp.min()
+        percs = np.percentile(temp, [1, 99.99])
+
+        if percs[1] - percs[0] == 0:
+            raise ValueError("Uniform image")
+        temp = (temp - percs[0]) / (percs[1] - percs[0])
+        return temp
 
 
 def run_fiducial(
@@ -313,15 +450,8 @@ def _run(
     overwrite: bool = False,
     no_priors: bool = False,
 ):
-    codebook_name = Path(codebook).stem
-    shift_json = _shift_json_path(path, roi, idx, codebook_name)
-
-    if not overwrite and shift_json.exists():
-        logger.info(f"Skipping {roi}/{idx:04d}: existing shift file at {shift_json.relative_to(path)}.")
-        return
-
     logger.info("Reading files")
-    out_path = path / f"registered--{roi}+{codebook_name}"
+    out_path = path / f"registered--{roi}+{Path(codebook).stem}"
     out_path.mkdir(exist_ok=True, parents=True)
 
     if not overwrite and (out_path / f"reg-{idx:04d}.tif").exists():
@@ -351,7 +481,7 @@ def _run(
 
     cb = json.loads(Path(codebook).read_text())
     bits_cb = set(chain.from_iterable(cb.values()))
-    # reference = config.registration.reference
+
     folders = {
         p
         for p in Path(path).glob(f"*--{roi}")
@@ -381,7 +511,7 @@ def _run(
         shifts = run_fiducial(
             path,
             {name: img.fid for name, img in imgs.items()},
-            codebook_name,
+            Path(codebook).stem,
             config,
             roi=roi,
             reference=reference,
@@ -442,14 +572,19 @@ def _run(
         orig_name, orig_idx = bit_name_mapping[bit]
         img = collapse_z(img, config.registration.slices).astype(np.float32)
         metadata = imgs[orig_name].metadata
-        img = apply_deconv_scaling(
-            img,
-            idx=orig_idx,
-            orig_name=orig_name,
-            global_deconv_scaling=imgs[orig_name].global_deconv_scaling,
-            metadata=metadata,
-            debug=debug,
-        )
+
+        if not metadata.get("prenormalized"):
+            scaling = imgs[orig_name].global_deconv_scaling
+            assert scaling is not None
+            img = apply_deconv_scaling(
+                img,
+                idx=orig_idx,
+                orig_name=orig_name,
+                global_deconv_scaling=scaling,
+                metadata=metadata,
+                debug=debug,
+            )
+            del scaling
 
         if ref is None:
             # Need to put this here because of shape change during collapse_z.
@@ -486,7 +621,10 @@ def _run(
         )
 
     sample = next(iter(transformed.values()))
-    out = np.zeros((sample.shape[0], len(transformed), sample.shape[1], sample.shape[2]), dtype=np.uint16)
+    out = np.zeros(
+        (sample.shape[0], len(transformed), sample.shape[1], sample.shape[2]),
+        dtype=np.uint16,
+    )
 
     # Sort by channel
     for i, (k, v) in enumerate(items := sorted(transformed.items(), key=sort_key)):
@@ -575,13 +713,8 @@ def run(
     initialize_logger(idx, debug)
 
     rois = get_rois(path, roi)
-    codebook_name = codebook.stem
 
     for roi in rois:
-        shift_json = _shift_json_path(path, roi, idx, codebook_name)
-        if not overwrite and shift_json.exists():
-            logger.info(f"Skipping {roi}/{idx:04d}: existing shift file at {shift_json.relative_to(path)}.")
-            continue
         _run(
             path,
             roi,
@@ -630,6 +763,7 @@ def run(
 @click.option("--threshold", type=float, default=6, help="Threshold value")
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
 @click.option("--overwrite", is_flag=True)
+@click.option("--debug", is_flag=True)
 def batch(
     path: Path,
     ref: str | None,
@@ -638,13 +772,12 @@ def batch(
     threshold: int,
     threads: int,
     overwrite: bool,
+    debug: bool,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
     ws = Workspace(path.parent.parent)
     logger.info(f"Found {ws.rois}")
-
-    codebook_name = codebook.stem
 
     if ref is None:
         if "2_10_18" in ws.rounds:
@@ -658,21 +791,18 @@ def batch(
         names = sorted({name for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")})
         if not len(names):
             raise ValueError(f"No images found for {ref}--{roi}")
-        idxs: list[int] = []
-        for name in names:
-            idx = int(name.stem.split("-")[1])
-            if not overwrite:
-                reg_exists = (path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif").exists()
-                shift_json = _shift_json_path(path, roi, idx, codebook_name)
-                if reg_exists or shift_json.exists():
-                    continue
-            idxs.append(idx)
+        idxs = [
+            int(name.stem.split("-")[1])
+            for name in names
+            if overwrite
+            or not (path / f"registered--{roi}+{codebook.stem}/reg-{name.stem.split('-')[1]}.tif").exists()
+        ]
 
         if not idxs:
-            logger.warning(f"Skipping {ref}--{roi}, existing registration outputs or shifts detected.")
+            logger.warning(f"Skipping {ref}--{roi}, already registered.")
             continue
 
-        with progress_bar_threadpool(len(idxs), threads=threads) as submit:
+        with progress_bar_threadpool(len(idxs), threads=threads, debug=debug) as submit:
             for i in idxs:
                 submit(
                     subprocess.run,

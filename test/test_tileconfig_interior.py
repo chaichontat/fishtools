@@ -77,16 +77,14 @@ def test_interior_indices_with_duplicates_in_x() -> None:
     # For each of ny=4 rows, interior x-ranks are 1..2 (unique ranks), and x=2.0 appears twice.
     # Thus per interior row (y=1,2) we expect indices at columns {1,2,3} → 3 per row.
     row_len = len(xs)
-    expected = np.array(
-        [
-            row_len * 1 + 1,
-            row_len * 1 + 2,
-            row_len * 1 + 3,
-            row_len * 2 + 1,
-            row_len * 2 + 2,
-            row_len * 2 + 3,
-        ]
-    )
+    expected = np.array([
+        row_len * 1 + 1,
+        row_len * 1 + 2,
+        row_len * 1 + 3,
+        row_len * 2 + 1,
+        row_len * 2 + 2,
+        row_len * 2 + 3,
+    ])
     assert np.array_equal(np.sort(pos), np.sort(expected))
 
 
@@ -111,13 +109,11 @@ def test_tileconfiguration_indices_map_to_index_column() -> None:
     # and shuffled rows to ensure mapping is by content, not position.
     rng = np.random.default_rng(1)
     perm = rng.permutation(len(xy))
-    df = pl.DataFrame(
-        {
-            "index": pl.Series((len(xy) - 1 - np.arange(len(xy))).astype(np.uint32)),
-            "x": pl.Series(xy[perm, 0].astype(np.float32)),
-            "y": pl.Series(xy[perm, 1].astype(np.float32)),
-        }
-    )
+    df = pl.DataFrame({
+        "index": pl.Series((len(xy) - 1 - np.arange(len(xy))).astype(np.uint32)),
+        "x": pl.Series(xy[perm, 0].astype(np.float32)),
+        "y": pl.Series(xy[perm, 1].astype(np.float32)),
+    })
     tc = TileConfiguration(df)
     ids = tc.indices_at_least_n_steps_from_edges(1)
     # Expected: compute over the same (permuted) XY ordering as the dataframe, then map to the
