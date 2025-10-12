@@ -178,6 +178,7 @@ def _prep_slab(
     crop_slices: tuple[slice, ...] | None,
     filter_before: bool,
     append_max: np.ndarray | None,
+    apply_filter: bool = True,
 ) -> np.ndarray:
     """Select channels, optional filtering and max-append; return (C, ... spatial ...) uint16.
 
@@ -186,15 +187,16 @@ def _prep_slab(
     - crop_slices: optional slices on spatial axes (must not include channel axis).
     - filter_before: if True, filter before selection; else filter after selection.
     - append_max: optional array broadcastable to spatial shape, added as an extra channel.
+    - apply_filter: enable sharpening filter (skipped for Zarr streaming to avoid extra IO).
     """
     arr = slab
-    if filter_before:
+    if apply_filter and filter_before:
         arr = unsharp_all(arr, channel_axis=channel_axis)
 
     # Select channels (channel axis last in arr)
     sel = np.take(arr, ch_idx, axis=channel_axis)
 
-    if not filter_before:
+    if apply_filter and not filter_before:
         sel = unsharp_all(sel, channel_axis=sel.ndim - 1)
 
     # Append max channel if provided
@@ -330,6 +332,52 @@ def _discover_registered_inputs(
     raise FileNotFoundError(f"No registered TIFFs in {reg_dir} or fused Zarr at {fused_zarr}.")
 
 
+def _distribute_file_budget(rois: list[str], counts: dict[str, int], total: int) -> dict[str, int]:
+    """Allocate a global file budget across ROIs using proportional rounding.
+
+    Uses largest-remainder rounding so that the total allocation sums to ``total``
+    while never exceeding the per-ROI availability in ``counts``.
+    """
+
+    available = sum(counts.get(roi, 0) for roi in rois)
+    if available == 0:
+        return {roi: 0 for roi in rois}
+    if total >= available:
+        return {roi: counts.get(roi, 0) for roi in rois}
+
+    quotas: dict[str, int] = {roi: 0 for roi in rois}
+    fractional: list[tuple[str, float, int]] = []
+
+    allocated = 0
+    for idx, roi in enumerate(rois):
+        count = counts.get(roi, 0)
+        if count == 0:
+            fractional.append((roi, 0.0, idx))
+            continue
+        share = (total * count) / available
+        base = min(count, int(math.floor(share)))
+        quotas[roi] = base
+        allocated += base
+        fractional.append((roi, share - base, idx))
+
+    remainder = total - allocated
+    if remainder <= 0:
+        return quotas
+
+    # Distribute leftover units to ROIs with the largest fractional remainder,
+    # breaking ties by favouring ROIs with more availability first and then by index.
+    fractional.sort(key=lambda item: (item[1], counts.get(item[0], 0), -item[2]), reverse=True)
+    for roi, _frac, _idx in fractional:
+        if remainder <= 0:
+            break
+        if quotas[roi] >= counts.get(roi, 0):
+            continue
+        quotas[roi] += 1
+        remainder -= 1
+
+    return quotas
+
+
 # ---------- Commands ----------
 
 
@@ -420,10 +468,38 @@ def cmd_extract(
             raise FileNotFoundError("Workspace contains no ROIs.")
         rois = ws.resolve_rois(ws.rois)
 
+    inputs_by_roi: dict[str, list[Path]] = {}
+    available_counts: dict[str, int] = {}
+    for current_roi in rois:
+        inputs = _discover_registered_inputs(
+            ws,
+            current_roi,
+            codebook,
+            require_zarr=use_zarr,
+        )
+        inputs_by_roi[current_roi] = inputs
+        available_counts[current_roi] = len(inputs[::every])
+
+    file_quota: dict[str, int | None] = {roi_name: None for roi_name in rois}
+    if roi is None:
+        total_available = sum(available_counts.values())
+        if total_available == 0:
+            raise FileNotFoundError("No registered inputs matched the selection criteria across any ROI.")
+        file_quota = (
+            {roi_name: available_counts[roi_name] for roi_name in rois}
+            if n >= total_available
+            else _distribute_file_budget(rois, available_counts, n)
+        )
+
     for idx, current_roi in enumerate(rois):
         roi_out = out
         if out is not None and len(rois) > 1:
             roi_out = out / current_roi
+
+        quota = file_quota.get(current_roi)
+        if quota == 0:
+            logger.info(f"[{current_roi}] Skipping ROI because global file budget allocated zero files.")
+            continue
 
         _extract_single_roi(
             ws=ws,
@@ -442,6 +518,8 @@ def cmd_extract(
             every=every,
             max_from=max_from,
             use_zarr=use_zarr,
+            file_quota=quota,
+            prefetched_inputs=inputs_by_roi[current_roi],
         )
 
 
@@ -463,28 +541,34 @@ def _extract_single_roi(
     every: int,
     max_from: str | None,
     use_zarr: bool,
+    file_quota: int | None,
+    prefetched_inputs: list[Path] | None,
 ) -> None:
     reg_dir = ws.registered(roi, codebook)
     out_dir = out
     if out_dir is None:
-        out_dir = ws.segment(roi, codebook) / ("extract_z" if mode == "z" else "extract_ortho")
+        out_dir = _default_output_dir(ws, roi)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"[{roi}] Input: {reg_dir}")
     logger.info(f"[{roi}] Output: {out_dir}")
     logger.info(f"[{roi}] Upscale factor: {upscale}")
 
-    inputs = _discover_registered_inputs(
-        ws,
-        roi,
-        codebook,
-        require_zarr=use_zarr,
-    )
+    if prefetched_inputs is not None:
+        inputs = prefetched_inputs
+    else:
+        inputs = _discover_registered_inputs(
+            ws,
+            roi,
+            codebook,
+            require_zarr=use_zarr,
+        )
     files = inputs[::every]
-    if n and len(files) > n:
+    limit = file_quota if file_quota is not None else n
+    if limit and len(files) > limit:
         import numpy as _np
 
-        idxs = _np.linspace(0, len(files) - 1, n, dtype=int)
+        idxs = _np.linspace(0, len(files) - 1, limit, dtype=int)
         idxs = _np.unique(idxs)
         files = [files[i] for i in idxs]
         logger.info(f"[{roi}] Uniform file sampling: {len(files)} of {len(inputs)} across sizes")
@@ -531,6 +615,7 @@ def _extract_single_roi(
             for f, vol, tile_origins, names_all, z_candidates in tile_jobs:
                 _process_zarr_tiles(
                     f,
+                    roi,
                     vol,
                     names_all,
                     tile_origins,
@@ -562,6 +647,7 @@ def _extract_single_roi(
             for f, vol, names_all, y_positions, x_positions in ortho_jobs:
                 _process_zarr_ortho(
                     f,
+                    roi,
                     vol,
                     names_all,
                     y_positions,
@@ -582,6 +668,7 @@ def _extract_single_roi(
                 submit(
                     _process_file_to_z_slices,
                     f,
+                    roi,
                     out_dir,
                     channels,
                     crop,
@@ -595,6 +682,7 @@ def _extract_single_roi(
                 submit(
                     _process_file_to_ortho,
                     f,
+                    roi,
                     out_dir,
                     channels,
                     crop,
@@ -659,8 +747,20 @@ def _format_size(num_bytes: int) -> str:
     return f"{n:.1f} TiB"
 
 
+def _default_output_dir(ws: Workspace, roi: str) -> Path:
+    """Return the default extract output directory for a given ROI."""
+    return ws.deconved / "segment" / roi
+
+
+def _prefix_with_roi(name: str, roi: str) -> str:
+    """Prefix output filename with the ROI identifier."""
+    prefix = f"{roi}--"
+    return name if name.startswith(prefix) else f"{prefix}{name}"
+
+
 def _process_file_to_z_slices(
     file: Path,
+    roi: str,
     out_dir: Path,
     channels: str | None,
     crop: int,
@@ -693,8 +793,10 @@ def _process_file_to_z_slices(
     out_names = [*base_names, "max_from"] if other_vol is not None else base_names
 
     z_len, y_len, x_len, _ = vol.shape
-    y_slice = slice(crop, y_len - crop) if crop > 0 else slice(None)
-    x_slice = slice(crop, x_len - crop) if crop > 0 else slice(None)
+    # Normal mode: crop to top-left 1024x1024 region regardless of --crop.
+    # If image is smaller than 1024 in either dimension, use full available size.
+    y_slice = slice(0, min(1024, y_len))
+    x_slice = slice(0, min(1024, x_len))
 
     # Determine z indices: use uniform sampling if n is provided; else step by dz
     if n is not None:
@@ -707,8 +809,9 @@ def _process_file_to_z_slices(
         plane = vol[i, :, :, :]  # (Y,X,C)
         other_max = None
         if other_vol is not None:
+            # Compute max across channels for the same Z-plane. Do not crop here;
+            # cropping is applied uniformly inside _prep_slab via crop_slices.
             other_max = other_vol[i, :, :, :].max(axis=2)  # (Y,X)
-            other_max = other_max[y_slice, x_slice]
         cyx_u16 = _prep_slab(
             plane[:, :, :],
             ch_idx=chsel.indices,
@@ -718,7 +821,8 @@ def _process_file_to_z_slices(
             append_max=other_max,
         )
         cyx_u16 = _resize_uint16(cyx_u16, (1.0, upscale, upscale))
-        out_file = out_dir / f"{file.stem}_z{i:02d}.tif"
+        out_name = _prefix_with_roi(f"{file.stem}_z{i:02d}.tif", roi)
+        out_file = out_dir / out_name
         _write_tiff(
             out_file,
             cyx_u16,
@@ -733,6 +837,7 @@ def _process_file_to_z_slices(
 
 def _process_file_to_ortho(
     file: Path,
+    roi: str,
     out_dir: Path,
     channels: str | None,
     crop: int,
@@ -790,7 +895,8 @@ def _process_file_to_ortho(
             append_max=other_max,
         )  # (C,Z,X)
         czx = _resize_uint16(czx, (1.0, anisotropy * upscale, upscale))
-        out_file = out_dir / f"{file.stem}_orthozx-{yi}.tif"
+        out_name = _prefix_with_roi(f"{file.stem}_orthozx-{yi}.tif", roi)
+        out_file = out_dir / out_name
         _write_tiff(
             out_file,
             czx,
@@ -817,7 +923,8 @@ def _process_file_to_ortho(
             append_max=other_max,
         )  # (C,Z,Y)
         czy = _resize_uint16(czy, (1.0, anisotropy * upscale, upscale))
-        out_file = out_dir / f"{file.stem}_orthozy-{xi}.tif"
+        out_name = _prefix_with_roi(f"{file.stem}_orthozy-{xi}.tif", roi)
+        out_file = out_dir / out_name
         _write_tiff(
             out_file,
             czy,
@@ -886,17 +993,20 @@ def _compute_tile_origins(
 
 def _format_tile_filename(
     stem: str,
+    roi: str,
     z_index: int,
     y0: int,
     x0: int,
     *,
     coord_width: int,
 ) -> str:
-    return f"{stem}_y{y0:0{coord_width}d}_x{x0:0{coord_width}d}_z{z_index:02d}.tif"
+    name = f"{stem}_y{y0:0{coord_width}d}_x{x0:0{coord_width}d}_z{z_index:02d}.tif"
+    return _prefix_with_roi(name, roi)
 
 
 def _process_zarr_tiles(
     file: Path,
+    roi: str,
     vol: object,
     names_all: list[str] | None,
     tile_origins: list[tuple[int, int]],
@@ -951,11 +1061,13 @@ def _process_zarr_tiles(
                 crop_slices=None,
                 filter_before=True,
                 append_max=other_max,
+                apply_filter=False,
             )
             cyx_u16 = _resize_uint16(cyx_u16, (1.0, upscale, upscale))
 
             out_name = _format_tile_filename(
                 file.stem,
+                roi,
                 z_index,
                 y0,
                 x0,
@@ -979,6 +1091,7 @@ def _process_zarr_tiles(
 
 def _process_zarr_ortho(
     file: Path,
+    roi: str,
     vol: object,
     names_all: list[str] | None,
     y_positions: list[int],
@@ -1022,9 +1135,11 @@ def _process_zarr_ortho(
             crop_slices=None,
             filter_before=False,
             append_max=other_max,
+            apply_filter=False,
         )
         czx = _resize_uint16(czx, (1.0, anisotropy * upscale, upscale))
-        out_file = out_dir / f"{file.stem}_orthozx-{yi}.tif"
+        out_name = _prefix_with_roi(f"{file.stem}_orthozx-{yi}.tif", roi)
+        out_file = out_dir / out_name
         _write_tiff(
             out_file,
             czx,
@@ -1047,9 +1162,11 @@ def _process_zarr_ortho(
             crop_slices=None,
             filter_before=False,
             append_max=other_max,
+            apply_filter=False,
         )
         czy = _resize_uint16(czy, (1.0, anisotropy * upscale, upscale))
-        out_file = out_dir / f"{file.stem}_orthozy-{xi}.tif"
+        out_name = _prefix_with_roi(f"{file.stem}_orthozy-{xi}.tif", roi)
+        out_file = out_dir / out_name
         _write_tiff(
             out_file,
             czy,

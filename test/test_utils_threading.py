@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
+
+import pytest
+from loguru import logger
 
 import fishtools.utils.threading as threading_utils
-import pytest
-
-from fishtools.utils.pretty_print import progress_bar_threadpool
+from fishtools.utils.logging import CONSOLE_SKIP_EXTRA
+from fishtools.utils.pretty_print import (
+    TaskCancelledException,
+    get_shared_console,
+    progress_bar_threadpool,
+)
 
 
 def _noop() -> None:
@@ -51,3 +58,40 @@ def test_progress_bar_threadpool_reuses_external_executor(monkeypatch: pytest.Mo
             future.result()
 
     assert len(shutdown_calls) == 1
+
+
+def test_progress_bar_threadpool_logs_use_shared_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    console_messages: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    console = get_shared_console()
+
+    def capture_log(*args: object, **kwargs: object) -> None:
+        console_messages.append((args, kwargs))
+
+    monkeypatch.setattr(console, "log", capture_log)
+
+    log_records: list[dict[str, object]] = []
+
+    def sink(message: Any) -> None:
+        log_records.append(message.record)
+
+    sink_id = logger.add(sink, level="ERROR", format="{message}")
+
+    def boom() -> None:
+        raise RuntimeError("boom")
+
+    with pytest.raises(TaskCancelledException):
+        with progress_bar_threadpool(1, threads=1, stop_on_exception=True) as submit:
+            submit(boom)
+
+    logger.remove(sink_id)
+
+    assert console_messages, "Exceptions must be routed through shared console"
+    console_payload = console_messages[0][0][0]
+    assert isinstance(console_payload, str)
+    assert "boom" in console_payload
+
+    matching = [record for record in log_records if "boom" in record["message"]]
+    assert matching, "Expected error record capturing the exception"
+    assert all(record["extra"].get(CONSOLE_SKIP_EXTRA) is True for record in matching), (
+        "Console sink should be skipped for captured logs"
+    )

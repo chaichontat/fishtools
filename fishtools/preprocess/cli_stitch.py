@@ -473,14 +473,13 @@ def register(
             raise ValueError(f"No registered codebooks found for ROI '{roi}' in workspace {ws.path}")
         else:
             raise ValueError(
-                "Multiple registered codebooks found for ROI '{}' in workspace {}. "
-                "Please specify one using --codebook.".format(roi, ws.path)
+                f"Multiple registered codebooks found for ROI '{roi}' in workspace {ws.path}. "
+                "Please specify one using --codebook."
             )
     elif codebook not in available_codebooks:
         raise ValueError(
-            "Codebook '{}' not found for ROI '{}' in workspace {}. Available: {}".format(
-                codebook, roi, ws.path, available_codebooks
-            )
+            f"Codebook '{codebook}' not found for ROI '{roi}' in workspace {ws.path}. "
+            f"Available: {available_codebooks}"
         )
 
     registered_dir = ws.registered(roi, codebook)
@@ -1263,9 +1262,7 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
                 logger.warning("Could not find channel names ('key') in TIF metadata.")
         except StopIteration:
             logger.warning(
-                "No registered TIF file found in {} to read channel names.".format(
-                    ws.registered(current_roi, codebook)
-                )
+                f"No registered TIF file found in {ws.registered(current_roi, codebook)} to read channel names."
             )
         except Exception as e:
             logger.warning(f"Error reading metadata from TIF file: {e}")
@@ -1332,6 +1329,12 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
 @click.option("--overwrite", is_flag=True, help="Overwrite existing outputs.")
 @click.option("--single-plane", is_flag=True, help="Only correct the specified Z plane (debugging aid).")
 @click.option("--debug", is_flag=True, help="Write float32 debug outputs alongside quantized corrections.")
+@click.option(
+    "--unsharp-mask/--no-unsharp-mask",
+    default=True,
+    show_default=True,
+    help="Pre-filter the N4 source plane with cucim.skimage.filters.unsharp_mask (requires GPU/CuPy).",
+)
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def n4(
     path: Path,
@@ -1349,6 +1352,7 @@ def n4(
     overwrite: bool,
     single_plane: bool,
     debug: bool,
+    unsharp_mask: bool,
 ) -> None:
     """Run N4 bias-field correction against stitched mosaics."""
 
@@ -1375,6 +1379,7 @@ def n4(
             overwrite=overwrite,
             single_plane=single_plane,
             debug=debug,
+            use_unsharp_mask=unsharp_mask,
         )
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc

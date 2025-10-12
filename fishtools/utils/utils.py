@@ -1,8 +1,6 @@
 import functools
 import logging
-import os
 import subprocess
-import sys
 import types
 from collections.abc import Callable, Sequence
 from functools import cache, wraps
@@ -300,7 +298,10 @@ def batch_roi(
                     try:
                         func(*args, **roi_kwargs)  # type: ignore[misc]
                     except Exception as e:
-                        raise RuntimeError(f"Failed processing ROI '{roi}': {e}") from e
+                        # Emit full traceback to logs to aid root-cause analysis
+                        logger.opt(exception=True).error("Exception while processing ROI '{roi}'", roi=roi)
+                        # Re-raise with exception type for clearer CLI surface
+                        raise RuntimeError(f"Failed processing ROI '{roi}': {type(e).__name__}: {e}") from e
 
                 return None
 

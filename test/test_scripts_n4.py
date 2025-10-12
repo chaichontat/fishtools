@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import types
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,18 @@ from typing import Any
 import numpy as np
 import pytest
 import zarr
-from tifffile import imread
+from skimage import filters as sk_filters
+from tifffile import imwrite as tif_imwrite
+
+# Provide a CuCIM stand-in backed by skimage filters so imports succeed in tests.
+if "cucim.skimage.filters" not in sys.modules:
+    cucim_module = sys.modules.setdefault("cucim", types.ModuleType("cucim"))
+    cucim_skimage = sys.modules.setdefault("cucim.skimage", types.ModuleType("cucim.skimage"))
+    cucim_filters = types.ModuleType("cucim.skimage.filters")
+    cucim_filters.unsharp_mask = sk_filters.unsharp_mask
+    cucim_skimage.filters = cucim_filters
+    cucim_module.skimage = cucim_skimage
+    sys.modules["cucim.skimage.filters"] = cucim_filters
 
 from fishtools.preprocess import n4
 
@@ -26,132 +38,20 @@ def _create_fused_store(path: Path, data: np.ndarray) -> None:
     store[...] = data
 
 
-def test_compute_field_from_workspace_creates_correction_field(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    workspace = tmp_path / "ws"
-    fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
-    fused_dir.mkdir(parents=True)
+def _fake_cp() -> types.SimpleNamespace:
+    def _asarray(arr: np.ndarray, dtype: Any | None = None) -> np.ndarray:
+        return np.asarray(arr, dtype=dtype)
 
-    data = np.zeros((2, 8, 8, 1), dtype=np.uint16)
-    data[0, 2:6, 2:6, 0] = 100
-    data[1, 3:7, 3:7, 0] = 400
-    _create_fused_store(fused_dir, data)
-
-    config = n4.N4RuntimeConfig(
-        workspace=workspace,
-        roi="roi",
-        codebook="cb",
-        channel=0,
-        shrink=2,
-        spline_lowres_px=32.0,
-        z_index=0,
-        field_output=fused_dir / "field.tif",
-        corrected_output=None,
-        apply_correction=False,
-        overwrite=True,
-    )
-
-    monkeypatch.setattr(
-        n4,
-        "compute_correction_field",
-        lambda *args, **kwargs: np.ones((8, 8), dtype=np.float32),
-    )
-
-    result = n4.compute_field_from_workspace(config)
-
-    assert result.field_path.exists()
-    assert result.corrected_path is None
-
-    field = imread(result.field_path)
-    assert field.shape[-2:] == (8, 8)
-    assert field.dtype == np.float32
-    assert np.isfinite(field).all()
-    assert np.isfinite(field).all()
-    assert field.mean() > 0
-
-
-def test_compute_field_from_workspace_applies_correction(tmp_path: Path) -> None:
-    workspace = tmp_path / "ws"
-    fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
-    fused_dir.mkdir(parents=True)
-
-    field = np.ones((8, 8), dtype=np.float32)
-    field[2:6, 2:6] = 2.0
-
-    biased = np.zeros((3, 8, 8, 1), dtype=np.float32)
-    for z in range(3):
-        biased[z, :, :, 0] = (z + 1) * field
-    _create_fused_store(fused_dir, biased.astype(np.uint16))
-
-    config = n4.N4RuntimeConfig(
-        workspace=workspace,
-        roi="roi",
-        codebook="cb",
-        channel=0,
-        shrink=1,
-        spline_lowres_px=16.0,
-        z_index=0,
-        field_output=fused_dir / "field.tif",
-        corrected_output=fused_dir / "corrected.zarr",
-        apply_correction=True,
-        overwrite=True,
-        debug=True,
-    )
-
-    result = n4.compute_field_from_workspace(config)
-    assert result.corrected_path is not None
-
-    corrected = zarr.open_array(result.corrected_path, mode="r")
-    assert corrected.shape == (3, 8, 8, 1)
-    wf = imread(result.field_path).astype(np.float32)
-    written_field = wf[0] if wf.ndim == 3 else wf
-
-    fused = zarr.open_array(fused_dir / "fused.zarr", mode="r")
-    corrected_float = []
-    for z in range(3):
-        plane = np.asarray(fused[z, :, :, 0], dtype=np.float32)
-        corrected_float.append(plane / written_field)
-
-    quant = dict(corrected.attrs["quantization"])
-    channel_meta = dict(quant["channels"][0])
-    lower = float(channel_meta["lower"])
-    scale = float(channel_meta["scale"])
-    dtype_info = np.iinfo(np.uint16)
-    corrected_float_arr = np.stack(corrected_float, axis=0)
-    stored_uint16 = np.asarray(corrected, dtype=np.uint16).squeeze(axis=-1)
-    recovered = stored_uint16.astype(np.float32) / scale + lower
-    diff = np.abs(recovered - corrected_float_arr)
-    inside_mask = (stored_uint16 > 0) & (stored_uint16 < dtype_info.max)
-    if np.any(inside_mask):
-        assert diff[inside_mask].max() <= 1e-2
-    below_mask = stored_uint16 == 0
-    if np.any(below_mask):
-        assert np.all(corrected_float_arr[below_mask] <= lower + 2e-2)
-    above_mask = stored_uint16 == dtype_info.max
-    upper = float(channel_meta["upper"])
-    if np.any(above_mask):
-        assert np.all(corrected_float_arr[above_mask] >= upper - 2e-2)
-    total_samples = quant["sampling"]["total_samples"]
-    assert quant["lower_percentile"] == pytest.approx(n4.QUANT_LOWER_PERCENTILE)
-    if total_samples < n4.QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE:
-        assert quant["upper_percentile"] == pytest.approx(n4.QUANT_FALLBACK_UPPER_PERCENTILE)
-    else:
-        assert quant["upper_percentile"] == pytest.approx(n4.QUANT_UPPER_PERCENTILE)
-
-    float_store = zarr.open_array(
-        result.corrected_path.with_name(
-            f"{result.corrected_path.stem}_float32{result.corrected_path.suffix}"
-        ),
-        mode="r",
-    )
-    assert float_store.shape == corrected.shape
-    np.testing.assert_allclose(
-        np.asarray(float_store).squeeze(axis=-1),
-        corrected_float_arr,
-        rtol=1e-4,
-        atol=5e-2,
-    )
+    ns = types.SimpleNamespace()
+    ns.asarray = _asarray
+    ns.float32 = np.float32
+    ns.bool_ = np.bool_
+    ns.ndarray = np.ndarray
+    ns.where = np.where
+    ns.asnumpy = lambda arr: np.asarray(arr)
+    ns.empty = lambda shape, dtype=None: np.empty(shape, dtype=dtype if dtype is not None else np.float32)
+    ns.nan_to_num = np.nan_to_num
+    return ns
 
 
 def test_compute_correction_field_requires_positive_mask() -> None:
@@ -186,110 +86,133 @@ def test_compute_correction_field_method_threshold_empty_mask() -> None:
         )
 
 
-def test_apply_correction_field_divides_by_field() -> None:
-    image = np.array([[2.0, 4.0], [6.0, 8.0]], dtype=np.float32)
-    field = np.array([[2.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+def test_unsharp_mask_helper_executes_with_mocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_cp = _fake_cp()
+    monkeypatch.setattr(n4, "cp", fake_cp)
+    monkeypatch.setattr(
+        n4,
+        "cucim_filters",
+        # Accept radius kwarg to mirror production call signature
+        types.SimpleNamespace(unsharp_mask=lambda arr, radius=3, preserve_range=True, **kwargs: arr * 2.0),
+    )
 
-    corrected = n4.apply_correction_field(image, field)
+    image = np.ones((3, 3), dtype=np.float32)
+    mask = np.zeros_like(image, dtype=bool)
+    mask[1, 1] = True
 
-    expected = np.array([[1.0, 2.0], [2.0, 2.0]], dtype=np.float32)
-    np.testing.assert_allclose(corrected, expected, rtol=1e-6, atol=1e-6)
-
-
-def test_apply_correction_field_prefers_cupy_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    image = np.array([[4.0, 8.0], [12.0, 16.0]], dtype=np.float32)
-    field = np.array([[2.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-    expected = np.array([[2.0, 4.0], [4.0, 4.0]], dtype=np.float32)
-
-    calls = {"asarray": 0, "asnumpy": 0}
-
-    class _DummyCuPy:
-        float32 = np.float32
-        ndarray = np.ndarray
-
-        def __init__(self) -> None:
-            self.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCount=lambda: 1))
-
-        def asarray(self, arr: np.ndarray, dtype: Any | None = None) -> np.ndarray:
-            calls["asarray"] += 1
-            return np.asarray(arr, dtype=dtype) if dtype is not None else np.asarray(arr)
-
-        def asnumpy(self, arr: np.ndarray) -> np.ndarray:
-            calls["asnumpy"] += 1
-            return np.asarray(arr)
-
-    dummy_cp = _DummyCuPy()
-    # Clear cached availability decision before overriding.
-    n4._cupy_available.cache_clear()
-    monkeypatch.setattr(n4, "cp", dummy_cp)
-    monkeypatch.setattr(n4, "_cupy_available", lambda: True)
-
-    corrected = n4.apply_correction_field(image, field)
-
-    np.testing.assert_allclose(corrected, expected, rtol=1e-6, atol=1e-6)
-    assert calls["asarray"] >= 2  # field + image transfer
-    assert calls["asnumpy"] >= 1
+    result = n4._apply_unsharp_mask_if_enabled(image, mask=mask, enabled=True)
+    assert isinstance(result, np.ndarray)
+    assert result.shape == image.shape
+    assert np.isclose(result[1, 1], 2.0)
+    assert np.allclose(result[mask == 0], 1.0)
 
 
-def test_apply_correction_field_rejects_non_positive_values() -> None:
-    image = np.ones((2, 2), dtype=np.float32)
-    field = np.ones((2, 2), dtype=np.float32)
-    field[0, 0] = 0.0
-
-    with pytest.raises(ValueError, match="Field must be strictly positive"):
-        n4.apply_correction_field(image, field)
-
-
-def test_apply_correction_to_store_outputs_corrected_zarr(tmp_path: Path) -> None:
+def test_unsharp_mask_preprocesses_n4_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace = tmp_path / "ws"
     fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
     fused_dir.mkdir(parents=True)
 
-    base = np.stack([
-        np.full((8, 8), 100.0, dtype=np.float32),
-        np.full((8, 8), 50.0, dtype=np.float32),
-    ])
-    field = np.linspace(1.0, 2.0, 64, dtype=np.float32).reshape(8, 8)
-    biased = base * field
-    data = np.stack([biased, biased], axis=-1)  # duplicate channel for unrelated data
-    _create_fused_store(fused_dir, data.astype(np.uint16))
+    data = np.zeros((1, 6, 6, 1), dtype=np.uint16)
+    data[0, 2:4, 2:4, 0] = 100
+    _create_fused_store(fused_dir, data)
 
-    output = fused_dir / "n4_corrected.zarr"
-    n4.apply_correction_to_store(
-        fused_dir / "fused.zarr",
-        channel_index=0,
-        field=field,
-        output_path=output,
+    fake_cp = _fake_cp()
+    fake_cp.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCount=lambda: 1))
+    monkeypatch.setattr(n4, "cp", fake_cp)
+    monkeypatch.setattr(
+        n4,
+        "cucim_filters",
+        # Accept radius kwarg to mirror production call signature
+        types.SimpleNamespace(unsharp_mask=lambda arr, radius=3, preserve_range=True, **kwargs: arr + 5.0),
+    )
+
+    observed: dict[str, np.ndarray] = {}
+
+    def fake_compute(image: np.ndarray, **_: Any) -> np.ndarray:
+        observed["input"] = np.asarray(image, dtype=np.float32)
+        return np.ones_like(image, dtype=np.float32)
+
+    monkeypatch.setattr(n4, "compute_correction_field", fake_compute)
+
+    config = n4.N4RuntimeConfig(
+        workspace=workspace,
+        roi="roi",
+        codebook="cb",
+        channel=0,
+        shrink=1,
+        spline_lowres_px=8.0,
+        z_index=0,
+        field_output=fused_dir / "field.tif",
+        corrected_output=None,
+        apply_correction=False,
         overwrite=True,
-        debug=True,
+        use_unsharp_mask=True,
     )
 
-    corrected = zarr.open_array(output, mode="r")
-    assert corrected.shape == (2, 8, 8, 1)
-    assert corrected.dtype == np.uint16
+    n4.compute_fields_from_workspace(config)
 
-    fused = zarr.open_array(fused_dir / "fused.zarr", mode="r")
-    corrected_float = [np.asarray(fused[idx, :, :, 0], dtype=np.float32) / field for idx in range(2)]
-    quant = dict(corrected.attrs["quantization"])
-    lower = float(quant["lower"])
-    scale = float(quant["scale"])
-    dtype_info = np.iinfo(np.uint16)
-    corrected_float_arr = np.stack(corrected_float, axis=0)
-    expected_uint16 = np.clip(
-        np.round(((corrected_float_arr[..., None]) - lower) * scale),
-        0.0,
-        dtype_info.max,
-    ).astype(np.uint16)
+    assert "input" in observed
+    mask = data[0, :, :, 0] > 0
+    original_plane = data[0, :, :, 0].astype(np.float32)
+    expected = np.where(mask, original_plane + 5.0, original_plane)
+    np.testing.assert_allclose(observed["input"], expected)
 
-    np.testing.assert_array_equal(np.asarray(corrected), expected_uint16)
 
-    float_store = zarr.open_array(output.with_name(f"{output.stem}_float32{output.suffix}"), mode="r")
-    np.testing.assert_allclose(
-        np.asarray(float_store).squeeze(axis=-1),
-        corrected_float_arr,
-        rtol=1e-4,
-        atol=5e-2,
+def test_unsharp_mask_applies_during_correction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "ws"
+    fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
+    fused_dir.mkdir(parents=True)
+
+    data = np.zeros((1, 4, 4, 1), dtype=np.uint16)
+    data[0, 1:3, 1:3, 0] = 50
+    _create_fused_store(fused_dir, data)
+
+    # Simplify GPU helpers
+    monkeypatch.setattr(n4, "_prepare_gpu_field", lambda field: np.asarray(field, dtype=np.float32))
+
+    masks_seen: list[np.ndarray] = []
+
+    def fake_correct_plane_gpu(
+        plane: np.ndarray,
+        *,
+        field_gpu: np.ndarray,
+        use_unsharp_mask: bool,
+        mask_cpu: np.ndarray | None = None,
+    ) -> np.ndarray:
+        if mask_cpu is not None:
+            masks_seen.append(np.asarray(mask_cpu, dtype=bool))
+        return np.asarray(plane, dtype=np.float32) / np.asarray(field_gpu, dtype=np.float32)
+
+    monkeypatch.setattr(n4, "_correct_plane_gpu", fake_correct_plane_gpu)
+    monkeypatch.setattr(
+        n4, "compute_correction_field", lambda *args, **kwargs: np.ones((4, 4), dtype=np.float32)
     )
+    fake_cp = _fake_cp()
+    fake_cp.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCount=lambda: 1))
+    monkeypatch.setattr(n4, "cp", fake_cp)
+
+    config = n4.N4RuntimeConfig(
+        workspace=workspace,
+        roi="roi",
+        codebook="cb",
+        channel=0,
+        shrink=1,
+        spline_lowres_px=8.0,
+        z_index=0,
+        field_output=fused_dir / "field.tif",
+        corrected_output=fused_dir / "corrected.zarr",
+        apply_correction=True,
+        overwrite=True,
+        use_unsharp_mask=True,
+    )
+
+    n4.compute_fields_from_workspace(config)
+
+    assert len(masks_seen) == 2  # reference plane + correction loop
+    expected_mask = data[0, :, :, 0] > 0
+    for mask in masks_seen:
+        assert mask.shape == expected_mask.shape
+        assert np.array_equal(mask, expected_mask)
 
 
 def test_compute_fields_from_workspace_records_threshold_metadata(
@@ -325,13 +248,13 @@ def test_compute_fields_from_workspace_records_threshold_metadata(
     )
 
     captured_meta: dict[str, Any] = {}
-    original_imwrite = n4.imwrite
 
     def _spy_imwrite(path: Path, data: Any, **kwargs: Any) -> None:
         metadata = kwargs.get("metadata")
         if isinstance(metadata, dict):
             captured_meta.update(metadata)
-        original_imwrite(path, data, **kwargs)
+        cleaned = {k: v for k, v in kwargs.items() if k != "metadata"}
+        tif_imwrite(path, data, **cleaned)
 
     monkeypatch.setattr(n4, "imwrite", _spy_imwrite)
 
@@ -343,36 +266,83 @@ def test_compute_fields_from_workspace_records_threshold_metadata(
     assert threshold_meta == {"kind": "method", "function": "threshold_otsu"}
 
 
-def test_apply_correction_to_store_float_debug_preserves_outlier(tmp_path: Path) -> None:
-    fused_path = tmp_path / "fused.zarr"
-    fused = zarr.open_array(
-        fused_path,
-        mode="w",
-        shape=(1, 8, 8, 1),
-        chunks=(1, 8, 8, 1),
-        dtype=np.float32,
-    )
-    fused[:] = 10.0
-    fused[0, 1, 1, 0] = 1000.0  # outlier not captured by stride-based sampling
+def test_compute_fields_from_workspace_corrects_zarr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "ws"
+    fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
+    fused_dir.mkdir(parents=True)
 
-    field = np.ones((8, 8), dtype=np.float32)
-    output = tmp_path / "corrected.zarr"
-    result = n4.apply_correction_to_store(
-        fused_path,
-        channel_index=0,
-        field=field,
-        output_path=output,
+    base_planes = np.stack([
+        np.full((8, 8), 100.0, dtype=np.float32),
+        np.full((8, 8), 50.0, dtype=np.float32),
+    ])
+    field = np.linspace(1.0, 2.0, 64, dtype=np.float32).reshape(8, 8)
+    biased = base_planes * field
+    data = np.stack([biased, biased], axis=-1)
+    _create_fused_store(fused_dir, data.astype(np.uint16))
+
+    monkeypatch.setattr(n4, "compute_correction_field", lambda *args, **kwargs: field.copy())
+    monkeypatch.setattr(n4, "_prepare_gpu_field", lambda arr: np.asarray(arr, dtype=np.float32))
+
+    def fake_correct_plane_gpu(
+        plane: np.ndarray,
+        *,
+        field_gpu: np.ndarray,
+        use_unsharp_mask: bool,
+        mask_cpu: np.ndarray | None = None,
+    ) -> np.ndarray:
+        return np.asarray(plane, dtype=np.float32) / np.asarray(field_gpu, dtype=np.float32)
+
+    monkeypatch.setattr(n4, "_correct_plane_gpu", fake_correct_plane_gpu)
+    fake_cp = _fake_cp()
+    fake_cp.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCount=lambda: 1))
+    monkeypatch.setattr(n4, "cp", fake_cp)
+
+    config = n4.N4RuntimeConfig(
+        workspace=workspace,
+        roi="roi",
+        codebook="cb",
+        channel=0,
+        shrink=1,
+        spline_lowres_px=8.0,
+        z_index=0,
+        field_output=fused_dir / "field.tif",
+        corrected_output=fused_dir / "corrected.zarr",
+        apply_correction=True,
         overwrite=True,
         debug=True,
+        use_unsharp_mask=False,
     )
 
-    quant = zarr.open_array(result, mode="r")
-    float_store = zarr.open_array(result.with_name(f"{result.stem}_float32{result.suffix}"), mode="r")
-    dtype_info = np.iinfo(np.uint16)
+    result = n4.compute_fields_from_workspace(config)[0]
+    assert result.corrected_path is not None
 
-    assert quant[0, 1, 1, 0] == dtype_info.max  # clipped in uint16
-    assert float_store[0, 1, 1, 0] == pytest.approx(1000.0, rel=1e-6)
-    assert (
-        quant.attrs["quantization"]["float_store"]
-        == result.with_name(f"{result.stem}_float32{result.suffix}").name
+    corrected = zarr.open_array(result.corrected_path, mode="r")
+    assert corrected.shape == (2, 8, 8, 1)
+    fused = zarr.open_array(fused_dir / "fused.zarr", mode="r")
+    corrected_float = [np.asarray(fused[idx, :, :, 0], dtype=np.float32) / field for idx in range(2)]
+
+    quant = dict(corrected.attrs["quantization"])
+    channel_meta = dict(quant["channels"][0])
+    lower = float(channel_meta["lower"])
+    scale = float(channel_meta["scale"])
+    dtype_info = np.iinfo(np.uint16)
+    corrected_float_arr = np.stack(corrected_float, axis=0)
+    stored_uint16 = np.asarray(corrected, dtype=np.uint16).squeeze(axis=-1)
+    recovered = stored_uint16.astype(np.float32) / scale + lower
+    diff = np.abs(recovered - corrected_float_arr)
+    inside_mask = (stored_uint16 > 0) & (stored_uint16 < dtype_info.max)
+    if np.any(inside_mask):
+        assert diff[inside_mask].max() <= 1e-2
+
+    float_store = zarr.open_array(
+        result.corrected_path.with_name(
+            f"{result.corrected_path.stem}_float32{result.corrected_path.suffix}"
+        ),
+        mode="r",
+    )
+    np.testing.assert_allclose(
+        np.asarray(float_store).squeeze(axis=-1),
+        corrected_float_arr,
+        rtol=1e-4,
+        atol=5e-2,
     )

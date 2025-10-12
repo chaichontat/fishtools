@@ -43,5 +43,12 @@ def shared_thread_pool(
     )
     try:
         yield executor
-    finally:
+    except BaseException:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            # Best-effort shutdown; swallow to re-raise original exception.
+            pass
+        raise
+    else:
         executor.shutdown(wait=True)
