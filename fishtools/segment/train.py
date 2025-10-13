@@ -1,8 +1,9 @@
+import re
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Pattern, Sequence, cast
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from fishtools.utils.utils import noglobal
 
@@ -11,6 +12,8 @@ class TrainConfig(BaseModel):
     name: str
     channels: tuple[int, int]
     training_paths: list[str]
+    include: list[str] = Field(default_factory=list)
+    exclude: list[str] = Field(default_factory=list)
     n_epochs: int = 200
 
     learning_rate: float = 0.008
@@ -23,6 +26,22 @@ class TrainConfig(BaseModel):
     train_losses: list[float] = []
 
 
+# Regex utilities are kept local to avoid cross-module dependencies while still
+# providing clear error messages for invalid user-supplied patterns.
+def _compile_patterns(patterns: Sequence[str]) -> list[Pattern[str]]:
+    compiled: list[Pattern[str]] = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as exc:
+            raise ValueError(f"Invalid regex pattern {pattern!r}: {exc}") from exc
+    return compiled
+
+
+def _matches_any(patterns: Sequence[Pattern[str]], value: str) -> bool:
+    return any(regex.search(value) for regex in patterns)
+
+
 # models = sorted(
 #     (file for file in (path / "models").glob("*") if "train_losses" not in file.name),
 #     key=lambda x: x.stat().st_mtime,
@@ -31,7 +50,10 @@ class TrainConfig(BaseModel):
 
 
 def concat_output(
-    path: Path, samples: list[str], mask_filter: list[str] | str = "_seg.npy", one_level_down: bool = False
+    path: Path,
+    samples: list[str],
+    mask_filter: list[str] | str = "_seg.npy",
+    one_level_down: bool = False,
 ) -> tuple[list, ...]:
     from cellpose.io import load_train_test_data
 
@@ -102,5 +124,98 @@ def run_train(name: str, path: Path, train_config: TrainConfig):
     )
 
     logger.info(f"Training data loaded: {len(out2[0])} images")
-    model_path, train_losses, test_losses = _train(out2, path, train_config=train_config, name=name)
-    return train_config.model_copy(update=dict(train_losses=train_losses.tolist()))
+    images, labels, image_names, test_images, test_labels, image_names_test = out2
+
+    # Build resolved paths from image_names; if names are relative, use as-is.
+    if train_config.include or train_config.exclude:
+        if image_names is None:
+            raise ValueError("Cellpose did not provide image names; include/exclude filters require them.")
+
+        include_regexes = _compile_patterns(train_config.include)
+        exclude_regexes = _compile_patterns(train_config.exclude)
+
+        normalized_paths = [
+            (name.as_posix() if isinstance(name, Path) else str(name)).replace("\\", "/")
+            for name in image_names
+        ]
+
+        records = [
+            (img, lbl, original_name, normalized_path)
+            for img, lbl, original_name, normalized_path in zip(
+                images, labels, image_names, normalized_paths
+            )
+        ]
+
+        dropped_by_include = [
+            normalized_path
+            for _, _, _, normalized_path in records
+            if include_regexes and not _matches_any(include_regexes, normalized_path)
+        ]
+
+        candidate_records = [
+            record
+            for record in records
+            if not include_regexes or _matches_any(include_regexes, record[3])
+        ]
+
+        dropped_by_exclude = [
+            normalized_path
+            for _, _, _, normalized_path in candidate_records
+            if exclude_regexes and _matches_any(exclude_regexes, normalized_path)
+        ]
+
+        filtered_records = [
+            record
+            for record in candidate_records
+            if not exclude_regexes or not _matches_any(exclude_regexes, record[3])
+        ]
+
+        if dropped_by_include:
+            logger.info(
+                f"Skipped {len(dropped_by_include)} image paths due to include filters: {dropped_by_include}"
+            )
+
+        if dropped_by_exclude:
+            logger.info(
+                f"Skipped {len(dropped_by_exclude)} image paths due to exclude filters: {dropped_by_exclude}"
+            )
+
+        if not filtered_records:
+            raise ValueError(
+                "No training images remain after applying include/exclude filters."
+                f" include={train_config.include}, exclude={train_config.exclude}"
+            )
+
+        filtered_images = [record[0] for record in filtered_records]
+        filtered_labels = [record[1] for record in filtered_records]
+        filtered_image_names = [record[2] for record in filtered_records]
+    else:
+        filtered_images = images
+        filtered_labels = labels
+        filtered_image_names = image_names
+
+    total_images = len(images)
+    kept_images = len(filtered_images)
+    excluded_images = total_images - kept_images
+    logger.info(f"Filter summary: kept {kept_images}/{total_images} images; excluded {excluded_images}.")
+
+    filtered: tuple[list, ...] = (
+        filtered_images,
+        filtered_labels,
+        filtered_image_names if filtered_image_names is not None else None,
+        test_images,
+        test_labels,
+        image_names_test,
+    )
+
+    if not filtered[0]:
+        raise ValueError(
+            "No training images remain after applying include/exclude filters."
+            f" include={train_config.include}, exclude={train_config.exclude}"
+        )
+
+    _model_path, train_losses, _test_losses = _train(filtered, path, train_config=train_config, name=name)
+
+    normalized_train_losses = train_losses.tolist() if hasattr(train_losses, "tolist") else list(train_losses)
+
+    return train_config.model_copy(update=dict(train_losses=normalized_train_losses))

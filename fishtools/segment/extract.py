@@ -389,7 +389,10 @@ def cmd_extract(
     ],
     roi: Annotated[
         str | None,
-        typer.Option("--roi", "-r", help="ROI name (e.g., cortex)", rich_help_panel="Inputs"),
+        typer.Argument(
+            help="Optional ROI name (e.g., cortex). Omit to process every ROI in the workspace.",
+            show_default=False,
+        ),
     ] = None,
     codebook: Annotated[
         str,
@@ -451,8 +454,13 @@ def cmd_extract(
     if mode == "ortho" and dz != 1:
         raise typer.BadParameter("--dz parameter is only valid for 'z' mode.")
 
-    if upscale is None:
+    if use_zarr:
+        if upscale is not None and not math.isclose(upscale, 2.0):
+            logger.info(f"Overriding --upscale value {upscale} to 2.0 for --zarr mode.")
+        upscale = 2.0
+    elif upscale is None:
         upscale = 1.0
+
     if upscale <= 0:
         raise typer.BadParameter("--upscale must be positive.")
 
@@ -636,8 +644,16 @@ def _extract_single_roi(
         total_outputs = 0
         for f in files:
             vol, names_all = _open_volume(f)
-            y_positions = _sample_positions(vol.shape[1], crop=crop, count=n, rng=rng)
-            x_positions = _sample_positions(vol.shape[2], crop=crop, count=n, rng=rng)
+            y_positions = _expand_positions_with_context(
+                _sample_positions(vol.shape[1], crop=crop, count=n, rng=rng),
+                crop=crop,
+                axis_len=vol.shape[1],
+            )
+            x_positions = _expand_positions_with_context(
+                _sample_positions(vol.shape[2], crop=crop, count=n, rng=rng),
+                crop=crop,
+                axis_len=vol.shape[2],
+            )
             total_outputs += len(y_positions) + len(x_positions)
             ortho_jobs.append((f, vol, names_all, y_positions, x_positions))
 
@@ -877,11 +893,13 @@ def _process_file_to_ortho(
 
     y_positions = (np.linspace(int(0.1 * y_eff), int(0.9 * y_eff), n).astype(int) + crop).tolist()
     x_positions = (np.linspace(int(0.1 * x_eff), int(0.9 * x_eff), n).astype(int) + crop).tolist()
+    y_positions_full = _expand_positions_with_context(y_positions, crop=crop, axis_len=y_len)
+    x_positions_full = _expand_positions_with_context(x_positions, crop=crop, axis_len=x_len)
     x_slice = slice(crop, x_len - crop) if crop > 0 else slice(None)
     y_slice = slice(crop, y_len - crop) if crop > 0 else slice(None)
 
     # ZX slabs (fixed Y)
-    for yi in y_positions:
+    for yi in y_positions_full:
         slab = vol[:, yi, x_slice, :]  # (Z,X,C)
         other_max = None
         if other_vol is not None:
@@ -909,7 +927,7 @@ def _process_file_to_ortho(
             progress()
 
     # ZY slabs (fixed X)
-    for xi in x_positions:
+    for xi in x_positions_full:
         slab = vol[:, y_slice, xi, :]  # (Z,Y,C)
         other_max = None
         if other_vol is not None:
@@ -952,6 +970,47 @@ def _sample_positions(length: int, *, crop: int, count: int, rng: Generator) -> 
 
     choices = rng.choice(population, size=count, replace=False)
     return sorted(int(v) for v in choices)
+
+
+def _expand_positions_with_context(
+    base_positions: list[int],
+    *,
+    crop: int,
+    axis_len: int,
+    step: int = 2,
+    context_pairs: int = 10,
+) -> list[int]:
+    """Return ordered unique positions including surrounding context for each base index.
+
+    For every position in ``base_positions`` this yields the base index followed by
+    ``context_pairs`` offsets in both positive and negative directions, stepping by ``step``.
+    Positions are clamped to the valid range implied by ``crop`` and ``axis_len`` and
+    deduplicated while preserving the first-seen order.
+    """
+
+    min_idx = crop
+    max_idx = axis_len - crop - 1 if crop > 0 else axis_len - 1
+    if min_idx > max_idx:
+        raise ValueError("Cropping removes all available positions.")
+
+    seen: set[int] = set()
+    ordered: list[int] = []
+
+    for base in base_positions:
+        offsets = [0]
+        for k in range(1, context_pairs + 1):
+            offsets.append(step * k)
+            offsets.append(-step * k)
+        for offset in offsets:
+            candidate = base + offset
+            if candidate < min_idx or candidate > max_idx:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            ordered.append(candidate)
+
+    return ordered
 
 
 def _compute_tile_origins(
@@ -1190,7 +1249,10 @@ def _app_entrypoint(
     ],
     roi: Annotated[
         str | None,
-        typer.Option("--roi", "-r", help="ROI name (e.g., cortex)", rich_help_panel="Inputs"),
+        typer.Argument(
+            help="Optional ROI name (e.g., cortex). Omit to process every ROI in the workspace.",
+            show_default=False,
+        ),
     ] = None,
     codebook: Annotated[
         str,

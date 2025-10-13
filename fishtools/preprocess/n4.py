@@ -24,7 +24,7 @@ from concurrent.futures import as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import cupy as cp
 import numpy as np
@@ -32,14 +32,10 @@ import SimpleITK as sitk
 import tifffile
 import zarr
 from cucim.skimage import filters as cucim_filters
+from cupy import ndarray as cupy_ndarray
 from loguru import logger
 from PIL import Image
 from skimage import filters
-
-if TYPE_CHECKING:  # pragma: no cover - typing aid
-    from cupy import ndarray as cupy_ndarray  # type: ignore[import-not-found]
-else:
-    cupy_ndarray = Any
 
 from fishtools import IMWRITE_KWARGS
 from fishtools.io.workspace import Workspace, safe_imwrite
