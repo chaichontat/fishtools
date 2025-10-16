@@ -2,7 +2,7 @@
 N4 bias-field correction for stitched mosaics.
 
 - Input: fused.zarr (ZYXC) under analysis/deconv/stitch--{roi}+{codebook}/.
-- Estimate a 2D per-channel field at --z-index (N4), normalized to mean 1 on
+- Estimate a 2D per-channel field at --z-index (N4), normalized to median ≈ 1 on
   foreground (>0), then apply to one plane or all Z.
 - Writes: correction field TIFF (CYX, float32) plus per‑channel PNGs; corrected
   fused.zarr (ZYXC, uint16). Add --debug to also write a float32 corrected Zarr.
@@ -55,7 +55,7 @@ QUANT_MIN_RANGE = 1e-6
 # Add a small headroom above the chosen upper percentile so that
 # a tiny fraction of very bright pixels do not saturate to 0xFFFF.
 # This does not change the recorded percentile but widens the scale used.
-QUANT_HEADROOM_FRACTION = 0.02  # 2% extra width beyond (upper - lower)
+
 
 # Custom CuPy kernels removed for simplicity. We perform per‑plane division and
 # optional unsharp masking on GPU, then quantize on CPU.
@@ -341,6 +341,41 @@ def _compute_channel_quant_from_single_plane(
     )
 
 
+def _normalize_field_to_unity(
+    field: np.ndarray,
+    image_yx: np.ndarray,
+    *,
+    threshold: float | str | None,
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """
+    Normalize N4 field so that the foreground (per `threshold`) has median ≈ 1
+    and the background is exactly 1.
+
+    Returns (normalized_field, scale, foreground_mask).
+    """
+    f = _ensure_float32(field)
+    if f.ndim != 2:
+        raise ValueError("Field must be 2D (Y, X)")
+
+    fg_mask, mask_meta = _compute_threshold_mask(image_yx, threshold)
+    if not np.any(fg_mask):
+        raise ValueError(_empty_mask_message(threshold, resolved_name=mask_meta.get("function")))
+
+    scale = float(np.nanmedian(f[fg_mask]))
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+
+    f_norm = f / scale
+    # Ensure background is exactly neutral (no correction where image is masked out)
+    bg_mask = ~fg_mask
+    if np.any(bg_mask):
+        f_norm[bg_mask] = 1.0
+
+    # Strict positivity for division stability
+    np.maximum(f_norm, np.finfo(np.float32).tiny, out=f_norm)
+    return f_norm, scale, fg_mask
+
+
 def _build_global_mask_from_fused(src: zarr.Array, qz: int) -> np.ndarray:
     """Compute a single boolean YX mask once from fused.zarr at reference z-plane.
 
@@ -503,8 +538,6 @@ def _write_fused_corrected_zyxc(
     use_unsharp_mask: bool,
 ) -> Path:
     """Write corrected imagery to Zarr with axes ordered as ZYXC."""
-    if len(channels) != len(fields) or len(channels) != len(names):
-        raise ValueError("channels, fields, and names must be the same length")
 
     src = zarr.open_array(fused_path, mode="r")
     if src.ndim != 4:
@@ -624,9 +657,25 @@ def _write_fused_corrected_zyxc(
                 hi=float(params.upper),
             )
 
-            # Precompute scale with headroom
-            width = max(params.upper - params.lower, QUANT_MIN_RANGE)
-            scale = uint16_max / (width * (1.0 + QUANT_HEADROOM_FRACTION))
+            # Adaptive high-percentile guard to maximize range without overflow.
+            # Compute an additional upper percentile from the same reference plane.
+            data_masked = np.asarray(corrected0, dtype=np.float32)[global_mask]
+            sample_n = data_masked.size
+            if sample_n >= 2_000_000:
+                guard_pct = 99.999
+            elif sample_n >= QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE:
+                guard_pct = 99.995
+            else:
+                guard_pct = 99.95
+            try:
+                guard_upper = float(np.percentile(data_masked, guard_pct))
+            except Exception:
+                guard_upper = float(params.upper)
+            if not math.isfinite(guard_upper) or guard_upper <= params.lower:
+                guard_upper = float(params.upper)
+            guard_upper = max(guard_upper, float(params.upper))
+            width_guard = max(guard_upper - params.lower, QUANT_MIN_RANGE)
+            scale = uint16_max / width_guard
 
             for zi, z_slot in enumerate(z_sel):
                 plane = np.asarray(src[z_slot, :, :, ch], dtype=np.float32)
@@ -636,10 +685,25 @@ def _write_fused_corrected_zyxc(
                     use_unsharp_mask=use_unsharp_mask,
                     mask_cpu=global_mask,
                 )
-                # Quantize on CPU
+                # Zero-out correction outside per-plane foreground (union across channels) to
+                # guarantee masked regions remain exactly 0 after quantization.
+                try:
+                    plane_union_mask = np.any(np.asarray(src[z_slot, :, :, :]) > 0, axis=-1)
+                except Exception:
+                    # Fall back to the reference-plane mask if union mask retrieval fails
+                    plane_union_mask = global_mask
+                if plane_union_mask.shape != corrected.shape:
+                    raise ValueError(
+                        f"Union mask shape {plane_union_mask.shape} does not match corrected plane {corrected.shape}"
+                    )
+                corrected = np.where(plane_union_mask, corrected, 0.0).astype(np.float32, copy=False)
+                # Quantize on CPU using adaptive guard scale
                 y = (corrected - params.lower) * scale
                 np.clip(y, 0.0, float(uint16_max), out=y)
                 u16 = np.rint(y).astype(np.uint16)
+                # Enforce zero outside mask post-quantization as well (safety against rounding)
+                if not np.all(plane_union_mask):
+                    u16[~plane_union_mask] = 0
                 if float_dest is not None:
                     float_dest[zi, :, :, ci] = corrected
                 dest[zi, :, :, ci] = u16
@@ -659,8 +723,33 @@ def _write_fused_corrected_zyxc(
     quant_channels: list[dict[str, Any]] = []
     uint16_range = np.iinfo(np.uint16).max
     for idx, name, params in zip(channels, names, channel_quant):
-        width = max(params.upper - params.lower, QUANT_MIN_RANGE)
-        scale = uint16_range / (width * (1.0 + QUANT_HEADROOM_FRACTION))
+        # Mirror the adaptive guard logic for metadata computation
+        qz = int(z_index) if z_index is not None else 0
+        global_mask = _build_global_mask_from_fused(src, qz)
+        plane0 = np.asarray(src[qz, :, :, idx], dtype=np.float32)
+        corrected0 = _correct_plane_gpu(
+            plane0,
+            field_gpu=_prepare_gpu_field(field_arrays[list(channels).index(idx)]),
+            use_unsharp_mask=use_unsharp_mask,
+            mask_cpu=global_mask,
+        )
+        data_masked = np.asarray(corrected0, dtype=np.float32)[global_mask]
+        sample_n = data_masked.size
+        if sample_n >= 2_000_000:
+            guard_pct = 99.999
+        elif sample_n >= QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE:
+            guard_pct = 99.995
+        else:
+            guard_pct = 99.95
+        try:
+            guard_upper = float(np.percentile(data_masked, guard_pct))
+        except Exception:
+            guard_upper = float(params.upper)
+        if not math.isfinite(guard_upper) or guard_upper <= params.lower:
+            guard_upper = float(params.upper)
+        guard_upper = max(guard_upper, float(params.upper))
+        width_guard = max(guard_upper - params.lower, QUANT_MIN_RANGE)
+        scale = uint16_range / width_guard
         quant_channels.append({
             "index": int(idx),
             "name": str(name),
@@ -669,6 +758,8 @@ def _write_fused_corrected_zyxc(
             "observed_min": float(params.observed_min),
             "observed_max": float(params.observed_max),
             "scale": float(scale),
+            "upper_guard": float(guard_upper),
+            "upper_guard_percentile": float(guard_pct),
             "lower_percentile": float(params.lower_percentile),
             "upper_percentile": float(params.upper_percentile),
             "samples": int(params.sample_count),
@@ -824,21 +915,13 @@ def compute_correction_field(
     # GetArrayFromImage returns a writable numpy array; avoids read-only view issues.
     field = sitk.GetArrayFromImage(sitk.Exp(log_bias_full)).astype(np.float32, copy=False)
 
-    # Normalize field to ~1.0 on foreground
-    fg_mask, mask_meta = _compute_threshold_mask(image_yx, threshold)
-    if not np.any(fg_mask):
-        raise ValueError(_empty_mask_message(threshold, resolved_name=mask_meta.get("function")))
-    scale = float(np.nanmedian(field[fg_mask]))  # robust center
-    if not np.isfinite(scale) or scale <= 0:
-        scale = 1.0
-    field /= scale
+    # Normalize: median ≈ 1 in foreground; exactly 1 outside the foreground mask
+    field, scale, fg_mask = _normalize_field_to_unity(field, image_yx, threshold=threshold)
     fg_total = fg_mask.size
     fg_fg = int(np.count_nonzero(fg_mask))
     logger.info(
         f"Foreground mask coverage: {fg_fg}/{fg_total} ({(fg_fg / max(fg_total, 1)):.2%}); normalization scale={scale:.6f}"
     )
-    # Strict positivity for division stability
-    np.maximum(field, np.finfo(np.float32).tiny, out=field)
     duration = perf_counter() - start_ts
     fmin = float(np.min(field))
     fmax = float(np.max(field))
@@ -1046,6 +1129,46 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
             cname, cfield = results[ch]
             name_list.append(cname)
             field_list.append(cfield)
+    else:
+        # Reuse existing field values for downstream correction
+        try:
+            existing_stack, stored_names = _load_multi_channel_field(field_output)
+            if existing_stack.shape[0] != len(channels):
+                raise ValueError(
+                    f"Existing field at {field_output} has {existing_stack.shape[0]} channels; expected {len(channels)}"
+                )
+            for ci, ch in enumerate(channels):
+                field_list.append(np.asarray(existing_stack[ci], dtype=np.float32))
+                if not name_list:
+                    # If names not already populated
+                    if stored_names and ci < len(stored_names):
+                        name_list.append(str(stored_names[ci]))
+                    else:
+                        name_list.append(f"channel_{ch}")
+        except Exception:
+            logger.opt(exception=True).warning("Failed to reuse existing correction field; recomputing.")
+            # Fall back to recompute
+            reuse_existing = False
+            max_workers = min(len(channels), max(1, (os.cpu_count() or 1) // 2))
+            results = {}
+            if len(channels) == 1:
+                ch = channels[0]
+                cidx, cname, cfield = _compute_one(ch)
+                results[cidx] = (cname, cfield)
+            else:
+                futmap = {}
+                with shared_thread_pool(
+                    max_workers=max_workers, launch_delay=0.05, thread_name_prefix="n4-field"
+                ) as pool:
+                    futmap = {pool.submit(_compute_one, ch): ch for ch in channels}
+                    for fut in as_completed(futmap):
+                        ch = futmap[fut]
+                        cidx, cname, cfield = fut.result()
+                        results[cidx] = (cname, cfield)
+            for ch in channels:
+                cname, cfield = results[ch]
+                name_list.append(cname)
+                field_list.append(cfield)
 
     # Write stacked multi-channel field once at the end
     meta_extra_all: dict[str, Any] = {
@@ -1062,7 +1185,9 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
     }
     if reuse_existing:
         written_field = field_output
+        global_mask: np.ndarray | None = None
     else:
+        # Save the true correction fields (background=1.0) for safe reuse.
         stacked = np.stack(field_list, axis=0).astype(np.float32)
         written_field = _write_multi_channel_field(
             stacked,
@@ -1074,11 +1199,16 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
 
     # Emit per-channel diagnostic PNGs
     if not reuse_existing:
+        # Zero background in diagnostic PNGs using union-of-channels mask at reference Z for readability.
+        src_for_mask = zarr.open_array(fused_path, mode="r")
+        qz = int(config.z_index) if config.z_index is not None else 0
+        global_mask = _build_global_mask_from_fused(src_for_mask, qz)
         for ch_name, arr in zip(name_list, field_list):
             try:
                 tag = _slugify(ch_name)
                 png_path = written_field.with_name(f"{written_field.stem}_{tag}.png")
-                _write_png_normalized(arr, png_path, long_edge_max=1024)
+                arr_png = np.where(global_mask, arr, 0.0)
+                _write_png_normalized(arr_png, png_path, long_edge_max=1024)
             except Exception:
                 logger.exception("Failed to write diagnostic PNG for channel {name}", name=ch_name)
 

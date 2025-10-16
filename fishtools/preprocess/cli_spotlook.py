@@ -27,7 +27,8 @@ from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import (
     DARK_PANEL_STYLE,
     configure_dark_axes,
-    micron_tick_formatter,
+    configure_micron_axes,
+    save_figure,
     scatter_spots,
     si_tick_formatter,
 )
@@ -163,23 +164,6 @@ def count_by_gene(spots: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def save_figure(fig: Figure, output_dir: Path, name: str, roi: str, codebook: str, log_level: str = "DEBUG"):
-    """Saves a matplotlib figure to the output directory with a standardized name for a single ROI."""
-    filename = output_dir / f"{name}--{roi}+{codebook}.png"
-    fig.savefig(filename.as_posix(), dpi=300, bbox_inches="tight")
-    _log = None
-    if log_level == "DEBUG":
-        _log = logger.debug
-    elif log_level == "INFO":
-        _log = logger.info
-    elif log_level == "WARNING":
-        _log = logger.warning
-    else:
-        raise ValueError(f"Unsupported log level: {log_level}")
-    _log(f"Saved {name}: {filename}")
-    plt.close(fig)
-
-
 def _save_combined_spots_plot(
     contexts: dict[str, ROIThresholdContext],
     output_dir: Path,
@@ -210,7 +194,11 @@ def _save_combined_spots_plot(
         int(fig_height * params.dpi),
     )
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height), dpi=params.dpi)
+    max_inches = max(fig_width, fig_height)
+    max_safe_dpi = int(65535 // max(1, max_inches))
+    render_dpi = max(1, min(int(params.dpi), max_safe_dpi))
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height), dpi=render_dpi)
     axes = np.atleast_1d(axes).ravel()
     ordered_rois = sorted(contexts)
 
@@ -245,9 +233,7 @@ def _save_combined_spots_plot(
 
     combined_path = (output_dir / f"spots_all--{codebook}.png").resolve()
     # Clamp DPI to avoid exceeding Agg backend limits (~65535 px on a side)
-    max_inches = max(fig_width, fig_height)
-    max_safe_dpi = int(65535 // max(1, max_inches))
-    save_dpi = min(int(params.dpi), max_safe_dpi)
+    save_dpi = render_dpi
     fig.savefig(combined_path.as_posix(), dpi=save_dpi, bbox_inches="tight")
     plt.close(fig)
     logger.debug(f"Saved combined spots overview: {combined_path}")
@@ -812,11 +798,7 @@ def _generate_final_outputs(
     )
 
     if {"x", "y"}.issubset(spots_ok.columns):
-        formatter = micron_tick_formatter(params.pixel_size_um)
-        ax.xaxis.set_major_formatter(formatter)
-        ax.yaxis.set_major_formatter(formatter)
-        ax.set_xlabel("X (µm)")
-        ax.set_ylabel("Y (µm)")
+        configure_micron_axes(ax, params.pixel_size_um, x_label="X", y_label="Y")
     else:
         ax.set_xlabel(x_col)
         ax.set_ylabel(y_col)
@@ -887,6 +869,12 @@ def _generate_final_outputs(
     required=True,
     help="Name of the codebook (stem of the .json file).",
 )
+@click.argument(
+    "roi",
+    type=str,
+    default="*",
+)
+@click.argument("rois", nargs=-1)
 @click.option(
     "--output",
     "-o",
@@ -894,12 +882,6 @@ def _generate_final_outputs(
     type=click.Path(file_okay=False, dir_okay=True, writable=True, resolve_path=True, path_type=Path),
     default=None,
     help="Directory to save outputs. [default: 'path.parent/output']",
-)
-@click.option(
-    "--roi",
-    "rois",
-    multiple=True,
-    help="Specific ROI to process. Can be used multiple times. [default: all found ROIs]",
 )
 @click.option(
     "--config",
@@ -921,8 +903,9 @@ def _generate_final_outputs(
 def threshold(
     path: Path,
     codebook_path: Path,
+    roi: str,
+    rois: tuple[str, ...],
     output_dir: Path | None = None,
-    rois: list[str] | None = None,
     config: Path | None = None,
     area_min: float | None = None,
     area_max: float | None = None,
@@ -936,13 +919,21 @@ def threshold(
     """
     Process spot data for each ROI individually with an interactive threshold selection step.
     """
+    wildcard_tokens = {"*", "all"}
+    requested_tokens = [token for token in (roi, *rois) if token]
+    includes_wildcard = any(token in wildcard_tokens for token in requested_tokens)
+    explicit_requested = [token for token in requested_tokens if token not in wildcard_tokens]
+    log_roi_value = ",".join(requested_tokens) if requested_tokens else "all"
+    if includes_wildcard and not explicit_requested:
+        log_roi_value = "all"
+
     setup_cli_logging(
         path,
         component="preprocess.spotlook.threshold",
         file=f"spotlook-threshold-{codebook_path.stem}",
         extra={
             "codebook": codebook_path.stem,
-            "roi": ",".join(rois) if rois else "all",
+            "roi": log_roi_value,
         },
     )
 
@@ -975,7 +966,16 @@ def threshold(
     codebook = Codebook(codebook_path)
 
     ws = Workspace(path)
-    rois_to_process = rois if rois else ws.rois
+    if includes_wildcard or not explicit_requested:
+        rois_to_process = ws.rois
+    else:
+        unique_requested: list[str] = []
+        seen: set[str] = set()
+        for token in explicit_requested:
+            if token not in seen:
+                unique_requested.append(token)
+                seen.add(token)
+        rois_to_process = ws.resolve_rois(unique_requested)
     if not rois_to_process:
         logger.error(f"No ROIs found or specified in workspace: {path}")
         raise typer.Exit(code=1)

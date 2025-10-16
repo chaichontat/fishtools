@@ -8,13 +8,10 @@ from typing import Any, Callable, Iterable, Literal, overload
 
 import numpy as np
 import numpy.typing as npt
-from loguru import logger
 from tifffile import TiffFile, imread
 from tifffile import imwrite as tifffile_imwrite
 
-from fishtools.io.codebook import Codebook
 from fishtools.preprocess.tileconfig import TileConfiguration
-from fishtools.utils.fs import download, get_file_name, set_cwd
 from fishtools.utils.tiff import (
     get_channels as _ft_get_channels,
 )
@@ -100,7 +97,7 @@ class OptimizePath:
         return self.path / "global_scale.txt"
 
 
-# Re-export Codebook for backward compatibility (imported above)
+# Backward compatibility: codebook utilities are resolved elsewhere
 
 
 @dataclass
@@ -219,6 +216,18 @@ class Workspace:
     def analysis(self) -> Path:
         """Return path to analysis directory."""
         return self.path / "analysis"
+
+    @property
+    def output(self) -> Path:
+        """Return path to top-level analysis output directory.
+
+        This is the canonical location for ROI-level aggregated artifacts
+        (e.g., per-ROI spots parquet files written by the spots pipeline).
+
+        Example:
+            >>> ws.output  # PosixPath('/experiment/analysis/output')
+        """
+        return self.analysis / "output"
 
     def deconv_scaling(self, round_: str | None = None) -> Path:
         """Return path to deconvolution scaling directory."""
@@ -603,6 +612,45 @@ class Workspace:
         if codebook is None:
             return self.deconved / f"stitch--{roi}"
         return self.deconved / f"stitch--{roi}+{codebook}"
+
+    @staticmethod
+    def sanitize_codebook_name(codebook: str) -> str:
+        """Normalize a codebook label for filesystem-friendly paths.
+
+        Replaces hyphens and spaces with underscores to match how other
+        parts of the pipeline name ROI-level parquet files.
+        """
+        return codebook.replace("-", "_").replace(" ", "_")
+
+    def spots_parquet(self, roi: str, codebook: str, *, must_exist: bool = False) -> Path:
+        """Resolve or suggest the ROI-level spots parquet path.
+
+        Search order (first existing is returned):
+        1) analysis/output/{roi}+{sanitize(codebook)}.parquet
+        2) analysis/output/{roi}+{codebook}.parquet
+        3) analysis/deconv/{roi}+{sanitize(codebook)}.parquet
+        4) analysis/deconv/{roi}+{codebook}.parquet
+
+        When ``must_exist`` is False and no candidates exist, returns the
+        preferred default path under ``analysis/output`` with the sanitized
+        codebook.
+        """
+        cb_s = self.sanitize_codebook_name(codebook)
+        candidates = [
+            self.output / f"{roi}+{cb_s}.parquet",
+            self.output / f"{roi}+{codebook}.parquet",
+            self.deconved / f"{roi}+{cb_s}.parquet",
+            self.deconved / f"{roi}+{codebook}.parquet",
+        ]
+        for p in candidates:
+            if p.exists():
+                return p
+        if must_exist:
+            searched = ", ".join(str(p) for p in candidates)
+            raise FileNotFoundError(
+                f"Spots parquet not found for ROI '{roi}', codebook '{codebook}'. Searched: {searched}"
+            )
+        return candidates[0]
 
     def fids(self, roi: str) -> Path:
         """Return path to fiducial marker directory for a given ROI."""

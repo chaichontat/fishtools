@@ -1,6 +1,8 @@
 import rich_click as click
 
 from .cli_basic import basic
+from .cli_check_shifts import check_shifts
+from .cli_check_stitch import check_stitch
 from .cli_correct_illum import correct_illum
 from .cli_deconv import deconvnew
 from .cli_deconv_old import deconv
@@ -76,6 +78,8 @@ main.add_command(spots)
 main.add_command(inspect_cli)
 main.add_command(verify)
 main.add_command(correct_illum)
+main.add_command(check_shifts)
+main.add_command(check_stitch)
 
 if __name__ == "__main__":
     main()

@@ -9,6 +9,7 @@ from tqdm import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 import fishtools.compression.compression as lib
+from fishtools.postprocess.cli import main as postprocess_main
 
 P, R = ParamSpec("P"), TypeVar("R", covariant=True)
 
@@ -109,6 +110,9 @@ def decompress(path: Path, out: Literal["dax", "tif"], delete: bool = False, n_p
         if delete and not (file.suffix == ".tif" and out == "tif"):
             file.unlink()
 
+
+# Register nested groups (must be declared before __main__ entry)
+main.add_command(postprocess_main, name="postprocess")
 
 if __name__ == "__main__":
     main()

@@ -10,9 +10,8 @@ dependencies:
   - bowtie2
   - click
   - colorama
-  - cupy-cuda12x
+  - cupy
   - htslib
-  - "hyperactive<5"
   - imagecodecs
   - kmer-jellyfish
   - levenshtein
@@ -27,8 +26,10 @@ dependencies:
       - biopython
       - cmocean
       - colorcet
+      - hyperactive<5
       - kb-python
       - itk
+      - line_profiler
       - primer3-py
       - pyfastx
       - simpleitk

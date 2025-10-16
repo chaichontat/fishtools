@@ -1,5 +1,6 @@
 import math
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import cmocean  # colormap, do not remove  # noqa: F401
@@ -16,9 +17,11 @@ from matplotlib.axes import Axes
 from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.text import Text
 from matplotlib.ticker import FuncFormatter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
+from numpy.lib.index_tricks import IndexExpression
 
 from fishtools.utils.utils import copy_signature
 
@@ -120,7 +123,15 @@ def plot_wheel(
     axs.scatter.axhline(0, color="black", alpha=0.25, markeredgewidth=0, linewidth=0.75)
     axs.scatter.axvline(0, color="black", alpha=0.25, markeredgewidth=0, linewidth=0.75)
     scatter_kw = (
-        dict(alpha=1, s=5, c=c if c is not None else θ, cmap=scatter_cmap, zorder=2, linewidth=0.2) | kwargs
+        dict(
+            alpha=1,
+            s=5,
+            c=c if c is not None else θ,
+            cmap=scatter_cmap,
+            zorder=2,
+            linewidth=0.2,
+        )
+        | kwargs
     )
     sc = axs.scatter.scatter(pcs[:, 0], pcs[:, 1], **scatter_kw)
     sc.set_edgecolor((0.4, 0.4, 0.4, 0.5))
@@ -135,7 +146,14 @@ def plot_wheel(
         axs.scatter.pcolormesh(re, im, angle, cmap=cmap, alpha=0.5)
 
     axs.histx.hist(pcs[:, 0], bins=xedges, alpha=0.8, edgecolor=None, linewidth=0)
-    axs.histy.hist(pcs[:, 1], bins=yedges, alpha=0.8, orientation="horizontal", edgecolor=None, linewidth=0)
+    axs.histy.hist(
+        pcs[:, 1],
+        bins=yedges,
+        alpha=0.8,
+        orientation="horizontal",
+        edgecolor=None,
+        linewidth=0,
+    )
 
     nullfmt = mpl.ticker.NullFormatter()
     axs.histx.xaxis.set_major_formatter(nullfmt)
@@ -238,7 +256,47 @@ def add_scale_bar(
         **kwargs,
     )
     ax.add_artist(scalebar)
-    return ax
+
+
+def save_figure(
+    fig: Figure,
+    output_dir: Path,
+    name: str,
+    roi: str,
+    codebook: str,
+    *,
+    dpi: int = 300,
+    log_level: str = "DEBUG",
+) -> Path:
+    """Save a Matplotlib figure with a standardized filename and close it.
+
+    Filename format: ``{name}--{roi}+{codebook}.png`` under ``output_dir``.
+
+    Args:
+        fig: Matplotlib Figure to save and close.
+        output_dir: Destination directory (created if needed).
+        name: Logical figure stem (e.g., "contours", "scree_final").
+        roi: Region of interest.
+        codebook: Codebook identifier.
+        dpi: Output DPI. Default 300 for parity with other preprocess plots.
+        log_level: One of {"DEBUG","INFO","WARNING"} for loguru level.
+
+    Returns:
+        Path to the saved PNG file.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filename = (output_dir / f"{name}--{roi}+{codebook}.png").resolve()
+    fig.savefig(filename.as_posix(), dpi=dpi, bbox_inches="tight")
+    if log_level == "DEBUG":
+        logger.debug(f"Saved {name}: {filename}")
+    elif log_level == "INFO":
+        logger.info(f"Saved {name}: {filename}")
+    elif log_level == "WARNING":
+        logger.warning(f"Saved {name}: {filename}")
+    else:
+        raise ValueError(f"Unsupported log level: {log_level}")
+    plt.close(fig)
+    return filename
 
 
 def scatter_spots(
@@ -297,6 +355,79 @@ def scatter_spots(
         ax.set_title(title, color=DARK_PANEL_STYLE["axes.titlecolor"])
 
 
+def place_labels_avoid_overlap(
+    ax: Axes,
+    xs: npt.ArrayLike,
+    ys: npt.ArrayLike,
+    labels: list[str],
+    *,
+    fontsize: int = 6,
+    use_arrows: bool = True,
+    offsets: list[tuple[float, float]] | None = None,
+) -> list[Text]:
+    """Annotate points with labels trying to avoid collisions.
+
+    Tries a set of offset positions around each anchor, accepting the first that
+    doesn't overlap previously placed labels (tested in display coordinates).
+    Returns the list of Text/Annotation artists.
+    """
+
+    xs = np.asarray(xs)
+    ys = np.asarray(ys)
+    if offsets is None:
+        offsets = [(6, 6), (6, -6), (-6, 6), (-6, -6), (9, 0), (-9, 0), (0, 9), (0, -9)]
+
+    placed_texts: list[Text] = []
+    bboxes: list[Any] = []
+    fig = ax.figure
+    # One initial draw to initialize the renderer and font metrics. Re-drawing
+    # inside the loop is very expensive and can make large plots appear stuck.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    for x, y, label in zip(xs, ys, labels):
+        accepted: Text | None = None
+        accepted_bb: Any | None = None
+        for dx, dy in offsets:
+            ann = ax.annotate(
+                label,
+                (float(x), float(y)),
+                xytext=(dx, dy),
+                textcoords="offset points",
+                fontsize=fontsize,
+                ha="center",
+                va="center",
+                arrowprops=dict(arrowstyle="-", lw=0.4, color="#888") if use_arrows and (dx or dy) else None,
+            )
+            # Use the cached renderer to compute extents without forcing a full draw
+            bb = ann.get_window_extent(renderer=renderer).expanded(1.05, 1.2)
+            if not any(bb.overlaps(prev) for prev in bboxes):
+                accepted, accepted_bb = ann, bb
+                break
+            ann.remove()
+
+        if accepted is None:
+            dx, dy = offsets[0]
+            accepted = ax.annotate(
+                label,
+                (float(x), float(y)),
+                xytext=(dx, dy),
+                textcoords="offset points",
+                fontsize=fontsize,
+                ha="center",
+                va="center",
+                arrowprops=dict(arrowstyle="-", lw=0.4, color="#888") if use_arrows and (dx or dy) else None,
+            )
+            # No redraw; compute extent against cached renderer
+            accepted_bb = accepted.get_window_extent(renderer=renderer)
+
+        placed_texts.append(accepted)
+        if accepted_bb is not None:
+            bboxes.append(accepted_bb)
+
+    return placed_texts
+
+
 def _generate_hsv_colors(n_colors: int, start_idx: int = 0):
     """Generate colors using HSV color space"""
     golden_ratio = (1 + 5**0.5) / 2
@@ -353,7 +484,9 @@ def create_label_colormap(label_image: np.ndarray):
 
 
 def make_rgb(
-    r: np.ndarray | None = None, g: np.ndarray | None = None, b: np.ndarray | None = None
+    r: np.ndarray | None = None,
+    g: np.ndarray | None = None,
+    b: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Create an RGB image from three separate channels.
@@ -475,7 +608,10 @@ def add_legend(
 
 @copy_signature(sc.pl.embedding)
 def plot_embedding(
-    adata: "ad.AnnData", figsize: tuple[float, float] | None = None, dpi: float = 200, **kwargs: Any
+    adata: "ad.AnnData",
+    figsize: tuple[float, float] | None = None,
+    dpi: float = 200,
+    **kwargs: Any,
 ):
     """
     Plot the embedding of an AnnData object.
@@ -483,7 +619,6 @@ def plot_embedding(
     Parameters:
     - adata: AnnData object containing the embedding data.
     """
-
     kwargs = kwargs | {"return_fig": True}
     fig = cast(Figure, sc.pl.embedding(adata, **kwargs))
 
@@ -568,3 +703,62 @@ def micron_tick_formatter(pixel_size_um: float = 0.108, *, round_: int = 1) -> F
         return str(round(micron_value, round_))
 
     return FuncFormatter(_format)
+
+
+def configure_micron_axes(
+    ax: Axes,
+    pixel_size_um: float,
+    *,
+    x_label: str = "X",
+    y_label: str = "Y",
+    round_: int = 1,
+) -> None:
+    """Format both axes in micrometers and set axis labels.
+
+    Applies a micrometer tick formatter to both axes based on the provided
+    ``pixel_size_um`` and sets labels to ``"{x_label} (µm)"`` and
+    ``"{y_label} (µm)"``.
+
+    Args:
+        ax: Target Matplotlib axes.
+        pixel_size_um: Physical pixel size in micrometers. Must be positive.
+        x_label: Base label for the x‑axis (default "X").
+        y_label: Base label for the y‑axis (default "Y").
+        round_: Number of decimal places for tick label rounding.
+
+    Raises:
+        ValueError: If ``pixel_size_um`` is not positive or if a non‑finite
+            tick value is encountered by the formatter.
+    """
+    fmt = micron_tick_formatter(pixel_size_um, round_=round_)
+    ax.xaxis.set_major_formatter(fmt)
+    ax.yaxis.set_major_formatter(fmt)
+    ax.set_xlabel(f"{x_label} (µm)")
+    ax.set_ylabel(f"{y_label} (µm)")
+
+
+def plot_img(
+    path: Path | str,
+    sl: slice | IndexExpression = slice(None, None, None),
+    fig_kwargs: dict | None = None,
+    **kwargs,
+):
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Image file not found: {path}")
+    if path.suffix.lower() in {".tif", ".tiff"}:
+        import tifffile
+
+        img = tifffile.imread(path)[sl]
+
+    elif path.suffix.lower() in {".zarr"}:
+        import zarr
+
+        img = zarr.open_array(path, mode="r")[sl]
+
+    else:
+        raise ValueError(f"Unsupported image format: {path.suffix}")
+
+    fig, ax = plt.subplots(**({"figsize": (10, 10)} | (fig_kwargs or {})))
+    ax.imshow(img, zorder=1, **kwargs)
+    return fig, ax

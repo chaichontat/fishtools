@@ -12,6 +12,7 @@ from fishtools.utils.utils import noglobal
 
 class TrainConfig(BaseModel):
     name: str
+    base_model: str = "cyto3"
     channels: tuple[int, int]
     training_paths: list[str]
     include: list[str] = Field(default_factory=list)
@@ -275,7 +276,7 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     # name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     images, labels, image_names, test_images, test_labels, image_names_test = out
 
-    model = CellposeModel(gpu=True, pretrained_model=cast(bool, "cyto3"))
+    model = CellposeModel(gpu=True, pretrained_model=cast(bool, train_config.base_model))
     model_path, train_losses, test_losses = train_seg(
         model.net,
         train_data=images,

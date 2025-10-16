@@ -116,14 +116,15 @@ class TileConfiguration:
     def __len__(self) -> int:
         return len(self.df)
 
-    def plot(self, ax: "Axes | None" = None):
+    def plot(self, ax: "Axes | None" = None, *, show_labels: bool = True, fontsize: int = 6):
         import matplotlib.pyplot as plt
 
         if not ax:
             _, ax = plt.subplots(figsize=(8, 6), dpi=200)
         for row in self.df.iter_rows(named=True):
             ax.scatter(row["x"], row["y"], s=0.1)
-            ax.text(row["x"], row["y"], str(row["index"]), fontsize=6, ha="center", va="center")
+            if show_labels:
+                ax.text(row["x"], row["y"], str(row["index"]), fontsize=fontsize, ha="center", va="center")
         ax.set_aspect("equal")
 
     # --- Selection helpers -------------------------------------------------

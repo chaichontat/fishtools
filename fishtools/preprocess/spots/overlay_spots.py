@@ -31,6 +31,7 @@ from fishtools.analysis.labelimage import (
 )
 from fishtools.io.workspace import Workspace
 from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.utils.logging import setup_cli_logging
 
 # --- Configuration ---
 CONTOUR_PAD = 1
@@ -792,6 +793,7 @@ def run_(
     overwrite: bool,
     debug: bool,
     max_proj: bool = False,
+    spot_cb_label: str | None = None,
 ):
     """
     Main function to process a specific Z-slice of segmented image data
@@ -800,7 +802,15 @@ def run_(
     # --- Prepare Paths and Directories ---
     segmentation_path = input_dir / segmentation_name
     spots_path = spots
-    output_chunk_dir = output_dir / f"chunks+{spots_path.stem.split('+')[1]}"
+    # Derive chunk subdir using provided codebook label when available,
+    # otherwise attempt to parse from the spots filename, with a safe fallback.
+    cb_for_chunks = spot_cb_label
+    if cb_for_chunks is None:
+        try:
+            cb_for_chunks = spots_path.stem.split("+")[1]
+        except Exception:
+            cb_for_chunks = "spots"
+    output_chunk_dir = output_dir / f"chunks+{cb_for_chunks}"
 
     try:
         output_chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -818,7 +828,7 @@ def run_(
         sys.exit(1)
 
     # --- Log Configuration ---
-    logger.info(f"--- Configuration ---")
+    logger.info("--- Configuration ---")
     logger.info(f"Input directory: {input_dir}")
     logger.info(f"Output directory: {output_chunk_dir}")
     logger.info(f"Segmentation: {segmentation_path}")
@@ -860,8 +870,29 @@ def initialize():
     required=True,
 )
 @click.argument("roi", type=str, default="*")
-@click.option("--codebook", type=str)
-@click.option("--seg-codebook", type=str)
+@click.option(
+    "--codebook",
+    type=str,
+    required=True,
+    help="Codebook name used for spots.",
+)
+@click.option(
+    "--seg-codebook",
+    type=str,
+    required=True,
+    default=None,
+    help="Segmentation codebook.",
+)
+@click.option(
+    "--spots",
+    "spots_opt",
+    type=click.Path(dir_okay=True, file_okay=True, path_type=Path),
+    default=None,
+    help=(
+        "Path to spots parquet file, or directory with per-ROI spots parquets "
+        "named '{roi}+{codebook}.parquet'. Defaults to <workspace>/analysis/output."
+    ),
+)
 @click.option(
     "--segmentation-name",
     type=str,
@@ -888,7 +919,8 @@ def overlay(
     path: Path,
     roi: str,
     codebook: str,
-    seg_codebook: str,
+    spots_opt: Path | None,
+    seg_codebook: str | None,
     segmentation_name: str,
     opening_radius: float,
     closing_radius: float,
@@ -898,43 +930,108 @@ def overlay(
 ):
     import zarr
 
+    # Workspace-aware logging
+    setup_cli_logging(path, component="preprocess.overlay_spots", file="overlay_spots.py", debug=debug)
+
     ws = Workspace(path)
-    rois = [roi] if roi != "*" else ws.rois
+    batch_mode = roi == "*"
+    rois = [roi] if not batch_mode else ws.rois
 
-    for roi in rois:
-        spots = path / f"{roi}+{codebook}.parquet"
-        input_dir = path / f"stitch--{roi}+{seg_codebook}"
+    # Default segmentation codebook to codebook when omitted
+    seg_cb = seg_codebook or codebook
+    if seg_codebook is None:
+        logger.info(f"Segmentation codebook not provided; defaulting to --codebook '{codebook}'.")
 
-        with ProcessPoolExecutor(
-            max_workers=8,
-            mp_context=get_context("spawn"),
-        ) as executor:
-            futures = []
-            roi, codebook = spots.stem.split("+")
-            z = zarr.open_array(input_dir / segmentation_name, mode="r")
-            for i in range(z.shape[0]):
-                futures.append(
-                    executor.submit(
-                        run_,
-                        input_dir,
-                        input_dir,
-                        segmentation_name,
-                        spots,
-                        ws.tileconfig_dir(roi) / "TileConfiguration.registered.txt",
-                        i,
-                        opening_radius,
-                        closing_radius,
-                        dilation_radius,
-                        overwrite,
-                        debug,
-                        max_proj=z.shape[0] == 1,
-                    )
-                )
-            for future in as_completed(futures):
+    for current_roi in rois:
+        try:
+            # Resolve spots parquet path
+            if spots_opt is not None:
+                p = Path(spots_opt)
+                if p.is_dir():
+                    spots = p / f"{current_roi}+{ws.sanitize_codebook_name(codebook)}.parquet"
+                else:
+                    spots = p
+                    if batch_mode:
+                        logger.warning(
+                            f"Batch mode with a single spots file '{p}'; this file will be reused for all ROIs."
+                        )
+            else:
                 try:
-                    future.result()
+                    spots = ws.spots_parquet(current_roi, codebook, must_exist=True)
+                except FileNotFoundError as e:
+                    msg = f"Skipping ROI '{current_roi}': {e}"
+                    if batch_mode:
+                        logger.warning(msg)
+                        continue
+                    raise click.ClickException(str(e))
+            input_dir = ws.stitch(current_roi, seg_cb)
+
+            seg_path = input_dir / segmentation_name
+
+            # Validate inputs; in batch mode skip missing/errored ROIs
+            if not seg_path.exists():
+                msg = f"Skipping ROI '{current_roi}': segmentation not found at {seg_path}."
+                if batch_mode:
+                    logger.warning(msg)
+                    continue
+                raise click.ClickException(msg)
+
+            if not spots.exists():
+                msg = f"Skipping ROI '{current_roi}': spots parquet not found at {spots}."
+                if batch_mode:
+                    logger.warning(msg)
+                    continue
+                raise click.ClickException(msg)
+
+            with ProcessPoolExecutor(
+                max_workers=8,
+                mp_context=get_context("spawn"),
+            ) as executor:
+                futures = []
+                try:
+                    z = zarr.open_array(seg_path, mode="r")
                 except Exception as e:
-                    logger.error(f"Error processing slice: {e}")
+                    msg = f"Skipping ROI '{current_roi}': failed to open segmentation '{seg_path}': {e}"
+                    if batch_mode:
+                        logger.error(msg)
+                        continue
+                    raise
+
+                for i in range(z.shape[0]):
+                    futures.append(
+                        executor.submit(
+                            run_,
+                            input_dir,
+                            input_dir,
+                            segmentation_name,
+                            spots,
+                            ws.tileconfig_dir(current_roi) / "TileConfiguration.registered.txt",
+                            i,
+                            opening_radius,
+                            closing_radius,
+                            dilation_radius,
+                            overwrite,
+                            debug,
+                            max_proj=z.shape[0] == 1,
+                            spot_cb_label=ws.sanitize_codebook_name(codebook),
+                        )
+                    )
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        # In batch mode, continue with other slices/ROIs
+                        if batch_mode:
+                            logger.error(f"ROI '{current_roi}': error processing slice: {e}")
+                            continue
+                        # Single-ROI mode: fail fast
+                        raise
+        except Exception as e:
+            # Any unhandled error per ROI — skip in batch mode; raise otherwise
+            if batch_mode:
+                logger.error(f"Skipping ROI '{current_roi}' due to error: {e}")
+                continue
+            raise
 
 
 if __name__ == "__main__":

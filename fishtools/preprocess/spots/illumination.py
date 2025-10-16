@@ -165,7 +165,7 @@ class RangeFieldPointsModel:
             suffix=subtile_suffix,
         )
         if xs.size == 0:
-            raise RuntimeError("No subtile percentile JSON data found; run calc_percentile_gpu first.")
+            raise RuntimeError("No subtile percentile JSON data found; run sample_percentile_gpu first.")
 
         meta: dict[str, Any] = {
             "roi": roi,

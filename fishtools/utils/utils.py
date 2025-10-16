@@ -1,4 +1,5 @@
 import functools
+import importlib
 import logging
 import subprocess
 import types
@@ -371,3 +372,63 @@ def create_rotation_matrix(angle_degrees: float) -> np.ndarray:
     cos_angle = np.cos(angle_radians)
     sin_angle = np.sin(angle_radians)
     return np.array([[cos_angle, -sin_angle], [sin_angle, cos_angle]])
+
+
+def make_lazy_getattr(
+    module_globals: dict[str, Any],
+    mapping: dict[str, tuple[str, str]],
+    extras: Sequence[str] | None = None,
+) -> tuple[Callable[[str], Any], Callable[[], list[str]], tuple[str, ...]]:
+    """Create PEP 562-style lazy attribute loader for a module.
+
+    This factory returns ``__getattr__``, ``__dir__``, and ``__all__`` suitable
+    for assignment in a module to expose a set of names that are resolved only
+    on first access and then cached in the module namespace.
+
+    Args:
+        module_globals: The target module's ``globals()`` dict. Used for caching
+            resolved attributes and computing ``__dir__``.
+        mapping: Name → (module, attribute) pairs to resolve lazily.
+        extras: Additional exported names (e.g., constants defined eagerly) to
+            include in ``__all__`` and completion results.
+
+    Returns:
+        (__getattr__, __dir__, __all__)
+
+    Example:
+        >>> __getattr__, __dir__, __all__ = make_lazy_getattr(
+        ...     globals(),
+        ...     {"Thing": ("pkg.sub", "Thing")},
+        ...     extras=("CONSTANT",),
+        ... )
+    """
+
+    lazy_names = dict(mapping)  # shallow copy for safety
+    extra_set = set(extras or ())
+    module_name = module_globals.get("__name__", "<module>")
+
+    def __getattr__(name: str) -> Any:
+        if name in lazy_names:
+            mod_name, attr = lazy_names[name]
+            try:
+                module = importlib.import_module(mod_name)
+            except Exception as e:  # provide context; do not swallow
+                raise AttributeError(
+                    f"{module_name}: failed to lazily import '{name}' from '{mod_name}': {e}"
+                ) from e
+            try:
+                value = getattr(module, attr)
+            except AttributeError as e:
+                raise AttributeError(
+                    f"{module_name}: module '{mod_name}' has no attribute '{attr}' for '{name}'"
+                ) from e
+            module_globals[name] = value  # cache
+            return value
+        raise AttributeError(f"module '{module_name}' has no attribute '{name}'")
+
+    def __dir__() -> list[str]:
+        return sorted(set(module_globals.keys()) | set(lazy_names.keys()) | extra_set)
+
+    __all__ = tuple(sorted(set(lazy_names.keys()) | extra_set))
+
+    return __getattr__, __dir__, __all__

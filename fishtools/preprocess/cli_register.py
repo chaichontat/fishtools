@@ -821,6 +821,15 @@ def run(
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
 @click.option("--overwrite", is_flag=True)
 @click.option("--debug", is_flag=True)
+@click.option(
+    "--verify",
+    is_flag=True,
+    help=(
+        "After batch registration, verify each registered TIFF can be read and has a "
+        "consistent shape (based on the first registered file). If a file fails, rerun "
+        "the single 'run' command with --overwrite."
+    ),
+)
 def batch(
     path: Path,
     ref: str | None,
@@ -830,6 +839,7 @@ def batch(
     threads: int,
     overwrite: bool,
     debug: bool,
+    verify: bool,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
@@ -864,7 +874,7 @@ def batch(
             or not (path / f"registered--{roi}+{codebook.stem}/reg-{name.stem.split('-')[1]}.tif").exists()
         ]
 
-        if not idxs:
+        if not idxs and not verify:
             logger.warning(f"Skipping {ref}--{roi}, already registered.")
             continue
 
@@ -888,6 +898,88 @@ def batch(
                     ],
                     check=True,
                 )
+
+        # Optional verification phase: ensure files are readable and shapes match.
+        if verify:
+            codebook_name = codebook.stem
+            reg_dir = path / f"registered--{roi}+{codebook_name}"
+            expected_shape: tuple[int, int, int, int] | None = None
+            verify_idxs = sorted({int(name.stem.split("-")[1]) for name in names})
+
+            def _read_shape(p: Path) -> tuple[int, int, int, int]:
+                try:
+                    with TiffFile(p) as tif:  # Verify decoding and read shape
+                        arr = tif.asarray()
+                        shape = tuple(arr.shape)
+                        assert len(shape) == 4, f"Unexpected ndim {arr.ndim} for {p}"
+                        return shape  # type: ignore[return-value]
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(f"Failed to read registered file {p}: {e}") from e
+
+            # Establish baseline expected shape from the first index that exists and is readable
+            for i in verify_idxs:
+                p = reg_dir / f"reg-{i:04d}.tif"
+                if not p.exists():
+                    # If the file does not exist (e.g., child run skipped), skip baseline attempt.
+                    continue
+                try:
+                    expected_shape = _read_shape(p)
+                    logger.info(f"[{roi}] Baseline registered shape from {p.name}: {expected_shape}")
+                    break
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[{roi}] Baseline read failed for {p.name}: {e}")
+
+            # Verify each produced file; if any fails, rerun the single index with overwrite
+            failed: list[int] = []
+            for i in verify_idxs:
+                p = reg_dir / f"reg-{i:04d}.tif"
+                if not p.exists():
+                    logger.warning(f"[{roi}] Missing output {p.name}; scheduling rerun.")
+                    failed.append(i)
+                    continue
+                try:
+                    shape = _read_shape(p)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[{roi}] Read failed for {p.name}: {e}; scheduling rerun.")
+                    failed.append(i)
+                    continue
+
+                if expected_shape is not None and shape != expected_shape:
+                    logger.warning(
+                        f"[{roi}] Shape mismatch for {p.name}: got {shape}, expected {expected_shape}; scheduling rerun."
+                    )
+                    failed.append(i)
+
+            for i in failed:
+                logger.info(f"[{roi}] Re-running index {i:04d} with --overwrite due to verification failure.")
+                _run_child_cli(
+                    [
+                        "preprocess",
+                        "register",
+                        "run",
+                        str(path),
+                        str(i),
+                        f"--codebook={codebook}",
+                        f"--fwhm={fwhm}",
+                        f"--threshold={threshold}",
+                        "--reference",
+                        ref,
+                        f"--roi={roi}",
+                        "--overwrite",
+                    ],
+                    check=True,
+                )
+
+                # Re-verify just this file; log if still failing
+                p = reg_dir / f"reg-{i:04d}.tif"
+                try:
+                    shape = _read_shape(p)
+                    if expected_shape is not None and shape != expected_shape:
+                        logger.error(
+                            f"[{roi}] Post-rerun shape still mismatched for {p.name}: {shape} vs {expected_shape}."
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"[{roi}] Post-rerun read still failing for {p.name}: {e}")
 
 
 register.add_command(batch)

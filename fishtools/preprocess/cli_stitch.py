@@ -517,6 +517,8 @@ def register(
     if overwrite:
         [p.unlink() for p in out_path.glob("*.tif")]
 
+    existing_digit_tifs = {p.name for p in out_path.glob("*.tif") if p.stem.isdigit()}
+
     def get_idx(img_path: Path) -> int:
         return int(img_path.stem.split("-")[1])
 
@@ -567,14 +569,92 @@ def register(
         tileconfig.write(out_path / "TileConfiguration.txt")
         logger.info(f"Created TileConfiguration at {out_path}.")
         logger.info("Running first.")
-        run_imagej(
-            out_path,
-            compute_overlap=True,
-            fuse=False,
-            threshold=threshold,
-            name="TileConfiguration",
-            sc=sc,
-        )
+    run_imagej(
+        out_path,
+        compute_overlap=True,
+        fuse=False,
+        threshold=threshold,
+        name="TileConfiguration",
+        sc=sc,
+    )
+    # Post-check: verify registered tile configuration and emit a layout plot
+    try:
+        tc_reg_path = out_path / "TileConfiguration.registered.txt"
+        if not tc_reg_path.exists():
+            logger.warning(
+                f"Registered TileConfiguration not found at {tc_reg_path.resolve()}; ImageJ may have failed to write it."
+            )
+        else:
+            try:
+                tc = TileConfiguration.from_file(tc_reg_path)
+            except Exception as exc:  # pragma: no cover - user file error
+                logger.warning(f"Failed to parse {tc_reg_path.resolve()}: {exc}")
+            else:
+                # Identify any tiles at exactly (0, 0), which indicates non-registered tiles
+                df = tc.df
+                zero_mask = (df["x"] == 0.0) & (df["y"] == 0.0)
+                bad = df.filter(zero_mask).sort("index")
+                if len(bad) > 1:
+                    extras = bad.slice(1)
+                    extra_count = len(extras)
+                    bad_dict = extras.select(["index", "filename"]).to_dict(as_series=False)
+                    indices = bad_dict.get("index", [])
+                    files = bad_dict.get("filename", [])
+                    paired = ", ".join(f"{i}:{f}" for i, f in zip(indices, files))
+                    logger.warning(
+                        f"Detected {extra_count} additional tile(s) registered at (0,0): {paired}. "
+                        "These tiles were likely not registered; inspect your input or rerun registration."
+                    )
+
+                # Save a per-ROI arrangement plot to the workspace outputs directory
+                try:
+                    import matplotlib.pyplot as plt
+
+                    from fishtools.utils.plot import micron_tick_formatter, place_labels_avoid_overlap
+
+                    fig, ax = plt.subplots(figsize=(6, 5), dpi=200)
+                    # Plot points without labels then add labels with avoidance
+                    tc.plot(ax, show_labels=False)
+                    df_lab = tc.df
+                    xs = df_lab["x"].to_numpy()
+                    ys = df_lab["y"].to_numpy()
+                    labels = [str(int(i)) for i in df_lab["index"].to_numpy()]
+                    place_labels_avoid_overlap(ax, xs, ys, labels, fontsize=6, use_arrows=True)
+                    # Convert axes to micrometers using default pixel size
+                    fmt = micron_tick_formatter(0.108)
+                    ax.xaxis.set_major_formatter(fmt)
+                    ax.yaxis.set_major_formatter(fmt)
+                    ax.set_xlabel("X (µm)")
+                    ax.set_ylabel("Y (µm)")
+                    ax.set_title(roi)
+                    fig.tight_layout()
+
+                    # Save under analysis/output and log absolute path
+                    out_dir = ws.output
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    out_png = (out_dir / f"stitch_layout--{roi}.png").resolve()
+                    fig.savefig(out_png.as_posix(), bbox_inches="tight")
+                    plt.close(fig)
+                    logger.info(f"Saved stitch layout plot: {out_png}")
+                except Exception as exc:  # pragma: no cover - plotting environment issues
+                    logger.warning(f"Failed to generate stitch layout plot: {exc}")
+    except Exception:
+        # Keep CLI resilient; log full context for diagnostics
+        logger.opt(exception=True).warning("Post-registration checks encountered an error; continuing.")
+
+    created_tile_tifs = [
+        p for p in out_path.glob("*.tif") if p.stem.isdigit() and p.name not in existing_digit_tifs
+    ]
+    if created_tile_tifs:
+        removed = 0
+        for tif_path in created_tile_tifs:
+            try:
+                tif_path.unlink(missing_ok=True)
+            except Exception as exc:
+                logger.warning(f"Failed to remove intermediate tile TIFF {tif_path}: {exc}")
+            else:
+                removed += 1
+        logger.info(f"Removed {removed} intermediate tile TIFF(s) from {out_path} after registration.")
 
 
 def extract(
@@ -943,8 +1023,22 @@ def fuse(
     if "--" in path.as_posix():
         raise ValueError("Please be in the workspace folder.")
 
+    stitch_dir = ws.stitch(roi, codebook)
+    existing_fused = [
+        candidate
+        for candidate in (stitch_dir / "fused.zarr", stitch_dir / "fused_n4.zarr")
+        if candidate.exists()
+    ]
+    if existing_fused and not overwrite:
+        existing_names = ", ".join(sorted(p.name for p in existing_fused))
+        logger.info(
+            f"Skipping ROI '{roi}' with codebook '{codebook}' — existing fused outputs ({existing_names}) present. "
+            "Re-run with --overwrite to regenerate."
+        )
+        return
+
     path_img = ws.registered(roi, codebook)
-    path = ws.stitch(roi, codebook)
+    path = stitch_dir
     files = sorted(path_img.glob("*.tif"))
     if not len(files):
         raise ValueError(f"No images found at {path_img.resolve()}")
@@ -1150,19 +1244,34 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
     for current_roi in target_rois:
         stitched_dir = ws.stitch(current_roi, codebook)
         # Group folders by Z index (parent directory name)
-        folders_by_z = walk_fused(stitched_dir)
+        try:
+            folders_by_z = walk_fused(stitched_dir)
+        except ValueError:
+            logger.warning(
+                f"No valid stitched folders found under {stitched_dir}. Skipping ROI '{current_roi}'."
+            )
+            continue
         # Sort folders within each Z index by C index (folder name)
         for z_idx in folders_by_z:
             folders_by_z[z_idx].sort(key=lambda f: int(f.name))
+
+        if not folders_by_z:
+            logger.warning(f"No stitched content discovered for ROI '{current_roi}'. Skipping.")
+            continue
 
         zs = max(folders_by_z.keys()) + 1
         cs = max(int(f.name) for f in folders_by_z[0]) + 1  # Assume C count is same for all Z
 
         # Check for fused images in the first Z plane to get dimensions
         first_z_folders = folders_by_z[0]
-        for folder in first_z_folders:
-            if not (folder / f"fused_{folder.name}-1.tif").exists():
-                raise ValueError(f"No fused image found for {folder.name} in Z=0")
+        missing = [
+            folder for folder in first_z_folders if not (folder / f"fused_{folder.name}-1.tif").exists()
+        ]
+        if missing:
+            logger.warning(
+                f"Missing fused images for ROI '{current_roi}' in Z=0: {[m.name for m in missing]}. Skipping ROI."
+            )
+            continue
 
         # Get shape from the first image of the first Z plane
         first_folder = first_z_folders[0]
@@ -1195,8 +1304,6 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
                 dtype=dtype,
             )
 
-        z_plane_data = np.zeros((img_shape[0], img_shape[1], cs), dtype=dtype)
-
         # Create thumbnail directory
         thumbnail_dir = stitched_dir / "thumbnails"
         thumbnail_dir.mkdir(exist_ok=True)
@@ -1204,33 +1311,37 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
         with progress_bar(len(folders_by_z)) as progress:
             for i in sorted(folders_by_z.keys()):
                 z_plane_folders = folders_by_z[i]
+                z_plane_data = np.zeros((img_shape[0], img_shape[1], cs), dtype=dtype)
                 thumbnail_data = None
+
                 for folder in z_plane_folders:
                     j = int(folder.name)
+                    img_path = folder / f"fused_{folder.name}-1.tif"
                     try:
-                        img = imread(folder / f"fused_{folder.name}-1.tif")
-                        # Write into the C dimension of the current Z-plane array
-                        z_plane_data[:, :, j] = img[:, :]
-                        if thumbnail_data is None:
-                            # Limit preview to at most 3 channels (RGB)
-                            preview_c = min(3, cs)
-                            thumbnail_data = np.zeros(
-                                (img.shape[0], img.shape[1], preview_c), dtype=np.uint16
-                            )
-                        if j < thumbnail_data.shape[2]:
-                            thumbnail_data[:, :, j] = img[:, :]
-                        del img
+                        img = imread(img_path)
                     except FileNotFoundError:
-                        raise FileNotFoundError(f"File not found: {folder / f'fused_{folder.name}-1.tif'}")
+                        logger.warning(f"File not found while combining ROI '{current_roi}': {img_path}")
+                        raise
                     except Exception as e:
-                        raise Exception(f"Error reading {folder / f'fused_{folder.name}-1.tif'}") from e
+                        logger.warning(
+                            f"Error reading image while combining ROI '{current_roi}': {img_path}: {e}"
+                        )
+                        raise
 
-                logger.info(f"Writing Z-plane {i}/{zs - 1} to Zarr array")
+                    z_plane_data[:, :, j] = img[:, :]
+
+                    if thumbnail_data is None:
+                        preview_c = min(3, cs)
+                        thumbnail_data = np.zeros((img.shape[0], img.shape[1], preview_c), dtype=np.uint16)
+                    if j < thumbnail_data.shape[2]:
+                        thumbnail_data[:, :, j] = img[:, :]
+
+                    del img
+
+                logger.info(f"Writing Z-plane {i + 1}/{zs} to Zarr array")
                 z_array[i, :, :, :] = z_plane_data
 
-                if i % 8 == 0:
-                    assert thumbnail_data is not None
-
+                if i % 8 == 0 and thumbnail_data is not None:
                     # Save as PNG; ensure we have 3 channels for RGB
                     td = (thumbnail_data[::8, ::8] >> 10).astype(np.uint8)
                     if td.ndim == 2:
@@ -1267,16 +1378,12 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
         except Exception as e:
             logger.warning(f"Error reading metadata from TIF file: {e}")
 
-        # Normalization calculation removed by request; downstream stages may compute on demand.
-
         logger.info("Deleting source folders.")
         all_folders = [f for z_folders in folders_by_z.values() for f in z_folders]
-
         for folder in all_folders:
             try:
                 shutil.rmtree(folder.parent)  # Remove the Z-level parent folder
             except FileNotFoundError:
-                # Can happen since some folder in all_folders are subdirectories of others
                 ...
         logger.info("Done.")
 
