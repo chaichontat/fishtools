@@ -6,44 +6,42 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
-from matplotlib.legend import Legend
+from click.testing import CliRunner
 from matplotlib.figure import Figure
-from scipy.interpolate import RegularGridInterpolator
+from matplotlib.legend import Legend
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
+from scipy.interpolate import RegularGridInterpolator
 
 from fishtools.preprocess.cli_spotlook import (
     ROIThresholdContext,
     ThresholdCurve,
-    _compute_threshold_curve,
     _compute_contour_levels,
+    _compute_threshold_curve,
     _prompt_threshold_levels,
-    _save_combined_threshold_plot,
     _save_combined_spots_plot,
+    _save_combined_threshold_plot,
+    threshold,
 )
-from fishtools.utils.plot import format_si
 from fishtools.preprocess.config import SpotThresholdParams
+from fishtools.utils.plot import format_si
 
 
 def _make_interpolator() -> RegularGridInterpolator:
     grid = np.linspace(0.0, 1.0, 3)
-    values = np.array(
-        [
-            [0.0, 0.2, 0.4],
-            [0.2, 0.4, 0.6],
-            [0.4, 0.6, 0.8],
-        ]
-    )
+    values = np.array([
+        [0.0, 0.2, 0.4],
+        [0.2, 0.4, 0.6],
+        [0.4, 0.6, 0.8],
+    ])
     return RegularGridInterpolator((grid, grid), values)
 
 
 def test_compute_threshold_curve_generates_expected_counts() -> None:
-    spots = pl.DataFrame(
-        {
-            "x_": [0.1, 0.2, 0.4, 0.6],
-            "y_": [0.1, 0.4, 0.6, 0.8],
-            "is_blank": [False, True, False, True],
-        }
-    )
+    spots = pl.DataFrame({
+        "x_": [0.1, 0.2, 0.4, 0.6],
+        "y_": [0.1, 0.4, 0.6, 0.8],
+        "is_blank": [False, True, False, True],
+    })
     contours = types.SimpleNamespace(levels=np.linspace(0.0, 1.0, 8))
     interpolator = _make_interpolator()
 
@@ -284,3 +282,53 @@ def test_contour_level_modes() -> None:
     # Log: log-spaced between min positive and max
     log_levels = _compute_contour_levels(z_pos, "log", 4)
     assert np.allclose(log_levels, 10 ** np.linspace(0.0, 3.0, 4))
+
+
+def test_threshold_cli_accepts_roi_argument(monkeypatch, tmp_path: Path) -> None:
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    codebook_path = tmp_path / "cb.json"
+    codebook_path.write_text("{}")
+
+    class DummyWorkspace:
+        last_resolved: list[str] | None = None
+
+        def __init__(self, root: Path):
+            self.path = Path(root)
+            self.rois = ["alpha", "beta"]
+
+        def resolve_rois(self, rois: list[str]) -> list[str]:
+            DummyWorkspace.last_resolved = list(rois)
+            return [roi for roi in rois if roi in self.rois]
+
+    class DummyCodebook:
+        def __init__(self, path: Path):
+            self.path = Path(path)
+            self.name = Path(path).stem
+
+        def to_dataframe(self) -> pl.DataFrame:
+            return pl.DataFrame()
+
+    def fake_load_spots_data(path: Path, roi: str, codebook: DummyCodebook) -> pl.DataFrame | None:
+        return None
+
+    monkeypatch.setattr("fishtools.preprocess.cli_spotlook.Workspace", DummyWorkspace)
+    monkeypatch.setattr("fishtools.preprocess.cli_spotlook.Codebook", DummyCodebook)
+    monkeypatch.setattr("fishtools.preprocess.cli_spotlook._load_spots_data", fake_load_spots_data)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        threshold,
+        [
+            str(workspace_root),
+            "-c",
+            str(codebook_path),
+            "alpha",
+            "beta",
+        ],
+        catch_exceptions=True,
+    )
+
+    assert isinstance(result.exception, SystemExit)
+    assert result.exit_code == 1
+    assert DummyWorkspace.last_resolved == ["alpha", "beta"]

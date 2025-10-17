@@ -208,11 +208,22 @@ if "cucim" not in sys.modules:
     cucim_skimage = types.ModuleType("cucim.skimage")
     cucim_transform = types.ModuleType("cucim.skimage.transform")
     cucim_transform.downscale_local_mean = _skimage_downscale_local_mean
+
+    cucim_filters = types.ModuleType("cucim.skimage.filters")
+
+    def _cucim_unimplemented(*_args: object, **_kwargs: object) -> None:  # pragma: no cover - GPU stub
+        raise RuntimeError("cucim stub invoked during tests; GPU-specific path not supported.")
+
+    cucim_filters.unsharp_mask = _cucim_unimplemented  # type: ignore[attr-defined]
+
     sys.modules["cucim"] = cucim
     sys.modules["cucim.skimage"] = cucim_skimage
     sys.modules["cucim.skimage.transform"] = cucim_transform
+    sys.modules["cucim.skimage.filters"] = cucim_filters
+
     cucim.skimage = cucim_skimage
     cucim_skimage.transform = cucim_transform
+    cucim_skimage.filters = cucim_filters
 
     class _CudaRuntime(types.SimpleNamespace):
         @staticmethod

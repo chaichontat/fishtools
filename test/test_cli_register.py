@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 from click.testing import CliRunner
 
-import fishtools.preprocess.cli_register as cli_register_module
 from fishtools.preprocess.cli_register import (
     DATA,
     Config,
@@ -414,3 +414,199 @@ def test_copy_codebook_is_idempotent(tmp_path: Path) -> None:
 
     assert copied == dest
     assert dest.read_text() == source.read_text()
+
+
+def test_cli_register_batch_verify_reruns_on_read_failure(tmp_path: Path, monkeypatch: Any) -> None:
+    # Arrange workspace and two indices
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+    (base / "2_10_18--roiA" / "2_10_18-0002.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    # Fake Workspace
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    # Child CLI stub creates placeholder output files
+    calls: list[list[str]] = []
+
+    def fake_child(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        assert check is True
+        calls.append(argv)
+        # Create an output file to be 'read' by the TiffFile stub
+        assert argv[:3] == ["preprocess", "register", "run"]
+        out_dir = Path(argv[3]) / f"registered--roiA+{Path(argv[5].split('=', 1)[1]).stem}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        idx = int(argv[4])
+        (out_dir / f"reg-{idx:04d}.tif").write_text("stub")
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_child)
+
+    # TiffFile stub: baseline (0001) reads OK; 0002 fails once, then succeeds after rerun
+    read_attempts: dict[Path, int] = {}
+    baseline_shape = (2, 3, 10, 10)
+
+    class _TF:
+        def __init__(self, p: Path, *_: Any, **__: Any) -> None:
+            self.p = Path(p)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # type: ignore[no-untyped-def]
+            return False
+
+        def asarray(self):  # type: ignore[no-untyped-def]
+            read_attempts[self.p] = read_attempts.get(self.p, 0) + 1
+            name = self.p.name
+            if name.endswith("reg-0001.tif"):
+                return np.zeros(baseline_shape, dtype=np.uint16)
+            if name.endswith("reg-0002.tif") and read_attempts[self.p] == 1:
+                raise IndexError("simulated decode error")
+            return np.zeros(baseline_shape, dtype=np.uint16)
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.TiffFile", _TF)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--threads",
+            "1",
+            "--verify",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Initial calls: two indices, plus one rerun for 0002
+    # The rerun must include --overwrite
+    indices = [int(c[4]) for c in calls if c[:3] == ["preprocess", "register", "run"]]
+    assert indices.count(1) == 1
+    assert indices.count(2) == 2  # one original + one rerun
+    assert any("--overwrite" in c for c in calls if c[4] == "2")
+
+    # Postconditions: TiffFile was attempted twice for reg-0002
+    reg_dir = base / f"registered--roiA+{cb.stem}"
+    assert (reg_dir / "reg-0001.tif").exists()
+    assert (reg_dir / "reg-0002.tif").exists()
+    assert read_attempts[reg_dir / "reg-0002.tif"] >= 2
+
+
+def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # Arrange workspace with two indices; both registered files already exist
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+    (base / "2_10_18--roiA" / "2_10_18-0002.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+    reg_dir = base / f"registered--roiA+{cb.stem}"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    (reg_dir / "reg-0001.tif").write_text("stub")
+    (reg_dir / "reg-0002.tif").write_text("stub")
+
+    # Fake Workspace
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    # Child CLI should only be called for failing index despite overwrite not provided
+    calls: list[list[str]] = []
+
+    def fake_child(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        calls.append(argv)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_child)
+
+    # TiffFile stub: 0001 fails once (triggers rerun); 0002 always OK
+    attempts: dict[str, int] = {"reg-0001.tif": 0}
+    baseline_shape = (1, 1, 4, 4)
+
+    class _TF:
+        def __init__(self, p: Path, *_: Any, **__: Any) -> None:
+            self.p = Path(p)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):  # type: ignore[no-untyped-def]
+            return False
+
+        def asarray(self):  # type: ignore[no-untyped-def]
+            name = self.p.name
+            if name == "reg-0001.tif":
+                attempts[name] += 1
+                if attempts[name] == 1:
+                    raise OSError("simulated read error")
+                return np.zeros(baseline_shape, dtype=np.uint16)
+            return np.zeros(baseline_shape, dtype=np.uint16)
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.TiffFile", _TF)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--threads",
+            "1",
+            "--verify",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # No initial runs should occur (both outputs existed), but one rerun for 0001
+    assert len(calls) == 1
+    assert calls[0][:3] == ["preprocess", "register", "run"]
+    assert calls[0][4] == "1"
+    assert "--overwrite" in calls[0]

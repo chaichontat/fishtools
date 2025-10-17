@@ -25,9 +25,9 @@ from fishtools.io.workspace import Workspace
 _FIELD_STORE_CACHE: dict[str, tuple[np.ndarray, dict[str, Any]]] = {}
 
 __all__ = [
-    "apply_field_stores_to_img",
+    "apply_field_tcyx_store_to_img",
     "clear_field_store_cache",
-    "load_field_cyx",
+    "load_field_t_plane_as_cyx",
     "parse_tile_index_from_path",
     "resolve_roi_for_field",
     "slice_field_patch",
@@ -41,17 +41,18 @@ def clear_field_store_cache() -> None:
     _FIELD_STORE_CACHE.clear()
 
 
-def load_field_cyx(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
-    """Load a CYX field from a Zarr array store exported by correct-illum.
+# Legacy CYX loader removed; TCYX path is now the default.
 
-    The store is expected to contain ``model_meta`` attributes describing the
-    channel order and coordinate offsets. Results are cached by absolute path
-    to avoid redundant Zarr reads when applying the same fields to many tiles.
+
+def load_field_t_plane_as_cyx(path: Path, kind: str) -> tuple[np.ndarray, dict[str, Any]]:
+    """Load a CYX field for a specific kind ("low" or "range") from a TCYX or CYX store.
+
+    - TCYX: selects the T-plane matching ``kind`` using ``t_labels`` attribute
+      (defaults to ["low", "range"] if missing), returns the resulting CYX array.
+    - CYX: returns the array directly (caller should ensure it matches ``kind``).
     """
-
-    key = str(path.resolve())
-    if key in _FIELD_STORE_CACHE:
-        return _FIELD_STORE_CACHE[key]
+    if kind not in {"low", "range"}:
+        raise ValueError(f"Unknown field kind: {kind}")
 
     try:
         import zarr
@@ -59,16 +60,32 @@ def load_field_cyx(path: Path) -> tuple[np.ndarray, dict[str, Any]]:
         za = zarr.open_array(str(path), mode="r")
         arr = np.asarray(za, dtype=np.float32)
         attrs = getattr(za, "attrs", {})
+        axes = (attrs.get("axes") or "").upper() if hasattr(attrs, "get") else ""
         model_meta = dict(attrs.get("model_meta", {})) if hasattr(attrs, "get") else {}
     except Exception as exc:  # pragma: no cover - precise zarr errors vary
         raise ValueError(f"Failed to read field Zarr array at {path}: {exc}") from exc
 
+    if arr.ndim == 4 or axes == "TCYX":
+        # Determine T index by labels; fallback to canonical order
+        t_labels = attrs.get("t_labels") if hasattr(attrs, "get") else None
+        if not isinstance(t_labels, (list, tuple)):
+            t_labels = ["low", "range"]
+        try:
+            t_index = int(t_labels.index(kind))
+        except ValueError as exc:  # pragma: no cover - defensive
+            raise ValueError(f"kind '{kind}' not present in field t_labels={t_labels}") from exc
+        cyx = np.asarray(arr[t_index], dtype=np.float32)
+        if cyx.ndim == 2:
+            cyx = cyx[None, ...]
+        elif cyx.ndim != 3:
+            raise ValueError(f"Expected CYX slice from TCYX, got shape {cyx.shape}")
+        return cyx, model_meta
+
+    # Legacy CYX or YX store
     if arr.ndim == 2:
         arr = arr[None, ...]
     elif arr.ndim != 3:
         raise ValueError(f"Expected CYX or YX field array, got shape {arr.shape}")
-
-    _FIELD_STORE_CACHE[key] = (arr, model_meta)
     return arr, model_meta
 
 
@@ -90,17 +107,13 @@ def slice_field_patch(
         try:
             cidx = int(channels.index(channel_name))
         except ValueError as exc:  # pragma: no cover - defensive, hard to trigger deterministically
-            raise ValueError(
-                f"Channel '{channel_name}' not found in field channels: {channels}"
-            ) from exc
+            raise ValueError(f"Channel '{channel_name}' not found in field channels: {channels}") from exc
     else:
         cidx = 0
 
     downsample = int(field_meta.get("downsample", 1) or 1)
     if downsample != 1:
-        raise ValueError(
-            f"Field store downsample={downsample} is unsupported; export with --downsample 1."
-        )
+        raise ValueError(f"Field store downsample={downsample} is unsupported; export with --downsample 1.")
 
     fx0 = float(field_meta.get("x0", 0.0))
     fy0 = float(field_meta.get("y0", 0.0))
@@ -169,26 +182,25 @@ def tile_origin(workspace: Workspace | Path, roi: str, tile_index: int) -> tuple
     return x0, y0
 
 
-def apply_field_stores_to_img(
+# Legacy CYX two-store application removed; use apply_field_tcyx_store_to_img instead.
+
+
+def apply_field_tcyx_store_to_img(
     img: np.ndarray,
     channel_labels_selected: Sequence[str],
     *,
-    low_zarr: Path,
-    range_zarr: Path,
+    tcyx_zarr: Path,
     x0: float,
     y0: float,
     trim: int,
 ) -> np.ndarray:
-    """Apply field correction using pre-exported LOW and RANGE Zarr stores.
+    """Apply field correction using a single TCYX field store.
 
-    Supports (C, Y, X) and (Z, C, Y, X) arrays and returns a float32 array. The
-    correction follows the contract used by CLI stitch extraction:
-
-        corrected = max(img - LOW_patch, 0) * RANGE_patch
+    Selects T-planes 'low' and 'range' and applies the same correction rule as
+    ``apply_field_stores_to_img``. Returns float32 array aligned with ``img``.
     """
-
-    low_cyx, low_meta = load_field_cyx(low_zarr)
-    rng_cyx, rng_meta = load_field_cyx(range_zarr)
+    low_cyx, low_meta = load_field_t_plane_as_cyx(tcyx_zarr, "low")
+    rng_cyx, rng_meta = load_field_t_plane_as_cyx(tcyx_zarr, "range")
 
     def _patch(channel: str) -> tuple[np.ndarray, np.ndarray]:
         low_patch = slice_field_patch(
@@ -214,7 +226,7 @@ def apply_field_stores_to_img(
         return low_patch, range_patch
 
     if img.ndim == 3:
-        channels, height, width = img.shape
+        channels, _, _ = img.shape
         out = img.astype(np.float32, copy=False)
         for c_index, channel_label in enumerate(channel_labels_selected):
             if c_index >= channels:
@@ -224,7 +236,7 @@ def apply_field_stores_to_img(
         return out
 
     if img.ndim == 4:
-        z, channels, height, width = img.shape
+        z, channels, _, _ = img.shape
         out = img.astype(np.float32, copy=False)
         cached_patches: list[tuple[np.ndarray, np.ndarray]] = []
         for c_index, channel_label in enumerate(channel_labels_selected):
@@ -237,4 +249,3 @@ def apply_field_stores_to_img(
         return out
 
     raise ValueError(f"Unsupported image shape for field application: {img.shape}")
-

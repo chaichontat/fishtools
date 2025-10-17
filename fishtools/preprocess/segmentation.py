@@ -9,5 +9,5 @@ def unsharp_all(
     return unsharp_mask(img, preserve_range=True, radius=3, channel_axis=channel_axis)
 
 
-# Backwards-compat: re-export calc_percentile from segment.normalize
-from fishtools.segment.normalize import calc_percentile  # noqa: E402  (import after unsharp_all)
+# Backwards-compat: re-export sample_percentile from segment.normalize
+from fishtools.segment.normalize import sample_percentile  # noqa: E402  (import after unsharp_all)

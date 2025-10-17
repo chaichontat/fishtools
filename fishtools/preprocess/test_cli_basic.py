@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -450,3 +451,66 @@ def test_run_writes_sampling_json(tmp_path: Path, mocker: MockerFixture) -> None
     assert isinstance(payload["sampled_tiles"], list)
     # Exactly the interior count
     assert len(payload["sampled_tiles"]) == 48
+
+
+def test_run_all_canonical_deduplicates_indices(tmp_path: Path, mocker: MockerFixture) -> None:
+    # Workspace with one ROI and two canonical rounds; ensure 'all' sampling dedups indices across rounds
+    roi = "roiA"
+    rounds = ["1_2_3", "4_5_6"]
+
+    # ROI grid 16x14 → interior(n=2) = (16-4)*(14-4)=12*10=120 indices (meets >=100 threshold)
+    coords = []
+    for y in range(14):
+        for x in range(16):
+            coords.append((float(x), float(y)))
+    (tmp_path / f"{roi}.csv").write_text("\n".join(f"{y},{x}" for x, y in coords))
+
+    def is_interior(i: int) -> bool:
+        y, x = divmod(i, 16)
+        return (x >= 2 and x <= 13) and (y >= 2 and y <= 11)
+
+    for r in rounds:
+        d = tmp_path / f"{r}--{roi}"
+        d.mkdir(parents=True, exist_ok=True)
+        for idx in range(16 * 14):
+            p = d / f"{r}-{idx:04d}.tif"
+            if is_interior(idx):
+                p.write_bytes(b"1")
+            else:
+                p.touch()
+
+    # Channels for canonical rounds
+    mocker.patch("fishtools.preprocess.cli_basic.get_channels", return_value=["560", "650", "750"])
+
+    captured = {}
+
+    def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None):
+        captured["files"] = list(files)
+        n = len(files)
+        c = nc or 3
+        return np.zeros((n, c, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32)
+
+    # Make sampling deterministic and avoid heavy work
+    mocker.patch("random.sample", side_effect=lambda x, k: list(x)[:k])
+    mocker.patch("numpy.loadtxt", return_value=None)
+    mocker.patch("fishtools.preprocess.cli_basic.fit_and_save_basic", return_value=[])
+
+    # Run in 'all' mode → round_=None
+    run_with_extractor(tmp_path, round_=None, extractor_func=fake_extractor, plot=False, zs=(0.5,))
+
+    assert "files" in captured
+    sampled = captured["files"]
+    # Expect exactly 120 unique interior indices overall (dedup across rounds)
+    assert len(sampled) == 120
+    # Ensure we sampled from both canonical rounds
+    sampled_rounds = {p.parent.name.split("--", 1)[0] for p in sampled}
+    assert sampled_rounds.issuperset(set(rounds))
+    # And ensure no two paths share the same (roi, index)
+    seen: set[tuple[str, int]] = set()
+    for p in sampled:
+        roi_dir = p.parent.name
+        roi_base = roi_dir.split("--", 1)[-1]
+        idx = int(p.stem.split("-")[-1])
+        key = (roi_base, idx)
+        assert key not in seen
+        seen.add(key)

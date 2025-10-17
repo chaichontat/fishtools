@@ -1,19 +1,21 @@
 import time
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
-from scipy import ndimage
 from click.testing import CliRunner
 from pydantic import BaseModel
+from scipy import ndimage
 from tifffile import TiffFile, TiffFileError, imwrite
 
+from fishtools.preprocess import downsample as downsample_module
 from fishtools.preprocess.cli_stitch import (
+    _label_for_max_from,
     copy_registered,
     create_tile_config,
     extract,
@@ -22,9 +24,7 @@ from fishtools.preprocess.cli_stitch import (
     run_imagej,
     stitch,
     walk_fused,
-    _label_for_max_from,
 )
-from fishtools.preprocess import downsample as downsample_module
 from fishtools.preprocess.tileconfig import TileConfiguration
 
 
@@ -632,7 +632,9 @@ class TestMaxFromLabelling:
 
     def test_label_for_max_from_with_channel_metadata(self, tmp_path: Path) -> None:
         target = tmp_path / "max.tif"
-        imwrite(target, np.ones((2, 4, 4), dtype=np.uint16), metadata={"axes": "CYX", "key": ["dapi", "bit1"]})
+        imwrite(
+            target, np.ones((2, 4, 4), dtype=np.uint16), metadata={"axes": "CYX", "key": ["dapi", "bit1"]}
+        )
         assert _label_for_max_from(target) == "max_from:dapi+bit1"
 
     def test_label_for_max_from_without_metadata(self, tmp_path: Path) -> None:
@@ -759,7 +761,8 @@ class TestZarrOperations:
             # If we get here without exception, the test passes
             # Verify Zarr directory would be created (mocked)
             zarr_path = stitch_path / "fused.zarr"
-            # In mock mode, we're just testing the logic flow
+            assert result is None
+            assert zarr_path.name == "fused.zarr"
 
         except (AttributeError, ValueError) as e:
             # Various failures are expected in test environment:
@@ -887,29 +890,58 @@ class TestErrorHandling:
         # Exact behavior depends on implementation, but shouldn't crash
         assert isinstance(result.exit_code, int)
 
-def test_corrupted_tile_configuration(
-    synthetic_stitch_dataset: SyntheticStitchDataset, mock_imagej_success
-):
-        """Test handling of corrupted tile configuration files"""
-        # Create corrupted tile configuration
-        corrupted_config = synthetic_stitch_dataset.base_path / "corrupted_config.txt"
-        corrupted_config.write_text("this is not a valid tile configuration")
 
-        runner = CliRunner()
+def test_fuse_skips_when_fused_outputs_exist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fuse should skip work when fused outputs already exist and overwrite is not set."""
+    workspace = tmp_path / "workspace"
+    deconv_path = workspace / "analysis" / "deconv"
+    stitch_dir = deconv_path / "stitch--roi+codebook1"
 
-        # Run register_simple with corrupted config
-        result = runner.invoke(
-            stitch,
-            [
-                "register-simple",
-                str(synthetic_stitch_dataset.base_path),
-                "--tileconfig",
-                str(corrupted_config),
-            ],
-        )
+    stitch_dir.mkdir(parents=True)
+    (workspace / "analysis" / "logs").mkdir(parents=True)
+    (workspace / "workspace.DONE").write_text("ok")
+    (stitch_dir / "fused.zarr").touch()
 
-        # Should fail with meaningful error
-        assert result.exit_code != 0
+    run_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def run_imagej_spy(*args, **kwargs):  # noqa: ANN001
+        run_calls.append((args, kwargs))
+        return None
+
+    monkeypatch.setattr("fishtools.preprocess.cli_stitch.run_imagej", run_imagej_spy)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        stitch,
+        ["fuse", str(deconv_path), "roi", "--codebook", "codebook1"],
+    )
+
+    assert result.exit_code == 0
+    assert not run_calls
+    assert "existing fused outputs" in result.output
+
+
+def test_corrupted_tile_configuration(synthetic_stitch_dataset: SyntheticStitchDataset, mock_imagej_success):
+    """Test handling of corrupted tile configuration files"""
+    # Create corrupted tile configuration
+    corrupted_config = synthetic_stitch_dataset.base_path / "corrupted_config.txt"
+    corrupted_config.write_text("this is not a valid tile configuration")
+
+    runner = CliRunner()
+
+    # Run register_simple with corrupted config
+    result = runner.invoke(
+        stitch,
+        [
+            "register-simple",
+            str(synthetic_stitch_dataset.base_path),
+            "--tileconfig",
+            str(corrupted_config),
+        ],
+    )
+
+    # Should fail with meaningful error
+    assert result.exit_code != 0
 
 
 class TestFinalStitchMetadata:

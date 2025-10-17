@@ -6,8 +6,6 @@ import pandas as pd
 import polars as pl
 import pyparsing as pp
 from numpy.typing import NDArray
-from shapely.geometry import Point, box
-from shapely.ops import unary_union
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -166,6 +164,9 @@ def interior_indices_geometry(xy: NDArray[np.floating | np.integer], n: int) -> 
     Returns:
         np.ndarray of positions into ``xy`` meeting the criterion.
     """
+    from shapely.geometry import Point, box
+    from shapely.ops import unary_union
+
     if xy.ndim != 2 or xy.shape[1] != 2:
         raise ValueError("xy must be a (N, 2) array of [x, y] coordinates")
     if n < 0:

@@ -105,6 +105,9 @@ def _compute_subtile_percentiles_cpu(
     return lo, hi
 
 
+    
+
+
 def _skip_existing(tile: Path, out_suffix: str, grid: int, keys: tuple[str, str], overwrite: bool) -> bool:
     if overwrite:
         return False
@@ -242,7 +245,10 @@ def render_global(
     rng_model = RangeFieldPointsModel.from_npz(model)
     meta = rng_model.meta
 
-    roi = roi or str(meta.get("roi"))
+    # Avoid converting missing/None ROI to literal "None"
+    if roi is None:
+        _roi_meta = meta.get("roi")
+        roi = str(_roi_meta) if _roi_meta is not None else None
     codebook = codebook or str(meta.get("codebook")) if meta.get("codebook") is not None else None
     if not roi:
         raise click.UsageError("ROI must be provided either via --roi or present in model metadata")
@@ -923,9 +929,10 @@ def plot_field(
     type=click.Path(dir_okay=True, file_okay=True, writable=True, path_type=Path),
     default=None,
     help=(
-        "Output Zarr store path (.zarr). If --what=both and --output is provided, "
-        "two stores will be written by appending -range.zarr and -low.zarr to the base name. "
-        "When omitted, defaults to '<model>-field-<kind>-ds<downsample>.zarr'."
+        "Output Zarr store path (.zarr). Exports a single TCYX array: "
+        "T=[LOW,RANGE] when --what=both, otherwise T=1. "
+        "When omitted, defaults to '<model>-field-<kind>-tcyx-ds<downsample>.zarr' for single-kind "
+        "or '<model>-field-both-tcyx-ds<downsample>.zarr' for --what=both."
     ),
 )
 def export_field(
@@ -947,7 +954,12 @@ def export_field(
     - Build a union-of-tiles (union-of-squares) mask
     - Normalize RANGE using that global mask
     - Crop to the mask's tight bounding box (remove irrelevant regions)
-    - Resize to native and optionally downsample; values outside the union are NaN
+    - Resize to native and optionally downsample; values outside the union are set to 1
+
+    Output layout:
+    - Zarr array with axes="TCYX". T indexes field type(s) in order [LOW, RANGE].
+      When ``--what`` selects a single kind, T=1 with the only plane labelled
+      accordingly.
     """
 
     import zarr
@@ -1120,37 +1132,27 @@ def export_field(
         m_ds = resize(m_native, (Hds, Wds), preserve_range=True, anti_aliasing=False).astype(np.float32)
         m_bool = m_ds > 0.5
         if (~m_bool).any():
+            # Fill outside the mask with identity value 1.0 for both fields.
+            # For RANGE (multiplicative), 1.0 is neutral; for LOW (subtractive),
+            # the consumer can decide how to handle out-of-support regions.
             out_range = out_range.copy()
-            out_range[:, ~m_bool] = 0
+            out_range[:, ~m_bool] = 1.0
             if out_low is not None:
                 out_low = out_low.copy()
-                out_low[:, ~m_bool] = 0
+                out_low[:, ~m_bool] = 1.0
 
-    # Resolve output path(s) as Zarr stores
+    # Resolve output path for TCYX store
     mode = what.lower()
-    if mode == "range":
-        if output is None:
-            output = model.with_name(f"{model.stem}-field-range-ds{int(downsample)}.zarr")
-        out_paths = {"range": output}
-    elif mode == "low":
-        if output is None:
-            output = model.with_name(f"{model.stem}-field-low-ds{int(downsample)}.zarr")
-        out_paths = {"low": output}
-    else:  # both
-        if output is not None:
-            base = output.with_suffix("")
-            out_paths = {
-                "range": base.with_name(f"{base.name}-range.zarr"),
-                "low": base.with_name(f"{base.name}-low.zarr"),
-            }
+    if output is None:
+        if mode == "range":
+            output = model.with_name(f"{model.stem}-field-range-tcyx-ds{int(downsample)}.zarr")
+        elif mode == "low":
+            output = model.with_name(f"{model.stem}-field-low-tcyx-ds{int(downsample)}.zarr")
         else:
-            out_paths = {
-                "range": model.with_name(f"{model.stem}-field-range-ds{int(downsample)}.zarr"),
-                "low": model.with_name(f"{model.stem}-field-low-ds{int(downsample)}.zarr"),
-            }
+            output = model.with_name(f"{model.stem}-field-both-tcyx-ds{int(downsample)}.zarr")
 
     md_common = {
-        "axes": "CYX",
+        "axes": "TCYX",
         "roi": roi,
         "codebook": codebook,
         "tile_w": int(tile_w),
@@ -1169,48 +1171,47 @@ def export_field(
     md_common = {k: v for k, v in md_common.items() if v is not None}
     md_common["channels"] = ch_names
 
-    # Write requested outputs (Zarr array stores with attrs)
-    if "range" in out_paths:
-        md_r = dict(md_common)
-        md_r["kind"] = "range"
-        rng_store = out_paths["range"]
-        # Ensure parent exists for nested store
-        rng_store.parent.mkdir(parents=True, exist_ok=True)
-        chunks = (1, min(512, Hds), min(512, Wds))
-        za = zarr.open(str(rng_store), mode="w", shape=out_range.shape, chunks=chunks, dtype=np.float32)
-        za[:] = out_range
-        za.attrs["axes"] = "CYX"
-        za.attrs["model_meta"] = md_r
-        logger.info(
-            "Saved export-field RANGE (Zarr) CYX={}×{}×{} → {}",
-            int(out_range.shape[0]),
-            int(Hds),
-            int(Wds),
-            rng_store,
-        )
-        rich.print(
-            f"[green]Exported RANGE field (normalized, ds={int(downsample)}) as Zarr with CYX shape {out_range.shape} → {rng_store}[/green]"
-        )
-    if "low" in out_paths and out_low is not None:
-        md_l = dict(md_common)
-        md_l["kind"] = "low"
-        low_store = out_paths["low"]
-        low_store.parent.mkdir(parents=True, exist_ok=True)
-        chunks_l = (1, min(512, Hds), min(512, Wds))
-        zb = zarr.open(str(low_store), mode="w", shape=out_low.shape, chunks=chunks_l, dtype=np.float32)
-        zb[:] = out_low
-        zb.attrs["axes"] = "CYX"
-        zb.attrs["model_meta"] = md_l
-        logger.info(
-            "Saved export-field LOW (Zarr) CYX={}×{}×{} → {}",
-            int(out_low.shape[0]),
-            int(Hds),
-            int(Wds),
-            low_store,
-        )
-        rich.print(
-            f"[green]Exported LOW field (ds={int(downsample)}) as Zarr with CYX shape {out_low.shape} → {low_store}[/green]"
-        )
+    # Compose TCYX array:
+    # - When both: T=2 planes [LOW, RANGE]
+    # - When single: T=1 with the requested kind
+    t_labels: list[str]
+    if mode == "both":
+        if out_low is None:
+            raise click.UsageError("--what both requested but LOW field is unavailable")
+        arr_tcyx = np.stack([out_low, out_range], axis=0)
+        t_labels = ["low", "range"]
+        md_common["kind"] = "both"
+    elif mode == "low":
+        if out_low is None:
+            raise click.UsageError("LOW field was not computed; ensure --what includes 'low'")
+        arr_tcyx = out_low[None, ...]
+        t_labels = ["low"]
+        md_common["kind"] = "low"
+    else:  # range only
+        arr_tcyx = out_range[None, ...]
+        t_labels = ["range"]
+        md_common["kind"] = "range"
+
+    # Write single TCYX store with attributes
+    output.parent.mkdir(parents=True, exist_ok=True)
+    chunks = (1, 1, min(512, Hds), min(512, Wds))
+    za = zarr.open(str(output), mode="w", shape=arr_tcyx.shape, chunks=chunks, dtype=np.float32)
+    za[:] = arr_tcyx
+    za.attrs["axes"] = "TCYX"
+    za.attrs["t_labels"] = t_labels
+    za.attrs["model_meta"] = md_common
+    logger.info(
+        "Saved export-field (Zarr) TCYX={}×{}×{}×{} kind={} → {}",
+        int(arr_tcyx.shape[0]),
+        int(arr_tcyx.shape[1]),
+        int(arr_tcyx.shape[2]),
+        int(arr_tcyx.shape[3]),
+        md_common.get("kind"),
+        output,
+    )
+    rich.print(
+        f"[green]Exported field as TCYX with shape {arr_tcyx.shape} (kind={md_common.get('kind')}, ds={int(downsample)}) → {output}[/green]"
+    )
 
 
 @correct_illum.command("plot-field-tile")

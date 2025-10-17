@@ -48,7 +48,6 @@ from fishtools.preprocess.config import StitchingConfig
 from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.illumination import (
-    apply_field_stores_to_img,
     parse_tile_index_from_path,
     resolve_roi_for_field,
     tile_origin,
@@ -56,7 +55,6 @@ from fishtools.preprocess.illumination import (
 from fishtools.preprocess.imagej import run_imagej as _run_imagej
 from fishtools.preprocess.imageops import clip_range_for_dtype as clip_range_for_dtype_lib
 from fishtools.preprocess.imageops import crop_xy as crop_xy_lib
-from fishtools.preprocess.n4 import run_cli_workflow
 from fishtools.preprocess.stitching import walk_fused as _walk_fused
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.preprocess.tileconfig import copy_registered as _copy_registered
@@ -67,6 +65,22 @@ from fishtools.utils.tiff import normalize_channel_names as norm_names
 from fishtools.utils.tiff import read_metadata_from_tif
 from fishtools.utils.utils import add_file_context, batch_roi
 from fishtools.utils.zarr_utils import numpy_array_to_zarr as _numpy_array_to_zarr
+
+"""Lazy N4 workflow import (CuPy/SimpleITK heavy).
+
+We keep a module-level symbol for tests to monkeypatch while deferring
+the actual import until the 'n4' command is invoked.
+"""
+run_cli_workflow = None  # type: ignore[assignment]
+
+
+def _get_run_cli_workflow():
+    global run_cli_workflow  # noqa: PLW0603 - intended shared cache
+    if run_cli_workflow is None:  # type: ignore[comparison-overlap]
+        from fishtools.preprocess.n4 import run_cli_workflow as _run
+
+        run_cli_workflow = _run  # type: ignore[assignment]
+    return run_cli_workflow  # type: ignore[return-value]
 
 
 def _clip_range_for_dtype(dtype: np.dtype) -> tuple[float, float] | None:  # shim
@@ -668,15 +682,12 @@ def extract(
     max_proj: bool = False,
     is_2d: bool = False,
     channels: list[int] | None = None,
-    # Field NPZ path deprecated: use field_low_zarr/field_range_zarr
-    field_corr: Path | None = None,
     max_from: Path | None = None,
     sc: StitchingConfig | None = None,
     workspace_root: Path | None = None,
     roi_for_ws: str | None = None,
     debug: bool = False,
-    field_low_zarr: Path | None = None,
-    field_range_zarr: Path | None = None,
+    field_zarr: Path | None = None,
 ) -> None:
     """
     Extract and format images for downstream segmentation analysis.
@@ -744,7 +755,7 @@ def extract(
     try:
         if is_2d:
             logger.info(
-                f"Extract2D: start tile={path.name} channels={channels} subsample_z={subsample_z} field_corr={bool(field_corr)}"
+                f"Extract2D: start tile={path.name} channels={channels} subsample_z={subsample_z} field_zarr={bool(field_zarr)}"
             )
             if len(img.shape) == 4:
                 if not max_proj:
@@ -761,26 +772,22 @@ def extract(
             if channels is not None:
                 img = img[channels]
 
-            # Apply field correction after downsample for 2D path using pre-exported field Zarr stores
-            if field_low_zarr is not None and field_range_zarr is not None:
+            # Apply field correction after downsample for 2D path using single TCYX store
+            if field_zarr is not None:
                 if workspace_root is None:
                     raise ValueError("workspace_root is required when applying field Zarr stores")
                 roi_name = resolve_roi_for_field(out_path, roi_for_ws)
                 tile_index = parse_tile_index_from_path(path)
                 x0, y0 = tile_origin(workspace_root, roi_name, tile_index)
-                img = apply_field_stores_to_img(
+                from fishtools.preprocess.illumination import apply_field_tcyx_store_to_img
+
+                img = apply_field_tcyx_store_to_img(
                     img,
                     channel_labels_selected,
-                    low_zarr=field_low_zarr,
-                    range_zarr=field_range_zarr,
+                    tcyx_zarr=field_zarr,
                     x0=x0,
                     y0=y0,
                     trim=int(trim),
-                )
-            elif field_corr is not None:
-                # Legacy NPZ path removed; prefer pre-exported Zarr stores
-                raise ValueError(
-                    "field_corr NPZ is no longer supported. Use --field-low-zarr/--field-range-zarr."
                 )
 
             clip_range = _clip_range_for_dtype(img.dtype)
@@ -869,26 +876,23 @@ def extract(
                 except Exception:
                     logger.opt(exception=True).debug("GPU cleanup failed after 3D downsample; continuing.")
 
-        # Apply field correction after downsample for 3D path using pre-exported field Zarr stores
-        if field_low_zarr is not None and field_range_zarr is not None:
+        # Apply field correction after downsample for 3D path using single TCYX store
+        if field_zarr is not None:
             if workspace_root is None:
                 raise ValueError("workspace_root is required when applying field Zarr stores")
             roi_name = resolve_roi_for_field(out_path, roi_for_ws)
             tile_index = parse_tile_index_from_path(path)
             x0, y0 = tile_origin(workspace_root, roi_name, tile_index)
-            img = apply_field_stores_to_img(
+            from fishtools.preprocess.illumination import apply_field_tcyx_store_to_img
+
+            img = apply_field_tcyx_store_to_img(
                 img,
                 channel_labels_selected,
-                low_zarr=field_low_zarr,
-                range_zarr=field_range_zarr,
+                tcyx_zarr=field_zarr,
                 x0=x0,
                 y0=y0,
                 trim=int(trim),
             ).astype(np.uint16)
-        elif field_corr is not None:
-            raise ValueError(
-                "field_corr NPZ is no longer supported. Use --field-low-zarr/--field-range-zarr."
-            )
 
         if max_proj:
             img = img.max(axis=0, keepdims=True)
@@ -963,19 +967,12 @@ def walk_fused(path: Path) -> dict[int, list[Path]]:  # shim
 @click.option("--debug", is_flag=True)
 @click.option("--max-from", type=str)
 @click.option(
-    "--field-low-zarr",
+    "--field-zarr",
     type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
     default=None,
     help=(
-        "Pre-exported LOW field Zarr store (CYX, ds=1) from correct-illum export-field --what low --downsample 1."
-    ),
-)
-@click.option(
-    "--field-range-zarr",
-    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
-    default=None,
-    help=(
-        "Pre-exported RANGE field Zarr store (CYX, ds=1) from correct-illum export-field --what range --downsample 1."
+        "Pre-exported field Zarr store (TCYX, ds=1) from correct-illum export-field --what both --downsample 1. "
+        "Selects T planes ['low','range'] during application."
     ),
 )
 @click.option(
@@ -1004,8 +1001,7 @@ def fuse(
     max_from: str | None = None,
     json_config: Path | None = None,
     # skip_extract: bool = False,
-    field_low_zarr: Path | None = None,
-    field_range_zarr: Path | None = None,
+    field_zarr: Path | None = None,
 ):
     setup_cli_logging(
         path,
@@ -1124,12 +1120,11 @@ def fuse(
         logger.warning(f"Not all images are present in {path_img}. Missing: {needed - imgs}. Dropping.")
 
     # When using pre-exported fields, enforce ds=1 for alignment
-    if (field_low_zarr or field_range_zarr) and int(downsample) != 1:
-        raise ValueError("When --field-low-zarr/--field-range-zarr are provided, please set --downsample 1.")
+    if (field_zarr) and int(downsample) != 1:
+        raise ValueError("When providing field Zarr stores, please set --downsample 1 for alignment.")
 
     # Sanity: both LOW and RANGE must be supplied together
-    if (field_low_zarr is None) ^ (field_range_zarr is None):
-        raise ValueError("Provide both --field-low-zarr and --field-range-zarr (or neither).")
+    # Only TCYX format is supported now
 
     if skip_extract:
         logger.info(f"Reusing previously extracted tiles at {path}. Use --overwrite to regenerate.")
@@ -1151,8 +1146,7 @@ def fuse(
                     workspace_root=ws.path,
                     roi_for_ws=roi,
                     debug=debug,
-                    field_low_zarr=field_low_zarr,
-                    field_range_zarr=field_range_zarr,
+                    field_zarr=field_zarr,
                 )
 
     def run_folder(folder: Path, capture_output: bool = False):
@@ -1471,7 +1465,8 @@ def n4(
     )
 
     try:
-        results = run_cli_workflow(
+        _runner = run_cli_workflow or _get_run_cli_workflow()
+        results = _runner(
             workspace=path,
             roi=roi,
             codebook=codebook,

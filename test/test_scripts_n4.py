@@ -346,3 +346,139 @@ def test_compute_fields_from_workspace_corrects_zarr(tmp_path: Path, monkeypatch
         rtol=1e-4,
         atol=5e-2,
     )
+
+
+def test_normalize_field_sets_background_to_one() -> None:
+    # Foreground: a 2x2 block with positive values; background: zeros
+    image = np.zeros((6, 6), dtype=np.float32)
+    image[2:4, 2:4] = 10.0
+
+    # Field: vary across image; background deliberately set far from 1.0
+    yy, xx = np.mgrid[0:6, 0:6].astype(np.float32)
+    field = 0.5 + 0.1 * (yy + xx)  # ranges from 0.5 .. 1.6
+
+    # Normalize so median ≈ 1 in foreground and exactly 1 outside
+    norm, scale, fg_mask = n4._normalize_field_to_unity(field, image, threshold=None)
+
+    assert norm.shape == field.shape
+    assert scale > 0
+    assert np.any(fg_mask)
+
+    # Background must be exactly 1.0
+    bg = ~fg_mask
+    if np.any(bg):
+        assert np.allclose(norm[bg], 1.0)
+
+    # Foreground median ~ 1 (robust within a small tolerance)
+    fg_vals = norm[fg_mask]
+    med = float(np.median(fg_vals)) if fg_vals.size else 1.0
+    assert abs(med - 1.0) < 1e-3
+
+
+def test_quantization_dynamic_guard_spans_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Synthetic plane with broad dynamic range and a few bright spikes
+    workspace = tmp_path / "ws"
+    fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
+    fused_dir.mkdir(parents=True)
+
+    rng = np.random.default_rng(0)
+    base = rng.uniform(10.0, 200.0, size=(1, 128, 128, 1)).astype(np.float32)
+    # Insert bright spikes (~0.05%)
+    spike_coords = [(5, 5), (64, 64), (100, 100)]
+    for y, x in spike_coords:
+        base[0, y, x, 0] = 2000.0
+    _create_fused_store(fused_dir, base.astype(np.uint16))
+
+    # Identity field; no sharpening during correction
+    monkeypatch.setattr(
+        n4, "compute_correction_field", lambda *args, **kwargs: np.ones((128, 128), dtype=np.float32)
+    )
+    monkeypatch.setattr(n4, "_prepare_gpu_field", lambda arr: np.asarray(arr, dtype=np.float32))
+    monkeypatch.setattr(
+        n4,
+        "_correct_plane_gpu",
+        lambda plane, field_gpu, use_unsharp_mask, mask_cpu=None: np.asarray(plane, dtype=np.float32)
+        / field_gpu,
+    )
+    fake_cp = _fake_cp()
+    fake_cp.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCount=lambda: 1))
+    monkeypatch.setattr(n4, "cp", fake_cp)
+
+    config = n4.N4RuntimeConfig(
+        workspace=workspace,
+        roi="roi",
+        codebook="cb",
+        channel=0,
+        shrink=1,
+        spline_lowres_px=8.0,
+        z_index=0,
+        field_output=fused_dir / "field.tif",
+        corrected_output=fused_dir / "corrected.zarr",
+        apply_correction=True,
+        overwrite=True,
+        debug=False,
+        use_unsharp_mask=False,
+    )
+    result = n4.compute_fields_from_workspace(config)[0]
+    corrected = zarr.open_array(result.corrected_path, mode="r")
+    u16 = np.asarray(corrected, dtype=np.uint16).squeeze(axis=-1)
+    assert u16.max() <= np.iinfo(np.uint16).max
+    # Expect near-full usage of dynamic range due to adaptive guard
+    assert u16.max() >= 60000
+
+
+def test_quantization_with_unsharp_spans_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "ws"
+    fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
+    fused_dir.mkdir(parents=True)
+
+    # Base image with moderate values; unsharp will boost edges
+    img = np.zeros((1, 64, 64, 1), dtype=np.float32)
+    img[0, 16:48, 16:48, 0] = 100.0
+    _create_fused_store(fused_dir, img.astype(np.uint16))
+
+    monkeypatch.setattr(
+        n4, "compute_correction_field", lambda *args, **kwargs: np.ones((64, 64), dtype=np.float32)
+    )
+    monkeypatch.setattr(n4, "_prepare_gpu_field", lambda arr: np.asarray(arr, dtype=np.float32))
+
+    # Simulate unsharp by inflating intensities inside the mask by 1.5x
+    def _fake_correct(
+        plane: np.ndarray,
+        *,
+        field_gpu: np.ndarray,
+        use_unsharp_mask: bool,
+        mask_cpu: np.ndarray | None = None,
+    ) -> np.ndarray:
+        out = np.asarray(plane, dtype=np.float32) / np.asarray(field_gpu, dtype=np.float32)
+        if use_unsharp_mask and mask_cpu is not None:
+            out = np.where(mask_cpu, out * 1.5, out)
+        return out
+
+    monkeypatch.setattr(n4, "_correct_plane_gpu", _fake_correct)
+    fake_cp = _fake_cp()
+    fake_cp.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(getDeviceCount=lambda: 1))
+    monkeypatch.setattr(n4, "cp", fake_cp)
+
+    config = n4.N4RuntimeConfig(
+        workspace=workspace,
+        roi="roi",
+        codebook="cb",
+        channel=0,
+        shrink=1,
+        spline_lowres_px=8.0,
+        z_index=0,
+        field_output=fused_dir / "field.tif",
+        corrected_output=fused_dir / "corrected.zarr",
+        apply_correction=True,
+        overwrite=True,
+        debug=False,
+        use_unsharp_mask=True,
+    )
+
+    result = n4.compute_fields_from_workspace(config)[0]
+    corrected = zarr.open_array(result.corrected_path, mode="r")
+    u16 = np.asarray(corrected, dtype=np.uint16).squeeze(axis=-1)
+    # No overflow and near-full usage of the range
+    assert u16.max() <= np.iinfo(np.uint16).max
+    assert u16.max() >= 60000

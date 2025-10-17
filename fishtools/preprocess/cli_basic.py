@@ -108,65 +108,72 @@ def _is_canonical_round(sample_file: Path) -> bool:
 
 
 def sample_canonical_unique_tiles(path: Path) -> tuple[list[Path], list[str]]:
-    """Return interior tiles from canonical rounds without duplicate tiles.
+    """Return interior tiles from canonical rounds with round-rotating selection.
 
     Canonical rounds are those whose channel names are numeric and exactly 3 long
-    (e.g., 560/650/750). Duplicates are removed by (roi, tile-index) so that the
-    same tile coordinate is not sampled twice across rounds.
+    (e.g., 560/650/750). For each ROI, we consider the set of interior tile
+    indices (n>=2 from edges). For a given (roi, index), we choose the tile from
+    one of the canonical rounds in a round-robin fashion across rounds so that
+    returned files are mixed across rounds without any index overlap.
 
     Returns:
         (files, extra_rounds)
-        files: deduplicated interior tile paths
+        files: interior tile paths with at most one file per (roi, index),
+               chosen by rotating across canonical rounds
         extra_rounds: non-canonical rounds encountered (for separate handling)
     """
-    # Discover rounds via Workspace to centralize naming logic
     rounds = Workspace.discover_rounds(path)
+    # Representative tile per round to determine canonicality
     round_to_sample: dict[str, Path] = {}
     for r in rounds:
-        # pick a representative tile under r--*/
         first = next(iter(sorted(path.glob(f"{r}--*/*.tif"))), None)
         if first is not None:
             round_to_sample[r] = first
 
-    canonical_rounds: set[str] = set()
-    for r, f in round_to_sample.items():
-        if _is_canonical_round(f):
-            canonical_rounds.add(r)
+    canonical_rounds = [r for r, f in sorted(round_to_sample.items()) if _is_canonical_round(f)]
+    extra_rounds = sorted(set(round_to_sample.keys()) - set(canonical_rounds))
 
-    all_rounds = set(round_to_sample.keys())
-    extra_rounds = sorted(all_rounds - canonical_rounds)
-
-    # Collect all tiles from canonical rounds
-    candidates: list[Path] = []
-    for r in sorted(canonical_rounds):
-        candidates.extend(sorted(path.glob(f"{r}--*/*.tif")))
-
-    # Prefer non "--basic" sources when deduplicating
-    candidates.sort(key=lambda p: ("--basic" in p.as_posix(), p.as_posix()))
-
-    # Build interior filter caches per ROI
+    # Map: roi_base -> index -> {round: path}
+    by_roi_index: dict[str, dict[int, dict[str, Path]]] = {}
     allowed_by_roi: dict[str, set[int] | None] = {}
 
-    # De-duplicate by (roi_base, tile_index)
-    seen: set[tuple[str, int]] = set()
-    unique_interior: list[Path] = []
+    for r in canonical_rounds:
+        for f in sorted(path.glob(f"{r}--*/*.tif")):
+            roi_dirname = f.parent.name
+            roi_base = _roi_base_from_dirname(roi_dirname)
+            if roi_base is None:
+                continue
+            allowed = _allowed_indices_for_roi(path, roi_dirname, allowed_by_roi)
+            idx = _parse_tile_index(f)
+            if allowed is None or idx is None or idx not in allowed:
+                continue  # enforce interior only when CSV known
+            by_roi_index.setdefault(roi_base, {}).setdefault(idx, {})[r] = f
 
-    for f in candidates:
-        roi_dirname = f.parent.name
-        allowed = _allowed_indices_for_roi(path, roi_dirname, allowed_by_roi)
-        idx = _parse_tile_index(f)
-        if allowed is None or idx is None or idx not in allowed:
-            continue  # enforce 2-step-from-edge rule
-        roi_base = _roi_base_from_dirname(roi_dirname)
-        if roi_base is None:
+    # Build rotated selection across rounds per ROI
+    selected: list[Path] = []
+    for roi_base, idx_map in sorted(by_roi_index.items()):
+        if not idx_map:
             continue
-        key = (roi_base, idx)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_interior.append(f)
+        # Maintain a rotation pointer per ROI
+        order = list(canonical_rounds)
+        ptr = 0
+        for idx in sorted(idx_map.keys()):
+            tried = 0
+            chosen: Path | None = None
+            while tried < len(order):
+                r = order[ptr]
+                ptr = (ptr + 1) % len(order)
+                tried += 1
+                f = idx_map[idx].get(r)
+                if f is not None:
+                    chosen = f
+                    break
+            if chosen is not None:
+                selected.append(chosen)
 
-    return unique_interior, extra_rounds
+    # Prefer stable ordering and non "--basic" sources
+    selected.sort(key=lambda p: ("--basic" in p.as_posix(), p.as_posix()))
+    return selected, extra_rounds
 
 
 def extract_data_from_tiff(

@@ -1,6 +1,7 @@
 import numpy as np
-from fishtools.segment.normalize import calc_percentile, sample_percentiles
 from skimage.filters import unsharp_mask
+
+from fishtools.segment.normalize import sample_percentile, sample_percentiles
 
 
 def test_sample_percentiles_shapes_and_order():
@@ -29,11 +30,11 @@ def test_sample_percentiles_shapes_and_order():
         np.testing.assert_allclose(mean_perc[idx, 1], global_high, rtol=0.15, atol=50.0)
 
 
-def test_calc_percentile_alias_matches():
+def test_sample_percentile_alias_matches():
     rng = np.random.default_rng(1)
     img = rng.integers(1, 65535, size=(2, 64, 64, 3), dtype=np.uint16)
 
     a, _ = sample_percentiles(img, channels=[1, 3], block=(32, 32), n=3, low=1, high=99, seed=0)
-    b, _ = calc_percentile(img, channels=[1, 3], block=(32, 32), n=3, low=1, high=99, seed=0)
+    b, _ = sample_percentile(img, channels=[1, 3], block=(32, 32), n=3, low=1, high=99, seed=0)
 
     np.testing.assert_allclose(a, b)

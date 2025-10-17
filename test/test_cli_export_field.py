@@ -3,13 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import zarr
 from click.testing import CliRunner
 from skimage.transform import resize
 from tifffile import imwrite
-import zarr
 
 from fishtools.io.workspace import Workspace
-from fishtools.preprocess.cli_correct_illum import correct_illum, _mask_union_of_tiles
+from fishtools.preprocess.cli_correct_illum import _mask_union_of_tiles, correct_illum
 from fishtools.preprocess.spots.illumination import RangeFieldPointsModel
 
 
@@ -161,19 +161,20 @@ def test_export_field_matches_plot_logic(tmp_path: Path) -> None:
     W = int(np.ceil(x1 - x0))
     H = int(np.ceil(y1 - y0))
     native = resize(inv_range, (H, W), preserve_range=True, anti_aliasing=True).astype(np.float32)
-    expected = resize(native, (max(1, H // 4), max(1, W // 4)), preserve_range=True, anti_aliasing=True).astype(
-        np.float32
-    )
+    expected = resize(
+        native, (max(1, H // 4), max(1, W // 4)), preserve_range=True, anti_aliasing=True
+    ).astype(np.float32)
 
     za = zarr.open(str(out_zarr), mode="r")
     got_raw = np.asarray(za).astype(np.float32)
-    axes = getattr(za, "attrs", {}).get("axes")
+    attrs = getattr(za, "attrs", {})
+    axes = attrs.get("axes") if hasattr(attrs, "get") else None
     if axes is not None:
-        assert axes == "CYX"
-
-    # Expect CYX with singleton channel
-    assert got_raw.ndim == 3 and got_raw.shape[0] == 1
-    got = got_raw[0]
+        assert axes == "TCYX"
+    # Expect TCYX with T=1 (range) and C=1
+    assert got_raw.ndim == 4 and got_raw.shape[0] == 1 and got_raw.shape[1] == 1
+    # Extract YX plane
+    got = got_raw[0, 0]
     assert got.shape == expected.shape
     # Means should be ~1.0 after normalization
     assert np.isclose(float(got.mean()), 1.0, atol=5e-2)

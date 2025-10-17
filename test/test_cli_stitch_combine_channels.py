@@ -5,10 +5,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import numpy.testing as npt
 import pytest
 from tifffile import imwrite
 
-from fishtools.preprocess.cli_stitch import combine
+from fishtools.preprocess.cli_stitch import combine, register
 
 
 @pytest.fixture()
@@ -21,9 +22,10 @@ def mock_zarr_ops(monkeypatch: Any):
             self.chunks = chunks
             self.dtype = dtype
             self.attrs: dict[str, Any] = {}
+            self.writes: list[tuple[Any, np.ndarray]] = []
 
         def __setitem__(self, key: Any, value: np.ndarray) -> None:
-            pass
+            self.writes.append((key, np.array(value, copy=True)))
 
         def __getitem__(self, key: Any) -> np.ndarray:
             # Return ones for any slice request
@@ -59,6 +61,8 @@ def mock_zarr_ops(monkeypatch: Any):
 
 def _make_stitch_tree(base: Path, roi: str, codebook: str, z: int, c: int, size: int = 16) -> Path:
     """Create stitch--{roi}+{codebook}/ZZ/CC/fused_CC-1.tif structure with constant pixels."""
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "workspace.DONE").write_text("test workspace marker")
     stitch_path = base / "analysis" / "deconv" / f"stitch--{roi}+{codebook}"
     stitch_path.mkdir(parents=True, exist_ok=True)
     for zi in range(z):
@@ -67,6 +71,32 @@ def _make_stitch_tree(base: Path, roi: str, codebook: str, z: int, c: int, size:
             chdir.mkdir(parents=True, exist_ok=True)
             imwrite(chdir / f"fused_{ci:02d}-1.tif", np.ones((size, size), dtype=np.uint16))
     return stitch_path
+
+
+def _create_workspace_with_registered_tile(
+    base: Path,
+    roi: str,
+    codebook: str,
+    *,
+    tile_channels: list[str],
+    tile_data: np.ndarray,
+) -> tuple[Path, Path, Path]:
+    workspace_root = base / "ws"
+    deconv = workspace_root / "analysis" / "deconv"
+    registered_dir = deconv / f"registered--{roi}+{codebook}"
+    registered_dir.mkdir(parents=True, exist_ok=True)
+    (workspace_root / "workspace.DONE").write_text("marker")
+    (workspace_root / "codebooks").mkdir(parents=True, exist_ok=True)
+    (workspace_root / "codebooks" / f"{codebook}.json").write_text(json.dumps({"gene": tile_channels}))
+    (deconv / f"{roi}.csv").write_text("0,0\n")
+    imwrite(
+        registered_dir / "reg-0000.tif",
+        tile_data,
+        metadata={"axes": "CYX", "key": tile_channels},
+    )
+    stitched_dir = deconv / f"stitch--{roi}"
+    stitched_dir.mkdir(exist_ok=True)
+    return workspace_root, registered_dir, stitched_dir
 
 
 def _install_registered_with_names(
@@ -136,3 +166,41 @@ def test_combine_channel_variants(
 
     # Normalization is no longer computed during combine; file should not exist
     assert not (stitch_path / "normalization.json").exists()
+
+    # Verify that every write to the Zarr array preserved per-channel data
+    arr = mock_zarr_ops[stitch_path / "fused.zarr"]
+    assert arr.writes, "Expected combine() to write at least one Z-plane"
+    for _, plane in arr.writes:
+        assert plane.shape[2] == c
+        npt.assert_array_equal(plane, np.ones_like(plane))
+
+
+def test_register_cleans_intermediate_tiles(tmp_path: Path, monkeypatch: Any) -> None:
+    roi = "roi1"
+    codebook = "cb1"
+    tile_channels = ["bit0"]
+    tile_data = np.ones((1, 4, 4), dtype=np.uint16)
+
+    root, _registered_dir, stitch_dir = _create_workspace_with_registered_tile(
+        tmp_path, roi, codebook, tile_channels=tile_channels, tile_data=tile_data
+    )
+
+    preexisting = stitch_dir / "0000.tif"
+    imwrite(preexisting, np.ones((4, 4), dtype=np.uint16))
+
+    def fake_run_imagej(path: Path, **_: Any) -> None:
+        src = path / "TileConfiguration.txt"
+        dst = path / "TileConfiguration.registered.txt"
+        if src.exists():
+            dst.write_text(src.read_text())
+
+    monkeypatch.setattr("fishtools.preprocess.cli_stitch.run_imagej", fake_run_imagej)
+
+    register.callback(path=root, roi=roi, codebook=codebook, idx=0, overwrite=True)
+
+    digit_tifs = sorted(p for p in stitch_dir.glob("*.tif") if p.stem.isdigit())
+    assert digit_tifs == []
+
+    # Ensure TileConfiguration artifacts persist for downstream fuse
+    assert (stitch_dir / "TileConfiguration.txt").exists()
+    assert (stitch_dir / "TileConfiguration.registered.txt").exists()

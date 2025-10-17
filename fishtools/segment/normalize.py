@@ -17,6 +17,7 @@ def sample_percentiles(
     low: float = 1,
     high: float = 99,
     seed: int = 0,
+    unsharp: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample percentile ranges from a large 4D stack.
 
@@ -68,13 +69,17 @@ def sample_percentiles(
     for x, y in zip(x_start, y_start):
         if taken >= n:
             break
-        crop = arr[:, x : x + block[0], y : y + block[1], :]
+        crop = arr[::2, x : x + block[0], y : y + block[1], :]
         # Skip crops containing any zero pixel in the selected channels (avoid stitched borders)
-        if np.any(crop[..., ch_idx] == 0):
+        logger.info(f"Sampled crop {taken} at ({x}, {y})")
+        if np.sum(np.sum(crop[..., ch_idx] == 1) / crop[..., ch_idx].size) > 0.2:
+            logger.info("Crop contains many zero pixels; skipping.")
             continue
+
         # Light sharpening before measuring percentiles
-        crop_filt = unsharp_mask(crop, preserve_range=True, radius=3, channel_axis=3)
-        samples.append(np.percentile(crop_filt[..., ch_idx], [low, high], axis=(0, 1, 2)))
+        if unsharp:
+            crop = unsharp_mask(crop, preserve_range=True, radius=3, channel_axis=3)
+        samples.append(np.percentile(crop[..., ch_idx], [low, high], axis=(0, 1, 2)))
         taken += 1
 
     if not samples:
@@ -85,8 +90,7 @@ def sample_percentiles(
     return mean_perc, all_samples
 
 
-# Backwards-compatible name used throughout the repo
-def calc_percentile(
+def sample_percentile(
     img: npt.ArrayLike,
     channels: list[int],
     block: tuple[int, int] = (512, 512),
@@ -95,5 +99,17 @@ def calc_percentile(
     low: float = 1,
     high: float = 99,
     seed: int = 0,
+    unsharp: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    return sample_percentiles(img, channels, block, n=n, low=low, high=high, seed=seed)
+    """Backward-compatible wrapper returning the same result as sample_percentiles."""
+
+    return sample_percentiles(
+        img,
+        channels,
+        block,
+        n=n,
+        low=low,
+        high=high,
+        seed=seed,
+        unsharp=unsharp,
+    )

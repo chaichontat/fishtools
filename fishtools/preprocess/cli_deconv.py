@@ -1035,8 +1035,8 @@ def run(
     if round_name is None or round_name == "*":
         selected_rounds = (
             tuple(all_rounds)
-            if mode != "legacy"
-            else [r for r in all_rounds if all(x.isdigit() for x in r.split("_")) and len(r.split("_")) == 3]
+            # if mode != "legacy"
+            # else [r for r in all_rounds if all(x.isdigit() for x in r.split("_")) and len(r.split("_")) == 3]
         )
     elif round_name in all_rounds:
         selected_rounds = (round_name,)

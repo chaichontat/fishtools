@@ -5,14 +5,14 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import pytest
+
 from fishtools.preprocess.illumination import (
-    apply_field_stores_to_img,
+    apply_field_tcyx_store_to_img,
     clear_field_store_cache,
     parse_tile_index_from_path,
     resolve_roi_for_field,
     tile_origin,
 )
-
 from fishtools.preprocess.tileconfig import TileConfiguration
 
 
@@ -21,13 +21,18 @@ def _clear_cache() -> None:
     clear_field_store_cache()
 
 
-def _write_field_store(path: Path, data: np.ndarray) -> None:
+def _write_field_store_tcyx(path: Path, low: np.ndarray, rng: np.ndarray, channels: list[str]) -> None:
     import zarr
 
-    za = zarr.open_array(str(path), mode="w", shape=data.shape, dtype="f4")
-    za[...] = data.astype(np.float32)
+    low = low.astype(np.float32)
+    rng = rng.astype(np.float32)
+    arr = np.stack([low, rng], axis=0)
+    za = zarr.open_array(str(path), mode="w", shape=arr.shape, dtype="f4")
+    za[...] = arr
+    za.attrs["axes"] = "TCYX"
+    za.attrs["t_labels"] = ["low", "range"]
     za.attrs["model_meta"] = {
-        "channels": ["cy3"],
+        "channels": channels,
         "downsample": 1,
         "x0": 0.0,
         "y0": 0.0,
@@ -56,19 +61,18 @@ def test_tile_origin_reads_tile_configuration(tmp_path: Path) -> None:
     assert origin == (12.5, 18.0)
 
 
-def test_apply_field_stores_to_img_cyx(tmp_path: Path) -> None:
-    low_store = tmp_path / "low.zarr"
-    range_store = tmp_path / "range.zarr"
-    _write_field_store(low_store, np.array([[1.0, 2.0], [0.0, 1.0]], dtype=np.float32)[None, ...])
-    _write_field_store(range_store, np.array([[2.0, 3.0], [4.0, 5.0]], dtype=np.float32)[None, ...])
+def test_apply_field_tcyx_store_to_img_cyx(tmp_path: Path) -> None:
+    field_store = tmp_path / "field.zarr"
+    low = np.array([[1.0, 2.0], [0.0, 1.0]], dtype=np.float32)[None, ...]
+    rng = np.array([[2.0, 3.0], [4.0, 5.0]], dtype=np.float32)[None, ...]
+    _write_field_store_tcyx(field_store, low, rng, ["cy3"])
 
     img = np.array([[2.0, 5.0], [1.0, 4.0]], dtype=np.float32)[None, ...]
     img_original = img.copy()
-    corrected = apply_field_stores_to_img(
+    corrected = apply_field_tcyx_store_to_img(
         img,
         ["cy3"],
-        low_zarr=low_store,
-        range_zarr=range_store,
+        tcyx_zarr=field_store,
         x0=0.0,
         y0=0.0,
         trim=0,
@@ -81,19 +85,18 @@ def test_apply_field_stores_to_img_cyx(tmp_path: Path) -> None:
     assert np.allclose(corrected, expected.astype(np.float32))
 
 
-def test_apply_field_stores_to_img_zcyx(tmp_path: Path) -> None:
-    low_store = tmp_path / "low.zarr"
-    range_store = tmp_path / "range.zarr"
-    _write_field_store(low_store, np.zeros((1, 2, 2), dtype=np.float32))
-    _write_field_store(range_store, np.ones((1, 2, 2), dtype=np.float32))
+def test_apply_field_tcyx_store_to_img_zcyx(tmp_path: Path) -> None:
+    field_store = tmp_path / "field.zarr"
+    low = np.zeros((1, 2, 2), dtype=np.float32)
+    rng = np.ones((1, 2, 2), dtype=np.float32)
+    _write_field_store_tcyx(field_store, low, rng, ["cy3"])
 
     img = np.arange(8, dtype=np.float32).reshape(2, 1, 2, 2)
     img_original = img.copy()
-    corrected = apply_field_stores_to_img(
+    corrected = apply_field_tcyx_store_to_img(
         img,
         ["cy3"],
-        low_zarr=low_store,
-        range_zarr=range_store,
+        tcyx_zarr=field_store,
         x0=0.0,
         y0=0.0,
         trim=0,
