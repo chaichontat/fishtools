@@ -1,5 +1,6 @@
 # %%
 import json
+import multiprocessing as mp
 import os
 import pickle
 import random
@@ -7,27 +8,25 @@ import re
 import shutil
 import subprocess
 import time
-import warnings
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import timedelta
 from itertools import chain, groupby
 from pathlib import Path
-from typing import Any, Literal, Mapping, Sequence, cast
+from typing import Any, Literal, Mapping, Optional, Sequence, cast
 
+import cupy as cp
 import matplotlib
 
-matplotlib.use("Agg", force=True)
-import multiprocessing as mp
-from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-
+# disable memory pool for predictable memory usage
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 import rich_click as click
 import starfish
-import starfish.data
 import tifffile
 import xarray as xr
 from loguru import logger
+from numpy.typing import NDArray  # noqa: F401
 from pydantic import BaseModel, TypeAdapter, field_validator
 from rich.progress import (
     BarColumn,
@@ -52,10 +51,13 @@ from starfish.image import Filter
 from starfish.spots import DecodeSpots, FindSpots
 from starfish.types import Features, Levels
 from starfish.util.plot import imshow_plane, intensity_histogram
-from tifffile import TiffFile, imread
+from tifffile import TiffFile
+
+matplotlib.use("Agg", force=True)
+cp.cuda.set_allocator(None)
 
 from fishtools.gpu.memory import release_all as _gpu_release_all
-from fishtools.io.workspace import CorruptedTiffError, Workspace
+from fishtools.io.workspace import CorruptedTiffError, Workspace, safe_imwrite
 from fishtools.preprocess.addition import ElementWiseAddition
 from fishtools.preprocess.cli_spotlook import threshold
 from fishtools.preprocess.config import (
@@ -64,6 +66,13 @@ from fishtools.preprocess.config import (
 )
 from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.spots.align_batchoptimize import optimize
+from fishtools.preprocess.spots.illum_field_correction import (
+    FieldContext,
+    correct_channel_with_field,
+)
+from fishtools.preprocess.spots.illum_field_correction import (
+    slice_field_ds_for_tile as _slice_field_ds_for_tile,
+)
 from fishtools.preprocess.spots.overlay_spots import overlay
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
 from fishtools.utils.logging import setup_cli_logging
@@ -73,58 +82,265 @@ from fishtools.utils.utils import git_hash
 
 GPU = os.environ.get("GPU", "1") == "1"
 if GPU:
-    # logger.info("Using GPU")
+    logger.info("Using GPU")
     from fishtools.gpu.codebook import Codebook
 else:
     from starfish import Codebook
-# from fishtools.gpu.codebook import Codebook
-
-# Optional CuPy import for GPU acceleration (used in find_threshold)
-try:  # pragma: no cover - availability depends on runtime
-    import cupy as cp  # type: ignore
-except Exception:  # pragma: no cover - tests run CPU path
-    cp = None  # type: ignore[assignment]
-
-
-def _cupy_available() -> bool:
-    """Return True when CuPy is importable and at least one device is accessible.
-
-    Follows the defensive pattern used in fishtools.preprocess.n4 to avoid
-    surprising crashes on hosts without CUDA.
-    """
-    if cp is None:
-        return False
-    try:
-        cuda = getattr(cp, "cuda", None)
-        runtime = getattr(cuda, "runtime", None) if cuda is not None else None
-        if runtime is not None:
-            count = runtime.getDeviceCount()  # type: ignore[attr-defined]
-            if not isinstance(count, int) or count < 1:
-                return False
-        # Validate simple allocation on the active backend
-        _ = cp.asarray([0.0], dtype=cp.float32)
-    except Exception:
-        return False
-    return True
 
 
 os.environ["TQDM_DISABLE"] = "1"
 
 
-def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = False) -> ImageStack:
+def _field_store_path(ws: Workspace, roi: str, codebook_label: str) -> Path:
+    slug = Workspace.sanitize_codebook_name(codebook_label)
+    base = ws.path / "analysis" / "deconv" / f"fields+{slug}"
+    return base / f"field--{roi}+{slug}.zarr"
+
+
+def _discover_field_store(ws: Workspace, roi: str, codebook_label: str) -> Path:
+    candidate = _field_store_path(ws, roi, codebook_label)
+    if candidate.is_dir():
+        return candidate
+    raise FileNotFoundError(
+        f"Illumination field store not found for ROI '{roi}' and codebook '{codebook_label}'. "
+        "Run 'preprocess correct-illum export-field' to generate it."
+    )
+
+
+def _ensure_field_stores(ws: Workspace, rois: Sequence[str], codebook_label: str) -> None:
+    missing: list[str] = []
+    for roi in rois:
+        try:
+            _discover_field_store(ws, roi, codebook_label)
+        except FileNotFoundError:
+            missing.append(roi)
+    if missing:
+        joined = ", ".join(sorted(set(missing)))
+        raise click.ClickException(
+            f"Missing illumination field store(s) for ROI(s): {joined}. "
+            "Run 'preprocess correct-illum export-field' before using --field-correct."
+        )
+
+
+def _build_field_context(
+    path: Path,
+    img: np.ndarray,
+    *,
+    workspace_root: Optional[Path] = None,
+    x_off: int = 0,
+    y_off: int = 0,
+) -> FieldContext:
+    m = re.match(r"^registered--(.+)\+(.*)$", path.parent.name)
+    if m is None:
+        raise click.ClickException(
+            f"Path {path.parent.name} does not match expected format 'registered--<roi>+<codebook>'"
+        )
+    roi, codebook = m.groups()
+
+    ws = Workspace(workspace_root) if workspace_root is not None else Workspace(path.parent.parent.parent)
+    tc = ws.tileconfig(roi)
+
+    def _tile_index_from_path(tile_path: Path) -> int:
+        stem = tile_path.stem
+        try:
+            return int(stem.split("-")[1])
+        except Exception:
+            return int(re.sub(r"\D+", "", stem))
+
+    tile_index = _tile_index_from_path(path)
+    row = tc.df.filter(pl.col("index") == int(tile_index))
+    if row.height == 0:
+        raise click.ClickException(f"Tile index {tile_index} not found for ROI '{roi}' in TileConfiguration")
+    tile_x0 = float(row[0, "x"])  # type: ignore[index]
+    tile_y0 = float(row[0, "y"])  # type: ignore[index]
+
     try:
-        with warnings.catch_warnings(action="ignore"):
-            # ! Normalize to 1. Any operations done after this WILL be clipped in [0, 1].
-            img = imread(path).astype(np.float32)[sl] / 65535
-    except tifffile.TiffFileError:
-        path.unlink()
-        raise Exception(f"{path} is corrupted. Deleted. Please rerun register")
+        with TiffFile(path) as tif_handle:
+            metadata = tif_handle.shaped_metadata[0]
+            maybe_key = metadata.get("key") if isinstance(metadata, dict) else None
+            if isinstance(maybe_key, (list, tuple)):
+                channel_labels = [str(ch) for ch in maybe_key]
+            elif isinstance(maybe_key, str):
+                channel_labels = [maybe_key]
+            else:
+                channel_labels = [str(i) for i in range(img.shape[1])]
+    except Exception:
+        channel_labels = [str(i) for i in range(img.shape[1])]
+
+    try:
+        store_path = _discover_field_store(ws, roi, codebook)
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc))
+
+    try:
+        import zarr  # local import
+    except Exception as exc:  # pragma: no cover
+        raise click.ClickException(f"zarr is required for --field-correct: {exc}")
+
+    za = zarr.open_array(str(store_path), mode="r")
+    attrs = getattr(za, "attrs", {})
+    axes_attr = attrs.get("axes")
+    if za.ndim != 4:
+        raise click.ClickException("Discovered field store must be TCYX (axes='TCYX').")
+    t_labels = attrs.get("t_labels")
+    try:
+        t_low = 0
+        t_range = 1
+    except ValueError:
+        raise click.ClickException("TCYX store must contain 'low' and 'range' planes in t_labels")
+    model_meta = dict(attrs.get("model_meta", {})) if hasattr(attrs, "get") else {}
+    ds = 4  # int(model_meta.get("downsample", 1) or 1)
+    fx0 = float(model_meta["x0"])
+    fy0 = float(model_meta["y0"])
+    field_channels = model_meta["channels"]
+    if isinstance(field_channels, (list, tuple)):
+        c_index_map = {
+            i: (field_channels.index(channel_labels[i]) if channel_labels[i] in field_channels else i)
+            for i in range(len(channel_labels))
+        }
+    else:
+        c_index_map = {i: i for i in range(len(channel_labels))}
+
+    low_scale = 65535.0
+
+    return FieldContext(
+        enabled=True,
+        field_arr=za,
+        t_low=t_low,
+        t_range=t_range,
+        ds=int(ds),
+        fx0=float(fx0),
+        fy0=float(fy0),
+        tile_x0=float(tile_x0),
+        tile_y0=float(tile_y0),
+        x_off=int(x_off),
+        y_off=int(y_off),
+        tile_h=int(img.shape[-2]),
+        tile_w=int(img.shape[-1]),
+        c_index_map={int(k): int(v) for k, v in c_index_map.items()},
+        use_gpu=False,
+        low_scale=float(low_scale),
+    )
+
+
+def make_fetcher(
+    path: Path,
+    raw: np.ndarray,
+    sl: slice | tuple | list[int] = np.s_[:],
+    *,
+    field_correct: bool = False,
+    workspace_root: Optional[Path] = None,
+) -> ImageStack:
+    """Create an ImageStack backed by a demo tile fetcher.
+
+    Behavior
+    --------
+    - Loads the tile TIFF and exposes it to Starfish via a lightweight
+      FetchedTile implementation (DemoFetchedTile).
+    - When ``field_correct`` is True, discovers the TCYX illumination field
+      for the ROI/codebook inside the workspace and applies the correction
+      to each returned YX plane before Starfish sees it:
+        corrected = max(plane - low, 0) * range
+      where (low, range) are sliced from the TCYX store at the tile origin,
+      padded outside with identity=1.0, then upsampled and applied on GPU.
+
+    Coordinate alignment
+    --------------------
+    - Uses the registered tile origin (TileConfiguration) and optional local
+      XY offsets derived from ``sl`` (e.g., quadrant slicing) to index into
+      the field store.
+    - Relies on field metadata (model_meta.x0/y0, downsample) stored in the
+      TCYX Zarr attributes for correct alignment.
+
+    Requirements
+    ------------
+    - TCYX stores are expected under ``analysis/deconv/fields+{codebook}``
+      with the filename ``field--{roi}+{codebook}.zarr`` produced by
+      ``preprocess correct-illum export-field --what both``.
+    """
+
+    # Resolve XY slice offsets from sl relative to the native tile
+    def _norm_slice(s: slice, dim: int) -> tuple[int, int]:
+        start = 0 if s.start is None else (dim + s.start if s.start < 0 else s.start)
+        stop = dim if s.stop is None else (dim + s.stop if s.stop < 0 else s.stop)
+        if start < 0:
+            start = 0
+        if stop > dim:
+            stop = dim
+        if stop < start:
+            stop = start
+        return int(start), int(stop - start)
+
+    y_off = 0
+    x_off = 0
+    if isinstance(sl, tuple) and len(sl) >= 4:
+        y_slice = sl[-2] if isinstance(sl[-2], slice) else slice(None)
+        x_slice = sl[-1] if isinstance(sl[-1], slice) else slice(None)
+        y_off, _ = _norm_slice(y_slice, raw.shape[-2])
+        x_off, _ = _norm_slice(x_slice, raw.shape[-1])
+
+    # Prepare field correction context if enabled
+    field_ctx: FieldContext | None = None
+    if field_correct:
+        field_ctx = _build_field_context(
+            path,
+            raw,
+            workspace_root=workspace_root,
+            x_off=int(x_off),
+            y_off=int(y_off),
+        )
+
+        low_ds, rng_ds = _slice_field_ds_for_tile(
+            field_ctx.field_arr,
+            field_ctx.t_low,
+            field_ctx.t_range,
+            int(field_ctx.ds),
+            int(field_ctx.tile_w),
+            int(field_ctx.tile_h),
+            float(field_ctx.tile_x0) + float(field_ctx.x_off),
+            float(field_ctx.tile_y0) + float(field_ctx.y_off),
+            float(field_ctx.fx0),
+            float(field_ctx.fy0),
+        )
+
+        logger.info("Applying field correction on all channels")
+        raw = raw[sl]
+
+        img = correct_channel_with_field(
+            raw,
+            low_ds,
+            rng_ds,
+            int(field_ctx.ds),
+            use_gpu=False,
+            normalize=True,
+            sl=sl,
+        )
+        logger.info("Field correction applied.")
+        # return np.clip(corrected_stack, 0.0, 1.0).astype(np.float32, copy=False)
+
+    else:
+        # Apply the actual slice, normalize to [0,1] float32
+        img = (raw[sl] / 65535.0).astype(np.float32, copy=False)
+        img = np.clip(img, 0.0, 1.0)
+
+    del raw
+
+    # print(type(img), img.shape, img.dtype)
 
     class DemoFetchedTile(FetchedTile):
-        def __init__(self, img: np.ndarray, z: int, chs: int, *args, **kwargs):
+        def __init__(
+            self,
+            img: np.ndarray,
+            z: int,
+            chs: int,
+            *,
+            field_ctx: Optional[FieldContext] = None,
+        ):
             self.img = img
             self.z = z
             self.c = chs
+            self._field_ctx = field_ctx
+            self._corrected_stack: np.ndarray | None = None
 
         @property
         def shape(self) -> Mapping[Axes, int]:
@@ -142,21 +358,22 @@ def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = F
             }
 
         def tile_data(self) -> np.ndarray:
-            if not max_proj:
-                return self.img[self.z, self.c]
-            elif max_proj == 1:
-                return self.img[:, self.c].max(axis=0)
-            else:
-                start = self.z // max_proj
-                end = min(start + max_proj, self.img.shape[0])
-                return self.img[start:end, self.c].max(axis=0)
+            return self.img[self.z, self.c]
 
     class DemoTileFetcher(TileFetcher):
+        def __init__(self, field_ctx: Optional[FieldContext] = None):
+            self._field_ctx = field_ctx
+
         def get_tile(self, fov_id: int, round_label: int, ch_label: int, zplane_label: int) -> FetchedTile:
-            return DemoFetchedTile(img, zplane_label, ch_label)
+            return DemoFetchedTile(
+                img,
+                zplane_label,
+                ch_label,
+                field_ctx=self._field_ctx,
+            )
 
     return ImageStack.from_tilefetcher(
-        DemoTileFetcher(),
+        DemoTileFetcher(field_ctx),
         {
             Axes.X: img.shape[3],
             Axes.Y: img.shape[2],
@@ -164,11 +381,7 @@ def make_fetcher(path: Path, sl: slice | list[int] = np.s_[:], max_proj: int = F
         fov=0,
         rounds=range(1),
         chs=range(img.shape[1]),
-        zplanes=range(img.shape[0])
-        if not max_proj
-        else [0]
-        if max_proj == 1
-        else range(img.shape[0] // max_proj),
+        zplanes=range(img.shape[0]),
         group_by=(Axes.CH, Axes.ZPLANE),
     )
 
@@ -369,9 +582,13 @@ def sample_imgs(
 @click.option("--batch-size", "-n", type=int, default=40)
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--overwrite", is_flag=True)
-@click.option("--max-proj", type=int, default=0)
 @click.option("--split", type=int, default=None)
 @click.option("--blank", type=str, default=None)
+@click.option(
+    "--field-correct/--no-field-correct",
+    default=False,
+    help="Apply illumination field correction using discovered TCYX field stores.",
+)
 @click.option(
     "--config",
     "json_config",
@@ -387,15 +604,20 @@ def step_optimize(
     batch_size: int = 40,
     threads: int = 8,
     overwrite: bool = False,
-    max_proj: int = False,
     split: int = 0,
     blank: str | None = None,
     json_config: Path | None = None,
+    field_correct: bool = False,
 ):
     _setup_command_logging(
         path,
         component="preprocess.spots.step_optimize",
-        file_tag=_make_tag("step-optimize", roi, codebook_path.stem, f"r{round_num}" if round_num else None),
+        file_tag=_make_tag(
+            "step-optimize",
+            roi,
+            codebook_path.stem,
+            f"r{round_num}" if round_num else None,
+        ),
         extra={
             "roi": roi,
             "round": round_num,
@@ -417,6 +639,15 @@ def step_optimize(
     if not (new_cb_path := path / "codebooks" / codebook_path.name).exists():
         shutil.copy(codebook_path, new_cb_path)
 
+    ws = Workspace(path)
+    if field_correct:
+        rois_needed = {
+            p.parent.name.split("--", 1)[1].split("+", 1)[0] for p in selected if "--" in p.parent.name
+        }
+        if not rois_needed:
+            rois_needed = {roi} if roi != "*" else set(ws.rois)
+        _ensure_field_stores(ws, sorted(rois_needed), codebook_path.stem)
+
     return _batch(
         selected,
         "run",
@@ -429,10 +660,10 @@ def step_optimize(
             f"--round={round_num}",
             *(["--overwrite"] if overwrite else []),
             f"--split={split}",
-            *([f"--max-proj={max_proj}"] if max_proj else []),
             *(["--roi", roi] if roi else []),
             *(["--blank", blank] if blank else []),
             *(["--config", json_config.as_posix()] if json_config else []),
+            *(["--field-correct"] if field_correct else []),
         ],
         threads=threads,
     )
@@ -447,8 +678,12 @@ def step_optimize(
 )
 @click.option("--overwrite", is_flag=True)
 @click.option("--round", "round_num", type=int, default=0)
-@click.option("--max-proj", type=int, default=0)
 @click.option("--blank", type=str, default=None)
+@click.option(
+    "--field-correct/--no-field-correct",
+    default=False,
+    help="Apply illumination field correction using discovered TCYX field stores.",
+)
 @click.option(
     "--config",
     "json_config",
@@ -462,9 +697,9 @@ def find_threshold(
     codebook: Path,
     overwrite: bool = False,
     round_num: int = 0,
-    max_proj: int = 0,
     blank: str | None = None,
     json_config: Path | None = None,
+    field_correct: bool = False,
 ):
     _setup_command_logging(
         path,
@@ -481,6 +716,14 @@ def find_threshold(
     paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
     path_out = path / (f"opt_{codebook.stem}" + (f"+{roi}" if roi != "*" else ""))
     jsonfile = path_out / "percentiles.json"
+
+    ws = Workspace(path)
+    if field_correct:
+        if roi == "*":
+            rois_needed = set(ws.rois)
+        else:
+            rois_needed = {roi}
+        _ensure_field_stores(ws, sorted(rois_needed), codebook.stem)
 
     rand = np.random.default_rng(0)
     if len(paths) > 50:
@@ -511,6 +754,7 @@ def find_threshold(
                 *(["--overwrite"] if overwrite else []),
                 *(["--blank", blank] if blank else []),
                 *(["--config", json_config.as_posix()] if json_config else []),
+                *(["--field-correct"] if field_correct else []),
             ],
             threads=4,
             split=[0],
@@ -543,7 +787,7 @@ def find_threshold(
             f"Round {round_num} not found. Please run align_prod optimize with the round_number first."
         )
 
-    use_gpu = GPU and _cupy_available()
+    use_gpu = False  # GPU and _cupy_available()
     if use_gpu:
         logger.info("find-threshold: Using GPU for percentile computation")
         mins_dev = cp.asarray(mins_np, dtype=cp.float32)
@@ -554,18 +798,15 @@ def find_threshold(
 
     try:
         for p in sorted(highpasses[:50]):
-            logger.debug(f"Processing {p.parent.name}/{p.name}")
+            logger.info(f"Processing highpass {p.parent.name}/{p.name}")
 
             # Load and lightly downsample spatially to control memory; keep float32
             img_np = tifffile.imread(p).astype(np.float32)[:, :, :1024:2, :1024:2]  # ZCYX
-            if max_proj:
-                img_np = img_np.max(axis=0)  # CYX
 
             if use_gpu:
                 img_dev = cp.asarray(img_np, dtype=cp.float32)
                 img_dev = img_dev - mins_dev  # broadcast
                 img_dev = img_dev * scale_dev
-                # Match historical behavior: axis=1 (channel) even when max_proj reduces dims
                 norm_dev = cp.linalg.norm(img_dev, axis=1)
                 val = float(cp.asnumpy(cp.percentile(norm_dev, percentile)))
                 del img_dev, norm_dev  # explicit free before next iteration
@@ -690,7 +931,11 @@ def _render_one_roi_plot(
     help="Codebook label or path; if a path is given, the stem is used.",
 )
 @click.option("--threads", "-t", type=int, default=8, help="Max processes to render plots.")
-@click.option("--only-blank", is_flag=True, help="Plot only genes with names starting with 'Blank'.")
+@click.option(
+    "--only-blank",
+    is_flag=True,
+    help="Plot only genes with names starting with 'Blank'.",
+)
 @click.option("--dark", is_flag=True, help="Use dark background + magma colormap.")
 @click.option(
     "--outdir",
@@ -1353,11 +1598,15 @@ def generate_subtraction_matrix(blanks: xr.DataArray, coefs: pl.DataFrame, keys:
 @click.option("--debug", is_flag=True)
 @click.option("--split", type=int, default=None, help="Quadrant split index (0-3)")
 @click.option("--highpass-only", is_flag=True)
-@click.option("--max-proj", type=int, default=0)
 @click.option(
     "--codebook",
     "codebook_path",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+)
+@click.option(
+    "--field-correct/--no-field-correct",
+    default=False,
+    help="Apply illumination field correction using discovered TCYX field stores.",
 )
 @click.option("--simple", is_flag=True)
 @click.option("--roi", type=str, default=None)
@@ -1381,11 +1630,11 @@ def run(
     split: int | None = None,
     highpass_only: bool = False,
     simple: bool = False,
-    max_proj: int = 0,
     decode: SpotDecodeConfig | None = None,
     roi: str | None = None,
     blank: str | None = None,
     json_config: Path | None = None,
+    field_correct: bool = False,
 ):
     """
     Run spot calling.
@@ -1480,6 +1729,7 @@ def run(
     )
     with TiffFile(path) as tif:
         img_keys = tif.shaped_metadata[0]["key"]
+        raw = tif.asarray()
 
     bit_mapping = {str(k): i for i, k in enumerate(img_keys)}
 
@@ -1523,8 +1773,10 @@ def run(
     ) + tuple(split_slice)
     stack = make_fetcher(
         path,
+        raw,
         slc,
-        max_proj=max_proj,
+        field_correct=field_correct,
+        workspace_root=workspace_hint if not path.is_dir() else path,
         # if limit_z is None
         # else np.s_[
         #     :limit_z:subsample_z,
@@ -1546,6 +1798,8 @@ def run(
             path.parent.parent / f"registered--{_roi}+{blank}" / path.name,
             _slc_blank,
             max_proj=max_proj,
+            field_correct=field_correct,
+            workspace_root=workspace_hint if not path.is_dir() else path,
         )
         if blank is not None
         else None
@@ -1562,7 +1816,7 @@ def run(
         level_method=Levels.SCALE_SATURATED_BY_IMAGE,
     )
     ghp.sigma = (
-        decode.sigma[0] / (max_proj or 1),
+        decode.sigma[0],
         decode.sigma[1],
         decode.sigma[2],
     )  # z,y,x
@@ -1634,10 +1888,10 @@ def run(
 
         if overwrite or not out_path.exists():
             logger.debug(f"Writing to {out_path}")
-            tifffile.imwrite(
+            safe_imwrite(
                 path.parent / "_highpassed" / f"{path.stem}_{codebook_path.stem}.hp.tif",
                 imgs.xarray.to_numpy().squeeze().swapaxes(0, 1),  # ZCYX
-                compression="zlib",
+                compression="zstd",
                 metadata={"keys": img_keys},
             )
         return
@@ -1806,7 +2060,6 @@ def parse_duration(duration_str: str) -> timedelta:
 @click.option("--threads", "-t", type=int, default=13)
 @click.option("--overwrite", is_flag=True)
 @click.option("--simple", is_flag=True)
-@click.option("--max-proj", type=int, default=0)
 @click.option(
     "--since",
     type=str,
@@ -1817,7 +2070,12 @@ def parse_duration(duration_str: str) -> timedelta:
 @click.option("--split", is_flag=True, help="Whether to split into quadrants. True regardless.")
 @click.option("--local-opt", is_flag=True)
 @click.option("--blank", type=str, default=None)
-@click.option("--stagger", type=float, default=5.0, help="Seconds to stagger starts per worker slot")
+@click.option(
+    "--stagger",
+    type=float,
+    default=5.0,
+    help="Seconds to stagger starts per worker slot",
+)
 @click.option(
     "--stagger-jitter",
     type=float,
@@ -1831,6 +2089,11 @@ def parse_duration(duration_str: str) -> timedelta:
     default=None,
     help="Optional project config (JSON). CLI flags override JSON.",
 )
+@click.option(
+    "--field-correct/--no-field-correct",
+    default=False,
+    help="Apply illumination field correction using discovered TCYX field stores.",
+)
 def batch(
     path: Path,
     roi: str,
@@ -1839,7 +2102,6 @@ def batch(
     overwrite: bool = False,
     simple: bool = False,
     split: bool = False,
-    max_proj: bool = False,
     since: str | None = None,
     delete_corrupted: bool = False,
     local_opt: bool = False,
@@ -1847,6 +2109,7 @@ def batch(
     json_config: Path | None = None,
     stagger: float = 0.0,
     stagger_jitter: float = 0.0,
+    field_correct: bool = False,
 ):
     _setup_command_logging(
         path,
@@ -1925,6 +2188,10 @@ def batch(
             logger.info(f"Skipping {skipped_count} already processed files within the scope.")
         logger.info(f"Processing {len(paths_to_process)} new files in scope.")
 
+    if field_correct:
+        rois_needed = {p.parent.name.split("--", 1)[1].split("+", 1)[0] for p in paths_to_process}
+        _ensure_field_stores(workspace, sorted(rois_needed), codebook_path.stem)
+
     if not paths_to_process:
         logger.warning("No files found to process based on current filters and overwrite status.")
         return
@@ -1940,10 +2207,10 @@ def batch(
                 codebook_path.as_posix(),
                 "--overwrite" if overwrite else "",
                 "--simple" if simple else "",
-                f"--max-proj={max_proj}" if max_proj else "",
                 f"--roi={roi}" if roi else "",
                 f"--blank={blank}" if blank else "",
                 *(["--config", json_config.as_posix()] if json_config else []),
+                *(["--field-correct"] if field_correct else []),
             ],
             threads=threads,
             split=split,
@@ -1962,9 +2229,9 @@ def batch(
                 codebook_path.as_posix(),
                 "--overwrite" if overwrite else "",
                 "--simple" if simple else "",
-                f"--max-proj={max_proj}" if max_proj else "",
                 f"--blank={blank}" if blank else "",
                 *(["--config", json_config.as_posix()] if json_config else []),
+                *(["--field-correct"] if field_correct else []),
             ],
             threads=threads,
             split=split,

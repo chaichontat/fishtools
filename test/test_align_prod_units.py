@@ -14,7 +14,6 @@ import polars as pl
 import pytest
 import tifffile
 import xarray as xr
-from fishtools.utils.io import CorruptedTiffError, Workspace
 
 from fishtools.preprocess.spots.align_prod import (
     Deviation,
@@ -26,6 +25,7 @@ from fishtools.preprocess.spots.align_prod import (
     generate_subtraction_matrix,
     get_blank_channel_info,
 )
+from fishtools.utils.io import CorruptedTiffError, Workspace
 
 
 def test_get_blank_channel_info_mappings() -> None:
@@ -204,7 +204,6 @@ def test_batch_delete_corrupted_uses_workspace_helpers(monkeypatch, tmp_path: Pa
         overwrite=False,
         simple=False,
         split=False,
-        max_proj=0,
         since=None,
         delete_corrupted=True,
         local_opt=False,

@@ -50,7 +50,6 @@ def test_find_threshold_writes_percentiles_cpu(tmp_path: Path) -> None:
         codebook=cb_path,
         overwrite=False,
         round_num=0,
-        max_proj=0,
         blank=None,
         json_config=None,
     )

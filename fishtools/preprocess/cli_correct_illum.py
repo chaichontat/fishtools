@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional, Sequence
 
 import cupy as cp
 import numpy as np
@@ -105,9 +107,6 @@ def _compute_subtile_percentiles_cpu(
     return lo, hi
 
 
-    
-
-
 def _skip_existing(tile: Path, out_suffix: str, grid: int, keys: tuple[str, str], overwrite: bool) -> bool:
     if overwrite:
         return False
@@ -165,6 +164,64 @@ def _resolve_tile_origins(
     xs0 = df.select("x").to_numpy().reshape(-1).astype(np.float64)
     ys0 = df.select("y").to_numpy().reshape(-1).astype(np.float64)
     return indices, xs0, ys0
+
+
+_ROI_WILDCARD_TOKENS = {"*", "all"}
+
+
+def _normalize_rois(
+    ws: Workspace,
+    tokens: tuple[str, ...],
+    meta_roi: str | None,
+) -> list[str]:
+    """Resolve ROI tokens using workspace discovery with wildcard support."""
+
+    def _resolve(rois: Iterable[str] | None) -> list[str]:
+        try:
+            return ws.resolve_rois(rois)
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+
+    requested = [token for token in tokens if token]
+    if not requested:
+        if meta_roi:
+            return _resolve([str(meta_roi)])
+        return _resolve(None)
+
+    includes_wildcard = any(token in _ROI_WILDCARD_TOKENS for token in requested)
+    explicit: list[str] = []
+    seen: set[str] = set()
+    for token in requested:
+        if token in _ROI_WILDCARD_TOKENS:
+            continue
+        if token not in seen:
+            explicit.append(token)
+            seen.add(token)
+
+    if includes_wildcard and not explicit:
+        return _resolve(None)
+
+    if not explicit:
+        raise click.UsageError("ROI selection resolved to an empty set.")
+
+    return _resolve(explicit)
+
+
+def _ensure_fields_dir(ws: Workspace, codebook: str) -> tuple[Path, str, str]:
+    """Return (dir, codebook_label, codebook_slug) for standardized fields storage."""
+
+    codebook_path = Path(codebook)
+    codebook_label = codebook_path.stem if codebook_path.suffix else str(codebook_path)
+    codebook_slug = Workspace.sanitize_codebook_name(codebook_label)
+    fields_dir = ws.deconved / f"fields+{codebook_slug}"
+    fields_dir.mkdir(parents=True, exist_ok=True)
+    return fields_dir, codebook_label, codebook_slug
+
+
+def _slugify_token(token: str) -> str:
+    """Normalize tokens for filesystem usage."""
+
+    return token.replace(" ", "_").replace("/", "-")
 
 
 @click.group("correct-illum")
@@ -264,7 +321,9 @@ def render_global(
     try:
         log_file_tag = f"{roi}+{codebook}" if codebook else roi
         setup_workspace_logging(
-            ws.path, component="preprocess.correct-illum.render-global", file=log_file_tag
+            ws.path,
+            component="preprocess.correct-illum.render-global",
+            file=log_file_tag,
         )
     except Exception:
         logger.opt(exception=True).debug("Workspace logging setup failed; continuing with default logger")
@@ -332,13 +391,23 @@ def render_global(
                 meta=dict(sub_meta, channel=ch0),
             )
             meta = rng_model.meta
-            logger.info("RenderGlobal: multi-channel NPZ detected; defaulting to first channel '{}'", ch0)
+            logger.info(
+                "RenderGlobal: multi-channel NPZ detected; defaulting to first channel '{}'",
+                ch0,
+            )
     except Exception:
         pass
 
     # Evaluate the global field once, normalize with the union-of-tiles mask, then slice per-tile.
     xs, ys, low_field, high_field = rng_model.evaluate(
-        x_min, y_min, x_max, y_max, grid_step=step_eff, neighbors=neigh_eff, kernel=ker, smoothing=smooth_eff
+        x_min,
+        y_min,
+        x_max,
+        y_max,
+        grid_step=step_eff,
+        neighbors=neigh_eff,
+        kernel=ker,
+        smoothing=smooth_eff,
     )
     mask = (
         _mask_union_of_tiles(xs, ys, xs0, ys0, tile_w, tile_h) if xs0.size else np.ones_like(low_field, bool)
@@ -406,8 +475,8 @@ def render_global(
     "workspace",
     type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
 )
-@click.argument("roi", type=str)
-@click.argument("idx", required=False, type=int)
+@click.argument("rois", nargs=-1, type=str)
+@click.option("--idx", type=int, default=None, help="Restrict to a single tile index")
 @click.option("--codebook", "codebook_opt", type=str, default=None, help="Codebook stem or path")
 @click.option("--percentiles", nargs=2, type=float, default=(0.1, 99.9), show_default=True)
 @click.option("--grid", type=int, default=4, show_default=True)
@@ -427,9 +496,16 @@ def render_global(
     help="Suffix for per-tile percentile JSON",
 )
 @click.option("--overwrite/--no-overwrite", default=False, show_default=True)
+@click.option(
+    "--sample-step",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Spatial stride for subsampling within each tile (1 = use all pixels).",
+)
 def calculate_percentiles(
     workspace: Path,
-    roi: str,
+    rois: tuple[str, ...],
     idx: int | None,
     codebook_opt: str | None,
     percentiles: tuple[float, float],
@@ -439,104 +515,134 @@ def calculate_percentiles(
     threads: int,
     out_suffix: str,
     overwrite: bool,
+    sample_step: int,
 ) -> None:
     """Compute subtile illumination percentiles (GPU preferred)."""
 
     console = rich.get_console()
     ws = Workspace(workspace)
-    if codebook_opt is None:
-        candidates = ws.registered_codebooks(rois=[roi])
-        if not candidates:
-            raise click.UsageError(f"No registered codebooks found for ROI '{roi}'. Provide --codebook.")
-        if len(candidates) > 1:
-            raise click.UsageError(
-                f"Multiple codebooks present for ROI '{roi}': {', '.join(candidates)}. Specify --codebook."
-            )
-        cb = candidates[0]
+    resolved_rois = _normalize_rois(ws, rois, None)
+
+    if not resolved_rois:
+        raise click.UsageError("No ROIs found to process.")
+
+    if codebook_opt is not None:
+        opt_path = Path(codebook_opt)
+        cb_global = opt_path.stem if (opt_path.suffix and not opt_path.is_dir()) else codebook_opt
     else:
-        path = Path(codebook_opt)
-        cb = path.stem if (path.suffix and not path.is_dir()) else codebook_opt
-
-    file_map, missing = ws.registered_file_map(cb, rois=[roi])
-    if missing:
-        raise click.UsageError(f"ROI(s) missing registered outputs: {', '.join(missing)}")
-
-    tiles_all = file_map.get(roi, [])
-    if not tiles_all:
-        raise click.UsageError(f"No registered tiles for roi='{roi}', codebook='{cb}'.")
-
-    use_gpu = os.environ.get("GPU", "0") == "1" and cp is not None
-    tiles = tiles_all
-    if idx is not None:
-        target = ws.regimg(roi, cb, int(idx))
-        if not target.exists():
-            raise click.UsageError(f"Tile {target.name} not found under registered--{roi}+{cb}.")
-        tiles = [target]
+        cb_global = None
 
     p_lo, p_hi = percentiles
     key_lo = format(p_lo, ".10g")
     key_hi = format(p_hi, ".10g")
+    if sample_step <= 0:
+        raise click.UsageError("--sample-step must be a positive integer")
 
-    if not overwrite:
-        before = len(tiles)
-        tiles = [t for t in tiles if not _skip_existing(t, out_suffix, grid, (key_lo, key_hi), overwrite)]
-        skipped = before - len(tiles)
-    else:
-        skipped = 0
+    use_gpu = os.environ.get("GPU", "0") == "1" and cp is not None
 
-    console.print(
-        f"Found [bold]{len(tiles)}[/bold] tile(s) for roi={roi}, codebook={cb}. Backend: {'GPU' if use_gpu else 'CPU'}",
-        style="green",
-    )
-
-    def _process(tile: Path) -> None:
-        arr, channel_names = _load_czyx(tile, use_gpu)
-        if use_gpu:
-            lo, hi = _compute_subtile_percentiles_gpu(
-                arr,
-                percentiles=percentiles,
-                grid=grid,
-                max_streams=max_streams,
-                channel_chunk=channel_chunk,
-            )
+    for roi_name in resolved_rois:
+        if cb_global is None:
+            candidates = ws.registered_codebooks(rois=[roi_name])
+            if not candidates:
+                raise click.UsageError(
+                    f"No registered codebooks found for ROI '{roi_name}'. Provide --codebook."
+                )
+            if len(candidates) > 1:
+                raise click.UsageError(
+                    f"Multiple codebooks present for ROI '{roi_name}': {', '.join(candidates)}. Specify --codebook."
+                )
+            cb = candidates[0]
         else:
-            assert isinstance(arr, np.ndarray)
-            lo, hi = _compute_subtile_percentiles_cpu(arr, percentiles=percentiles, grid=grid)
-        _, _, H, W = arr.shape  # type: ignore[attr-defined]
-        y_edges = _edges(int(H), grid)
-        x_edges = _edges(int(W), grid)
-        payload: dict[str, list[dict[str, object]]] = {}
-        for ci, cname in enumerate(channel_names):
-            entries: list[dict[str, object]] = []
-            for r in range(grid):
-                y0, y1 = y_edges[r], y_edges[r + 1]
-                for col in range(grid):
-                    x0, x1 = x_edges[col], x_edges[col + 1]
-                    entries.append({
-                        "x": int(x0),
-                        "y": int(y0),
-                        "x_size": int(x1 - x0),
-                        "y_size": int(y1 - y0),
-                        "percentiles": {
-                            key_lo: float(lo[r, col, ci]),
-                            key_hi: float(hi[r, col, ci]),
-                        },
-                    })
-            payload[cname] = entries
-        tile.with_suffix(out_suffix).write_text(json.dumps(payload, indent=2))
+            cb = cb_global
 
-    if use_gpu:
-        with progress_bar(len(tiles)) as advance:
-            for tile in tiles:
-                _process(tile)
-                advance()
-    else:
-        with progress_bar_threadpool(len(tiles), threads=max(1, int(threads))) as submit:
-            for tile in tiles:
-                submit(_process, tile)
+        file_map, missing = ws.registered_file_map(cb, rois=[roi_name])
+        if missing:
+            raise click.UsageError(f"ROI(s) missing registered outputs: {', '.join(missing)}")
 
-    tail = f" (skipped {skipped} existing; use --overwrite to recompute)" if skipped else ""
-    rich.print(f"[cyan]Percentile JSONs written next to TIFFs with suffix '{out_suffix}'.{tail}[/cyan]")
+        tiles_all = file_map.get(roi_name, [])
+        if not tiles_all:
+            raise click.UsageError(f"No registered tiles for roi='{roi_name}', codebook='{cb}'.")
+
+        if idx is not None:
+            target = ws.regimg(roi_name, cb, int(idx))
+            if not target.exists():
+                raise click.UsageError(f"Tile {target.name} not found under registered--{roi_name}+{cb}.")
+            tiles = [target]
+        else:
+            tiles = list(tiles_all)
+
+        if not overwrite:
+            before = len(tiles)
+            tiles = [t for t in tiles if not _skip_existing(t, out_suffix, grid, (key_lo, key_hi), False)]
+            skipped = before - len(tiles)
+        else:
+            skipped = 0
+
+        console.print(
+            f"[bold]{roi_name}[/bold]: {len(tiles)} tile(s) queued "
+            f"(codebook={cb}, backend={'GPU' if use_gpu else 'CPU'}, sample_step={sample_step})",
+            style="green",
+        )
+
+        def _process(tile: Path) -> None:
+            arr, channel_names = _load_czyx(tile, use_gpu)
+            if sample_step > 1:
+                if use_gpu:
+                    arr = cp.ascontiguousarray(arr[:, :, ::sample_step, ::sample_step])
+                else:
+                    arr = np.ascontiguousarray(arr[:, :, ::sample_step, ::sample_step])
+            if use_gpu:
+                lo, hi = _compute_subtile_percentiles_gpu(
+                    arr,
+                    percentiles=percentiles,
+                    grid=grid,
+                    max_streams=max_streams,
+                    channel_chunk=channel_chunk,
+                )
+            else:
+                assert isinstance(arr, np.ndarray)
+                lo, hi = _compute_subtile_percentiles_cpu(arr, percentiles=percentiles, grid=grid)
+            _, _, H, W = arr.shape  # type: ignore[attr-defined]
+            y_edges = _edges(int(H), grid)
+            x_edges = _edges(int(W), grid)
+            payload: dict[str, list[dict[str, object]]] = {}
+            for ci, cname in enumerate(channel_names):
+                entries: list[dict[str, object]] = []
+                for r in range(grid):
+                    y0, y1 = y_edges[r], y_edges[r + 1]
+                    for col in range(grid):
+                        x0, x1 = x_edges[col], x_edges[col + 1]
+                        entries.append({
+                            "x": int(x0),
+                            "y": int(y0),
+                            "x_size": int(x1 - x0),
+                            "y_size": int(y1 - y0),
+                            "percentiles": {
+                                key_lo: float(lo[r, col, ci]),
+                                key_hi: float(hi[r, col, ci]),
+                            },
+                        })
+                payload[cname] = entries
+            tile.with_suffix(out_suffix).write_text(json.dumps(payload, indent=2))
+
+        if tiles:
+            if use_gpu:
+                with progress_bar(len(tiles)) as advance:
+                    for tile in tiles:
+                        _process(tile)
+                        advance()
+            else:
+                with progress_bar_threadpool(len(tiles), threads=max(1, int(threads))) as submit:
+                    for tile in tiles:
+                        submit(_process, tile)
+        else:
+            console.print(
+                f"[yellow]{roi_name}: all tiles already up-to-date (use --overwrite to recompute).[/yellow]"
+            )
+            continue
+
+        tail = f" (skipped {skipped} existing; use --overwrite to recompute)" if skipped else ""
+        console.print(f"[cyan]{roi_name}: percentile JSONs written with suffix '{out_suffix}'.{tail}[/cyan]")
 
 
 @correct_illum.command("field-generate")
@@ -589,7 +695,8 @@ def field_generate(
     """
 
     ws = Workspace(workspace)
-    reg_dir = ws.registered(roi, Path(codebook).stem if Path(codebook).suffix else codebook)
+    fields_dir, codebook_label, codebook_slug = _ensure_fields_dir(ws, codebook)
+    reg_dir = ws.registered(roi, codebook_label)
 
     # Load tile indices and origins
     indices, xs0, ys0 = _resolve_tile_origins({}, ws, roi)
@@ -625,7 +732,7 @@ def field_generate(
         )
         meta_sc: dict[str, object] = {
             "roi": roi,
-            "codebook": Path(codebook).stem if Path(codebook).suffix else codebook,
+            "codebook": codebook_label,
             "channel": chosen_channel,
             "kernel": kernel,
             "smoothing": float(smoothing),
@@ -657,10 +764,12 @@ def field_generate(
         range_mean = float(meta.get("range_mean", getattr(model, "range_mean", 1.0)))
         range_mean = max(range_mean, 1e-6)
         if output is None:
-            opt_dir = ws.opt(str(meta["codebook"]))
-            opt_dir = opt_dir.path if hasattr(opt_dir, "path") else Path(opt_dir)
-            suffix = f"{channel_used}-{p_low}-{p_high}.npz".replace("/", "-")
-            output = opt_dir / f"illum-field--{roi}-{suffix}"
+            descriptor = "--".join([
+                _slugify_token(str(channel_used)),
+                _slugify_token(str(p_low)),
+                _slugify_token(str(p_high)),
+            ])
+            output = fields_dir / f"illum-field--{roi}+{codebook_slug}--{descriptor}.npz"
         out_path = model.to_npz(output)
         rich.print(
             f"[green]Saved illumination field model → {out_path} (range mean {range_mean:.6g})[/green]"
@@ -698,7 +807,7 @@ def field_generate(
     vhigh_mc = np.stack(highs_list, axis=1)  # (N, C)
     meta_mc: dict[str, object] = {
         "roi": roi,
-        "codebook": Path(codebook).stem if Path(codebook).suffix else codebook,
+        "codebook": codebook_label,
         "kernel": kernel,
         "smoothing": float(smoothing),
         "epsilon": None,
@@ -725,10 +834,12 @@ def field_generate(
     range_mean = float(meta.get("range_mean", getattr(model_mc, "range_mean", 1.0)))
     range_mean = max(range_mean, 1e-6)
     if output is None:
-        opt_dir = ws.opt(str(meta["codebook"]))
-        opt_dir = opt_dir.path if hasattr(opt_dir, "path") else Path(opt_dir)
-        suffix = f"ALL-{p_low}-{p_high}.npz".replace("/", "-")
-        output = opt_dir / f"illum-field--{roi}-{suffix}"
+        descriptor = "--".join([
+            "ALL",
+            _slugify_token(str(p_low)),
+            _slugify_token(str(p_high)),
+        ])
+        output = fields_dir / f"illum-field--{roi}+{codebook_slug}--{descriptor}.npz"
     out_path = model_mc.to_npz(output)
     rich.print(
         f"[green]Saved multi-channel illumination field model → {out_path} (channels={len(channels)}, range mean {range_mean:.6g})[/green]"
@@ -894,17 +1005,37 @@ def plot_field(
 
 
 @correct_illum.command("export-field")
-@click.argument("model", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option(
-    "--workspace",
+@click.argument(
+    "workspace",
     type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
 )
-@click.option("--roi", type=str, required=False)
-@click.option("--codebook", type=str, required=False)
+@click.argument("rois", nargs=-1, type=str)
 @click.option(
-    "--downsample", type=int, default=1, show_default=True, help="Downsample factor for output (1 = native)"
+    "--model",
+    "model_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    required=False,
+    help="Optional illumination NPZ. When omitted, discover per-ROI models generated by field-generate.",
 )
-@click.option("--grid-step", type=float, default=None, help="Override grid step used for evaluation")
+@click.option(
+    "--codebook",
+    type=str,
+    required=False,
+    help="Codebook label (falls back to NPZ metadata when omitted).",
+)
+@click.option(
+    "--downsample",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Downsample factor for output (1 = native)",
+)
+@click.option(
+    "--grid-step",
+    type=float,
+    default=None,
+    help="Override grid step used for evaluation",
+)
 @click.option(
     "--what",
     type=click.Choice(["range", "low", "both"], case_sensitive=False),
@@ -929,16 +1060,20 @@ def plot_field(
     type=click.Path(dir_okay=True, file_okay=True, writable=True, path_type=Path),
     default=None,
     help=(
-        "Output Zarr store path (.zarr). Exports a single TCYX array: "
-        "T=[LOW,RANGE] when --what=both, otherwise T=1. "
-        "When omitted, defaults to '<model>-field-<kind>-tcyx-ds<downsample>.zarr' for single-kind "
-        "or '<model>-field-both-tcyx-ds<downsample>.zarr' for --what=both."
+        "Explicit Zarr output path. When omitted, writes to "
+        "'analysis/deconv/fields+{sanitize(codebook)}/field--{roi}+{sanitize(codebook)}.zarr'."
     ),
 )
+@click.option(
+    "--overwrite/--no-overwrite",
+    default=False,
+    show_default=True,
+    help="When true, discard any existing export and recompute all channels.",
+)
 def export_field(
-    model: Path,
-    workspace: Path | None,
-    roi: str | None,
+    workspace: Path,
+    rois: tuple[str, ...],
+    model_path: Path | None,
     codebook: str | None,
     downsample: int,
     grid_step: float | None,
@@ -946,272 +1081,738 @@ def export_field(
     neighbors: int | None,
     smoothing: float | None,
     output: Path | None,
+    overwrite: bool,
 ) -> None:
-    """Export LOW and normalized inverse RANGE fields cropped to the union-of-tiles.
-
-    Parity with plot-field logic:
-    - Evaluate LOW/HIGH on a grid from tile extents
-    - Build a union-of-tiles (union-of-squares) mask
-    - Normalize RANGE using that global mask
-    - Crop to the mask's tight bounding box (remove irrelevant regions)
-    - Resize to native and optionally downsample; values outside the union are set to 1
-
-    Output layout:
-    - Zarr array with axes="TCYX". T indexes field type(s) in order [LOW, RANGE].
-      When ``--what`` selects a single kind, T=1 with the only plane labelled
-      accordingly.
-    """
+    """Export LOW and RANGE fields to TCYX Zarr stores per ROI."""
 
     import zarr
     from skimage.transform import resize
 
+    def _update_progress(
+        za_obj: zarr.Array | None,
+        status: str,
+        completed: Sequence[str],
+        total: int | None,
+    ) -> None:
+        """Persist incremental export progress metadata to the Zarr store."""
+
+        if za_obj is None or total is None:
+            return
+        payload = {
+            "completed_channels": list(completed),
+            "total_channels": int(total),
+        }
+        try:
+            za_obj.attrs.update({"status": status, "progress": payload})
+        except Exception:
+            logger.opt(exception=True).warning(
+                f"Failed to update export-field progress metadata (status={status})"
+            )
+
     if downsample <= 0:
         raise click.UsageError("--downsample must be a positive integer")
 
-    rng_model = RangeFieldPointsModel.from_npz(model)
-    meta = rng_model.meta
-
-    roi = roi or meta.get("roi")
-    codebook = codebook or meta.get("codebook")
-    if workspace is None:
-        workspace = Path(meta.get("workspace", "."))
-
     ws = Workspace(workspace)
-    meta.setdefault("workspace", str(ws.path))
 
-    # Initialize workspace-scoped logging like other commands
-    try:
-        log_file_tag = f"{roi}+{codebook}" if codebook else (roi or "roi")
-        setup_workspace_logging(ws.path, component="preprocess.correct-illum.export-field", file=log_file_tag)
-    except Exception:
-        logger.opt(exception=True).debug("Workspace logging setup failed; continuing with default logger")
+    if output is not None and rois and len(rois) > 1:
+        raise click.UsageError("--output can only be provided when exporting a single ROI.")
 
-    indices, xs0, ys0 = _resolve_tile_origins(meta, ws, roi)
-    logger.info(
-        "ExportField: model='{}', ROI='{}', CB='{}', tiles={}, ds={}, grid_step={}, neighbors={}, smoothing={}",
-        model.name,
-        roi,
-        codebook,
-        int(indices.size),
-        int(downsample),
-        grid_step if grid_step is not None else "meta",
-        int(neighbors or 0) if neighbors is not None else 0,
-        smoothing if smoothing is not None else meta.get("smoothing"),
-    )
+    fields_dir: Path | None = None
+    codebook_label: str
+    codebook_slug: str
+    roi_to_model: dict[str, Path] = {}
+    model_cache: dict[Path, RangeFieldPointsModel] = {}
 
-    tile_w = float(meta.get("tile_w", 1968.0))
-    tile_h = float(meta.get("tile_h", 1968.0))
+    if model_path is not None:
+        model_path = Path(model_path)
+        rng_single = RangeFieldPointsModel.from_npz(model_path)
+        meta_single = dict(rng_single.meta)
+        roi_single = meta_single.get("roi")
+        if roi_single is None:
+            raise click.UsageError("Model metadata is missing 'roi'; specify ROI explicitly.")
+        resolved_rois = _normalize_rois(ws, rois, str(roi_single))
+        if not resolved_rois:
+            resolved_rois = [str(roi_single)]
+        if len(resolved_rois) != 1 or str(resolved_rois[0]) != str(roi_single):
+            raise click.UsageError(
+                "Single model NPZ can only be exported for its own ROI. "
+                f"Model ROI='{roi_single}', requested={resolved_rois}"
+            )
+        codebook_label_raw = codebook or meta_single.get("codebook")
+        if not codebook_label_raw:
+            raise click.UsageError(
+                "Codebook must be provided either via --codebook or present in model metadata"
+            )
+        fields_dir, codebook_label, codebook_slug = _ensure_fields_dir(ws, str(codebook_label_raw))
+        roi_to_model[str(roi_single)] = model_path
+        model_cache[model_path] = rng_single
+    else:
+        if not codebook:
+            raise click.UsageError("Either provide --model or specify --codebook to auto-discover models.")
+        fields_dir, codebook_label, codebook_slug = _ensure_fields_dir(ws, codebook)
+        candidates = sorted(fields_dir.glob(f"illum-field--*+{codebook_slug}--*.npz"))
+        if not candidates:
+            raise click.UsageError(
+                f"No illumination field models found in {fields_dir} for codebook '{codebook}'."
+            )
+        models_map: dict[str, Path] = {}
+        for candidate in candidates:
+            suffix = candidate.name[len("illum-field--") :]
+            roi_part, sep, _ = suffix.partition(f"+{codebook_slug}--")
+            if not sep or not roi_part:
+                continue
+            models_map[roi_part] = candidate
+        if rois:
+            resolved_rois = _normalize_rois(ws, rois, None)
+        else:
+            resolved_rois = sorted(models_map.keys())
+        if not resolved_rois:
+            raise click.UsageError("No ROIs matched available illumination field models.")
+        for roi_name in resolved_rois:
+            try:
+                roi_to_model[roi_name] = models_map[roi_name]
+            except KeyError as exc:  # coverage safety
+                raise click.UsageError(
+                    f"Illumination field NPZ not found for ROI '{roi_name}' in {fields_dir}."
+                ) from exc
 
-    if xs0.size:
+    if output is not None and len(roi_to_model) > 1:
+        raise click.UsageError("--output can only be provided when exporting a single ROI.")
+
+    if not roi_to_model:
+        raise click.UsageError("No ROI/model pairs resolved for export.")
+
+    assert fields_dir is not None
+
+    for roi, model_path_roi in sorted(roi_to_model.items()):
+        log_file_tag = f"{roi}+{codebook_label}"
+        try:
+            setup_workspace_logging(
+                ws.path,
+                component="preprocess.correct-illum.export-field",
+                file=log_file_tag,
+                debug=True,
+            )
+        except Exception:
+            logger.opt(exception=True).debug("Workspace logging setup failed; continuing with default logger")
+
+        logger.info(
+            "ExportField: model='{}', ROI='{}', workspace='{}', codebook='{}', what='{}', ds={}",
+            model_path_roi.name,
+            roi,
+            ws.path,
+            codebook_label,
+            what,
+            downsample,
+        )
+
+        default_output_path = fields_dir / f"field--{roi}+{codebook_slug}.zarr"
+        output_path = output if output is not None else default_output_path
+
+        za_store: zarr.Array | None = None
+        progress_total: int | None = None
+        completed_channels: list[str] = []
+        completed_set: set[str] = set()
+        existing_shape: tuple[int, int, int, int] | None = None
+        existing_attrs: dict[str, object] = {}
+        existing_model_meta: dict[str, object] | None = None
+        arr_shape: tuple[int, int, int, int] | None = None
+        chunks: tuple[int, int, int, int] | None = None
+        t_low_idx = 0
+        t_range_idx = 1
+
+        rng_model = model_cache.get(model_path_roi)
+        if rng_model is None:
+            rng_model = RangeFieldPointsModel.from_npz(model_path_roi)
+            model_cache[model_path_roi] = rng_model
+        meta = dict(rng_model.meta)
+        meta.setdefault("roi", roi)
+        meta.setdefault("codebook", codebook_label)
+        meta.setdefault("workspace", str(ws.path))
+        if str(meta.get("roi")) != roi:
+            logger.warning(
+                "Model ROI metadata '{}' differs from requested ROI '{}'; overriding metadata.",
+                meta.get("roi"),
+                roi,
+            )
+            meta["roi"] = roi
+
+        indices, xs0, ys0 = _resolve_tile_origins(meta, ws, roi)
+        if indices.size == 0:
+            raise click.UsageError(f"No TileConfiguration entries found for ROI '{roi}'")
+
+        order = np.argsort(indices.astype(np.int64))
+        indices = indices[order]
+        xs0 = xs0[order]
+        ys0 = ys0[order]
+
+        tile_w = float(meta.get("tile_w", 1968))
+        tile_h = float(meta.get("tile_h", 1968))
+
         x0 = float(xs0.min())
         x1 = float(xs0.max() + tile_w)
-    else:
-        # Fallback to point cloud bounds if no tile origins are available
-        pts = rng_model.xy.astype(float, copy=False)
-        x0 = float(pts[:, 0].min()) - tile_w * 0.5 if pts.size else 0.0
-        x1 = float(pts[:, 0].max()) + tile_w * 0.5 if pts.size else tile_w
-
-    if ys0.size:
         y0 = float(ys0.min())
         y1 = float(ys0.max() + tile_h)
-    else:
-        pts = rng_model.xy.astype(float, copy=False)
-        y0 = float(pts[:, 1].min()) - tile_h * 0.5 if pts.size else 0.0
-        y1 = float(pts[:, 1].max()) + tile_h * 0.5 if pts.size else tile_h
 
-    # Support multi-channel NPZs by evaluating per-channel and stacking to CYX
-    vlow = np.asarray(rng_model.vlow)
-    vhigh = np.asarray(rng_model.vhigh)
-    n_channels = int(vlow.shape[1]) if vlow.ndim == 2 else 1
-    ch_names = list(meta.get("channels", [])) if isinstance(meta.get("channels"), list) else []
-    if not ch_names or len(ch_names) != n_channels:
-        ch_names = (
-            [str(meta.get("channel", "channel_0"))]
-            if n_channels == 1
-            else [f"ch{i}" for i in range(n_channels)]
-        )
-    logger.info("Detected {} channel(s) in field NPZ: {}", n_channels, ",".join(ch_names))
+        grid_step_eff = grid_step
+        if grid_step_eff is None:
+            grid_step_eff = float(meta.get("grid_step_suggest", meta.get("grid_step", 128.0)))
+        neighbors_eff = neighbors
+        if neighbors_eff is None:
+            neighbors_eff = int(meta.get("neighbors", 0) or 0) or None
+        smoothing_eff = smoothing
+        if smoothing_eff is None:
+            smoothing_eff = float(meta.get("smoothing", 1.0))
 
-    planes_range: list[np.ndarray] = []
-    planes_low: list[np.ndarray] = []
-    m_sub_ref: np.ndarray | None = None
-    x0_crop = x1_crop = y0_crop = y1_crop = 0.0
-    H = W = Hds = Wds = 0
-    for ci in range(n_channels):
-        vlo_ci = vlow[:, ci] if vlow.ndim == 2 else vlow
-        vhi_ci = vhigh[:, ci] if vhigh.ndim == 2 else vhigh
-        meta_ci = dict(meta)
-        # Force per-channel scale recompute inside submodel
-        meta_ci.pop("range_mean", None)
-        meta_ci["channel"] = ch_names[ci]
-        mdl_ci = RangeFieldPointsModel(xy=rng_model.xy, vlow=vlo_ci, vhigh=vhi_ci, meta=meta_ci)
+        vlow = np.asarray(rng_model.vlow)
+        vhigh = np.asarray(rng_model.vhigh)
+        if vlow.ndim == 1:
+            vlow = vlow[:, None]
+        if vhigh.ndim == 1:
+            vhigh = vhigh[:, None]
 
-        xs, ys, low_field, high_field = mdl_ci.evaluate(
-            x0,
-            y0,
-            x1,
-            y1,
-            grid_step=grid_step,
-            neighbors=neighbors,
-            smoothing=smoothing,
-        )
-        mask = (
-            _mask_union_of_tiles(xs, ys, xs0, ys0, tile_w, tile_h)
-            if xs0.size
-            else np.ones_like(low_field, bool)
-        )
-        inv_range = mdl_ci.range_correction(low_field, high_field, mask=mask)
+        n_channels = int(vlow.shape[1])
+        ch_names = list(meta.get("channels", [])) if isinstance(meta.get("channels"), list) else []
+        if not ch_names or len(ch_names) != n_channels:
+            ch_names = (
+                [str(meta.get("channel", "channel_0"))]
+                if n_channels == 1
+                else [f"ch{i}" for i in range(n_channels)]
+            )
+        logger.info("Detected {} channel(s) in field NPZ: {}", n_channels, ",".join(ch_names))
 
-        if ci == 0:
+        store_exists = output_path.exists()
+        if store_exists and overwrite:
+            logger.info("Overwrite requested; removing existing field store at {}", output_path)
+            try:
+                if output_path.is_dir():
+                    shutil.rmtree(output_path)
+                else:
+                    output_path.unlink()
+            except Exception as exc:
+                raise click.ClickException(
+                    f"Failed to remove existing field store at {output_path}: {exc}"
+                ) from exc
+            store_exists = False
+            completed_channels.clear()
+            completed_set.clear()
+            progress_total = None
+            existing_shape = None
+            existing_attrs = {}
+            existing_model_meta = None
+        if store_exists:
+            logger.info("Existing field store detected at {}; opening in r+ mode", output_path)
+            za_store = zarr.open(str(output_path), mode="r+")
+            existing_shape = tuple(int(dim) for dim in za_store.shape)
+            if len(existing_shape) != 4 or existing_shape[0] != 2 or existing_shape[1] != n_channels:
+                raise click.UsageError(
+                    f"Existing field store at {output_path} has incompatible shape {existing_shape}; "
+                    "delete it or export to a different path."
+                )
+            if za_store.dtype != np.float32:
+                raise click.UsageError(
+                    f"Existing field store at {output_path} has dtype {za_store.dtype}; expected float32."
+                )
+            existing_attrs = dict(getattr(za_store, "attrs", {}))
+            axes_attr = existing_attrs.get("axes")
+            if axes_attr is None:
+                logger.warning(
+                    "Existing field store at {} missing 'axes' metadata; setting to 'TCYX' for compatibility.",
+                    output_path,
+                )
+                try:
+                    za_store.attrs["axes"] = "TCYX"
+                    existing_attrs["axes"] = "TCYX"
+                except Exception as exc:
+                    raise click.UsageError(
+                        f"Failed to set missing 'axes' metadata on existing field store at {output_path}: {exc}"
+                    ) from exc
+            elif axes_attr != "TCYX":
+                raise click.UsageError(
+                    f"Existing field store at {output_path} has axes={axes_attr!r}; expected 'TCYX'."
+                )
+            t_labels_raw = existing_attrs.get("t_labels")
+            if isinstance(t_labels_raw, (list, tuple)):
+                t_labels_attr = [str(label) for label in t_labels_raw]
+            else:
+                t_labels_attr = []
+            if "low" not in t_labels_attr or "range" not in t_labels_attr:
+                logger.warning(
+                    "Existing field store at {} missing required T labels 'low'/'range'; setting default ['low','range'].",
+                    output_path,
+                )
+                try:
+                    t_labels_attr = ["low", "range"]
+                    za_store.attrs["t_labels"] = t_labels_attr
+                    existing_attrs["t_labels"] = t_labels_attr
+                except Exception as exc:
+                    raise click.UsageError(
+                        f"Failed to set missing T labels on existing field store at {output_path}: {exc}"
+                    ) from exc
+            channel_names_raw = existing_attrs.get("channel_names")
+            if isinstance(channel_names_raw, (list, tuple)):
+                channel_names_attr = [str(name) for name in channel_names_raw]
+            else:
+                channel_names_attr = []
+            if not channel_names_attr:
+                logger.warning(
+                    "Existing field store at {} missing channel_names metadata; setting to {}",
+                    output_path,
+                    ch_names,
+                )
+                try:
+                    za_store.attrs["channel_names"] = ch_names
+                    existing_attrs["channel_names"] = ch_names
+                    channel_names_attr = ch_names
+                except Exception as exc:
+                    raise click.UsageError(
+                        f"Failed to set missing channel_names on existing field store at {output_path}: {exc}"
+                    ) from exc
+            if channel_names_attr != ch_names:
+                raise click.UsageError(
+                    "Existing field store channel list does not match model channels: "
+                    f"{channel_names_attr} vs {ch_names}. Remove the store or rerun with --output."
+                )
+            existing_model_meta_obj = existing_attrs.get("model_meta")
+            if not isinstance(existing_model_meta_obj, dict):
+                raise click.UsageError(
+                    f"Existing field store at {output_path} is missing model_meta metadata."
+                )
+            existing_model_meta = dict(existing_model_meta_obj)
+            expected_meta_subset = {
+                "roi": roi,
+                "codebook": codebook_label,
+                "tile_w": int(tile_w),
+                "tile_h": int(tile_h),
+                "downsample": int(downsample),
+                "grid_step": float(grid_step_eff) if grid_step_eff is not None else None,
+                "neighbors": int(neighbors_eff or 0),
+                "smoothing": float(smoothing_eff) if smoothing_eff is not None else None,
+                "cropped": True,
+            }
+            mismatched_keys = [
+                key
+                for key, expected_value in expected_meta_subset.items()
+                if expected_value is not None and existing_model_meta.get(key) != expected_value
+            ]
+            if mismatched_keys:
+                raise click.UsageError(
+                    "Existing field store metadata does not match current export parameters "
+                    f"(mismatched keys: {', '.join(mismatched_keys)}). "
+                    "Remove the store or export to a new path."
+                )
+            progress_attr = existing_attrs.get("progress")
+            if isinstance(progress_attr, dict):
+                completed_channels = [
+                    str(name) for name in progress_attr.get("completed_channels", []) if str(name) in ch_names
+                ]
+                total_progress = progress_attr.get("total_channels")
+                if isinstance(total_progress, int):
+                    progress_total = total_progress
+            completed_set = set(completed_channels)
+            if completed_set:
+                completed_channels = [name for name in ch_names if name in completed_set]
             logger.info(
-                "Evaluated field grid: nx={}, ny={}, bbox=({:.1f},{:.1f})-({:.1f},{:.1f})",
-                int(xs.size),
-                int(ys.size),
+                "Resume detected: {} of {} channel(s) already exported in {}",
+                len(completed_channels),
+                n_channels,
+                output_path,
+            )
+            if progress_total is None:
+                progress_total = n_channels
+            if len(completed_set) == n_channels:
+                ordered_completed = [name for name in ch_names if name in completed_set]
+                if len(ordered_completed) != n_channels:
+                    ordered_completed = ch_names
+                _update_progress(za_store, "complete", ordered_completed, progress_total)
+                logger.info(
+                    "All {} channel(s) already present in {}; skipping export-field recomputation.",
+                    n_channels,
+                    output_path,
+                )
+                rich.print(
+                    f"[yellow]Field store already complete for ROI={roi} codebook={codebook_label}; "
+                    f"skipping export → {output_path}[/yellow]"
+                )
+                continue
+
+        # Cached grid/mask/crop computed once (identical across channels)
+        xs: np.ndarray | None = None
+        ys: np.ndarray | None = None
+        mask: np.ndarray | None = None
+        j0 = j1 = i0 = i1 = 0
+        x0_crop = x1_crop = y0_crop = y1_crop = 0.0
+        H = W = Hds = Wds = 0
+
+        # Optional GPU path for resampling (set GPU=1 to enable)
+        use_gpu_resize = os.environ.get("GPU", "0") == "1"
+        logger.info(
+            "ExportField backend: resizing on {} (GPU env GPU={} detected)",
+            "GPU" if use_gpu_resize else "CPU",
+            os.environ.get("GPU", "0"),
+        )
+
+        def _zoom_batch_to_output(batch: list[np.ndarray], oh: int, ow: int) -> list[np.ndarray]:
+            """Resize a batch of coarse fields to the output resolution, preferring GPU."""
+
+            if not batch:
+                return []
+            if not use_gpu_resize:
+                logger.debug(f"zoom_batch: CPU resize for {len(batch)} field(s) to {ow}x{oh}")
+                return [
+                    resize(arr, (oh, ow), preserve_range=True, anti_aliasing=True).astype(np.float32)
+                    for arr in batch
+                ]
+            try:
+                from cucim.skimage.transform import rescale as _cucim_rescale  # type: ignore
+
+                result: list[np.ndarray] = []
+                last_scale_y = last_scale_x = 0.0
+                for arr in batch:
+                    arr_gpu = cp.asarray(arr, dtype=cp.float32)
+                    scale_y = float(oh) / float(arr_gpu.shape[-2])
+                    scale_x = float(ow) / float(arr_gpu.shape[-1])
+                    zoomed_gpu = _cucim_rescale(
+                        arr_gpu,
+                        scale=(scale_y, scale_x),
+                        order=2,
+                        preserve_range=True,
+                        anti_aliasing=False,
+                    ).astype(cp.float32, copy=False)
+                    if zoomed_gpu.shape != (oh, ow):
+                        zoomed_gpu = zoomed_gpu[:oh, :ow]
+                    result.append(cp.asnumpy(zoomed_gpu))
+                    last_scale_y, last_scale_x = scale_y, scale_x
+                logger.debug(
+                    f"zoom_batch: cuCIM resize for {len(batch)} field(s) to {ow}x{oh} "
+                    f"(scale_y={last_scale_y:.4f}, scale_x={last_scale_x:.4f})"
+                )
+                return result
+            except Exception as exc:
+                logger.opt(exception=exc).error(
+                    f"zoom_batch: GPU resize failed while processing {len(batch)} field(s) to {ow}x{oh}"
+                )
+                raise
+            finally:
+                try:
+                    cp.get_default_memory_pool().free_all_blocks()  # type: ignore[attr-defined]
+                except Exception as pool_exc:
+                    logger.opt(exception=pool_exc).debug("Failed to clear CuPy memory pool after resize")
+
+        # Preallocate CPU-side outputs once dimensions are known; fill in channel batches of 2
+        out_range: np.ndarray | None = None
+        out_low: np.ndarray | None = None
+        md_common: dict[str, object] | None = None
+        m_bool: np.ndarray | None = None
+
+        for ci in range(n_channels):
+            ch_name = ch_names[ci]
+            if ch_name in completed_set:
+                logger.info(
+                    "Skipping channel '{}' (already present in {})",
+                    ch_name,
+                    output_path,
+                )
+                continue
+
+            vlo_ci = vlow[:, ci] if vlow.ndim == 2 else vlow
+            vhi_ci = vhigh[:, ci] if vhigh.ndim == 2 else vhigh
+            meta_ci = dict(meta)
+            meta_ci.pop("range_mean", None)
+            meta_ci["channel"] = ch_name
+            mdl_ci = RangeFieldPointsModel(xy=rng_model.xy, vlow=vlo_ci, vhigh=vhi_ci, meta=meta_ci)
+
+            xs_ci, ys_ci, low_field, high_field = mdl_ci.evaluate(
                 x0,
                 y0,
                 x1,
                 y1,
+                grid_step=grid_step_eff,
+                neighbors=neighbors_eff,
+                smoothing=smoothing_eff,
             )
 
-            rows_any = mask.any(axis=1)
-            cols_any = mask.any(axis=0)
-            if rows_any.any() and cols_any.any():
-                j0 = int(np.argmax(rows_any))
-                j1 = int(len(rows_any) - 1 - np.argmax(rows_any[::-1]))
-                i0 = int(np.argmax(cols_any))
-                i1 = int(len(cols_any) - 1 - np.argmax(cols_any[::-1]))
-                j0 = max(0, min(j0, j1))
-                i0 = max(0, min(i0, i1))
-            else:
-                j0, j1 = 0, mask.shape[0] - 1
-                i0, i1 = 0, mask.shape[1] - 1
+            # Expand the evaluated grid by one cell on all sides using nearest-neighbor padding
+            # so downstream cropping/resizing has a stable exterior surface to sample.
+            def _expand_grid_with_edge(
+                xs_in: np.ndarray, ys_in: np.ndarray, low_in: np.ndarray, high_in: np.ndarray
+            ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                xs_in = np.asarray(xs_in, dtype=np.float32)
+                ys_in = np.asarray(ys_in, dtype=np.float32)
+                if xs_in.size < 1 or ys_in.size < 1:
+                    return xs_in, ys_in, low_in, high_in
+                dx = float(xs_in[1] - xs_in[0]) if xs_in.size > 1 else 1.0
+                dy = float(ys_in[1] - ys_in[0]) if ys_in.size > 1 else 1.0
+                xs_out = np.empty(xs_in.size + 2, dtype=np.float32)
+                ys_out = np.empty(ys_in.size + 2, dtype=np.float32)
+                xs_out[0] = float(xs_in[0]) - dx
+                xs_out[-1] = float(xs_in[-1]) + dx
+                xs_out[1:-1] = xs_in
+                ys_out[0] = float(ys_in[0]) - dy
+                ys_out[-1] = float(ys_in[-1]) + dy
+                ys_out[1:-1] = ys_in
+                low_pad = np.pad(low_in, ((1, 1), (1, 1)), mode="edge").astype(np.float32, copy=False)
+                high_pad = np.pad(high_in, ((1, 1), (1, 1)), mode="edge").astype(np.float32, copy=False)
+                return xs_out, ys_out, low_pad, high_pad
 
-            x0_crop = float(xs[i0])
-            x1_crop = float(xs[i1])
-            y0_crop = float(ys[j0])
-            y1_crop = float(ys[j1])
+            xs_ci, ys_ci, low_field, high_field = _expand_grid_with_edge(xs_ci, ys_ci, low_field, high_field)
 
-            W = int(np.ceil(x1_crop - x0_crop))
-            H = int(np.ceil(y1_crop - y0_crop))
-            if W <= 0 or H <= 0:
-                raise click.UsageError(
-                    "Computed empty cropped extent; check tile configuration or model metadata"
+            if xs is None or ys is None:
+                xs, ys = xs_ci, ys_ci
+                logger.info(
+                    "Evaluated field grid: nx={}, ny={}, bbox=({:.1f},{:.1f})-({:.1f},{:.1f})",
+                    int(xs.size),
+                    int(ys.size),
+                    x0,
+                    y0,
+                    x1,
+                    y1,
                 )
-            Hds = max(1, int(round(H / float(downsample))))
-            Wds = max(1, int(round(W / float(downsample))))
+                mask = (
+                    _mask_union_of_tiles(xs, ys, xs0, ys0, tile_w, tile_h)
+                    if xs0.size
+                    else np.ones((ys.size, xs.size), dtype=bool)
+                )
+
+                rows_any = mask.any(axis=1)
+                cols_any = mask.any(axis=0)
+                if rows_any.any() and cols_any.any():
+                    j0_raw = int(np.argmax(rows_any))
+                    j1_raw = int(len(rows_any) - 1 - np.argmax(rows_any[::-1]))
+                    i0_raw = int(np.argmax(cols_any))
+                    i1_raw = int(len(cols_any) - 1 - np.argmax(cols_any[::-1]))
+                    # Clamp first to preserve ordering
+                    j0_raw = max(0, min(j0_raw, j1_raw))
+                    i0_raw = max(0, min(i0_raw, i1_raw))
+                else:
+                    j0_raw, j1_raw = 0, mask.shape[0] - 1
+                    i0_raw, i1_raw = 0, mask.shape[1] - 1
+
+                # After expanding the evaluated grid by one, also include one-cell exterior ring
+                # in the cropped region to preserve that padding in the saved store.
+                j0 = max(0, j0_raw - 1)
+                i0 = max(0, i0_raw - 1)
+                j1 = min(mask.shape[0] - 1, j1_raw + 1)
+                i1 = min(mask.shape[1] - 1, i1_raw + 1)
+
+                x0_crop = float(xs[i0])
+                x1_crop = float(xs[i1])
+                y0_crop = float(ys[j0])
+                y1_crop = float(ys[j1])
+
+                W = int(np.ceil(x1_crop - x0_crop))
+                H = int(np.ceil(y1_crop - y0_crop))
+                if W <= 0 or H <= 0:
+                    raise click.UsageError(
+                        "Computed empty cropped extent; check tile configuration or model metadata"
+                    )
+                Hds = max(1, int(round(H / float(downsample))))
+                Wds = max(1, int(round(W / float(downsample))))
+                logger.info(
+                    "Cropped native size: {}x{} (W×H); downsampled to {}x{}",
+                    int(W),
+                    int(H),
+                    int(Wds),
+                    int(Hds),
+                )
+                mask_slice = mask[j0 : j1 + 1, i0 : i1 + 1]
+                logger.debug(
+                    (
+                        f"Mask crop indices (i0={i0} i1={i1} j0={j0} j1={j1}); "
+                        f"mask true ratio={float(mask_slice.mean()) if mask_slice.size else 0.0:.3f}"
+                    )
+                )
+
+                # Preallocate outputs and precompute downsampled mask once
+                m_sub_ref = mask_slice
+                m_ds = resize(
+                    m_sub_ref.astype(float),
+                    (Hds, Wds),
+                    preserve_range=True,
+                    anti_aliasing=False,
+                ).astype(np.float32)
+                m_bool = m_ds > 0.5
+                logger.debug(
+                    f"Downsampled mask coverage: "
+                    f"{float(m_bool.mean()) if m_bool.size else 0.0:.3f} (true pixels / total)"
+                )
+                out_range = np.empty((n_channels, Hds, Wds), dtype=np.float32)
+                out_low = np.empty((n_channels, Hds, Wds), dtype=np.float32)
+                mode = what.lower()
+                if mode != "both":
+                    logger.warning(
+                        "--what={} requested; exporting both planes (low, range) and ignoring single-plane output.",
+                        mode,
+                    )
+                if progress_total is None:
+                    progress_total = n_channels
+                arr_shape = (2, n_channels, Hds, Wds)
+                chunk_y = min(Hds, 2048)
+                chunk_x = min(Wds, 2048)
+                chunks = (1, 1, chunk_y, chunk_x)
+                md_common = {
+                    "axes": "TCYX",
+                    "roi": roi,
+                    "codebook": codebook_label,
+                    "tile_w": int(tile_w),
+                    "tile_h": int(tile_h),
+                    "grid_step": float(grid_step_eff) if grid_step_eff is not None else None,
+                    "neighbors": int(neighbors_eff or 0),
+                    "smoothing": float(smoothing_eff) if smoothing_eff is not None else None,
+                    "downsample": int(downsample),
+                    "x0": float(x0_crop),
+                    "y0": float(y0_crop),
+                    "width_native": int(W),
+                    "height_native": int(H),
+                    "cropped": True,
+                }
+                md_common = {k: v for k, v in md_common.items() if v is not None}
+                md_common["channels"] = ch_names
+                md_common["kind"] = "both"
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                if za_store is None:
+                    za_store = zarr.open(
+                        str(output_path),
+                        mode="w",
+                        shape=arr_shape,
+                        chunks=chunks,
+                        dtype=np.float32,
+                    )
+                    za_store.attrs["axes"] = "TCYX"
+                    za_store.attrs["t_labels"] = ["low", "range"]
+                    za_store.attrs["channel_names"] = ch_names
+                    za_store.attrs["model_meta"] = md_common
+                    _update_progress(za_store, "initializing", completed_channels, progress_total)
+                else:
+                    if existing_shape is not None and existing_shape != arr_shape:
+                        raise click.UsageError(
+                            "Existing field store shape "
+                            f"{existing_shape} does not match expected {arr_shape}; cannot resume export."
+                        )
+                    za_store.attrs["channel_names"] = ch_names
+                    za_store.attrs["model_meta"] = md_common
+            else:
+                # Sanity check: grids must match across channels
+                if xs_ci.shape != xs.shape or ys_ci.shape != ys.shape:
+                    raise RuntimeError(
+                        "Evaluated grids differ across channels; cannot assemble multi-channel export."
+                    )
+
+            if mask is None or out_low is None or out_range is None:
+                raise RuntimeError("Export-field buffers were not initialized before channel processing.")
+
+            inv_range = mdl_ci.range_correction(low_field, high_field, mask=mask)
+            inv_sub = inv_range[j0 : j1 + 1, i0 : i1 + 1].astype(np.float32, copy=False)
+            low_sub = low_field[j0 : j1 + 1, i0 : i1 + 1].astype(np.float32, copy=False)
+
+            resize_backend = "GPU" if use_gpu_resize else "CPU"
+            resize_start = time.perf_counter()
+            inv_ds = _zoom_batch_to_output([inv_sub], Hds, Wds)[0]
+            inv_resize_sec = time.perf_counter() - resize_start
+            resize_start = time.perf_counter()
+            low_ds = _zoom_batch_to_output([low_sub], Hds, Wds)[0]
+            low_resize_sec = time.perf_counter() - resize_start
+
+            if m_bool is not None and not m_bool.all():
+                inv_ds = np.where(m_bool, inv_ds, np.float32(1.0))
+                low_ds = np.where(m_bool, low_ds, np.float32(1.0))
+
+            out_range[ci, :, :] = inv_ds
+            out_low[ci, :, :] = low_ds
+
+            io_duration: float | None = None
+            if za_store is not None:
+                io_start = time.perf_counter()
+                za_store[t_range_idx, ci, :, :] = inv_ds.astype(np.float32, copy=False)
+                za_store[t_low_idx, ci, :, :] = low_ds.astype(np.float32, copy=False)
+                io_duration = time.perf_counter() - io_start
+
+            if ch_name not in completed_channels:
+                completed_channels.append(ch_name)
+            completed_set.add(ch_name)
+
+            logger.debug(
+                (
+                    f"Channel '{ch_name}' zoom complete "
+                    f"(min={float(inv_ds.min()):.3f} max={float(inv_ds.max()):.3f} "
+                    f"mean={float(inv_ds.mean()):.3f})"
+                )
+            )
+
+            if za_store is not None:
+                _update_progress(za_store, "in_progress", completed_channels, progress_total)
+
+            msg = (
+                f"Channel {ci} ('{ch_name}') resize ({resize_backend}) "
+                f"range={inv_resize_sec:.3f}s low={low_resize_sec:.3f}s"
+            )
+            if io_duration is not None:
+                msg += f", zarr-write={io_duration:.3f}s"
+            logger.info(msg)
+
+        logger.info("Channel batch processing complete; finalizing export.")
+        if out_low is None or out_range is None or md_common is None:
+            raise RuntimeError("Export did not initialize output buffers; aborting without writing results.")
+
+        arr_shape = (2, *out_low.shape)
+        if za_store is None:
+            chunk_y = min(arr_shape[2], 2048)
+            chunk_x = min(arr_shape[3], 2048)
+            chunks = (1, 1, chunk_y, chunk_x)
             logger.info(
-                "Cropped native size: {}x{} (W×H); downsampled to {}x{}", int(W), int(H), int(Wds), int(Hds)
+                "Zarr store was not initialized during batching; writing full TCYX array once (shape={}, chunks={})",
+                arr_shape,
+                chunks,
             )
-            m_sub_ref = mask[j0 : j1 + 1, i0 : i1 + 1]
-
-        inv_sub = inv_range[j0 : j1 + 1, i0 : i1 + 1]
-        native_range = resize(inv_sub, (H, W), preserve_range=True, anti_aliasing=True).astype(np.float32)
-        out_plane_range = resize(native_range, (Hds, Wds), preserve_range=True, anti_aliasing=True).astype(
-            np.float32
-        )
-        planes_range.append(out_plane_range)
-
-        # Also prepare LOW field if requested
-        if what.lower() in {"low", "both"}:
-            low_sub = low_field[j0 : j1 + 1, i0 : i1 + 1]
-            native_low = resize(low_sub, (H, W), preserve_range=True, anti_aliasing=True).astype(np.float32)
-            out_plane_low = resize(native_low, (Hds, Wds), preserve_range=True, anti_aliasing=True).astype(
-                np.float32
+            zat_path = output_path
+            zat_path.parent.mkdir(parents=True, exist_ok=True)
+            io_start = time.perf_counter()
+            za_store = zarr.open(
+                str(zat_path),
+                mode="w",
+                shape=arr_shape,
+                chunks=chunks,
+                dtype=np.float32,
             )
-            planes_low.append(out_plane_low)
-
-    out_range = (
-        np.stack(planes_range, axis=0) if planes_range else np.zeros((n_channels, 1, 1), dtype=np.float32)
-    )
-    out_low = np.stack(planes_low, axis=0) if planes_low else None
-
-    if m_sub_ref is not None:
-        m_native = resize(m_sub_ref.astype(float), (H, W), preserve_range=True, anti_aliasing=False).astype(
-            np.float32
-        )
-        m_ds = resize(m_native, (Hds, Wds), preserve_range=True, anti_aliasing=False).astype(np.float32)
-        m_bool = m_ds > 0.5
-        if (~m_bool).any():
-            # Fill outside the mask with identity value 1.0 for both fields.
-            # For RANGE (multiplicative), 1.0 is neutral; for LOW (subtractive),
-            # the consumer can decide how to handle out-of-support regions.
-            out_range = out_range.copy()
-            out_range[:, ~m_bool] = 1.0
-            if out_low is not None:
-                out_low = out_low.copy()
-                out_low[:, ~m_bool] = 1.0
-
-    # Resolve output path for TCYX store
-    mode = what.lower()
-    if output is None:
-        if mode == "range":
-            output = model.with_name(f"{model.stem}-field-range-tcyx-ds{int(downsample)}.zarr")
-        elif mode == "low":
-            output = model.with_name(f"{model.stem}-field-low-tcyx-ds{int(downsample)}.zarr")
+            za_store.attrs["axes"] = "TCYX"
+            za_store.attrs["t_labels"] = ["low", "range"]
+            za_store.attrs["channel_names"] = ch_names
+            md_common["kind"] = "both"
+            za_store.attrs["model_meta"] = md_common
+            za_store[t_low_idx, :, :, :] = out_low.astype(np.float32, copy=False)
+            za_store[t_range_idx, :, :, :] = out_range.astype(np.float32, copy=False)
+            full_write_sec = time.perf_counter() - io_start
+            logger.info(
+                "Full TCYX array write completed in %.3fs for %d channel(s)",
+                full_write_sec,
+                out_low.shape[0],
+            )
+            if progress_total is None:
+                progress_total = n_channels
+            _update_progress(za_store, "initializing", completed_channels, progress_total)
         else:
-            output = model.with_name(f"{model.stem}-field-both-tcyx-ds{int(downsample)}.zarr")
+            md_common["kind"] = "both"
+            za_store.attrs["model_meta"] = md_common
 
-    md_common = {
-        "axes": "TCYX",
-        "roi": roi,
-        "codebook": codebook,
-        "tile_w": int(tile_w),
-        "tile_h": int(tile_h),
-        "grid_step": float(grid_step) if grid_step is not None else None,
-        "neighbors": int(neighbors or 0),
-        "smoothing": float(smoothing) if smoothing is not None else None,
-        "downsample": int(downsample),
-        # Cropped global coordinates (plot-field parity)
-        "x0": float(x0_crop),
-        "y0": float(y0_crop),
-        "width_native": int(W),
-        "height_native": int(H),
-        "cropped": True,
-    }
-    md_common = {k: v for k, v in md_common.items() if v is not None}
-    md_common["channels"] = ch_names
-
-    # Compose TCYX array:
-    # - When both: T=2 planes [LOW, RANGE]
-    # - When single: T=1 with the requested kind
-    t_labels: list[str]
-    if mode == "both":
-        if out_low is None:
-            raise click.UsageError("--what both requested but LOW field is unavailable")
-        arr_tcyx = np.stack([out_low, out_range], axis=0)
-        t_labels = ["low", "range"]
-        md_common["kind"] = "both"
-    elif mode == "low":
-        if out_low is None:
-            raise click.UsageError("LOW field was not computed; ensure --what includes 'low'")
-        arr_tcyx = out_low[None, ...]
-        t_labels = ["low"]
-        md_common["kind"] = "low"
-    else:  # range only
-        arr_tcyx = out_range[None, ...]
-        t_labels = ["range"]
-        md_common["kind"] = "range"
-
-    # Write single TCYX store with attributes
-    output.parent.mkdir(parents=True, exist_ok=True)
-    chunks = (1, 1, min(512, Hds), min(512, Wds))
-    za = zarr.open(str(output), mode="w", shape=arr_tcyx.shape, chunks=chunks, dtype=np.float32)
-    za[:] = arr_tcyx
-    za.attrs["axes"] = "TCYX"
-    za.attrs["t_labels"] = t_labels
-    za.attrs["model_meta"] = md_common
-    logger.info(
-        "Saved export-field (Zarr) TCYX={}×{}×{}×{} kind={} → {}",
-        int(arr_tcyx.shape[0]),
-        int(arr_tcyx.shape[1]),
-        int(arr_tcyx.shape[2]),
-        int(arr_tcyx.shape[3]),
-        md_common.get("kind"),
-        output,
-    )
-    rich.print(
-        f"[green]Exported field as TCYX with shape {arr_tcyx.shape} (kind={md_common.get('kind')}, ds={int(downsample)}) → {output}[/green]"
-    )
+        if progress_total is None:
+            progress_total = n_channels
+        if len(completed_set) < n_channels:
+            missing = [name for name in ch_names if name not in completed_set]
+            completed_channels.extend(missing)
+            completed_set.update(missing)
+        _update_progress(za_store, "complete", completed_channels, progress_total)
+        logger.info(
+            "Saved export-field (Zarr) TCYX={}×{}×{}×{} kind={} → {}",
+            int(arr_shape[0]),
+            int(arr_shape[1]),
+            int(arr_shape[2]),
+            int(arr_shape[3]),
+            md_common.get("kind"),
+            output_path,
+        )
+        rich.print(
+            f"[green]Exported field as TCYX with shape {arr_shape} (kind={md_common.get('kind')}, ds={int(downsample)}) → {output_path}[/green]"
+        )
 
 
 @correct_illum.command("plot-field-tile")

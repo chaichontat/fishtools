@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import zarr
 from click.testing import CliRunner
 from skimage.transform import resize
-import zarr
 
 from fishtools.io.workspace import Workspace
-from fishtools.preprocess.cli_correct_illum import correct_illum, _mask_union_of_tiles
+from fishtools.preprocess.cli_correct_illum import _mask_union_of_tiles, correct_illum
 from fishtools.preprocess.spots.illumination import RangeFieldPointsModel
 
 
@@ -102,12 +102,18 @@ def test_export_field_multi_channel_cyx(tmp_path: Path) -> None:
     assert out_zarr.exists()
 
     za = zarr.open(str(out_zarr), mode="r")
-    arr = np.asarray(za).astype(np.float32)
-    axes = getattr(za, "attrs", {}).get("axes")
-    assert axes == "CYX"
+    arr_all = np.asarray(za).astype(np.float32)
+    attrs = dict(getattr(za, "attrs", {}))
+    axes = attrs.get("axes")
+    assert axes == "TCYX"
+    t_labels = list(attrs.get("t_labels", []))
+    assert "range" in t_labels and "low" in t_labels
+    t_idx = t_labels.index("range")
+    # Select RANGE plane; expect C×Y×X
+    arr = arr_all[t_idx]
     assert arr.ndim == 3 and arr.shape[0] == 2  # two channels
 
-    # Means per channel should be ~1.0 after normalization
+    # Means per channel should be ~1.0 after normalization (RANGE plane)
     m0 = float(np.nanmean(arr[0]))
     m1 = float(np.nanmean(arr[1]))
     assert abs(m0 - 1.0) < 5e-2 and abs(m1 - 1.0) < 5e-2

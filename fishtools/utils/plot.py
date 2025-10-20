@@ -1,17 +1,15 @@
+from __future__ import annotations
+
 import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
-import cmocean  # colormap, do not remove  # noqa: F401
-import colorcet as cc  # colormap, do not remove  # noqa: F401
 import matplotlib as mpl
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
-import polars as pl
-import scanpy as sc
 from loguru import logger
 from matplotlib.axes import Axes
 from matplotlib.colors import ListedColormap
@@ -23,10 +21,9 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 from numpy.lib.index_tricks import IndexExpression
 
-from fishtools.utils.utils import copy_signature
-
 if TYPE_CHECKING:
     import anndata as ad
+    import polars as pl
 
 
 # Common plot styling primitives -------------------------------------------------
@@ -111,6 +108,10 @@ def plot_wheel(
     colorbar_label: str | None = None,
     **kwargs: Any,
 ) -> tuple[Figure, NamedTuple]:
+    # Ensure colorcet colormaps (e.g., 'cet_colorwheel') are registered with Matplotlib
+    import cmocean  # noqa: F401
+    import colorcet as cc  # noqa: F401
+
     θ = np.arctan2(pcs[:, 0], pcs[:, 1])
     fig = fig or plt.figure(1, figsize=(6, 6))
     axs = NamedTuple("axs", scatter=Axes, histx=Axes, histy=Axes)(
@@ -316,6 +317,7 @@ def scatter_spots(
     facecolor: str | None = None,
 ) -> None:
     """Render a downsampled scatter of spots on the provided axis."""
+    # Polars not required here at runtime; type checked via from __future__ annotations
     ax.set_aspect("equal")
     # ax.axis("off")
 
@@ -606,7 +608,6 @@ def add_legend(
     return ax
 
 
-@copy_signature(sc.pl.embedding)
 def plot_embedding(
     adata: "ad.AnnData",
     figsize: tuple[float, float] | None = None,
@@ -619,6 +620,12 @@ def plot_embedding(
     Parameters:
     - adata: AnnData object containing the embedding data.
     """
+    # Lazy import to avoid importing scanpy at module import time
+    try:
+        import scanpy as sc  # type: ignore
+    except Exception as e:  # pragma: no cover - runtime environment dependent
+        raise RuntimeError("plot_embedding requires 'scanpy'. Please install it to use this function.") from e
+
     kwargs = kwargs | {"return_fig": True}
     fig = cast(Figure, sc.pl.embedding(adata, **kwargs))
 
@@ -649,6 +656,9 @@ def plot_all_genes(
     figsize: tuple[float, float] | None = None,
     cmap: str | None = None,
 ):
+    # Local import to avoid importing polars when plotting utilities are imported
+    import polars as pl  # type: ignore
+
     genes = spots.group_by("target").len().sort("len", descending=True)["target"]
     genes = spots["target"].unique()
     genes = filter(lambda x: x.startswith("Blank"), genes) if only_blank else genes

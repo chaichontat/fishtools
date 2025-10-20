@@ -1,5 +1,6 @@
 import re
 from collections.abc import Iterable
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Pattern, Sequence, cast
 
@@ -9,10 +10,12 @@ from pydantic import BaseModel, Field
 from fishtools.utils.logging import setup_workspace_logging
 from fishtools.utils.utils import noglobal
 
+IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
+
 
 class TrainConfig(BaseModel):
     name: str
-    base_model: str = "cyto3"
+    base_model: str = "cyto3" if not IS_CELLPOSE_SAM else "cpsam"
     channels: tuple[int, int]
     training_paths: list[str]
     include: list[str] = Field(default_factory=list)
@@ -272,6 +275,8 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     from cellpose.models import CellposeModel
     from cellpose.train import train_seg
 
+    IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
+
     # if name is None:
     # name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     images, labels, image_names, test_images, test_labels, image_names_test = out
@@ -282,7 +287,6 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
         train_data=images,
         train_labels=labels,
         save_path=path,  # /models automatically appended
-        channels=train_config.channels,
         batch_size=train_config.batch_size,
         channel_axis=0,
         test_data=test_images,
@@ -295,6 +299,7 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
         bsize=train_config.bsize,
         normalize=cast(bool, {"percentile": train_config.normalization_percs}),
         min_train_masks=1,
+        **({"channels": train_config.channels} if not IS_CELLPOSE_SAM else {}),
     )
     return model_path, train_losses, test_losses
 
