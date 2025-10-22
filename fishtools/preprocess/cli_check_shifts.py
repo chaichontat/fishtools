@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import click
+import numpy as np
+import pandas as pd
 import seaborn as sns
 from loguru import logger
+from tifffile import TiffFile
 
 from fishtools.io.codebook import Codebook
 from fishtools.io.workspace import Workspace
 from fishtools.plot.diagnostics.shifts import (
     Shift,
     ShiftsAdapter,
+    infer_rounds,
+    build_shift_layout_table,
+    make_shifts_layout_figure,
     make_corr_hist_figure,
     make_corr_vs_l2_figure,
     make_shifts_scatter_figure,
@@ -59,6 +66,70 @@ def _check_missing_tiles(
     missing = sorted(ref_tiles - shift_tiles)
     if missing:
         logger.warning(f"Missing shifts for tiles: {missing}")
+
+
+def _infer_tile_size_px(ws: Workspace, roi: str, codebook: str, default: float = 1968.0) -> float:
+    """Infer tile edge length in pixels from a sample registered TIFF.
+
+    Falls back to ``default`` if anything goes wrong. Logs the chosen value.
+    """
+    try:
+        reg_dir = ws.registered(roi, codebook)
+        sample = next(iter(sorted(reg_dir.glob("reg-*.tif"))), None)
+        if sample is None:
+            logger.warning(f"No registered TIFFs found to infer tile size; using default {default}.")
+            return float(default)
+        with TiffFile(sample) as tif:
+            shape = tif.pages[0].shape  # YX (or CYX/ZCYX but first page is YX)
+        if len(shape) < 2:
+            logger.warning(f"Unexpected TIFF shape for tile size inference: {shape}; using default {default}.")
+            return float(default)
+        y, x = int(shape[-2]), int(shape[-1])
+        if y != x:
+            logger.warning(f"Non-square tile detected ({x}x{y}); using X dimension {x} as tile size.")
+        size = float(x)
+        logger.info(f"Inferred tile size from {sample.name}: {size}px")
+        return size
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed inferring tile size; using default {default}: {e}")
+        return float(default)
+
+
+def build_corr_l2_table(
+    shifts_by_tile: Mapping[int, Mapping[str, Shift]],
+    *,
+    roi: str,
+) -> pd.DataFrame:
+    """Return per-round correlation and L2 distances for each tile."""
+
+    rounds = infer_rounds(shifts_by_tile)
+    records: list[dict[str, object]] = []
+
+    for round_name in rounds:
+        per_round: list[tuple[int, Shift]] = []
+        for tile_id, per_tile in shifts_by_tile.items():
+            shift = per_tile.get(round_name)
+            if shift is None:
+                continue
+            per_round.append((tile_id, shift))
+        if not per_round:
+            continue
+
+        shifts = np.array([shift.shifts for _, shift in per_round], dtype=float)
+        mean_shift = shifts.mean(axis=0)
+        l2 = np.linalg.norm(shifts - mean_shift, axis=1)
+
+        for (tile_id, shift), dist in zip(per_round, l2, strict=False):
+            records.append({
+                "roi": roi,
+                "round": round_name,
+                "tile": int(tile_id),
+                "correlation": float(shift.corr),
+                "L2": float(dist),
+            })
+
+    records.sort(key=lambda item: (str(item["round"]), int(item["tile"])))
+    return pd.DataFrame.from_records(records, columns=["roi", "round", "tile", "correlation", "L2"])
 
 
 ## Saving is unified via fishtools.utils.plot.save_figure
@@ -164,3 +235,35 @@ def check_shifts(
 
         fig3 = make_corr_hist_figure(shifts_by_tile, ncols=cols)
         save_figure(fig3, output_dir, "shifts_corr_hist", roi, codebook.name, log_level="INFO")
+
+        corr_l2_df = build_corr_l2_table(shifts_by_tile, roi=roi)
+        csv_path = output_dir / f"shifts_corr_l2--{roi}+{codebook.name}.csv"
+        if corr_l2_df.empty:
+            logger.warning(f"No correlation/L2 records produced for ROI '{roi}'. Skipping CSV export.")
+        else:
+            corr_l2_df.to_csv(csv_path, index=False)
+            logger.info(f"Saved correlation/L2 CSV: {csv_path}")
+
+        # New: per-round layout scatter using TileConfiguration centers offset by shifts
+        try:
+            tc = ws.tileconfig(roi)
+        except FileNotFoundError:
+            logger.warning(f"TileConfiguration not found for ROI {roi}; skipping shifts layout plot.")
+            continue
+        tile_size_px = _infer_tile_size_px(ws, roi, codebook.name, default=1968.0)
+        centers = {
+            int(idx): (float(x) + 0.5 * tile_size_px, float(y) + 0.5 * tile_size_px)
+            for idx, x, y in tc.df.select(["index", "x", "y"]).iter_rows()
+        }
+        records = build_shift_layout_table(centers, shifts_by_tile, roi=roi)
+        try:
+            fig_layout = make_shifts_layout_figure(
+                records,
+                tile_size_px=tile_size_px,
+                pixel_size_um=0.108,
+                label_skip=2,
+                corr_threshold=corr_threshold,
+            )
+            save_figure(fig_layout, output_dir, "shifts_layout", roi, codebook.name, log_level="INFO")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to render shifts_layout for ROI {roi}: {e}")
