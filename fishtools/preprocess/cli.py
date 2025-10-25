@@ -1,16 +1,48 @@
+from importlib import import_module
+from types import SimpleNamespace
+
 import rich_click as click
 
-from .cli_basic import basic
-from .cli_check_shifts import check_shifts
-from .cli_check_stitch import check_stitch
-from .cli_correct_illum import correct_illum
-from .cli_deconv import deconvnew
-from .cli_deconv_old import deconv
-from .cli_inspect import inspect_cli
-from .cli_register import register
-from .cli_stitch import stitch
-from .cli_verify import verify
-from .spots.align_prod import spots
+LAZY_COMMANDS: dict[str, SimpleNamespace] = {
+    "basic": SimpleNamespace(module="fishtools.preprocess.cli_basic", attr="basic"),
+    "deconvnew": SimpleNamespace(module="fishtools.preprocess.cli_deconv", attr="deconvnew"),
+    "deconv": SimpleNamespace(module="fishtools.preprocess.cli_deconv_old", attr="deconv"),
+    "register": SimpleNamespace(module="fishtools.preprocess.cli_register", attr="register"),
+    "stitch": SimpleNamespace(module="fishtools.preprocess.cli_stitch", attr="stitch"),
+    "spots": SimpleNamespace(module="fishtools.preprocess.spots.align_prod", attr="spots"),
+    "inspect": SimpleNamespace(module="fishtools.preprocess.cli_inspect", attr="inspect_cli"),
+    "verify": SimpleNamespace(module="fishtools.preprocess.cli_verify", attr="verify"),
+    "correct-illum": SimpleNamespace(module="fishtools.preprocess.cli_correct_illum", attr="correct_illum"),
+    "check-shifts": SimpleNamespace(module="fishtools.preprocess.cli_check_shifts", attr="check_shifts"),
+    "check-stitch": SimpleNamespace(module="fishtools.preprocess.cli_check_stitch", attr="check_stitch"),
+}
+
+
+class LazyGroup(click.Group):
+    """Lazy-loading Click group that defers CLI imports until invocation."""
+
+    def __init__(self, *args, lazy_commands: dict[str, SimpleNamespace] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lazy_commands = lazy_commands or {}
+
+    def list_commands(self, ctx):
+        eager = super().list_commands(ctx)
+        lazy = sorted(self._lazy_commands)
+        # Preserve eager order, append lazy while keeping uniqueness.
+        ordered = list(dict.fromkeys([*eager, *lazy]))
+        return ordered
+
+    def get_command(self, ctx, cmd_name):
+        command = super().get_command(ctx, cmd_name)
+        if command is not None:
+            return command
+
+        spec = self._lazy_commands.get(cmd_name)
+        if spec is None:
+            return None
+
+        module = import_module(spec.module)
+        return getattr(module, spec.attr)
 
 
 # Wrapper to integrate Typer app with Click
@@ -51,7 +83,7 @@ click.rich_click.USE_MARKDOWN = True
 click.rich_click.STYLE_HELPTEXT = ""
 
 
-@click.group()
+@click.group(cls=LazyGroup, lazy_commands=LAZY_COMMANDS)
 def main():
     r"""Combinatorial FISH Probe Design Utilities
 
@@ -68,18 +100,7 @@ def main():
     ...
 
 
-main.add_command(basic)
-main.add_command(deconvnew)
-main.add_command(deconv)
-main.add_command(register)
 main.add_command(registerv1)
-main.add_command(stitch)
-main.add_command(spots)
-main.add_command(inspect_cli)
-main.add_command(verify)
-main.add_command(correct_illum)
-main.add_command(check_shifts)
-main.add_command(check_stitch)
 
 if __name__ == "__main__":
     main()

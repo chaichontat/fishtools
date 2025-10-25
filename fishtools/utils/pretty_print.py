@@ -16,6 +16,7 @@ from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
+    ProgressColumn,
     SpinnerColumn,
     TextColumn,
     TimeElapsedColumn,
@@ -34,18 +35,131 @@ def get_shared_console() -> Console:
     return _SHARED_CONSOLE
 
 
+class _StepStats:
+    """Tracks per-step durations and rolling averages.
+
+    Design notes:
+    - We record the wall time between successive progress updates (i.e., calls
+      to the bar's callback). This treats each update as one "step" regardless of
+      work size, which matches typical usage of our `progress_bar` helper.
+    - Rolling windows are computed over a bounded deque so memory stays constant.
+    - The first update only primes the clock; no duration is recorded until the
+      second update to avoid an artificial initial zero-length step.
+    """
+
+    def __init__(self, window: int = 10) -> None:
+        self.window = max(1, int(window))
+        self._durations: list[float] = []  # seconds, bounded to `window`
+        self._last_t: float | None = None
+
+    def prime(self) -> None:
+        self._last_t = time.perf_counter()
+
+    def step(self) -> None:
+        now = time.perf_counter()
+        if self._last_t is not None:
+            dt = max(0.0, now - self._last_t)
+            self._durations.append(dt)
+            if len(self._durations) > self.window:
+                # Keep only the most recent `window` durations
+                del self._durations[: len(self._durations) - self.window]
+        self._last_t = now
+
+    @property
+    def last(self) -> float | None:
+        return self._durations[-1] if self._durations else None
+
+    def avg(self, k: int) -> float | None:
+        if not self._durations:
+            return None
+        if k <= 0:
+            return None
+        tail = self._durations[-k:]
+        if not tail:
+            return None
+        return sum(tail) / len(tail)
+
+
+def _fmt_seconds(seconds: float | None) -> str:
+    """Format seconds with a compact, human-friendly unit.
+
+    Examples: 0.0042 -> 4.2 ms, 0.12 -> 120 ms, 1.23 -> 1.23 s, 95 -> 1m35s
+    """
+    if seconds is None:
+        return "—"
+    s = max(0.0, float(seconds))
+    if s < 0.001:
+        return f"{s * 1_000_000:.1f}µs"
+    if s < 1.0:
+        return f"{s * 1_000:.0f} ms"
+    if s < 60.0:
+        return f"{s:.2f} s"
+    m, sec = divmod(int(s), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m}m{sec}s"
+    return f"{m}m{sec}s"
+
+
+class StepStatsColumn(ProgressColumn):
+    """Rich Progress column showing last and rolling-average step durations.
+
+    Displays: "last X • avgN1 Y • avgN2 Z ..." with compact units, where N1/N2
+    are provided windows (e.g., (5, 10)).
+
+    Implementation detail: the column reads from a shared `_StepStats` instance
+    that is updated by the progress callback. This keeps logic out of Render
+    (which may be called frequently) and avoids relying on `task.fields`.
+    """
+
+    def __init__(self, stats: _StepStats, *, windows: tuple[int, ...] = (5, 10)) -> None:
+        super().__init__()
+        self._stats = stats
+        # Sanitize windows: positive integers, unique order preserved
+        seen: set[int] = set()
+        cleaned: list[int] = []
+        for w in windows:
+            try:
+                iw = int(w)
+            except Exception:
+                continue
+            if iw <= 0 or iw in seen:
+                continue
+            seen.add(iw)
+            cleaned.append(iw)
+        self._windows: tuple[int, ...] = tuple(cleaned) if cleaned else (5, 10)
+
+    def render(self, task):
+        from rich.text import Text
+
+        parts = [f"last {_fmt_seconds(self._stats.last)}"]
+        for w in self._windows:
+            parts.append(f"avg{w} {_fmt_seconds(self._stats.avg(w))}")
+        return Text(" • ".join(parts), style="dim")
+
+
 @contextmanager
-def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
+def progress_bar(
+    n: int,
+    *,
+    step_stats: tuple[int, ...] | None = (5, 10),
+) -> Generator[Callable[..., int], None, None]:
     """Progress bar.
 
     Args:
         n: Number of iterations.
+        step_stats: Tuple | None of window sizes for rolling averages (default: (5, 10)).
 
     Yields:
         Callback function to be called to update the progress bar.
     """
     logger.debug("Starting...")
-    with Progress(
+    # Optional step stats tracking shared with the custom column. Keep enough
+    # history to satisfy the largest requested window.
+    max_window = max(step_stats) if step_stats else 10
+    stats = _StepStats(window=max_window)
+
+    columns: list[ProgressColumn] = [
         SpinnerColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.1f}%"),
         BarColumn(),
@@ -54,14 +168,25 @@ def progress_bar(n: int) -> Generator[Callable[..., int], None, None]:
         TimeElapsedColumn(),
         TextColumn("•"),
         TimeRemainingColumn(),
-        console=_SHARED_CONSOLE,
-    ) as p:
+    ]
+    if step_stats:
+        columns += [TextColumn("•"), StepStatsColumn(stats, windows=step_stats)]
+
+    with Progress(*columns, console=_SHARED_CONSOLE) as p:
         lock = threading.RLock()
         track = iter(p.track(range(n)))
+        primed = False
 
         def callback(*args: Any, **kwargs: Any):
             with lock:
                 try:
+                    nonlocal primed
+                    if step_stats:
+                        if not primed:
+                            stats.prime()
+                            primed = True
+                        else:
+                            stats.step()
                     return next(track)
                 except StopIteration:
                     return n
@@ -165,6 +290,7 @@ def progress_bar_threadpool(
     stop_on_exception: bool = False,
     executor: ThreadPoolExecutor | None = None,
     debug: bool = False,
+    step_stats: tuple[int, ...] | None = (5, 10),
 ):
     """Creates a thread pool with a progress bar that handles graceful shutdown.
 
@@ -177,6 +303,8 @@ def progress_bar_threadpool(
         executor: Optional pre-configured executor. When provided, the caller
             remains responsible for its lifecycle. This allows sharing a thread
             pool across multiple progress contexts.
+        step_stats: Tuple of window sizes for rolling averages (default: (5, 10)).
+            Set to None to disable the step statistics column.
 
     Returns:
         submit: Function to submit tasks to the thread pool. Has signature:
@@ -209,7 +337,7 @@ def progress_bar_threadpool(
     manage_executor = executor is None
     executor_cm = ThreadPoolExecutor(threads) if manage_executor else nullcontext(executor)
 
-    with progress_bar(n) as callback, executor_cm as exc:
+    with progress_bar(n, step_stats=step_stats) as callback, executor_cm as exc:
         console = get_shared_console()
         console_logger = logger.bind(**{CONSOLE_SKIP_EXTRA: True})
 

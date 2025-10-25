@@ -25,7 +25,9 @@ def _write_tileconfig(stitch_dir: Path, entries: list[tuple[int, float, float]])
     (stitch_dir / "TileConfiguration.registered.txt").write_text("".join(lines))
 
 
-def _make_synthetic_model(npz_path: Path, bbox: tuple[float, float, float, float], tile_w: int, tile_h: int) -> None:
+def _make_synthetic_model(
+    npz_path: Path, bbox: tuple[float, float, float, float], tile_w: int, tile_h: int
+) -> None:
     x0, y0, x1, y1 = bbox
     xs = np.linspace(x0, x1, 9, dtype=np.float32)
     ys = np.linspace(y0, y1, 7, dtype=np.float32)
@@ -81,9 +83,10 @@ def test_render_global_field_stamps_patches(tmp_path: Path) -> None:
     ws = Workspace(ws_root)
 
     # Synthetic model
-    model_dir = ws.opt(cb).path
+    cb_slug = Workspace.sanitize_codebook_name(cb)
+    model_dir = ws.deconved / f"fields+{cb_slug}"
     model_dir.mkdir(parents=True, exist_ok=True)
-    model_npz = model_dir / f"illum-field--{roi}-synthetic.npz"
+    model_npz = model_dir / f"illum-field--{roi}+{cb_slug}--synthetic.npz"
     _make_synthetic_model(model_npz, bbox, tile_w, tile_h)
 
     # Run CLI to render the first 2 tiles globally
@@ -154,4 +157,3 @@ def test_render_global_field_stamps_patches(tmp_path: Path) -> None:
 
     assert rendered.shape == expected.shape
     assert np.allclose(rendered, expected, rtol=1e-3, atol=1e-3)
-

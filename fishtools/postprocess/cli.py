@@ -2,10 +2,44 @@
 Main CLI entry point for fishtools postprocessing utilities.
 """
 
+from importlib import import_module
+from types import SimpleNamespace
+
 import rich_click as click
 
-from .cli_concat import concat
-from .cli_intensity import extract_intensity
+LAZY_COMMANDS: dict[str, SimpleNamespace] = {
+    "concat": SimpleNamespace(module="fishtools.postprocess.cli_concat", attr="concat"),
+    "extract-intensity": SimpleNamespace(
+        module="fishtools.postprocess.cli_intensity", attr="extract_intensity"
+    ),
+}
+
+
+class LazyGroup(click.Group):
+    """Lazy-loading Click group that defers CLI imports until invocation."""
+
+    def __init__(self, *args, lazy_commands: dict[str, SimpleNamespace] | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lazy_commands = lazy_commands or {}
+
+    def list_commands(self, ctx):
+        eager = super().list_commands(ctx)
+        lazy = sorted(self._lazy_commands)
+        ordered = list(dict.fromkeys([*eager, *lazy]))
+        return ordered
+
+    def get_command(self, ctx, cmd_name):
+        command = super().get_command(ctx, cmd_name)
+        if command is not None:
+            return command
+
+        spec = self._lazy_commands.get(cmd_name)
+        if spec is None:
+            return None
+
+        module = import_module(spec.module)
+        return getattr(module, spec.attr)
+
 
 # Configure rich_click for enhanced CLI experience
 click.rich_click.SHOW_ARGUMENTS = True
@@ -14,7 +48,7 @@ click.rich_click.USE_MARKDOWN = True
 click.rich_click.STYLE_HELPTEXT = ""
 
 
-@click.group()
+@click.group(cls=LazyGroup, lazy_commands=LAZY_COMMANDS)
 def main() -> None:
     """
     FISH Postprocessing Utilities
@@ -33,11 +67,6 @@ def main() -> None:
         fishtools postprocess <command> --help
     """
     pass
-
-
-# Add commands to the main group
-main.add_command(concat)
-main.add_command(extract_intensity, name="extract-intensity")
 
 
 if __name__ == "__main__":

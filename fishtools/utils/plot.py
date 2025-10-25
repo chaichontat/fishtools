@@ -1,18 +1,18 @@
+from __future__ import annotations
+
 import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
-import cmocean  # colormap, do not remove  # noqa: F401
-import colorcet as cc  # colormap, do not remove  # noqa: F401
 import matplotlib as mpl
 import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
-import polars as pl
-import scanpy as sc
 from loguru import logger
+from matplotlib import colormaps
+from matplotlib import colors as mcolors
 from matplotlib.axes import Axes
 from matplotlib.colors import ListedColormap
 from matplotlib.figure import Figure
@@ -23,10 +23,9 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
 from numpy.lib.index_tricks import IndexExpression
 
-from fishtools.utils.utils import copy_signature
-
 if TYPE_CHECKING:
     import anndata as ad
+    import polars as pl
 
 
 # Common plot styling primitives -------------------------------------------------
@@ -111,6 +110,10 @@ def plot_wheel(
     colorbar_label: str | None = None,
     **kwargs: Any,
 ) -> tuple[Figure, NamedTuple]:
+    # Ensure colorcet colormaps (e.g., 'cet_colorwheel') are registered with Matplotlib
+    import cmocean  # noqa: F401
+    import colorcet as cc  # noqa: F401
+
     θ = np.arctan2(pcs[:, 0], pcs[:, 1])
     fig = fig or plt.figure(1, figsize=(6, 6))
     axs = NamedTuple("axs", scatter=Axes, histx=Axes, histy=Axes)(
@@ -316,6 +319,7 @@ def scatter_spots(
     facecolor: str | None = None,
 ) -> None:
     """Render a downsampled scatter of spots on the provided axis."""
+    # Polars not required here at runtime; type checked via from __future__ annotations
     ax.set_aspect("equal")
     # ax.axis("off")
 
@@ -606,7 +610,6 @@ def add_legend(
     return ax
 
 
-@copy_signature(sc.pl.embedding)
 def plot_embedding(
     adata: "ad.AnnData",
     figsize: tuple[float, float] | None = None,
@@ -619,6 +622,12 @@ def plot_embedding(
     Parameters:
     - adata: AnnData object containing the embedding data.
     """
+    # Lazy import to avoid importing scanpy at module import time
+    try:
+        import scanpy as sc  # type: ignore
+    except Exception as e:  # pragma: no cover - runtime environment dependent
+        raise RuntimeError("plot_embedding requires 'scanpy'. Please install it to use this function.") from e
+
     kwargs = kwargs | {"return_fig": True}
     fig = cast(Figure, sc.pl.embedding(adata, **kwargs))
 
@@ -649,6 +658,9 @@ def plot_all_genes(
     figsize: tuple[float, float] | None = None,
     cmap: str | None = None,
 ):
+    # Local import to avoid importing polars when plotting utilities are imported
+    import polars as pl  # type: ignore
+
     genes = spots.group_by("target").len().sort("len", descending=True)["target"]
     genes = spots["target"].unique()
     genes = filter(lambda x: x.startswith("Blank"), genes) if only_blank else genes
@@ -762,3 +774,288 @@ def plot_img(
     fig, ax = plt.subplots(**({"figsize": (10, 10)} | (fig_kwargs or {})))
     ax.imshow(img, zorder=1, **kwargs)
     return fig, ax
+
+
+def tableau20_label_cmap(
+    labels: np.ndarray,
+    *,
+    background_label: int | None = 0,
+    background_color: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+    seed: int | None = None,
+    connectivity: int = 4,
+    fill_interiors: bool = True,
+    add_border: bool = False,
+    border_color: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0),
+    border_label: int = -1,
+) -> tuple[mcolors.ListedColormap, mcolors.BoundaryNorm, dict[int, int]]:
+    """Generate a Tableau-20-based colormap that avoids adjacent label clashes.
+
+    The function builds a greedy graph coloring over the label adjacency graph.
+    It keeps sampling colors from the Tableau 20 palette until it finds one that
+    does not conflict with already-colored neighbors, ensuring visually distinct
+    boundaries in the rendered segmentation.
+
+    Parameters
+    ----------
+    labels
+        Integer label image (2-D or 3-D) to analyze.
+    background_label
+        Label value that should map to the background color. Set to ``None`` to
+        disable a dedicated background slot.
+    background_color
+        RGBA tuple to use for the background entry. Defaults to transparent.
+    seed
+        Seed forwarded to ``numpy.random.Generator`` for reproducible color
+        assignments. Uses nondeterministic entropy when omitted.
+    connectivity
+        Neighborhood definition. ``4`` uses axial neighbors, ``8`` additionally
+        considers diagonals. Only supported for 2-D inputs at the moment.
+    fill_interiors
+        When ``False`` the per-label colors are emitted fully transparent
+        (alpha equals ``0``) so that only optional borders remain visible.
+
+    Returns
+    -------
+    cmap, norm, label_to_index
+        ``ListedColormap`` and matching ``BoundaryNorm`` suitable for
+        ``matplotlib.pyplot.imshow`` along with the label → palette index
+        mapping used to build a dense index image. When ``add_border`` is set,
+        ``label_to_index`` also contains ``border_label`` so border pixels can
+        be encoded consistently.
+    """
+
+    label_array = np.asarray(labels)
+    if label_array.ndim < 2:
+        msg = "`labels` must be at least 2-D to define adjacency."
+        raise ValueError(msg)
+    if connectivity not in {4, 8}:
+        msg = "`connectivity` must be either 4 or 8."
+        raise ValueError(msg)
+    if connectivity == 8 and label_array.ndim != 2:
+        msg = "8-connectivity is only implemented for 2-D label arrays."
+        raise ValueError(msg)
+
+    tableau_colors = np.array(colormaps["tab20"].colors)
+    rng = np.random.default_rng(seed)
+
+    unique_labels = np.unique(label_array)
+    if background_label is not None:
+        unique_labels = unique_labels[unique_labels != background_label]
+
+    colorable_labels = [int(value) for value in unique_labels]
+    adjacency: dict[int, set[int]] = {value: set() for value in colorable_labels}
+
+    def _register_pairs(first: np.ndarray, second: np.ndarray) -> None:
+        mask = first != second
+        if not np.any(mask):
+            return
+        if background_label is not None:
+            mask &= first != background_label
+            mask &= second != background_label
+        if not np.any(mask):
+            return
+        pairs = np.stack((first[mask], second[mask]), axis=-1)
+        if pairs.size == 0:
+            return
+        unique_pairs = np.unique(pairs, axis=0)
+        for left, right in unique_pairs:
+            left_val = int(left)
+            right_val = int(right)
+            if left_val in adjacency:
+                adjacency[left_val].add(right_val)
+            if right_val in adjacency:
+                adjacency.setdefault(right_val, set()).add(left_val)
+
+    # Axial neighbors (N, S, E, W) for any dimensionality ≥ 2.
+    for axis in range(label_array.ndim):
+        slicer_head = [slice(None)] * label_array.ndim
+        slicer_tail = [slice(None)] * label_array.ndim
+        slicer_head[axis] = slice(0, -1)
+        slicer_tail[axis] = slice(1, None)
+        head = label_array[tuple(slicer_head)]
+        tail = label_array[tuple(slicer_tail)]
+        _register_pairs(head, tail)
+
+    if connectivity == 8 and label_array.ndim == 2:
+        diag_pairs = [
+            (label_array[:-1, :-1], label_array[1:, 1:]),
+            (label_array[1:, :-1], label_array[:-1, 1:]),
+        ]
+        for left, right in diag_pairs:
+            _register_pairs(left, right)
+
+    background_rgba = _normalize_rgba(background_color)
+    border_rgba = _normalize_rgba(border_color)
+
+    color_assignments: dict[int, tuple[float, float, float, float]] = {}
+    color_rgb: dict[int, tuple[float, float, float]] = {}
+
+    if colorable_labels:
+        shuffled_labels = rng.permutation(colorable_labels)
+        palette_indices = np.arange(tableau_colors.shape[0])
+
+        for label_value in shuffled_labels:
+            neighbor_colors = {
+                color_rgb[neighbor] for neighbor in adjacency.get(label_value, set()) if neighbor in color_rgb
+            }
+            assigned_rgb: tuple[float, float, float] | None = None
+            for palette_index in rng.permutation(palette_indices):
+                candidate = tuple(float(value) for value in tableau_colors[palette_index])
+                if candidate not in neighbor_colors:
+                    assigned_rgb = candidate
+                    break
+            if assigned_rgb is None:
+                base = tableau_colors[rng.integers(len(tableau_colors))][:3]
+                perturbation = rng.normal(loc=0.0, scale=0.05, size=3)
+                rgb = np.clip(base + perturbation, 0.0, 1.0)
+                assigned_rgb = (float(rgb[0]), float(rgb[1]), float(rgb[2]))
+            assert assigned_rgb is not None
+            alpha = 1.0 if fill_interiors else 0.0
+            color_assignments[label_value] = (
+                assigned_rgb[0],
+                assigned_rgb[1],
+                assigned_rgb[2],
+                alpha,
+            )
+            color_rgb[label_value] = assigned_rgb
+
+    ordered_labels = sorted(color_assignments)
+    color_list = [background_rgba] if background_label is not None else []
+    color_list.extend(color_assignments[label_value] for label_value in ordered_labels)
+
+    if add_border:
+        color_list.append(border_rgba)
+
+    cmap = mcolors.ListedColormap(color_list)
+    boundaries = np.arange(len(color_list) + 1) - 0.5
+    norm = mcolors.BoundaryNorm(boundaries, cmap.N)
+
+    label_to_index: dict[int, int] = {}
+    if background_label is not None:
+        label_to_index[int(background_label)] = 0
+    for offset, label_value in enumerate(ordered_labels, start=len(label_to_index)):
+        label_to_index[label_value] = offset
+
+    if add_border:
+        label_to_index[int(border_label)] = len(color_list) - 1
+
+    return cmap, norm, label_to_index
+
+
+def encode_labels_for_colormap(
+    labels: np.ndarray,
+    label_to_index: dict[int, int],
+    *,
+    background_label: int | None = 0,
+    border_label: int = -1,
+    connectivity: int = 4,
+) -> np.ndarray:
+    """Convert a label image into palette indices, optionally painting borders.
+
+    Parameters
+    ----------
+    labels
+        Source label array (2-D or higher) that matches the data used to build
+        ``label_to_index``.
+    label_to_index
+        Mapping returned by :func:`tableau20_label_cmap`. When it contains
+        ``border_label`` the function will encode thin borders around regions.
+    background_label
+        Value to treat as background; pixels are assigned its palette index.
+    border_label
+        Sentinel stored in ``label_to_index`` for the border color. Set to a
+        value absent from ``label_to_index`` to disable border encoding.
+    connectivity
+        Neighbor definition (4 or 8) for the border extraction in 2-D.
+    """
+
+    label_array = np.asarray(labels)
+    if label_array.ndim < 2:
+        msg = "`labels` must be at least 2-D to define borders."
+        raise ValueError(msg)
+    if connectivity not in {4, 8}:
+        msg = "`connectivity` must be either 4 or 8."
+        raise ValueError(msg)
+    if connectivity == 8 and label_array.ndim != 2:
+        msg = "8-connectivity is only implemented for 2-D label arrays."
+        raise ValueError(msg)
+
+    index_image = np.empty(label_array.shape, dtype=np.int32)
+    if background_label is None:
+        try:
+            default_index = next(iter(label_to_index.values()))
+        except StopIteration as exc:
+            msg = "`label_to_index` must contain at least one entry."
+            raise ValueError(msg) from exc
+    else:
+        default_index = label_to_index[int(background_label)]
+    index_image.fill(default_index)
+
+    for label_value, palette_index in label_to_index.items():
+        if label_value in {border_label, background_label}:
+            continue
+        index_image[label_array == label_value] = palette_index
+
+    border_index = label_to_index.get(int(border_label))
+    if border_index is None:
+        return index_image
+
+    border_mask = _compute_border_mask(
+        label_array, background_label=background_label, connectivity=connectivity
+    )
+    index_image[border_mask] = border_index
+    return index_image
+
+
+def _normalize_rgba(color: tuple[float, ...]) -> tuple[float, float, float, float]:
+    if len(color) == 4:
+        return color[0], color[1], color[2], color[3]
+    if len(color) == 3:
+        return color[0], color[1], color[2], 1.0
+    msg = "Color tuples must provide 3 (RGB) or 4 (RGBA) components."
+    raise ValueError(msg)
+
+
+def _compute_border_mask(
+    labels: np.ndarray,
+    *,
+    background_label: int | None,
+    connectivity: int,
+) -> np.ndarray:
+    mask = np.zeros(labels.shape, dtype=bool)
+
+    def _mark_border(first: np.ndarray, second: np.ndarray, slicer_first, slicer_second) -> None:
+        different = first != second
+        if background_label is not None:
+            different &= (first != background_label) | (second != background_label)
+        if not np.any(different):
+            return
+        mask[tuple(slicer_first)][different] = True
+        mask[tuple(slicer_second)][different] = True
+
+    for axis in range(labels.ndim):
+        slicer_head = [slice(None)] * labels.ndim
+        slicer_tail = [slice(None)] * labels.ndim
+        slicer_head[axis] = slice(0, -1)
+        slicer_tail[axis] = slice(1, None)
+        _mark_border(
+            labels[tuple(slicer_head)],
+            labels[tuple(slicer_tail)],
+            slicer_head,
+            slicer_tail,
+        )
+
+    if connectivity == 8 and labels.ndim == 2:
+        diag_configs = [
+            ([slice(0, -1), slice(0, -1)], [slice(1, None), slice(1, None)]),
+            ([slice(1, None), slice(0, -1)], [slice(0, -1), slice(1, None)]),
+        ]
+        for head_slices, tail_slices in diag_configs:
+            _mark_border(
+                labels[tuple(head_slices)],
+                labels[tuple(tail_slices)],
+                head_slices,
+                tail_slices,
+            )
+
+    return mask

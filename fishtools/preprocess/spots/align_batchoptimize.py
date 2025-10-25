@@ -1,10 +1,68 @@
 # %%
 import json
 import subprocess
+import time
 from pathlib import Path
 
 import rich_click as click
 from loguru import logger
+
+from fishtools.io.workspace import Workspace
+
+
+def _field_store_path(ws: Workspace, roi: str, codebook_label: str) -> Path:
+    slug = Workspace.sanitize_codebook_name(codebook_label)
+    return ws.path / "analysis" / "deconv" / f"fields+{slug}" / f"field--{roi}+{slug}.zarr"
+
+
+def _ensure_field_stores(ws: Workspace, rois: list[str], codebook_label: str) -> None:
+    missing: list[str] = []
+    for roi in rois:
+        if not _field_store_path(ws, roi, codebook_label).is_dir():
+            missing.append(roi)
+    if missing:
+        joined = ", ".join(sorted(set(missing)))
+        raise click.ClickException(
+            f"Missing illumination field store(s) for ROI(s): {joined}. Run 'preprocess correct-illum export-field' first."
+        )
+
+
+def _format_command(args: list[str | Path]) -> str:
+    return " ".join(str(a) for a in args)
+
+
+def _run_with_logging(
+    args: list[str | Path],
+    *,
+    round_index: int,
+    label: str,
+) -> None:
+    formatted = _format_command(args)
+    logger.info("[round {}] starting {}: {}", round_index, label, formatted)
+    start = time.perf_counter()
+    try:
+        subprocess.run(args, check=True, capture_output=False)
+    except subprocess.CalledProcessError as exc:
+        duration = time.perf_counter() - start
+        logger.error(
+            "[round {}] {} failed after {:.2f}s (returncode={}, cmd={})",
+            round_index,
+            label,
+            duration,
+            exc.returncode,
+            formatted,
+        )
+        raise
+    except Exception:
+        duration = time.perf_counter() - start
+        logger.exception(
+            "[round {}] {} crashed after {:.2f}s (cmd={})", round_index, label, duration, formatted
+        )
+        raise
+    else:
+        duration = time.perf_counter() - start
+        logger.info("[round {}] completed {} in {:.2f}s", round_index, label, duration)
+
 
 # %%
 
@@ -19,7 +77,6 @@ from loguru import logger
 @click.option("--rounds", type=int, default=10)
 @click.option("--threads", type=int, default=10)
 @click.option("--batch-size", type=int, default=50)
-@click.option("--max-proj", is_flag=True)
 @click.option("--blank", type=str, default=None, help="Blank image to subtract (config preferred)")
 @click.option("--threshold", type=float, default=0.008, help="CV before stopping")
 @click.option(
@@ -29,22 +86,44 @@ from loguru import logger
     default=None,
     help="Optional project config (JSON) forwarded to subcommands.",
 )
+@click.option(
+    "--field-correct/--no-field-correct",
+    default=False,
+    help="Apply illumination field correction using discovered TCYX field stores for all subcommands.",
+)
 def optimize(
     path: Path,
     roi: str,
     codebook: Path,
     rounds: int = 10,
     threads: int = 10,
-    max_proj: bool = False,
     batch_size: int = 50,
     blank: str | None = None,
     threshold: float = 0.008,
     json_config: Path | None = None,
+    field_correct: bool = False,
 ):
     if not len(list(path.glob(f"registered--{roi}{'*' if roi != '*' else ''}"))):
         raise ValueError(
             f"No registered images found under registered--{roi}. Verify that you're in the base working directory, not the registered folder."
         )
+
+    logger.info(
+        "Batch optimize start: workspace='{}' roi='{}' codebook='{}' rounds={} threads={} batch_size={} field_correct={}",
+        path,
+        roi,
+        codebook,
+        rounds,
+        threads,
+        batch_size,
+        field_correct,
+    )
+    if field_correct:
+        workspace = Workspace(path)
+        rois_needed = workspace.rois if roi == "*" else [roi]
+        logger.info("Checking illumination field stores for ROI(s): {}", ", ".join(sorted(rois_needed)))
+        _ensure_field_stores(workspace, rois_needed, codebook.stem)
+        logger.info("All required illumination field stores present.")
 
     wd = path / f"opt_{codebook.stem}{f'+{roi}' if roi != '*' else ''}"
     try:
@@ -83,61 +162,51 @@ def optimize(
                 return
 
         logger.critical(f"Starting round {i}")
-        # Increases global scale count
-        subprocess.run(
-            [
-                "preprocess",
-                "spots",
-                "step-optimize",
-                str(path),
-                roi,
-                "--codebook",
-                codebook,
-                f"--batch-size={batch_size}",
-                f"--round={i}",
-                f"--threads={threads}",
-                "--overwrite",
-                "--split=0",
-                *(["--max-proj=1"] if max_proj else []),
-                *(["--blank", blank] if blank else []),
-                *(["--config", json_config] if json_config else []),
-            ],
-            check=True,
-            capture_output=False,
-        )
+        step_cmd: list[str | Path] = [
+            "preprocess",
+            "spots",
+            "step-optimize",
+            str(path),
+            roi,
+            "--codebook",
+            codebook,
+            f"--batch-size={batch_size}",
+            f"--round={i}",
+            f"--threads={threads}",
+            "--overwrite",
+            "--split=0",
+            *(["--blank", blank] if blank else []),
+            *(["--config", json_config] if json_config else []),
+            *(["--field-correct"] if field_correct else []),
+        ]
+        _run_with_logging(step_cmd, round_index=i, label="step-optimize")
 
-        subprocess.run(
-            [
-                "preprocess",
-                "spots",
-                "combine",
-                str(path),
-                roi,
-                "--codebook",
-                codebook,
-                f"--round={i}",
-            ],
-            check=True,
-            capture_output=False,
-        )
+        combine_cmd: list[str | Path] = [
+            "preprocess",
+            "spots",
+            "combine",
+            str(path),
+            roi,
+            "--codebook",
+            codebook,
+            f"--round={i}",
+        ]
+        _run_with_logging(combine_cmd, round_index=i, label="combine")
 
-        # Increases percentiles count
-        subprocess.run(
-            [
-                "preprocess",
-                "spots",
-                "find-threshold",
-                str(path),
-                roi,
-                "--codebook",
-                codebook,
-                f"--round={i}",
-                *(["--blank", blank] if blank else []),
-                *(["--config", json_config] if json_config else []),
-            ],
-            check=True,
-            capture_output=False,
-        )
+        find_cmd: list[str | Path] = [
+            "preprocess",
+            "spots",
+            "find-threshold",
+            str(path),
+            roi,
+            "--codebook",
+            codebook,
+            f"--round={i}",
+            *(["--blank", blank] if blank else []),
+            *(["--config", json_config] if json_config else []),
+            *(["--field-correct"] if field_correct else []),
+        ]
+        _run_with_logging(find_cmd, round_index=i, label="find-threshold")
 
 
 # if __name__ == "__main__":
