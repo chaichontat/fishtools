@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
 import cupy as cp
 import matplotlib
@@ -23,6 +23,11 @@ import seaborn as sns
 
 I_MAX = 2**16 - 2  # use 65535 unless you must reserve it
 _STANDARD_P_HIGH = 0.99999  # for log highlighting of deviations
+
+if TYPE_CHECKING:
+    import torch
+
+ArrayLike = np.ndarray | cp.ndarray | "torch.Tensor"
 
 # Optional hardcoded overrides for upper percentile (p_high) per round and channel.
 #
@@ -669,9 +674,6 @@ def precompute(
     )
 
 
-ArrayLike = Union[np.ndarray, cp.ndarray]
-
-
 def quantize_global(
     res: ArrayLike,
     m_glob: np.ndarray,
@@ -715,30 +717,56 @@ def quantize_global(
     - Keeps everything in the same array module as `res` (CPU/GPU) until the final
       return; set `as_numpy=False` to keep it on GPU.
     """
+    import torch
+
+    is_torch = isinstance(res, torch.Tensor)
+
     # Accept (C, Y, X) by promoting to (1, C, Y, X)
     if res.ndim == 3:
         res = res[None, ...]
     if res.ndim != 4:
         raise ValueError("res must have shape (Z, C, Y, X) or (C, Y, X)")
 
+    if is_torch:
+        return _quantize_global_torch(
+            res,
+            m_glob,
+            s_glob,
+            i_max=i_max,
+            return_stats=return_stats,
+            as_numpy=as_numpy,
+        )
+
+    return _quantize_global_array(
+        res,
+        m_glob,
+        s_glob,
+        i_max=i_max,
+        return_stats=return_stats,
+        as_numpy=as_numpy,
+    )
+
+
+def _quantize_global_array(
+    res: Union[np.ndarray, cp.ndarray],
+    m_glob: np.ndarray,
+    s_glob: np.ndarray,
+    *,
+    i_max: int,
+    return_stats: bool,
+    as_numpy: bool,
+) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
+    xp = cp.get_array_module(res) if isinstance(res, cp.ndarray) else np
+    res = res.astype(xp.float32, copy=False)
     Z, C, Y, X = map(int, res.shape)
 
-    # Pick array module based on input
-    xp = cp.get_array_module(res) if isinstance(res, (cp.ndarray,)) else np
-
-    # Ensure dtype float32 for arithmetic
-    res = res.astype(xp.float32, copy=False)
-
-    # Broadcast global affine over channel axis
-    m = xp.asarray(m_glob, dtype=xp.float32)[xp.newaxis, :, xp.newaxis, xp.newaxis]  # (1,C,1,1)
+    m = xp.asarray(m_glob, dtype=xp.float32)[xp.newaxis, :, xp.newaxis, xp.newaxis]
     s = xp.asarray(s_glob, dtype=xp.float32)[xp.newaxis, :, xp.newaxis, xp.newaxis]
 
-    # Affine map, clip, round, cast
     arr = s * (res - m)
     xp.clip(arr, 0.0, float(i_max), out=arr)
     arr = xp.rint(arr)
 
-    # Optional stats (computed before casting; cheap)
     stats: Optional[Dict[str, Any]] = None
     if return_stats:
         clipped_low = int((arr <= 0).sum().item())
@@ -746,14 +774,53 @@ def quantize_global(
         total = int(arr.size)
         stats = {"clipped_low": clipped_low, "clipped_high": clipped_high, "total": total}
 
-    arr = arr.astype(xp.uint16, copy=False)  # (Z, C, Y, X)
-    arr = arr.reshape(Z * C, Y, X)  # (-1, Y, X)
+    arr = arr.astype(xp.uint16, copy=False)
+    arr = arr.reshape(Z * C, Y, X)
 
-    # Move to NumPy if requested or if input was NumPy
     if as_numpy or xp is np:
         out = arr.get() if xp is cp else arr
     else:
-        out = arr  # keep on GPU
+        out = arr
+
+    return (out, stats) if return_stats else out
+
+
+def _quantize_global_torch(
+    res: "torch.Tensor",
+    m_glob: np.ndarray,
+    s_glob: np.ndarray,
+    *,
+    i_max: int,
+    return_stats: bool,
+    as_numpy: bool,
+) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]], "torch.Tensor"]:
+    import torch
+
+    res = res.to(dtype=torch.float32)
+    Z, C, Y, X = map(int, res.shape)
+    device = res.device
+
+    m = torch.as_tensor(m_glob, device=device, dtype=torch.float32).view(1, C, 1, 1)
+    s = torch.as_tensor(s_glob, device=device, dtype=torch.float32).view(1, C, 1, 1)
+
+    arr = s * (res - m)
+    arr = torch.clamp(arr, 0.0, float(i_max))
+    arr = torch.round(arr)
+
+    stats: Optional[Dict[str, Any]] = None
+    if return_stats:
+        clipped_low = int((arr <= 0).sum().item())
+        clipped_high = int((arr >= float(i_max)).sum().item())
+        total = int(arr.numel())
+        stats = {"clipped_low": clipped_low, "clipped_high": clipped_high, "total": total}
+
+    arr = arr.to(dtype=torch.uint16)
+    arr = arr.reshape(Z * C, Y, X)
+
+    if as_numpy:
+        out = arr.detach().cpu().numpy()
+    else:
+        out = arr
 
     return (out, stats) if return_stats else out
 
