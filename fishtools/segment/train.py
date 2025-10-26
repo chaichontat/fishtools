@@ -1,21 +1,36 @@
 import re
 from collections.abc import Iterable
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Pattern, Sequence, cast
+from typing import Any, Literal, Pattern, Sequence, cast
 
+import numpy as np
+import torch
 from loguru import logger
 from pydantic import BaseModel, Field
 
+try:
+    from cellpose.cellpose_te_adapter import TEConfig, enable_transformer_engine
+except ModuleNotFoundError as exc:
+    TEConfig = None
+    enable_transformer_engine = None
+    _TE_IMPORT_ERROR = exc
+else:
+    _TE_IMPORT_ERROR = None
 from fishtools.utils.logging import setup_workspace_logging
 from fishtools.utils.utils import noglobal
 
-IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
+try:
+    IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
+except PackageNotFoundError:
+    IS_CELLPOSE_SAM = False
 
 
 class TrainConfig(BaseModel):
     name: str
-    base_model: str = "cyto3" if not IS_CELLPOSE_SAM else "cpsam"
+    base_model: str = (
+        "cyto3" if not IS_CELLPOSE_SAM else "cpsam"  # "/working/cellpose-training/models/embryonic-pre"
+    )
     channels: tuple[int, int]
     training_paths: list[str]
     include: list[str] = Field(default_factory=list)
@@ -27,9 +42,16 @@ class TrainConfig(BaseModel):
     bsize: int = 224
     weight_decay: float = 1e-5
     SGD: bool = False
+    optimizer: Literal["adamw"] | None = None
 
     normalization_percs: tuple[float, float] = (1, 99.5)
     train_losses: list[float] = []
+    use_te: bool = False
+    te_fp8: bool = False
+    packed: bool = False
+    pack_k: int = 3
+    pack_guard: int = 16
+    pack_stripe_height: int | None = 68
 
 
 _IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
@@ -138,7 +160,14 @@ def _filter_images_by_patterns(
     """
     if not (include_regexes or exclude_regexes):
         total = len(images)
-        return images, labels, list(image_names) if image_names is not None else None, total, total, 0
+        return (
+            images,
+            labels,
+            list(image_names) if image_names is not None else None,
+            total,
+            total,
+            0,
+        )
 
     if image_names is None:
         raise ValueError("Cellpose did not provide image names; include/exclude filters require them.")
@@ -227,7 +256,34 @@ def _filter_images_by_patterns(
     kept_images = len(filtered_images)
     excluded_images = total_images - kept_images
 
-    return filtered_images, filtered_labels, filtered_image_names, total_images, kept_images, excluded_images
+    return (
+        filtered_images,
+        filtered_labels,
+        filtered_image_names,
+        total_images,
+        kept_images,
+        excluded_images,
+    )
+
+
+def _restrict_to_first_two_channels(images: Iterable[Any]) -> tuple[list[Any], int]:
+    """Return copies of images limited to the first two channels when possible.
+
+    Cellpose expects channel-first data when `channel_axis=0`. We trim any extra
+    channels up front to avoid accidental use of higher indices that might exist
+    in the raw stacks. Images that are not NumPy arrays (e.g. placeholder paths)
+    or that already expose <=2 channels are left untouched.
+    """
+
+    restricted: list[Any] = []
+    trimmed = 0
+    for image in images:
+        if isinstance(image, np.ndarray) and image.ndim >= 3 and image.shape[0] > 2:
+            restricted.append(image[:2].copy())
+            trimmed += 1
+        else:
+            restricted.append(image)
+    return restricted, trimmed
 
 
 # models = sorted(
@@ -276,12 +332,35 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     from cellpose.train import train_seg
 
     IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
-
-    # if name is None:
-    # name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     images, labels, image_names, test_images, test_labels, image_names_test = out
 
-    model = CellposeModel(gpu=True, pretrained_model=cast(bool, train_config.base_model))
+    if train_config.te_fp8 and not train_config.use_te:
+        raise ValueError("Transformer Engine FP8 requested but --use-te not enabled.")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required for training but was not detected.")
+
+    device = torch.device("cuda")
+
+    model = CellposeModel(
+        gpu=True,
+        pretrained_model=train_config.base_model,
+        device=device,
+    )
+
+    if train_config.use_te:
+        if enable_transformer_engine is None or TEConfig is None:
+            raise RuntimeError(
+                "Transformer Engine requested but cellpose_te_adapter is unavailable. "
+                "Ensure the adapter is on PYTHONPATH."
+            ) from _TE_IMPORT_ERROR
+
+        mode = "fp8" if train_config.te_fp8 else "bf16"
+        calibrate_steps = 100 if train_config.te_fp8 else 0
+        # Use a plain print here to avoid any logger scoping surprises in CLI contexts
+        print(f"Enabling Transformer Engine mode={mode} calibrate_steps={calibrate_steps}")
+        enable_transformer_engine(model.net, TEConfig(mode=mode, calibrate_steps=calibrate_steps))
+
     model_path, train_losses, test_losses = train_seg(
         model.net,
         train_data=images,
@@ -292,13 +371,17 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
         test_data=test_images,
         test_labels=test_labels,
         weight_decay=train_config.weight_decay,
-        SGD=train_config.SGD,
+        SGD=False,
         learning_rate=train_config.learning_rate,
+        rescale=True,
         n_epochs=train_config.n_epochs,
         model_name=name,
-        bsize=train_config.bsize,
         normalize=cast(bool, {"percentile": train_config.normalization_percs}),
-        min_train_masks=1,
+        min_train_masks=4,
+        pack_to_single_tile=train_config.packed,
+        pack_k=train_config.pack_k,
+        pack_guard=train_config.pack_guard,
+        pack_stripe_height=train_config.pack_stripe_height,
         **({"channels": train_config.channels} if not IS_CELLPOSE_SAM else {}),
     )
     return model_path, train_losses, test_losses
@@ -327,7 +410,11 @@ def run_train(name: str, path: Path, train_config: TrainConfig):
         for sample in discovered_samples:
             alias_path = path / sample
             resolved_path = alias_path.resolve(strict=False)
-            sample_values = (sample.as_posix(), alias_path.as_posix(), resolved_path.as_posix())
+            sample_values = (
+                sample.as_posix(),
+                alias_path.as_posix(),
+                resolved_path.as_posix(),
+            )
             if any(_matches_any(exclude_regexes, value) for value in sample_values):
                 dropped_samples.append(sample)
             else:
@@ -391,11 +478,22 @@ def run_train(name: str, path: Path, train_config: TrainConfig):
 
     logger.info(f"Filter summary: kept {kept_images}/{total_images} images; excluded {excluded_images}.")
 
+    limited_train_images, trimmed_train = _restrict_to_first_two_channels(filtered_images)
+    limited_test_images: list[Any] | None = None
+    trimmed_test = 0
+    if test_images is not None:
+        limited_test_images, trimmed_test = _restrict_to_first_two_channels(test_images)
+
+    if trimmed_train or trimmed_test:
+        logger.info(
+            f"Restricted image channels to first two for {trimmed_train} training and {trimmed_test} test samples."
+        )
+
     filtered: tuple[list, ...] = (
-        filtered_images,
+        limited_train_images,
         filtered_labels,
         filtered_image_names if filtered_image_names is not None else None,
-        test_images,
+        limited_test_images if limited_test_images is not None else None,
         test_labels,
         image_names_test,
     )

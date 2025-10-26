@@ -274,15 +274,24 @@ if "cucim" not in sys.modules:
     def _get_elapsed_time(start: _CudaEvent, end: _CudaEvent) -> float:
         return max(0.0, (end.timestamp - start.timestamp) * 1_000.0)
 
-    _cupy.cuda = types.SimpleNamespace(
-        runtime=_CudaRuntime(),
-        Device=lambda idx: _CudaDevice(idx),
-        Stream=_CudaStream,
-        Event=_CudaEvent,
-        get_current_stream=_get_current_stream,
-        get_elapsed_time=_get_elapsed_time,
-        nvtx=types.SimpleNamespace(RangePush=lambda *_args, **_kwargs: None, RangePop=lambda: None),
-    )
+    # Attach minimal cuda namespace to whichever 'cupy' is active (real or stub)
+    _cupy_mod = sys.modules.get("cupy")
+    if _cupy_mod is not None:
+        setattr(
+            _cupy_mod,
+            "cuda",
+            types.SimpleNamespace(
+                runtime=_CudaRuntime(),
+                Device=lambda idx: _CudaDevice(idx),
+                Stream=_CudaStream,
+                Event=_CudaEvent,
+                get_current_stream=_get_current_stream,
+                get_elapsed_time=_get_elapsed_time,
+                nvtx=types.SimpleNamespace(
+                    RangePush=lambda *_args, **_kwargs: None, RangePop=lambda: None
+                ),
+            ),
+        )
 
 
 @pytest.fixture(autouse=True)

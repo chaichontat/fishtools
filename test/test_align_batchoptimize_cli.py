@@ -106,7 +106,6 @@ def test_optimize_includes_blank_when_provided(monkeypatch: Any, workspace: Path
             "3",
             "--batch-size",
             "50",
-            "--max-proj",
             "--blank",
             "cb_blank",
             "--threshold",
@@ -120,7 +119,6 @@ def test_optimize_includes_blank_when_provided(monkeypatch: Any, workspace: Path
     find_args = calls[2].args
     assert any(a.startswith("--blank=") or a == "--blank" for a in step_args)
     assert any(a.startswith("--blank=") or a == "--blank" for a in find_args)
-    assert any(a == "--max-proj=1" for a in step_args)
 
 
 def test_optimize_forwards_config(monkeypatch: Any, workspace: Path, tmp_path: Path) -> None:

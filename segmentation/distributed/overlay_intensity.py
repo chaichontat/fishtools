@@ -8,90 +8,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
 
-import numpy as np
-import polars as pl
 import rich_click as click
 import zarr
 from loguru import logger
-from skimage.measure import regionprops_table
 
-
-def load_slice(zarr_path: Path, idx: int) -> np.ndarray | None:
-    """Loads a specific Z-slice from a Zarr store."""
-    logger.info(f"Slice {idx}: Loading from {zarr_path}...")
-    try:
-        img_stack = zarr.open_array(str(zarr_path), mode="r")
-        img_slice = img_stack[idx]
-        logger.info(f"Slice {idx}: Loaded slice with shape {img_slice.shape}.")
-        return img_slice
-    except Exception as e:
-        logger.error(f"Slice {idx}: Failed to load Zarr slice: {e}")
-        return None
-
-
-def process_slice_regionprops(
-    idx: int,
-    segmentation_zarr_path: Path,
-    intensity_zarr_path: Path,
-    name: str,
-    output_dir: Path,
-    overwrite: bool = False,
-) -> None:
-    """
-    Loads segmentation and intensity slices, calculates regionprops,
-    and saves results.
-    """
-    props_path = output_dir / f"intensity_{name}" / f"intensity-{idx:02d}.parquet"
-    props_path.parent.mkdir(exist_ok=True, parents=True)
-
-    if not overwrite and props_path.exists():
-        logger.info(f"Slice {idx}: Skipping, output files already exist.")
-        return
-
-        # 2. Load Intensity Image
-    intensity_img = zarr.open_array(str(intensity_zarr_path), mode="r")
-    keys = intensity_img.attrs["key"]
-    try:
-        c_idx = keys.index(name)
-    except ValueError:
-        raise ValueError(f"Channel {name} not found in {keys}")
-    intensity_img = intensity_img[idx, :, :, c_idx]
-
-    # 1. Load Segmentation Mask
-    seg_mask = load_slice(segmentation_zarr_path, idx)
-
-    if seg_mask.shape != intensity_img.shape:
-        raise ValueError(
-            f"Slice {idx}: Shape mismatch between segmentation ({seg_mask.shape}) "
-            f"and intensity ({intensity_img.shape}). Cannot calculate intensity props."
-        )
-
-    # 3. Calculate Region Properties
-    logger.info(f"Slice {idx}: Calculating region properties...")
-    try:
-        # Define properties to extract, including intensity-based ones
-        properties = [
-            "label",
-            "area",
-            "centroid",
-            "bbox",
-            "mean_intensity",
-            "max_intensity",
-            "min_intensity",
-        ]
-        # Use intensity_image argument for intensity stats
-        props_table = regionprops_table(seg_mask, intensity_image=intensity_img, properties=properties)
-        props_df = pl.DataFrame(props_table)
-        n_regions = len(props_df)
-        logger.info(f"Slice {idx}: Found {n_regions} regions.")
-
-    except Exception as e:
-        logger.error(f"Slice {idx}: Failed to calculate region properties: {e}")
-        return  # Don't save partial results if props calculation fails
-
-    # 4. Save Results
-    props_df.write_parquet(props_path)
-    logger.info(f"Slice {idx}: Saved region properties ({n_regions} regions) to {props_path}")
+from segmentation.distributed.utils import StitchPaths, process_slice_regionprops
 
 
 @click.command()
@@ -134,8 +55,13 @@ def main(
     Extracts region properties and intensity images for each Z-slice
     from segmentation and intensity Zarr stores.
     """
-    segmentation_zarr_path = input_dir / segmentation_name
-    intensity_zarr_path = input_dir / intensity_name
+    if not channel:
+        logger.error("Channel name must be provided via --channel.")
+        sys.exit(1)
+
+    stitch_paths = StitchPaths.from_stitch_root(input_dir)
+    segmentation_zarr_path = stitch_paths.segmentation(segmentation_name)
+    intensity_zarr_path = stitch_paths.intensity_store(intensity_name)
 
     # --- Input Validation ---
     if not segmentation_zarr_path.exists():

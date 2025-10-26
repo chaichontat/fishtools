@@ -10,6 +10,8 @@ from cellpose.io import imread
 from loguru import logger
 from natsort import natsorted
 
+_MASK_FALLBACK_SUFFIXES = ("_masks.npy", "_masks.tif", "_masks.tiff", "_masks.png")
+
 
 def get_image_files(folder, mask_filter, imf=None, look_one_level_down=False):
     """
@@ -60,8 +62,10 @@ def get_image_files(folder, mask_filter, imf=None, look_one_level_down=False):
 
     # return error if no files found
     if al == 0:
+        return []
         raise ValueError("ERROR: no files in --dir folder ")
     elif l0 == 0:
+        return []
         raise ValueError(
             "ERROR: no images in --dir folder with extensions .png, .jpg, .jpeg, .tif, .tiff, .flex"
         )
@@ -107,6 +111,9 @@ def get_label_files(image_names, mask_filter, imf=None):
     nimg = len(image_names)
     label_names0 = [os.path.splitext(image_names[n])[0] for n in range(nimg)]
 
+    if not label_names0:
+        return [], None
+
     if imf is not None and len(imf) > 0:
         label_names = [label_names0[n][: -len(imf)] for n in range(nimg)]
     else:
@@ -123,8 +130,23 @@ def get_label_files(image_names, mask_filter, imf=None):
 
     # check for masks
     if mask_filter == "_seg.npy":
-        label_names = [label_names[n] + mask_filter for n in range(nimg)]
-        return label_names, None
+        resolved_labels: list[str] = []
+        for base_name in label_names:
+            seg_candidate = base_name + mask_filter
+            if os.path.exists(seg_candidate):
+                resolved_labels.append(seg_candidate)
+                continue
+
+            fallback = None
+            for suffix in _MASK_FALLBACK_SUFFIXES:
+                candidate = base_name + suffix
+                if os.path.exists(candidate):
+                    fallback = candidate
+                    break
+
+            resolved_labels.append(fallback if fallback is not None else seg_candidate)
+
+        return resolved_labels, None
 
     if os.path.exists(label_names[0] + mask_filter + ".tif"):
         label_names = [label_names[n] + mask_filter + ".tif" for n in range(nimg)]

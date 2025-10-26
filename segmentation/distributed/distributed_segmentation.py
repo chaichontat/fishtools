@@ -7,6 +7,7 @@ import os
 import pathlib
 import shutil
 from collections.abc import Callable
+from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -23,13 +24,14 @@ import tifffile
 import typer
 import yaml
 import zarr
-from fishtools.segment.normalize import calc_percentile
 from loguru import logger
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
 from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
+from fishtools.segment.normalize import sample_percentile
+from fishtools.segment.train import IS_CELLPOSE_SAM
 from fishtools.utils.pretty_print import progress_bar
 
 # logger.remove()
@@ -333,6 +335,8 @@ def process_block(
 
     (5) return remapped segments as a numpy array, boxes, and box_ids
 
+    **Absolutely cannot use `logger` in mapped functions since it cannot be pickled**
+
     Parameters
     ----------
     block_index : tuple
@@ -537,7 +541,13 @@ def read_preprocess_and_segment(
         log_file = f"dask_worker_{distributed.get_worker().name}.log"
         log_file = pathlib.Path(worker_logs_directory).joinpath(log_file)
     cellpose.io.logger_setup(stdout_file_replacement=log_file)
-    model = cellpose.models.CellposeModel(**model_kwargs)
+
+    if IS_CELLPOSE_SAM:
+        from cellpose.contrib.cellposetrt import CellposeModelTRT
+
+        model = CellposeModelTRT(**model_kwargs)
+    else:
+        model = cellpose.models.CellposeModel(**model_kwargs)
     return model.eval(image, **eval_kwargs)[0].astype(np.uint32)
 
 
@@ -893,13 +903,19 @@ def distributed_eval(
 
     path_nonempty = temporary_directory.parent / "nonempty.json"
     try:
+        obj = json.loads(path_nonempty.read_text())
+        try:
+            if obj["block_size"] != blocksize:
+                raise ValueError("Block size has changed since last run; recomputing non-empty blocks.")
+        except KeyError:
+            raise ValueError("Block size not found in nonempty.json; recomputing non-empty blocks.")
         idxs = json.loads(path_nonempty.read_text())["idxs"]
-    except (FileNotFoundError, json.decoder.JSONDecodeError, KeyError):
+    except (FileNotFoundError, json.decoder.JSONDecodeError, KeyError, ValueError):
         check_futures = cluster.client.map(
             check_block_has_data,
             block_crops[offset : None if n is None else offset + n],
             zarr_array=input_zarr,
-            threshold=0,
+            threshold=1,
         )
 
         logger.info("Gathering input data check results...")
@@ -913,7 +929,7 @@ def distributed_eval(
 
         idxs = [i for i, is_non_zero in enumerate(non_zero_results, offset) if is_non_zero]
 
-        path_nonempty.write_text(json.dumps({"idxs": idxs}, indent=2))
+        path_nonempty.write_text(json.dumps({"idxs": idxs, "block_size": blocksize}, indent=2))
 
     # final_block_indices, final_block_crops = [], []
     final_block_indices, final_block_crops = (
@@ -1139,13 +1155,13 @@ def merge_boxes(boxes: NDArray[Any]) -> tuple[slice, ...]:
     return box_union
 
 
-app = typer.Typer()
+app = typer.Typer(pretty_exceptions_show_locals=False)
 
 
 @app.command()
 def main(
     path: Path = typer.Argument(..., help="Path to the folder containing the zarr file."),
-    channels: str = typer.Option(..., help="Comma-separated list of channel names to use."),
+    channels: str | None = typer.Option(None, help="Comma-separated list of channel names to use."),
     overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
 ) -> None:
     """
@@ -1182,6 +1198,8 @@ def main(
         logger.warning("Segmentation already exists. Exiting.")
         exit()
 
+    IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
+
     # ---- 1. Configuration ----
     path_zarr = path
     path = Path(path).parent
@@ -1193,13 +1211,19 @@ def main(
     config = json.loads((path.parent / "config.json").read_text())
     cellpose_model_kwargs = {
         "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
-        "pretrained_model_ortho": config["pretrained_model_ortho"],
         "gpu": True,
     }
+    if IS_CELLPOSE_SAM:
+        # ...
+        cellpose_model_kwargs["pretrained_model"] = (
+            "/home/chaichontat/cellpose/scripts/builds/cpsam_b4_sm120_bf16.plan"
+        )
+    else:
+        cellpose_model_kwargs["pretrained_model_ortho"] = config.get("pretrained_model_ortho", None)
 
     # Dask Cluster Configuration (for local machine)
     local_cluster_kwargs = {
-        "n_workers": 4,  # 4 cellpose instances can run on an RTX 4090
+        "n_workers": 4 if not IS_CELLPOSE_SAM else 2,  # 4 cellpose instances can run on an RTX 4090
         "ncpus": 4,  # Physical cores per worker (adjust based on your CPU)
         "memory_limit": "64GB",  # RAM per worker - CRITICAL: Must fit block+model+overhead
         "threads_per_worker": 1,  # Usually 1 for Cellpose
@@ -1212,60 +1236,80 @@ def main(
     foreground_mask = None
     if mask_path and os.path.exists(mask_path):
         print(f"Loading mask from {mask_path}")
-        foreground_mask = tifffile.imread(mask_path) > 0
+        foreground_mask = tifffile.imread(mask_path) > 1.0
 
     input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
 
     key = cast(str, input_zarr_array.attrs["key"])
-    try:
-        channels_list = [key.index(c) + 1 for c in channels.split(",")]
-        logger.info(f"Using channels: {channels}")
-    except ValueError:
-        raise ValueError(f"Channel names {channels} not found in {key}")
+    if channels is None:
+        channels_list = list(range(1, input_zarr_array.shape[3] + 1))  # All channels
+        logger.info(f"No channels specified. Using all channels: {channels_list}")
+    else:
+        try:
+            channels_list = [key.index(c) + 1 for c in channels.split(",")]
+            logger.info(f"Using channels: {channels}")
+            if len(channels_list) != len(key):
+                logger.warning(
+                    f"Selected channels {channels_list} do not match total channels {list(range(1, input_zarr_array.shape[3] + 1))}"
+                )
+                input("Do you want to continue? Press Enter to continue or Ctrl+C to abort.")
+        except ValueError:
+            raise ValueError(f"Channel names {channels} not found in {key}")
     del channels
 
-    processing_blocksize = (input_zarr_array.shape[0], 512, 512, len(channels_list))
+    processing_blocksize = (input_zarr_array.shape[0], 1024, 1024, len(channels_list))  # ZYXc
     try:
         if overwrite:
-            raise FileNotFoundError
+            raise FileNotFoundError  # To force into the except block
         normalization = json.loads((path / "normalization.json").read_text())
     except FileNotFoundError:
         logger.info("Existing normalization params not found. Calculating percentiles.")
-        perc, _ = calc_percentile(
+        perc, _ = sample_percentile(
             input_zarr_array,
             channels=channels_list,
-            block=(processing_blocksize[1], processing_blocksize[2]),
+            block=(512, 512),
             n=30,
-            low=5,
-            high=99.5,
+            low=1,
+            high=99.9,
         )
         normalization = {"lowhigh": perc}
         (path / "normalization.json").write_text(json.dumps(normalization, indent=2, cls=NumpyEncoder))
+    print(normalization)
 
-    if len(channels_list) == 1:
+    if len(channels_list) == 1:  # Cellpose pre SAM always expects 2 channels
         channels_list = [channels_list[0], channels_list[0]]
         normalization = {"lowhigh": [normalization["lowhigh"], normalization["lowhigh"]]}
+
+    if IS_CELLPOSE_SAM and len(channels_list) < 3:
+        print(np.repeat([[0], [1]], repeats=3 - len(channels_list), axis=0).shape)
+        normalization = {
+            "lowhigh": np.concatenate(
+                [normalization["lowhigh"], np.repeat([[0, 1]], repeats=3 - len(channels_list), axis=0)],
+                axis=0,
+            )
+        }
+
     logger.info(f"Normalization params: {normalization}")
 
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
-        "diameter": config["diameter"],  # MUST BE INT
-        "channels": channels_list,  # Use [0,0] for grayscale, [1,2] for R=cyto G=nucleus etc.
-        "batch_size": 24,  # Adjust based on GPU memory (if using GPU)
-        # Use Cellpose's internal normalization (or False if pre-normalized)
-        "normalize": {},
+        "diameter": config.get("diameter", 30),  # MUST BE INT
+        "batch_size": 16 if not IS_CELLPOSE_SAM else 4,  # Adjust based on GPU memory (if using GPU)
+        "normalize": normalization,
         "flow_threshold": 0,  # Useless in 3D
-        "cellprob_threshold": -2,  # Default is 0.0, adjust if needed
-        "anisotropy": 3.0,
-        "resample": True,
-        "flow3D_smooth": 3,
+        "cellprob_threshold": -0.5,  # Default is 0.0, adjust if needed
+        "anisotropy": 2.0,
+        "resample": False,
+        "flow3D_smooth": 2,
+        "niter": 2000,
         "do_3D": True,
         "z_axis": 0,
         "channel_axis": 3,
+        **({"channels": channels_list} if not IS_CELLPOSE_SAM else {}),
     }
 
     # ---- 3. Run Distributed Evaluation ----
-    print("Starting distributed Cellpose evaluation...")
+    logger.info("Starting distributed Cellpose evaluation…")
     try:
         # The @cluster decorator handles cluster creation/management
         final_segmentation_zarr, final_bounding_boxes = distributed_eval(
@@ -1281,13 +1325,15 @@ def main(
         )
         (zarr_output_path.parent / "segmentation.done").touch()
         shutil.rmtree(temporary_directory)
-        print("\n--- Run Finished ---")
-        print(f"Final segmentation saved to: {zarr_output_path}")
-        print(f"Output Zarr shape: {final_segmentation_zarr.shape}, dtype: {final_segmentation_zarr.dtype}")
-        print(f"Number of segmented objects found: {len(final_bounding_boxes)}")
+        logger.info("Run Finished")
+        logger.info(f"Final segmentation saved to: {zarr_output_path}")
+        logger.info(
+            f"Output Zarr shape: {final_segmentation_zarr.shape}, dtype: {final_segmentation_zarr.dtype}"
+        )
+        logger.info(f"Number of segmented objects found: {len(final_bounding_boxes)}")
 
     except Exception as e:
-        print("\n--- Error during distributed evaluation ---")
+        logger.exception("Error during distributed evaluation")
         raise e
 
 

@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import types
 from pathlib import Path
 from typing import Sequence
@@ -293,6 +294,70 @@ class TestTrainFunction:
         expected_config_data["train_losses"] = mock_returned_train_losses
 
         assert returned_json == TrainConfig.model_validate(expected_config_data)
+
+    @patch("fishtools.segment.train._train")
+    def test_train_flow_limits_images_to_first_two_channels(
+        self,
+        mock_internal_heavy_train: MagicMock,
+        cellpose_loader_stub: types.ModuleType,
+        tmp_path: Path,
+        sample_train_config: TrainConfig,
+        mock_setup_workspace_logging: MagicMock,
+    ):
+        model_name = sample_train_config.name
+        main_train_path = tmp_path / "training_root"
+        main_train_path.mkdir()
+
+        _ensure_training_dirs(main_train_path, sample_train_config.training_paths)
+
+        image_a = np.arange(4 * 5 * 6, dtype=np.float32).reshape(4, 5, 6)
+        image_b = np.arange(3 * 2 * 2, dtype=np.float32).reshape(3, 2, 2)
+        label_a = np.ones((5, 6), dtype=np.uint16)
+        label_b = np.ones((2, 2), dtype=np.uint16)
+
+        sample_paths = sample_train_config.training_paths
+        cellpose_loader_stub._responses.extend(  # type: ignore[attr-defined]
+            [
+                (
+                    [image_a],
+                    [label_a],
+                    [str(main_train_path / sample_paths[0] / "img_a.tif")],
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    [image_b],
+                    [label_b],
+                    [str(main_train_path / sample_paths[1] / "img_b.tif")],
+                    None,
+                    None,
+                    None,
+                ),
+            ]
+        )
+
+        mock_internal_heavy_train.return_value = (
+            str(main_train_path / "models" / model_name),
+            [0.1],
+            [0.2],
+        )
+
+        run_train(model_name, main_train_path, sample_train_config)
+
+        _assert_logging_call(mock_setup_workspace_logging, main_train_path, model_name)
+
+        mock_internal_heavy_train.assert_called_once()
+        concatenated_data = mock_internal_heavy_train.call_args.args[0]
+        trimmed_images = concatenated_data[0]
+
+        assert isinstance(trimmed_images, list)
+        assert len(trimmed_images) == 2
+        assert all(isinstance(image, np.ndarray) for image in trimmed_images)
+        assert trimmed_images[0].shape == (2, 5, 6)
+        assert trimmed_images[1].shape == (2, 2, 2)
+        np.testing.assert_array_equal(trimmed_images[0], image_a[:2])
+        np.testing.assert_array_equal(trimmed_images[1], image_b[:2])
 
     @patch("fishtools.segment.train._train")
     def test_train_flow_applies_include_exclude_filters(
@@ -953,3 +1018,55 @@ class TestMainCommand:
 
         assert result.exit_code != 0
         assert f"Config file {model_name}.json not found" in str(result.exception)
+
+    @patch("fishtools.segment.run_train")
+    def test_main_config_allows_line_comments(
+        self, mock_train_orchestrator_func: MagicMock, tmp_path: Path
+    ):
+        train_dir = tmp_path / "my_train_project"
+        train_dir.mkdir()
+        models_dir = train_dir / "models"
+        models_dir.mkdir()
+
+        model_name = "test_model"
+        config_path = models_dir / f"{model_name}.json"
+        config_with_comments = (
+            "// top-level comment\n"
+            "{\n"
+            "  // name comment\n"
+            "  \"name\": \"test_model\",\n"
+            "  \"channels\": [0, 1],\n"
+            "  // paths comment\n"
+            "  \"training_paths\": [\"sample_data1\"],\n"
+            "  \"n_epochs\": 5\n"
+            "}\n"
+            "// trailing comment\n"
+        )
+        config_path.write_text(config_with_comments)
+
+        mock_obj = MagicMock()
+        mock_obj.model_dump_json.return_value = "{}"
+        mock_train_orchestrator_func.return_value = mock_obj
+
+        runner = CliRunner()
+        # Keep original contents for later comparison
+        original_contents = config_path.read_text()
+
+        result = runner.invoke(app, ["train", str(train_dir), model_name])
+
+        if result.exception:
+            raise result.exception
+
+        assert result.exit_code == 0
+        # Original config file must remain unchanged (comments preserved)
+        assert config_path.read_text() == original_contents
+        # Updated config should be written next to it, not overwriting the original
+        trained_path = models_dir / f"{model_name}.trained.json"
+        assert trained_path.exists()
+        # Ensure we parsed and invoked training with a TrainConfig
+        args, _ = mock_train_orchestrator_func.call_args
+        parsed_cfg = args[2]
+        assert isinstance(parsed_cfg, TrainConfig)
+        assert parsed_cfg.name == model_name
+        assert parsed_cfg.channels == (0, 1)
+        assert parsed_cfg.training_paths == ["sample_data1"]
