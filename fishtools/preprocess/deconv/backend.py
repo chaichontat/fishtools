@@ -19,6 +19,7 @@ from typing import Any, Callable, Protocol, Sequence
 import cupy as cp
 import numpy as np
 import tifffile
+import torch
 
 from fishtools.io.workspace import safe_imwrite
 from fishtools.preprocess.config import DeconvolutionOutputMode
@@ -47,6 +48,7 @@ class ProcessorConfig:
     m_glob: np.ndarray | None
     s_glob: np.ndarray | None
     debug: bool
+    prefer_torch: bool = False
 
 
 # ------------------- Output backends -------------------
@@ -68,7 +70,7 @@ class OutputBackend(Protocol):
     def expected_targets(self, out_dir: Path, src: Path) -> Sequence[Path]:  # pragma: no cover - simple logic
         ...
 
-    def setup(self, processor: "DeconvolutionTileProcessor") -> None:  # pragma: no cover - thin interface
+    def setup(self, processor: DeconvolutionTileProcessor) -> None:  # pragma: no cover - thin interface
         ...
 
     def postprocess(
@@ -102,7 +104,7 @@ OutputBackendFactory = Callable[[ProcessorConfig], OutputBackend]
 
 
 def legacy_per_tile_quantize(
-    res: cp.ndarray,
+    res: Any,
     hw: tuple[int, int],
     *,
     percentile_low: float = LEGACY_PERCENTILES[0],
@@ -114,9 +116,18 @@ def legacy_per_tile_quantize(
     if height <= 0 or width <= 0:
         raise ValueError(f"Invalid tile dimensions hw={hw}")
 
-    payload = cp.asarray(res, dtype=cp.float32)
+    if torch is not None and isinstance(res, torch.Tensor):
+        payload = res.detach().to(dtype=torch.float32).cpu().numpy()
+        xp = np
+    elif isinstance(res, cp.ndarray):
+        payload = cp.asarray(res, dtype=cp.float32)
+        xp = cp
+    else:
+        payload = np.asarray(res, dtype=np.float32)
+        xp = np
+
     if payload.ndim == 3:
-        payload = payload[:, cp.newaxis, ...]
+        payload = payload[:, xp.newaxis, ...]
     elif payload.ndim != 4:
         raise ValueError(
             "Expected deconvolution output with 3D or 4D shape (z[, c], y, x) for legacy quantization."
@@ -125,21 +136,26 @@ def legacy_per_tile_quantize(
     if payload.shape[-2:] != (height, width):
         raise ValueError(f"Legacy quantization mismatch: payload spatial dims {payload.shape[-2:]} != {hw}.")
 
-    mins = cp.percentile(payload, percentile_low, axis=(0, 2, 3))
-    maxs = cp.percentile(payload, percentile_high, axis=(0, 2, 3))
+    mins = xp.percentile(payload, percentile_low, axis=(0, 2, 3))
+    maxs = xp.percentile(payload, percentile_high, axis=(0, 2, 3))
 
-    mins = mins.astype(cp.float32, copy=False).reshape(1, -1, 1, 1)
-    maxs = maxs.astype(cp.float32, copy=False).reshape(1, -1, 1, 1)
+    mins = mins.astype(xp.float32, copy=False).reshape(1, -1, 1, 1)
+    maxs = maxs.astype(xp.float32, copy=False).reshape(1, -1, 1, 1)
 
-    scale = cp.float32(65534.0) / cp.maximum(maxs - mins, cp.float32(1e-20))
+    scale = xp.float32(65534.0) / xp.maximum(maxs - mins, xp.float32(1e-20))
     scale = scale.reshape(1, -1, 1, 1)
 
-    scaled = cp.clip((payload - mins) * scale, 0.0, 65534.0)
-    towrite = scaled.astype(cp.uint16).reshape(-1, height, width)
+    scaled = xp.clip((payload - mins) * scale, 0.0, 65534.0)
+    towrite = scaled.astype(xp.uint16).reshape(-1, height, width)
 
-    mins_host = cp.asnumpy(mins.reshape(-1)).astype(np.float32, copy=False)
-    scale_host = cp.asnumpy(scale.reshape(-1)).astype(np.float32, copy=False)
-    towrite_host = cp.asnumpy(towrite)
+    if xp is cp:
+        mins_host = cp.asnumpy(mins.reshape(-1)).astype(np.float32, copy=False)
+        scale_host = cp.asnumpy(scale.reshape(-1)).astype(np.float32, copy=False)
+        towrite_host = cp.asnumpy(towrite)
+    else:
+        mins_host = mins.reshape(-1).astype(np.float32, copy=False)
+        scale_host = scale.reshape(-1).astype(np.float32, copy=False)
+        towrite_host = towrite
 
     return towrite_host, mins_host, scale_host
 
@@ -157,7 +173,7 @@ class Float32HistBackend:
         base = root / src.parent.name / src.name
         return [base, base.with_suffix(".histogram.csv")]
 
-    def setup(self, processor: "DeconvolutionTileProcessor") -> None:
+    def setup(self, processor: DeconvolutionTileProcessor) -> None:
         self._out32 = processor.config.output_dir.parent / "deconv32"
         self._out32.mkdir(parents=True, exist_ok=True)
         if self.config.mode is not DeconvolutionOutputMode.F32:
@@ -165,7 +181,7 @@ class Float32HistBackend:
 
     def postprocess(
         self,
-        res: cp.ndarray,
+        res: Any,
         path: Path,
         hw: tuple[int, int],
     ) -> tuple[OutputArtifacts, dict[str, Any], dict[str, float]]:
@@ -173,10 +189,15 @@ class Float32HistBackend:
         t0 = time.perf_counter()
 
         reshaped = res.reshape(-1, H, W)
-        f32_payload = cp.asnumpy(reshaped).astype(np.float32, copy=False)
+        if torch is not None and isinstance(reshaped, torch.Tensor):
+            f32_payload = reshaped.detach().to(torch.float32).cpu().numpy()
+        elif isinstance(reshaped, cp.ndarray):
+            f32_payload = cp.asnumpy(reshaped.astype(cp.float32, copy=False))
+        else:
+            f32_payload = np.asarray(reshaped, dtype=np.float32)
 
         digest = hashlib.blake2b(
-            f"{self.config.round_name}:{path}".encode("utf-8"),
+            f"{self.config.round_name}:{path}".encode(),
             digest_size=8,
         ).digest()
         seed = int.from_bytes(digest, "little")
@@ -264,12 +285,12 @@ class U16PrenormBackend:
     def expected_targets(self, out_dir: Path, src: Path) -> Sequence[Path]:
         return [out_dir / src.parent.name / src.name]
 
-    def setup(self, processor: "DeconvolutionTileProcessor") -> None:  # pragma: no cover - trivial
+    def setup(self, processor: DeconvolutionTileProcessor) -> None:  # pragma: no cover - trivial
         return None
 
     def postprocess(
         self,
-        res: cp.ndarray,
+        res: Any,
         path: Path,  # noqa: ARG002
         hw: tuple[int, int],  # noqa: ARG002
     ) -> tuple[OutputArtifacts, dict[str, Any], dict[str, float]]:
@@ -330,13 +351,13 @@ class LegacyPerTileU16Backend:
     def expected_targets(self, out_dir: Path, src: Path) -> Sequence[Path]:
         return [out_dir / src.parent.name / src.name]
 
-    def setup(self, processor: "DeconvolutionTileProcessor") -> None:
+    def setup(self, processor: DeconvolutionTileProcessor) -> None:
         self._out_dir = processor.config.output_dir
         self._out_dir.mkdir(parents=True, exist_ok=True)
 
     def postprocess(
         self,
-        res: cp.ndarray,
+        res: Any,
         path: Path,  # noqa: ARG002
         hw: tuple[int, int],
     ) -> tuple[OutputArtifacts, dict[str, Any], dict[str, float]]:
@@ -440,12 +461,26 @@ class DeconvolutionTileProcessor:
         self._device_id = device_id
         self._backend_factory = backend_factory
         self._backend: OutputBackend | None = None
+        self._torch_enabled = bool(config.prefer_torch)
+        self._torch_projectors: tuple[Any, Any] | None = None
+        self._torch_device: Any | None = None
+        self._torch_darkfield: Any | None = None
+        self._torch_inv_flatfield: Any | None = None
 
     def set_device(self, device_id: int) -> None:
         self._device_id = device_id
 
     def _load_basics(self) -> None:
         self._darkfield, self._flatfield = load_basic_profiles(self.config.basic_paths)
+
+    def _basic_correct_torch(self, tensor: torch.Tensor) -> torch.Tensor:
+        if torch is None:
+            raise RuntimeError("PyTorch is not available for torch-based BaSiC correction.")
+        if self._torch_darkfield is None or self._torch_inv_flatfield is None:
+            raise RuntimeError("Torch BaSiC tensors are not initialized.")
+        corrected = tensor - self._torch_darkfield
+        corrected = corrected * self._torch_inv_flatfield
+        return torch.clamp(corrected, min=0.0)
 
     def setup(self) -> None:
         if self._device_id is not None and hasattr(cp.cuda, "Device"):
@@ -480,6 +515,26 @@ class DeconvolutionTileProcessor:
         )
 
         self._projectors = projectors(self.config.step)
+
+        if self._torch_enabled:
+            if torch is None:
+                raise RuntimeError("prefer_torch requested but PyTorch is unavailable.")
+            device_index = self._device_id if self._device_id is not None else cp.cuda.Device().id
+            device = torch.device(f"cuda:{device_index}")
+            self._torch_device = device
+            self._torch_projectors = tuple(
+                torch.from_numpy(cp.asnumpy(p)).to(device=device, dtype=torch.float32)
+                for p in self._projectors
+            )
+            self._torch_darkfield = torch.from_numpy(cp.asnumpy(self._darkfield)).to(
+                device=device,
+                dtype=torch.float32,
+            )
+            self._torch_inv_flatfield = torch.from_numpy(cp.asnumpy(self._inv_flatfield)).to(
+                device=device,
+                dtype=torch.float32,
+            )
+
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
         # Backend selection: prefer explicit factory; else fallback to legacy behavior
@@ -499,6 +554,10 @@ class DeconvolutionTileProcessor:
         self._backend = None
         self._inv_flatfield = None
         self._basic_kernel = None
+        self._torch_projectors = None
+        self._torch_device = None
+        self._torch_darkfield = None
+        self._torch_inv_flatfield = None
 
     def read_tile(
         self, path: Path
@@ -531,11 +590,9 @@ class DeconvolutionTileProcessor:
         plane_count = int(np.prod(payload.shape[:-2]))
         if plane_count % channels != 0:
             raise ValueError(
-                (
-                    f"{path} has {plane_count} payload planes not divisible by {channels} BaSiC channel(s). "
-                    "This typically indicates a channel inference mismatch. Verify TIFF metadata (waveform→params→powers) "
-                    "and fallback logic, or pass the correct --basic-name so that the number of BaSiC profiles matches the data."
-                )
+                f"{path} has {plane_count} payload planes not divisible by {channels} BaSiC channel(s). "
+                "This typically indicates a channel inference mismatch. Verify TIFF metadata (waveform→params→powers) "
+                "and fallback logic, or pass the correct --basic-name so that the number of BaSiC profiles matches the data."
             )
 
         try:
@@ -566,25 +623,64 @@ class DeconvolutionTileProcessor:
             self._darkfield is not None and self._inv_flatfield is not None and self._basic_kernel is not None
         )
 
-        # GPU-side cast saves bandwidth; ensure contiguous float32 on device
-        x = cp.asarray(payload_np, dtype=cp.float32)
-        self._basic_kernel(x, self._darkfield, self._inv_flatfield, x)
+        use_torch = (
+            self._torch_enabled
+            and torch is not None
+            and self._torch_projectors is not None
+            and self._torch_device is not None
+            and self._torch_darkfield is not None
+            and self._torch_inv_flatfield is not None
+        )
+
+        torch_input = None
+        torch_basic = None
+        x_cp = None
+
+        if use_torch:
+            torch_input = torch.from_numpy(np.ascontiguousarray(payload_np)).to(
+                device=self._torch_device,
+                dtype=torch.float32,
+            )
+            torch_basic = self._basic_correct_torch(torch_input)
+        else:
+            # GPU-side cast saves bandwidth; ensure contiguous float32 on device
+            x_cp = cp.asarray(payload_np, dtype=cp.float32)
+            self._basic_kernel(x_cp, self._darkfield, self._inv_flatfield, x_cp)
 
         timings["basic"] = time.perf_counter() - t_basic0
 
         t_dec0 = time.perf_counter()
 
-        res = deconvolve_lucyrichardson_guo(x, self._projectors, iters=1)  # type: ignore[arg-type]
+        if use_torch and torch_basic is not None:
+            from fishtools.preprocess.deconv.torch_lr import (
+                deconvolve_lucyrichardson_guo_torch as torch_lr,
+            )
+
+            res_payload = torch_lr(
+                torch_basic,
+                self._torch_projectors,  # type: ignore[arg-type]
+                iters=1,
+                eps=1e-6,
+                i_max=None,
+                enable_tf32=False,
+                flip_kernels=True,
+                debug=self.config.debug,
+            )
+        else:
+            res_payload = deconvolve_lucyrichardson_guo(x_cp, self._projectors, iters=1)  # type: ignore[arg-type]
 
         timings["deconv"] = time.perf_counter() - t_dec0
 
-        artifacts, meta_patch, extra_timings = self._backend.postprocess(res, path, hw)
+        artifacts, meta_patch, extra_timings = self._backend.postprocess(res_payload, path, hw)
         timings["quant"] = extra_timings.get("quant", 0.0)
         timings["post"] = extra_timings.get("post", 0.0)
         timings |= timer.to_dict()
         timer.reset()
 
-        del res, x
+        if use_torch:
+            del res_payload, torch_input, torch_basic
+        else:
+            del res_payload, x_cp
 
         metadata_out = metadata_in | meta_patch
         return artifacts, metadata_out, timings
@@ -642,5 +738,6 @@ def make_processor_factory(
         m_glob=None if config.m_glob is None else np.asarray(config.m_glob, dtype=np.float32),
         s_glob=None if config.s_glob is None else np.asarray(config.s_glob, dtype=np.float32),
         debug=config.debug,
+        prefer_torch=config.prefer_torch,
     )
     return _ProcessorFactory(safe_config, backend_factory)
