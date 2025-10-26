@@ -1,12 +1,9 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import cupy as cp
 import numpy as np
-
-if TYPE_CHECKING:
-    import torch
 
 
 def _choose_offsets(strides: tuple[int, int, int], *, seed: int | None = None) -> tuple[int, int, int]:
@@ -22,33 +19,21 @@ def _choose_offsets(strides: tuple[int, int, int], *, seed: int | None = None) -
 
 
 def sample_histograms(
-    res: Any,
+    res: cp.ndarray,
     *,
     bins: int = 8192,
     strides: tuple[int, int, int] = (4, 2, 2),
     offsets: tuple[int, int, int] | None = None,
     seed: int | None = None,
 ) -> dict[str, Any]:
-    """Compute per-channel histograms on a subsample of a (Z,C,Y,X) tensor."""
-    import torch
+    """Compute per-channel histograms on a subsample of a (Z,C,Y,X) CuPy array.
 
+    - Uses per-channel min/max from the same subsample to build bin edges.
+    - Returns CPU-friendly payload (numpy arrays) ready to serialize.
+    """
     if res.ndim != 4:
         raise ValueError("res must be (Z,C,Y,X)")
 
-    if isinstance(res, torch.Tensor):
-        return _sample_histograms_torch(res, bins=bins, strides=strides, offsets=offsets, seed=seed)
-
-    return _sample_histograms_cupy(res, bins=bins, strides=strides, offsets=offsets, seed=seed)
-
-
-def _sample_histograms_cupy(
-    res: cp.ndarray,
-    *,
-    bins: int,
-    strides: tuple[int, int, int],
-    offsets: tuple[int, int, int] | None,
-    seed: int | None,
-) -> dict[str, Any]:
     Z, C, Y, X = map(int, res.shape)
     SZ, SY, SX = strides
     if offsets is None:
@@ -61,8 +46,9 @@ def _sample_histograms_cupy(
         SZ = SY = SX = 1
         off_z = off_y = off_x = 0
 
-    mins_ch = cp.min(subset, axis=(0, 2, 3))
-    maxs_ch = cp.max(subset, axis=(0, 2, 3))
+    # compute per-channel mins/maxs on the subsample
+    mins_ch = cp.min(subset, axis=(0, 2, 3))  # (C,)
+    maxs_ch = cp.max(subset, axis=(0, 2, 3))  # (C,)
 
     counts_list: list[np.ndarray] = []
     edges_list: list[np.ndarray] = []
@@ -79,60 +65,6 @@ def _sample_histograms_cupy(
         edges_list.append(cp.asnumpy(edges_gpu).astype(np.float32, copy=False))
 
     n_samp = int(subset[:, 0, :, :].size)
-    payload = {
-        "C": int(C),
-        "bins": int(bins),
-        "counts": counts_list,
-        "edges": edges_list,
-        "strides": (int(SZ), int(SY), int(SX)),
-        "offsets": (int(off_z), int(off_y), int(off_x)),
-        "sampled_per_channel": n_samp,
-        "tile_shape": (int(Z), int(C), int(Y), int(X)),
-    }
-    return payload
-
-
-def _sample_histograms_torch(
-    res: "torch.Tensor",
-    *,
-    bins: int,
-    strides: tuple[int, int, int],
-    offsets: tuple[int, int, int] | None,
-    seed: int | None,
-) -> dict[str, Any]:
-    import math
-
-    Z, C, Y, X = map(int, res.shape)
-    SZ, SY, SX = strides
-    if offsets is None:
-        offsets = _choose_offsets(strides, seed=seed)
-    off_z, off_y, off_x = offsets
-
-    subset = res[off_z::SZ, :, off_y::SY, off_x::SX]
-    if subset.numel() == 0:
-        subset = res
-        SZ = SY = SX = 1
-        off_z = off_y = off_x = 0
-
-    subset = subset.to(dtype=torch.float32)
-    mins_ch = subset.amin(dim=(0, 2, 3))
-    maxs_ch = subset.amax(dim=(0, 2, 3))
-
-    counts_list: list[np.ndarray] = []
-    edges_list: list[np.ndarray] = []
-
-    for c in range(C):
-        lo = float(mins_ch[c].item())
-        hi = float(maxs_ch[c].item())
-        if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
-            lo, hi = 0.0, 1.0
-        edges_gpu = torch.linspace(lo, hi, int(bins) + 1, device=subset.device, dtype=torch.float32)
-        sample_c = subset[:, c, :, :].reshape(-1)
-        hist = torch.histc(sample_c, bins=int(bins), min=lo, max=hi)
-        counts_list.append(hist.detach().cpu().numpy().astype(np.int64, copy=False))
-        edges_list.append(edges_gpu.detach().cpu().numpy().astype(np.float32, copy=False))
-
-    n_samp = int(subset[:, 0, :, :].numel())
     payload = {
         "C": int(C),
         "bins": int(bins),
