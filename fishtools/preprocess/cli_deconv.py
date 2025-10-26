@@ -388,7 +388,6 @@ def _prepare_round_plan(
     label: str | None,
     mode: DeconvolutionOutputMode,
     prefixed: _PrefixedLogger | None = None,
-    prefer_torch: bool = False,
 ) -> _RoundProcessingPlan | None:
     file_list = list(files)
     prefixed = prefixed or _PrefixedLogger(label)
@@ -439,7 +438,6 @@ def _prepare_round_plan(
         m_glob=m_glob,
         s_glob=s_glob,
         debug=debug,
-        prefer_torch=prefer_torch,
     )
     logger.info(config)
 
@@ -551,7 +549,6 @@ def _run_round_tiles(
     label: str | None,
     mode: DeconvolutionOutputMode,
     progress: ProgressUpdater | None = None,
-    prefer_torch: bool = False,
 ) -> list[WorkerMessage]:
     """Run one round with explicit OutputBackend chosen by CLI."""
 
@@ -568,7 +565,6 @@ def _run_round_tiles(
         debug=debug,
         label=label,
         mode=mode,
-        prefer_torch=prefer_torch,
     )
 
     if plan is None:
@@ -605,7 +601,6 @@ def _plan_and_execute(
     mode: DeconvolutionOutputMode,
     delete_origin: bool,
     progress: ProgressUpdater | None = None,
-    prefer_torch: bool = False,
 ) -> list[WorkerMessage]:
     workspace = Workspace(path)
     out_dir = workspace.deconved
@@ -682,7 +677,6 @@ def _plan_and_execute(
             label=round_token,
             mode=mode,
             prefixed=prefixed,
-            prefer_torch=prefer_torch,
         )
 
         if plan is not None:
@@ -751,7 +745,6 @@ def multi_run(
     stop_on_error: bool,
     configure_logging: bool = False,
     process_label: str = "0",
-    prefer_torch: bool = False,
 ) -> list[WorkerMessage]:
     """Run multi-GPU deconvolution for a single round programmatically."""
 
@@ -785,7 +778,6 @@ def multi_run(
         stop_on_error=stop_on_error,
         mode=selected_mode,
         delete_origin=False,
-        prefer_torch=prefer_torch,
     )
 
     return failures
@@ -996,13 +988,6 @@ def prepare(
     show_default=True,
     help="Skip writing uint16 deliverables so quantize can run separately.",
 )
-@click.option(
-    "--torch/--no-torch",
-    "prefer_torch",
-    default=True,
-    show_default=True,
-    help="Use the PyTorch TF32 deconvolution path instead of the CuPy implementation.",
-)
 def run(
     path: Path,
     round_name: str | None,
@@ -1020,7 +1005,6 @@ def run(
     devices: str,
     stop_on_error: bool,
     skip_quantized: bool,
-    prefer_torch: bool,
 ) -> None:
     """Run multi-GPU deconvolution across selected rounds and ROIs."""
     round_tag = round_name or "all"
@@ -1029,7 +1013,7 @@ def run(
         component="preprocess.deconv.run",
         file_tag=f"run-{round_tag}",
         debug=debug,
-        extra={"round": round_tag, "roi": roi_name, "mode": mode, "prefer_torch": prefer_torch},
+        extra={"round": round_tag, "roi": roi_name, "mode": mode},
     )
     _configure_logging(debug, process_label="0")
 
@@ -1101,7 +1085,6 @@ def run(
         stop_on_error=stop_on_error,
         mode=selected_mode,
         delete_origin=delete_origin,
-        prefer_torch=prefer_torch,
     )
 
 
