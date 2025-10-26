@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Tuple
-
 import numpy as np
 import numpy.typing as npt
 from loguru import logger
@@ -17,6 +15,7 @@ def sample_percentiles(
     low: float = 1,
     high: float = 99,
     seed: int = 0,
+    subsample_z: int = 2,
     unsharp: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sample percentile ranges from a large 4D stack.
@@ -79,7 +78,7 @@ def sample_percentiles(
         # Light sharpening before measuring percentiles
         if unsharp:
             crop = unsharp_mask(crop, preserve_range=True, radius=3, channel_axis=3)
-        samples.append(np.percentile(crop[..., ch_idx], [low, high], axis=(0, 1, 2)))
+        samples.append(np.percentile(crop[::subsample_z, ch_idx], [low, high], axis=(0, 1, 2)))
         taken += 1
 
     if not samples:

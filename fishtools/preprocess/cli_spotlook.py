@@ -1,4 +1,5 @@
 import math
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -994,6 +995,11 @@ def threshold(
         logger.info(f"Analyzing spot density patterns for ROI {roi}...")
         logger.debug("Attempting to load raw spots parquet")
         spots_raw = _load_spots_data(path, roi, codebook)
+        shutil.copy(
+            path / f"registered--{roi}+{codebook.name}" / f"decoded-{codebook.name}" / "spots.parquet",
+            output_dir / f"{roi}+{codebook.name}.raw.parquet",
+        )
+
         if spots_raw is None or spots_raw.is_empty():
             logger.warning(f"No data loaded for ROI {roi}. Skipping to next.")
             skipped_rois.append(roi)

@@ -97,10 +97,11 @@ def test_e2e_field_apply_after_downsample_no_mock(tmp_path: Path) -> None:
     )
     assert res2.exit_code == 0, res2.output
 
-    # Resolve generated model path (opt_{cb}/illum-field--{roi}-*.npz)
+    # Resolve generated model path (fields+{cb_slug}/illum-field--{roi}+{cb_slug}--*.npz)
     ws = Workspace(ws_root)
-    opt_dir = ws.opt(cb).path
-    models = sorted(opt_dir.glob(f"illum-field--{roi}-*.npz"))
+    cb_slug = Workspace.sanitize_codebook_name(cb)
+    fields_dir = ws.deconved / f"fields+{cb_slug}"
+    models = sorted(fields_dir.glob(f"illum-field--{roi}+{cb_slug}--*.npz"))
     assert models, "Expected a generated field model NPZ"
     model_npz = models[0]
 

@@ -19,6 +19,7 @@ from loguru import logger
 from rich.console import Console
 
 from fishtools.preprocess.deconv.core import deconvolve_lucyrichardson_guo, projectors
+from fishtools.preprocess.deconv.helpers import safe_delete_origin_dirs
 from fishtools.utils.io import Workspace, get_channels, get_metadata, safe_imwrite
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar
@@ -413,11 +414,7 @@ def _run(
 
                 # Deconvolution
                 t_deconv_start = time.perf_counter()
-                print(img_gpu[5, 0, 1024:1026, 1024:1026])
-                print(step)
-                print(projectors(step)[0].flatten()[1000:1005])
                 res = deconvolve_lucyrichardson_guo(img_gpu, projectors(step), iters=1)
-                print(res[5, 0, 1024:1026, 1024:1026])
 
                 if debug:
                     cp.cuda.runtime.deviceSynchronize()
@@ -755,6 +752,12 @@ def batch(
             step=step,
             debug=debug,
         )
+
+        all_round_files = sorted(path.glob(f"{r}--*/{r}-*.tif"))
+        try:
+            safe_delete_origin_dirs(all_round_files, path / "analysis" / "deconv")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Failed to delete origin directories safely: {exc}")
 
 
 if __name__ == "__main__":

@@ -305,6 +305,9 @@ def stitch(
         not_exists = [f for f in out_files if not f.exists()]
         if not_exists:
             logger.warning(f"{[f.name for f in not_exists]} do not exist. 0 spots or corrupted files.")
-        df = pl.scan_parquet([f for f in out_files if f.exists()]).collect()
-        df.write_parquet(path_cb / "spots.parquet")
+        df: pl.DataFrame = pl.scan_parquet([f for f in out_files if f.exists()]).collect()
+        df.write_parquet(
+            path_cb / "spots.parquet",
+            metadata={"codebook": codebook.stem},
+        )
         logger.info(f"Wrote to {path_cb / 'spots.parquet'}")

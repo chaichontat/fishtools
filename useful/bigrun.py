@@ -116,7 +116,7 @@ def optimize(
     codebook: Path,
     threads: int,
     *,
-    rounds: int = 6,
+    rounds: int = 8,
     blank: str | None = None,
     json_config: Path | None = None,
 ):
@@ -170,7 +170,7 @@ def cli(): ...
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Path to the codebook file",
 )
-@click.option("--threads", type=int, default=15, help="Number of threads to use")
+@click.option("--threads", type=int, default=8, help="Number of threads to use")
 @click.option("--blank", type=str, default=None, help="Blank image to subtract")
 @click.option(
     "--config",
