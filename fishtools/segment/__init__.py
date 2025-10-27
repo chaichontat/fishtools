@@ -2,13 +2,14 @@ import logging
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
+import torch
 import typer
 
 from fishtools.preprocess.spots.overlay_spots import overlay as overlay_spots_command
 from fishtools.segment.extract import cmd_extract as extract_cmd
 from fishtools.segment.extract import cmd_extract_single as extract_single_cmd
 from fishtools.segment.run import run
-from fishtools.segment.train import TrainConfig, run_train
+from fishtools.segment.train import TrainConfig, build_trt_engine, run_train
 
 
 def _strip_line_comments(text: str) -> str:
@@ -89,6 +90,42 @@ def train(
 
 
 app.command("run", help="Run Cellpose 3D inference on a fused volume")(run)
+
+
+@app.command("trt-build", help="Build a TensorRT engine for a trained model.")
+def trt_build_cmd(
+    model: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to the trained model weights",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ],
+    batch_size: int = typer.Option(
+        1,
+        "--batch-size",
+        help="Maximum batch dimension to embed in the engine profile.",
+        show_default=True,
+    ),
+):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required to build a TensorRT engine.")
+
+    model_path = model
+    name = model_path.name
+
+    plan_path = build_trt_engine(
+        model_path=model_path,
+        name=name,
+        device=torch.device("cuda:0"),
+        bsize=256,
+        batch_size=batch_size,
+    )
+
+    typer.echo(f"Saved TensorRT engine to {plan_path}")
 
 
 # Register the extract command directly from the submodule function.

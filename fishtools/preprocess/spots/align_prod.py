@@ -54,7 +54,10 @@ from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile
 
 matplotlib.use("Agg", force=True)
-cp.cuda.set_allocator(None)
+if hasattr(cp, "cuda") and hasattr(cp.cuda, "set_allocator"):
+    cp.cuda.set_allocator(None)
+else:  # CPU-only environments expose a stub without allocator control
+    logger.warning("CuPy CUDA allocator unavailable; continuing without GPU allocator reset.")
 
 from fishtools.gpu.memory import release_all as _gpu_release_all
 from fishtools.io.workspace import CorruptedTiffError, Workspace, safe_imwrite
@@ -669,6 +672,24 @@ def step_optimize(
     )
 
 
+def _channel_labels_from_metadata(metadata: Mapping[str, Any] | None, channel_count: int) -> list[str]:
+    keys: Any = None
+    if metadata is not None:
+        keys = metadata.get("keys") or metadata.get("key")
+
+    if isinstance(keys, (list, tuple)):
+        labels = [str(k) for k in keys]
+    elif keys is not None:
+        labels = [str(keys)]
+    else:
+        labels = []
+
+    if len(labels) != channel_count:
+        labels = [str(i) for i in range(channel_count)]
+
+    return labels
+
+
 @spots.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("roi", type=str)
@@ -796,12 +817,41 @@ def find_threshold(
         mins_dev = None  # type: ignore[assignment]
         scale_dev = None  # type: ignore[assignment]
 
+    skipped_mismatched: list[str] = []
     try:
         for p in sorted(highpasses[:50]):
             logger.info(f"Processing highpass {p.parent.name}/{p.name}")
 
             # Load and lightly downsample spatially to control memory; keep float32
-            img_np = tifffile.imread(p).astype(np.float32)[:, :, :1024:2, :1024:2]  # ZCYX
+            with TiffFile(p) as tif:
+                hp_np = tif.asarray()
+                metadata = tif.shaped_metadata[0] if tif.shaped_metadata else None
+
+            channel_labels = _channel_labels_from_metadata(metadata, hp_np.shape[1])
+            channel_count_img = hp_np.shape[1]
+            expected_channels = mins_np.shape[1]
+            if channel_count_img != expected_channels:
+                if channel_count_img < expected_channels:
+                    problematic = [str(i) for i in range(channel_count_img, expected_channels)]
+                    issue = "missing"
+                else:
+                    problematic = channel_labels[expected_channels:]
+                    issue = "extra"
+
+                logger.error(
+                    "Skipping %s: expected %d channels (indices %s) but found %d (labels %s). %s indices: %s",
+                    p.name,
+                    expected_channels,
+                    [str(i) for i in range(expected_channels)],
+                    channel_count_img,
+                    channel_labels,
+                    issue.capitalize(),
+                    problematic,
+                )
+                skipped_mismatched.append(p.name)
+                continue
+
+            img_np = hp_np.astype(np.float32)[:, :, :1024:2, :1024:2]  # ZCYX
 
             if use_gpu:
                 img_dev = cp.asarray(img_np, dtype=cp.float32)
@@ -822,6 +872,13 @@ def find_threshold(
         if use_gpu:
             # Best‑effort: free pools between large batches
             _gpu_release_all()
+
+    if skipped_mismatched:
+        logger.warning(
+            "Skipped %d highpass file(s) with channel mismatches: %s",
+            len(skipped_mismatched),
+            ", ".join(skipped_mismatched),
+        )
 
     path_out.mkdir(exist_ok=True)
 

@@ -523,14 +523,27 @@ def _run(
     shifts = {}
 
     cb = json.loads(Path(codebook).read_text())
-    bits_cb = set(chain.from_iterable(cb.values()))
+    codebook_bits = {str(bit) for bit in chain.from_iterable(cb.values())}
 
-    folders = {
+    roi_dirs = [
         p
         for p in Path(path).glob(f"*--{roi}")
         if p.is_dir()
         and not any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
-        and set(p.name.split("--")[0].split("_")) & set(map(str, bits_cb | set(reference.split("_"))))
+    ]
+
+    available_bits = {bit for p in roi_dirs for bit in p.name.split("--")[0].split("_") if bit}
+
+    missing_bits = sorted(bit for bit in codebook_bits if bit not in available_bits)
+    available_display = ", ".join(sorted(available_bits)) or "none"
+    if missing_bits:
+        raise ValueError(
+            f"Missing codebook bits for ROI {roi}: {', '.join(missing_bits)} (available: {available_display})"
+        )
+
+    reference_bits = set(reference.split("_"))
+    folders = {
+        p for p in roi_dirs if set(p.name.split("--")[0].split("_")) & (codebook_bits | reference_bits)
     }
 
     # Convert file name to bit
@@ -567,7 +580,7 @@ def _run(
         del _img.fid, _img.fid_raw
 
     # Remove reference if not in codebook since we're done with fiducials.
-    if not (set(reference.split("_")) & set(map(str, bits_cb))):
+    if not (set(reference.split("_")) & codebook_bits):
         del imgs[reference]
 
     channels: dict[str, str] = {}
@@ -605,8 +618,8 @@ def _run(
     ref = None
 
     affine = Affine(As=As, ats=ats)
-    bits_cb = sorted(set(map(str, bits_cb)) & set(bits))
-    for i, bit in enumerate(bits_cb):
+    bits_in_output = sorted(codebook_bits & set(bits))
+    for i, bit in enumerate(bits_in_output):
         bit = str(bit)
         img = bits[bit]
         del bits[bit]

@@ -177,28 +177,40 @@ def _load_codebook_channels(ws: Workspace, codebook: str) -> set[str]:
 def _collect_registered_channels(
     img_paths: Sequence[Path],
     expected: set[str],
-) -> set[str]:
-    """Accumulate channel identifiers present in registered TIFF metadata."""
+) -> tuple[list[Path], set[str], list[tuple[Path, list[str]]]]:
+    """Filter registered tiles that satisfy the required channel coverage.
+
+    Returns the valid tiles, the union of channels observed across them, and tiles that
+    were skipped with their missing channels.
+    """
 
     discovered: set[str] = set()
+    valid_paths: list[Path] = []
+    skipped: list[tuple[Path, list[str]]] = []
+
     for img_path in img_paths:
         with TiffFile(img_path) as tif:
             metadata = _read_tiff_metadata(tif)
         raw_keys = metadata.get("key")
         if raw_keys is None:
-            continue
-        if isinstance(raw_keys, str):
-            discovered.add(raw_keys)
+            channels: set[str] = set()
+        elif isinstance(raw_keys, str):
+            channels = {raw_keys}
         elif isinstance(raw_keys, Iterable):
-            for key in raw_keys:
-                discovered.add(str(key))
+            channels = {str(key) for key in raw_keys}
         else:
-            discovered.add(str(raw_keys))
+            channels = {str(raw_keys)}
 
-        if expected and expected.issubset(discovered):
-            break
+        if expected:
+            missing = sorted(expected - channels)
+            if missing:
+                skipped.append((img_path, missing))
+                continue
 
-    return discovered
+        discovered.update(channels)
+        valid_paths.append(img_path)
+
+    return valid_paths, discovered, skipped
 
 
 def create_tile_config(
@@ -477,6 +489,15 @@ def register(
         except Exception as e:
             logger.warning(f"Failed to load config {json_config}: {e}")
     ws = Workspace(path)
+    out_path = ws.stitch(roi)
+    tileconfig_registered = out_path / "TileConfiguration.registered.txt"
+    if tileconfig_registered.exists() and not overwrite:
+        logger.info(
+            f"TileConfiguration.registered.txt already exists for roi={roi}; "
+            "use --overwrite to re-register. Skipping."
+        )
+        return
+
     available_codebooks = ws.registered_codebooks(rois=[roi])
 
     if codebook is None:
@@ -504,28 +525,43 @@ def register(
     if not imgs:
         raise ValueError(f"No registered TIFF files found under {registered_dir}.")
     codebook_channels = _load_codebook_channels(ws, codebook)
-    registered_channels = _collect_registered_channels(imgs, expected=codebook_channels)
+    imgs, registered_channels, skipped_tiles = _collect_registered_channels(imgs, expected=codebook_channels)
+
+    if skipped_tiles:
+        for skipped_path, missing in skipped_tiles:
+            missing_labels = ", ".join(missing)
+            logger.warning(
+                f"Skipping registered tile {skipped_path.name} for ROI '{roi}' (codebook '{codebook}') "
+                f"because it is missing channel(s): {missing_labels}."
+            )
+
+    if not imgs:
+        logger.warning(
+            f"All registered tiles for ROI '{roi}' with codebook '{codebook}' are missing required channels; "
+            "skipping this ROI."
+        )
+        return
 
     if not registered_channels:
-        raise ValueError(
-            f"Registered tiles for ROI '{roi}' with codebook '{codebook}' are missing TIFF metadata "
-            "'key'; unable to validate channel coverage."
+        logger.warning(
+            f"Registered tiles for ROI '{roi}' with codebook '{codebook}' have no channel metadata; skipping."
         )
+        return
 
     missing_channels = sorted(codebook_channels - registered_channels)
     if missing_channels:
         observed = ", ".join(sorted(registered_channels)) or "none"
         missing = ", ".join(missing_channels)
-        raise ValueError(
-            f"Registered tiles for ROI '{roi}' with codebook '{codebook}' are missing channel(s): "
-            f"{missing}. Observed channels: {observed}."
+        logger.warning(
+            f"Registered tiles for ROI '{roi}' with codebook '{codebook}' still missing channel(s): {missing}. "
+            f"Observed channels: {observed}. Skipping ROI."
         )
+        return
 
     logger.debug(
         f"Validated codebook channels for roi={roi}, codebook={codebook}: {sorted(registered_channels)}"
     )
 
-    out_path = ws.stitch(roi)
     out_path.mkdir(exist_ok=True)
 
     if overwrite:

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Union
 
 import cupy as cp
 import matplotlib
@@ -426,14 +427,27 @@ def precompute_global_quantization(
             # Clip out non-positive intensities for log-scale x-axis
             mask = mids > 0
             if not np.any(mask):
-                ax.text(0.5, 0.5, "no >0 bins", transform=ax.transAxes, ha="center", va="center")
+                ax.text(
+                    0.5,
+                    0.5,
+                    "no >0 bins",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="center",
+                )
             else:
                 ax.plot(mids[mask], counts[mask] + 1.0)
                 ax.set_xscale("log")
                 ax.set_yscale("log")
             # Vertical lines at low/high cutoffs with percentile labels (only if >0)
             if q_lo[i] > 0:
-                ax.axvline(q_lo[i], color="tab:red", linestyle="--", linewidth=1.2, label=f"low {p_low_pct}%")
+                ax.axvline(
+                    q_lo[i],
+                    color="tab:red",
+                    linestyle="--",
+                    linewidth=1.2,
+                    label=f"low {p_low_pct}%",
+                )
             if q_hi[i] > 0:
                 ax.axvline(
                     q_hi[i],
@@ -585,7 +599,7 @@ def quantize(
             deliverable = np.concatenate([quantized, fid], axis=0)
 
             if metadata is None:
-                metadata_dict: Dict[str, Any] = {}
+                metadata_dict: dict[str, Any] = {}
             elif isinstance(metadata, dict):
                 metadata_dict = dict(metadata)
             else:
@@ -680,7 +694,7 @@ def quantize_global(
     i_max: int = 2**16 - 2,  # use 65535; set 65534 if you reserve 65535
     return_stats: bool = False,
     as_numpy: bool = True,
-) -> Union[np.ndarray, Tuple[np.ndarray, Dict[str, Any]]]:
+) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
     """
     Map deconvolved float32 data to uint16 with a single global affine per channel.
 
@@ -744,7 +758,11 @@ def quantize_global(
         clipped_low = int((arr <= 0).sum().item())
         clipped_high = int((arr >= float(i_max)).sum().item())
         total = int(arr.size)
-        stats = {"clipped_low": clipped_low, "clipped_high": clipped_high, "total": total}
+        stats = {
+            "clipped_low": clipped_low,
+            "clipped_high": clipped_high,
+            "total": total,
+        }
 
     arr = arr.astype(xp.uint16, copy=False)  # (Z, C, Y, X)
     arr = arr.reshape(Z * C, Y, X)  # (-1, Y, X)

@@ -6,17 +6,11 @@ from typing import Any, Literal, Pattern, Sequence, cast
 
 import numpy as np
 import torch
+from cellpose.contrib.cellposetrt import trt_build
 from loguru import logger
 from pydantic import BaseModel, Field
 
-try:
-    from cellpose.cellpose_te_adapter import TEConfig, enable_transformer_engine
-except ModuleNotFoundError as exc:
-    TEConfig = None
-    enable_transformer_engine = None
-    _TE_IMPORT_ERROR = exc
-else:
-    _TE_IMPORT_ERROR = None
+from fishtools.segment.augment import PhotometricConfig, build_batch_augmenter
 from fishtools.utils.logging import setup_workspace_logging
 from fishtools.utils.utils import noglobal
 
@@ -24,6 +18,20 @@ try:
     IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
 except PackageNotFoundError:
     IS_CELLPOSE_SAM = False
+
+
+_PLAN_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def sanitize_device_name(name: str) -> str:
+    sanitized = _PLAN_SANITIZE_PATTERN.sub("_", name).strip("_")
+    return sanitized or "cuda"
+
+
+def plan_path_for_device(model_path: Path, device_name: str) -> Path:
+    safe_device_name = sanitize_device_name(device_name)
+    base_name = model_path.name
+    return model_path.with_name(f"{base_name}-{safe_device_name}.plan")
 
 
 class TrainConfig(BaseModel):
@@ -334,9 +342,6 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
     images, labels, image_names, test_images, test_labels, image_names_test = out
 
-    if train_config.te_fp8 and not train_config.use_te:
-        raise ValueError("Transformer Engine FP8 requested but --use-te not enabled.")
-
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU is required for training but was not detected.")
 
@@ -348,18 +353,18 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
         device=device,
     )
 
-    if train_config.use_te:
-        if enable_transformer_engine is None or TEConfig is None:
-            raise RuntimeError(
-                "Transformer Engine requested but cellpose_te_adapter is unavailable. "
-                "Ensure the adapter is on PYTHONPATH."
-            ) from _TE_IMPORT_ERROR
+    if train_config.use_te or train_config.te_fp8:
+        raise ValueError(
+            "Transformer Engine support has been removed; omit `use_te` and `te_fp8` from TrainConfig."
+        )
 
-        mode = "fp8" if train_config.te_fp8 else "bf16"
-        calibrate_steps = 100 if train_config.te_fp8 else 0
-        # Use a plain print here to avoid any logger scoping surprises in CLI contexts
-        print(f"Enabling Transformer Engine mode={mode} calibrate_steps={calibrate_steps}")
-        enable_transformer_engine(model.net, TEConfig(mode=mode, calibrate_steps=calibrate_steps))
+    # Photometric augmenter: pick 1–2 ops per image, applied before packing
+    phot_aug = build_batch_augmenter(
+        cfg=PhotometricConfig(),
+        seed=0,
+        min_ops_per_image=1,
+        max_ops_per_image=2,
+    )
 
     model_path, train_losses, test_losses = train_seg(
         model.net,
@@ -382,9 +387,58 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
         pack_k=train_config.pack_k,
         pack_guard=train_config.pack_guard,
         pack_stripe_height=train_config.pack_stripe_height,
+        batch_photom_augment=phot_aug,
         **({"channels": train_config.channels} if not IS_CELLPOSE_SAM else {}),
     )
+
+    model_path = Path(model_path)
+    build_trt_engine(
+        model_path=model_path,
+        name=name,
+        bsize=train_config.bsize,
+        device=device,
+        batch_size=1,
+    )
+
     return model_path, train_losses, test_losses
+
+
+def build_trt_engine(
+    *,
+    model_path: Path,
+    bsize: int,
+    device: torch.device,
+    batch_size: int = 1,
+) -> Path:
+    device_name_raw = torch.cuda.get_device_name(device)
+    base_name = model_path.name
+    plan_path = plan_path_for_device(model_path, device_name_raw)
+    onnx_path = model_path.with_name(f"{base_name}.onnx")
+    device_props = torch.cuda.get_device_properties(device)
+    vram_mb = max(1024, int(device_props.total_memory / (1024 * 1024)))
+    logger.info(
+        f"Building TensorRT engine {plan_path.name} (batch_size={batch_size}, bsize={bsize}, device={device_name_raw}, vram={vram_mb} MB)"
+    )
+
+    trt_build.export_onnx(
+        str(model_path),
+        str(onnx_path),
+        batch_size=batch_size,
+        bsize=bsize,
+        opset=20,
+    )
+    trt_build.build_engine(
+        str(onnx_path),
+        str(plan_path),
+        batch_size=batch_size,
+        bsize=bsize,
+        vram=vram_mb,
+    )
+    try:
+        onnx_path.unlink()
+    except FileNotFoundError:
+        pass
+    return plan_path
 
 
 # @noglobal
