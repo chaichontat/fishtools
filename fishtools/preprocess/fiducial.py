@@ -419,7 +419,7 @@ def handle_exception(
             local_fwhm += threshold_step
             logger.warning(f"Trying with larger FWHM. σ threshold: {local_σ}, FWHM: {local_fwhm}")
     elif isinstance(exc, DriftTooLarge) or isinstance(exc, ResidualTooLarge):
-        logger.warning(log_message)
+        logger.warning(log_message + exc.args[0])
         local_σ += threshold_step
         if (local_σ, local_fwhm) in tried and local_fwhm >= min_fwhm:
             local_fwhm -= threshold_step

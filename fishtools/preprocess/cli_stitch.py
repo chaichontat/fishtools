@@ -455,6 +455,7 @@ def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int, j
 @click.option("--threshold", type=float, default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--max-proj", is_flag=True)
+@click.option("--debug", is_flag=True)
 @click.option(
     "--config",
     "json_config",
@@ -474,13 +475,14 @@ def register(
     max_proj: bool = False,
     overwrite: bool = False,
     threshold: float | None = None,
+    debug: bool = False,
     json_config: Path | None = None,
 ):
     setup_cli_logging(
         path,
         component="preprocess.stitch.register",
         file=f"stitch-register-{roi}",
-        extra={"roi": roi, "codebook": codebook},
+        extra={"roi": roi, "codebook": codebook, "debug": debug},
     )
     sc: StitchingConfig | None = None
     if json_config:
@@ -524,16 +526,16 @@ def register(
     imgs = sorted(f for f in registered_dir.glob("*.tif") if not f.name.endswith(".hp.tif"))
     if not imgs:
         raise ValueError(f"No registered TIFF files found under {registered_dir}.")
-    codebook_channels = _load_codebook_channels(ws, codebook)
-    imgs, registered_channels, skipped_tiles = _collect_registered_channels(imgs, expected=codebook_channels)
+    # codebook_channels = _load_codebook_channels(ws, codebook)
+    # imgs, registered_channels, skipped_tiles = _collect_registered_channels(imgs, expected=codebook_channels)
 
-    if skipped_tiles:
-        for skipped_path, missing in skipped_tiles:
-            missing_labels = ", ".join(missing)
-            logger.warning(
-                f"Skipping registered tile {skipped_path.name} for ROI '{roi}' (codebook '{codebook}') "
-                f"because it is missing channel(s): {missing_labels}."
-            )
+    # if skipped_tiles:
+    #     for skipped_path, missing in skipped_tiles:
+    #         missing_labels = ", ".join(missing)
+    #         logger.warning(
+    #             f"Skipping registered tile {skipped_path.name} for ROI '{roi}' (codebook '{codebook}') "
+    #             f"because it is missing channel(s): {missing_labels}."
+    #         )
 
     if not imgs:
         logger.warning(
@@ -542,25 +544,25 @@ def register(
         )
         return
 
-    if not registered_channels:
-        logger.warning(
-            f"Registered tiles for ROI '{roi}' with codebook '{codebook}' have no channel metadata; skipping."
-        )
-        return
+    # if not registered_channels:
+    #     logger.warning(
+    #         f"Registered tiles for ROI '{roi}' with codebook '{codebook}' have no channel metadata; skipping."
+    #     )
+    #     return
 
-    missing_channels = sorted(codebook_channels - registered_channels)
-    if missing_channels:
-        observed = ", ".join(sorted(registered_channels)) or "none"
-        missing = ", ".join(missing_channels)
-        logger.warning(
-            f"Registered tiles for ROI '{roi}' with codebook '{codebook}' still missing channel(s): {missing}. "
-            f"Observed channels: {observed}. Skipping ROI."
-        )
-        return
+    # missing_channels = sorted(codebook_channels - registered_channels)
+    # if missing_channels:
+    #     observed = ", ".join(sorted(registered_channels)) or "none"
+    #     missing = ", ".join(missing_channels)
+    #     logger.warning(
+    #         f"Registered tiles for ROI '{roi}' with codebook '{codebook}' still missing channel(s): {missing}. "
+    #         f"Observed channels: {observed}. Skipping ROI."
+    #     )
+    #     return
 
-    logger.debug(
-        f"Validated codebook channels for roi={roi}, codebook={codebook}: {sorted(registered_channels)}"
-    )
+    # logger.debug(
+    #     f"Validated codebook channels for roi={roi}, codebook={codebook}: {sorted(registered_channels)}"
+    # )
 
     out_path.mkdir(exist_ok=True)
 
@@ -625,6 +627,7 @@ def register(
         fuse=False,
         threshold=threshold,
         name="TileConfiguration",
+        capture_output=not debug,
         sc=sc,
     )
     # Post-check: verify registered tile configuration and emit a layout plot

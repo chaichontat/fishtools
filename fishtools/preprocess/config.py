@@ -242,8 +242,8 @@ class DeconvolutionConfig(BaseModel):
     # BaSiC correction nested under deconvolution
     basic: BasicConfig = Field(default_factory=BasicConfig, description="BaSiC correction configuration")
     output_mode: DeconvolutionOutputMode = Field(
-        default=DeconvolutionOutputMode.U16,
-        description="Default output mode for CLI-driven deconvolution (u16 or float32).",
+        default=DeconvolutionOutputMode.LEGACY,
+        description="Default output mode for CLI-driven deconvolution (u16, float32, or legacy).",
     )
 
 

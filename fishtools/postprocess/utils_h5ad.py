@@ -10,7 +10,6 @@ import anndata as ad
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scanpy as sc
 
 __all__ = [
     "std_log1p",
@@ -28,6 +27,8 @@ __all__ = [
 
 def std_log1p(adata: ad.AnnData, min_genes: int = 200, min_cells: int = 100) -> ad.AnnData:
     """Standard Scanpy normalization: filter, normalize_total, log1p."""
+
+    import scanpy as sc
 
     sc.pp.filter_cells(adata, min_genes=min_genes)
     sc.pp.filter_genes(adata, min_cells=min_cells)
@@ -48,6 +49,7 @@ def cluster(
     """Convenience wrapper for RAPIDS PCA → neighbors → UMAP → Leiden."""
 
     import rapids_singlecell as rsc
+    import scanpy as sc
 
     if use_rep == "X_pca":
         sc.pp.filter_genes(adata, min_cells=min_cells)
@@ -61,6 +63,8 @@ def cluster(
 def qc(adata: ad.AnnData) -> ad.AnnData:
     """Calculate QC metrics with defenses for low gene counts."""
 
+    import scanpy as sc
+
     n_genes = adata.shape[1]
     sc.pp.calculate_qc_metrics(
         adata,
@@ -72,6 +76,8 @@ def qc(adata: ad.AnnData) -> ad.AnnData:
 
 def normalize_pearson(adata: ad.AnnData, n_top_genes: int = 2000):
     """Select HVGs via Pearson residuals, then normalize residuals."""
+
+    import scanpy as sc
 
     sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=n_top_genes)
 
@@ -118,6 +124,7 @@ def leiden_umap(
     """Run RAPIDS neighbors + Leiden + UMAP with configurable parameters."""
 
     import rapids_singlecell as rsc
+    import scanpy as sc
 
     rsc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=n_pcs, metric=metric)
     sc.tl.leiden(adata, n_iterations=2, resolution=resolution, flavor="igraph")
@@ -127,6 +134,8 @@ def leiden_umap(
 
 def normalize_total(adata: ad.AnnData):
     """Return adata.log1p normalized copy and placeholder plot callable."""
+
+    import scanpy as sc
 
     sc.pp.normalize_total(adata)
     sc.pp.log1p(adata)
@@ -159,6 +168,8 @@ def run_tricycle(adata: ad.AnnData, trc: pd.DataFrame) -> ad.AnnData:
 
 def get_leiden_genes(adata: ad.AnnData, group: int | str | Literal["all"], head: int = 5):
     """Retrieve top marker genes for a Leiden cluster or all clusters."""
+
+    import scanpy as sc
 
     if group == "all":
         return sorted(

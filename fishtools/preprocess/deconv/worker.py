@@ -54,7 +54,9 @@ def parse_device_spec(spec: str | Sequence[int] | None) -> list[int]:
     visible_env = os.environ.get("CUDA_VISIBLE_DEVICES")
     visible_mask: list[int] | None = None
     if visible_env:
-        visible_mask = [int(item.strip()) for item in visible_env.split(",") if item.strip()]
+        parsed = [int(item.strip()) for item in visible_env.split(",") if item.strip()]
+        if parsed:
+            visible_mask = parsed
 
     try:
         total = cp.cuda.runtime.getDeviceCount()
@@ -65,7 +67,10 @@ def parse_device_spec(spec: str | Sequence[int] | None) -> list[int]:
         raise RuntimeError("No CUDA devices detected")
 
     if spec is None or spec == "auto":
-        return list(range(total))
+        if visible_mask is None:
+            # Default to the primary device when no visibility mask is configured.
+            return [0]
+        return list(range(len(visible_mask)))
 
     if isinstance(spec, str):
         items = [s.strip() for s in spec.split(",") if s.strip()]

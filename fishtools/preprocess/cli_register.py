@@ -2,12 +2,12 @@
 import json
 import pickle
 import shutil
-import subprocess
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
+from subprocess import CompletedProcess
 from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
@@ -32,7 +32,7 @@ from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import Shifts, align_fiducials
 from fishtools.utils.io import Workspace, safe_imwrite
 from fishtools.utils.logging import setup_cli_logging
-from fishtools.utils.pretty_print import progress_bar_threadpool
+from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
 
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
@@ -120,10 +120,14 @@ def parse_nofids(
     return out, out_shift, bit_name_mapping
 
 
-def _run_child_cli(argv: list[str], *, check: bool = True):
-    """Wrapper around subprocess.run for easy monkeypatching in tests."""
+def _run_child_cli(
+    argv: list[str],
+    *,
+    check: bool = True,
+) -> CompletedProcess[str]:
+    """Wrapper around subprocess execution for easy monkeypatching in tests."""
 
-    return subprocess.run(argv, check=check)
+    return run_subprocess_streaming(argv, check=check)
 
 
 def _copy_codebook_to_workspace(cli_path: Path, codebook_path: Path) -> Path:
@@ -355,8 +359,6 @@ def run_fiducial(
     debug: bool,
     no_priors: bool = False,
 ):
-    logger.info("Aligning fiducials")
-
     prior_mapping: dict[str, str] = {}
 
     if (
@@ -490,7 +492,7 @@ def _run(
     overwrite: bool = False,
     no_priors: bool = False,
 ):
-    logger.info("Reading files")
+    logger.info("Starting")
     codebook_name = Path(codebook).stem
     out_path = path / f"registered--{roi}+{codebook_name}"
     reg_file = out_path / f"reg-{idx:04d}.tif"
@@ -667,6 +669,7 @@ def _run(
 
         transformed[bit] = transformed_img
         logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
+        logger.info("Finished")
 
     if not len(transformed):
         raise ValueError("No images were transformed.")

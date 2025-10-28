@@ -6,7 +6,6 @@ import pickle
 import random
 import re
 import shutil
-import subprocess
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import timedelta
@@ -23,7 +22,6 @@ import numpy as np
 import polars as pl
 import rich_click as click
 import starfish
-import tifffile
 import xarray as xr
 from loguru import logger
 from numpy.typing import NDArray  # noqa: F401
@@ -80,12 +78,11 @@ from fishtools.preprocess.spots.overlay_spots import overlay
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import plot_all_genes
-from fishtools.utils.pretty_print import progress_bar_threadpool
+from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
 from fishtools.utils.utils import git_hash
 
 GPU = os.environ.get("GPU", "1") == "1"
 if GPU:
-    logger.info("Using GPU")
     from fishtools.gpu.codebook import Codebook
 else:
     from starfish import Codebook
@@ -185,12 +182,21 @@ def _build_field_context(
     axes_attr = attrs.get("axes")
     if za.ndim != 4:
         raise click.ClickException("Discovered field store must be TCYX (axes='TCYX').")
+    if axes_attr not in (None, "TCYX"):
+        raise click.ClickException(f"Expected axes='TCYX' in field store, found {axes_attr!r}.")
+
     t_labels = attrs.get("t_labels")
-    try:
+    if isinstance(t_labels, (list, tuple)):
+        try:
+            t_low = int(t_labels.index("low"))
+            t_range = int(t_labels.index("range"))
+        except ValueError as exc:
+            raise click.ClickException(
+                "TCYX store must contain 'low' and 'range' planes in t_labels"
+            ) from exc
+    else:
         t_low = 0
         t_range = 1
-    except ValueError:
-        raise click.ClickException("TCYX store must contain 'low' and 'range' planes in t_labels")
     model_meta = dict(attrs.get("model_meta", {})) if hasattr(attrs, "get") else {}
     ds = 4  # int(model_meta.get("downsample", 1) or 1)
     fx0 = float(model_meta["x0"])
@@ -443,7 +449,8 @@ def load_codebook(
         try:
             cb_json.pop(k)
         except KeyError:
-            logger.warning(f"Codebook does not contain {k}")
+            ...
+            # logger.warning(f"Codebook does not contain {k}")
 
     if simple:
         cb_json = {k: [v[0]] for k, v in cb_json.items()}
@@ -531,10 +538,15 @@ def _batch(
     if not len(paths):
         raise ValueError("No files found.")
 
-    def _run_with_stagger(cmd: list[str], delay: float = 0.0):
+    def _run_with_stagger(cmd: list[str], delay: float = 0.0, worker_idx: int | None = None):
         if delay > 0:
             time.sleep(delay)
-        return subprocess.run(cmd, check=True, capture_output=False)
+        return run_subprocess_streaming(
+            cmd,
+            thread_index=worker_idx,
+            check=True,
+            emit_to_console=True,
+        )
 
     with progress_bar_threadpool(
         len(paths) * len(split_list), threads=threads, stop_on_exception=False
@@ -549,7 +561,7 @@ def _batch(
                 cmd = ["python", __file__, mode, str(path), *[a for a in args if a]] + (
                     ["--split", str(s)] if s is not None else []
                 )
-                submit(_run_with_stagger, cmd, delay)
+                submit(_run_with_stagger, cmd, delay, slot + 1)
                 idx += 1
 
 
@@ -1781,9 +1793,7 @@ def run(
         else:
             decode = SpotDecodeConfig()
 
-    logger.info(
-        f"Running {path.parent.name}/{path.name} {f'split {split}' if split is not None else ''} with {limit_z} z-slices and {subsample_z}x subsampling."
-    )
+    logger.info(f"Running {path.parent.name}/{path.name} {f'split {split}' if split is not None else ''}")
     with TiffFile(path) as tif:
         img_keys = tif.shaped_metadata[0]["key"]
         raw = tif.asarray()
@@ -1828,6 +1838,7 @@ def run(
             [bit_mapping[k] for k in used_bits if k in bit_mapping],
         ]
     ) + tuple(split_slice)
+    max_proj = False
     stack = make_fetcher(
         path,
         raw,
