@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 
+import cupy as cp
 import numpy as np
 import rich_click as click
 from loguru import logger
@@ -42,7 +44,7 @@ from fishtools.preprocess.deconv.worker import (
     run_multi_gpu,
 )
 from fishtools.utils.logging import setup_cli_logging
-from fishtools.utils.pretty_print import get_shared_console, progress_bar
+from fishtools.utils.pretty_print import ProgressReporter, progress_reporter, wrap_progress
 
 rescale = core_rescale
 
@@ -179,7 +181,15 @@ __all__ = [
 _DEFAULT_OUTPUT_MODE = DeconvolutionConfig().output_mode
 _PREPARE_DEFAULT_MODE = DeconvolutionOutputMode.F32
 
-ProgressUpdater = Callable[[], int]
+ProgressCallback = Callable[[], int]
+
+
+def _ensure_reporter(progress: ProgressReporter | ProgressCallback | None) -> ProgressReporter | None:
+    if progress is None:
+        return None
+    if isinstance(progress, ProgressReporter):
+        return progress
+    return wrap_progress(progress)
 
 
 def _setup_cli_logging(
@@ -475,19 +485,21 @@ def _execute_round_plan(
     devices: Sequence[int],
     stop_on_error: bool,
     debug: bool,
-    progress: ProgressUpdater | None = None,
+    progress: ProgressReporter | ProgressCallback | None = None,
 ) -> list[WorkerMessage]:
     if not plan.has_work:
         return []
+
+    reporter = _ensure_reporter(progress)
 
     prefixed = plan.prefixed
     pending = plan.pending
     depth = DEFAULT_QUEUE_DEPTH
 
-    def _run_with_progress(update: ProgressUpdater) -> list[WorkerMessage]:
+    def _run_with_progress(reporter: ProgressReporter) -> list[WorkerMessage]:
         def callback(message: WorkerMessage) -> None:
             if message.status == "ok":
-                update()
+                reporter.advance()
                 # Render per-tile timing above the shared progress bar without duplicating bars
                 if message.path is not None and message.stages is not None:
                     s = message.stages
@@ -495,7 +507,7 @@ def _execute_round_plan(
                         s.get("basic", 0.0) + s.get("deconv", 0.0) + s.get("quant", 0.0) + s.get("post", 0.0)
                     )
                     dev = message.device if message.device is not None else "?"
-                    get_shared_console().print(
+                    reporter.print(
                         f"[P{message.worker_id + 1}] [GPU{dev}] {message.path.name}: "
                         f"gpu={gpu:.2f}s (basic={s.get('basic', 0.0):.2f}+"
                         f"dec={s.get('deconv', 0.0):.2f}+quant={s.get('quant', 0.0):.2f}+post={s.get('post', 0.0):.2f}) "
@@ -503,7 +515,7 @@ def _execute_round_plan(
                     )
             elif message.status == "error":
                 # Print errors above the progress bar as well
-                get_shared_console().print(
+                reporter.print(
                     f"[bold red]Failed to process {getattr(message.path, 'name', '<unknown>')}: {message.error}[/bold red]"
                 )
 
@@ -517,11 +529,11 @@ def _execute_round_plan(
             debug=debug,
         )
 
-    if progress is None:
-        with progress_bar(len(pending)) as local_progress:
-            failures = _run_with_progress(local_progress)
+    if reporter is None:
+        with progress_reporter(len(pending)) as local_reporter:
+            failures = _run_with_progress(local_reporter)
     else:
-        failures = _run_with_progress(progress)
+        failures = _run_with_progress(reporter)
 
     if failures:
         details = ", ".join(str(msg.path) for msg in failures if msg.path is not None)
@@ -548,7 +560,7 @@ def _run_round_tiles(
     stop_on_error: bool,
     label: str | None,
     mode: DeconvolutionOutputMode,
-    progress: ProgressUpdater | None = None,
+    progress: ProgressReporter | ProgressCallback | None = None,
 ) -> list[WorkerMessage]:
     """Run one round with explicit OutputBackend chosen by CLI."""
 
@@ -600,7 +612,7 @@ def _plan_and_execute(
     stop_on_error: bool,
     mode: DeconvolutionOutputMode,
     delete_origin: bool,
-    progress: ProgressUpdater | None = None,
+    progress: ProgressReporter | ProgressCallback | None = None,
 ) -> list[WorkerMessage]:
     workspace = Workspace(path)
     out_dir = workspace.deconved
@@ -699,13 +711,17 @@ def _plan_and_execute(
 
     failures: list[WorkerMessage] = []
 
-    def _execute(plan: _RoundProcessingPlan, progress_callback: ProgressUpdater | None) -> None:
+    def _execute(
+        plan: _RoundProcessingPlan,
+        progress_callback: ProgressReporter | ProgressCallback | None,
+    ) -> None:
+        reporter = _ensure_reporter(progress_callback)
         plan_failures = _execute_round_plan(
             plan,
             devices=devices,
             stop_on_error=stop_on_error,
             debug=debug,
-            progress=progress_callback,
+            progress=reporter,
         )
         failures.extend(plan_failures)
         if delete_origin:
@@ -714,13 +730,15 @@ def _plan_and_execute(
             except Exception as exc:  # noqa: BLE001
                 plan.prefixed.error(f"Failed to delete origin directories: {exc}")
 
-    if progress is None:
-        with progress_bar(total_pending) as shared_progress:
+    base_reporter = _ensure_reporter(progress)
+
+    if base_reporter is None:
+        with progress_reporter(total_pending) as shared_reporter:
             for plan in plans:
-                _execute(plan, shared_progress)
+                _execute(plan, shared_reporter)
     else:
         for plan in plans:
-            _execute(plan, progress)
+            _execute(plan, base_reporter)
 
     return failures
 
@@ -922,6 +940,7 @@ def prepare(
         debug=debug,
         extra={"rounds": rounds_tag, "roi": roi_tag},
     )
+
     try:
         device_list = parse_device_spec(devices)
     except Exception as exc:  # noqa: BLE001
@@ -988,6 +1007,7 @@ def prepare(
     show_default=True,
     help="Skip writing uint16 deliverables so quantize can run separately.",
 )
+@click.option("--skip-non-bit", is_flag=True)
 def run(
     path: Path,
     round_name: str | None,
@@ -1005,6 +1025,7 @@ def run(
     devices: str,
     stop_on_error: bool,
     skip_quantized: bool,
+    skip_non_bit: bool = False,
 ) -> None:
     """Run multi-GPU deconvolution across selected rounds and ROIs."""
     round_tag = round_name or "all"
@@ -1035,7 +1056,7 @@ def run(
     if round_name is None or round_name == "*":
         selected_rounds = (
             tuple(all_rounds)
-            if mode == "legacy"
+            if not skip_non_bit
             else [
                 r
                 for r in all_rounds
@@ -1095,6 +1116,84 @@ def run(
 @deconvnew.command()
 @click.argument("path", type=click.Path(path_type=Path))
 @click.argument("round_name", type=str, required=False)
+@click.option("--roi", "roi_name", type=str, default="*")
+@click.option("--ref", "ref_round", type=str, default=None)
+@click.option("--limit", type=int, default=None)
+@click.option(
+    "--mode",
+    "--backend",
+    type=click.Choice(["u16", "float32", "legacy"]),
+    default=_DEFAULT_OUTPUT_MODE.value,
+    show_default=True,
+)
+@click.option("--histogram-bins", type=int, default=8192, show_default=True)
+@click.option("--overwrite", is_flag=True)
+@click.option("--delete-origin", is_flag=True)
+@click.option("--n-fids", type=int, default=2, show_default=True)
+@click.option(
+    "--basic-name",
+    type=str,
+    default=None,
+    show_default=False,
+    help=("BaSiC profile prefix. If omitted, uses round-specific prefix first then falls back to 'all'."),
+)
+@click.option("--debug", is_flag=True)
+@click.option("--devices", type=str, default="auto", show_default=True)
+@click.option(
+    "--stop-on-error/--continue-on-error",
+    default=True,
+    show_default=True,
+    help="Stop all workers after the first failure.",
+)
+@click.option(
+    "--skip-quantized/--include-quantized",
+    default=False,
+    show_default=True,
+    help="Skip writing uint16 deliverables so quantize can run separately.",
+)
+@click.option("--skip-non-bit", is_flag=True)
+def batch(
+    path: Path,
+    round_name: str | None,
+    *,
+    roi_name: str,
+    ref_round: str | None,
+    limit: int | None,
+    mode: str,
+    histogram_bins: int,
+    overwrite: bool,
+    delete_origin: bool,
+    n_fids: int,
+    basic_name: str | None,
+    debug: bool,
+    devices: str,
+    stop_on_error: bool,
+    skip_quantized: bool,
+    skip_non_bit: bool = False,
+) -> None:
+    run.callback(
+        path,
+        round_name,
+        roi_name=roi_name,
+        ref_round=ref_round,
+        limit=limit,
+        mode=mode,
+        histogram_bins=histogram_bins,
+        overwrite=overwrite,
+        delete_origin=delete_origin,
+        n_fids=n_fids,
+        basic_name=basic_name,
+        debug=debug,
+        devices=devices,
+        stop_on_error=stop_on_error,
+        skip_quantized=skip_quantized,
+        skip_non_bit=skip_non_bit,
+    )
+
+
+@deconvnew.command()
+@click.argument("path", type=click.Path(path_type=Path))
+@click.argument("round_name", type=str, required=False)
 def easy(path: Path, round_name: str | None):
     round_tag = round_name or "all"
     _setup_cli_logging(
@@ -1121,7 +1220,7 @@ def easy(path: Path, round_name: str | None):
                 ),
                 executor.submit(
                     subprocess.run,
-                    ["preprocess", "deconvnew", "run", str(path), round_],
+                    ["preprocess", "deconvnew", "run", "--mode=u16", str(path), round_],
                     check=True,
                 ),
             ]
