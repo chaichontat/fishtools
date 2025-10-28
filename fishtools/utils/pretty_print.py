@@ -1,13 +1,16 @@
+import io
+import itertools
 import json
 import os
 import signal
 import subprocess
 import threading
 import time
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from types import FrameType
-from typing import Any, Callable, Concatenate, Generator, ParamSpec, Protocol, TypeVar
+from typing import IO, Any, Callable, Concatenate, Generator, ParamSpec, Protocol, TypeVar
 
 import colorama
 from loguru import logger
@@ -200,6 +203,218 @@ def progress_bar(
             deque(track, maxlen=0)  # Exhaust the iterator
         except (StopIteration, ValueError):
             ...
+
+
+class ProgressReporter:
+    """Helper that coordinates progress advancement and console-safe output."""
+
+    __slots__ = ("_advance", "_console")
+
+    def __init__(self, advance: Callable[[], int], *, console: Console | None = None) -> None:
+        self._advance = advance
+        self._console = console or get_shared_console()
+
+    def advance(self) -> int:
+        """Advance the underlying progress task."""
+
+        return self._advance()
+
+    def print(self, message: str, *, style: str | None = None, end: str = "\n") -> None:
+        """Render ``message`` above the live progress bar without forcing a redraw."""
+
+        if style:
+            self._console.print(f"[{style}]{message}[/{style}]", end=end)
+        else:
+            self._console.print(message, end=end)
+
+    def log(self, *args: Any, **kwargs: Any) -> None:
+        """Delegate to the shared console's ``log`` helper."""
+
+        self._console.log(*args, **kwargs)
+
+    @property
+    def console(self) -> Console:
+        return self._console
+
+
+@contextmanager
+def progress_reporter(
+    n: int,
+    *,
+    step_stats: tuple[int, ...] | None = (5, 10),
+) -> Generator[ProgressReporter, None, None]:
+    """Context manager yielding a :class:`ProgressReporter` bound to ``n`` steps."""
+
+    with progress_bar(n, step_stats=step_stats) as advance:
+        yield ProgressReporter(advance)
+
+
+def wrap_progress(advance: Callable[[], int]) -> ProgressReporter:
+    """Wrap an existing progress callback into a :class:`ProgressReporter`."""
+
+    return ProgressReporter(advance)
+
+
+# Maintain stable worker identifiers for streaming subprocess output.
+_STREAM_THREAD_IDS: dict[int, int] = {}
+_STREAM_THREAD_COUNTER = itertools.count(1)
+_STREAM_ID_LOCK = threading.RLock()
+
+
+def _resolve_stream_thread_index(explicit: int | None) -> int:
+    if explicit is not None:
+        return explicit
+    ident = threading.get_ident()
+    with _STREAM_ID_LOCK:
+        existing = _STREAM_THREAD_IDS.get(ident)
+        if existing is not None:
+            return existing
+        next_id = next(_STREAM_THREAD_COUNTER)
+        _STREAM_THREAD_IDS[ident] = next_id
+        return next_id
+
+
+Command = Sequence[str] | str
+
+
+def run_subprocess_streaming(
+    args: Command,
+    *,
+    thread_index: int | None = None,
+    reporter: ProgressReporter | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    check: bool = True,
+    shell: bool = False,
+    encoding: str = "utf-8",
+    errors: str = "replace",
+    timeout: float | None = None,
+    start_new_session: bool | None = None,
+    creationflags: int = 0,
+    preexec_fn: Callable[[], None] | None = None,
+    stdin: IO[str] | int | None = None,
+    emit_to_console: bool = True,
+    line_handler: Callable[[str, str], None] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a subprocess, streaming stdout/stderr through the shared console.
+
+    Each output line is prefixed with ``[T{thread_index}]`` and printed via the
+    provided :class:`ProgressReporter` (or the shared console when omitted).
+
+    Args:
+        args: Command to execute (identical to :func:`subprocess.run`).
+        thread_index: Identifier used in the output prefix (auto-assigned when omitted).
+        reporter: Optional :class:`ProgressReporter` for console-safe printing.
+        cwd: Working directory for the subprocess.
+        env: Environment overrides for the subprocess.
+        check: Raise :class:`CalledProcessError` when the return code is non-zero.
+        shell: Whether to execute through the shell.
+        encoding: Text decoding applied to process output.
+        errors: Error handling strategy used while decoding.
+        timeout: Maximum time in seconds to wait for completion.
+
+        :class:`subprocess.CompletedProcess` containing collected stdout/stderr.
+    """
+
+    console = reporter.console if reporter is not None else get_shared_console()
+    resolved_index = _resolve_stream_thread_index(thread_index)
+    lock = threading.RLock()
+
+    popen_env = dict(env) if env is not None else None
+
+    process = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding=encoding,
+        errors=errors,
+        bufsize=1,
+        universal_newlines=True,
+        cwd=cwd,
+        env=popen_env,
+        shell=shell,
+        start_new_session=start_new_session,
+        creationflags=creationflags,
+        preexec_fn=preexec_fn,
+        stdin=stdin,
+    )
+    register_subprocess(process)
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def _emit(line: str, kind: str) -> None:
+        # Preserve ANSI color codes by disabling Rich markup parsing.
+        stripped = line.rstrip("\r\n")
+        if line_handler is not None:
+            try:
+                line_handler(line, kind)
+            except Exception:
+                ...
+        if not emit_to_console:
+            return
+        prefix = f"[T{resolved_index}] "
+        with lock:
+            console.print(f"{prefix}{stripped}", markup=False)
+
+    def _reader(stream: "io.TextIOBase", sink: list[str], kind: str) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                sink.append(line)
+                _emit(line, kind)
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                ...
+
+    threads = [
+        threading.Thread(target=_reader, args=(process.stdout, stdout_chunks, "stdout"), daemon=True),
+        threading.Thread(target=_reader, args=(process.stderr, stderr_chunks, "stderr"), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    try:
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise
+    finally:
+        unregister_subprocess(process)
+        for t in threads:
+            t.join()
+
+    stdout_text = "".join(stdout_chunks)
+    stderr_text = "".join(stderr_chunks)
+
+    result = subprocess.CompletedProcess(
+        args=args,
+        returncode=process.returncode,
+        stdout=stdout_text,
+        stderr=stderr_text,
+    )
+
+    cancel_event = get_cancel_event()
+    cancelled = cancel_event.is_set()
+
+    if check and result.returncode != 0:
+        if cancelled:
+            raise TaskCancelledException("Subprocess cancelled by shutdown signal.")
+        raise subprocess.CalledProcessError(
+            returncode=result.returncode,
+            cmd=args,
+            output=stdout_text,
+            stderr=stderr_text,
+        )
+
+    return result
 
 
 P = ParamSpec("P")
