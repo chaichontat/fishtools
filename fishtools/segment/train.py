@@ -7,6 +7,10 @@ from typing import Any, Literal, Pattern, Sequence, cast
 import numpy as np
 import torch
 from cellpose.contrib.cellposetrt import trt_build
+from cellpose.models import CellposeModel
+from cellpose.train import train_seg as train_seg_transformer
+from cellpose.train_unet import train_seg as train_seg_unet
+from cellpose.unet import CellposeUNetModel
 from loguru import logger
 from pydantic import BaseModel, Field
 
@@ -36,11 +40,16 @@ def plan_path_for_device(model_path: Path, device_name: str) -> Path:
 
 class TrainConfig(BaseModel):
     name: str
-    base_model: str = (
-        "cyto3" if not IS_CELLPOSE_SAM else "cpsam"  # "/working/cellpose-training/models/embryonic-pre"
-    )
+    base_model: str | None
+    # Backend selector: 'sam' (v4 transformer) or 'unet' (legacy UNet).
+    backend: Literal["sam", "unet"] = "sam"
     channels: tuple[int, int]
     training_paths: list[str]
+    # Optional explicit test set roots. Accepts a single string or list of strings
+    # using the same semantics as `training_paths` (relative to training root,
+    # may point to files or directories; image directories are discovered by
+    # scanning for supported image/mask files one level below as needed).
+    test_folder: str | list[str] | None = None
     include: list[str] = Field(default_factory=list)
     exclude: list[str] = Field(default_factory=list)
     n_epochs: int = 200
@@ -334,73 +343,41 @@ def concat_output(
     return first
 
 
-@noglobal
-def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfig):
-    from cellpose.models import CellposeModel
-    from cellpose.train import train_seg
+def _concat_images_only(
+    path: Path,
+    samples: list[str],
+    *,
+    mask_filter: str = "_seg.npy",
+    one_level_down: bool = True,
+) -> tuple[list, list, list]:
+    """Load and concatenate only images/labels/names from multiple sample roots.
 
-    IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
-    images, labels, image_names, test_images, test_labels, image_names_test = out
+    Mirrors the behavior of `concat_output` for training data but does not
+    attempt to load per-sample test data; instead, it simply concatenates the
+    loaded triplets for the provided `samples`.
+    """
+    from .cp_io import load_images_labels
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required for training but was not detected.")
+    images_all: list = []
+    labels_all: list = []
+    names_all: list = []
 
-    device = torch.device("cuda")
-
-    model = CellposeModel(
-        gpu=True,
-        pretrained_model=train_config.base_model,
-        device=device,
-    )
-
-    if train_config.use_te or train_config.te_fp8:
-        raise ValueError(
-            "Transformer Engine support has been removed; omit `use_te` and `te_fp8` from TrainConfig."
+    for i, sample in enumerate(samples):
+        sample_dir = (path / sample).as_posix()
+        images, labels, names = load_images_labels(
+            sample_dir, mask_filter=mask_filter, image_filter=None, look_one_level_down=one_level_down
         )
+        if images is not None:
+            images_all.extend(images)
+        if labels is not None:
+            labels_all.extend(labels)
+        if names is not None:
+            names_all.extend(names)
 
-    # Photometric augmenter: pick 1–2 ops per image, applied before packing
-    phot_aug = build_batch_augmenter(
-        cfg=PhotometricConfig(),
-        seed=0,
-        min_ops_per_image=1,
-        max_ops_per_image=2,
-    )
+    if images_all is not None:
+        assert len(images_all) == len(labels_all)
 
-    model_path, train_losses, test_losses = train_seg(
-        model.net,
-        train_data=images,
-        train_labels=labels,
-        save_path=path,  # /models automatically appended
-        batch_size=train_config.batch_size,
-        channel_axis=0,
-        test_data=test_images,
-        test_labels=test_labels,
-        weight_decay=train_config.weight_decay,
-        SGD=False,
-        learning_rate=train_config.learning_rate,
-        rescale=True,
-        n_epochs=train_config.n_epochs,
-        model_name=name,
-        normalize=cast(bool, {"percentile": train_config.normalization_percs}),
-        min_train_masks=4,
-        pack_to_single_tile=train_config.packed,
-        pack_k=train_config.pack_k,
-        pack_guard=train_config.pack_guard,
-        pack_stripe_height=train_config.pack_stripe_height,
-        batch_photom_augment=phot_aug,
-        **({"channels": train_config.channels} if not IS_CELLPOSE_SAM else {}),
-    )
-
-    model_path = Path(model_path)
-    build_trt_engine(
-        model_path=model_path,
-        name=name,
-        bsize=train_config.bsize,
-        device=device,
-        batch_size=1,
-    )
-
-    return model_path, train_losses, test_losses
+    return images_all, labels_all, names_all
 
 
 def build_trt_engine(
@@ -409,6 +386,7 @@ def build_trt_engine(
     bsize: int,
     device: torch.device,
     batch_size: int = 1,
+    backend: Literal["sam", "unet"] = "sam",
 ) -> Path:
     device_name_raw = torch.cuda.get_device_name(device)
     base_name = model_path.name
@@ -426,6 +404,7 @@ def build_trt_engine(
         batch_size=batch_size,
         bsize=bsize,
         opset=20,
+        backend=backend,
     )
     trt_build.build_engine(
         str(onnx_path),
@@ -439,6 +418,98 @@ def build_trt_engine(
     except FileNotFoundError:
         pass
     return plan_path
+
+
+@noglobal
+def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfig):
+    images, labels, image_names, test_images, test_labels, image_names_test = out
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required for training but was not detected.")
+
+    device = torch.device("cuda")
+
+    if not train_config.base_model:
+        if train_config.backend == "sam":
+            logger.info("No base_model specified; defaulting to 'cpsam' for SAM backend.")
+            train_config = train_config.model_copy(update={"base_model": "cpsam"})
+        else:
+            logger.info("No base_model specified; defaulting to 'cyto3' for UNet backend.")
+            train_config = train_config.model_copy(update={"base_model": "cyto3"})
+
+    if train_config.backend == "unet":
+        model = CellposeUNetModel(
+            gpu=True,
+            pretrained_model=train_config.base_model,
+            device=device,
+        )
+        # Always train in bf16 for UNet as well
+        model.net.to(torch.bfloat16)
+        setattr(model.net, "dtype", torch.bfloat16)
+        train_seg_fn = train_seg_unet
+    else:
+        model = CellposeModel(
+            gpu=True,
+            pretrained_model=train_config.base_model,
+            device=device,
+            use_bfloat16=True,
+        )
+        train_seg_fn = train_seg_transformer
+
+    if train_config.use_te or train_config.te_fp8:
+        raise ValueError(
+            "Transformer Engine support has been removed; omit `use_te` and `te_fp8` from TrainConfig."
+        )
+
+    # Photometric augmenter: pick 1–2 ops per image, applied before packing
+    phot_aug = build_batch_augmenter(
+        cfg=PhotometricConfig(),
+        seed=0,
+        min_ops_per_image=1,
+        max_ops_per_image=2,
+    )
+
+    pack_kwargs: dict[str, Any] = {
+        "pack_to_single_tile": train_config.packed,
+        "pack_k": train_config.pack_k,
+        "pack_guard": train_config.pack_guard,
+        "pack_stripe_height": train_config.pack_stripe_height,
+        "pack_stripe_border": 0,
+    }
+    if train_config.backend == "unet":
+        pack_kwargs["channels"] = train_config.channels
+
+    model_path, train_losses, test_losses = train_seg_fn(
+        model.net,
+        train_data=images,
+        train_labels=labels,
+        save_path=path,  # /models automatically appended
+        batch_size=train_config.batch_size,
+        channel_axis=0,
+        test_data=test_images,
+        test_labels=test_labels,
+        weight_decay=train_config.weight_decay,
+        SGD=False,
+        learning_rate=train_config.learning_rate,
+        rescale=True,
+        n_epochs=train_config.n_epochs,
+        model_name=name,
+        normalize=cast(bool, {"percentile": train_config.normalization_percs}),
+        min_train_masks=4,
+        batch_photom_augment=phot_aug,
+        **pack_kwargs,
+    )
+
+    model_path = Path(model_path)
+    build_trt_engine(
+        model_path=model_path,
+        bsize=train_config.bsize,
+        device=device,
+        batch_size=train_config.batch_size,
+        backend=train_config.backend,
+    )
+
+    return model_path, train_losses, test_losses
 
 
 # @noglobal
@@ -533,10 +604,135 @@ def run_train(name: str, path: Path, train_config: TrainConfig):
     logger.info(f"Filter summary: kept {kept_images}/{total_images} images; excluded {excluded_images}.")
 
     limited_train_images, trimmed_train = _restrict_to_first_two_channels(filtered_images)
-    limited_test_images: list[Any] | None = None
+
+    # Optional explicit test set discovery/loading using the same semantics as training
+    final_test_images: list[Any] | None = None
+    final_test_labels: list[Any] | None = None
+    final_test_names: list[Any] | None = None
     trimmed_test = 0
-    if test_images is not None:
-        limited_test_images, trimmed_test = _restrict_to_first_two_channels(test_images)
+
+    if train_config.test_folder is not None:
+        # Normalize to list[str]
+        test_entries: list[str] = (
+            [train_config.test_folder]
+            if isinstance(train_config.test_folder, str)
+            else list(train_config.test_folder)
+        )
+
+        try:
+            discovered_test_samples = _discover_training_dirs(path, test_entries)
+        except ValueError:
+            # If no test directories were discovered and there are no filters,
+            # skip test set silently; otherwise propagate a clear error.
+            if include_regexes or exclude_regexes:
+                raise
+            else:
+                logger.info("No test directories discovered for test_folder; proceeding without a test set.")
+                discovered_test_samples = []
+
+        if exclude_regexes:
+            kept_test_samples: list[Path] = []
+            dropped_test_samples: list[Path] = []
+            for sample in discovered_test_samples:
+                alias_path = path / sample
+                resolved_path = alias_path.resolve(strict=False)
+                sample_values = (
+                    sample.as_posix(),
+                    alias_path.as_posix(),
+                    resolved_path.as_posix(),
+                )
+                if any(_matches_any(exclude_regexes, value) for value in sample_values):
+                    dropped_test_samples.append(sample)
+                else:
+                    kept_test_samples.append(sample)
+
+            if dropped_test_samples:
+                logger.info(
+                    f"Skipped {len(dropped_test_samples)} test directories due to exclude filters: {[s.as_posix() for s in dropped_test_samples]}"
+                )
+
+            discovered_test_samples = kept_test_samples
+
+        if not discovered_test_samples:
+            # With no discovered samples and no filters, continue without tests.
+            if include_regexes or exclude_regexes:
+                raise ValueError(
+                    "No test images remain after applying include/exclude filters."
+                    f" include={train_config.include}, exclude={train_config.exclude}"
+                )
+            else:
+                logger.info("No test directories remain after discovery; proceeding without a test set.")
+                final_test_images = None
+                final_test_labels = None
+                final_test_names = None
+                trimmed_test = 0
+                # Skip the rest of the explicit test loading
+                pass
+        if discovered_test_samples:
+            resolved_test_sample_map: dict[Path, Path] = {}
+            for sample in discovered_test_samples:
+                alias_path = path / sample
+                try:
+                    resolved_target = alias_path.resolve(strict=True)
+                except FileNotFoundError:
+                    resolved_target = alias_path.resolve(strict=False)
+                resolved_test_sample_map.setdefault(resolved_target, sample)
+
+            logger.info(
+                f"Loading test data from {len(discovered_test_samples)} discovered directories: "
+                f"{[sample.as_posix() for sample in discovered_test_samples]}"
+            )
+
+            test_images_raw, test_labels_raw, test_names_raw = _concat_images_only(
+                path,
+                [sample.as_posix() for sample in discovered_test_samples],
+                mask_filter="_seg.npy",
+                one_level_down=True,
+            )
+
+            (
+                filtered_test_images,
+                filtered_test_labels,
+                filtered_test_names,
+                total_test_images,
+                kept_test_images,
+                excluded_test_images,
+            ) = _filter_images_by_patterns(
+                images=test_images_raw,
+                labels=test_labels_raw,
+                image_names=test_names_raw,
+                include_regexes=include_regexes,
+                exclude_regexes=exclude_regexes,
+                training_root=path,
+                resolved_sample_map=resolved_test_sample_map,
+            )
+
+            logger.info(
+                f"Test filter summary: kept {kept_test_images}/{total_test_images} images; excluded {excluded_test_images}."
+            )
+
+            if not filtered_test_images:
+                if include_regexes or exclude_regexes:
+                    raise ValueError(
+                        "No test images remain after applying include/exclude filters."
+                        f" include={train_config.include}, exclude={train_config.exclude}"
+                    )
+                else:
+                    logger.info("No test images discovered; proceeding without a test set.")
+                    final_test_images = None
+                    final_test_labels = None
+                    final_test_names = None
+                    trimmed_test = 0
+            else:
+                final_test_images, trimmed_test = _restrict_to_first_two_channels(filtered_test_images)
+                final_test_labels = filtered_test_labels
+                final_test_names = filtered_test_names
+    else:
+        # Fall back to whatever came back from the original loader (usually None)
+        if test_images is not None:
+            final_test_images, trimmed_test = _restrict_to_first_two_channels(test_images)
+            final_test_labels = test_labels
+            final_test_names = image_names_test
 
     if trimmed_train or trimmed_test:
         logger.info(
@@ -547,9 +743,9 @@ def run_train(name: str, path: Path, train_config: TrainConfig):
         limited_train_images,
         filtered_labels,
         filtered_image_names if filtered_image_names is not None else None,
-        limited_test_images if limited_test_images is not None else None,
-        test_labels,
-        image_names_test,
+        final_test_images if final_test_images is not None else None,
+        final_test_labels,
+        final_test_names,
     )
 
     if not filtered[0]:

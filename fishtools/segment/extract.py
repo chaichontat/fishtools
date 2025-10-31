@@ -18,7 +18,13 @@ from tifffile import imread, imwrite
 
 from fishtools.io.workspace import Workspace
 from fishtools.preprocess.segmentation import unsharp_all
-from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
+from fishtools.utils.logging import configure_cli_logging, setup_cli_logging
+from fishtools.utils.pretty_print import (
+    ProgressReporter,
+    progress_bar_threadpool,
+    progress_reporter,
+    wrap_progress,
+)
 
 """Extract utilities and Typer command callback.
 
@@ -266,8 +272,7 @@ def _execute_extraction(
 
         logger.info(f"[{label}] Tracking {total_outputs} output files from Zarr input(s)")
 
-        progress_update: Callable[[], int | None]
-        with progress_bar(total_outputs) as progress_update:
+        with progress_reporter(total_outputs) as progress_update:
             for (
                 f,
                 vol,
@@ -327,8 +332,7 @@ def _execute_extraction(
 
         logger.info(f"[{label}] Tracking {total_outputs} ortho outputs from Zarr input(s)")
 
-        progress_update: Callable[[], int | None]
-        with progress_bar(total_outputs) as progress_update:
+        with progress_reporter(total_outputs) as progress_update:
             for (
                 f,
                 vol,
@@ -563,6 +567,37 @@ FILE_NAME = "fused_n4.zarr"
 ZARR_TILE_SIZE = 512
 
 
+def _distribute_file_budget(rois: list[str], counts: dict[str, int], total: int) -> dict[str, int]:
+    """Allocate a global quota across ROIs respecting per-ROI availability."""
+    if total <= 0:
+        return {roi: 0 for roi in rois}
+
+    availability = {roi: max(0, counts.get(roi, 0)) for roi in rois}
+    total_available = sum(availability.values())
+    if total_available <= total:
+        return availability
+
+    # Largest remainder method: allocate floor of proportional share, then distribute leftovers.
+    allocations: dict[str, int] = {}
+    remainders: list[tuple[float, str]] = []
+    for roi in rois:
+        share = total * availability[roi] / total_available if total_available else 0.0
+        base = min(availability[roi], int(math.floor(share)))
+        allocations[roi] = base
+        remainders.append((share - base, roi))
+
+    remaining = total - sum(allocations.values())
+    if remaining > 0:
+        for _, roi in sorted(remainders, key=lambda item: item[0], reverse=True):
+            if remaining == 0:
+                break
+            if allocations[roi] < availability[roi]:
+                allocations[roi] += 1
+                remaining -= 1
+
+    return allocations
+
+
 def _discover_registered_inputs(
     ws: Workspace,
     roi: str,
@@ -659,6 +694,18 @@ def cmd_extract(
     if mode not in {"z", "ortho"}:
         raise typer.BadParameter("Mode must be 'z' or 'ortho'.")
 
+    setup_cli_logging(
+        path,
+        component="segment.extract",
+        file=f"segment-extract-{mode}",
+        extra={
+            "mode": mode,
+            "roi": roi or "all",
+            "codebook": codebook,
+            "threads": threads,
+        },
+    )
+
     # Validate mode-specific parameters
     if mode == "z" and anisotropy != 6:
         raise typer.BadParameter("--anisotropy parameter is only valid for 'ortho' mode.")
@@ -698,6 +745,16 @@ def cmd_extract(
         )
         inputs_by_roi[current_roi] = inputs
 
+    quota_map: dict[str, int | None]
+    if n is None:
+        quota_map = {roi_val: None for roi_val in rois}
+    else:
+        counts = {roi_val: len(inputs_by_roi[roi_val]) for roi_val in rois}
+        quota_map = _distribute_file_budget(rois, counts, n)
+
+    if len(rois) == 1:
+        quota_map = {roi_val: None for roi_val in rois}
+
     for idx, current_roi in enumerate(rois):
         roi_out = out
         if out is not None and len(rois) > 1:
@@ -721,6 +778,7 @@ def cmd_extract(
             max_from=max_from,
             use_zarr=use_zarr,
             prefetched_inputs=inputs_by_roi[current_roi],
+            file_quota=quota_map[current_roi],
         )
 
 
@@ -783,6 +841,12 @@ def cmd_extract_single(
     mode = mode.lower().strip()
     if mode not in {"z", "ortho"}:
         raise typer.BadParameter("Mode must be 'z' or 'ortho'.")
+
+    configure_cli_logging(
+        workspace=None,
+        component="segment.extract-single",
+        extra={"mode": mode},
+    )
 
     if mode == "z" and anisotropy != 6:
         raise typer.BadParameter("--anisotropy parameter is only valid for 'ortho' mode.")
@@ -862,6 +926,7 @@ def _extract_single_roi(
     max_from: str | None,
     use_zarr: bool,
     prefetched_inputs: list[Path] | None,
+    file_quota: int | None,
 ) -> None:
     reg_dir = ws.registered(roi, codebook)
     out_dir = out
@@ -883,6 +948,8 @@ def _extract_single_roi(
             require_zarr=use_zarr,
         )
     files = inputs[::every]
+    if file_quota is not None:
+        files = files[:file_quota]
     if not files:
         raise FileNotFoundError(f"[{roi}] No registered inputs matched the selection criteria.")
 
@@ -986,7 +1053,7 @@ def _process_volume(
     max_from_path: Path | None,
     upscale: float,
     mask_path: Path | None,
-    progress: Callable[[], int | None] | None,
+    progress: ProgressReporter | Callable[[], int | None] | None,
     kind: Literal["z", "z_tiles", "ortho"],
     vol: Volume | None = None,
     channel_names: list[str] | None = None,
@@ -997,6 +1064,13 @@ def _process_volume(
     x_positions: list[int] | None = None,
 ) -> None:
     """Shared extraction implementation covering per-slice, tile, and ortho projections."""
+    if progress is None:
+        reporter: ProgressReporter | None = None
+    elif isinstance(progress, ProgressReporter):
+        reporter = progress
+    else:
+        reporter = wrap_progress(progress)
+
     size_str = _format_size(_path_size_cached(str(file.resolve())))
     if kind == "ortho":
         logger.info(f"Ortho: {file.name} [{size_str}]")
@@ -1073,8 +1147,8 @@ def _process_volume(
                 resized_mask = _resize_mask(mask_cropped, (upscale, upscale))
                 mask_out_name = _mask_filename(out_name)
                 _write_mask_tiff(out_dir / mask_out_name, resized_mask, axes="YX")
-            if progress is not None:
-                progress()
+            if reporter is not None:
+                reporter.advance()
         return
 
     if kind == "z_tiles":
@@ -1108,8 +1182,8 @@ def _process_volume(
 
                 if zero_tile:
                     skipped_for_tile += 1
-                    if progress is not None:
-                        progress()
+                    if reporter is not None:
+                        reporter.advance()
                     continue
 
                 cyx_u16 = _prep_slab(
@@ -1146,8 +1220,8 @@ def _process_volume(
                     resized_mask = _resize_mask(mask_tile, (upscale, upscale))
                     mask_out = out_dir / _mask_filename(out_name)
                     _write_mask_tiff(mask_out, resized_mask, axes="YX")
-                if progress is not None:
-                    progress()
+                if reporter is not None:
+                    reporter.advance()
             if skipped_for_tile:
                 logger.debug(
                     f"Skipped {skipped_for_tile} z-slice(s) in tile ({y0},{x0}) of {file.name} due to zeros."
@@ -1202,8 +1276,8 @@ def _process_volume(
                 resized_mask = _resize_mask(mask_slab, (anisotropy * upscale, upscale))
                 mask_file = out_dir / _mask_filename(out_name)
                 _write_mask_tiff(mask_file, resized_mask, axes="ZX")
-            if progress is not None:
-                progress()
+            if reporter is not None:
+                reporter.advance()
 
         for xi in x_positions:
             slab = vol[:, y_slice_main, xi, :]
@@ -1237,8 +1311,8 @@ def _process_volume(
                 resized_mask = _resize_mask(mask_slab, (anisotropy * upscale, upscale))
                 mask_file = out_dir / _mask_filename(out_name)
                 _write_mask_tiff(mask_file, resized_mask, axes="ZY")
-            if progress is not None:
-                progress()
+            if reporter is not None:
+                reporter.advance()
         return
 
     raise ValueError(f"Unsupported extraction kind: {kind}")

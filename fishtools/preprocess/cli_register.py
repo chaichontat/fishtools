@@ -826,6 +826,7 @@ def run(
 
 @click.command()
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
+@click.argument("roi", type=str, default="*")
 @click.option(
     "--codebook",
     help="Path to the codebook file",
@@ -848,6 +849,7 @@ def run(
 )
 def batch(
     path: Path,
+    roi: str,
     ref: str | None,
     codebook: Path,
     fwhm: int,
@@ -879,7 +881,10 @@ def batch(
         else:
             raise ValueError("No reference specified and no default found.")
 
-    for roi in ws.rois:
+    # Progressive scoping: default to all ROIs ("*"/"all"), otherwise process the
+    # single provided ROI to align with other preprocess CLIs.
+    selected_rois = ws.rois if roi in {"*", "all"} else [roi]
+    for roi in selected_rois:
         names = sorted({name for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")})
         if not len(names):
             raise ValueError(f"No images found for {ref}--{roi}")

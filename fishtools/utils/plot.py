@@ -21,7 +21,7 @@ from matplotlib.text import Text
 from matplotlib.ticker import FuncFormatter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
-from numpy.lib.index_tricks import IndexExpression
+from numpy.lib.index_tricks import IndexExpression  # noqa: F401 (kept for type compatibility)
 
 if TYPE_CHECKING:
     import anndata as ad
@@ -750,29 +750,108 @@ def configure_micron_axes(
 
 
 def plot_img(
-    path: Path | str,
-    sl: slice | IndexExpression = slice(None, None, None),
+    img: Path | str | npt.ArrayLike,
+    sl: slice | tuple[Any, ...] = slice(None, None, None),
     fig_kwargs: dict | None = None,
-    **kwargs,
-):
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Image file not found: {path}")
-    if path.suffix.lower() in {".tif", ".tiff"}:
-        import tifffile
+    **kwargs: Any,
+) -> tuple[Figure, Axes]:
+    """Plot an image assuming ZCYX or ZYXC. Nothing more.
 
-        img = tifffile.imread(path)[sl]
+    Rules (intentionally strict):
+    - Only supports 2-D, 3-D (Y,X[,C]) or 4-D arrays in ZCYX or ZYXC.
+    - ``sl`` must be a tuple of ints/slices matching dimensionality
+      (e.g., ``np.s_[z, y, x, c]`` for ZYXC or ``np.s_[z, c, y, x]`` for ZCYX).
+      If omitted, defaults to ``z=0`` and ``c=0`` when present.
+    - Extent is inferred from the original Y/X slices; explicit ``extent`` overrides.
+    """
 
-    elif path.suffix.lower() in {".zarr"}:
-        import zarr
+    def _slice_extent_from_slice(axis_indexer: slice, size: int) -> tuple[float, float]:
+        start, stop, step = axis_indexer.indices(size)
+        length = len(range(start, stop, step))
+        if length <= 0:
+            return float(start), float(start)
+        last = start + step * (length - 1)
+        return float(start), float(last + step)
 
-        img = zarr.open_array(path, mode="r")[sl]
+    if isinstance(img, (str, Path)):
+        path = Path(img)
+        if not path.exists():
+            raise FileNotFoundError(f"Image file not found: {path}")
+        if path.suffix.lower() in {".tif", ".tiff"}:
+            import tifffile
 
+            source = tifffile.imread(path)
+        elif path.suffix.lower() in {".zarr"}:
+            import zarr
+
+            source = zarr.open_array(path, mode="r")
+        else:
+            raise ValueError(f"Unsupported image format: {path.suffix}")
     else:
-        raise ValueError(f"Unsupported image format: {path.suffix}")
+        source = np.asarray(img)
 
-    fig, ax = plt.subplots(**({"figsize": (10, 10)} | (fig_kwargs or {})))
-    ax.imshow(img, zorder=1, **kwargs)
+    if not hasattr(source, "shape") or not hasattr(source, "ndim"):
+        source = np.asarray(source)
+
+    if source.ndim < 2:
+        raise ValueError("plot_img expects at least a 2-D source image.")
+
+    # Build explicit indexers per axis with simple defaults.
+    if isinstance(sl, tuple):
+        indexers = list(sl)
+    else:
+        indexers = [sl]
+
+    if source.ndim == 2:  # Y,X
+        if len(indexers) == 1:
+            indexers = [slice(None), slice(None)]
+        if len(indexers) != 2:
+            raise ValueError("2-D input expects 2 indexers: (y, x).")
+        ydim, xdim = 0, 1
+    elif source.ndim == 3:  # Y,X,C after fixing Z
+        if len(indexers) == 1:
+            indexers = [slice(None), slice(None), slice(None)]
+        if len(indexers) != 3:
+            raise ValueError("3-D input expects 3 indexers: (y, x, c).")
+        ydim, xdim = 0, 1
+    elif source.ndim == 4:  # ZCYX or ZYXC
+        if len(indexers) == 1:
+            # Default to ZYXC view at z=0, c=0
+            indexers = [0, slice(None), slice(None), 0]
+        if len(indexers) != 4:
+            raise ValueError("4-D input expects 4 indexers for ZCYX or ZYXC.")
+        # Detect which positions are Y/X slices to choose layout without heuristics.
+        is_zyxc = isinstance(indexers[1], slice) and isinstance(indexers[2], slice)
+        if is_zyxc:
+            ydim, xdim = 1, 2
+        else:
+            ydim, xdim = 2, 3
+    else:
+        raise ValueError("Only 2-D, 3-D, or 4-D (ZCYX/ZYXC) supported.")
+
+    display = np.asarray(source[tuple(indexers)])
+    if display.ndim < 2:
+        raise ValueError("Slicing removed spatial axes; need at least Y and X.")
+    if display.ndim > 3:
+        raise ValueError("After slicing, at most 3 dims are supported (Y,X[,C]).")
+
+    default_extent: tuple[float, float, float, float] | None = None
+    if "extent" not in kwargs and isinstance(indexers[ydim], slice) and isinstance(indexers[xdim], slice):
+        y0, y1 = _slice_extent_from_slice(indexers[ydim], source.shape[ydim])
+        x0, x1 = _slice_extent_from_slice(indexers[xdim], source.shape[xdim])
+
+        def _is_trivial(s: slice) -> bool:
+            return s.start is None and s.stop is None and (s.step in (None, 1))
+
+        if not (_is_trivial(indexers[ydim]) and _is_trivial(indexers[xdim])):
+            default_extent = (float(x0), float(x1), float(y0), float(y1))
+
+    fig_kwargs = fig_kwargs or {}
+    fig, ax = plt.subplots(**({"figsize": (10, 10)} | fig_kwargs))
+    im_kwargs = {"zorder": 1} | kwargs
+    if default_extent is not None:
+        im_kwargs = {"extent": default_extent} | im_kwargs
+    ax.imshow(display, **im_kwargs)
     return fig, ax
 
 

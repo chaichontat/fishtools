@@ -1,49 +1,42 @@
 from __future__ import annotations
 
+import datetime
 import pickle
 import shutil
-from importlib.metadata import version
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import Literal
 
+import click
 import numpy as np
 import tifffile
-import typer
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
 from fishtools.io.workspace import Workspace
 from fishtools.segment.train import plan_path_for_device
 
-if TYPE_CHECKING:
-    from cellpose.contrib.packed_infer import PackedCellposeModelTRT as CellposeModel
-
 TIFF_COMPRESSION = 22610
 
 
 class RunConfig(BaseModel):
     volume_path: Path = Field(description="Path to a fused 4D TIFF (Z,C,Y,X) volume.")
-    model_path: Path = Field(
-        description="Pretrained Cellpose model to load for inference."
+    model_path: Path = Field(description="Pretrained Cellpose model to load for inference.")
+    backend: Literal["sam", "unet"] = Field(
+        default="sam",
+        description="Model backend to use: 'sam' for transformer, 'unet' for legacy UNet.",
     )
 
-    channels: tuple[int, int] = Field(
+    channels: tuple[int, ...] = Field(
         default=(1, 2),
-        description="Pair of channel indices exposed to Cellpose. 1-based indices are computed internally.",
+        description="Channel indices exposed to Cellpose. UNet requires two channels; SAM can accept more.",
     )
-    anisotropy: float = Field(
-        default=4.0, gt=0.0, description="Voxel Z-to-XY anisotropy passed to Cellpose."
-    )
+    anisotropy: float = Field(default=4.0, gt=0.0, description="Voxel Z-to-XY anisotropy passed to Cellpose.")
     output_dir: Path | None = Field(
         default=None,
         description="Optional output directory; defaults to <volume>/../cellpose when omitted.",
     )
-    overwrite: bool = Field(
-        default=False, description="Recompute tiles even when artifacts already exist."
-    )
-    use_gpu: bool = Field(
-        default=True, description="Request GPU execution when available."
-    )
+    overwrite: bool = Field(default=False, description="Recompute tiles even when artifacts already exist.")
+    use_gpu: bool = Field(default=True, description="Request GPU execution when available.")
     normalize_percentiles: tuple[float, float] = Field(
         default=(1.0, 99.9),
         description="Percentiles used for Cellpose normalization low/high cutoffs.",
@@ -60,23 +53,20 @@ class RunConfig(BaseModel):
     @model_validator(mode="after")
     def _validate_config(self) -> "RunConfig":
         # Semantic validation: channels must be distinct and non-negative
-        if len(self.channels) != 2:
-            raise ValueError(
-                "Exactly two channel indices are required for 3D Cellpose."
-            )
-        if self.channels[0] == self.channels[1]:
-            raise ValueError(
-                "Channel indices must be distinct to provide a dual-channel input."
-            )
+        num_channels = len(self.channels)
+        if num_channels < 2:
+            raise ValueError("At least two channel indices are required for 3D Cellpose.")
+        if len(set(self.channels)) != num_channels:
+            raise ValueError("Channel indices must be distinct.")
+        if self.backend == "unet" and num_channels != 2:
+            raise ValueError("UNet backend expects exactly two channel indices.")
         if any(idx < 0 for idx in self.channels):
             raise ValueError("Channel indices must be non-negative.")
 
         # Semantic validation: percentiles must be ordered
         low, high = self.normalize_percentiles
         if not 0.0 <= low < high <= 100.0:
-            raise ValueError(
-                "Normalization percentiles must satisfy 0 <= low < high <= 100."
-            )
+            raise ValueError("Normalization percentiles must satisfy 0 <= low < high <= 100.")
 
         # Semantic validation: ortho weights must be positive and length three
         if self.ortho_weights is not None:
@@ -132,12 +122,8 @@ def _discover_workspace_rois(volume_path: Path) -> tuple[Workspace, list[str]]:
     steps = 0
     while True:
         if not candidate.is_dir():
-            raise ValueError(
-                f"Volume path {volume_path} is not located inside a valid workspace directory."
-            )
-        if any(
-            child.is_file() and child.suffix == ".DONE" for child in candidate.iterdir()
-        ):
+            raise ValueError(f"Volume path {volume_path} is not located inside a valid workspace directory.")
+        if any(child.is_file() and child.suffix == ".DONE" for child in candidate.iterdir()):
             workspace = Workspace(candidate)
             return workspace, workspace.rois
         parent = candidate.parent
@@ -153,6 +139,8 @@ def _discover_workspace_rois(volume_path: Path) -> tuple[Workspace, list[str]]:
 
 def _find_trt_plan(model_path: Path) -> tuple[Path, str] | None:
     """Return the TensorRT plan path paired with the raw device name, if available."""
+    import datetime
+
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
@@ -166,16 +154,14 @@ def _find_trt_plan(model_path: Path) -> tuple[Path, str] | None:
     return None
 
 
-def _cellpose(model: CellposeModel, image: np.ndarray, *, config: RunConfig):
+def _cellpose(model, image: np.ndarray, *, config: RunConfig):
     """Run Cellpose 3D eval on a single tile.
 
     Parameter mapping preserved from legacy pipeline for compatibility with trained models.
     Normalization uses tile-based percentile stretching; flow/diameter/rescale settings
     match the training regime.
     """
-    IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
-
-    channels = config.channels
+    backend = config.backend
     normalization = {
         "lowhigh": None,
         "normalize": True,
@@ -191,7 +177,7 @@ def _cellpose(model: CellposeModel, image: np.ndarray, *, config: RunConfig):
         image,
         channel_axis=1,
         normalize=normalization,
-        batch_size=1,
+        batch_size=4,
         anisotropy=2,
         flow_threshold=0.4,
         cellprob_threshold=-1.0,
@@ -203,143 +189,97 @@ def _cellpose(model: CellposeModel, image: np.ndarray, *, config: RunConfig):
         do_3D=True,
         # bsize=224,
         augment=True,
-        **(dict(channels=channels) if not IS_CELLPOSE_SAM else dict(z_axis=0)),
+        **({"channels": config.channels} if backend == "unet" else {"z_axis": 0}),
     )
 
     return masks, flows, styles
 
 
 def run(
-    volume: Annotated[
-        Path,
-        typer.Argument(
-            help="Path to the fused registered stack (Z,C,Y,X) used for inference.",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            resolve_path=True,
-        ),
-    ],
-    model: Annotated[
-        Path,
-        typer.Option("--model", "-m", help="Pretrained Cellpose model to load."),
-    ],
-    channels: Annotated[
-        str,
-        typer.Option(
-            "--channels",
-            "-c",
-            help="Comma-separated pair of channel indices (1-based).",
-        ),
-    ] = "1,2",
-    anisotropy: Annotated[
-        float,
-        typer.Option("--anisotropy", help="Voxel anisotropy passed to Cellpose."),
-    ] = 4.0,
-    output_dir: Annotated[
-        Path | None,
-        typer.Option(
-            "--output-dir", help="Directory where masks and metadata are stored."
-        ),
-    ] = None,
-    overwrite: Annotated[
-        bool,
-        typer.Option(
-            "--overwrite/--no-overwrite", help="Overwrite existing mask tiles."
-        ),
-    ] = False,
-    normalize: Annotated[
-        str,
-        typer.Option(
-            "--normalize-percentiles",
-            help="Comma-separated low,high percentiles for Cellpose normalization.",
-        ),
-    ] = "1.0,99.0",
-    save_flows: Annotated[
-        bool,
-        typer.Option(
-            "--save-flows/--no-save-flows",
-            help="Persist raw network flows to NPZ for downstream reuse.",
-        ),
-    ] = False,
-    ortho_weights: Annotated[
-        str | None,
-        typer.Option(
-            "--ortho-weights",
-            help="Comma-separated weights for the (XY,YZ,ZX) model passes.",
-        ),
-    ] = None,
+    volume: Path,
+    *,
+    model: Path,
+    channels: str = "1,2",
+    anisotropy: float = 4.0,
+    output_dir: Path | None = None,
+    overwrite: bool = False,
+    normalize: str = "1.0,99.0",
+    save_flows: bool = False,
+    ortho_weights: str | None = None,
+    backend: str = "sam",
 ):
-    from cellpose.contrib.packed_infer import (
-        PackedCellposeModel as CellposeModel,
-    )
-    from cellpose.contrib.packed_infer import (
-        PackedCellposeModelTRT,
-    )
+    backend_normalized = backend.lower()
+    if backend_normalized not in {"sam", "unet"}:
+        raise click.BadParameter(f"Unsupported backend {backend!r}; choose 'sam' or 'unet'.")
 
-    IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
-
-    try:
-        config = RunConfig(
-            volume_path=volume,
-            model_path=model,
-            anisotropy=anisotropy,
-            output_dir=output_dir,
-            overwrite=overwrite,
-            use_gpu=True,
-            normalize_percentiles=tuple(map(float, normalize.split(","))),
-            channels=tuple(map(int, channels.split(","))),
-            save_flows=save_flows,
-            ortho_weights=(
-                tuple(map(float, ortho_weights.split(",")))
-                if ortho_weights is not None
-                else None
-            ),
-        )
-    except Exception as exc:
-        raise typer.BadParameter(str(exc)) from exc
+    channels_tuple = tuple(map(int, channels.split(",")))
+    normalize_tuple = tuple(map(float, normalize.split(",")))
+    ortho_tuple = tuple(map(float, ortho_weights.split(","))) if ortho_weights is not None else None
+    config = RunConfig(
+        volume_path=volume,
+        model_path=model,
+        backend=backend_normalized,
+        anisotropy=anisotropy,
+        output_dir=output_dir,
+        overwrite=overwrite,
+        use_gpu=True,
+        normalize_percentiles=normalize_tuple,
+        channels=channels_tuple,
+        save_flows=save_flows,
+        ortho_weights=ortho_tuple,
+    )
 
     logger.info(f"Segment run configuration: {config.model_dump()}")
 
-    try:
-        workspace, discovered_rois = _discover_workspace_rois(config.volume_path)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-
     img = tifffile.imread(volume)
-    ortho_kwargs = (
-        dict(
-            pretrained_model_ortho="/working/cellpose-training/models/embryonic2/ortho"
-        )
-        if not IS_CELLPOSE_SAM
+    ortho_kwargs: dict[str, object] = (
+        {"pretrained_model_ortho": "/working/cellpose-training/models/embryonicortho"}
+        if config.backend == "unet"
         else {}
     )
+
+    if config.backend == "sam":
+        from cellpose.contrib.packed_infer import (
+            PackedCellposeModel as TorchModel,
+        )
+        from cellpose.contrib.packed_infer import (
+            PackedCellposeModelTRT as TRTModel,
+        )
+    else:
+        from cellpose.contrib.packed_infer import (
+            PackedCellposeUNetModel as TorchModel,
+        )
+        from cellpose.contrib.packed_infer import (
+            PackedCellposeUNetModelTRT as TRTModel,
+        )
+
     plan_selection = _find_trt_plan(config.model_path)
     if plan_selection is not None:
         plan_path, device_name = plan_selection
+        plan_mtime = plan_path.stat().st_mtime
+        plan_time_local = datetime.datetime.fromtimestamp(plan_mtime).strftime("%Y-%m-%d %H:%M:%S")
         logger.info(
-            f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}'."
+            f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}' "
+            f"(backend={config.backend}, mtime={plan_time_local})."
         )
-        cellpose_model = PackedCellposeModelTRT(
-            gpu=True, pretrained_model=str(plan_path)
-        )
+        cellpose_model = TRTModel(gpu=config.use_gpu, pretrained_model=str(plan_path))
+
     else:
-        cellpose_model = CellposeModel(
-            gpu=True,
-            pretrained_model=model,
+        logger.info("TensorRT plan not found; falling back to Torch for backend=%s.", config.backend)
+        cellpose_model = TorchModel(
+            gpu=config.use_gpu,
+            pretrained_model=str(model),
             **ortho_kwargs,
         )
 
     sidecar = {
         "config": {
-            "volume_path": str(config.volume_path),
             "model_path": str(config.model_path),
+            "backend": config.backend,
             "channels": list(config.channels),
             "anisotropy": config.anisotropy,
             "normalize_percentiles": list(config.normalize_percentiles),
-            "ortho_weights": list(config.ortho_weights)
-            if config.ortho_weights is not None
-            else None,
+            "ortho_weights": list(config.ortho_weights) if config.ortho_weights is not None else None,
         },
     }
 
@@ -370,9 +310,4 @@ def run(
         )
         logger.info(f"Saved flows to {flow_path}")
 
-    logger.info(
-        f"Wrote masks to {mask_path}"
-    )
-    roi_count = len(discovered_rois)
-    plural = "ROI" if roi_count == 1 else "ROIs"
-    logger.info(f"Discovered {roi_count} {plural} in workspace {workspace.path}")
+    logger.info(f"Wrote masks to {mask_path}")
