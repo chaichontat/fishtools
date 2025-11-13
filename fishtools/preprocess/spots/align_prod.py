@@ -75,7 +75,6 @@ from fishtools.preprocess.spots.illum_field_correction import (
 from fishtools.preprocess.spots.illum_field_correction import (
     slice_field_ds_for_tile as _slice_field_ds_for_tile,
 )
-from fishtools.preprocess.spots.overlay_spots import overlay
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import plot_all_genes
@@ -2340,7 +2339,6 @@ def batch(
 
 spots.add_command(optimize)
 spots.add_command(stitch)
-spots.add_command(overlay)
 spots.add_command(threshold)
 
 if __name__ == "__main__":

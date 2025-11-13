@@ -12,7 +12,7 @@ import rich_click as click
 import zarr
 from loguru import logger
 
-from segmentation.distributed.utils import StitchPaths, process_slice_regionprops
+from fishtools.segment.utils import StitchPaths, process_slice_regionprops
 
 
 @click.command()

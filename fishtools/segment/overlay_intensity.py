@@ -13,13 +13,13 @@ import zarr
 from loguru import logger
 
 # Share the exact same region detection primitives used by
-# `preprocess spots overlay` to keep behavior identical up to the
+# `segment overlay spots` to keep behavior identical up to the
 # intersection step.
-from fishtools.preprocess.spots.overlay_spots import (
+from fishtools.segment.overlay_spots import (
     extract_polygons_from_mask,
     load_segmentation_slice,
 )
-from segmentation.distributed.utils import (
+from fishtools.segment.utils import (
     StitchPaths,
     compute_regionprops_table,
     slice_intensity_channel,
@@ -36,7 +36,7 @@ def _process_slice_shared_detection(
     overwrite: bool = False,
 ) -> None:
     """Compute per-label intensity using the same region detection code
-    as `preprocess spots overlay`.
+    as `segment overlay spots`.
 
     Steps shared with spots overlay:
     - load segmentation slice via `load_segmentation_slice`
@@ -126,7 +126,7 @@ def _process_slice_shared_detection(
     help="Number of parallel processes to use.",
 )
 @click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing output files.")
-def main(
+def overlay_intensity(
     input_dir: Path,
     segmentation_name: str,
     intensity_name: str,
@@ -216,4 +216,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    overlay_intensity()

@@ -250,7 +250,7 @@ def segment_workflow(
     for roi in ws.rois:
         for codebook in ["mousecommon", "zachDE"]:
             execute_script(
-                f"preprocess spots overlay . {roi} --{codebook=} --seg-codebook={seg_codebook}",
+                f"segment overlay spots {ws.path} {roi} --{codebook=} --seg-codebook={seg_codebook}",
                 overwrite=overwrite,
             )
 

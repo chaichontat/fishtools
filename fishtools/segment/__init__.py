@@ -6,7 +6,8 @@ from typing import Any, Optional
 import click
 import torch
 
-from fishtools.preprocess.spots.overlay_spots import overlay as overlay_spots_command
+from fishtools.segment.overlay_intensity import overlay_intensity as overlay_intensity_command
+from fishtools.segment.overlay_spots import overlay as overlay_spots_command
 from fishtools.segment.extract import cmd_extract as extract_cmd
 from fishtools.segment.extract import cmd_extract_single as extract_single_cmd
 from fishtools.segment.run import run as run_cli
@@ -203,7 +204,7 @@ def trt_build_cmd(model: Path, batch_size: int) -> None:
 )
 @click.option(
     "--anisotropy",
-    default=6,
+    default=4,
     show_default=True,
     type=click.IntRange(1, None),
     help="Z scale factor (ortho mode).",
@@ -405,6 +406,8 @@ def overlay_spots(
         debug,
     )
 
+
+overlay.add_command(overlay_intensity_command, name="intensity")
 
 run = run_cli
 

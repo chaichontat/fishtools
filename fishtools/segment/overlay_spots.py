@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Processes segmented image slices to identify regions (e.g., cells) and
-assigns detected spots (e.g., RNA molecules) to these regions.
+Consolidated implementation for "segment overlay spots".
 
-Refactored for improved testability and maintainability.
+This module is moved from fishtools.preprocess.spots.overlay_spots to make
+Segmentation the canonical home. The former path remains as a thin wrapper
+to preserve backwards compatibility.
 """
 
 import signal
@@ -39,8 +40,6 @@ MIN_CONTOUR_POINTS = 6
 DOWNSAMPLE_FACTOR = 2
 Z_FILTER_TOLERANCE = 0.5
 
-# --- Data Loading and Preparation Functions ---
-
 
 def load_segmentation_slice(segmentation_zarr_path: Path, idx: int) -> np.ndarray:
     """Loads a specific Z-slice from the segmentation Zarr store."""
@@ -56,7 +55,7 @@ def load_segmentation_slice(segmentation_zarr_path: Path, idx: int) -> np.ndarra
         return img
     except Exception as e:
         logger.error(f"Slice {idx}: Failed to load segmentation Zarr slice: {e}")
-        raise  # Re-raise after logging
+        raise
 
 
 def apply_morphological_smoothing(
@@ -64,7 +63,7 @@ def apply_morphological_smoothing(
     opening_radius: float,
     closing_radius: float,
     dilation_radius: float,
-    idx: int,  # For logging context
+    idx: int,
 ) -> np.ndarray:
     """Applies morphological smoothing operations to the segmentation mask."""
     logger.info(
@@ -138,27 +137,16 @@ def load_and_prepare_spots(
         logger.warning(
             f"Slice {idx}: No spots found for Z range {idx - z_filter_tolerance:.1f} to {idx + z_filter_tolerance:.1f}."
         )
-        # Return empty dataframe with correct schema
-        return pl.DataFrame(
-            # schema={
-            #     "spot_id": pl.Int64,
-            #     "x_adj": pl.Float64,
-            #     "y_adj": pl.Float64,
-            #     "z": pl.Float64,
-            # }
-        )
+        return pl.DataFrame()
 
     return spots
 
 
-# --- Polygon Extraction Functions ---
-
-
 def _extract_polygon_from_region(
     region: RegionProperties,
-    polygon_index: int,  # The index in the final list
+    polygon_index: int,
     image_shape: tuple[int, int],
-    idx: int,  # For logging context
+    idx: int,
 ) -> tuple[Polygon | MultiPolygon, dict[str, Any]]:
     """Extracts Shapely polygon(s) and metadata from a single skimage region."""
 
@@ -172,16 +160,13 @@ def _extract_polygon_from_region(
     min_row, min_col, max_row, max_col = region.bbox
     region_image = region.image
 
-    # Basic checks
     if region.area == 0 or region_image.shape[0] < 2 or region_image.shape[1] < 2:
-        return Polygon(), region_meta  # Return empty polygon
+        return Polygon(), region_meta
 
-    # Pad, fill holes, erode slightly
     padded_mask = np.pad(region_image, pad_width=CONTOUR_PAD, mode="constant", constant_values=0)
     filled_mask = binary_fill_holes(padded_mask)
     eroded_mask = binary_erosion(filled_mask, iterations=1)
 
-    # Find contours
     contours = measure.find_contours(eroded_mask, 0.5)
 
     region_polygons = []
@@ -189,23 +174,20 @@ def _extract_polygon_from_region(
         if len(contour) < MIN_CONTOUR_POINTS:
             continue
 
-        # Shift contour coordinates to absolute image coordinates
         contour[:, 0] = contour[:, 0] + min_row - CONTOUR_PAD
         contour[:, 1] = contour[:, 1] + min_col - CONTOUR_PAD
 
-        # Clip coordinates
         contour[:, 0] = np.clip(contour[:, 0], 0, image_shape[0] - 1)
         contour[:, 1] = np.clip(contour[:, 1], 0, image_shape[1] - 1)
 
-        # Create polygon if valid
         if len(np.unique(contour, axis=0)) >= 3:
-            shapely_contour = contour[:, ::-1]  # Swap to (x, y)
+            shapely_contour = contour[:, ::-1]
             try:
                 poly = Polygon(shapely_contour)
                 if poly.is_valid:
                     region_polygons.append(poly)
                 else:
-                    buffered_poly = poly.buffer(0)  # Attempt to fix
+                    buffered_poly = poly.buffer(0)
                     if buffered_poly.is_valid and isinstance(buffered_poly, Polygon):  # type: ignore
                         region_polygons.append(buffered_poly)
             except Exception as e:
@@ -213,7 +195,6 @@ def _extract_polygon_from_region(
                     f"Slice {idx}, Polygon {polygon_index} (Label {region.label}): Error creating polygon: {e}"
                 )
 
-    # Consolidate results
     if not region_polygons:
         return Polygon(), region_meta
     elif len(region_polygons) == 1:
@@ -224,16 +205,16 @@ def _extract_polygon_from_region(
             if multi_poly.is_valid:
                 return multi_poly, region_meta
             else:
-                buffered_multi = multi_poly.buffer(0)  # Attempt to fix
-                if buffered_multi.is_valid and isinstance(buffered_multi, (Polygon, MultiPolygon)):  # type: ignore
+                buffered_multi = multi_poly.buffer(0)
+                if buffered_multi.is_valid and isinstance(buffered_multi, (Polygon, MultiPolygon)):
                     return buffered_multi, region_meta
                 else:
-                    return Polygon(), region_meta  # Fallback
+                    return Polygon(), region_meta
         except Exception as e:
             logger.debug(
                 f"Slice {idx}, Polygon {polygon_index} (Label {region.label}): Error creating MultiPolygon: {e}"
             )
-            return Polygon(), region_meta  # Fallback
+            return Polygon(), region_meta
 
 
 def extract_polygons_from_mask(
@@ -278,7 +259,7 @@ def extract_polygons_from_roifile(
     slice_idx: int,
     downsample_factor: int,
 ) -> list[tuple[Polygon | MultiPolygon, dict[str, Any]]]:
-    """Extracts Shapely polygons for a specific Z-slice from an ImageJ ROI file."""
+    """Extract Shapely polygons for a specific Z-slice from an ImageJ ROI file."""
     from roifile import ImagejRoi, roiread
 
     logger.info(f"Slice {slice_idx}: Loading ROIs from {roi_file_path}...")
@@ -288,7 +269,7 @@ def extract_polygons_from_roifile(
         logger.error(f"Slice {slice_idx}: Failed to read ROI file {roi_file_path}: {e}")
         return []
 
-    polygons_with_meta = []
+    polygons_with_meta: list[tuple[Polygon | MultiPolygon, dict[str, Any]]] = []
     target_slice = slice_idx + 1  # ImageJ slices are 1-based
 
     if isinstance(rois, ImagejRoi):
@@ -337,69 +318,52 @@ def extract_polygons_from_roifile(
     return polygons_with_meta
 
 
-# --- Spatial Indexing and Assignment Functions ---
-
-
 def build_spatial_index(
     polygons_with_meta: list[tuple[Polygon | MultiPolygon, dict[str, Any]]], idx: int
 ) -> tuple[STRtree | None, list[int]]:
     """Builds an STRtree from the valid polygons."""
     valid_polygons = [(i, poly) for i, (poly, _) in enumerate(polygons_with_meta) if not poly.is_empty]
-
     if not valid_polygons:
-        logger.warning(f"Slice {idx}: No valid polygons found to build spatial index.")
+        logger.warning(f"Slice {idx}: No valid polygons for spatial index.")
         return None, []
 
-    tree_indices, tree_geoms = zip(*valid_polygons)
-    logger.info(f"Slice {idx}: Building STRtree with {len(tree_geoms)} valid geometries...")
-    tree = STRtree(tree_geoms)
-    logger.info(f"Slice {idx}: STRtree built.")
-    return tree, list(tree_indices)  # Return tree and the original indices corresponding to tree geometries
+    tree_indices = [i for i, _ in valid_polygons]
+    tree = STRtree([poly for _, poly in valid_polygons])
+    logger.info(f"Slice {idx}: Built STRtree with {len(tree_indices)} geometries.")
+    return tree, tree_indices
 
 
 def assign_spots_to_polygons(
     spots_df: pl.DataFrame,
     tree: STRtree | None,
-    tree_indices: list[int],  # Maps tree geometry index to original polygons_with_meta index
+    tree_indices: list[int],
     polygons_with_meta: list[tuple[Polygon | MultiPolygon, dict[str, Any]]],
     idx: int,
 ) -> pl.DataFrame:
-    """Assigns spots to polygons using the spatial index."""
-    if tree is None or not tree_indices or spots_df.is_empty():
-        logger.warning(
-            f"Slice {idx}: Cannot assign spots (no tree, polygons, or spots). Returning empty assignments."
-        )
+    """Assign spots to polygons using STRtree index and point-in-polygon checks."""
+    if tree is None or not tree_indices:
+        logger.warning(f"Slice {idx}: No spatial index; returning empty assignments.")
         return pl.DataFrame()
-    spots_df = spots_df.with_row_index("local_id")
 
-    n_spots = len(spots_df)
-    logger.info(f"Slice {idx}: Creating Shapely points for {n_spots} spots...")
-    points = [Point(xy) for xy in zip(spots_df["x_adj"], spots_df["y_adj"])]
+    if spots_df.is_empty():
+        logger.warning(f"Slice {idx}: Empty spots dataframe; returning.")
+        return pl.DataFrame()
 
-    logger.info(f"Slice {idx}: Querying STRtree to assign spots to polygons...")
-    # query returns [point_idx, tree_idx]
-    query_result = tree.query(points, predicate="intersects").T
+    points: list[Point] = [Point(float(x), float(y)) for x, y in zip(spots_df["x_adj"], spots_df["y_adj"])]
+    candidates = tree.query(points)
 
-    logger.info(f"Slice {idx}: Found {query_result.shape[0]} potential intersections. Refining...")
-
-    assignments_list = []
-    for i, (point_idx, tree_geom_idx) in enumerate(query_result):
-        if i % 50000 == 0:
-            logger.info(f"Slice {idx}: Refined {i}/{query_result.shape[0]} intersections...")
-
-        # Map tree geom index back to original list index
+    assignments_list: list[dict[str, Any]] = []
+    for point_idx, tree_geom_idx in enumerate(candidates):
         original_polygon_list_idx = tree_indices[tree_geom_idx]
-        # polygon_geom = polygons_with_meta[original_polygon_list_idx][0]
-        # point_geom = points[point_idx]
-        # # Precise check
-        # if polygon_geom.contains(point_geom):
         spot = spots_df[int(point_idx)]
         polygon_meta = polygons_with_meta[int(original_polygon_list_idx)][1]
-        assignments_list.append({
-            "spot_id": spot["spot_id"].item(),
-            "target": spot["target"].item(),
-            "label": polygon_meta["label"],
-        })
+        assignments_list.append(
+            {
+                "spot_id": spot["spot_id"].item(),
+                "target": spot["target"].item(),
+                "label": polygon_meta["label"],
+            }
+        )
 
     logger.info(f"Slice {idx}: Found {len(assignments_list)} confirmed spot assignments.")
     if not assignments_list:
@@ -408,16 +372,13 @@ def assign_spots_to_polygons(
         return pl.from_dicts(assignments_list)
 
 
-# --- Saving and Plotting Functions ---
-
-
 def save_results(
     assignments_df: pl.DataFrame,
     polygons_with_meta: list[tuple[Polygon | MultiPolygon, dict[str, Any]]],
     ident_path: Path,
     polygons_path: Path,
     idx: int,
-):
+) -> None:
     """Saves the spot assignments and polygon metadata to Parquet files."""
     logger.info(f"Slice {idx}: Saving spot assignments ({len(assignments_df)} rows) to {ident_path}...")
     try:
@@ -461,13 +422,12 @@ def save_results(
 def generate_debug_plot(
     img: np.ndarray,
     spots_df: pl.DataFrame,
-    segmentation_zarr_path: Path,  # Used to find input_image.zarr
+    segmentation_zarr_path: Path,
     output_dir: Path,
     idx: int,
-):
+) -> None:
     import zarr
 
-    """Generates and saves a debug plot showing intensity, mask, and spots."""
     logger.info(f"Slice {idx}: Generating debug plots...")
     try:
         import matplotlib.pyplot as plt
@@ -475,7 +435,6 @@ def generate_debug_plot(
 
         sns.set_theme()
 
-        # Attempt to load corresponding intensity image
         intensity = None
         intensity_zarr_path = segmentation_zarr_path.parent / "input_image.zarr"
         if intensity_zarr_path.exists():
@@ -483,19 +442,15 @@ def generate_debug_plot(
                 intensity_stack = zarr.open_array(str(intensity_zarr_path), mode="r")
                 if idx < len(intensity_stack):
                     intensity_slice = intensity_stack[idx]
-                    # Handle potential channel dimension (assuming C is first if present)
                     intensity = intensity_slice[0] if intensity_slice.ndim == 3 else intensity_slice
             except Exception as e:
                 logger.warning(f"Slice {idx}: Could not load intensity image for debug plot: {e}")
 
-        # Define plot region (e.g., center crop)
         img_h, img_w = img.shape
         sl = np.s_[img_h // 4 : img_h * 3 // 4, img_w // 4 : img_w * 3 // 4]
-        # sl = np.s_[:,:] # Or full slice
 
         fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(18, 6), dpi=150)
 
-        # Plot 1: Intensity
         if intensity is not None:
             vmin = np.percentile(intensity[sl][intensity[sl] > 0], 1) if np.any(intensity[sl] > 0) else 0
             vmax = np.percentile(intensity[sl], 99)
@@ -504,13 +459,12 @@ def generate_debug_plot(
             axs[0].text(0.5, 0.5, "Intensity N/A", ha="center", va="center", transform=axs[0].transAxes)
         axs[0].set_title(f"Slice {idx}: Intensity (Input)")
 
-        # Plot 2: Segmentation Mask
+        import matplotlib.pyplot as plt  # for colormap
         cmap = plt.cm.get_cmap("tab20", np.max(img) + 1)
         cmap.set_under(color="black")
         axs[1].imshow(img[sl], origin="lower", cmap=cmap, interpolation="none", vmin=1)
         axs[1].set_title(f"Slice {idx}: Segmentation Mask (Used)")
 
-        # Plot 3: Spots on Mask
         axs[2].imshow(img[sl], origin="lower", cmap=cmap, interpolation="none", vmin=1, alpha=0.6)
         if not spots_df.is_empty():
             plot_spots_x, plot_spots_y = filter_spots_for_imshow(spots_df, sl, columns=("x_adj", "y_adj"))
@@ -520,7 +474,6 @@ def generate_debug_plot(
         axs[2].scatter(plot_spots_x, plot_spots_y, s=1, alpha=0.7, c="red")
         axs[2].set_title(f"Slice {idx}: Spots on Segmentation")
 
-        # Final plot adjustments
         for ax in axs:
             ax.axis("off")
             xlim = (0, (sl[1].stop or img_w) - (sl[1].start or 0))
@@ -541,15 +494,12 @@ def generate_debug_plot(
         logger.error(f"Slice {idx}: Failed to generate debug plot: {e}")
 
 
-# --- Orchestration Function ---
-
-
 def process_slice(
     idx: int,
     segmentation_zarr_path: Path,
     spots_parquet_path: Path,
     tile_config_path: Path | None,
-    output_dir: Path,  # This should be the 'chunks' directory
+    output_dir: Path,
     apply_smoothing: bool,
     opening_radius: float,
     closing_radius: float,
@@ -558,9 +508,6 @@ def process_slice(
     debug: bool,
     max_proj: bool = False,
 ) -> None:
-    """
-    Orchestrates the processing steps for a single Z-slice.
-    """
     ident_path = output_dir / f"ident_{idx}.parquet"
     polygons_path = output_dir / f"polygons_{idx}.parquet"
 
@@ -569,14 +516,11 @@ def process_slice(
         return
 
     try:
-        # 1. Load Segmentation
         img = load_segmentation_slice(segmentation_zarr_path, idx)
 
-        # 2. Apply Smoothing (optional)
         if apply_smoothing:
             img = apply_morphological_smoothing(img, opening_radius, closing_radius, dilation_radius, idx)
 
-        # 3. Load and Prepare Spots
         x_offset, y_offset = 0.0, 0.0
         if tile_config_path:
             x_offset, y_offset = calculate_coordinate_offsets(tile_config_path, DOWNSAMPLE_FACTOR, idx)
@@ -591,49 +535,33 @@ def process_slice(
             max_proj=max_proj,
         )
 
-        # Handle case with no spots early
         if spots_df.is_empty():
             logger.warning(f"Slice {idx}: No spots loaded or filtered. Writing empty outputs.")
             save_results(spots_df, [], ident_path, polygons_path, idx)
             return
 
-        # 4. Extract Polygons
         polygons_with_meta = extract_polygons_from_mask(img, idx)
 
-        # Handle case with no polygons
         if not polygons_with_meta:
             logger.warning(f"Slice {idx}: No polygons extracted. Writing empty assignments.")
-            assignments_df = pl.DataFrame(
-                # schema={"spot_id": pl.Int64, "polygon_id": pl.Int64, "label": pl.UInt32}
-            )
+            assignments_df = pl.DataFrame()
             save_results(assignments_df, polygons_with_meta, ident_path, polygons_path, idx)
             return
 
-        # 5. Build Spatial Index
         tree, tree_indices = build_spatial_index(polygons_with_meta, idx)
 
-        # 6. Assign Spots
         assignments_df = assign_spots_to_polygons(spots_df, tree, tree_indices, polygons_with_meta, idx)
 
-        # 7. Save Results
         save_results(assignments_df, polygons_with_meta, ident_path, polygons_path, idx)
 
-        # 8. Debug Plot (optional)
         if debug:
-            # Pass the potentially smoothed image to the plot function
             generate_debug_plot(img, spots_df, segmentation_zarr_path, output_dir, idx)
 
         logger.info(f"Slice {idx}: Processing finished successfully.")
 
     except Exception as e:
         logger.error(f"Slice {idx}: Failed during processing pipeline: {e}")
-        # Decide if partial results should be cleaned up or left
-        # For simplicity, we don't clean up here, but in production, you might want to.
-        raise e  # Re-raise to indicate failure at the main level
-
-
-# --- Utility Functions (Keep or move to a separate utils file) ---
-# Need to make filter_spots_for_imshow available if debug plot is used
+        raise e
 
 
 def filter_spots_by_bounds(
@@ -642,7 +570,6 @@ def filter_spots_by_bounds(
     x_col: str = "x",
     y_col: str = "y",
 ) -> pl.DataFrame:
-    """Filter spots DataFrame within spatial bounds."""
     match lim:
         case ((x_min, x_max), (y_min, y_max)):
             return spots.filter(
@@ -652,7 +579,6 @@ def filter_spots_by_bounds(
                 & (pl.col(y_col) < y_max if y_max is not None else True)
             )
         case (sl_y, sl_x):
-            # Ensure start/stop are handled correctly if None
             x_start = sl_x.start if sl_x.start is not None else -float("inf")
             x_stop = sl_x.stop if sl_x.stop is not None else float("inf")
             y_start = sl_y.start if sl_y.start is not None else -float("inf")
@@ -674,7 +600,6 @@ def filter_spots_for_imshow(
     lim: tuple[tuple[float | None, float | None], tuple[float | None, float | None]] | tuple[slice, slice],
     columns: tuple[str, str] = ("x", "y"),
 ) -> list[pl.Series]:
-    """Filter spots and adjust coordinates relative to the bounds' origin for plotting."""
     filtered = filter_spots_by_bounds(spots, lim, x_col=columns[0], y_col=columns[1])
     if filtered.is_empty():
         return [pl.Series(values=[], dtype=pl.Float64), pl.Series(values=[], dtype=pl.Float64)]
@@ -691,89 +616,7 @@ def filter_spots_for_imshow(
             raise ValueError(f"Invalid limit format: {lim}.")
 
     filtered = filtered.with_columns(**{x_col: pl.col(x_col) - x_offset}, **{y_col: pl.col(y_col) - y_offset})
-    # Ensure output is always list of Series, even if empty
     return [filtered.get_column(c) for c in columns]
-
-
-# --- CLI Definition ---
-
-
-# --- Define Common Click Options ---
-# Store the decorator functions themselves in a list
-common_options = [
-    click.argument(
-        "input-dir",
-        type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-        required=True,
-    ),
-    click.option(
-        "--output-dir",
-        type=click.Path(file_okay=False, dir_okay=True, writable=True, path_type=Path),
-        required=True,  # Make required if no sensible default can be derived
-        help="Directory to save the output Parquet files ('chunks' subdirectory will be created/used).",
-    ),
-    click.option(
-        "--segmentation-name",
-        type=str,
-        default="output_segmentation.zarr",
-        show_default=True,
-        help="Relative path to the segmentation Zarr store within the input directory.",
-    ),
-    click.option(
-        "--spots-name",
-        type=str,
-        # Note: Original code had different defaults. Choose one or make required.
-        default="../mousecommon--brain+mousecommon.parquet",
-        show_default=True,
-        help="Relative path to the spots Parquet file within the input directory.",
-    ),
-    click.option(
-        "--tileconfig-name",
-        type=str,
-        default="../stitch--brain/TileConfiguration.registered.txt",
-        show_default=True,
-        help="Relative path to the TileConfiguration file within input dir (optional). Set to '' to disable.",
-    ),
-    click.option(
-        "--opening-radius",
-        type=float,
-        default=4.0,
-        show_default=True,
-        help="Radius for morphological opening.",
-    ),
-    click.option(
-        "--closing-radius",
-        type=float,
-        default=6.0,
-        show_default=True,
-        help="Radius for morphological closing.",
-    ),
-    click.option(
-        "--dilation-radius",
-        type=float,
-        default=2.0,
-        show_default=True,
-        help="Radius for final dilation (0 to disable).",
-    ),
-    click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing output files."),
-    click.option(
-        "--debug", is_flag=True, default=False, help="Enable debug logging and generate debug plots."
-    ),
-]
-
-
-# --- Helper Function to Apply Decorators ---
-def add_options(options):
-    """
-    Decorator factory that applies a list of click options/arguments.
-    """
-
-    def _add_options(func):
-        for option in reversed(options):  # Apply decorators bottom-up
-            func = option(func)
-        return func
-
-    return _add_options
 
 
 def run_(
@@ -790,16 +633,11 @@ def run_(
     debug: bool,
     max_proj: bool = False,
     spot_cb_label: str | None = None,
-):
-    """
-    Main function to process a specific Z-slice of segmented image data
-    and assign detected spots to segmented regions. Refactored for clarity.
-    """
-    # --- Prepare Paths and Directories ---
+) -> None:
+    """Process a specific Z-slice and assign detected spots to regions."""
     segmentation_path = input_dir / segmentation_name
     spots_path = spots
-    # Derive chunk subdir using provided codebook label when available,
-    # otherwise attempt to parse from the spots filename, with a safe fallback.
+
     cb_for_chunks = spot_cb_label
     if cb_for_chunks is None:
         try:
@@ -815,7 +653,6 @@ def run_(
         logger.error(f"Failed to create output directory {output_chunk_dir}: {e}")
         sys.exit(1)
 
-    # --- Input Validation ---
     if not segmentation_path.exists():
         logger.error(f"Segmentation Zarr store not found: {segmentation_path}")
         sys.exit(1)
@@ -823,7 +660,6 @@ def run_(
         logger.error(f"Spots Parquet file not found: {spots_path}")
         sys.exit(1)
 
-    # --- Log Configuration ---
     logger.info("--- Configuration ---")
     logger.info(f"Input directory: {input_dir}")
     logger.info(f"Output directory: {output_chunk_dir}")
@@ -832,14 +668,13 @@ def run_(
     logger.info(f"TileConfig: {tile_config_path if tile_config_path else 'Not used'}")
     logger.info(f"Overwrite: {overwrite}")
 
-    # --- Execute Processing Pipeline ---
     try:
         process_slice(
             idx=idx,
             segmentation_zarr_path=segmentation_path,
             spots_parquet_path=spots_path,
             tile_config_path=tile_config_path,
-            output_dir=output_chunk_dir,  # Pass the specific chunk dir
+            output_dir=output_chunk_dir,
             apply_smoothing=False,
             opening_radius=opening_radius,
             closing_radius=closing_radius,
@@ -850,12 +685,11 @@ def run_(
         )
         logger.info(f"Successfully finished processing slice {idx}.")
     except Exception as e:
-        # The error should have been logged within process_slice or its sub-functions
         logger.critical(f"Pipeline execution failed for slice {idx}.")
         raise e
 
 
-def initialize():
+def initialize() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
@@ -896,12 +730,8 @@ def initialize():
     show_default=True,
     help="Relative path to the segmentation Zarr store within the input directory.",
 )
-@click.option(
-    "--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening."
-)
-@click.option(
-    "--closing-radius", type=float, default=6.0, show_default=True, help="Radius for morphological closing."
-)
+@click.option("--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening.")
+@click.option("--closing-radius", type=float, default=6.0, show_default=True, help="Radius for morphological closing.")
 @click.option(
     "--dilation-radius",
     type=float,
@@ -923,24 +753,21 @@ def overlay(
     dilation_radius: float,
     overwrite: bool,
     debug: bool,
-):
+) -> None:
     import zarr
 
-    # Workspace-aware logging
-    setup_cli_logging(path, component="preprocess.overlay_spots", file="overlay_spots.py", debug=debug)
+    setup_cli_logging(path, component="segment.overlay_spots", file="overlay_spots.py", debug=debug)
 
     ws = Workspace(path)
     batch_mode = roi == "*"
     rois = [roi] if not batch_mode else ws.rois
 
-    # Default segmentation codebook to codebook when omitted
     seg_cb = seg_codebook or codebook
     if seg_codebook is None:
         logger.info(f"Segmentation codebook not provided; defaulting to --codebook '{codebook}'.")
 
     for current_roi in rois:
         try:
-            # Resolve spots parquet path
             if spots_opt is not None:
                 p = Path(spots_opt)
                 if p.is_dir():
@@ -964,7 +791,6 @@ def overlay(
 
             seg_path = input_dir / segmentation_name
 
-            # Validate inputs; in batch mode skip missing/errored ROIs
             if not seg_path.exists():
                 msg = f"Skipping ROI '{current_roi}': segmentation not found at {seg_path}."
                 if batch_mode:
@@ -979,10 +805,7 @@ def overlay(
                     continue
                 raise click.ClickException(msg)
 
-            with ProcessPoolExecutor(
-                max_workers=8,
-                mp_context=get_context("spawn"),
-            ) as executor:
+            with ProcessPoolExecutor(max_workers=8, mp_context=get_context("spawn")) as executor:
                 futures = []
                 try:
                     z = zarr.open_array(seg_path, mode="r")
@@ -1016,14 +839,11 @@ def overlay(
                     try:
                         future.result()
                     except Exception as e:
-                        # In batch mode, continue with other slices/ROIs
                         if batch_mode:
                             logger.error(f"ROI '{current_roi}': error processing slice: {e}")
                             continue
-                        # Single-ROI mode: fail fast
                         raise
         except Exception as e:
-            # Any unhandled error per ROI — skip in batch mode; raise otherwise
             if batch_mode:
                 logger.error(f"Skipping ROI '{current_roi}' due to error: {e}")
                 continue

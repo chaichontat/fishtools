@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 from shapely.geometry import MultiPolygon, Polygon
 
-from fishtools.preprocess.spots.overlay_spots import (
+from fishtools.segment.overlay_spots import (
     assign_spots_to_polygons,
     build_spatial_index,
     extract_polygons_from_roifile,
