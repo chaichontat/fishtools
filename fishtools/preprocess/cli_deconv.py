@@ -778,6 +778,17 @@ def multi_run(
     load_scaling = selected_mode is DeconvolutionOutputMode.U16 and not skip_quantized
 
     ref_round = str(ref) if ref is not None else None
+    # If a reference round is provided but not present, ignore and warn for consistency with CLI.
+    if ref_round is not None:
+        try:
+            all_rounds = Workspace.discover_rounds(path)
+        except Exception:  # pragma: no cover - discovery already validated by callers in CLI path
+            all_rounds = []
+        if ref_round not in all_rounds:
+            logger.warning(
+                f"Reference round '{ref_round}' not found in {path}. Proceeding without reference indices."
+            )
+            ref_round = None
 
     failures = _plan_and_execute(
         path=path,
@@ -1054,15 +1065,13 @@ def run(
         raise click.ClickException("No ROIs found in workspace.")
 
     if round_name is None or round_name == "*":
-        selected_rounds = (
-            tuple(all_rounds)
-            if not skip_non_bit
-            else [
-                r
-                for r in all_rounds
-                if not (all(x.isdigit() for x in r.split("_")) and (len(r.split("_")) == 3))
-            ]
-        )
+        if not skip_non_bit:
+            selected_rounds = tuple(all_rounds)
+        else:
+            # Keep only bit-coded rounds (exactly three numeric tokens separated by underscores)
+            selected_rounds = tuple(
+                r for r in all_rounds if (all(x.isdigit() for x in r.split("_")) and (len(r.split("_")) == 3))
+            )
     elif round_name in all_rounds:
         selected_rounds = (round_name,)
     else:
@@ -1091,7 +1100,11 @@ def run(
 
     ref_token = ref_round
     if ref_token is not None and ref_token not in all_rounds:
-        raise click.ClickException(f"Reference round '{ref_token}' not found in {path}.")
+        # Do not error if a --ref is provided but absent; proceed without reference gating.
+        logger.warning(
+            f"Reference round '{ref_token}' not found in {path}. Proceeding without reference indices."
+        )
+        ref_token = None
 
     _plan_and_execute(
         path=path,

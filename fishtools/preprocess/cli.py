@@ -15,6 +15,7 @@ LAZY_COMMANDS: dict[str, SimpleNamespace] = {
     "correct-illum": SimpleNamespace(module="fishtools.preprocess.cli_correct_illum", attr="correct_illum"),
     "check-shifts": SimpleNamespace(module="fishtools.preprocess.cli_check_shifts", attr="check_shifts"),
     "check-stitch": SimpleNamespace(module="fishtools.preprocess.cli_check_stitch", attr="check_stitch"),
+    "check-deconv": SimpleNamespace(module="fishtools.preprocess.cli_check_deconv", attr="check_deconv"),
 }
 
 

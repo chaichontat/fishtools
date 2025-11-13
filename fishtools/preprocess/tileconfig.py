@@ -146,6 +146,67 @@ class TileConfiguration:
         # Map dataframe row positions to tile IDs in the "index" column
         return self.df.select("index").to_numpy().reshape(-1)[pos_idx]
 
+    # --- Connectivity helpers ---------------------------------------------
+    def components_grid4(self) -> list[list[int]]:
+        """Return connected components using 4-neighborhood in ordinal grid.
+
+        Uses ordinal ranks derived from unique sorted ``x`` and ``y``. Two tiles
+        are adjacent if their ranks differ by exactly 1 along a single axis and
+        are equal on the other axis.
+        """
+        if len(self) == 0:
+            return []
+
+        idx = self.df.select("index").to_numpy().reshape(-1).astype(int)
+        x = self.df.select("x").to_numpy().reshape(-1)
+        y = self.df.select("y").to_numpy().reshape(-1)
+
+        # Ordinal ranks via inverse mapping (robust for float equality)
+        _, rx = np.unique(x, return_inverse=True)
+        _, ry = np.unique(y, return_inverse=True)
+
+        id_to_code: dict[int, tuple[int, int]] = {int(i): (int(a), int(b)) for i, a, b in zip(idx, rx, ry)}
+        code_to_ids: dict[tuple[int, int], list[int]] = {}
+        for i, code in id_to_code.items():
+            code_to_ids.setdefault(code, []).append(i)
+
+        visited: set[int] = set()
+        components: list[list[int]] = []
+
+        for root in idx:
+            r = int(root)
+            if r in visited:
+                continue
+            stack = [r]
+            visited.add(r)
+            comp: list[int] = []
+            while stack:
+                cur = stack.pop()
+                comp.append(cur)
+                cx, cy = id_to_code[cur]
+                # Same-rank duplicates
+                for nid in code_to_ids.get((cx, cy), []):
+                    if nid not in visited:
+                        visited.add(nid)
+                        stack.append(nid)
+                # 4-neighbors
+                for nx_, ny_ in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                    for nid in code_to_ids.get((nx_, ny_), []) or []:
+                        if nid not in visited:
+                            visited.add(nid)
+                            stack.append(nid)
+            components.append(sorted(comp))
+
+        components.sort(key=lambda c: (-len(c), c[0] if c else -1))
+        return components
+
+    def main_component_ids_grid4(self) -> set[int]:
+        """Return the set of tile ids in the largest 4-neighborhood component."""
+        comps = self.components_grid4()
+        if not comps:
+            return set()
+        return set(int(i) for i in comps[0])
+
 
 def interior_indices_geometry(xy: NDArray[np.floating | np.integer], n: int) -> NDArray[np.int_]:
     """Geometry-backed interior selector using Shapely.
@@ -273,3 +334,73 @@ def tiles_at_least_n_steps_from_edges(xy: NDArray[np.floating | np.integer], n: 
     dmin = np.minimum(dx, dy)
 
     return np.nonzero(dmin >= n)[0]
+
+    # --- Connectivity helpers ---------------------------------------------
+    def components_grid4(self) -> list[list[int]]:
+        """Return connected components using 4-neighborhood in ordinal grid.
+
+        - Uses ordinal ranks derived from unique sorted ``x`` and ``y``.
+        - Two tiles are adjacent if their ranks differ by exactly 1 along a
+          single axis and are equal on the other axis.
+
+        Returns a list of components where each component is a list of tile
+        identifiers from the ``index`` column.
+        """
+        if len(self) == 0:
+            return []
+
+        # Extract arrays
+        idx = self.df.select("index").to_numpy().reshape(-1).astype(int)
+        x = self.df.select("x").to_numpy().reshape(-1)
+        y = self.df.select("y").to_numpy().reshape(-1)
+
+        # Ordinal ranks with return_inverse for stable integer codes
+        _, rx = np.unique(x, return_inverse=True)
+        _, ry = np.unique(y, return_inverse=True)
+
+        # Map tile id -> (rank_x, rank_y) and inverse map
+        id_to_code: dict[int, tuple[int, int]] = {int(i): (int(a), int(b)) for i, a, b in zip(idx, rx, ry)}
+        code_to_ids: dict[tuple[int, int], list[int]] = {}
+        for i, code in id_to_code.items():
+            code_to_ids.setdefault(code, []).append(i)
+
+        # BFS over tile ids using 4-neighborhood in rank space
+        visited: set[int] = set()
+        components: list[list[int]] = []
+
+        for root in idx:
+            if int(root) in visited:
+                continue
+            comp: list[int] = []
+            stack: list[int] = [int(root)]
+            visited.add(int(root))
+            while stack:
+                cur = stack.pop()
+                comp.append(cur)
+                cx, cy = id_to_code[cur]
+                # Same-cell duplicates (identical ranks)
+                for nid in code_to_ids.get((cx, cy), []):
+                    if nid not in visited:
+                        visited.add(nid)
+                        stack.append(nid)
+                # 4-neighborhood
+                for nx_, ny_ in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                    neigh_ids = code_to_ids.get((nx_, ny_))
+                    if not neigh_ids:
+                        continue
+                    for nid in neigh_ids:
+                        if nid not in visited:
+                            visited.add(nid)
+                            stack.append(nid)
+            components.append(sorted(comp))
+
+        # Sort components deterministically by size desc, then by smallest id
+        components.sort(key=lambda c: (-len(c), c[0] if c else -1))
+        return components
+
+    def main_component_ids_grid4(self) -> set[int]:
+        """Return the set of tile ids in the largest 4-neighborhood component."""
+        comps = self.components_grid4()
+        if not comps:
+            return set()
+        return set(int(i) for i in comps[0])

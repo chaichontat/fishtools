@@ -585,23 +585,12 @@ def calculate_percentiles(
         )
 
         def _process(tile: Path) -> None:
+            # Keep coordinates in native pixel units. Do NOT pre-downsample XY globally,
+            # otherwise (x, y, x_size, y_size) written to JSON would be in decimated
+            # coordinates and later inferred tile_w/tile_h would be too small.
             arr, channel_names = _load_czyx(tile, use_gpu)
-            if sample_step > 1:
-                if use_gpu:
-                    arr = cp.ascontiguousarray(arr[:, :, ::sample_step, ::sample_step])
-                else:
-                    arr = np.ascontiguousarray(arr[:, :, ::sample_step, ::sample_step])
-            if use_gpu:
-                lo, hi = _compute_subtile_percentiles_gpu(
-                    arr,
-                    percentiles=percentiles,
-                    grid=grid,
-                    max_streams=max_streams,
-                    channel_chunk=channel_chunk,
-                )
-            else:
-                assert isinstance(arr, np.ndarray)
-                lo, hi = _compute_subtile_percentiles_cpu(arr, percentiles=percentiles, grid=grid)
+            # Percentiles will be computed per-subtile below with optional sampling stride.
+            assert (use_gpu and cp is not None) or (not use_gpu)
             _, _, H, W = arr.shape  # type: ignore[attr-defined]
             y_edges = _edges(int(H), grid)
             x_edges = _edges(int(W), grid)
@@ -612,15 +601,29 @@ def calculate_percentiles(
                     y0, y1 = y_edges[r], y_edges[r + 1]
                     for col in range(grid):
                         x0, x1 = x_edges[col], x_edges[col + 1]
+                        # Apply sampling stride only when computing percentiles; keep
+                        # recorded coordinates in native pixel units.
+                        if use_gpu:
+                            view = arr[ci : ci + 1, :, y0:y1:sample_step, x0:x1:sample_step]
+                            pct = cp.quantile(
+                                view,
+                                cp.asarray([percentiles[0] / 100.0, percentiles[1] / 100.0]),
+                                axis=(1, 2, 3),
+                            )  # type: ignore[name-defined]
+                            lo_val = float(cp.asnumpy(pct[0]))
+                            hi_val = float(cp.asnumpy(pct[1]))
+                        else:
+                            sub = arr[ci : ci + 1, :, y0:y1:sample_step, x0:x1:sample_step]
+                            pct = np.percentile(sub, [percentiles[0], percentiles[1]], axis=(1, 2, 3))
+                            lo_val = float(pct[0])
+                            hi_val = float(pct[1])
+
                         entries.append({
                             "x": int(x0),
                             "y": int(y0),
                             "x_size": int(x1 - x0),
                             "y_size": int(y1 - y0),
-                            "percentiles": {
-                                key_lo: float(lo[r, col, ci]),
-                                key_hi: float(hi[r, col, ci]),
-                            },
+                            "percentiles": {key_lo: lo_val, key_hi: hi_val},
                         })
                 payload[cname] = entries
             tile.with_suffix(out_suffix).write_text(json.dumps(payload, indent=2))
@@ -872,9 +875,10 @@ def plot_field(
     grid_step: float | None,
     output: Path | None,
 ) -> None:
-    """Plot a saved illumination field NPZ (LOW/HIGH/RANGE)."""
+    """Plot LOW field and RANGE correction for ALL channels in an illumination NPZ."""
 
     import matplotlib.pyplot as plt
+    from matplotlib import colors
 
     rng_model = RangeFieldPointsModel.from_npz(model)
     meta = rng_model.meta
@@ -913,95 +917,180 @@ def plot_field(
         y0 = y_min_pts - tile_h * 0.5
         y1 = y_max_pts + tile_h * 0.5
 
-    # If the NPZ is multi-channel, pick the first channel for plotting by default
-    try:
-        vlow = np.asarray(rng_model.vlow)
-        if vlow.ndim == 2 and vlow.shape[1] > 1:
-            ch_names = list(meta.get("channels", [])) if isinstance(meta.get("channels"), list) else []
-            ch0 = ch_names[0] if ch_names else "ch0"
-            sub_meta = dict(meta)
-            # Force per-channel scale recompute
-            sub_meta.pop("range_mean", None)
-            rng_model = RangeFieldPointsModel(
-                xy=rng_model.xy,
-                vlow=vlow[:, 0],
-                vhigh=np.asarray(rng_model.vhigh)[:, 0],
-                meta=dict(sub_meta, channel=ch0),
-            )
-            meta = rng_model.meta
-    except Exception:
-        pass
+    vlow = np.asarray(rng_model.vlow)
+    vhigh = np.asarray(rng_model.vhigh)
+    if vlow.ndim == 1:
+        vlow = vlow[:, None]
+        vhigh = vhigh[:, None]
+    n_channels = int(vlow.shape[1])
+    ch_names = list(meta.get("channels", [])) if isinstance(meta.get("channels"), list) else []
+    if not ch_names or len(ch_names) != n_channels:
+        ch_names = [f"ch{i}" for i in range(n_channels)]
 
-    xs, ys, low_field, high_field = rng_model.evaluate(
-        x0,
-        y0,
-        x1,
-        y1,
-        grid_step=grid_step,
-    )
-
-    fig = plt.figure(figsize=(10, 6), dpi=140)
-    title = f"Illum Field — ROI={roi} CB={codebook} CH={meta.get('channel')}"
-    fig.suptitle(title)
-
-    ax_low = fig.add_subplot(2, 2, 1)
-    if xs0.size:
-        mask = _mask_union_of_tiles(xs, ys, xs0, ys0, tile_w, tile_h)
-    else:
-        mask = np.ones_like(low_field, dtype=bool)
-
-    low_masked = np.ma.array(low_field, mask=~mask)
-    inv_range = rng_model.range_correction(low_field, high_field, mask=mask)
-    range_masked = np.ma.array(inv_range, mask=~mask)
-
-    im_low = ax_low.imshow(low_masked, origin="upper", extent=[x0, x1, y0, y1], zorder=1)
-    ax_low.set_aspect("equal")
-    ax_low.set_title("LOW field")
-    fig.colorbar(im_low, ax=ax_low, fraction=0.046)
-
-    ax_range = fig.add_subplot(2, 2, 2)
-    from matplotlib import colors
-
-    # Fixed colorbar for RANGE: clamp to [0.5, 2] with center at 1
+    # Build figure: 2 columns (LOW, RANGE) × n_channels rows
+    height_per_row = 2.5
+    fig = plt.figure(figsize=(10, max(2, int(n_channels * height_per_row))), dpi=140)
+    fig.suptitle(f"Illum Field — ROI={roi} CB={codebook} (ALL channels)")
     div_norm = colors.TwoSlopeNorm(vmin=0.5, vcenter=1.0, vmax=2.0)
 
-    im_rng = ax_range.imshow(
-        range_masked,
-        origin="upper",
-        extent=[x0, x1, y0, y1],
-        zorder=1,
-        cmap="coolwarm",
-        norm=div_norm,
-    )
-    ax_range.set_aspect("equal")
-    ax_range.set_title("RANGE correction (normalized inverse)")
-    fig.colorbar(im_rng, ax=ax_range, fraction=0.046)
+    # Precompute mask once at evaluation grid per channel (grids identical across channels)
+    mask_ref = None
+    xs_ref = None
+    ys_ref = None
 
-    ax_low_pts = fig.add_subplot(2, 2, 3)
-    sc_low = ax_low_pts.scatter(rng_model.xy[:, 0], rng_model.xy[:, 1], c=rng_model.vlow, s=8, cmap="viridis")
-    ax_low_pts.set_xlim(x0, x1)
-    ax_low_pts.set_ylim(y1, y0)
-    ax_low_pts.set_aspect("equal")
-    ax_low_pts.set_title("Low samples")
-    fig.colorbar(sc_low, ax=ax_low_pts, fraction=0.046)
+    for ci in range(n_channels):
+        sub_meta = dict(meta)
+        sub_meta.pop("range_mean", None)  # force per-channel normalization
+        ch_label = ch_names[ci]
+        mdl_ci = RangeFieldPointsModel(
+            xy=rng_model.xy, vlow=vlow[:, ci], vhigh=vhigh[:, ci], meta=dict(sub_meta, channel=ch_label)
+        )
 
-    ax_high_pts = fig.add_subplot(2, 2, 4)
-    sc_high = ax_high_pts.scatter(
-        rng_model.xy[:, 0], rng_model.xy[:, 1], c=rng_model.vhigh, s=8, cmap="magma"
-    )
-    ax_high_pts.set_xlim(x0, x1)
-    ax_high_pts.set_ylim(y1, y0)
-    ax_high_pts.set_aspect("equal")
-    ax_high_pts.set_title("High samples")
-    fig.colorbar(sc_high, ax=ax_high_pts, fraction=0.046)
+        xs, ys, low_field, high_field = mdl_ci.evaluate(
+            x0,
+            y0,
+            x1,
+            y1,
+            grid_step=grid_step,
+        )
+
+        if mask_ref is None:
+            if xs0.size:
+                mask_ref = _mask_union_of_tiles(xs, ys, xs0, ys0, tile_w, tile_h)
+            else:
+                mask_ref = np.ones_like(low_field, dtype=bool)
+            xs_ref, ys_ref = xs, ys
+        else:
+            # Grids should match across channels
+            if xs_ref is None or ys_ref is None or xs.shape != xs_ref.shape or ys.shape != ys_ref.shape:
+                raise RuntimeError(
+                    "Evaluated grids differ across channels; cannot plot ALL channels together."
+                )
+
+        low_masked = np.ma.array(low_field, mask=~mask_ref)
+        inv_range = mdl_ci.range_correction(low_field, high_field, mask=mask_ref)
+        range_masked = np.ma.array(inv_range, mask=~mask_ref)
+
+        ax_low = fig.add_subplot(n_channels, 2, ci * 2 + 1)
+        im_low = ax_low.imshow(low_masked, origin="upper", extent=[x0, x1, y0, y1])
+        ax_low.set_aspect("equal")
+        ax_low.set_title(f"{ch_label} — LOW")
+        fig.colorbar(im_low, ax=ax_low, fraction=0.046)
+
+        ax_rng = fig.add_subplot(n_channels, 2, ci * 2 + 2)
+        im_rng = ax_rng.imshow(
+            range_masked, origin="upper", extent=[x0, x1, y0, y1], cmap="coolwarm", norm=div_norm
+        )
+        ax_rng.set_aspect("equal")
+        ax_rng.set_title(f"{ch_label} — RANGE (normalized)")
+        fig.colorbar(im_rng, ax=ax_rng, fraction=0.046)
 
     fig.tight_layout()
-
     if output is None:
         output = model.with_suffix(".png")
     fig.savefig(output.as_posix(), dpi=200, bbox_inches="tight")
     plt.close(fig)
     rich.print(f"[green]Saved illumination plot → {output}[/green]")
+
+
+@correct_illum.command("plot-field-zarr")
+@click.argument("zarr_path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.option(
+    "--channels",
+    type=str,
+    default=None,
+    help="Comma-separated channel names or indices to include (default: all)",
+)
+@click.option(
+    "--output",
+    type=click.Path(dir_okay=False, writable=True, path_type=Path),
+    default=None,
+    help="Optional output image path (PNG)",
+)
+def plot_field_zarr(zarr_path: Path, channels: str | None, output: Path | None) -> None:
+    """Plot LOW and RANGE directly from a TCYX Zarr store (no re-evaluation)."""
+    import matplotlib.pyplot as plt
+    import zarr
+    from matplotlib import colors
+
+    za = zarr.open_array(str(zarr_path), mode="r")
+    if za.ndim != 4:
+        raise click.UsageError("Expected a TCYX Zarr array (4D).")
+    attrs = getattr(za, "attrs", {})
+    axes = attrs.get("axes")
+    if axes not in (None, "TCYX"):
+        raise click.UsageError(f"Unexpected axes='{axes}'; expected 'TCYX'.")
+    t_labels = attrs.get("t_labels") or ["low", "range"]
+    try:
+        t_low = int(t_labels.index("low"))
+        t_range = int(t_labels.index("range"))
+    except Exception:
+        t_low, t_range = 0, 1
+    ch_names = attrs.get("channel_names") or []
+    C = int(za.shape[1])
+    if not ch_names or len(ch_names) != C:
+        ch_names = [f"ch{i}" for i in range(C)]
+
+    # Resolve channel selection
+    if channels:
+        requested = [c.strip() for c in channels.split(",") if c.strip()]
+        idx: list[int] = []
+        for tok in requested:
+            if tok.isdigit():
+                i = int(tok)
+                if not (0 <= i < C):
+                    raise click.UsageError(f"Channel index out of range: {i}")
+                idx.append(i)
+            else:
+                if tok not in ch_names:
+                    raise click.UsageError(f"Unknown channel name: {tok}")
+                idx.append(ch_names.index(tok))
+        sel = idx
+    else:
+        sel = list(range(C))
+
+    # Use model_meta for extent if present
+    md = attrs.get("model_meta") or {}
+    try:
+        x0 = float(md.get("x0", 0.0))
+        y0 = float(md.get("y0", 0.0))
+        Wn = float(md.get("width_native", za.shape[3] * int(md.get("downsample", 1) or 1)))
+        Hn = float(md.get("height_native", za.shape[2] * int(md.get("downsample", 1) or 1)))
+        extent = [x0, x0 + Wn, y0, y0 + Hn]
+    except Exception:
+        extent = None
+
+    # Figure: 2 columns (LOW, RANGE) × rows=len(sel); use nearest interpolation (no smoothing)
+    height_per_row = 2.5
+    fig = plt.figure(figsize=(10, max(2, int(len(sel) * height_per_row))), dpi=140)
+    fig.suptitle(f"Field (Zarr) — {zarr_path.name}")
+    div_norm = colors.TwoSlopeNorm(vmin=0.5, vcenter=1.0, vmax=2.0)
+
+    for r, ci in enumerate(sel):
+        low = za[t_low, ci, :, :]
+        rng = za[t_range, ci, :, :]
+        label = ch_names[ci]
+
+        ax_low = fig.add_subplot(len(sel), 2, r * 2 + 1)
+        im_low = ax_low.imshow(low, origin="upper", extent=extent, interpolation="nearest")
+        ax_low.set_aspect("equal")
+        ax_low.set_title(f"{label} — LOW (stored)")
+        fig.colorbar(im_low, ax=ax_low, fraction=0.046)
+
+        ax_rng = fig.add_subplot(len(sel), 2, r * 2 + 2)
+        im_rng = ax_rng.imshow(
+            rng, origin="upper", extent=extent, interpolation="nearest", cmap="coolwarm", norm=div_norm
+        )
+        ax_rng.set_aspect("equal")
+        ax_rng.set_title(f"{label} — RANGE (stored)")
+        fig.colorbar(im_rng, ax=ax_rng, fraction=0.046)
+
+    fig.tight_layout()
+    if output is None:
+        output = zarr_path.with_suffix(".png")
+    fig.savefig(output.as_posix(), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    rich.print(f"[green]Saved Zarr field plot → {output}[/green]")
 
 
 @correct_illum.command("export-field")
@@ -1714,8 +1803,10 @@ def export_field(
             low_resize_sec = time.perf_counter() - resize_start
 
             if m_bool is not None and not m_bool.all():
+                # Outside the union-of-tiles mask, use multiplicative identity for RANGE (1.0)
+                # and additive identity for LOW (0.0) to match application semantics.
                 inv_ds = np.where(m_bool, inv_ds, np.float32(1.0))
-                low_ds = np.where(m_bool, low_ds, np.float32(1.0))
+                low_ds = np.where(m_bool, low_ds, np.float32(0.0))
 
             out_range[ci, :, :] = inv_ds
             out_low[ci, :, :] = low_ds

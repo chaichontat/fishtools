@@ -1,32 +1,38 @@
-# import json
+import json
+
 # import pickle
 # import queue
-# import re
+import re
+
 # import threading
 # import time
 # from collections.abc import Iterable
-# from itertools import chain
-# from pathlib import Path
-# from typing import Any
+from itertools import chain
+from pathlib import Path
 
+# from typing import Any
 # import cupy as cp
-# import numpy as np
-from fishtools.preprocess.cli_deconv import deconvnew as deconv
+import numpy as np
 
 # import pyfiglet
-# import rich_click as click
+import rich_click as click
+
 # import tifffile
 # from basicpy import BaSiC
-# from loguru import logger
-# from rich.console import Console
+from loguru import logger
 
+from fishtools.io.workspace import Workspace
+from fishtools.preprocess.cli_deconv import _setup_cli_logging
+from fishtools.preprocess.cli_deconv import deconvnew as deconv
+
+# from rich.console import Console
 # from fishtools.preprocess.deconv.core import deconvolve_lucyrichardson_guo, projectors
 # from fishtools.preprocess.deconv.helpers import safe_delete_origin_dirs
 # from fishtools.utils.io import Workspace, get_channels, get_metadata, safe_imwrite
 # from fishtools.utils.logging import setup_cli_logging
-# from fishtools.utils.pretty_print import progress_bar
+from fishtools.utils.pretty_print import progress_bar
 
-# DATA = Path(__file__).parent.parent.parent / "data"
+DATA = Path(__file__).parent.parent.parent / "data"
 
 
 # def _setup_cli_logging(
@@ -82,66 +88,66 @@ from fishtools.preprocess.cli_deconv import deconvnew as deconv
 #     return np.clip(scaled, 0, 65534)
 
 
-# def _compute_range(
-#     path: Path,
-#     round_: str,
-#     *,
-#     perc_min: float | list[float] = 0.1,
-#     perc_scale: float | list[float] = 0.1,
-# ):
-#     """
-#     Find the min and scale of the deconvolution for all files in a directory.
-#     The reverse scaling equation is:
-#                  s_global
-#         scaled = -------- * img + s_global * (min - m_global)
-#                   scale
-#     Hence we want scale_global to be as low as possible
-#     and min_global to be as high as possible.
-#     """
-#     ws = Workspace(path)
-#     files = sorted(ws.deconved.glob(f"{round_}*/*.tif"))
-#     n_c = len(round_.split("_"))
+def _compute_range(
+    path: Path,
+    round_: str,
+    *,
+    perc_min: float | list[float] = 0.1,
+    perc_scale: float | list[float] = 0.1,
+):
+    """
+    Find the min and scale of the deconvolution for all files in a directory.
+    The reverse scaling equation is:
+                 s_global
+        scaled = -------- * img + s_global * (min - m_global)
+                  scale
+    Hence we want scale_global to be as low as possible
+    and min_global to be as high as possible.
+    """
+    ws = Workspace(path)
+    files = sorted(ws.deconved.glob(f"{round_}*/*.tif"))
+    n_c = len(round_.split("_"))
 
-#     files = [u for p in files if (u := p.with_suffix(".deconv.json")).exists()]
-#     n = len(files)
+    files = [u for p in files if (u := p.with_suffix(".deconv.json")).exists()]
+    n = len(files)
 
-#     deconv_min = np.zeros((n, n_c))
-#     deconv_scale = np.zeros((n, n_c))
-#     logger.info(f"Found {n} files")
-#     if not files:
-#         logger.warning(f"No files found in {ws.deconved / f'{round_}*'}. Skipping.")
-#         return
+    deconv_min = np.zeros((n, n_c))
+    deconv_scale = np.zeros((n, n_c))
+    logger.info(f"Found {n} files")
+    if not files:
+        logger.warning(f"No files found in {ws.deconved / f'{round_}*'}. Skipping.")
+        return
 
-#     with progress_bar(len(files)) as pbar:
-#         for i, f in enumerate(files):
-#             meta = json.loads(f.read_text())
+    with progress_bar(len(files)) as pbar:
+        for i, f in enumerate(files):
+            meta = json.loads(f.read_text())
 
-#             try:
-#                 deconv_min[i, :] = meta["deconv_min"]
-#                 deconv_scale[i, :] = meta["deconv_scale"]
-#             except KeyError:
-#                 raise AttributeError("No deconv metadata found.")
-#             pbar()
+            try:
+                deconv_min[i, :] = meta["deconv_min"]
+                deconv_scale[i, :] = meta["deconv_scale"]
+            except KeyError:
+                raise AttributeError("No deconv metadata found.")
+            pbar()
 
-#     logger.info(f"Calculating percentiles: {perc_min, perc_scale}")
+    logger.info(f"Calculating percentiles: {perc_min, perc_scale}")
 
-#     if isinstance(perc_min, float) and isinstance(perc_scale, float):
-#         m_ = np.percentile(deconv_min, perc_min, axis=0)
-#         s_ = np.percentile(deconv_scale, perc_scale, axis=0)
-#     elif isinstance(perc_min, list) and isinstance(perc_scale, list):
-#         m_, s_ = np.zeros(n_c), np.zeros(n_c)
-#         for i in range(n_c):
-#             m_[i] = np.percentile(deconv_min[:, i], perc_min[i])
-#             s_[i] = np.percentile(deconv_scale[:, i], perc_scale[i])
-#     else:
-#         raise ValueError("perc_min and perc_scale must be either float or list of floats.")
+    if isinstance(perc_min, float) and isinstance(perc_scale, float):
+        m_ = np.percentile(deconv_min, perc_min, axis=0)
+        s_ = np.percentile(deconv_scale, perc_scale, axis=0)
+    elif isinstance(perc_min, list) and isinstance(perc_scale, list):
+        m_, s_ = np.zeros(n_c), np.zeros(n_c)
+        for i in range(n_c):
+            m_[i] = np.percentile(deconv_min[:, i], perc_min[i])
+            s_[i] = np.percentile(deconv_scale[:, i], perc_scale[i])
+    else:
+        raise ValueError("perc_min and perc_scale must be either float or list of floats.")
 
-#     if np.any(m_ == 0) or np.any(s_ == 0):
-#         raise ValueError("Found a channel with min=0. This is not allowed.")
+    if np.any(m_ == 0) or np.any(s_ == 0):
+        raise ValueError("Found a channel with min=0. This is not allowed.")
 
-#     ws.deconv_scaling().mkdir(exist_ok=True)
-#     np.savetxt(ws.deconv_scaling(round_), np.vstack([m_, s_]))
-#     logger.info(f"Saved to {ws.deconv_scaling(round_)}")
+    ws.deconv_scaling().mkdir(exist_ok=True)
+    np.savetxt(ws.deconv_scaling(round_), np.vstack([m_, s_]))
+    logger.info(f"Saved to {ws.deconv_scaling(round_)}")
 
 
 # console = Console()
@@ -151,123 +157,123 @@ from fishtools.preprocess.cli_deconv import deconvnew as deconv
 # def deconv(): ...
 
 
-# PROTEIN_PERC_MIN = 50
-# PROTEIN_PERC_SCALE = 50
+PROTEIN_PERC_MIN = 50
+PROTEIN_PERC_SCALE = 50
 
 
-# def _get_percentiles_for_round(
-#     round_name: str,
-#     default_perc_min: float,
-#     default_perc_scale: float,
-#     max_rna_bit: int,
-#     override: dict[str, tuple[float, float]] | None = None,
-# ) -> tuple[list[float], list[float]]:
-#     """Determines the percentile values for min and scale based on the round name components."""
-#     percentile_mins: list[float] = []
-#     percentile_scales: list[float] = []
-#     override = override or {}
+def _get_percentiles_for_round(
+    round_name: str,
+    default_perc_min: float,
+    default_perc_scale: float,
+    max_rna_bit: int,
+    override: dict[str, tuple[float, float]] | None = None,
+) -> tuple[list[float], list[float]]:
+    """Determines the percentile values for min and scale based on the round name components."""
+    percentile_mins: list[float] = []
+    percentile_scales: list[float] = []
+    override = override or {}
 
-#     bits = round_name.split("_")
-#     for bit in bits:
-#         if bit in override:
-#             min_val, scale_val = override[bit]
-#             logger.info(f"Using override for bit '{bit}' to {override[bit]} in round '{round_name}'.")
-#             percentile_mins.append(min_val)
-#             percentile_scales.append(scale_val)
-#             continue
+    bits = round_name.split("_")
+    for bit in bits:
+        if bit in override:
+            min_val, scale_val = override[bit]
+            logger.info(f"Using override for bit '{bit}' to {override[bit]} in round '{round_name}'.")
+            percentile_mins.append(min_val)
+            percentile_scales.append(scale_val)
+            continue
 
-#         is_rna_bit = (bit.isdigit() and int(bit) <= max_rna_bit) or re.match(r"^b\d{3}$", bit)
-#         if not is_rna_bit:
-#             # Protein staining often has bright flare spots.
-#             logger.info(
-#                 f"Bit '{bit}' in round '{round_name}' is non-numeric or exceeds max_rna_bit ({max_rna_bit}). "
-#                 f"Using protein percentiles: min={PROTEIN_PERC_MIN}, scale={PROTEIN_PERC_SCALE}."
-#             )
-#         percentile_mins.append(PROTEIN_PERC_MIN if not is_rna_bit else default_perc_min)
-#         percentile_scales.append(PROTEIN_PERC_SCALE if not is_rna_bit else default_perc_scale)
-#     return percentile_mins, percentile_scales
+        is_rna_bit = (bit.isdigit() and int(bit) <= max_rna_bit) or re.match(r"^b\d{3}$", bit)
+        if not is_rna_bit:
+            # Protein staining often has bright flare spots.
+            logger.info(
+                f"Bit '{bit}' in round '{round_name}' is non-numeric or exceeds max_rna_bit ({max_rna_bit}). "
+                f"Using protein percentiles: min={PROTEIN_PERC_MIN}, scale={PROTEIN_PERC_SCALE}."
+            )
+        percentile_mins.append(PROTEIN_PERC_MIN if not is_rna_bit else default_perc_min)
+        percentile_scales.append(PROTEIN_PERC_SCALE if not is_rna_bit else default_perc_scale)
+    return percentile_mins, percentile_scales
 
 
-# @deconv.command()
-# @click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
-# @click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
-# @click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
-# @click.option("--overwrite", is_flag=True)
-# @click.option("--override", type=str, multiple=True)
-# @click.option("--max-rna-bit", type=int, default=36)
-# def compute_range(
-#     path: Path,
-#     perc_min: float = 0.1,
-#     perc_scale: float = 0.1,
-#     overwrite: bool = False,
-#     max_rna_bit: int = 36,
-#     override: list[str] | None = None,
-# ):
-#     """
-#     Find the scaling factors of all images in the children sub-folder of `path`.
-#     Run this on the entire workspace. See `_compute_range` for more details.
+@deconv.command()
+@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
+@click.option("--perc_min", type=float, default=0.1, help="Percentile of the min")
+@click.option("--perc_scale", type=float, default=0.1, help="Percentile of the scale")
+@click.option("--overwrite", is_flag=True)
+@click.option("--override", type=str, multiple=True)
+@click.option("--max-rna-bit", type=int, default=36)
+def compute_range(
+    path: Path,
+    perc_min: float = 0.1,
+    perc_scale: float = 0.1,
+    overwrite: bool = False,
+    max_rna_bit: int = 36,
+    override: list[str] | None = None,
+):
+    """
+    Find the scaling factors of all images in the children sub-folder of `path`.
+    Run this on the entire workspace. See `_compute_range` for more details.
 
-#     Args:
-#         path: The root path containing round subdirectories (e.g., 'path/analysis/deconv').
-#         perc_min: Default percentile for calculating the minimum intensity value for RNA bits.
-#         perc_scale: Default percentile for calculating the scaling factor for RNA bits.
-#         overwrite: If True, recompute and overwrite existing scaling files.
-#         max_rna_bit: The maximum integer value considered an RNA bit. Others are treated differently (e.g., protein).
-#     """
-#     _setup_cli_logging(
-#         path,
-#         component="preprocess.deconv.compute_range",
-#         file_tag="compute_range",
-#         extra={
-#             "perc_min": perc_min,
-#             "perc_scale": perc_scale,
-#             "overwrite": overwrite,
-#         },
-#     )
+    Args:
+        path: The root path containing round subdirectories (e.g., 'path/analysis/deconv').
+        perc_min: Default percentile for calculating the minimum intensity value for RNA bits.
+        perc_scale: Default percentile for calculating the scaling factor for RNA bits.
+        overwrite: If True, recompute and overwrite existing scaling files.
+        max_rna_bit: The maximum integer value considered an RNA bit. Others are treated differently (e.g., protein).
+    """
+    _setup_cli_logging(
+        path,
+        component="preprocess.deconv.compute_range",
+        file_tag="compute_range",
+        extra={
+            "perc_min": perc_min,
+            "perc_scale": perc_scale,
+            "overwrite": overwrite,
+        },
+    )
 
-#     if "deconv" not in path.resolve().as_posix():
-#         raise ValueError(f"This command must be run within a 'deconv' directory. Path provided: {path}")
+    if "deconv" not in path.resolve().as_posix():
+        raise ValueError(f"This command must be run within a 'deconv' directory. Path provided: {path}")
 
-#     ws = Workspace(path)
-#     override = override or []
-#     rounds = ws.rounds
-#     try:
-#         override_dict = {(parts := v.split(","))[0]: (float(parts[1]), float(parts[2])) for v in override}
-#     except ValueError:
-#         raise ValueError("Override must be in the format 'bit,min,scale'.")
-#     del override
+    ws = Workspace(path)
+    override = override or []
+    rounds = ws.rounds
+    try:
+        override_dict = {(parts := v.split(","))[0]: (float(parts[1]), float(parts[2])) for v in override}
+    except ValueError:
+        raise ValueError("Override must be in the format 'bit,min,scale'.")
+    del override
 
-#     if not len(set(override_dict) & set(chain.from_iterable(map(lambda x: x.split("_"), rounds)))) == len(
-#         override_dict
-#     ):
-#         raise ValueError("Overridden bits must exist.")
+    if not len(set(override_dict) & set(chain.from_iterable(map(lambda x: x.split("_"), rounds)))) == len(
+        override_dict
+    ):
+        raise ValueError("Overridden bits must exist.")
 
-#     logger.info(f"Found rounds: {rounds}")
-#     scaling_dir = path / "deconv_scaling"
-#     scaling_dir.mkdir(exist_ok=True)
+    logger.info(f"Found rounds: {rounds}")
+    scaling_dir = path / "deconv_scaling"
+    scaling_dir.mkdir(exist_ok=True)
 
-#     for round_name in rounds:
-#         scaling_file = scaling_dir / f"{round_name}.txt"
-#         if not overwrite and scaling_file.exists():
-#             logger.info(f"Scaling file for {round_name} already exists. Skipping.")
-#             continue
+    for round_name in rounds:
+        scaling_file = scaling_dir / f"{round_name}.txt"
+        if not overwrite and scaling_file.exists():
+            logger.info(f"Scaling file for {round_name} already exists. Skipping.")
+            continue
 
-#         try:
-#             logger.info(f"Processing {round_name}")
-#             percentile_mins, percentile_scales = _get_percentiles_for_round(
-#                 round_name, perc_min, perc_scale, max_rna_bit, override=override_dict
-#             )
+        try:
+            logger.info(f"Processing {round_name}")
+            percentile_mins, percentile_scales = _get_percentiles_for_round(
+                round_name, perc_min, perc_scale, max_rna_bit, override=override_dict
+            )
 
-#             _compute_range(path, round_name, perc_min=percentile_mins, perc_scale=percentile_scales)
+            _compute_range(path, round_name, perc_min=percentile_mins, perc_scale=percentile_scales)
 
-#         except FileNotFoundError:
-#             logger.warning(f"No .tif files found for round {round_name} in {path}. Skipping.")
-#         except AttributeError as e:
-#             logger.error(f"Metadata error processing {round_name}: {e}. Skipping.")
-#         except ValueError as e:
-#             logger.error(f"Value error processing {round_name}: {e}. Skipping.")
-#         except Exception as e:
-#             logger.exception(f"An unexpected error occurred while processing {round_name}: {e}. Skipping.")
+        except FileNotFoundError:
+            logger.warning(f"No .tif files found for round {round_name} in {path}. Skipping.")
+        except AttributeError as e:
+            logger.error(f"Metadata error processing {round_name}: {e}. Skipping.")
+        except ValueError as e:
+            logger.error(f"Value error processing {round_name}: {e}. Skipping.")
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred while processing {round_name}: {e}. Skipping.")
 
 
 # def _run(

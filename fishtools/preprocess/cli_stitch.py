@@ -457,6 +457,11 @@ def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int, j
 @click.option("--max-proj", is_flag=True)
 @click.option("--debug", is_flag=True)
 @click.option(
+    "--drop-disconnected/--keep-disconnected",
+    default=True,
+    help="Drop tiles not connected to the main ROI (4-neighborhood).",
+)
+@click.option(
     "--config",
     "json_config",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
@@ -477,6 +482,7 @@ def register(
     threshold: float | None = None,
     debug: bool = False,
     json_config: Path | None = None,
+    drop_disconnected: bool = True,
 ):
     setup_cli_logging(
         path,
@@ -569,7 +575,8 @@ def register(
     if overwrite:
         [p.unlink() for p in out_path.glob("*.tif")]
 
-    existing_digit_tifs = {p.name for p in out_path.glob("*.tif") if p.stem.isdigit()}
+    # No need to track pre-existing numeric TIFFs; all extracted per-tile TIFFs are
+    # intermediates and will be removed after ImageJ registration completes.
 
     def get_idx(img_path: Path) -> int:
         return int(img_path.stem.split("-")[1])
@@ -612,12 +619,35 @@ def register(
         files = sorted(f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif"))
         files_idx = [int(file.stem.split("-")[-1]) for file in files if file.stem.split("-")[-1].isdigit()]
         logger.debug(f"Using {files_idx}")
+        # Build initial TileConfiguration from the positions CSV subset that
+        # corresponds to the extracted files present in the stitch directory.
         tileconfig = TileConfiguration.from_pos(
             pd.read_csv(
                 ws.tile_positions_csv(roi, position_file=position_file),
                 header=None,
             ).iloc[sorted(files_idx)]
         )
+
+        # Connected components detection and optional filtering.
+        # Always log the exact set of disconnected tiles; when requested,
+        # drop them from the working TileConfiguration.
+        if len(tileconfig) > 0:
+            keep_ids = tileconfig.main_component_ids_grid4()
+            if keep_ids and len(keep_ids) < len(tileconfig):
+                # Convert to python ints for clear logging
+                all_ids = set(int(i) for i in tileconfig.df.get_column("index").to_list())
+                disconnected_ids = sorted(int(i) for i in (all_ids - keep_ids))
+                if disconnected_ids:
+                    joined = ", ".join(str(i) for i in disconnected_ids)
+                    logger.warning(
+                        f"Found {len(disconnected_ids)} disconnected tile(s) not in main component (4-neighborhood): {joined}"
+                    )
+                    if drop_disconnected:
+                        logger.info(
+                            f"Dropping {len(disconnected_ids)} disconnected tile(s) from TileConfiguration."
+                        )
+                        tileconfig = tileconfig.drop(disconnected_ids)
+
         tileconfig.write(out_path / "TileConfiguration.txt")
         logger.info(f"Created TileConfiguration at {out_path}.")
         logger.info("Running first.")
@@ -695,12 +725,12 @@ def register(
         # Keep CLI resilient; log full context for diagnostics
         logger.opt(exception=True).warning("Post-registration checks encountered an error; continuing.")
 
-    created_tile_tifs = [
-        p for p in out_path.glob("*.tif") if p.stem.isdigit() and p.name not in existing_digit_tifs
-    ]
-    if created_tile_tifs:
+    # Remove all digit-named per-tile TIFFs; these are intermediate extracts
+    # used solely to feed ImageJ registration.
+    all_tile_tifs = [p for p in out_path.glob("*.tif") if p.stem.isdigit()]
+    if all_tile_tifs:
         removed = 0
-        for tif_path in created_tile_tifs:
+        for tif_path in all_tile_tifs:
             try:
                 tif_path.unlink(missing_ok=True)
             except Exception as exc:

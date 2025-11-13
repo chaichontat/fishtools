@@ -513,15 +513,11 @@ def generate_debug_plot(
         # Plot 3: Spots on Mask
         axs[2].imshow(img[sl], origin="lower", cmap=cmap, interpolation="none", vmin=1, alpha=0.6)
         if not spots_df.is_empty():
-            try:
-                from __main__ import filter_spots_for_imshow  # Hacky way if running as script
-            except ImportError:
-                logger.warning("filter_spots_for_imshow function not found for debug plot.")
-                plot_spots_x, plot_spots_y = [], []  # Avoid error
-            else:
-                plot_spots_x, plot_spots_y = filter_spots_for_imshow(spots_df, sl, columns=("x_adj", "y_adj"))
+            plot_spots_x, plot_spots_y = filter_spots_for_imshow(spots_df, sl, columns=("x_adj", "y_adj"))
+        else:
+            plot_spots_x, plot_spots_y = [], []
 
-            axs[2].scatter(plot_spots_x, plot_spots_y, s=1, alpha=0.7, c="red")
+        axs[2].scatter(plot_spots_x, plot_spots_y, s=1, alpha=0.7, c="red")
         axs[2].set_title(f"Slice {idx}: Spots on Segmentation")
 
         # Final plot adjustments

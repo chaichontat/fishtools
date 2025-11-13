@@ -70,6 +70,7 @@ from fishtools.preprocess.spots.align_batchoptimize import optimize
 from fishtools.preprocess.spots.illum_field_correction import (
     FieldContext,
     correct_channel_with_field,
+    remap_field_channels,
 )
 from fishtools.preprocess.spots.illum_field_correction import (
     slice_field_ds_for_tile as _slice_field_ds_for_tile,
@@ -198,10 +199,12 @@ def _build_field_context(
         t_low = 0
         t_range = 1
     model_meta = dict(attrs.get("model_meta", {})) if hasattr(attrs, "get") else {}
-    ds = 4  # int(model_meta.get("downsample", 1) or 1)
+    # Use the store's declared downsample; fallback to 1 if missing.
+    ds = int(model_meta.get("downsample", 1) or 1)
     fx0 = float(model_meta["x0"])
     fy0 = float(model_meta["y0"])
-    field_channels = model_meta["channels"]
+    # Prefer channel_names attribute when present; fallback to model_meta["channels"].
+    field_channels = attrs.get("channel_names") or model_meta.get("channels")
     if isinstance(field_channels, (list, tuple)):
         c_index_map = {
             i: (field_channels.index(channel_labels[i]) if channel_labels[i] in field_channels else i)
@@ -299,6 +302,9 @@ def make_fetcher(
             y_off=int(y_off),
         )
 
+        # Slice the DS field at the tile origin only; per-slice offsets from `sl`
+        # are handled inside `correct_channel_with_field` via rescaled crop of the
+        # downsampled planes. Passing offsets here would double-apply the crop.
         low_ds, rng_ds = _slice_field_ds_for_tile(
             field_ctx.field_arr,
             field_ctx.t_low,
@@ -306,14 +312,40 @@ def make_fetcher(
             int(field_ctx.ds),
             int(field_ctx.tile_w),
             int(field_ctx.tile_h),
-            float(field_ctx.tile_x0) + float(field_ctx.x_off),
-            float(field_ctx.tile_y0) + float(field_ctx.y_off),
+            float(field_ctx.tile_x0),
+            float(field_ctx.tile_y0),
             float(field_ctx.fx0),
             float(field_ctx.fy0),
         )
 
         logger.info("Applying field correction on all channels")
         raw = raw[sl]
+
+        # Align field channel order to the selected image channels automatically
+        try:
+            # Derive selected channel positions from `sl`; default = all
+            if isinstance(sl, tuple) and len(sl) >= 2:
+                ch_sel = sl[1]
+                if isinstance(ch_sel, (list, tuple, np.ndarray)):
+                    sel_positions = [int(i) for i in ch_sel]
+                elif isinstance(ch_sel, slice):
+                    sel_positions = list(range(raw.shape[1]))
+                else:
+                    sel_positions = list(range(raw.shape[1]))
+            else:
+                sel_positions = list(range(raw.shape[1]))
+
+            # Remap field planes into the selected image order (subset/reorder)
+            low_ds, rng_ds = remap_field_channels(
+                low_ds,
+                rng_ds,
+                sel_positions,
+                field_ctx.c_index_map,
+            )
+        except click.ClickException:
+            raise
+        except Exception as exc:  # pragma: no cover — defensive guard around inspection logic
+            raise click.ClickException(f"Failed to verify field channel ordering: {exc}")
 
         img = correct_channel_with_field(
             raw,
@@ -996,7 +1028,6 @@ def _render_one_roi_plot(
     "--codebook",
     "codebook_label",
     type=str,
-    default="cs-base",
     help="Codebook label or path; if a path is given, the stem is used.",
 )
 @click.option("--threads", "-t", type=int, default=8, help="Max processes to render plots.")
@@ -1037,7 +1068,7 @@ def _render_one_roi_plot(
 def plot_all_genes_cli(
     path: Path,
     roi: str,
-    codebook_label: str = "cs-base",
+    codebook_label: str,
     threads: int = 8,
     only_blank: bool = False,
     dark: bool = False,
@@ -1739,7 +1770,6 @@ def run(
 
     # Defaults for parameters now typically provided via JSON
     subsample_z: int = 1
-    limit_z: int | None = None
 
     # Merge project config if provided
     config = None
