@@ -1,7 +1,7 @@
 import json
 import pickle
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +17,8 @@ from basicpy import BaSiC
 from loguru import logger
 from tifffile import TiffFile, imread
 
-from fishtools.io.workspace import Workspace, get_channels
+from fishtools import IMWRITE_KWARGS
+from fishtools.io.workspace import Workspace, get_channels, safe_imwrite
 from fishtools.preprocess.basic import fit_basic, plot_basic
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.plot import plot_tile_sizes
@@ -301,7 +302,145 @@ def fit_and_save_basic(
                 plot_basic(basics[-1])
                 plt.show()
 
-        return basics
+    return basics
+
+
+def _load_basic_profiles_cpu(paths: Sequence[Path]) -> tuple[np.ndarray, np.ndarray]:
+    """Load BaSiC darkfield/flatfield profiles from pickle payloads for CPU usage."""
+    darks: list[np.ndarray] = []
+    flats: list[np.ndarray] = []
+    reference_shape: tuple[int, int] | None = None
+
+    for pkl_path in paths:
+        loaded = pickle.loads(pkl_path.read_bytes())
+        basic = loaded.get("basic") if isinstance(loaded, dict) else loaded
+        if basic is None:
+            raise ValueError(f"BaSiC payload at {pkl_path} does not contain a 'basic' model.")
+
+        dark = np.asarray(basic.darkfield, dtype=np.float32)
+        flat = np.asarray(basic.flatfield, dtype=np.float32)
+
+        if dark.shape != flat.shape:
+            raise ValueError(f"Dark/flat shape mismatch for {pkl_path}: {dark.shape} vs {flat.shape}.")
+        if reference_shape is None:
+            reference_shape = dark.shape
+        elif dark.shape != reference_shape:
+            raise ValueError("Inconsistent BaSiC profile geometry; all profiles must match.")
+
+        darks.append(dark)
+        flats.append(flat)
+
+    if not darks:
+        raise ValueError("No BaSiC profiles provided.")
+
+    darkfield_np = np.stack(darks, axis=0).astype(np.float32, copy=False)
+    flatfield_np = np.stack(flats, axis=0).astype(np.float32, copy=False)
+    return darkfield_np, flatfield_np
+
+
+def _apply_basic_cpu(payload: np.ndarray, darkfield: np.ndarray, flatfield: np.ndarray) -> np.ndarray:
+    """Apply BaSiC correction on CPU and return float32 array with original shape."""
+    if payload.ndim < 3:
+        raise ValueError("Expected payload with at least 3 dimensions (planes, height, width).")
+
+    channels, height, width = darkfield.shape
+    if flatfield.shape != (channels, height, width):
+        raise ValueError("Darkfield and flatfield shapes must match.")
+
+    plane_count = int(np.prod(payload.shape[:-2]))
+    if plane_count % channels != 0:
+        raise ValueError(
+            f"Payload plane count {plane_count} not divisible by channel count {channels}. "
+            "Verify --channels or --basic-name selection."
+        )
+
+    reshaped = payload.reshape(-1, channels, height, width).astype(np.float32, copy=False)
+
+    if not np.all(flatfield > 0):
+        logger.warning("Flatfield contains non-positive entries. Clamping to epsilon for stability.")
+        flatfield = np.where(flatfield > 0, flatfield, np.float32(1e-6))
+
+    corrected = reshaped - darkfield[np.newaxis, ...]
+    corrected /= flatfield[np.newaxis, ...]
+    np.clip(corrected, 0.0, np.finfo(np.float32).max, out=corrected)
+    return corrected.reshape(payload.shape)
+
+
+def _infer_channel_names_for_transform(
+    *,
+    input_path: Path,
+    workspace: Path,
+    round_name: str,
+    basic_name: str | None,
+    explicit_channels: str | None,
+) -> list[str]:
+    if explicit_channels:
+        channels = [token.strip() for token in explicit_channels.split(",") if token.strip()]
+        if not channels:
+            raise ValueError("--channels provided but no valid entries parsed.")
+        return channels
+
+    inferred = get_channels(input_path)
+    if inferred:
+        return inferred
+
+    basic_dir = workspace / "basic"
+    target_prefixes: list[str] = []
+    if basic_name:
+        target_prefixes.append(basic_name)
+    else:
+        target_prefixes.extend([round_name, "all"])
+
+    for prefix in target_prefixes:
+        prefix_str = f"{prefix}-"
+        candidates = sorted(p for p in basic_dir.glob(f"{prefix}-*.pkl") if p.is_file())
+        channels: list[str] = []
+        for candidate in candidates:
+            stem = candidate.stem
+            if not stem.startswith(prefix_str):
+                continue
+            channels.append(stem[len(prefix_str) :])
+        if channels:
+            return channels
+
+    raise ValueError(
+        "Unable to infer channel names from TIFF metadata or existing BaSiC profiles. "
+        "Provide --channels (comma-separated)."
+    )
+
+
+def _resolve_basic_paths_cpu(
+    workspace: Path,
+    *,
+    round_name: str,
+    channels: Sequence[str],
+    basic_name: str | None,
+) -> list[Path]:
+    paths: list[Path] = []
+    basic_dir = workspace / "basic"
+    for channel in channels:
+        primary: Path | None = None
+        if basic_name:
+            candidate = basic_dir / f"{basic_name}-{channel}.pkl"
+            if candidate.exists():
+                primary = candidate
+            else:
+                raise FileNotFoundError(f"BaSiC profile not found: {candidate} (explicit --basic-name).")
+        else:
+            preferred = basic_dir / f"{round_name}-{channel}.pkl"
+            fallback_all = basic_dir / f"all-{channel}.pkl"
+            if preferred.exists():
+                primary = preferred
+            elif fallback_all.exists():
+                primary = fallback_all
+            else:
+                raise FileNotFoundError(
+                    "Missing BaSiC profile for channel "
+                    f"{channel}: tried {preferred.name} then {fallback_all.name}."
+                )
+        paths.append(primary)
+        logger.debug(f"Using BaSiC profile for channel {channel} at {primary}")
+    return paths
 
 
 # Alternative data extractor for single-file format
@@ -624,6 +763,201 @@ def batch(path: Path, overwrite: bool = False, threads: int = 1, zs: str = "0.5"
         ]
         for fut in as_completed(futs):
             fut.result()
+
+
+def _transform_single_tile(
+    tile_path: Path,
+    *,
+    workspace_root: Path,
+    base_output_root: Path | None,
+    default_root: Path,
+    darkfield: np.ndarray,
+    flatfield: np.ndarray,
+    channel_names: list[str],
+    n_fids: int,
+    overwrite: bool,
+) -> None:
+    if base_output_root is not None:
+        dest_dir = base_output_root
+    else:
+        try:
+            rel_parent = tile_path.parent.relative_to(workspace_root)
+            dest_dir = default_root / rel_parent
+        except ValueError:
+            dest_dir = default_root
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    output_path = dest_dir / tile_path.name
+
+    if output_path.exists() and not overwrite:
+        logger.info(f"{output_path} exists; skipping. Use --overwrite to replace.")
+        return
+
+    with TiffFile(tile_path) as tif:
+        try:
+            metadata = tif.shaped_metadata[0]  # type: ignore[index]
+        except (TypeError, IndexError):
+            metadata = tif.imagej_metadata or {}
+        if not isinstance(metadata, dict):
+            metadata = dict(metadata) if metadata is not None else {}
+        image = tif.asarray()
+
+    if image.ndim < 3:
+        raise click.ClickException(
+            f"Unsupported TIFF shape {image.shape}; expected at least (channels, H, W)."
+        )
+
+    if n_fids:
+        if image.ndim != 3:
+            raise click.ClickException("--n-fids currently supports 3D stacks with channel axis first.")
+        if image.shape[0] <= n_fids:
+            raise click.ClickException(
+                f"{tile_path.name} has {image.shape[0]} plane(s); cannot remove {n_fids} fid slice(s)."
+            )
+        fid = image[-n_fids:]
+        payload = image[:-n_fids]
+    else:
+        fid = None
+        payload = image
+
+    corrected = _apply_basic_cpu(payload, darkfield, flatfield)
+    corrected_u16 = np.clip(np.rint(corrected), 0, np.iinfo(np.uint16).max).astype(np.uint16, copy=False)
+
+    if fid is not None:
+        deliverable = np.concatenate([corrected_u16, fid.astype(np.uint16, copy=False)], axis=0)
+    else:
+        deliverable = corrected_u16.astype(np.uint16, copy=False)
+
+    metadata_out = dict(metadata)
+    metadata_out["basic_corrected"] = True
+    metadata_out["basic_channels"] = channel_names
+
+    safe_imwrite(
+        output_path,
+        deliverable,
+        metadata=metadata_out,
+        **IMWRITE_KWARGS,
+    )
+    logger.info(f"Wrote BaSiC-corrected TIFF to {output_path}")
+
+
+@basic.command()
+@click.argument("workspace", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str)
+@click.argument("idx", type=int, required=False)
+@click.option("--round", "round_name", required=True, help="Round identifier used to locate the input tiles.")
+@click.option("--output-dir", type=click.Path(dir_okay=True, file_okay=False, path_type=Path), default=None)
+@click.option(
+    "--basic-name",
+    type=str,
+    default=None,
+    help="Override BaSiC profile prefix (default: round, fallback to 'all').",
+)
+@click.option(
+    "--channels", type=str, default=None, help="Comma-separated channel names if metadata lookup fails."
+)
+@click.option(
+    "--n-fids", type=int, default=0, show_default=True, help="Number of fiducial slices appended in the TIFF."
+)
+@click.option("--overwrite", is_flag=True, help="Overwrite existing outputs.")
+def transform(
+    workspace: Path,
+    roi: str,
+    idx: int | None,
+    *,
+    round_name: str,
+    output_dir: Path | None,
+    basic_name: str | None,
+    channels: str | None,
+    n_fids: int,
+    overwrite: bool,
+) -> None:
+    """Apply BaSiC correction to one or more TIFF tiles identified by ROI/index."""
+    setup_cli_logging(
+        workspace,
+        component="preprocess.basic.transform",
+        file=f"basic-transform-{round_name}",
+        extra={"round": round_name, "roi": roi, "idx": idx},
+    )
+
+    workspace_path = workspace.resolve()
+    try:
+        ws = Workspace(workspace_path)
+        workspace_root = ws.path
+        try:
+            roi = ws.resolve_rois([roi])[0]
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+    except Exception:
+        ws = None
+        workspace_root = workspace_path
+
+    round_dir = workspace_root / f"{round_name}--{roi}"
+    if not round_dir.exists():
+        raise click.ClickException(f"Round directory not found: {round_dir}")
+
+    if idx is not None:
+        idx_token = f"{idx:04d}"
+        candidate = round_dir / f"{round_name}-{idx_token}.tif"
+        if not candidate.exists():
+            raise click.ClickException(f"Tile not found: {candidate}")
+        tile_paths = [candidate]
+    else:
+        tile_paths = sorted(
+            p for p in round_dir.glob(f"{round_name}-*.tif") if _parse_tile_index(p) is not None
+        )
+        if not tile_paths:
+            raise click.ClickException(f"No tiles found under {round_dir} matching {round_name}-*.tif.")
+
+    try:
+        channel_names = _infer_channel_names_for_transform(
+            input_path=tile_paths[0],
+            workspace=workspace_root,
+            round_name=round_name,
+            basic_name=basic_name,
+            explicit_channels=channels,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    basic_paths = _resolve_basic_paths_cpu(
+        workspace_root,
+        round_name=round_name,
+        channels=channel_names,
+        basic_name=basic_name,
+    )
+
+    darkfield_np, flatfield_np = _load_basic_profiles_cpu(basic_paths)
+
+    default_root = workspace_root / "analysis" / "basic_transform"
+    if output_dir is not None:
+        base_output_root = (
+            output_dir if output_dir.is_absolute() else (workspace_root / output_dir)
+        ).resolve()
+    else:
+        base_output_root = None
+
+    processed = 0
+    for tile_path in tile_paths:
+        try:
+            _transform_single_tile(
+                tile_path,
+                workspace_root=workspace_root,
+                base_output_root=base_output_root,
+                default_root=default_root,
+                darkfield=darkfield_np,
+                flatfield=flatfield_np,
+                channel_names=channel_names,
+                n_fids=n_fids,
+                overwrite=overwrite,
+            )
+        except click.ClickException:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            raise click.ClickException(f"Failed to transform {tile_path.name}: {exc}") from exc
+        processed += 1
+
+    logger.info(f"Finished BaSiC correction for {processed} tile(s).")
 
 
 if __name__ == "__main__":

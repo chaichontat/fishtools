@@ -1,17 +1,18 @@
 # %%
+import os
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from collections import defaultdict
 from itertools import product
 from pathlib import Path
+from typing import NamedTuple
 
 import matplotlib as mpl
 import polars as pl
 import seaborn as sns
-from loguru import logger
 
 from fishtools.postprocess import (
-    normalize_pearson,
     normalize_total,
-    rotate_label,
     rotate_rois_in_adata,
 )
 from fishtools.utils.io import Workspace
@@ -19,10 +20,10 @@ from fishtools.utils.utils import create_rotation_matrix
 
 mpl.rcParams["figure.dpi"] = 300
 sns.set_theme()
-ws = Workspace(Path("/working/20250407_cs3_2"))
-rois = ["tc", "tl"]  # ws.rois
-seg_codebook = "atp"
-codebooks = ["mousecommon", "zachDE"]
+ws = Workspace(Path("/working/20251001_JaxA3_Coro11/analysis/deconv"))
+rois = ["2r"]  # ws.rois
+seg_codebook = "pi"
+codebooks = ["cs_base"]
 path = ws.deconved
 
 dfs: dict[tuple[str, str], pl.DataFrame] = {}
@@ -33,7 +34,7 @@ for roi, codebook in product(rois, codebooks):
         pl.scan_parquet(
             glob_path,
             include_file_paths="path",
-            allow_missing_columns=True,
+            missing_columns="insert",
         )
         .with_columns(
             z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt8),
@@ -42,7 +43,7 @@ for roi, codebook in product(rois, codebooks):
             roi=pl.lit(roi),
         )
         .with_columns(
-            roilabel=pl.col("roi") + pl.col("label").cast(pl.Utf8),
+            roilabel=pl.format("{}|{}", pl.col("roi"), pl.col("label")),
         )
         .sort("z")
         .collect()
@@ -56,39 +57,42 @@ if not dfs:
     )
 df = pl.concat(dfs.values())
 # %%
-intensity = "cfse"
-
-intensities = {}
-for roi in rois:
-    # Construct path using the singular seg_codebook
-    glob_path_intensity = (
-        path / f"stitch--{roi}+{seg_codebook}" / f"intensity_{intensity}/intensity-*.parquet"
-    )
-    try:
-        intensity_roi = (
-            pl.scan_parquet(
-                glob_path_intensity,
-                include_file_paths="path",
-                allow_missing_columns=True,
-            )
-            .with_columns(
-                z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt8),
-                roi=pl.lit(roi),
-            )
-            .with_columns(
-                roilabel=pl.col("roi") + pl.col("label").cast(pl.Utf8),
-                roilabelz=pl.col("z").cast(pl.Utf8) + pl.col("roi") + pl.col("label").cast(pl.Utf8),
-            )
-            # .sort("z") # Maintained as commented out from original
-            .collect()
+INTENSITY = NamedTuple("INTENSITY", [("roi", str), ("intensity", str)])
+channels = ["edu", "brdu", "pi"]
+intensities: dict[INTENSITY, pl.DataFrame] = {}
+for intensity in channels:
+    for roi in rois:
+        # Construct path using the singular seg_codebook
+        glob_path_intensity = (
+            path / f"stitch--{roi}+{seg_codebook}" / f"intensity_{intensity}/intensity-*.parquet"
         )
-        if not intensity_roi.is_empty():
-            intensities[roi] = intensity_roi
-        # else: # Optional:
-        # print(f"Warning: No intensity files found for ROI '{roi}' with seg_codebook '{seg_codebook}' at {glob_path_intensity}")
-    except Exception as e:
-        # print(f"Warning: Could not load intensity files for ROI '{roi}' with seg_codebook '{seg_codebook}' from {glob_path_intensity}. Error: {e}")
-        pass
+        print(glob_path_intensity)
+        try:
+            intensity_roi = (
+                pl.scan_parquet(
+                    glob_path_intensity,
+                    include_file_paths="path",
+                    missing_columns="insert",
+                )
+                .with_columns(
+                    z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt16),
+                    roi=pl.lit(roi),
+                    label=pl.col("label").cast(pl.UInt32),
+                )
+                .select(["z", "roi", "label", "mean_intensity", "max_intensity", "min_intensity"])
+                .collect()
+            )
+            print(intensity_roi)
+            intensity_roi = intensity_roi.rename({
+                f"{x}_intensity": f"{intensity}_{x}" for x in ["mean", "max", "min"]
+            })
+            if not intensity_roi.is_empty():
+                intensities[INTENSITY(roi=roi, intensity=intensity)] = intensity_roi
+            # else: # Optional:
+            # print(f"Warning: No intensity files found for ROI '{roi}' with seg_codebook '{seg_codebook}' at {glob_path_intensity}")
+        except Exception as e:
+            # print(f"Warning: Could not load intensity files for ROI '{roi}' with seg_codebook '{seg_codebook}' from {glob_path_intensity}. Error: {e}")
+            pass
 
 
 if not intensities:  # Corrected check
@@ -96,7 +100,7 @@ if not intensities:  # Corrected check
         f"No intensity files found for any ROI in '{rois}' with seg_codebook '{seg_codebook}', or 'rois' list is empty."
     )
 
-assert len(intensities) == len(rois), (
+assert len(intensities) == len(rois) * len(channels), (
     f"Not all ROIs have intensity data. Expected {len(rois)}, got {len(intensities)}."
 )
 
@@ -104,41 +108,41 @@ assert len(intensities) == len(rois), (
 
 _spots_accumulator = defaultdict(list)
 
-# Iterate over each ROI and its corresponding DataFrame from 'dfs'
-# df_for_current_roi is dfs[roi]
+# Iterate per ROI/codebook to build a joined frame that carries spot coordinates for export.
 joineds = []
 for (roi, codebook), _df in dfs.items():
     print(roi, codebook)
 
-    spots_file_path = path / f"{roi}+{codebook}.parquet"
-
+    spots_file_path = path.parent / "output" / f"{roi}+{codebook}.parquet"
     if not spots_file_path.exists():
         print(f"Info: Spots file not found, skipping: {spots_file_path}")
         continue
 
-    current_roi_codebook_spots_df = pl.read_parquet(spots_file_path).with_columns(
-        roi=pl.lit(roi), codebook=pl.lit(codebook)
-    )
-
-    if "index" not in current_roi_codebook_spots_df.columns:
-        current_roi_codebook_spots_df = current_roi_codebook_spots_df.with_row_index(name="label")
+    # Ensure a "spot_id" column that matches ident_*.parquet
+    spots_df = pl.read_parquet(spots_file_path).with_columns(roi=pl.lit(roi), codebook=pl.lit(codebook))
+    if "index" in spots_df.columns:
+        spots_df = spots_df.rename({"index": "spot_id"})
     else:
-        current_roi_codebook_spots_df = current_roi_codebook_spots_df.rename(dict(index="label"))
+        spots_df = spots_df.with_row_index(name="spot_id")
 
-    joined = _df.with_columns(label=pl.col("label").cast(pl.UInt32)).join(
-        current_roi_codebook_spots_df, on=[pl.col("codebook"), pl.col("label")], how="left"
-    )
-
+    # Join by the unique spot identifier to fetch per-spot coordinates and attributes
+    joined = _df.join(spots_df, on="spot_id", how="left")
     if joined.is_empty():
-        print(f"Info: No relevant ident data found in dfs['{roi}']")
+        print(f"Info: No relevant ident data found for ROI '{roi}', codebook '{codebook}'.")
     joineds.append(joined)
-joined = pl.concat(joineds)
+
+joined = pl.concat(joineds) if joineds else pl.DataFrame()
 
 # %%
 (path / "baysor").mkdir(exist_ok=True)
-joined.select(
-    x="x", y="y", z="z", gene=pl.col("target").str.split("-").list.get(0), cell=pl.col("label").fill_null(0)
-).filter(pl.col("gene") != "Blank").write_csv(path / "baysor" / "spots.csv")
+if not joined.is_empty():
+    joined.select(
+        x=pl.col("x"),
+        y=pl.col("y"),
+        z=pl.col("z"),
+        gene=pl.col("target").str.split("-").list.get(0),
+        cell=pl.col("label").fill_null(0),
+    ).filter(pl.col("gene") != "Blank").write_csv(path / "baysor" / "spots.csv")
 
 
 # %%
@@ -192,44 +196,94 @@ for roi in rois:
         )
         .with_columns(z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt8), roi=pl.lit(roi))
         .with_columns(
-            roilabel=pl.col("roi") + pl.col("label").cast(pl.Utf8),
-            roilabelz=pl.col("z").cast(pl.Utf8) + pl.col("roi") + pl.col("label").cast(pl.Utf8),
+            roilabel=pl.format("{}|{}", pl.col("roi"), pl.col("label")),
+            roilabelz=pl.format(
+                "{}|{}|{}",
+                pl.col("z").cast(pl.Utf8),
+                pl.col("roi"),
+                pl.col("label").cast(pl.Utf8),
+            ),
         )
         .drop("path")
         .sort("z")
         .collect()
     )
 
+
+# --- Diagnostics: check (z, roi, label) coverage parity before joining intensities ---
+def _pair_set(df: pl.DataFrame) -> set[tuple[int, int]]:
+    if df.is_empty():
+        return set()
+    # Cast to Python ints to avoid dtype mismatches when comparing
+    return set((int(z), int(lbl)) for z, lbl in df.select(["z", "label"]).unique().iter_rows())
+
+
+for roi in rois:
+    poly_pairs = _pair_set(polygons[roi])
+    print(f"[diag] ROI={roi}: polygons unique (z,label)={len(poly_pairs)}")
+    for ch in channels:
+        key = INTENSITY(roi=roi, intensity=ch)
+        if key not in intensities:
+            print(f"[diag] ROI={roi}, ch={ch}: intensity shards missing")
+            continue
+        int_pairs = _pair_set(intensities[key])
+        missing = poly_pairs - int_pairs
+        extra = int_pairs - poly_pairs
+        print(
+            f"[diag] ROI={roi}, ch={ch}: missing_in_intensity={len(missing)}, extra_in_intensity={len(extra)}"
+        )
+        if missing:
+            print(f"[diag]   sample missing (z,label): {sorted(list(missing))[:10]}")
+        if extra:
+            print(f"[diag]   sample extra   (z,label): {sorted(list(extra))[:10]}")
+
 for polygon in list(polygons):
-    polygons[polygon] = polygons[polygon].join(intensities[polygon], on="roilabelz")
+    _df = polygons[polygon].with_columns(
+        z=pl.col("z").cast(pl.UInt16),
+        label=pl.col("label").cast(pl.UInt32),
+    )
+    for intensity in ["edu", "brdu", "pi"]:
+        if (roi_intensity := INTENSITY(roi=polygon, intensity=intensity)) in intensities:
+            _df = _df.join(intensities[roi_intensity], on=["z", "roi", "label"], how="left")
+
+    polygons[polygon] = _df
 polygons = pl.concat(polygons.values())
 polygons, roi_offsets = arrange_rois(polygons, max_columns=2, padding=100)
 
 
 def pl_weighted_mean(value_col: str, weight_col: str) -> pl.Expr:
     """
-    Generate a Polars aggregation expression to take a weighted mean
-    https://github.com/pola-rs/polars/issues/7499#issuecomment-2569748864
+    Generate a Polars aggregation expression to take a weighted mean.
+
+    Note: the previous implementation incorrectly used the literal string
+    name for the weight column inside a `then(...)`, which produced a
+    string-valued expression instead of referencing the actual column.
+    That could propagate nulls and yield zeros/NaNs when aggregating. The
+    correct form references the column via `pl.col(weight_col)` and computes
+    sum(value * weight) / sum(weight).
     """
     values = pl.col(value_col)
-    weights = pl.when(values.is_not_null()).then(weight_col)
-    return weights.dot(values).truediv(weights.sum()).fill_nan(None)
+    weights = pl.when(values.is_not_null()).then(pl.col(weight_col)).otherwise(None)
+    return (values * weights).sum().truediv(weights.sum()).fill_nan(None)
 
 
-weighted_centroids = (
-    polygons.group_by(pl.col("roilabel"))
-    .agg(
-        area=pl.col("area").sum(),
-        x=(pl.col("centroid_x") * pl.col("area")).sum() / pl.col("area").sum(),
-        y=(pl.col("centroid_y") * pl.col("area")).sum() / pl.col("area").sum(),
-        z=(pl.col("z").cast(pl.Float64) * pl.col("area")).sum() / pl.col("area").sum(),
-        mean_intensity=(pl.col("mean_intensity") * pl.col("area")).sum() / pl.col("area").sum(),
-        max_intensity=pl.col("max_intensity").max(),
-        min_intensity=pl.col("min_intensity").min(),
-        roi=pl.col("roi").first(),
-    )
-    .sort("roilabel")
+_agg = dict(
+    area=pl.col("area").sum(),
+    x=(pl.col("centroid_x") * pl.col("area")).sum() / pl.col("area").sum(),
+    y=(pl.col("centroid_y") * pl.col("area")).sum() / pl.col("area").sum(),
+    z=(pl.col("z").cast(pl.Float64) * pl.col("area")).sum() / pl.col("area").sum(),
+    roi=pl.col("roi").first(),
 )
+
+for intensity in ["edu", "brdu", "pi"]:
+    _agg.update({
+        f"{intensity}_mean": pl_weighted_mean(f"{intensity}_mean", "area"),
+        f"{intensity}_max": pl.col(f"{intensity}_max").max(),
+        f"{intensity}_min": pl.col(f"{intensity}_min").min(),
+    })
+
+# %%
+weighted_centroids = polygons.group_by(pl.col("roilabel")).agg(**_agg).sort("roilabel")
 
 # %%
 weighted_centroids = weighted_centroids.to_pandas().set_index("roilabel")
@@ -240,14 +294,34 @@ weighted_centroids.index = weighted_centroids.index.astype(str)
 # %%
 molten = df.group_by([pl.col("roilabel"), pl.col("target")]).agg(pl.len())
 
+
+# %%
+def convert_transcript_to_gene(ts: str, non_unique_targets: list[str] | None = None) -> str:
+    if non_unique_targets and any(ts.startswith(nt) for nt in non_unique_targets):
+        return ts
+    gene, tsidx = ts.rsplit("-", 1)
+    return gene
+
+
+non_unique_targets = (
+    molten.filter(~pl.col("target").str.starts_with("Blank"))
+    .unique("target")
+    .with_columns(gene_name=pl.col("target").map_elements(convert_transcript_to_gene, return_dtype=pl.Utf8))
+    .group_by("gene_name")
+    .agg(count=pl.len())
+    .filter(pl.col("count") > 1)
+    .get_column("gene_name")
+    .to_list()
+)
+print("Non-unique genes:", non_unique_targets)
+
 # %%
 cbg = (
-    molten.with_columns(
-        gene_name=pl.when(
-            pl.col("target").str.contains(r"-2\d+").and_(~pl.col("target").str.starts_with("Blank"))
+    molten.filter(~pl.col("target").str.starts_with("Blank"))
+    .with_columns(
+        gene_name=pl.col("target").map_elements(
+            lambda x: convert_transcript_to_gene(x, non_unique_targets), return_dtype=pl.Utf8
         )
-        .then(pl.col("target").str.split("-").list.get(0))
-        .otherwise(pl.col("target"))
     )
     .drop("target")
     .pivot("gene_name", index="roilabel", values="len")
@@ -273,19 +347,19 @@ import tifffile
 from shapely import MultiPolygon, Point, Polygon, STRtree
 
 adata = ad.AnnData(cbg)
-adata.obs = weighted_centroids.reindex(adata.obs.index)
 
+
+adata.obs = weighted_centroids.reindex(adata.obs.index)
 n_genes = adata.shape[1]
 sc.pp.calculate_qc_metrics(
     adata, inplace=True, percent_top=(n_genes // 10, n_genes // 5, n_genes // 2, n_genes)
 )
-sc.pp.filter_cells(adata, min_counts=40)
+sc.pp.filter_cells(adata, min_counts=30)
 sc.pp.filter_cells(adata, max_counts=1200)
 sc.pp.filter_genes(adata, min_cells=10)
 # adata = adata[(adata.obs["y"] < 23189.657075200797) | (adata.obs["y"] > 46211.58630310604)]
-adata.obsm["spatial"] = adata.obs[["x", "y"]].to_numpy()
-adata = adata[adata.obs["area"] > 500]
 # adata = adata[~adata.obs["roi"].isin(["bl", "br"])]
+adata.obsm["spatial"] = adata.obs[["x", "y"]].to_numpy()
 sc.pl.violin(
     adata,
     ["n_genes_by_counts", "total_counts"],
@@ -293,11 +367,12 @@ sc.pl.violin(
     multi_panel=True,
 )
 print(np.median(adata.obs["total_counts"]), len(adata))
-
+# %%
+adata.write_h5ad(ws.output / f"1whole+cs_base.h5ad")
 # adata.write_h5ad(path / "segmentation_counts.h5ad")
 # %%
 plt.scatter(adata.obs["x"][::1], adata.obs["y"][::1], s=1, alpha=0.3)
-
+plt.axis("equal")
 
 # %%
 # %%
@@ -305,7 +380,7 @@ plt.scatter(adata.obs["x"][::1], adata.obs["y"][::1], s=1, alpha=0.3)
 #
 adata.layers["raw"] = adata.X.copy()
 adata, plot = normalize_total(adata)
-adata.obs["total_intensity"] = adata.obs["mean_intensity"] * adata.obs["area"]
+adata.obs["edu_mean"] = adata.obs["edu_mean"] * adata.obs["area"]
 # adata.obsm["spatial"] = np.dot(create_rotation_matrix(82), adata.obsm["spatial"].T).T
 # plot()
 # adata, plot = normalize_pearson(adata)
@@ -317,11 +392,7 @@ adata.obs["total_intensity"] = adata.obs["mean_intensity"] * adata.obs["area"]
 # %%
 #  (adata.obs['total_counts'] / adata.obs["area"]) / np.mean(adata.X.sum(axis=1) / adata.obs["area"])
 
-# %%
 
-
-# %%
-# sc.pp.scale(adata, max_value=10)
 # %%
 import rapids_singlecell as rsc
 
@@ -337,22 +408,23 @@ import scanpy.external as sce
 # %%
 rsc.pp.neighbors(adata, n_neighbors=25, n_pcs=25, metric="cosine", random_state=12)
 # %%
-sc.tl.leiden(adata, n_iterations=2, resolution=0.9, flavor="igraph")
+sc.tl.leiden(adata, n_iterations=2, resolution=2, flavor="igraph")
 # %%
 rsc.tl.umap(adata, min_dist=0.1, n_components=2, random_state=0)
 # %%
 # fig, ax = plt.subplots(figsize=(8, 6))
 
-rotate_rois_in_adata(adata, dict(tl=-70, tc=-18, tr=5, br=-38))
+rotate_rois_in_adata(adata, {"1whole": 60})
 # %%
 from fishtools.utils.plot import add_scale_bar, plot_embedding
 
 fig, axs = plot_embedding(
     adata,
-    color=["leiden"],
+    color=["edu_max"],
     basis="spatial_rot",
     dpi=300,
-    figsize=(8, 4),
+    figsize=(10, 6),
+    s=2,
     # legend_loc=None,
     # cmap="Blues",
     # vmin=np.percentile(adata.obs["mean_intensity"], 1),
@@ -363,37 +435,31 @@ add_scale_bar(axs[0], 1000 / 0.216, "1000 μm")
 # adata.obs["cfsepos"] = adata.obs["mean_intensity"] > 10000
 
 # %%
-adata.obs["log_mean_intensity"] = np.log10(adata.obs["mean_intensity"] + 1)
-fig, axs = plot_embedding(
-    adata[adata.obs["roi"] == "tc"],
-    color=["log_mean_intensity"],
-    basis="spatial_rot",
-    dpi=300,
-    cmap="Blues",
-    figsize=(8, 4),
-    vmin=np.percentile(adata.obs["log_mean_intensity"], 80),
-    vmax=np.percentile(adata.obs["log_mean_intensity"], 99.9),
-    colorbar_loc=None,
-    # cmap="Blues",
-    # vmin=np.percentile(adata.obs["mean_intensity"], 1),
-    # vmax=np.percentile(adata.obs["mean_intensity"], 99),
-)
-axs[0].axis("off")
-add_scale_bar(axs[0], 1000 / 0.216, "1000 μm")
+adata.obs["log_edu_mean"] = np.log10(adata.obs["edu_mean"] + 1)
+adata.obs["log_brdu_mean"] = np.log10(adata.obs["brdu_mean"] + 1)
 
-# %%
-fig, ax = plt.subplots(figsize=(8, 6))
-gene = "total_intensity"
-ax.set_aspect("equal")
-sc.pl.embedding(
-    adata,
-    color=gene,
-    basis="spatial_rot",
-    cmap="Blues",
-    ax=ax,
-    vmin=np.percentile(adata.obs["total_intensity"], 1),
-    vmax=np.percentile(adata.obs["total_intensity"], 99.9),
-)  # type: ignore
+
+def plot_intensity(gene: str, basis="spatial_rot", **kwargs):
+    fig, axs = plot_embedding(
+        adata[adata.obs["roi"] == rois[0]],
+        color=[f"log_{gene}_mean"],
+        basis=basis,
+        dpi=300,
+        cmap="Blues",
+        figsize=(8, 4),
+        vmin=np.percentile(adata.obs[f"log_{gene}_mean"], 80),
+        vmax=np.percentile(adata.obs[f"log_{gene}_mean"], 99.9),
+        colorbar_loc=None,
+        # cmap="Blues",
+        # vmin=np.percentile(adata.obs["mean_intensity"], 1),
+        # vmax=np.percentile(adata.obs["mean_intensity"], 99),
+    )
+    axs[0].axis("off")
+    add_scale_bar(axs[0], 1000 / 0.216, "1000 μm")
+    return fig, axs
+
+
+plot_intensity("brdu")
 
 
 # %%
@@ -417,7 +483,7 @@ gene = "leiden"
 #     # vmax=np.percentile(adata[:, gene].X, 99.99),
 #     # vmin=np.percentile(adata[:, gene].X, 50),
 # )  # type: ignore
-m = adata[adata.obs["mean_intensity"] > 2000]
+m = adata  # [adata.obs["mean_intensity"] > 2000]
 # ax.scatter(
 #     m.obsm["spatial"][:, 0],
 #     m.obsm["spatial"][:, 1],
@@ -428,9 +494,9 @@ m = adata[adata.obs["mean_intensity"] > 2000]
 # )
 
 fig, axs = plot_embedding(
-    m[m.obs["roi"] == "tc"],
+    m[m.obs["roi"] == "1whole"],
     color=["leiden"],
-    basis="spatial_rot",
+    basis="spatial",
     dpi=300,
     # cmap="Blues",
     figsize=(8, 4),
@@ -459,8 +525,8 @@ gene = "leiden"
 
 sc.pl.embedding(
     adata,
-    color=["Dlx1", "Hes5", "Top2a", "Arx", "Id2", "Gria2", "Lhx2"],
-    basis="spatial_rot",
+    color=["leiden"],
+    basis="umap",
     ncols=3,
     cmap="CMRmap_r",
     # ax=ax,
@@ -475,7 +541,7 @@ sc.pl.embedding(
 fig = sc.pl.embedding(
     adata,
     basis="spatial_rot",
-    color=["Pax6", "Cux2", "Neurog2", "Pax6", "Boc", "Slc1a3", "Neurog2", "Satb2"],
+    color=["Pax6", "Cux2", "Neurog2", "Lhx2", "Boc", "Slc1a3", "Neurog2", "Satb2"],
     cmap="Blues",
     ncols=3,
     return_fig=True,
@@ -534,26 +600,121 @@ for ax in fig.axes:
 
 # %%
 sc.pl.pca(adata, color=["tricycle"], cmap="cet_colorwheel")
-sc.pl.pca(
-    adata, color=["mean_intensity"], cmap="CMRmap_r", vmax=np.percentile(adata.obs["mean_intensity"], 99.9)
+# %%
+sc.pl.umap(adata, color=["Eomes"], cmap="CMRmap_r", vmax=np.percentile(adata[:, "Eomes"].X, 99.9))
+sc.pl.umap(
+    adata, color=["log_edu_mean"], cmap="CMRmap_r", vmax=np.percentile(adata.obs["log_edu_mean"], 99.9)
 )
 
+# --- Overlay UMAP: BRDU (green) vs EDU (magenta) -----------------------------------------------
+from typing import Tuple
+
+import anndata as ad
+
+
+def _percentile_normalize(x: np.ndarray, percs: tuple[float, float] = (1.0, 99.9)) -> np.ndarray:
+    """Normalize a 1D array to 0..1 using given percentiles, robust to NaNs/inf."""
+    x = np.asarray(x)
+    finite = np.isfinite(x)
+    if not finite.any():
+        return np.zeros_like(x, dtype=float)
+    lo = np.nanpercentile(x[finite], percs[0])
+    hi = np.nanpercentile(x[finite], percs[1])
+    if hi <= lo:
+        return np.clip(x - lo, 0, None)
+    return np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+
+
+def plot_umap_overlay_green_magenta(
+    adata: ad.AnnData,
+    *,
+    green_key: str = "log_edu_mean",
+    magenta_key: str = "log_brdu_mean",
+    percs: tuple[float, float] = (40, 99),
+    s: float = 2.0,
+    alpha: float = 0.7,
+    background: str = "black",
+    ax: plt.Axes | None = None,
+    title: str | None = "UMAP overlay: BRDU (green) vs EDU (magenta)",
+) -> tuple[plt.Figure, plt.Axes]:
+    """
+    Overlay two continuous features on UMAP using additive RGB:
+    - Green channel ← `green_key` (e.g., BRDU)
+    - Magenta channel (R+B) ← `magenta_key` (e.g., EDU)
+    Areas with both high → near-white; exclusive → pure green/magenta.
+    """
+    if "X_umap" not in adata.obsm:
+        raise ValueError("UMAP coordinates not found in adata.obsm['X_umap'].")
+
+    xy = adata.obsm["X_umap"]
+    if xy.shape[1] != 2:
+        raise ValueError("Expected 2D UMAP embedding in adata.obsm['X_umap'].")
+
+    if green_key not in adata.obs or magenta_key not in adata.obs:
+        missing = [k for k in [green_key, magenta_key] if k not in adata.obs]
+        raise KeyError(f"Missing keys in adata.obs: {missing}")
+
+    g_raw = adata.obs[green_key].to_numpy()
+    m_raw = adata.obs[magenta_key].to_numpy()
+
+    g = _percentile_normalize(g_raw, percs)
+    m = _percentile_normalize(m_raw, percs)
+
+    # Magenta = R+B; Green stays in G.
+    rgb = np.column_stack([m, g, m])  # shape (n, 3)
+
+    created_fig = False
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7.2, 6.0), dpi=200, facecolor=background)
+        created_fig = True
+    else:
+        fig = ax.figure
+
+    ax.set_facecolor(background)
+    ax.scatter(xy[:, 0], xy[:, 1], c=rgb, s=s, alpha=alpha, linewidths=0, rasterized=True)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if title:
+        ax.set_title(title)
+
+    # Text legend
+    ax.text(0.02, 0.98, "BrdU", transform=ax.transAxes, color="lime", va="top", ha="left", fontsize=10)
+    ax.text(0.98, 0.98, "EdU", transform=ax.transAxes, color="magenta", va="top", ha="right", fontsize=10)
+
+    return fig, ax
+
+
+# Render the overlay next to the individual maps
+plot_umap_overlay_green_magenta(adata, green_key="log_edu_mean", magenta_key="log_brdu_mean")
+
+
 # %%
+
+
+# %%
+var = "EdU"
 fig, ax = plt.subplots(ncols=1, figsize=(8, 6), dpi=200)
 u = adata[adata.obs["leiden"] == "1"]
-ax.set_title("θ vs mean CFSE intensity")
-ax.hexbin(u.obs["tricycle"], np.log10(u.obs["total_intensity"] + 1), gridsize=200, cmap="Blues", vmax=10)
+ax.set_title(f"θ vs mean {var} intensity")
+ax.hexbin(
+    u.obs["tricycle"], np.log10(u.obs[f"log_{var.lower()}_mean"] + 1), gridsize=200, cmap="Blues", vmax=10
+)
 ax.set_xlabel("θ")
-ax.set_ylabel("log10(mean CFSE intensity)")
+ax.set_ylabel(f"log10(mean {var} intensity)")
 # %%
 fig, ax = plt.subplots(ncols=1, figsize=(8, 6), dpi=200)
 
-ax.set_title("θ vs mean CFSE intensity")
+ax.set_title(f"θ vs mean {var} intensity")
 ax.hexbin(
-    adata.obs["tricycle"], np.log10(adata.obs["total_intensity"] + 1), gridsize=200, cmap="Blues", vmax=10
+    adata.obs["tricycle"],
+    np.log10(adata.obs[f"log_{var.lower()}_mean"] + 1),
+    gridsize=200,
+    cmap="Blues",
+    vmax=10,
 )
 ax.set_xlabel("θ")
-ax.set_ylabel("log10(mean CFSE intensity)")
+ax.set_ylabel(f"log10(mean {var} intensity)")
 
 # %%
 
@@ -564,9 +725,9 @@ plt.loglog(
 )
 
 # %%
-from fishtools.utils.plot import plot_embedding, plot_wheel
+from fishtools.utils.plot import plot_wheel
 
-adata.obs["log_mean_intensity"] = np.log10(adata.obs["mean_intensity"] + 1)
+# %%
 fig, axs = plot_wheel(
     np.nan_to_num(adata.obsm["tricycle"], nan=0),
     # scatter_cmap="Blues",
@@ -584,12 +745,12 @@ fig, axs = plot_wheel(
     np.nan_to_num(m.obsm["tricycle"], nan=0),
     # scatter_cmap="Blues",
     alpha=0.1,
-    c=m.obs["total_intensity"],
-    scatter_cmap="turbo",
-    # colorize_background=True,
+    c=m.obs["log_brdu_mean"],
+    scatter_cmap="CMRmap_r",
+    colorize_background=False,
     fig=fig,
     # vmax=np.percentile(adata.obs["total_intensity"], 99),
-    colorbar_label="mean CFSE intensity",
+    colorbar_label="mean BrdU intensity",
 )
 
 
@@ -598,12 +759,14 @@ fig, axs = plot_wheel(
 # %%
 fig = sc.pl.embedding(
     adata,
-    basis="spatial",
+    basis="umap",
     color=[
         "leiden",
-        # "mean_intensity",
-        # "Pax6",
-        # "Sox2",
+        "log_edu_mean",
+        "log_brdu_mean",
+        "Pax6",
+        "Sox2",
+        "Hes5",
         # "Btg2",
         # "Neurog2",
         # "Neurod1",
@@ -615,8 +778,10 @@ fig = sc.pl.embedding(
         # "Gad1",
         # "Satb2",
         # "Fezf2",
-        "Slc17a6",
+        # "Slc17a6",
         "Slc17a7",
+        "Lhx2",
+        "Lhx6",
         "Pdgfra",
         "Gad1",
         "Cux2",
@@ -772,9 +937,9 @@ with sns.axes_style("white"):
 
 # %%
 sc.pl.embedding(
-    adata[adata[:, "Gad1"].X.__gt__(0) & adata[:, "Slc17a6"].X.__gt__(1)],
+    adata[adata[:, "Gad2"].X.__gt__(0) & adata[:, "Slc17a7"].X.__gt__(1)],
     basis="spatial",
-    color=["Gad1", "Slc17a6"],
+    color=["Gad2", "Slc17a7"],
     cmap="Blues",
 )
 

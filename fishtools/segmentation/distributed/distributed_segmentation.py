@@ -6,13 +6,18 @@ import logging
 import os
 import pathlib
 import shutil
+import sys
 from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated, Any, cast
 
+if __package__ in (None, ""):
+    repo_root = pathlib.Path(__file__).resolve().parents[3]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
 import cellpose.io
-import cellpose.models
 import dask
 import dask_image.ndmeasure
 import dask_jobqueue
@@ -28,10 +33,12 @@ from loguru import logger
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
+
+from fishtools.segmentation.distributed.gpu_cluster import myGPUCluster
 from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.segment.normalize import sample_percentile
-from fishtools.segment.train import IS_CELLPOSE_SAM
+from fishtools.segment.train import IS_CELLPOSE_SAM, plan_path_for_device
 from fishtools.utils.pretty_print import progress_bar
 
 # logger.remove()
@@ -43,6 +50,33 @@ logging.basicConfig(level="INFO", handlers=[RichHandler(level="INFO")])
 logging.getLogger("cellpose").setLevel(logging.WARNING)
 
 logger = logging.getLogger("rich")
+
+
+def _gpu_probe() -> dict[str, Any]:
+    """Executed on workers to report CUDA visibility and current device."""
+    import distributed as _dist  # local import to avoid serialization surprises
+
+    info: dict[str, Any] = {}
+    try:
+        import torch  # type: ignore
+    except Exception:
+        torch = None  # type: ignore
+    try:
+        info["worker"] = getattr(_dist.get_worker(), "name", "unknown")
+    except Exception:
+        info["worker"] = "unknown"
+    try:
+        info["cuda_visible_devices"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    except Exception:
+        info["cuda_visible_devices"] = ""
+    try:
+        if torch is not None and getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+            info["torch_current_device"] = int(torch.cuda.current_device())
+        else:
+            info["torch_current_device"] = None
+    except Exception:
+        info["torch_current_device"] = None
+    return info
 
 
 ######################## File format functions ################################
@@ -151,7 +185,9 @@ def _modify_dask_config(
     config_name: str = DEFAULT_CONFIG_FILENAME,
 ) -> None:
     dask.config.set(config)
-    with open(_config_path(config_name), "w") as f:
+    cfg_path = Path(_config_path(config_name))
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg_path, "w") as f:
         yaml.dump(dask.config.config, f, default_flow_style=False)
 
 
@@ -289,8 +325,8 @@ def cluster(func: Callable[..., Any]) -> Callable[..., Any]:
             "Either cluster or cluster_kwargs must be defined"
         )
         if not "cluster" in kwargs:
-            cluster_constructor = myLocalCluster
-            with cluster_constructor(**kwargs["cluster_kwargs"]) as cluster:
+            ck = dict(kwargs.get("cluster_kwargs", {}) or {})
+            with myGPUCluster(**ck) as cluster:
                 kwargs["cluster"] = cluster
                 return func(*args, **kwargs)
         return func(*args, **kwargs)
@@ -370,11 +406,11 @@ def process_block(
         preprocessing_steps = [(F, {'sigma':2.0}), (G, {'radius':4})]
 
     model_kwargs : dict
-        Arguments passed to cellpose.models.Cellpose
+        Arguments passed to PackedCellposeModel
         This is how you select and parameterize a model.
 
     eval_kwargs : dict
-        Arguments passed to the eval function of the Cellpose model
+        Arguments passed to the eval function of the PackedCellpose model
         This is how you parameterize model evaluation.
 
     blocksize : iterable (list, tuple, np.ndarray)
@@ -475,7 +511,11 @@ def process_block(
     box_ids_for_this_block = final_unique_ids_3d[final_unique_ids_3d != 0]
 
     if test_mode:
-        return segmentation_global_3d, boxes, box_ids_for_this_block  # Return 3D results
+        return (
+            segmentation_global_3d,
+            boxes,
+            box_ids_for_this_block,
+        )  # Return 3D results
 
     # --- Write 3D results to 3D output Zarr ---
     # print(f"Block {block_index}: Writing to output Zarr at {crop_trimmed_3d}")
@@ -489,6 +529,50 @@ def process_block(
 
 
 # ----------------------- component functions ---------------------------------#
+
+
+def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
+    """Instantiate a PackedCellpose model, preferring TensorRT plans when available."""
+    import torch
+    from cellpose.contrib.packed_infer import (
+        PackedCellposeModel,
+        PackedCellposeModelTRT,
+    )
+
+    resolved_kwargs = dict(model_kwargs)
+    pretrained_model = resolved_kwargs.get("pretrained_model")
+    if pretrained_model is None:
+        raise ValueError("model_kwargs must include 'pretrained_model'.")
+
+    pretrained_path = Path(pretrained_model)
+    resolved_kwargs["pretrained_model"] = str(pretrained_path)
+
+    plan_selection: tuple[Path, str] | None = None
+    if torch is not None and getattr(torch.cuda, "is_available", lambda: False)():
+        if getattr(torch.cuda, "device_count", lambda: 0)() > 0:
+            device_index = 0
+            device_name = torch.cuda.get_device_name(device_index)
+            plan_candidate = plan_path_for_device(pretrained_path, device_name)
+            if plan_candidate.is_file():
+                plan_selection = (plan_candidate, device_name)
+
+    if plan_selection is not None:
+        plan_path, device_name = plan_selection
+        logger.info("Using TensorRT plan %s for CUDA device '%s'", plan_path.name, device_name)
+        trt_kwargs = {
+            key: value for key, value in resolved_kwargs.items() if key not in {"pretrained_model_ortho"}
+        }
+        trt_kwargs["pretrained_model"] = str(plan_path)
+        trt_kwargs.setdefault("gpu", True)
+        return PackedCellposeModelTRT(**trt_kwargs)
+
+    if IS_CELLPOSE_SAM:
+        resolved_kwargs.pop("pretrained_model_ortho", None)
+
+    resolved_kwargs.setdefault("gpu", True)
+    return PackedCellposeModel(**resolved_kwargs)
+
+
 def read_preprocess_and_segment(
     input_zarr: zarr.Array,
     crop: tuple[slice, ...],
@@ -513,7 +597,7 @@ def read_preprocess_and_segment(
     preprocessing_steps : list of tuple
         List of (function, kwargs) pairs for preprocessing pipeline
     model_kwargs : dict
-        Arguments passed to CellposeModel constructor
+        Arguments passed to PackedCellposeModel constructor
     eval_kwargs : dict
         Arguments passed to CellposeModel.eval method
     worker_logs_directory : str, optional
@@ -532,6 +616,21 @@ def read_preprocess_and_segment(
     if preprocessing_steps is None:
         preprocessing_steps = []
 
+    # Minimal per-worker GPU probe for visibility during bring-up
+    try:
+        import torch
+
+        vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        dev = torch.cuda.current_device() if torch.cuda.is_available() else None
+        logger.info(
+            "Worker %s visible CUDA=%s torch_dev=%s",
+            getattr(distributed.get_worker(), "name", "unknown"),
+            vis,
+            None if dev is None else int(dev),
+        )
+    except Exception:
+        pass
+
     image = input_zarr[crop]
     for pp_step in preprocessing_steps:
         pp_step[1]["crop"] = crop
@@ -542,17 +641,15 @@ def read_preprocess_and_segment(
         log_file = pathlib.Path(worker_logs_directory).joinpath(log_file)
     cellpose.io.logger_setup(stdout_file_replacement=log_file)
 
-    if IS_CELLPOSE_SAM:
-        from cellpose.contrib.cellposetrt import CellposeModelTRT
-
-        model = CellposeModelTRT(**model_kwargs)
-    else:
-        model = cellpose.models.CellposeModel(**model_kwargs)
+    model = _build_packed_cellpose_model(model_kwargs)
     return model.eval(image, **eval_kwargs)[0].astype(np.uint32)
 
 
 def remove_overlaps(
-    array: NDArray[Any], crop: tuple[slice, ...], overlap: int, blocksize: tuple[int, ...]
+    array: NDArray[Any],
+    crop: tuple[slice, ...],
+    overlap: int,
+    blocksize: tuple[int, ...],
 ) -> tuple[NDArray[Any], list[slice]]:
     """
     Remove overlapping regions from segmented block.
@@ -827,10 +924,10 @@ def distributed_eval(
         preprocessing_steps = [(F, {'sigma':2.0}), (G, {'radius':4})]
 
     model_kwargs : dict (default: {})
-        Arguments passed to cellpose.models.Cellpose
+        Arguments passed to PackedCellposeModel
 
     eval_kwargs : dict (default: {})
-        Arguments passed to cellpose.models.Cellpose.eval
+        Arguments passed to PackedCellposeModel.eval
 
     cluster : A dask cluster object (default: None)
         Only set if you have constructed your own static cluster. The default
@@ -872,10 +969,16 @@ def distributed_eval(
     if cluster_kwargs is None:
         cluster_kwargs = {}
 
+    # Derive a stable base directory for artifacts/logs
+    if temporary_directory is None:
+        base_parent = Path(write_path).parent if isinstance(write_path, (str, Path)) else Path.cwd()
+        temporary_directory = base_parent / "cellpose_temp"
+
     timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
     worker_logs_dirname = f"dask_worker_logs_{timestamp}"
-    worker_logs_dir = Path(input_zarr.path).parent / worker_logs_dirname
-    worker_logs_dir.mkdir()
+    base_dir = Path(temporary_directory).parent
+    worker_logs_dir = base_dir / worker_logs_dirname
+    worker_logs_dir.mkdir(parents=True, exist_ok=True)
 
     if "diameter" not in eval_kwargs.keys():
         raise ValueError("Diameter must be set in eval_kwargs")
@@ -898,18 +1001,28 @@ def distributed_eval(
             print(f"Error checking block crop {crop}: {e}")
             return False
 
+    # Optional: GPU preflight probe to confirm worker pinning
+    try:
+        probe = cluster.client.run(_gpu_probe)
+        logger.info("GPU probe results: %s", probe)
+    except Exception as e:
+        logger.warning("GPU probe failed: %s", e)
+
     offset = 0
     n = None
 
-    path_nonempty = temporary_directory.parent / "nonempty.json"
+    path_nonempty = write_path.parent / "nonempty.json"
     try:
         obj = json.loads(path_nonempty.read_text())
         try:
-            if obj["block_size"] != blocksize:
-                raise ValueError("Block size has changed since last run; recomputing non-empty blocks.")
+            # Normalize to tuples so type differences (list vs tuple) don't force recompute
+            bs_saved = tuple(obj["block_size"])  # may be JSON list
+            bs_current = tuple(blocksize)
         except KeyError:
             raise ValueError("Block size not found in nonempty.json; recomputing non-empty blocks.")
-        idxs = json.loads(path_nonempty.read_text())["idxs"]
+        if bs_saved != bs_current:
+            raise ValueError("Block size has changed since last run; recomputing non-empty blocks.")
+        idxs = obj["idxs"]
     except (FileNotFoundError, json.decoder.JSONDecodeError, KeyError, ValueError):
         check_futures = cluster.client.map(
             check_block_has_data,
@@ -929,7 +1042,8 @@ def distributed_eval(
 
         idxs = [i for i, is_non_zero in enumerate(non_zero_results, offset) if is_non_zero]
 
-        path_nonempty.write_text(json.dumps({"idxs": idxs, "block_size": blocksize}, indent=2))
+        # Persist as JSON-friendly types; block_size saved as list for portability
+        path_nonempty.write_text(json.dumps({"idxs": idxs, "block_size": list(blocksize)}, indent=2))
 
     # final_block_indices, final_block_crops = [], []
     final_block_indices, final_block_crops = (
@@ -1007,6 +1121,8 @@ def distributed_eval(
         dtype=np.uint32,
         chunks=segmentation_da.chunks,
     )
+    # Ensure target parent directory exists prior to writing the Zarr store
+    Path(write_path).parent.mkdir(parents=True, exist_ok=True)
     dask.array.to_zarr(relabeled, write_path, overwrite=True)
 
     print("Merging boxes...")
@@ -1016,7 +1132,10 @@ def distributed_eval(
 
 # ----------------------- component functions ---------------------------------#
 def get_block_crops(
-    shape: tuple[int, ...], blocksize: np.ndarray, overlap: int, mask: NDArray[Any] | None
+    shape: tuple[int, ...],
+    blocksize: np.ndarray,
+    overlap: int,
+    mask: NDArray[Any] | None,
 ) -> tuple[list[tuple[int, ...]], list[tuple[slice, ...]]]:
     """Given a voxel grid shape, blocksize, and overlap size, construct
     tuples of slices for every block; optionally only include blocks
@@ -1051,7 +1170,9 @@ def get_block_crops(
 
 
 def determine_merge_relabeling(
-    block_indices: list[tuple[int, ...]], faces: list[list[NDArray[Any]]], used_labels: NDArray[Any]
+    block_indices: list[tuple[int, ...]],
+    faces: list[list[NDArray[Any]]],
+    used_labels: NDArray[Any],
 ) -> NDArray[np.uint32]:
     """Determine boundary segment mergers, remap all label IDs to merge
     and put all label IDs in range [1..N] for N global segments found"""
@@ -1163,6 +1284,16 @@ def main(
     path: Path = typer.Argument(..., help="Path to the folder containing the zarr file."),
     channels: str | None = typer.Option(None, help="Comma-separated list of channel names to use."),
     overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
+    workers_per_gpu: int = typer.Option(
+        2, help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster)"
+    ),
+    threads_per_worker: int = typer.Option(1, help="Threads per worker (GPU-bound work typically uses 1)"),
+    use_localcuda: bool = typer.Option(
+        False, help="If true and workers_per_gpu<=1, use dask-cuda LocalCUDACluster"
+    ),
+    n_workers: int | None = typer.Option(
+        None, help="For LocalCUDACluster: number of workers (defaults to #GPUs)"
+    ),
 ) -> None:
     """
     Main CLI entry point for distributed Cellpose segmentation.
@@ -1194,41 +1325,55 @@ def main(
     - path/segmentation.done (completion marker)
     - path/cellpose_temp/ (temporary processing files)
     """
-    if not overwrite and (path / "segmentation.done").exists():
+    # Normalize input paths:
+    # - If given a directory named '*.zarr' → treat as the Zarr store
+    # - If given a parent directory → expect 'fused.zarr' inside it
+    input_path = Path(path)
+    if input_path.suffix == ".zarr" and input_path.exists():
+        zarr_input_path = input_path
+        base_dir = input_path.parent
+    elif input_path.is_dir():
+        base_dir = input_path
+        zarr_input_path = base_dir / "fused.zarr"
+        if not zarr_input_path.exists():
+            raise FileNotFoundError(f"Expected 'fused.zarr' in {base_dir} but it was not found.")
+    else:
+        raise FileNotFoundError(f"Path {input_path} must be a directory or a '.zarr' store.")
+
+    # Short-circuit if results already present (unless overwrite)
+    if not overwrite and (base_dir / "segmentation.done").exists():
         logger.warning("Segmentation already exists. Exiting.")
         exit()
 
     IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
 
     # ---- 1. Configuration ----
-    path_zarr = path
-    path = Path(path).parent
-    zarr_input_path = path_zarr
-    zarr_output_path = path / "output_segmentation.zarr"
-    temporary_directory = path / "cellpose_temp"
+    zarr_output_path = base_dir / "output_segmentation.zarr"
+    temporary_directory = base_dir / "cellpose_temp"
     (zarr_output_path.parent / "segmentation.done").unlink(missing_ok=True)
 
-    config = json.loads((path.parent / "config.json").read_text())
+    config = json.loads((base_dir.parent / "config.json").read_text())
+    # Optional: ortho aggregation weights (XY, YZ, ZX). Pass-through without validation here.
+    ortho_weights = config.get("ortho_weights", [1.5, 1.0, 1.0])
     cellpose_model_kwargs = {
         "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
         "gpu": True,
     }
     if IS_CELLPOSE_SAM:
-        # ...
-        cellpose_model_kwargs["pretrained_model"] = (
-            "/home/chaichontat/cellpose/scripts/builds/cpsam_b4_sm120_bf16.plan"
-        )
+        ...
     else:
         cellpose_model_kwargs["pretrained_model_ortho"] = config.get("pretrained_model_ortho", None)
 
-    # Dask Cluster Configuration (for local machine)
+    # Dask Cluster Configuration (always GPU-backed)
     local_cluster_kwargs = {
-        "n_workers": 4 if not IS_CELLPOSE_SAM else 2,  # 4 cellpose instances can run on an RTX 4090
-        "ncpus": 4,  # Physical cores per worker (adjust based on your CPU)
-        "memory_limit": "64GB",  # RAM per worker - CRITICAL: Must fit block+model+overhead
-        "threads_per_worker": 1,  # Usually 1 for Cellpose
-        # 'config': {'distributed.worker.resources.GPU': 1} # Optional: Explicitly assign GPU resource if needed
+        "workers_per_gpu": int(workers_per_gpu),
+        "threads_per_worker": int(threads_per_worker),
     }
+    if use_localcuda and workers_per_gpu <= 1:
+        local_cluster_kwargs.update({
+            "use_localcuda": True,
+            "n_workers": n_workers,
+        })
 
     preprocessing_pipeline = [(unsharp_all, {})]
 
@@ -1257,23 +1402,28 @@ def main(
             raise ValueError(f"Channel names {channels} not found in {key}")
     del channels
 
-    processing_blocksize = (input_zarr_array.shape[0], 1024, 1024, len(channels_list))  # ZYXc
+    processing_blocksize = (
+        input_zarr_array.shape[0],
+        256,
+        1024,
+        len(channels_list),
+    )  # ZYXc
     try:
         if overwrite:
             raise FileNotFoundError  # To force into the except block
-        normalization = json.loads((path / "normalization.json").read_text())
+        normalization = json.loads((base_dir / "normalization.json").read_text())
     except FileNotFoundError:
         logger.info("Existing normalization params not found. Calculating percentiles.")
         perc, _ = sample_percentile(
             input_zarr_array,
             channels=channels_list,
-            block=(512, 512),
+            block=(256, 1024),
             n=30,
             low=1,
             high=99.9,
         )
         normalization = {"lowhigh": perc}
-        (path / "normalization.json").write_text(json.dumps(normalization, indent=2, cls=NumpyEncoder))
+        (base_dir / "normalization.json").write_text(json.dumps(normalization, indent=2, cls=NumpyEncoder))
     print(normalization)
 
     if len(channels_list) == 1:  # Cellpose pre SAM always expects 2 channels
@@ -1284,7 +1434,10 @@ def main(
         print(np.repeat([[0], [1]], repeats=3 - len(channels_list), axis=0).shape)
         normalization = {
             "lowhigh": np.concatenate(
-                [normalization["lowhigh"], np.repeat([[0, 1]], repeats=3 - len(channels_list), axis=0)],
+                [
+                    normalization["lowhigh"],
+                    np.repeat([[0, 1]], repeats=3 - len(channels_list), axis=0),
+                ],
                 axis=0,
             )
         }
@@ -1300,13 +1453,16 @@ def main(
         "cellprob_threshold": -0.5,  # Default is 0.0, adjust if needed
         "anisotropy": 2.0,
         "resample": False,
-        "flow3D_smooth": 2,
+        "flow3D_smooth": 3,
         "niter": 2000,
         "do_3D": True,
+        "min_size": 200,
         "z_axis": 0,
         "channel_axis": 3,
         **({"channels": channels_list} if not IS_CELLPOSE_SAM else {}),
     }
+    if ortho_weights is not None:
+        cellpose_eval_kwargs["ortho_weights"] = ortho_weights
 
     # ---- 3. Run Distributed Evaluation ----
     logger.info("Starting distributed Cellpose evaluation…")

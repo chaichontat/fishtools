@@ -468,6 +468,7 @@ def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int, j
     default=None,
     help="Optional project config to populate stitching defaults.",
 )
+@click.option("--debug", is_flag=True)
 @batch_roi()
 def register(
     path: Path,
@@ -482,7 +483,7 @@ def register(
     threshold: float | None = None,
     debug: bool = False,
     json_config: Path | None = None,
-    drop_disconnected: bool = True,
+    debug: bool = False,
 ):
     setup_cli_logging(
         path,
@@ -597,6 +598,7 @@ def register(
                     downsample=1,
                     max_proj=False,  # already max proj
                     sc=sc,
+                    debug=debug,
                 )
 
     elif max_proj or idx is not None:
@@ -613,6 +615,7 @@ def register(
                     idx=idx,
                     max_proj=max_proj,
                     sc=sc,
+                    debug=debug,
                 )
 
     if overwrite or not (out_path / "TileConfiguration.registered.txt").exists():
@@ -659,6 +662,7 @@ def register(
         name="TileConfiguration",
         capture_output=not debug,
         sc=sc,
+        capture_output=not debug,
     )
     # Post-check: verify registered tile configuration and emit a layout plot
     try:

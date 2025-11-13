@@ -8,9 +8,13 @@ from typing import Literal
 
 import click
 import numpy as np
+import polars as pl
 import tifffile
+import torch
+from cellpose import dynamics
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
+from skimage.measure import regionprops_table
 
 from fishtools.io.workspace import Workspace
 from fishtools.segment.train import plan_path_for_device
@@ -195,6 +199,58 @@ def _cellpose(model, image: np.ndarray, *, config: RunConfig):
     return masks, flows, styles
 
 
+def _build_label_metadata(
+    masks: np.ndarray,
+    flow_field: np.ndarray,
+    *,
+    use_gpu: bool,
+) -> pl.DataFrame:
+    """Generate per-label metadata including flow-error QC metrics."""
+
+    if masks.size == 0:
+        return pl.DataFrame({
+            "label": pl.Series([], dtype=pl.UInt32),
+            "flow_error": pl.Series([], dtype=pl.Float32),
+            "voxel_count": pl.Series([], dtype=pl.UInt64),
+        })
+
+    mask_int = np.asarray(masks, dtype=np.int32)
+    props_dict = regionprops_table(mask_int, properties=("label", "area", "bbox", "centroid"))
+    props_df = pl.DataFrame(props_dict)
+    if props_df.is_empty():
+        return pl.DataFrame({
+            "label": pl.Series([], dtype=pl.UInt32),
+            "flow_error": pl.Series([], dtype=pl.Float32),
+            "voxel_count": pl.Series([], dtype=pl.UInt64),
+        })
+
+    props_df = props_df.with_columns(
+        pl.col("label").cast(pl.UInt32),
+        pl.col("area").cast(pl.UInt64).alias("voxel_count"),
+    ).drop("area")
+
+    device = torch.device("cpu")
+    if use_gpu and torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif use_gpu and torch.backends.mps.is_available():
+        device = torch.device("mps")
+
+    flow_errors, dP_masks = dynamics.flow_error(mask_int, np.asarray(flow_field), device=device)
+    del dP_masks
+
+    labels = props_df.select("label").to_numpy().ravel()
+    flow_df = pl.DataFrame({
+        "label": pl.Series(np.arange(1, flow_errors.size + 1, dtype=np.uint32)),
+        "flow_error": pl.Series(flow_errors.astype(np.float32)),
+    }).filter(pl.col("label").is_in(labels.astype(np.uint32)))
+
+    metadata = props_df.join(flow_df, on="label", how="left").sort("label")
+
+    primary = ["label", "voxel_count", "flow_error"]
+    other_cols = [col for col in metadata.columns if col not in primary]
+    return metadata.select([*(c for c in primary if c in metadata.columns), *other_cols])
+
+
 def run(
     volume: Path,
     *,
@@ -284,6 +340,7 @@ def run(
     }
 
     masks, flows, styles = _cellpose(cellpose_model, img, config=config)
+    metadata_df = _build_label_metadata(masks, flows[1], use_gpu=config.use_gpu)
 
     # Save outputs
     out = volume.parent.parent / "segment2_5d"
@@ -298,6 +355,8 @@ def run(
         masks.astype(np.uint32),
         compression="zstd",
     )
+    metadata_path = pickle_path.with_name(volume.stem + "_labels.parquet")
+    metadata_df.write_parquet(metadata_path)
     with pickle_path.open("wb") as handle:
         pickle.dump({"flows": flows, "styles": styles, **sidecar}, handle)
 
@@ -311,3 +370,6 @@ def run(
         logger.info(f"Saved flows to {flow_path}")
 
     logger.info(f"Wrote masks to {mask_path}")
+    roi_count = len(discovered_rois)
+    plural = "ROI" if roi_count == 1 else "ROIs"
+    logger.info(f"Discovered {roi_count} {plural} in workspace {workspace.path}")

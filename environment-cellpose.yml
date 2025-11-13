@@ -1,0 +1,22 @@
+# Install PyTorch and cellpose yourself after setting this up with `pip install cellpose`
+
+name: cellpose
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.12
+  - cuda-version=12.8
+  - cuda-cudart=12.8
+  - cuda-nvrtc=12.8
+  - numpy
+  - scipy
+  - zarr>=3
+  - pyyaml
+  - typer
+  - rich
+  - loguru
+  - tifffile
+  - imagecodecs
+  - dask
+  - dask-image
+  - dask-jobqueue
