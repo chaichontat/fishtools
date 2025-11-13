@@ -51,6 +51,10 @@ def _emit_diag_func():
     return module._emit_pairing_diagnostics, module._IntensityKey
 
 
+def _build_counts_matrix_func():
+    return _segment_export_module()._build_counts_matrix
+
+
 def _write_parquet(path: Path, frame: pl.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.write_parquet(path)
@@ -106,7 +110,7 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
         diag=False,
     )
 
-    cells_path = analysis_deconv / "segment_export" / f"cells--{seg_codebook}+{codebook}.parquet"
+    cells_path = workspace / "analysis/output/segmented" / f"polygons--{roi}+{seg_codebook}.parquet"
     assert cells_path.exists()
     cells_df = pl.read_parquet(cells_path)
     assert set(["x", "y", "roi", "area", "marker_mean"]).issubset(set(cells_df.columns))
@@ -156,29 +160,46 @@ def test_resolve_channels_auto_and_manual(tmp_path: Path) -> None:
 
 def test_diag_helper_raises_on_mismatch() -> None:
     emit_diag, intensity_key_cls = _emit_diag_func()
-    poly_df = pl.DataFrame(
-        {
-            "z": [0],
-            "label": [1],
-            "roi": ["roi1"],
-            "area": [1.0],
-            "centroid_x": [0.0],
-            "centroid_y": [0.0],
-            "roilabel": ["roi1|1"],
-        }
-    )
+    poly_df = pl.DataFrame({
+        "z": [0],
+        "label": [1],
+        "roi": ["roi1"],
+        "area": [1.0],
+        "centroid_x": [0.0],
+        "centroid_y": [0.0],
+        "roilabel": ["roi1|1"],
+    })
     polygons = {"roi1": poly_df}
     intensities = {
-        intensity_key_cls(roi="roi1", channel="brdu"): pl.DataFrame(
-            {
-                "z": [0],
-                "roi": ["roi1"],
-                "label": [2],
-                "brdu_mean": [1.0],
-                "brdu_max": [1.0],
-                "brdu_min": [1.0],
-            }
-        )
+        intensity_key_cls(roi="roi1", channel="brdu"): pl.DataFrame({
+            "z": [0],
+            "roi": ["roi1"],
+            "label": [2],
+            "brdu_mean": [1.0],
+            "brdu_max": [1.0],
+            "brdu_min": [1.0],
+        })
     }
     with pytest.raises(ValueError, match="Segmentation masks disagree"):
         emit_diag(polygons, intensities, ["brdu"])
+
+
+def test_counts_matrix_matches_transcript_gene_conversion() -> None:
+    build_counts = _build_counts_matrix_func()
+    targets = ["GeneA-202", "GeneA-201", "GeneX-201", "GeneY-2-204"]
+    df = pl.DataFrame({
+        "roilabel": ["roi1|1", "roi1|1", "roi1|2", "roi1|3"],
+        "target": targets,
+    })
+    counts = build_counts({("roi1", "cb"): df})
+
+    expected_genes = {"GeneA-202", "GeneA-201", "GeneX", "GeneY-2"}
+    result_genes = set(counts.columns) - {"roilabel"}
+    assert result_genes == expected_genes
+
+
+def _convert_transcript_to_gene(ts: str, non_unique_targets: list[str] | None = None) -> str:
+    if non_unique_targets and any(ts.startswith(nt) for nt in non_unique_targets):
+        return ts
+    gene, _ = ts.rsplit("-", 1)
+    return gene

@@ -129,9 +129,7 @@ def _run_overlay_for_roi(
         raise FileNotFoundError(f"ROI '{roi}': segmentation Zarr not found at {segmentation_zarr_path}")
 
     intensity_zarr_path = resolve_intensity_store(
-        stitch_paths,
-        intensity_codebook,
-        store_name=intensity_store,
+        stitch_paths, intensity_codebook, store_name=intensity_store
     )
 
     try:

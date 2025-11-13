@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import Iterable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterable
 
 import polars as pl
 from loguru import logger
@@ -94,8 +94,8 @@ def _resolve_codebooks(codebooks: Iterable[str]) -> list[str]:
     return cb_list
 
 
-def _prepare_output_dir(deconv: Path, override: Path | None) -> Path:
-    out_dir = override or (deconv / "segment_export")
+def _prepare_output_dir(default_path: Path, override: Path | None) -> Path:
+    out_dir = override or default_path
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -137,20 +137,24 @@ def _load_ident_shards(
         if not any(root.glob("ident_*.parquet")):
             logger.warning(f"ROI={roi} codebook={codebook}: no ident shards under {root}")
             continue
-        df_roi = _scan_ident(glob_path).with_columns(
-            z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt16),
-            codebook=pl.lit(codebook),
-            roi=pl.lit(roi),
-            spot_id=pl.col("spot_id").cast(pl.UInt32),
-        ).with_columns(
-            roilabel=pl.format("{}|{}", pl.col("roi"), pl.col("label")),
-        ).drop("path").sort("z")
+        df_roi = (
+            _scan_ident(glob_path)
+            .with_columns(
+                z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt16),
+                codebook=pl.lit(codebook),
+                roi=pl.lit(roi),
+                spot_id=pl.col("spot_id").cast(pl.UInt32),
+            )
+            .with_columns(
+                roilabel=pl.format("{}|{}", pl.col("roi"), pl.col("label")),
+            )
+            .drop("path")
+            .sort("z")
+        )
         if not df_roi.is_empty():
             dfs[(roi, codebook)] = df_roi
     if not dfs:
-        raise ValueError(
-            f"No ident files found for ROIs {list(rois)} with seg_codebook '{seg_codebook}'."
-        )
+        raise ValueError(f"No ident files found for ROIs {list(rois)} with seg_codebook '{seg_codebook}'.")
     return dfs
 
 
@@ -207,12 +211,18 @@ def _load_polygon_shards(
         if not any(chunks_dir.glob("polygons_*.parquet")):
             logger.warning(f"ROI={roi}: no polygons shards under {chunks_dir}")
             continue
-        pdf = _scan_polygons(glob_path).with_columns(
-            z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt16),
-            roi=pl.lit(roi),
-        ).with_columns(
-            roilabel=pl.format("{}|{}", pl.col("roi"), pl.col("label")),
-        ).drop("path").sort("z")
+        pdf = (
+            _scan_polygons(glob_path)
+            .with_columns(
+                z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt16),
+                roi=pl.lit(roi),
+            )
+            .with_columns(
+                roilabel=pl.format("{}|{}", pl.col("roi"), pl.col("label")),
+            )
+            .drop("path")
+            .sort("z")
+        )
         if not pdf.is_empty():
             polygons_by_roi[roi] = pdf
     if not polygons_by_roi:
@@ -290,16 +300,11 @@ def _build_cells_dataframe(
     return polygons_df.group_by(pl.col("roilabel")).agg(**agg).sort("roilabel")
 
 
-def _write_cells_parquet(
-    cells: pl.DataFrame,
-    out_dir: Path,
-    seg_codebook: str,
-    primary_codebook: str,
-) -> Path:
-    out_path = out_dir / f"cells--{seg_codebook}+{primary_codebook}.parquet"
-    cells.write_parquet(out_path)
-    logger.info(f"Wrote cells parquet to {out_path}")
-    return out_path
+def _write_cells_parquet(cells: pl.DataFrame, target_path: Path) -> Path:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    cells.write_parquet(target_path)
+    logger.info(f"Wrote cells parquet to {target_path}")
+    return target_path
 
 
 def _build_counts_matrix(dfs: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFrame:
@@ -308,8 +313,7 @@ def _build_counts_matrix(dfs: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFra
         raise ValueError("Spot ident shards contained no rows to aggregate.")
 
     transcript_counts = (
-        ident_concat
-        .filter(~pl.col("target").str.starts_with("Blank"))
+        ident_concat.filter(~pl.col("target").str.starts_with("Blank"))
         .group_by(["roilabel", "target"])
         .agg(pl.len().alias("count"))
     )
@@ -317,7 +321,9 @@ def _build_counts_matrix(dfs: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFra
         raise ValueError("No informative targets found after filtering Blank controls.")
 
     duplicate_genes = (
-        transcript_counts
+        ident_concat.filter(~pl.col("target").str.starts_with("Blank"))
+        .select("target")
+        .unique()
         .with_columns(gene=pl.col("target").map_elements(_gene_name_from_target, return_dtype=pl.Utf8))
         .group_by("gene")
         .agg(pl.len().alias("occurrences"))
@@ -326,10 +332,15 @@ def _build_counts_matrix(dfs: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFra
         .to_list()
     )
     duplicate_set = set(duplicate_genes)
+    if duplicate_set:
+        logger.debug(
+            "[export] duplicate gene bases require full transcript labels (%d): %s",
+            len(duplicate_set),
+            sorted(duplicate_set),
+        )
 
     counts_by_gene = (
-        transcript_counts
-        .with_columns(
+        transcript_counts.with_columns(
             gene=pl.col("target").map_elements(
                 lambda value: _resolve_gene_name(value, duplicate_set),
                 return_dtype=pl.Utf8,
@@ -343,6 +354,8 @@ def _build_counts_matrix(dfs: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFra
     )
     if counts_by_gene.is_empty():
         raise ValueError("Failed to construct gene expression matrix for export.")
+    gene_cols = [col for col in counts_by_gene.columns if col != "roilabel"]
+    logger.debug("[export] counts matrix gene columns (%d): %s", len(gene_cols), gene_cols)
     return counts_by_gene
 
 
@@ -351,9 +364,7 @@ def _build_anndata(counts_by_gene: pl.DataFrame, cells: pl.DataFrame) -> "anndat
     cells_pd = cells.to_pandas().set_index("roilabel")
     missing_obs = counts_pd.index.difference(cells_pd.index)
     if not missing_obs.empty:
-        raise ValueError(
-            "Missing centroid entries for roilabels: " + ", ".join(missing_obs.astype(str))
-        )
+        raise ValueError("Missing centroid entries for roilabels: " + ", ".join(missing_obs.astype(str)))
     obs_pd = cells_pd.loc[counts_pd.index]
 
     import anndata as ad
@@ -382,6 +393,7 @@ def _build_anndata(counts_by_gene: pl.DataFrame, cells: pl.DataFrame) -> "anndat
     adata.obsm["spatial"] = adata.obs[["x", "y"]].to_numpy(dtype=np.float32)
     return adata
 
+
 def export_cmd(
     path: Path,
     roi: str | None,
@@ -404,7 +416,7 @@ def export_cmd(
     cb_list = _resolve_codebooks(codebooks)
 
     deconv = ws.deconved
-    out_root = _prepare_output_dir(deconv, out_dir)
+    segmented_root = _prepare_output_dir(ws.output / "segmented", out_dir)
 
     ident_frames = _load_ident_shards(deconv, rois, cb_list, seg_codebook)
     channel_list = _resolve_channels(deconv, rois, seg_codebook, channels)
@@ -417,13 +429,15 @@ def export_cmd(
         _emit_pairing_diagnostics(polygons_by_roi, intensities, channel_list)
 
     cells = _build_cells_dataframe(polygons_by_roi, intensities, channel_list)
-    _write_cells_parquet(cells, out_root, seg_codebook, primary_cb)
+
+    roi_token = rois[0] if len(rois) == 1 else "all"
+    cb_token = Workspace.sanitize_codebook_name(primary_cb)
+    cells_path = segmented_root / f"polygons--{roi_token}+{seg_codebook}.parquet"
+    _write_cells_parquet(cells, cells_path)
 
     counts_by_gene = _build_counts_matrix(ident_frames)
     adata = _build_anndata(counts_by_gene, cells)
 
-    roi_token = rois[0] if len(rois) == 1 else "all"
-    cb_token = Workspace.sanitize_codebook_name(primary_cb)
     ws.output.mkdir(parents=True, exist_ok=True)
     out_h5ad = ws.output / f"{roi_token}+{cb_token}.h5ad"
     adata.write_h5ad(out_h5ad)
