@@ -217,6 +217,35 @@ class StitchPaths:
         ) from error_hint
 
 
+def resolve_intensity_store(
+    stitch: "StitchPaths",
+    intensity_name: str,
+    *,
+    store_name: str = "fused.zarr",
+) -> Path:
+    """Resolve an intensity Zarr path from a codebook label."""
+
+    workspace = stitch.workspace
+    roi = stitch.roi
+    search_labels = [intensity_name]
+    sanitized = workspace.sanitize_codebook_name(intensity_name)
+    if sanitized not in search_labels:
+        search_labels.append(sanitized)
+
+    searched_paths: list[Path] = []
+    for label in search_labels:
+        candidate = workspace.stitch(roi, label) / store_name
+        searched_paths.append(candidate)
+        if candidate.exists():
+            return candidate
+
+    searched = ", ".join(str(p) for p in searched_paths)
+    raise FileNotFoundError(
+        f"Could not resolve intensity store for codebook '{intensity_name}'. "
+        f"Searched: {searched}"
+    )
+
+
 def load_intensity_parquet(stitch: StitchPaths, channel: str) -> pl.DataFrame:
     """Collect all intensity parquet shards for the given channel."""
 

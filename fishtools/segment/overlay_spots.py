@@ -350,20 +350,31 @@ def assign_spots_to_polygons(
         return pl.DataFrame()
 
     points: list[Point] = [Point(float(x), float(y)) for x, y in zip(spots_df["x_adj"], spots_df["y_adj"])]
-    candidates = tree.query(points)
+    query_result = tree.query(points, predicate="intersects")
+
+    if query_result.size == 0:
+        logger.info(f"Slice {idx}: STRtree query returned no candidates.")
+        return pl.DataFrame()
+
+    if query_result.ndim == 1:
+        query_result = query_result.reshape(2, 1)
+
+    candidate_pairs = query_result.T
+    logger.info(f"Slice {idx}: Found {candidate_pairs.shape[0]} potential intersections. Refining...")
 
     assignments_list: list[dict[str, Any]] = []
-    for point_idx, tree_geom_idx in enumerate(candidates):
-        original_polygon_list_idx = tree_indices[tree_geom_idx]
+    for i, (point_idx, tree_geom_idx) in enumerate(candidate_pairs, start=1):
+        if i % 50000 == 0:
+            logger.info(f"Slice {idx}: Refined {i}/{candidate_pairs.shape[0]} intersections...")
+
+        original_polygon_list_idx = tree_indices[int(tree_geom_idx)]
         spot = spots_df[int(point_idx)]
         polygon_meta = polygons_with_meta[int(original_polygon_list_idx)][1]
-        assignments_list.append(
-            {
-                "spot_id": spot["spot_id"].item(),
-                "target": spot["target"].item(),
-                "label": polygon_meta["label"],
-            }
-        )
+        assignments_list.append({
+            "spot_id": spot["spot_id"].item(),
+            "target": spot["target"].item(),
+            "label": polygon_meta["label"],
+        })
 
     logger.info(f"Slice {idx}: Found {len(assignments_list)} confirmed spot assignments.")
     if not assignments_list:
@@ -460,6 +471,7 @@ def generate_debug_plot(
         axs[0].set_title(f"Slice {idx}: Intensity (Input)")
 
         import matplotlib.pyplot as plt  # for colormap
+
         cmap = plt.cm.get_cmap("tab20", np.max(img) + 1)
         cmap.set_under(color="black")
         axs[1].imshow(img[sl], origin="lower", cmap=cmap, interpolation="none", vmin=1)
@@ -730,8 +742,12 @@ def initialize() -> None:
     show_default=True,
     help="Relative path to the segmentation Zarr store within the input directory.",
 )
-@click.option("--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening.")
-@click.option("--closing-radius", type=float, default=6.0, show_default=True, help="Radius for morphological closing.")
+@click.option(
+    "--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening."
+)
+@click.option(
+    "--closing-radius", type=float, default=6.0, show_default=True, help="Radius for morphological closing."
+)
 @click.option(
     "--dilation-radius",
     type=float,

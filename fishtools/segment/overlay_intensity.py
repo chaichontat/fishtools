@@ -3,14 +3,16 @@ Extracts region properties (including intensity measures) for each slice
 of a segmentation mask and saves them along with the corresponding intensity image.
 """
 
-import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
+from typing import Iterable
 
 import rich_click as click
 import zarr
 from loguru import logger
+
+from fishtools.io.workspace import Workspace
 
 # Share the exact same region detection primitives used by
 # `segment overlay spots` to keep behavior identical up to the
@@ -22,6 +24,7 @@ from fishtools.segment.overlay_spots import (
 from fishtools.segment.utils import (
     StitchPaths,
     compute_regionprops_table,
+    resolve_intensity_store,
     slice_intensity_channel,
     write_regionprops_parquet,
 )
@@ -91,97 +94,62 @@ def _process_slice_shared_detection(
     write_regionprops_parquet(df, output_dir, channel, idx, overwrite=overwrite)
 
 
-@click.command()
-@click.argument(
-    "input-dir",
-    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-)
-@click.option(
-    "--segmentation-name",
-    type=str,
-    default="output_segmentation.zarr",
-    show_default=True,
-    help="Name of the segmentation Zarr store within the input directory.",
-)
-@click.option(
-    "--intensity-name",
-    type=str,
-    default="input_image.zarr",
-    show_default=True,
-    help="Name of the intensity image Zarr store within the input directory.",
-)
-@click.option(
-    "--channel",
-    type=str,
-    help=(
-        "Channel name. If omitted, processes all channels from the intensity Zarr "
-        "(attrs['key'])."
-    ),
-)
-@click.option(
-    "--max-workers",
-    type=int,
-    default=4,
-    show_default=True,
-    help="Number of parallel processes to use.",
-)
-@click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing output files.")
-def overlay_intensity(
-    input_dir: Path,
+def _discover_channels(intensity_zarr_path: Path, channel: str | None) -> list[str]:
+    try:
+        intensity_arr = zarr.open_array(str(intensity_zarr_path), mode="r")
+        if channel is not None:
+            return [channel]
+
+        keys = intensity_arr.attrs.get("key")
+        if keys is None:
+            raise ValueError("Intensity Zarr missing attrs['key']; provide --channel explicitly.")
+        if isinstance(keys, (str, bytes)):
+            return [str(keys)]
+        return [str(k) for k in keys]
+    except Exception as exc:  # pragma: no cover - IO failure path
+        raise RuntimeError(
+            f"Failed to resolve channels from intensity Zarr {intensity_zarr_path}: {exc}"
+        ) from exc
+
+
+def _run_overlay_for_roi(
+    workspace: Workspace,
+    roi: str,
+    seg_codebook: str,
+    intensity_codebook: str,
     segmentation_name: str,
-    intensity_name: str,
+    intensity_store: str,
     channel: str | None,
-    max_workers: int,
+    threads: int,
     overwrite: bool,
-):
-    """
-    Extracts region properties and intensity images for each Z-slice
-    from segmentation and intensity Zarr stores.
-    """
-    stitch_paths = StitchPaths.from_stitch_root(input_dir)
+) -> None:
+    stitch_paths = StitchPaths.from_workspace(workspace, roi, seg_codebook)
     segmentation_zarr_path = stitch_paths.segmentation(segmentation_name)
-    intensity_zarr_path = stitch_paths.intensity_store(intensity_name)
-
-    # --- Input Validation ---
     if not segmentation_zarr_path.exists():
-        logger.error(f"Segmentation Zarr store not found: {segmentation_zarr_path}")
-        sys.exit(1)
-    if not intensity_zarr_path.exists():
-        logger.error(f"Intensity Zarr store not found: {intensity_zarr_path}")
-        sys.exit(1)
+        raise FileNotFoundError(f"ROI '{roi}': segmentation Zarr not found at {segmentation_zarr_path}")
 
-    # --- Determine Number of Slices & Channels ---
+    intensity_zarr_path = resolve_intensity_store(
+        stitch_paths,
+        intensity_codebook,
+        store_name=intensity_store,
+    )
+
     try:
         seg_stack = zarr.open_array(str(segmentation_zarr_path), mode="r")
         num_slices = seg_stack.shape[0]
-        logger.info(f"Found {num_slices} slices in {segmentation_zarr_path}.")
-    except Exception as e:
-        logger.error(f"Failed to open segmentation Zarr to determine slice count: {e}")
-        sys.exit(1)
+        logger.info(f"ROI '{roi}': Found {num_slices} slices in {segmentation_zarr_path}.")
+    except Exception as exc:  # pragma: no cover - IO failure path
+        raise RuntimeError(
+            f"ROI '{roi}': failed to open segmentation Zarr {segmentation_zarr_path}: {exc}"
+        ) from exc
 
-    try:
-        intensity_arr = zarr.open_array(str(intensity_zarr_path), mode="r")
-        keys = intensity_arr.attrs.get("key")
-        if channel is None:
-            if keys is None:
-                raise ValueError(
-                    "Intensity Zarr missing attrs['key']; provide --channel explicitly."
-                )
-            if isinstance(keys, (str, bytes)):
-                channels: list[str] = [str(keys)]
-            else:
-                channels = [str(k) for k in keys]
-        else:
-            channels = [channel]
-    except Exception as e:
-        logger.error(f"Failed to resolve channels from intensity Zarr: {e}")
-        sys.exit(1)
+    channels = _discover_channels(intensity_zarr_path, channel)
+    logger.info(f"ROI '{roi}': Processing channels {channels} from {intensity_zarr_path}.")
 
-    # --- Process Slices in Parallel ---
     processed_count = 0
     failed_count = 0
-    with ProcessPoolExecutor(max_workers=max_workers, mp_context=get_context("spawn")) as executor:
-        futures = {}
+    with ProcessPoolExecutor(max_workers=threads, mp_context=get_context("spawn")) as executor:
+        futures: dict = {}
         for ch in channels:
             for idx in range(num_slices):
                 fut = executor.submit(
@@ -190,7 +158,7 @@ def overlay_intensity(
                     segmentation_zarr_path,
                     intensity_zarr_path,
                     ch,
-                    input_dir,
+                    stitch_paths.stitch_root,
                     overwrite,
                 )
                 futures[fut] = (ch, idx)
@@ -198,21 +166,112 @@ def overlay_intensity(
         for future in as_completed(futures):
             ch, idx = futures[future]
             try:
-                future.result()  # Raise exception if one occurred in the process
+                future.result()
                 processed_count += 1
-                logger.info(f"Successfully processed slice {idx} [channel={ch}].")
-            except Exception as e:
-                logger.error(f"Slice {idx} [channel={ch}] failed: {e}")
+                logger.info(f"ROI '{roi}': Successfully processed slice {idx} [channel={ch}].")
+            except Exception as exc:
+                logger.error(f"ROI '{roi}': Slice {idx} [channel={ch}] failed: {exc}")
                 failed_count += 1
 
-    logger.info("--- Extraction Summary ---")
-    logger.info(f"Total slices: {num_slices}")
-    logger.info(f"Channels: {channels}")
-    logger.info(f"Successfully processed: {processed_count}")
-    logger.info(f"Failed: {failed_count}")
+    logger.info(
+        f"ROI '{roi}': Completed intensity overlay (processed={processed_count}, failed={failed_count})."
+    )
 
     if failed_count > 0:
-        sys.exit(1)
+        raise RuntimeError(
+            f"ROI '{roi}': Failed to process {failed_count} slice(s); inspect logs for details."
+        )
+
+
+@click.command()
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.argument("roi", required=False)
+@click.option(
+    "--seg-codebook",
+    type=str,
+    required=True,
+    help="Codebook label used for segmentation artifacts.",
+)
+@click.option(
+    "--intensity-codebook",
+    type=str,
+    required=True,
+    help="Codebook label used to resolve the intensity store.",
+)
+@click.option(
+    "--segmentation-name",
+    type=str,
+    default="output_segmentation.zarr",
+    show_default=True,
+    help="Relative path to the segmentation Zarr within the stitched ROI directory.",
+)
+@click.option(
+    "--intensity-store",
+    type=str,
+    default="fused.zarr",
+    show_default=True,
+    help="Filename of the intensity Zarr inside stitch--ROI+<codebook>.",
+)
+@click.option(
+    "--channel",
+    type=str,
+    help="Channel name. When omitted, all channels in attrs['key'] are processed.",
+)
+@click.option(
+    "--threads",
+    type=int,
+    default=12,
+    show_default=True,
+    help="Number of parallel worker processes to use per ROI.",
+)
+@click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing output files.")
+def overlay_intensity(
+    path: Path,
+    roi: str | None,
+    seg_codebook: str,
+    intensity_codebook: str,
+    segmentation_name: str,
+    intensity_store: str,
+    channel: str | None,
+    threads: int,
+    overwrite: bool,
+):
+    """Overlay stitched intensity volumes onto segmentation masks for one or more ROIs."""
+
+    workspace = Workspace(path)
+    target_roi = roi or "*"
+    batch_mode = target_roi == "*"
+    rois: Iterable[str] = workspace.rois if batch_mode else [target_roi]
+
+    if not rois:
+        raise click.ClickException(f"No ROIs discovered under workspace {path}.")
+
+    failed: list[str] = []
+    for current_roi in rois:
+        try:
+            _run_overlay_for_roi(
+                workspace,
+                current_roi,
+                seg_codebook,
+                intensity_codebook,
+                segmentation_name,
+                intensity_store,
+                channel,
+                threads,
+                overwrite,
+            )
+        except Exception as exc:
+            logger.error(f"ROI '{current_roi}': {exc}")
+            if batch_mode:
+                failed.append(current_roi)
+                continue
+            raise click.ClickException(str(exc)) from exc
+
+    if failed:
+        raise click.ClickException("One or more ROIs failed during overlay intensity: " + ", ".join(failed))
 
 
 if __name__ == "__main__":

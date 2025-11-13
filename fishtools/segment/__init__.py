@@ -3,13 +3,14 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, Optional
 
-import click
+import rich_click as click
 import torch
 
-from fishtools.segment.overlay_intensity import overlay_intensity as overlay_intensity_command
-from fishtools.segment.overlay_spots import overlay as overlay_spots_command
+from fishtools.segment.export import export_cmd as segment_export_cmd
 from fishtools.segment.extract import cmd_extract as extract_cmd
 from fishtools.segment.extract import cmd_extract_single as extract_single_cmd
+from fishtools.segment.overlay_intensity import overlay_intensity as overlay_intensity_command
+from fishtools.segment.overlay_spots import overlay as overlay_spots_command
 from fishtools.segment.run import run as run_cli
 from fishtools.segment.train import TrainConfig, build_trt_engine, run_train
 
@@ -177,6 +178,63 @@ def trt_build_cmd(model: Path, batch_size: int) -> None:
         batch_size=batch_size,
     )
     click.echo(f"Saved TensorRT engine to {plan_path}")
+
+
+@app.command("export")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.argument("roi", required=False)
+@click.option(
+    "--seg-codebook",
+    required=True,
+    help="Codebook label used for segmentation artifacts (polygons, intensities).",
+)
+@click.option(
+    "--codebook",
+    "codebooks",
+    multiple=True,
+    required=True,
+    help="Decoded spots codebook labels to include in the export (repeatable).",
+)
+@click.option(
+    "--channels",
+    default="auto",
+    show_default=True,
+    help="Comma-separated intensity channel list, or 'auto' to discover from intensity_* outputs.",
+)
+@click.option(
+    "--out-dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Optional output directory; defaults under analysis/deconv/segment_export.",
+)
+@click.option(
+    "--diag/--no-diag",
+    default=False,
+    show_default=True,
+    help="Emit matching diagnostics for polygons/intensity shards per ROI.",
+)
+def export_command(
+    path: Path,
+    roi: Optional[str],
+    seg_codebook: str,
+    codebooks: tuple[str, ...],
+    channels: str,
+    out_dir: Optional[Path],
+    diag: bool,
+) -> None:
+    """Export Baysor-ready spots plus aggregated per-cell intensities."""
+
+    segment_export_cmd(
+        path=path,
+        roi=roi,
+        seg_codebook=seg_codebook,
+        codebooks=codebooks,
+        channels=channels,
+        out_dir=out_dir,
+        diag=diag,
+    )
 
 
 @app.command("extract")
@@ -416,6 +474,7 @@ __all__ = [
     "train",
     "run_command",
     "trt_build_cmd",
+    "export_command",
     "extract_command",
     "extract_single_command",
     "overlay",
@@ -442,4 +501,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    app()
+    main()
