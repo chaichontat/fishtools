@@ -29,16 +29,19 @@ import tifffile
 import typer
 import yaml
 import zarr
-from loguru import logger
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
-
-from fishtools.segmentation.distributed.gpu_cluster import myGPUCluster
-from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.segment.normalize import sample_percentile
 from fishtools.segment.train import IS_CELLPOSE_SAM, plan_path_for_device
+from fishtools.segmentation.distributed.cache_utils import (
+    read_nonempty_cache,
+    read_normalization_cache,
+    write_nonempty_cache,
+    write_normalization_cache,
+)
+from fishtools.segmentation.distributed.gpu_cluster import myGPUCluster
 from fishtools.utils.pretty_print import progress_bar
 
 # logger.remove()
@@ -537,9 +540,15 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
     from cellpose.contrib.packed_infer import (
         PackedCellposeModel,
         PackedCellposeModelTRT,
+        PackedCellposeUNetModel,
+        PackedCellposeUNetModelTRT,
     )
 
     resolved_kwargs = dict(model_kwargs)
+    backend = resolved_kwargs.pop("backend", "sam").lower()
+    if backend not in {"sam", "unet"}:
+        raise ValueError("backend must be either 'sam' or 'unet'.")
+
     pretrained_model = resolved_kwargs.get("pretrained_model")
     if pretrained_model is None:
         raise ValueError("model_kwargs must include 'pretrained_model'.")
@@ -555,22 +564,31 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
             plan_candidate = plan_path_for_device(pretrained_path, device_name)
             if plan_candidate.is_file():
                 plan_selection = (plan_candidate, device_name)
+    plan_candidate = plan_candidate if "plan_candidate" in locals() else plan_path_for_device(pretrained_path, "cuda")
+
+    backend_to_classes = {
+        "sam": (PackedCellposeModel, PackedCellposeModelTRT),
+        "unet": (PackedCellposeUNetModel, PackedCellposeUNetModelTRT),
+    }
+    base_cls, trt_cls = backend_to_classes[backend]
 
     if plan_selection is not None:
         plan_path, device_name = plan_selection
         logger.info("Using TensorRT plan %s for CUDA device '%s'", plan_path.name, device_name)
-        trt_kwargs = {
-            key: value for key, value in resolved_kwargs.items() if key not in {"pretrained_model_ortho"}
-        }
+        trt_kwargs = dict(resolved_kwargs)
         trt_kwargs["pretrained_model"] = str(plan_path)
         trt_kwargs.setdefault("gpu", True)
-        return PackedCellposeModelTRT(**trt_kwargs)
+        return trt_cls(**trt_kwargs)
 
-    if IS_CELLPOSE_SAM:
+    raise FileNotFoundError(
+        f"TensorRT plan required. Expected plan at {plan_candidate} for the current GPU."
+    )
+
+    if backend == "sam" and IS_CELLPOSE_SAM:
         resolved_kwargs.pop("pretrained_model_ortho", None)
 
     resolved_kwargs.setdefault("gpu", True)
-    return PackedCellposeModel(**resolved_kwargs)
+    return base_cls(**resolved_kwargs)
 
 
 def read_preprocess_and_segment(
@@ -642,7 +660,11 @@ def read_preprocess_and_segment(
     cellpose.io.logger_setup(stdout_file_replacement=log_file)
 
     model = _build_packed_cellpose_model(model_kwargs)
-    return model.eval(image, **eval_kwargs)[0].astype(np.uint32)
+    backend = model_kwargs.get("backend", "sam")
+    filtered_eval_kwargs = dict(eval_kwargs)
+    if backend == "unet":
+        filtered_eval_kwargs.pop("ortho_weights", None)
+    return model.eval(image, **filtered_eval_kwargs)[0].astype(np.uint32)
 
 
 def remove_overlaps(
@@ -1012,18 +1034,10 @@ def distributed_eval(
     n = None
 
     path_nonempty = write_path.parent / "nonempty.json"
-    try:
-        obj = json.loads(path_nonempty.read_text())
-        try:
-            # Normalize to tuples so type differences (list vs tuple) don't force recompute
-            bs_saved = tuple(obj["block_size"])  # may be JSON list
-            bs_current = tuple(blocksize)
-        except KeyError:
-            raise ValueError("Block size not found in nonempty.json; recomputing non-empty blocks.")
-        if bs_saved != bs_current:
-            raise ValueError("Block size has changed since last run; recomputing non-empty blocks.")
-        idxs = obj["idxs"]
-    except (FileNotFoundError, json.decoder.JSONDecodeError, KeyError, ValueError):
+    idxs = read_nonempty_cache(path_nonempty, blocksize)
+    if idxs is not None:
+        logger.info("Loaded cached non-empty block indices (%d entries).", len(idxs))
+    else:
         check_futures = cluster.client.map(
             check_block_has_data,
             block_crops[offset : None if n is None else offset + n],
@@ -1031,19 +1045,21 @@ def distributed_eval(
             threshold=1,
         )
 
-        logger.info("Gathering input data check results...")
+        total_tiles = len(check_futures)
+        logger.info("Checking non-zero blocks: 0/%d", total_tiles)
         try:
-            non_zero_results = cluster.client.gather(check_futures, errors="raise")
-            logger.info("Input data check results gathered.")
+            with progress_bar(total_tiles) as submit:
+                [fut.add_done_callback(submit) for fut in check_futures]
+                non_zero_results = cluster.client.gather(check_futures, errors="raise")
+            logger.info("Checked non-zero blocks: %d/%d", total_tiles, total_tiles)
         except Exception as e:
             logger.critical(f"Error gathering input check results: {e}")
             logger.critical("Skipping zero-input block filtering due to error.")
             raise e
 
         idxs = [i for i, is_non_zero in enumerate(non_zero_results, offset) if is_non_zero]
-
-        # Persist as JSON-friendly types; block_size saved as list for portability
-        path_nonempty.write_text(json.dumps({"idxs": idxs, "block_size": list(blocksize)}, indent=2))
+        write_nonempty_cache(path_nonempty, blocksize, idxs)
+        logger.info("Persisted %d non-empty block indices to %s", len(idxs), path_nonempty)
 
     # final_block_indices, final_block_crops = [], []
     final_block_indices, final_block_crops = (
@@ -1284,6 +1300,12 @@ def main(
     path: Path = typer.Argument(..., help="Path to the folder containing the zarr file."),
     channels: str | None = typer.Option(None, help="Comma-separated list of channel names to use."),
     overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
+    config_path: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Explicit path to config.json. Defaults to <path>/../config.json when omitted.",
+    ),
     workers_per_gpu: int = typer.Option(
         2, help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster)"
     ),
@@ -1321,7 +1343,7 @@ def main(
     - path/normalization.json (auto-generated if missing)
 
     Output files:
-    - path/output_segmentation.zarr (segmentation results)
+    - path/output_segmentation-sam.zarr or path/output_segmentation-unet.zarr (segmentation results, backend-dependent)
     - path/segmentation.done (completion marker)
     - path/cellpose_temp/ (temporary processing files)
     """
@@ -1346,27 +1368,39 @@ def main(
         exit()
 
     IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
+    if not IS_CELLPOSE_SAM:
+        raise RuntimeError("This script requires Cellpose version 4.x for SAM backend support.")
 
     # ---- 1. Configuration ----
-    zarr_output_path = base_dir / "output_segmentation.zarr"
-    temporary_directory = base_dir / "cellpose_temp"
-    (zarr_output_path.parent / "segmentation.done").unlink(missing_ok=True)
+    if config_path is None:
+        config_path = base_dir.parent / "config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Config file not found at {config_path}")
 
-    config = json.loads((base_dir.parent / "config.json").read_text())
+    config = json.loads(config_path.read_text())
+    backend = config.get("backend", "sam").lower()
+    if backend not in {"sam", "unet"}:
+        raise ValueError("backend must be one of {'sam', 'unet'}.")
+    using_sam_backend = backend == "sam"
+
+    zarr_output_path = base_dir / f"output_segmentation-{backend}.zarr"
+    temporary_directory = base_dir / "cellpose_temp"
+    (base_dir / "segmentation.done").unlink(missing_ok=True)
     # Optional: ortho aggregation weights (XY, YZ, ZX). Pass-through without validation here.
     ortho_weights = config.get("ortho_weights", [1.5, 1.0, 1.0])
     cellpose_model_kwargs = {
         "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
         "gpu": True,
+        "backend": backend,
     }
-    if IS_CELLPOSE_SAM:
+    if using_sam_backend and IS_CELLPOSE_SAM:
         ...
     else:
         cellpose_model_kwargs["pretrained_model_ortho"] = config.get("pretrained_model_ortho", None)
 
     # Dask Cluster Configuration (always GPU-backed)
     local_cluster_kwargs = {
-        "workers_per_gpu": int(workers_per_gpu),
+        "workers_per_gpu": int(10 if backend == "unet" else workers_per_gpu),
         "threads_per_worker": int(threads_per_worker),
     }
     if use_localcuda and workers_per_gpu <= 1:
@@ -1402,18 +1436,26 @@ def main(
             raise ValueError(f"Channel names {channels} not found in {key}")
     del channels
 
-    processing_blocksize = (
-        input_zarr_array.shape[0],
-        256,
-        1024,
-        len(channels_list),
-    )  # ZYXc
-    try:
-        if overwrite:
-            raise FileNotFoundError  # To force into the except block
-        normalization = json.loads((base_dir / "normalization.json").read_text())
-    except FileNotFoundError:
-        logger.info("Existing normalization params not found. Calculating percentiles.")
+    if backend == "unet":
+        processing_blocksize = (
+            input_zarr_array.shape[0],
+            224,
+            224 * 4,
+            len(channels_list),
+        )  # ZYXc tuned for UNet
+    else:
+        processing_blocksize = (
+            input_zarr_array.shape[0],
+            256,
+            1024,
+            len(channels_list),
+        )  # ZYXc tuned for SAM
+    normalization_path = base_dir / "normalization.json"
+    normalization = read_normalization_cache(normalization_path)
+    if normalization is not None:
+        logger.info("Loaded cached normalization thresholds from %s", normalization_path)
+    else:
+        logger.info("Calculating normalization percentiles (cache miss).")
         perc, _ = sample_percentile(
             input_zarr_array,
             channels=channels_list,
@@ -1423,14 +1465,14 @@ def main(
             high=99.9,
         )
         normalization = {"lowhigh": perc}
-        (base_dir / "normalization.json").write_text(json.dumps(normalization, indent=2, cls=NumpyEncoder))
-    print(normalization)
+        write_normalization_cache(normalization_path, normalization)
+        logger.info("Saved normalization thresholds to %s", normalization_path)
 
-    if len(channels_list) == 1:  # Cellpose pre SAM always expects 2 channels
+    if len(channels_list) == 1:
         channels_list = [channels_list[0], channels_list[0]]
         normalization = {"lowhigh": [normalization["lowhigh"], normalization["lowhigh"]]}
 
-    if IS_CELLPOSE_SAM and len(channels_list) < 3:
+    if using_sam_backend and IS_CELLPOSE_SAM and len(channels_list) < 3:
         print(np.repeat([[0], [1]], repeats=3 - len(channels_list), axis=0).shape)
         normalization = {
             "lowhigh": np.concatenate(
@@ -1447,7 +1489,7 @@ def main(
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
         "diameter": config.get("diameter", 30),  # MUST BE INT
-        "batch_size": 16 if not IS_CELLPOSE_SAM else 4,  # Adjust based on GPU memory (if using GPU)
+        "batch_size": 2,
         "normalize": normalization,
         "flow_threshold": 0,  # Useless in 3D
         "cellprob_threshold": -0.5,  # Default is 0.0, adjust if needed
@@ -1457,10 +1499,14 @@ def main(
         "niter": 2000,
         "do_3D": True,
         "min_size": 200,
-        "z_axis": 0,
         "channel_axis": 3,
-        **({"channels": channels_list} if not IS_CELLPOSE_SAM else {}),
     }
+    if using_sam_backend:
+        cellpose_eval_kwargs["z_axis"] = 0
+        if not IS_CELLPOSE_SAM:
+            cellpose_eval_kwargs["channels"] = channels_list
+    else:
+        cellpose_eval_kwargs["channels"] = channels_list
     if ortho_weights is not None:
         cellpose_eval_kwargs["ortho_weights"] = ortho_weights
 

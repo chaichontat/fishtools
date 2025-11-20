@@ -55,6 +55,11 @@ def _build_counts_matrix_func():
     return _segment_export_module()._build_counts_matrix
 
 
+def _annotate_cells_func():
+    module = _segment_export_module()
+    return module.annotate_cells_with_roi, module.load_roi_polygons
+
+
 def _write_parquet(path: Path, frame: pl.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.write_parquet(path)
@@ -196,6 +201,40 @@ def test_counts_matrix_matches_transcript_gene_conversion() -> None:
     expected_genes = {"GeneA-202", "GeneA-201", "GeneX", "GeneY-2"}
     result_genes = set(counts.columns) - {"roilabel"}
     assert result_genes == expected_genes
+
+
+def test_annotate_cells_with_roi_marks_obs_column(tmp_path: Path) -> None:
+    annotate_cells, _ = _annotate_cells_func()
+
+    roi_path = tmp_path / "roi.zip"
+    _write_roi_zip(roi_path)
+
+    import anndata as ad
+    import numpy as np
+
+    adata = ad.AnnData(X=np.zeros((3, 1), dtype=np.float32))
+    adata.obs["x"] = [40.0, 400.0, -10.0]
+    adata.obs["y"] = [40.0, 400.0, -10.0]
+    adata.obsm["spatial"] = adata.obs[["x", "y"]].to_numpy()
+
+    annotate_cells(adata, roi_path, scale=8.0, column_name="roi_mask")
+
+    assert adata.obs["roi_mask"].tolist() == ["1", "", ""]
+
+
+def _write_roi_zip(path: Path) -> None:
+    import zipfile
+
+    import roifile
+
+    ImagejRoi = roifile.ImagejRoi
+    roi = ImagejRoi.frompoints([(0, 0), (10, 0), (10, 10), (0, 10)])
+    roi.name = "1"
+    roi_file = path.with_suffix(".roi")
+    roi.tofile(roi_file)
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.write(roi_file, arcname="1.roi")
+    roi_file.unlink()
 
 
 def _convert_transcript_to_gene(ts: str, non_unique_targets: list[str] | None = None) -> str:

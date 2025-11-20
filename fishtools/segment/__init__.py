@@ -1,18 +1,21 @@
 import logging
+from functools import lru_cache
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Optional
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Optional
 
 import rich_click as click
 import torch
 
-from fishtools.segment.export import export_cmd as segment_export_cmd
-from fishtools.segment.extract import cmd_extract as extract_cmd
-from fishtools.segment.extract import cmd_extract_single as extract_single_cmd
-from fishtools.segment.overlay_intensity import overlay_intensity as overlay_intensity_command
-from fishtools.segment.overlay_spots import overlay as overlay_spots_command
-from fishtools.segment.run import run as run_cli
-from fishtools.segment.train import TrainConfig, build_trt_engine, run_train
+if TYPE_CHECKING:  # pragma: no cover
+    from fishtools.segment.train import TrainConfig as TrainConfig
+
+
+@lru_cache(maxsize=None)
+def _import_cached(module: str):
+    return import_module(module)
+
 
 
 def _strip_line_comments(text: str) -> str:
@@ -28,6 +31,29 @@ class SegmentCLI(click.Group):
     def main(self, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("standalone_mode", False)
         return super().main(*args, **kwargs)
+
+
+class _LazyCommandGroup(click.Group):
+    def __init__(self, *args: Any, lazy_commands: dict[str, SimpleNamespace] | None = None, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._lazy_commands = lazy_commands or {}
+
+    def list_commands(self, ctx):  # type: ignore[override]
+        eager = super().list_commands(ctx)
+        lazy = sorted(self._lazy_commands)
+        return list(dict.fromkeys([*eager, *lazy]))
+
+    def get_command(self, ctx, cmd_name):  # type: ignore[override]
+        command = super().get_command(ctx, cmd_name)
+        if command is not None:
+            return command
+        spec = self._lazy_commands.get(cmd_name)
+        if spec is None:
+            return None
+        module = _import_cached(spec.module)
+        cmd = getattr(module, spec.attr)
+        self.add_command(cmd, cmd_name)
+        return cmd
 
 
 app = SegmentCLI(help="Segmentation tooling CLI.")
@@ -53,6 +79,10 @@ def train(
     te_fp8: bool,
     packed: bool,
 ) -> None:
+    train_module = _import_cached("fishtools.segment.train")
+    TrainConfigCls = train_module.TrainConfig
+    run_train = train_module.run_train
+
     models_path = path / "models"
     if not models_path.exists():
         raise click.ClickException(
@@ -62,7 +92,7 @@ def train(
     config_path = models_path / f"{name}.json"
     try:
         raw = config_path.read_text()
-        train_config = TrainConfig.model_validate_json(_strip_line_comments(raw))
+        train_config = TrainConfigCls.model_validate_json(_strip_line_comments(raw))
     except FileNotFoundError as exc:  # pragma: no cover - user error path
         raise click.ClickException(
             f"Config file {name}.json not found in {models_path}. Please create it first."
@@ -84,6 +114,19 @@ def train(
     updated = run_train(name, path, train_config).model_dump_json(indent=2)
     output_path = models_path / f"{name}.trained.json"
     output_path.write_text(updated)
+
+
+@app.command("distill")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.argument("outdir")
+def distill_command(path: Path, outdir: str) -> None:
+    distill_module = _import_cached("fishtools.segment.distill")
+    warnings = distill_module.run_distill(path, outdir)
+    for message in warnings:
+        click.echo(message)
 
 
 @app.command("run")
@@ -139,6 +182,8 @@ def run_command(
     ortho_weights: Optional[str],
     backend: str,
 ) -> None:
+    from fishtools.segment.run import run as run_cli
+
     run_cli(
         volume,
         model=model_path,
@@ -165,17 +210,26 @@ def run_command(
     type=click.IntRange(1, None),
     help="Maximum batch dimension to embed in the engine profile.",
 )
-def trt_build_cmd(model: Path, batch_size: int) -> None:
-    from fishtools.segment.train import build_trt_engine
-
+@click.option(
+    "--backend",
+    type=click.Choice(["sam", "unet"], case_sensitive=False),
+    default="sam",
+    show_default=True,
+    help="Segmentation backend to export (UNet uses a 2-channel input).",
+)
+def trt_build_cmd(model: Path, batch_size: int, backend: str) -> None:
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA GPU is required to build a TensorRT engine.")
 
+    from fishtools.segment.train import build_trt_engine
+
+    bsize = 224 if backend.lower() == "unet" else 256
     plan_path = build_trt_engine(
         model_path=model,
         device=torch.device("cuda:0"),
-        bsize=256,
+        bsize=bsize,
         batch_size=batch_size,
+        backend=backend,
     )
     click.echo(f"Saved TensorRT engine to {plan_path}")
 
@@ -225,6 +279,8 @@ def export_command(
     diag: bool,
 ) -> None:
     """Export Baysor-ready spots plus aggregated per-cell intensities."""
+
+    from fishtools.segment.export import export_cmd as segment_export_cmd
 
     segment_export_cmd(
         path=path,
@@ -305,7 +361,9 @@ def extract_command(
     max_from: Optional[str],
     zarr: bool,
 ) -> None:
-    extract_cmd(
+    from fishtools.segment.extract import cmd_extract
+
+    cmd_extract(
         mode,
         path,
         roi=roi,
@@ -380,7 +438,9 @@ def extract_single_command(
     max_from: Optional[Path],
     label: Optional[str],
 ) -> None:
-    extract_single_cmd(
+    from fishtools.segment.extract import cmd_extract_single
+
+    cmd_extract_single(
         mode,
         registered,
         out=out,
@@ -397,7 +457,12 @@ def extract_single_command(
     )
 
 
-@app.group()
+_OVERLAY_LAZY_COMMANDS = {
+    "intensity": SimpleNamespace(module="fishtools.segment.overlay_intensity", attr="overlay_intensity"),
+}
+
+
+@app.group(cls=_LazyCommandGroup, lazy_commands=_OVERLAY_LAZY_COMMANDS)
 def overlay() -> None:
     """Visualization helpers for segmentation outputs."""
 
@@ -450,7 +515,9 @@ def overlay_spots(
     debug: bool,
 ) -> None:
     current_roi = roi if roi is not None else "*"
-    overlay_spots_command.callback(
+    from fishtools.segment.overlay_spots import overlay as overlay_impl
+
+    overlay_impl(
         path,
         current_roi,
         codebook,
@@ -465,9 +532,18 @@ def overlay_spots(
     )
 
 
-overlay.add_command(overlay_intensity_command, name="intensity")
+def run(*args, **kwargs):
+    from fishtools.segment.run import run as run_cli
 
-run = run_cli
+    return run_cli(*args, **kwargs)
+
+
+_LAZY_EXPORT_ATTRS = {
+    "TrainConfig": ("fishtools.segment.train", "TrainConfig"),
+    "build_trt_engine": ("fishtools.segment.train", "build_trt_engine"),
+    "run_train": ("fishtools.segment.train", "run_train"),
+}
+
 
 __all__ = [
     "app",
@@ -489,9 +565,14 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     if name == "cp_io":
-        module = import_module("fishtools.segment.cp_io")
+        module = _import_cached("fishtools.segment.cp_io")
         globals()["cp_io"] = module
         return module
+    if name in _LAZY_EXPORT_ATTRS:
+        module_name, attr = _LAZY_EXPORT_ATTRS[name]
+        value = getattr(_import_cached(module_name), attr)
+        globals()[name] = value
+        return value
     raise AttributeError(name)
 
 

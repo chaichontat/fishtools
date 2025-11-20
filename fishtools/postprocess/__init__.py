@@ -49,7 +49,9 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
 }
 
 __getattr__, __dir__, __all__ = make_lazy_getattr(
-    globals(), _LAZY_ATTRS, extras=("jitter", "rotate_rois_in_adata", "add_scale_bar")
+    globals(),
+    _LAZY_ATTRS,
+    extras=("jitter", "rotate_rois_in_adata", "translate_rois_in_adata", "add_scale_bar"),
 )
 
 if TYPE_CHECKING:  # pragma: no cover - for editors only
@@ -186,6 +188,33 @@ def rotate_rois_in_adata(adata, roi_rotation_angles: dict[str, float]):
         spatial_coords[roi_indices, :] = rotated_coords
 
     adata.obsm["spatial_rot"] = spatial_coords
+    return adata
+
+
+def translate_rois_in_adata(adata: "ad.AnnData", roi_translations: dict[str, tuple[float, float]]):
+    """Translate ROI spatial coordinates in-place by the provided pixel offsets."""
+    import numpy as np  # local import
+    from loguru import logger  # local import
+
+    spatial_coords = adata.obsm.get("spatial_rot", adata.obsm["spatial"]).copy()
+
+    for roi_name, shift in roi_translations.items():
+        if len(shift) != 2:
+            raise ValueError(f"Translation for ROI '{roi_name}' must be a tuple of length 2, got {shift}.")
+
+        dx, dy = shift
+        roi_indices = np.where(adata.obs["roi"] == roi_name)[0]
+
+        if len(roi_indices) == 0:
+            logger.warning(
+                f"ROI '{roi_name}' not found in adata.obs['roi']. Skipping translation for this ROI."
+            )
+            continue
+
+        spatial_coords[roi_indices, 0] += dx
+        spatial_coords[roi_indices, 1] += dy
+
+    adata.obsm["spatial_trans"] = spatial_coords
     return adata
 
 
