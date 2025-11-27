@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,7 @@ from cupyx.scipy.ndimage import convolve as cconvolve
 from loguru import logger
 from tifffile import imread
 
-DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data"
+DATA_DIR = Path(os.environ["DATA_PATH"]).expanduser().resolve() if "DATA_PATH" in os.environ else (Path(__file__).resolve().parent.parent.parent.parent / "data")
 PSF_FILENAME = "PSF GL.tif"
 
 
