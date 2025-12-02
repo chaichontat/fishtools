@@ -44,7 +44,7 @@ dependencies = [
     "starfish @ git+https://github.com/chaichontat/starfish@master",
     "prefect>=3",
     "typer>=0.15.0",
-    "zarr>=3",
+    "zarr>=3.1.4",
     "pyfiglet>=1.0.4",
 ]
 
