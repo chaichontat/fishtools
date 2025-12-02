@@ -20,3 +20,12 @@ dependencies:
   - dask
   - dask-image
   - dask-jobqueue
+  - pip:
+    - tensorrt-cuda12<10.14
+    # 10.14 will fail with
+    # [TRT] [E] Error Code: 9: Skipping tactic 0x0000000000000000 due to exception [type.cpp:186: infer_type] Could not infer output types for operation: 49313: deconv: y-(bf16[__mye49330_proxy,3,256,256][]so[3,2,1,0]p[0,0,0,0], mem_prop=0, align=2) | /net/out/Conv_output_0-(bf16[__mye49330_proxy,192,32,32][]so[], mem_prop=0, align=2), /net/ConvTranspose filterWeightsBFloat16-{1, 0, 0, 0, 0, 0, 0, 0, ...}(bf16[192,3,8,8][192,64,8,1]so[3,2,1,0], mem_prop=0, align=2)<entry>, __mye49314/net/ConvTranspose_alpha-1F:(f32[][]so[], mem_prop=0, align=4)<entry>, __mye49315/net/ConvTranspose_beta-0F:(f32[][]so[], mem_prop=0, align=4)<entry>, stream = 0 // /net/ConvTranspose n_groups: 1  lpad: {0, 0}  rpad: {0, 0}  pad_mode: 0 strides: {8, 8}  dilations: {1, 1} , No matching rules found for input operand types In compileGraph at /_src/optimizer/myelin/codeGenerator.cpp:1548
+    # [TRT] [E] IBuilder::buildSerializedNetwork: Error Code 10: Internal Error (Could not find any implementation for node {ForeignNode[/net/patch_embed/proj/Conv.../net/ConvTranspose]}. In computeCosts at /_src/optimizer/common/tactic/optimizer.cpp:4143)
+    - git+https://github.com/meta-pytorch/segment-anything-fast@6327c0d
+    - onnx>=1.20.0
+    - onnxruntime-gpu>=1.23.2
+    - onnxscript>=0.5.6
