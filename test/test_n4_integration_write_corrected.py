@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pytest
 import zarr
 
 from fishtools.preprocess import n4
+from fishtools.utils.zarr_utils import default_zarr_codecs
 
 
 pytestmark = pytest.mark.timeout(30)
@@ -20,6 +20,7 @@ def _make_fused(path: Path, data: np.ndarray, names: list[str] | None = None) ->
         shape=data.shape,
         chunks=(1, data.shape[1], data.shape[2], 1),
         dtype=data.dtype,
+        codecs=default_zarr_codecs(),
     )
     store[...] = data
     if names is not None:

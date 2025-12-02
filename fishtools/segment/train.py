@@ -9,15 +9,14 @@ import torch
 from cellpose.contrib.cellposetrt import trt_build
 from cellpose.models import CellposeModel
 from cellpose.train import train_seg as train_seg_transformer
-from cellpose.train_unet import train_seg as train_seg_unet
-from cellpose.unet import CellposeUNetModel
+# from cellpose.train_unet import train_seg as train_seg_unet
+# from cellpose.unet import CellposeUNetModel
 from loguru import logger
 from pydantic import BaseModel, Field
 
 from fishtools.segment.augment import PhotometricConfig, build_batch_augmenter
 from fishtools.segment.data_discovery import _compile_patterns, _discover_training_dirs, _matches_any
 from fishtools.utils.logging import setup_workspace_logging
-from fishtools.utils.utils import noglobal
 
 try:
     IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
@@ -39,6 +38,33 @@ def plan_path_for_device(model_path: Path, device_name: str) -> Path:
     return model_path.with_name(f"{base_name}-{safe_device_name}.plan")
 
 
+def _cleanup_model_artifacts(model_path: Path) -> None:
+    """Remove stale TensorRT artifacts for a trained model.
+
+    Deletes device-specific `.plan` files first, followed by any ONNX files
+    derived from the same model name. This ensures we rebuild engines from a
+    clean slate after training.
+    """
+
+    model_dir = model_path.parent
+    base_name = model_path.name
+
+    plan_files = sorted(model_dir.glob(f"{base_name}-*.plan"))
+    onnx_files = sorted(model_dir.glob(f"{base_name}*.onnx"))
+
+    if plan_files or onnx_files:
+        logger.info(
+            f"Removing existing TensorRT artifacts for {base_name}: "
+            f"plans={[p.name for p in plan_files]}, onnx={[o.name for o in onnx_files]}"
+        )
+
+    for plan_file in plan_files:
+        plan_file.unlink(missing_ok=True)
+
+    for onnx_file in onnx_files:
+        onnx_file.unlink(missing_ok=True)
+
+
 class TrainConfig(BaseModel):
     name: str
     base_model: str | None
@@ -46,6 +72,7 @@ class TrainConfig(BaseModel):
     backend: Literal["sam", "unet"] = "sam"
     channels: tuple[int, int]
     training_paths: list[str]
+    diameter: float | None = 50  # target rescale diameter (px) for SAM training; if None, infer per-image
     # Optional explicit test set roots. Accepts a single string or list of strings
     # using the same semantics as `training_paths` (relative to training root,
     # may point to files or directories; image directories are discovered by
@@ -67,9 +94,9 @@ class TrainConfig(BaseModel):
     use_te: bool = False
     te_fp8: bool = False
     packed: bool = False
-    pack_k: int = 3
+    pack_k: int = 2
     pack_guard: int = 16
-    pack_stripe_height: int | None = 68
+    pack_stripe_height: int | None = 81
 
 
 def _filter_images_by_patterns(
@@ -335,7 +362,6 @@ def build_trt_engine(
     return plan_path
 
 
-@noglobal
 def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfig):
     images, labels, image_names, test_images, test_labels, image_names_test = out
 
@@ -394,6 +420,20 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     if train_config.backend == "unet":
         pack_kwargs["channels"] = train_config.channels
 
+    extra_train_kwargs: dict[str, Any] = {}
+    if train_config.backend == "sam" and train_config.diameter is not None:
+        extra_train_kwargs["diameter_override"] = train_config.diameter
+        model_diam = getattr(model.net, "diam_mean", None)
+        model_diam_val = float(model_diam.item()) if model_diam is not None else None
+        if model_diam_val is not None:
+            logger.info(
+                f"Using diameter_override={train_config.diameter:.1f}px; model diam_mean={model_diam_val:.1f}px"
+            )
+        else:
+            logger.info(
+                f"Using diameter_override={train_config.diameter:.1f}px (model diam_mean unavailable)"
+            )
+
     model_path, train_losses, test_losses = train_seg_fn(
         model.net,
         train_data=images,
@@ -413,9 +453,11 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
         min_train_masks=4,
         batch_photom_augment=phot_aug,
         **pack_kwargs,
+        **extra_train_kwargs,
     )
 
     model_path = Path(model_path)
+    _cleanup_model_artifacts(model_path)
     build_trt_engine(
         model_path=model_path,
         bsize=train_config.bsize,
@@ -427,7 +469,6 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     return model_path, train_losses, test_losses
 
 
-# @noglobal
 def run_train(name: str, path: Path, train_config: TrainConfig):
     log_destination = setup_workspace_logging(
         workspace=path,

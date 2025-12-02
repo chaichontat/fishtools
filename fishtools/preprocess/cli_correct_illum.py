@@ -19,6 +19,7 @@ from fishtools.preprocess.spots.illumination import RangeFieldPointsModel
 from fishtools.utils.logging import setup_workspace_logging
 from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
 from fishtools.utils.tiff import normalize_channel_names, read_metadata_from_tif
+from fishtools.utils.zarr_utils import default_zarr_codecs
 
 
 def _edges(n: int, grid: int) -> list[int]:
@@ -1766,6 +1767,7 @@ def export_field(
                         shape=arr_shape,
                         chunks=chunks,
                         dtype=np.float32,
+                        codecs=default_zarr_codecs(),
                     )
                     za_store.attrs["axes"] = "TCYX"
                     za_store.attrs["t_labels"] = ["low", "range"]
@@ -1864,6 +1866,7 @@ def export_field(
                 shape=arr_shape,
                 chunks=chunks,
                 dtype=np.float32,
+                codecs=default_zarr_codecs(),
             )
             za_store.attrs["axes"] = "TCYX"
             za_store.attrs["t_labels"] = ["low", "range"]

@@ -1,37 +1,27 @@
 import datetime
-import functools
-import getpass
 import json
 import logging
 import os
 import pathlib
 import shutil
-import sys
 from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated, Any, cast
 
-if __package__ in (None, ""):
-    repo_root = pathlib.Path(__file__).resolve().parents[3]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-
 import cellpose.io
-import dask
-import dask_image.ndmeasure
 import dask_jobqueue
 import distributed
 import imagecodecs
 import numpy as np
-import scipy
 import tifffile
 import typer
-import yaml
 import zarr
+from cellpose import transforms as cp_transforms
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
+from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.segment.normalize import sample_percentile
 from fishtools.segment.train import IS_CELLPOSE_SAM, plan_path_for_device
@@ -41,7 +31,18 @@ from fishtools.segmentation.distributed.cache_utils import (
     write_nonempty_cache,
     write_normalization_cache,
 )
-from fishtools.segmentation.distributed.gpu_cluster import myGPUCluster
+from fishtools.segmentation.distributed.gpu_cluster import cluster, myLocalCluster
+from fishtools.segmentation.distributed.merge_utils import (
+    block_faces,
+    bounding_boxes_in_global_coordinates,
+    determine_merge_relabeling,
+    get_block_crops,
+    get_nblocks,
+    global_segment_ids,
+    merge_all_boxes,
+    relabel_and_write,
+    remove_overlaps,
+)
 from fishtools.utils.pretty_print import progress_bar
 
 # logger.remove()
@@ -54,16 +55,143 @@ logging.getLogger("cellpose").setLevel(logging.WARNING)
 
 logger = logging.getLogger("rich")
 
+# Per-worker cache for PackedCellpose models (keyed by backend and model path).
+_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+
+# Per-worker initialization flag to avoid repeated setup overhead.
+_WORKER_INITIALIZED: bool = False
+_WORKER_LOGS_DIR: str | None = None
+
+
+######################## Checkpoint/Resume Functions ###########################
+
+
+def compute_model_md5(model_path: Path) -> str:
+    """MD5 hash of model file. Matches `md5sum <file>` CLI output."""
+    import hashlib
+
+    h = hashlib.md5()
+    with open(model_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def save_run_config(
+    path: Path,
+    model_kwargs: dict[str, Any],
+    eval_kwargs: dict[str, Any],
+    blocksize: tuple[int, ...],
+    input_shape: tuple[int, ...],
+    overlap: int,
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
+) -> None:
+    """Save run configuration for resume validation."""
+    model_path = Path(model_kwargs["pretrained_model"])
+    config = {
+        "model_md5": compute_model_md5(model_path),
+        "model_path": str(model_path),
+        "model_kwargs": model_kwargs,
+        "eval_kwargs": eval_kwargs,
+        "blocksize": list(blocksize),
+        "overlap": overlap,
+        "input_shape": list(input_shape),
+        "preprocessing_steps": [f[0].__name__ for f in preprocessing_steps],
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    path.write_text(json.dumps(config, indent=2, cls=NumpyEncoder))
+
+
+def _normalize_for_comparison(obj: Any) -> Any:
+    """Normalize objects for comparison (convert numpy arrays to lists)."""
+    return json.loads(json.dumps(obj, cls=NumpyEncoder))
+
+
+def validate_run_config(
+    path: Path,
+    model_kwargs: dict[str, Any],
+    eval_kwargs: dict[str, Any],
+    blocksize: tuple[int, ...],
+    input_shape: tuple[int, ...],
+    overlap: int,
+    preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]],
+) -> None:
+    """Validate current config matches saved config. Raises on mismatch."""
+    saved = json.loads(path.read_text())
+    current_md5 = compute_model_md5(Path(model_kwargs["pretrained_model"]))
+
+    # Normalize current values for comparison (numpy arrays -> lists)
+    current_model_kwargs = _normalize_for_comparison(model_kwargs)
+    current_eval_kwargs = _normalize_for_comparison(eval_kwargs)
+
+    errors = []
+    if saved["model_md5"] != current_md5:
+        errors.append(f"model_md5: {saved['model_md5']} != {current_md5}")
+    if saved["model_kwargs"] != current_model_kwargs:
+        errors.append(f"model_kwargs differ: {saved['model_kwargs']} != {current_model_kwargs}")
+    if saved["eval_kwargs"] != current_eval_kwargs:
+        errors.append(f"eval_kwargs differ: {saved['eval_kwargs']} != {current_eval_kwargs}")
+    if saved["blocksize"] != list(blocksize):
+        errors.append(f"blocksize: {saved['blocksize']} != {list(blocksize)}")
+    if saved["overlap"] != overlap:
+        errors.append(f"overlap: {saved['overlap']} != {overlap}")
+    if saved["input_shape"] != list(input_shape):
+        errors.append(f"input_shape: {saved['input_shape']} != {list(input_shape)}")
+
+    current_pp = [f[0].__name__ for f in preprocessing_steps]
+    if saved["preprocessing_steps"] != current_pp:
+        errors.append(f"preprocessing_steps: {saved['preprocessing_steps']} != {current_pp}")
+
+    if errors:
+        raise ValueError("Cannot resume - config mismatch:\n" + "\n".join(errors))
+
+    logger.info(f"Config validated - model MD5 matches (verify: md5sum {model_kwargs['pretrained_model']})")
+
+
+def load_checkpoint(path: Path) -> set[tuple[int, ...]]:
+    """Load completed block indices from checkpoint file."""
+    completed: set[tuple[int, ...]] = set()
+    if not path.exists():
+        return completed
+    with open(path) as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                completed.add(tuple(entry["index"]))
+            except json.JSONDecodeError as e:
+                logger.warning(f"Skipping corrupted checkpoint line {i}: {e}")
+    return completed
+
+
+def append_checkpoint(
+    checkpoint_path: Path,
+    block_index: tuple[int, ...],
+    worker_name: str,
+    duration_s: float,
+    n_masks: int,
+) -> None:
+    """Atomically append checkpoint entry."""
+
+    entry = {
+        "index": list(block_index),
+        "ts": datetime.datetime.now().isoformat(),
+        "worker": worker_name,
+        "duration_s": round(duration_s, 2),
+        "n_masks": n_masks,
+    }
+    with open(checkpoint_path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
 
 def _gpu_probe() -> dict[str, Any]:
     """Executed on workers to report CUDA visibility and current device."""
     import distributed as _dist  # local import to avoid serialization surprises
+    import torch  # type: ignore
 
     info: dict[str, Any] = {}
-    try:
-        import torch  # type: ignore
-    except Exception:
-        torch = None  # type: ignore
     try:
         info["worker"] = getattr(_dist.get_worker(), "name", "unknown")
     except Exception:
@@ -73,7 +201,7 @@ def _gpu_probe() -> dict[str, Any]:
     except Exception:
         info["cuda_visible_devices"] = ""
     try:
-        if torch is not None and getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+        if torch.cuda.is_available():
             info["torch_current_device"] = int(torch.cuda.current_device())
         else:
             info["torch_current_device"] = None
@@ -104,12 +232,22 @@ def numpy_array_to_zarr(write_path: Path | str, array: NDArray[Any], chunks: tup
         A read+write reference to the zarr array on disk
     """
 
+    zarr.config.set({"array.target_shard_size_bytes": "10MB"})
     zarr_array = zarr.open(
         write_path,
         mode="w",
         shape=array.shape,
         chunks=chunks,
         dtype=array.dtype,
+        codecs=[
+            zarr.codecs.BytesCodec(),
+            zarr.codecs.BloscCodec(
+                cname="zstd",
+                clevel=4,
+                shuffle=zarr.codecs.BloscShuffle.shuffle,
+                typesize=2,
+            ),
+        ],
     )
     zarr_array[...] = array
     return zarr_array
@@ -175,32 +313,6 @@ def wrap_folder_of_tiffs(
 
 ######################## Cluster related functions ############################
 
-# ----------------------- config stuff ----------------------------------------#
-DEFAULT_CONFIG_FILENAME = "distributed_cellpose_dask_config.yaml"
-
-
-def _config_path(config_name: str) -> str:
-    return str(pathlib.Path.home()) + "/.config/dask/" + config_name
-
-
-def _modify_dask_config(
-    config: dict[str, Any],
-    config_name: str = DEFAULT_CONFIG_FILENAME,
-) -> None:
-    dask.config.set(config)
-    cfg_path = Path(_config_path(config_name))
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(cfg_path, "w") as f:
-        yaml.dump(dask.config.config, f, default_flow_style=False)
-
-
-def _remove_config_file(
-    config_name: str = DEFAULT_CONFIG_FILENAME,
-) -> None:
-    config_path = _config_path(config_name)
-    if os.path.exists(config_path):
-        os.remove(config_path)
-
 
 def format_slice(s: slice | tuple[slice, ...]) -> str:
     """
@@ -231,112 +343,6 @@ def format_slice(s: slice | tuple[slice, ...]) -> str:
     return ":".join(parts).rstrip(":")
 
 
-# ----------------------- clusters --------------------------------------------#
-class myLocalCluster(distributed.LocalCluster):
-    """
-    This is a thin wrapper extending dask.distributed.LocalCluster to set
-    configs before the cluster or workers are initialized.
-
-    For a list of full arguments (how to specify your worker resources) see:
-    https://distributed.dask.org/en/latest/api.html#distributed.LocalCluster
-    You need to know how many cpu cores and how much RAM your machine has.
-
-    Most users will only need to specify:
-    n_workers
-    ncpus (number of physical cpu cores per worker)
-    memory_limit (which is the limit per worker, should be a string like '16GB')
-    threads_per_worker (for most workflows this should be 1)
-
-    You can also modify any dask configuration option through the
-    config argument.
-
-    If your workstation has a GPU, one of the workers will have exclusive
-    access to it by default. That worker will be much faster than the others.
-    You may want to consider creating only one worker (which will have access
-    to the GPU) and letting that worker process all blocks serially.
-    """
-
-    def __init__(
-        self,
-        ncpus: int,
-        config: dict[str, Any] | None = None,
-        config_name: str = DEFAULT_CONFIG_FILENAME,
-        persist_config: bool = False,
-        **kwargs: Any,
-    ) -> None:
-        # config
-        self.config_name = config_name
-        self.persist_config = persist_config
-        scratch_dir = f"{os.getcwd()}/"
-        scratch_dir += f".{getpass.getuser()}_distributed_cellpose/"
-        config_defaults = {"temporary-directory": scratch_dir}
-        if config is None:
-            config = {}
-        config = {**config_defaults, **config}
-        _modify_dask_config(config, config_name)
-
-        # construct
-        if "host" not in kwargs:
-            kwargs["host"] = ""
-        super().__init__(**kwargs)
-        self.client = distributed.Client(self)
-
-        # set environment variables for workers (threading)
-        environment_vars = {
-            "MKL_NUM_THREADS": str(2 * ncpus),
-            "NUM_MKL_THREADS": str(2 * ncpus),
-            "OPENBLAS_NUM_THREADS": str(2 * ncpus),
-            "OPENMP_NUM_THREADS": str(2 * ncpus),
-            "OMP_NUM_THREADS": str(2 * ncpus),
-        }
-
-        def set_environment_vars():
-            for k, v in environment_vars.items():
-                os.environ[k] = v
-
-        self.client.run(set_environment_vars)
-
-        print("Cluster dashboard link: ", self.dashboard_link)
-
-    def __enter__(self) -> "myLocalCluster":
-        return self
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        if not self.persist_config:
-            _remove_config_file(self.config_name)
-        self.client.close()
-        super().__exit__(exc_type, exc_value, traceback)
-
-
-# ----------------------- decorator -------------------------------------------#
-def cluster(func: Callable[..., Any]) -> Callable[..., Any]:
-    """
-    This decorator ensures a function will run inside a cluster
-    as a context manager. The decorated function, "func", must
-    accept "cluster" and "cluster_kwargs" as parameters. If
-    "cluster" is not None then the user has provided an existing
-    cluster and we just run func. If "cluster" is None then
-    "cluster_kwargs" are used to construct a new cluster, and
-    the function is run inside that cluster context.
-    """
-
-    @functools.wraps(func)
-    def create_or_pass_cluster(*args: Any, **kwargs: Any) -> Any:
-        # TODO: this only checks if args are explicitly present in function call
-        #       it does not check if they are set correctly in any way
-        assert "cluster" in kwargs or "cluster_kwargs" in kwargs, (
-            "Either cluster or cluster_kwargs must be defined"
-        )
-        if not "cluster" in kwargs:
-            ck = dict(kwargs.get("cluster_kwargs", {}) or {})
-            with myGPUCluster(**ck) as cluster:
-                kwargs["cluster"] = cluster
-                return func(*args, **kwargs)
-        return func(*args, **kwargs)
-
-    return create_or_pass_cluster
-
-
 ######################## the function to run on each block ####################
 
 
@@ -353,6 +359,7 @@ def process_block(
     preprocessing_steps: list[tuple[Callable[..., NDArray[Any]], dict[str, Any]]] = [],
     worker_logs_directory: str | None = None,
     test_mode: bool = False,
+    checkpoint_path: Path | None = None,
 ) -> (
     tuple[NDArray[np.uint32], list[tuple[slice, ...]], NDArray[np.uint32]]
     | tuple[list[NDArray[Any]], list[tuple[slice, ...]], NDArray[np.uint32]]
@@ -465,6 +472,9 @@ def process_block(
         box_ids : 1D numpy array, parallel to boxes, the segment IDs of the
                   boxes
     """
+    import time
+
+    start_time = time.perf_counter()
     logger.info(f"RUNNING BLOCK: {block_index}\tREGION: [{format_slice(crop)}]")
     segmentation_3d = read_preprocess_and_segment(
         input_zarr,
@@ -503,7 +513,7 @@ def process_block(
     # Need nblocks in 3D for correct mapping if using ravel_multi_index on 3D indices
     nblocks_3d = get_nblocks(input_zarr.shape[:-1], spatial_blocksize)  # Use 3D shapes
     # Assuming block_index is ZYX index (needs verification how it's generated/used)
-    # If block_index is ZYXC, need to adapt. Let's assume it corresponds to ZYX blocks for now.
+    # If block_index is ZYXC, need to adapt. Let's assume we only need ZYX index part
     # If block_indices were generated using 4D nblocks, adjust here:
     block_index_3d = block_index[:-1]  # Assume we only need ZYX index part
 
@@ -526,6 +536,16 @@ def process_block(
 
     # --- Calculate faces (3D) ---
     faces = block_faces(segmentation_global_3d)  # Faces are 3D
+
+    # --- Write checkpoint ---
+    if checkpoint_path is not None:
+        append_checkpoint(
+            checkpoint_path,
+            block_index,
+            distributed.get_worker().name,
+            time.perf_counter() - start_time,
+            int(np.max(segmentation_global_3d)),
+        )
 
     # Return 3D faces, 3D boxes, and corresponding IDs
     return faces, boxes, box_ids_for_this_block
@@ -574,7 +594,7 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
 
     if plan_selection is not None:
         plan_path, device_name = plan_selection
-        logger.info("Using TensorRT plan %s for CUDA device '%s'", plan_path.name, device_name)
+        logger.info(f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}'")
         trt_kwargs = dict(resolved_kwargs)
         trt_kwargs["pretrained_model"] = str(plan_path)
         trt_kwargs.setdefault("gpu", True)
@@ -667,202 +687,110 @@ def read_preprocess_and_segment(
     return model.eval(image, **filtered_eval_kwargs)[0].astype(np.uint32)
 
 
-def remove_overlaps(
-    array: NDArray[Any],
-    crop: tuple[slice, ...],
-    overlap: int,
-    blocksize: tuple[int, ...],
-) -> tuple[NDArray[Any], list[slice]]:
+def _padded_from_raw_y(Ly_raw: int, *, bsize: int) -> int:
     """
-    Remove overlapping regions from segmented block.
+    Compute padded Y size seen by Cellpose tiler for a given raw Ly.
 
-    Overlapping regions are added during processing to provide context for boundary
-    pixels/voxels during segmentation. After segmentation is complete, these overlaps
-    must be removed to prevent double-counting during block stitching.
-
-    Parameters
-    ----------
-    array : NDArray
-        The segmented array with overlaps to be trimmed
-    crop : tuple of slice
-        Original crop coordinates including overlaps
-    overlap : int
-        Size of overlap in pixels/voxels
-    blocksize : tuple of int
-        Target block size without overlaps
-
-    Returns
-    -------
-    tuple[NDArray, list[slice]]
-        Trimmed array and updated crop coordinates
-
-    Notes
-    -----
-    This function modifies both the array dimensions and the crop coordinates
-    to maintain consistency for downstream processing.
+    Uses the same padding rule as core.run_net via transforms.get_pad_yx.
     """
-    crop_trimmed = list(crop)
-    for axis in range(array.ndim):
-        if crop[axis].start != 0:
-            slc = [
-                slice(None),
-            ] * array.ndim
-            slc[axis] = slice(overlap, None)
-            array = array[tuple(slc)]
-            a, b = crop[axis].start, crop[axis].stop
-            crop_trimmed[axis] = slice(a + overlap, b)
-        if array.shape[axis] > blocksize[axis]:
-            slc = [
-                slice(None),
-            ] * array.ndim
-            slc[axis] = slice(None, blocksize[axis])
-            array = array[tuple(slc)]
-            a = crop_trimmed[axis].start
-            crop_trimmed[axis] = slice(a, a + blocksize[axis])
-    return array, crop_trimmed
+    ypad1, ypad2, _, _ = cp_transforms.get_pad_yx(Ly_raw, 0, min_size=(bsize, bsize))
+    return Ly_raw + ypad1 + ypad2
 
 
-def bounding_boxes_in_global_coordinates(
-    segmentation: NDArray[Any], crop: tuple[slice, ...]
-) -> list[tuple[slice, ...]]:
+def _padded_from_raw_x(Lx_raw: int, *, bsize: int) -> int:
     """
-    Compute bounding boxes for all segments in global coordinates.
+    Compute padded X size seen by Cellpose tiler for a given raw Lx.
 
-    Calculates tight bounding boxes for each segmented object and converts
-    local block coordinates to global image coordinates. This is performed
-    during distributed processing to avoid recomputation later.
-
-    Parameters
-    ----------
-    segmentation : NDArray
-        Segmented array with integer labels
-    crop : tuple of slice
-        Global crop coordinates for this block
-
-    Returns
-    -------
-    list[tuple[slice, ...]]
-        List of bounding box coordinates as tuples of slices in global coordinates
-
-    Notes
-    -----
-    Bounding boxes are essential for efficient downstream processing and
-    analysis of segmented objects. Computing them during distributed processing
-    avoids the need to reload large arrays later.
+    Uses the same padding rule as core.run_net via transforms.get_pad_yx.
     """
-    boxes = scipy.ndimage.find_objects(segmentation)
-    boxes = [b for b in boxes if b is not None]
-    translate = lambda a, b: slice(a.start + b.start, a.start + b.stop)
-    for iii, box in enumerate(boxes):
-        boxes[iii] = tuple(translate(a, b) for a, b in zip(crop, box))
-    return boxes
+    _, _, xpad1, xpad2 = cp_transforms.get_pad_yx(0, Lx_raw, min_size=(bsize, bsize))
+    return Lx_raw + xpad1 + xpad2
 
 
-def get_nblocks(shape: tuple[int, ...], blocksize: np.ndarray) -> NDArray[np.int_]:
+def _find_raw_for_target_tiles(
+    n_target: int,
+    *,
+    bsize: int = 256,
+    tile_overlap: float = 0.1,
+    axis: str,
+    search_margin: int = 512,
+) -> tuple[int, int]:
     """
-    Calculate the number of blocks needed per axis given shape and block size.
+    Find the largest raw size whose padded size yields the desired tile count.
 
-    Determines how many blocks are required along each axis to cover the entire
-    image volume, accounting for partial blocks at boundaries.
-
-    Parameters
-    ----------
-    shape : tuple of int
-        Dimensions of the full image volume
-    blocksize : tuple of int
-        Size of individual blocks along each axis
-
-    Returns
-    -------
-    NDArray[np.int_]
-        Number of blocks needed per axis
-
-    Examples
-    --------
-    >>> get_nblocks((1000, 1000), (256, 256))
-    array([4, 4])
+    Returns (raw_size, padded_size) along the requested axis.
     """
-    return np.ceil(np.array(shape) / blocksize).astype(int)
+    if n_target <= 0:
+        raise ValueError("n_target must be positive")
+
+    alpha = 1.0 + 2.0 * tile_overlap
+
+    if n_target == 1:
+        padded_min = 0
+        padded_max = bsize
+    else:
+        padded_min = int(np.floor((n_target - 1) * bsize / alpha)) + 1
+        padded_max = int(np.floor(n_target * bsize / alpha))
+        if padded_min <= bsize:
+            padded_min = bsize + 1
+
+    if padded_max < padded_min:
+        raise ValueError(f"No padded size range for n_target={n_target}")
+
+    if axis == "y":
+        mapper = _padded_from_raw_y
+    elif axis == "x":
+        mapper = _padded_from_raw_x
+    else:
+        raise ValueError("axis must be 'y' or 'x'")
+
+    raw_upper = max(bsize, padded_max + search_margin)
+    best_raw: int | None = None
+    best_padded: int | None = None
+
+    for raw in range(1, raw_upper + 1):
+        padded = mapper(raw, bsize=bsize)
+        if padded_min <= padded <= padded_max:
+            if best_raw is None or raw > best_raw:
+                best_raw = raw
+                best_padded = padded
+
+    if best_raw is None or best_padded is None:
+        raise ValueError(f"Could not find raw size for n_target={n_target} along axis={axis}")
+
+    return best_raw, best_padded
 
 
-def global_segment_ids(
-    segmentation: NDArray[Any], block_index: tuple[int, ...], nblocks: NDArray[np.int_]
-) -> tuple[NDArray[np.uint32], list[np.uint32]]:
+def solve_internal_xy_for_tiles(
+    ny_target: int,
+    nx_target: int,
+    *,
+    bsize: int = 256,
+    tile_overlap: float = 0.1,
+) -> tuple[int, int]:
     """
-    Generate globally unique segment IDs by encoding block indices.
+    Solve for effective internal (Ly, Lx) that yield desired (ny, nx) tiles.
 
-    Creates unique segment identifiers by packing block indices into the segment IDs.
-    This ensures that segments from different blocks have unique identifiers before
-    the final relabeling step that maps all segments to the range [1..N].
-
-    Parameters
-    ----------
-    segmentation : NDArray
-        Local segmentation array with local segment IDs
-    block_index : tuple of int
-        Multi-dimensional index of this block in the block grid
-    nblocks : NDArray[np.int_]
-        Number of blocks along each axis
-
-    Returns
-    -------
-    tuple[NDArray[np.uint32], list[np.uint32]]
-        Global segmentation array and remapping table
-
-    Notes
-    -----
-    The encoding scheme uses a uint32 split into 5 digits for block ID and
-    5 digits for local segment ID. This limits the system to:
-    - Maximum 42,950 blocks total
-    - Maximum 99,999 segments per block
-
-    The background label (0) is preserved across all blocks.
+    The returned Ly/Lx correspond to the dimensions seen by Cellpose's tiler
+    after padding and any diameter rescaling. This is exactly the geometry
+    that run_net operates on.
     """
-    unique, unique_inverse = np.unique(segmentation, return_inverse=True)
-    p = str(np.ravel_multi_index(block_index, nblocks))
-    remap = [np.uint32(p + str(x).zfill(5)) for x in unique]
-    if unique[0] == 0:
-        remap[0] = np.uint32(0)  # 0 should just always be 0
-    segmentation = np.array(remap)[unique_inverse.reshape(segmentation.shape)]
-    return segmentation, remap
+    if ny_target <= 0 or nx_target <= 0:
+        raise ValueError("ny_target and nx_target must be positive")
 
-
-def block_faces(segmentation: NDArray[Any]) -> list[NDArray[Any]]:
-    """
-    Extract block faces along all axes for boundary matching.
-
-    Extracts the faces (boundary slices) of a segmented block along each axis.
-    These faces are used to identify segments that cross block boundaries
-    and need to be merged during the final stitching step.
-
-    Parameters
-    ----------
-    segmentation : NDArray
-        Segmented block array
-
-    Returns
-    -------
-    list[NDArray]
-        List of face arrays, two per axis (start and end faces)
-
-    Notes
-    -----
-    For a 3D block, this returns 6 faces: left/right, front/back, top/bottom.
-    Face matching is essential for identifying segments that span multiple blocks.
-    """
-    faces = []
-    for iii in range(segmentation.ndim):
-        a = [
-            slice(None),
-        ] * segmentation.ndim
-        a[iii] = slice(0, 1)
-        faces.append(segmentation[tuple(a)])
-        a = [
-            slice(None),
-        ] * segmentation.ndim
-        a[iii] = slice(-1, None)
-        faces.append(segmentation[tuple(a)])
-    return faces
+    Ly_raw, _ = _find_raw_for_target_tiles(
+        ny_target,
+        bsize=bsize,
+        tile_overlap=tile_overlap,
+        axis="y",
+    )
+    Lx_raw, _ = _find_raw_for_target_tiles(
+        nx_target,
+        bsize=bsize,
+        tile_overlap=tile_overlap,
+        axis="x",
+    )
+    return Ly_raw, Lx_raw
 
 
 ######################## Distributed Cellpose #################################
@@ -902,7 +830,7 @@ def distributed_eval(
     If running on a workstation, please read the docstring for the
     LocalCluster class defined in this module. That will tell you what to
     put in the cluster_kwargs dictionary. If using the Janelia cluster,
-    please read the docstring for the JaneliaLSFCluster class.
+    please read the docstring for the janeliaLSFCluster class in this module.
 
     Parameters
     ----------
@@ -1007,6 +935,7 @@ def distributed_eval(
 
     overlap = eval_kwargs["diameter"] * 2
     block_indices, block_crops = get_block_crops(input_zarr.shape, blocksize, overlap, mask)
+    assert cluster is not None
 
     def check_block_has_data(crop: tuple[slice, ...], zarr_array: zarr.Array, threshold: int = 0) -> bool:
         """
@@ -1030,10 +959,11 @@ def distributed_eval(
     except Exception as e:
         logger.warning("GPU probe failed: %s", e)
 
+
     offset = 0
     n = None
 
-    path_nonempty = write_path.parent / "nonempty.json"
+    path_nonempty = Path(write_path).parent / "nonempty.json"
     idxs = read_nonempty_cache(path_nonempty, blocksize)
     if idxs is not None:
         logger.info("Loaded cached non-empty block indices (%d entries).", len(idxs))
@@ -1050,6 +980,7 @@ def distributed_eval(
         try:
             with progress_bar(total_tiles) as submit:
                 [fut.add_done_callback(submit) for fut in check_futures]
+
                 non_zero_results = cluster.client.gather(check_futures, errors="raise")
             logger.info("Checked non-zero blocks: %d/%d", total_tiles, total_tiles)
         except Exception as e:
@@ -1076,31 +1007,100 @@ def distributed_eval(
     Path(temporary_directory).mkdir(parents=True, exist_ok=True)
     assert temporary_directory.exists()
     temp_zarr_path = Path(temporary_directory) / "segmentation_unstitched.zarr"
+    checkpoint_path = Path(temporary_directory) / "checkpoint.jsonl"
+    run_config_path = Path(temporary_directory) / "run_config.json"
 
+    # Detect resume vs fresh start
+    is_resume = run_config_path.exists()
+
+    if is_resume:
+        if not temp_zarr_path.exists():
+            raise RuntimeError(f"Cannot resume: temp_zarr missing at {temp_zarr_path}")
+        validate_run_config(
+            run_config_path,
+            model_kwargs,
+            eval_kwargs,
+            blocksize,
+            input_zarr.shape,
+            overlap,
+            preprocessing_steps,
+        )
+        completed_indices = load_checkpoint(checkpoint_path)
+        logger.info(f"Resuming: {len(completed_indices)} of {len(final_block_indices)} blocks already completed")
+    else:
+        save_run_config(
+            run_config_path,
+            model_kwargs,
+            eval_kwargs,
+            blocksize,
+            input_zarr.shape,
+            overlap,
+            preprocessing_steps,
+        )
+        completed_indices = set()
+        logger.info(f"Fresh run - saving config to {run_config_path}")
+
+    # Filter to remaining blocks
+    remaining_block_indices = []
+    remaining_block_crops = []
+    for idx, crop in zip(final_block_indices, final_block_crops):
+        if tuple(idx) not in completed_indices:
+            remaining_block_indices.append(idx)
+            remaining_block_crops.append(crop)
+
+    logger.info(f"Blocks to process: {len(remaining_block_indices)} (skipped {len(completed_indices)} already completed)")
+
+    zarr.config.set({"array.target_shard_size_bytes": "10MB"})
     temp_zarr = zarr.open(
         temp_zarr_path,
-        mode="w",
+        mode="r+" if is_resume else "w",
         shape=output_shape,  # Use 3D shape
         chunks=output_blocksize,  # Use 3D chunks
         dtype=np.uint32,
     )
-    futures = cluster.client.map(
-        process_block,
-        final_block_indices,
-        final_block_crops,
-        input_zarr=input_zarr,
-        preprocessing_steps=preprocessing_steps,
-        model_kwargs=model_kwargs,
-        eval_kwargs=eval_kwargs,
-        blocksize=blocksize,
-        overlap=overlap,
-        output_zarr=temp_zarr,
-        worker_logs_directory=str(worker_logs_dir),
-    )
 
-    with progress_bar(len(final_block_indices)) as submit:
-        [fut.add_done_callback(submit) for fut in futures]
-        results = cluster.client.gather(futures)
+    if not remaining_block_indices:
+        logger.info("All blocks already completed, proceeding to merge")
+    else:
+        futures = cluster.client.map(
+            process_block,
+            remaining_block_indices,
+            remaining_block_crops,
+            input_zarr=input_zarr,
+            preprocessing_steps=preprocessing_steps,
+            model_kwargs=model_kwargs,
+            eval_kwargs=eval_kwargs,
+            blocksize=blocksize,
+            overlap=overlap,
+            output_zarr=temp_zarr,
+            worker_logs_directory=str(worker_logs_dir),
+            checkpoint_path=checkpoint_path,
+        )
+
+        with progress_bar(len(remaining_block_indices)) as submit:
+            [fut.add_done_callback(submit) for fut in futures]
+            cluster.client.gather(futures)
+
+    # Reconstruct faces/boxes from temp_zarr for ALL blocks (handles resume case)
+    logger.info("Computing faces and bounding boxes from temp_zarr...")
+    results = []
+    for block_idx, block_crop in zip(final_block_indices, final_block_crops):
+        # Get the trimmed crop (without overlap)
+        spatial_crop = block_crop[:-1]  # ZYX slices
+        spatial_blocksize = blocksize[:-1]
+        trimmed_crop = []
+        for axis, (slc, bs) in enumerate(zip(spatial_crop, spatial_blocksize)):
+            start = slc.start if slc.start == 0 else slc.start + overlap
+            stop = min(start + bs, slc.stop)
+            trimmed_crop.append(slice(start, stop))
+        trimmed_crop = tuple(trimmed_crop)
+
+        seg_block = temp_zarr[trimmed_crop]
+        faces = block_faces(seg_block)
+        boxes = bounding_boxes_in_global_coordinates(seg_block, trimmed_crop)
+        unique_ids = np.unique(seg_block)
+        box_ids = unique_ids[unique_ids != 0]
+        results.append((faces, boxes, box_ids))
 
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
         cluster.scale(0)
@@ -1122,174 +1122,19 @@ def distributed_eval(
             min_workers=cluster.locals_store["min_workers"],
             max_workers=12,
             ncpus=1,
-            memory="15GB",
-            mem=int(15e9),
+            memory="32GB",
+            mem=int(32e9),
             queue=None,
             job_extra_directives=[],
         )
         cluster.scale(32)
 
     print("Relabeling blocks...")
-    segmentation_da = dask.array.from_zarr(temp_zarr)
-    relabeled = dask.array.map_blocks(
-        lambda block: np.load(new_labeling_path)[block],
-        segmentation_da,
-        dtype=np.uint32,
-        chunks=segmentation_da.chunks,
-    )
-    # Ensure target parent directory exists prior to writing the Zarr store
-    Path(write_path).parent.mkdir(parents=True, exist_ok=True)
-    dask.array.to_zarr(relabeled, write_path, overwrite=True)
+    relabel_and_write(temp_zarr, new_labeling_path, write_path)
 
     print("Merging boxes...")
     merged_boxes = merge_all_boxes(boxes, new_labeling[box_ids])
     return zarr.open(write_path, mode="r"), merged_boxes
-
-
-# ----------------------- component functions ---------------------------------#
-def get_block_crops(
-    shape: tuple[int, ...],
-    blocksize: np.ndarray,
-    overlap: int,
-    mask: NDArray[Any] | None,
-) -> tuple[list[tuple[int, ...]], list[tuple[slice, ...]]]:
-    """Given a voxel grid shape, blocksize, and overlap size, construct
-    tuples of slices for every block; optionally only include blocks
-    that contain foreground in the mask. Returns parallel lists,
-    the block indices and the slice tuples."""
-    blocksize = np.array(blocksize)
-    if mask is not None:
-        ratio = np.array(mask.shape) / shape
-        mask_blocksize = np.round(ratio * blocksize).astype(int)
-
-    indices, crops = [], []
-    nblocks = get_nblocks(shape, blocksize)
-    for index in np.ndindex(*nblocks):
-        start = blocksize * index - overlap
-        stop = start + blocksize + 2 * overlap
-        start = np.maximum(0, start)
-        stop = np.minimum(shape, stop)
-        crop = tuple(slice(x, y) for x, y in zip(start, stop))
-
-        foreground = True
-        if mask is not None:
-            start = mask_blocksize * index
-            stop = start + mask_blocksize
-            stop = np.minimum(mask.shape, stop)
-            mask_crop = tuple(slice(x, y) for x, y in zip(start, stop))
-            if not np.any(mask[mask_crop]):
-                foreground = False
-        if foreground:
-            indices.append(index)
-            crops.append(crop)
-    return indices, crops
-
-
-def determine_merge_relabeling(
-    block_indices: list[tuple[int, ...]],
-    faces: list[list[NDArray[Any]]],
-    used_labels: NDArray[Any],
-) -> NDArray[np.uint32]:
-    """Determine boundary segment mergers, remap all label IDs to merge
-    and put all label IDs in range [1..N] for N global segments found"""
-    faces = adjacent_faces(block_indices, faces)
-    used_labels = used_labels.astype(int)
-    label_range = int(np.max(used_labels))
-
-    label_groups = block_face_adjacency_graph(faces, label_range)
-    new_labeling = scipy.sparse.csgraph.connected_components(label_groups, directed=False)[1]
-    # new_labeling is returned as int32. Loses half range. Potentially a problem.
-    unused_labels = np.ones(label_range + 1, dtype=bool)
-    unused_labels[used_labels] = 0
-    new_labeling[unused_labels] = 0
-    unique, unique_inverse = np.unique(new_labeling, return_inverse=True)
-    new_labeling = np.arange(len(unique), dtype=np.uint32)[unique_inverse]
-    return new_labeling
-
-
-def adjacent_faces(
-    block_indices: list[tuple[int, ...]], faces: list[list[NDArray[Any]]]
-) -> list[NDArray[Any]]:
-    """Find faces which touch and pair them together in new data structure"""
-    face_pairs = []
-    faces_index_lookup = {a: b for a, b in zip(block_indices, faces)}
-    for block_index in block_indices:
-        for ax in range(len(block_index)):
-            neighbor_index = np.array(block_index)
-            neighbor_index[ax] += 1
-            neighbor_index = tuple(neighbor_index)
-            try:
-                a = faces_index_lookup[block_index][2 * ax + 1]
-                b = faces_index_lookup[neighbor_index][2 * ax]
-                face_pairs.append(np.concatenate((a, b), axis=ax))
-            except KeyError:
-                continue
-    return face_pairs
-
-
-def block_face_adjacency_graph(faces: list[NDArray[Any]], nlabels: int):
-    """Shrink labels in face plane, then find which labels touch across the
-    face boundary"""
-    # FIX float parameters
-    # print("Initial nlabels:", nlabels, "Type:", type(nlabels))
-    nlabels = int(nlabels)
-    # print("Final nlabels:", nlabels, "Type:", type(nlabels))
-
-    all_mappings = []
-    structure = scipy.ndimage.generate_binary_structure(3, 1)
-    for face in faces:
-        sl0 = tuple(slice(0, 1) if d == 2 else slice(None) for d in face.shape)
-        sl1 = tuple(slice(1, 2) if d == 2 else slice(None) for d in face.shape)
-        a = shrink_labels(face[sl0], 1.0)
-        b = shrink_labels(face[sl1], 1.0)
-        face = np.concatenate((a, b), axis=np.argmin(a.shape))
-        mapped = dask_image.ndmeasure._utils._label._across_block_label_grouping(face, structure)
-        all_mappings.append(mapped)
-    i, j = np.concatenate(all_mappings, axis=1)
-    v = np.ones_like(i)
-    return scipy.sparse.coo_matrix((v, (i, j)), shape=(nlabels + 1, nlabels + 1)).tocsr()
-
-
-def shrink_labels(plane: NDArray[Any], threshold: float) -> NDArray[Any]:
-    """Shrink labels in plane by some distance from their boundary"""
-    gradmag = np.linalg.norm(np.gradient(plane.squeeze()), axis=0)
-    shrunk_labels = np.copy(plane.squeeze())
-    shrunk_labels[gradmag > 0] = 0
-    distances = scipy.ndimage.distance_transform_edt(shrunk_labels)
-    shrunk_labels[distances <= threshold] = 0
-    return shrunk_labels.reshape(plane.shape)
-
-
-def merge_all_boxes(boxes: list[tuple[slice, ...]], box_ids: NDArray[Any]) -> list[tuple[slice, ...]]:
-    """Merge all boxes that map to the same box_ids"""
-    merged_boxes = []
-    boxes_array = np.array(boxes, dtype=object)
-    # FIX float parameters
-    # print("Box IDs:", box_ids, "Type:", type(box_ids))
-    box_ids = box_ids.astype(int)
-    # print("Box IDs:", box_ids, "Type:", type(box_ids))
-
-    for iii in np.unique(box_ids):
-        merge_indices = np.argwhere(box_ids == iii).squeeze()
-        if merge_indices.shape:
-            merged_box = merge_boxes(boxes_array[merge_indices])
-        else:
-            merged_box = boxes_array[merge_indices]
-        merged_boxes.append(merged_box)
-    return merged_boxes
-
-
-def merge_boxes(boxes: NDArray[Any]) -> tuple[slice, ...]:
-    """Take union of two or more parallelpipeds"""
-    box_union = boxes[0]
-    for iii in range(1, len(boxes)):
-        local_union = []
-        for s1, s2 in zip(box_union, boxes[iii]):
-            start = min(s1.start, s2.start)
-            stop = max(s1.stop, s2.stop)
-            local_union.append(slice(start, stop))
-        box_union = tuple(local_union)
-    return box_union
 
 
 app = typer.Typer(pretty_exceptions_show_locals=False)
@@ -1315,6 +1160,14 @@ def main(
     ),
     n_workers: int | None = typer.Option(
         None, help="For LocalCUDACluster: number of workers (defaults to #GPUs)"
+    ),
+    target_ny: int | None = typer.Option(
+        None,
+        help="Desired internal Cellpose ny tiles (SAM backend only; overrides default 4).",
+    ),
+    target_nx: int | None = typer.Option(
+        None,
+        help="Desired internal Cellpose nx tiles (SAM backend only; overrides default 6).",
     ),
 ) -> None:
     """
@@ -1385,9 +1238,15 @@ def main(
 
     zarr_output_path = base_dir / f"output_segmentation-{backend}.zarr"
     temporary_directory = base_dir / "cellpose_temp"
+
+    # Clear temp directory if --overwrite is set (forces fresh start, no resume)
+    if overwrite and temporary_directory.exists():
+        logger.info(f"--overwrite: removing existing temp directory {temporary_directory}")
+        shutil.rmtree(temporary_directory)
+
     (base_dir / "segmentation.done").unlink(missing_ok=True)
-    # Optional: ortho aggregation weights (XY, YZ, ZX). Pass-through without validation here.
-    ortho_weights = config.get("ortho_weights", [1.5, 1.0, 1.0])
+    ortho_weights = config.get("ortho_weights", [4, 1.0, 1.0])
+    diameter = config.get("diameter", 25)
     cellpose_model_kwargs = {
         "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
         "gpu": True,
@@ -1400,7 +1259,7 @@ def main(
 
     # Dask Cluster Configuration (always GPU-backed)
     local_cluster_kwargs = {
-        "workers_per_gpu": int(10 if backend == "unet" else workers_per_gpu),
+        "workers_per_gpu": int(8 if backend == "unet" else workers_per_gpu),
         "threads_per_worker": int(threads_per_worker),
     }
     if use_localcuda and workers_per_gpu <= 1:
@@ -1444,12 +1303,26 @@ def main(
             len(channels_list),
         )  # ZYXc tuned for UNet
     else:
+        # Determine effective internal tiling size for SAM backend.
+        ny_target = target_ny if target_ny is not None else 2
+        nx_target = target_nx if target_nx is not None else 6
+        Ly_internal, Lx_internal = solve_internal_xy_for_tiles(
+            ny_target,
+            nx_target,
+            bsize=256,
+            tile_overlap=0.1,
+        )
+        # Map internal (post-diameter-rescale) back to raw block size.
+        scale_back = float(diameter) / 30.0
+        by = int(Ly_internal * scale_back)
+        bx = int(Lx_internal * scale_back)
         processing_blocksize = (
             input_zarr_array.shape[0],
-            256,
-            1024,
+            by,
+            bx,
             len(channels_list),
         )  # ZYXc tuned for SAM
+        logger.info(f"SAM backend: target tiles (ny={ny_target}, nx={nx_target}) → internal size ({Ly_internal}x{Lx_internal}) → blocksize ({by}x{bx})")
     normalization_path = base_dir / "normalization.json"
     normalization = read_normalization_cache(normalization_path)
     if normalization is not None:
@@ -1488,15 +1361,15 @@ def main(
 
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
-        "diameter": config.get("diameter", 30),  # MUST BE INT
-        "batch_size": 2,
+        "diameter": config.get("diameter", 25),  # MUST BE INT
+        "batch_size": 16 if backend == "unet" else 4,
         "normalize": normalization,
-        "flow_threshold": 0,  # Useless in 3D
-        "cellprob_threshold": -0.5,  # Default is 0.0, adjust if needed
+        "flow_threshold": 0,  # Ignored in 3D
+        "cellprob_threshold": 0,  # Default is 0.0, adjust if needed
         "anisotropy": 2.0,
         "resample": False,
-        "flow3D_smooth": 3,
-        "niter": 2000,
+        "flow3D_smooth": 0.5,
+        "niter": 1000,
         "do_3D": True,
         "min_size": 200,
         "channel_axis": 3,

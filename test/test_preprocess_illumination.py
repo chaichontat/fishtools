@@ -14,6 +14,7 @@ from fishtools.preprocess.illumination import (
     tile_origin,
 )
 from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.utils.zarr_utils import default_zarr_codecs
 
 
 @pytest.fixture(autouse=True)
@@ -27,7 +28,13 @@ def _write_field_store_tcyx(path: Path, low: np.ndarray, rng: np.ndarray, channe
     low = low.astype(np.float32)
     rng = rng.astype(np.float32)
     arr = np.stack([low, rng], axis=0)
-    za = zarr.open_array(str(path), mode="w", shape=arr.shape, dtype="f4")
+    za = zarr.open_array(
+        str(path),
+        mode="w",
+        shape=arr.shape,
+        dtype="f4",
+        codecs=default_zarr_codecs(),
+    )
     za[...] = arr
     za.attrs["axes"] = "TCYX"
     za.attrs["t_labels"] = ["low", "range"]

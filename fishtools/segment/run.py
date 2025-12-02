@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import pickle
 import shutil
+import warnings
 from pathlib import Path
 from typing import Literal
 
@@ -18,6 +19,8 @@ from skimage.measure import regionprops_table
 
 from fishtools.io.workspace import Workspace
 from fishtools.segment.train import plan_path_for_device
+
+# warnings.filterwarnings('error')
 
 TIFF_COMPRESSION = 22610
 
@@ -49,13 +52,17 @@ class RunConfig(BaseModel):
         default=False,
         description="Persist raw network flows (dP + cell probabilities) alongside masks.",
     )
+    ortho_model_path: Path | None = Field(
+        default=None,
+        description="Optional UNet orthogonal-view model to supply when using the UNet backend.",
+    )
     ortho_weights: tuple[float, float, float] | None = Field(
         default=None,
         description="Optional weights applied to the (XY, YZ, ZX) passes when aggregating Cellpose 3D flows.",
     )
 
     @model_validator(mode="after")
-    def _validate_config(self) -> "RunConfig":
+    def _validate_config(self) -> RunConfig:
         # Semantic validation: channels must be distinct and non-negative
         num_channels = len(self.channels)
         if num_channels < 2:
@@ -80,6 +87,9 @@ class RunConfig(BaseModel):
                 raise ValueError("ortho_weights must be non-negative.")
             if all(weight == 0 for weight in self.ortho_weights):
                 raise ValueError("At least one ortho weight must be positive.")
+
+        if self.ortho_model_path is not None and not self.ortho_model_path.is_file():
+            raise ValueError(f"ortho_model_path {self.ortho_model_path} does not exist or is not a file.")
 
         # Path validation: output_dir cannot be an existing file
         if self.output_dir is not None and self.output_dir.is_file():
@@ -143,8 +153,6 @@ def _discover_workspace_rois(volume_path: Path) -> tuple[Workspace, list[str]]:
 
 def _find_trt_plan(model_path: Path) -> tuple[Path, str] | None:
     """Return the TensorRT plan path paired with the raw device name, if available."""
-    import datetime
-
     import torch
 
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
@@ -181,18 +189,18 @@ def _cellpose(model, image: np.ndarray, *, config: RunConfig):
         image,
         channel_axis=1,
         normalize=normalization,
-        batch_size=4,
-        anisotropy=2,
+        batch_size=2,
+        anisotropy=4,
         flow_threshold=0.4,
-        cellprob_threshold=-1.0,
-        flow3D_smooth=3,
-        ortho_weights=config.ortho_weights,
-        niter=2000,
+        cellprob_threshold=0,
+        flow3D_smooth=2,
+        niter=1000,
         # stitch_threshold=0.24,
-        diameter=60,
+        diameter=50,
         do_3D=True,
+        # ortho_weights=config.ortho_weights,
         # bsize=224,
-        augment=True,
+        # augment=True,
         **({"channels": config.channels} if backend == "unet" else {"z_axis": 0}),
     )
 
@@ -208,21 +216,25 @@ def _build_label_metadata(
     """Generate per-label metadata including flow-error QC metrics."""
 
     if masks.size == 0:
-        return pl.DataFrame({
-            "label": pl.Series([], dtype=pl.UInt32),
-            "flow_error": pl.Series([], dtype=pl.Float32),
-            "voxel_count": pl.Series([], dtype=pl.UInt64),
-        })
+        return pl.DataFrame(
+            {
+                "label": pl.Series([], dtype=pl.UInt32),
+                "flow_error": pl.Series([], dtype=pl.Float32),
+                "voxel_count": pl.Series([], dtype=pl.UInt64),
+            }
+        )
 
     mask_int = np.asarray(masks, dtype=np.int32)
     props_dict = regionprops_table(mask_int, properties=("label", "area", "bbox", "centroid"))
     props_df = pl.DataFrame(props_dict)
     if props_df.is_empty():
-        return pl.DataFrame({
-            "label": pl.Series([], dtype=pl.UInt32),
-            "flow_error": pl.Series([], dtype=pl.Float32),
-            "voxel_count": pl.Series([], dtype=pl.UInt64),
-        })
+        return pl.DataFrame(
+            {
+                "label": pl.Series([], dtype=pl.UInt32),
+                "flow_error": pl.Series([], dtype=pl.Float32),
+                "voxel_count": pl.Series([], dtype=pl.UInt64),
+            }
+        )
 
     props_df = props_df.with_columns(
         pl.col("label").cast(pl.UInt32),
@@ -235,18 +247,21 @@ def _build_label_metadata(
     elif use_gpu and torch.backends.mps.is_available():
         device = torch.device("mps")
 
-    flow_errors, dP_masks = dynamics.flow_error(mask_int, np.asarray(flow_field), device=device)
-    del dP_masks
+    # flow_errors, dP_masks = dynamics.flow_error(mask_int, np.asarray(flow_field), device=device)
+    # del dP_masks
 
-    labels = props_df.select("label").to_numpy().ravel()
-    flow_df = pl.DataFrame({
-        "label": pl.Series(np.arange(1, flow_errors.size + 1, dtype=np.uint32)),
-        "flow_error": pl.Series(flow_errors.astype(np.float32)),
-    }).filter(pl.col("label").is_in(labels.astype(np.uint32)))
+    # labels = props_df.select("label").to_numpy().ravel()
+    # flow_df = pl.DataFrame(
+    #     {
+    #         "label": pl.Series(np.arange(1, flow_errors.size + 1, dtype=np.uint32)),
+    #         "flow_error": pl.Series(flow_errors.astype(np.float32)),
+    #     }
+    # ).filter(pl.col("label").is_in(labels.astype(np.uint32)))
 
-    metadata = props_df.join(flow_df, on="label", how="left").sort("label")
+    # .join(flow_df, on="label", how="left").sort("label")
+    metadata = props_df
 
-    primary = ["label", "voxel_count", "flow_error"]
+    primary = ["label"]
     other_cols = [col for col in metadata.columns if col not in primary]
     return metadata.select([*(c for c in primary if c in metadata.columns), *other_cols])
 
@@ -261,6 +276,7 @@ def run(
     overwrite: bool = False,
     normalize: str = "1.0,99.0",
     save_flows: bool = False,
+    ortho_model: Path | None = None,
     ortho_weights: str | None = None,
     backend: str = "sam",
 ):
@@ -282,34 +298,41 @@ def run(
         normalize_percentiles=normalize_tuple,
         channels=channels_tuple,
         save_flows=save_flows,
+        ortho_model_path=ortho_model,
         ortho_weights=ortho_tuple,
     )
 
     logger.info(f"Segment run configuration: {config.model_dump()}")
 
     img = tifffile.imread(volume)
-    ortho_kwargs: dict[str, object] = (
-        {"pretrained_model_ortho": "/working/cellpose-training/models/embryonicortho"}
-        if config.backend == "unet"
-        else {}
-    )
 
     if config.backend == "sam":
-        from cellpose.contrib.packed_infer import (
-            PackedCellposeModel as TorchModel,
-        )
-        from cellpose.contrib.packed_infer import (
-            PackedCellposeModelTRT as TRTModel,
-        )
-    else:
-        from cellpose.contrib.packed_infer import (
-            PackedCellposeUNetModel as TorchModel,
-        )
-        from cellpose.contrib.packed_infer import (
-            PackedCellposeUNetModelTRT as TRTModel,
-        )
+        # from cellpose.contrib.cellposetrt import CellposeModelTRT as TRTModel
 
+        from cellpose.contrib.packed_infer import PackedCellposeModel as TorchModel
+        from cellpose.contrib.packed_infer import PackedCellposeModelTRT as TRTModel
+    else:
+        from cellpose.contrib.packed_infer import CellposeUNetModel as TorchModel
+        from cellpose.contrib.packed_infer import CellposeUNetModelTRT as TRTModel
+
+    # Auto-detect TRT plan for main model
     plan_selection = _find_trt_plan(config.model_path)
+
+    # Auto-detect TRT plan for ortho model if provided
+    ortho_plan_path = None
+    if config.ortho_model_path is not None:
+        ortho_plan_selection = _find_trt_plan(config.ortho_model_path)
+        if ortho_plan_selection is not None:
+            ortho_plan_path, ortho_device_name = ortho_plan_selection
+            logger.info(
+                f"Using TensorRT plan {ortho_plan_path.name} for ortho model on CUDA device '{ortho_device_name}'."
+            )
+        else:
+            raise FileNotFoundError(
+                f"TensorRT plan not found for ortho model at {config.ortho_model_path}. "
+                f"When using TensorRT for the main model, ortho model must also have a TRT plan built."
+            )
+
     if plan_selection is not None:
         plan_path, device_name = plan_selection
         plan_mtime = plan_path.stat().st_mtime
@@ -318,10 +341,23 @@ def run(
             f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}' "
             f"(backend={config.backend}, mtime={plan_time_local})."
         )
-        cellpose_model = TRTModel(gpu=config.use_gpu, pretrained_model=str(plan_path))
+        # Use TRT plan for ortho if found, otherwise fall back to PyTorch model
+        ortho_kwargs = {}
+        if ortho_plan_path is not None:
+            ortho_kwargs["pretrained_model_ortho"] = str(ortho_plan_path)
+        elif config.ortho_model_path is not None:
+            ortho_kwargs["pretrained_model_ortho"] = str(config.ortho_model_path)
+
+        trt_kwargs = {"gpu": config.use_gpu, "pretrained_model": str(plan_path), **ortho_kwargs}
+        cellpose_model = TRTModel(**trt_kwargs)
 
     else:
         logger.info("TensorRT plan not found; falling back to Torch for backend=%s.", config.backend)
+        # For PyTorch fallback, use the original model path (not TRT plan)
+        ortho_kwargs = {}
+        if config.ortho_model_path is not None:
+            ortho_kwargs["pretrained_model_ortho"] = str(config.ortho_model_path)
+
         cellpose_model = TorchModel(
             gpu=config.use_gpu,
             pretrained_model=str(model),
@@ -335,6 +371,7 @@ def run(
             "channels": list(config.channels),
             "anisotropy": config.anisotropy,
             "normalize_percentiles": list(config.normalize_percentiles),
+            "ortho_model_path": str(config.ortho_model_path) if config.ortho_model_path else None,
             "ortho_weights": list(config.ortho_weights) if config.ortho_weights is not None else None,
         },
     }
@@ -370,6 +407,3 @@ def run(
         logger.info(f"Saved flows to {flow_path}")
 
     logger.info(f"Wrote masks to {mask_path}")
-    roi_count = len(discovered_rois)
-    plural = "ROI" if roi_count == 1 else "ROIs"
-    logger.info(f"Discovered {roi_count} {plural} in workspace {workspace.path}")

@@ -42,6 +42,7 @@ from fishtools.io.workspace import Workspace, safe_imwrite
 from fishtools.utils.logging import setup_logging
 from fishtools.utils.pretty_print import progress_bar
 from fishtools.utils.threading import shared_thread_pool
+from fishtools.utils.zarr_utils import default_zarr_codecs
 
 setup_logging()
 
@@ -588,6 +589,8 @@ def _write_fused_corrected_zyxc(
     else:
         dest_chunks = None
 
+    zarr.config.set({"array.target_shard_size_bytes": "10MB"})
+
     t0_open = perf_counter()
     dest = zarr.open_array(
         partial_dest_path,
@@ -595,6 +598,7 @@ def _write_fused_corrected_zyxc(
         shape=(len(z_sel), y_dim, x_dim, len(channels)),
         chunks=dest_chunks,
         dtype=np.uint16,
+        codecs=default_zarr_codecs(),
     )
     logger.info(
         "Opened destination Zarr (partial create) at {path} with shape {shape} (took {dt:.2f}s)",
@@ -611,6 +615,7 @@ def _write_fused_corrected_zyxc(
             shape=(len(z_sel), y_dim, x_dim, len(channels)),
             chunks=dest_chunks,
             dtype=np.float32,
+            codecs=default_zarr_codecs(),
         )
         logger.info(
             "Opened float32 debug Zarr at {path} with shape {shape} (took {dt:.2f}s)",

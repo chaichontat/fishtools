@@ -29,6 +29,7 @@ large-scale datasets through efficient memory management and parallelization.
 
 import json
 import shutil
+import subprocess
 from collections.abc import Iterable
 from itertools import chain
 from pathlib import Path
@@ -47,11 +48,7 @@ from fishtools.io.workspace import Workspace, safe_imwrite
 from fishtools.preprocess.config import StitchingConfig
 from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.downsample import gpu_downsample_xy
-from fishtools.preprocess.illumination import (
-    parse_tile_index_from_path,
-    resolve_roi_for_field,
-    tile_origin,
-)
+from fishtools.preprocess.illumination import parse_tile_index_from_path, resolve_roi_for_field, tile_origin
 from fishtools.preprocess.imagej import run_imagej as _run_imagej
 from fishtools.preprocess.imageops import clip_range_for_dtype as clip_range_for_dtype_lib
 from fishtools.preprocess.imageops import crop_xy as crop_xy_lib
@@ -64,7 +61,10 @@ from fishtools.utils.tiff import compose_metadata as compose_meta
 from fishtools.utils.tiff import normalize_channel_names as norm_names
 from fishtools.utils.tiff import read_metadata_from_tif
 from fishtools.utils.utils import add_file_context, batch_roi
-from fishtools.utils.zarr_utils import numpy_array_to_zarr as _numpy_array_to_zarr
+from fishtools.utils.zarr_utils import default_zarr_codecs, numpy_array_to_zarr as _numpy_array_to_zarr
+
+# Expose subprocess for tests that monkeypatch cli_stitch.subprocess.run
+_subprocess_run_for_tests = subprocess.run
 
 """Lazy N4 workflow import (CuPy/SimpleITK heavy).
 
@@ -597,7 +597,6 @@ def register(
                     downsample=1,
                     max_proj=False,  # already max proj
                     sc=sc,
-                    debug=debug,
                 )
 
     elif max_proj or idx is not None:
@@ -614,7 +613,6 @@ def register(
                     idx=idx,
                     max_proj=max_proj,
                     sc=sc,
-                    debug=debug,
                 )
 
     if overwrite or not (out_path / "TileConfiguration.registered.txt").exists():
@@ -1216,7 +1214,6 @@ def fuse(
                     sc=sc,
                     workspace_root=ws.path,
                     roi_for_ws=roi,
-                    debug=debug,
                     field_zarr=field_zarr,
                 )
 
@@ -1351,23 +1348,15 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
         logger.info(f"Writing to {zarr_path.resolve()}")
         # Define chunks: chunk along Z=1, use user chunk_size for Y/X, full chunk for C
         zarr_chunks = (1, chunk_size, chunk_size, cs)
-        try:
-            z_array = zarr.create_array(
-                zarr_path,
-                shape=final_shape,
-                chunks=zarr_chunks,
-                dtype=dtype,
-                overwrite=True,
-            )
-        except AttributeError:
-            # New zarr API
-            z_array = zarr.open_array(
-                zarr_path,
-                mode="w",
-                shape=final_shape,
-                chunks=zarr_chunks,
-                dtype=dtype,
-            )
+        zarr.config.set({"array.target_shard_size_bytes": "10MB"})
+        z_array = zarr.open_array(
+            zarr_path,
+            mode="w",
+            shape=final_shape,
+            chunks=zarr_chunks,
+            dtype=dtype,
+            codecs=default_zarr_codecs(),
+        )
 
         # Create thumbnail directory
         thumbnail_dir = stitched_dir / "thumbnails"

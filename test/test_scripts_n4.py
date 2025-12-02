@@ -22,6 +22,7 @@ if "cucim.skimage.filters" not in sys.modules:
     sys.modules["cucim.skimage.filters"] = cucim_filters
 
 from fishtools.preprocess import n4
+from fishtools.utils.zarr_utils import default_zarr_codecs
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -34,6 +35,7 @@ def _create_fused_store(path: Path, data: np.ndarray) -> None:
         shape=data.shape,
         chunks=(1, y_dim, x_dim, 1),
         dtype=data.dtype,
+        codecs=default_zarr_codecs(),
     )
     store[...] = data
 

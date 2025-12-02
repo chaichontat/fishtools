@@ -5,7 +5,8 @@ import polars as pl
 import pytest
 from click.testing import CliRunner
 
-from test._cellpose_stub import ensure_cellpose_stub
+from _cellpose_stub import ensure_cellpose_stub
+from fishtools.utils.zarr_utils import default_zarr_codecs
 
 
 def _make_polygons():
@@ -127,7 +128,12 @@ def _write_segmentation(ws: Path, roi: str, seg_cb: str, data: np.ndarray) -> Pa
     seg_dir = ws / "analysis/deconv" / f"stitch--{roi}+{seg_cb}"
     seg_dir.mkdir(parents=True, exist_ok=True)
     arr = zarr.open_array(
-        str(seg_dir / "output_segmentation.zarr"), mode="w", shape=data.shape, dtype=data.dtype, chunks=data.shape
+        str(seg_dir / "output_segmentation.zarr"),
+        mode="w",
+        shape=data.shape,
+        dtype=data.dtype,
+        chunks=data.shape,
+        codecs=default_zarr_codecs(),
     )
     arr[:] = data
     return seg_dir

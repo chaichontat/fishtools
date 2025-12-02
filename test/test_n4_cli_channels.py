@@ -3,15 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
-import pytest
 import numpy as np
+import pytest
 import zarr
 from typer.testing import CliRunner
 
 from fishtools.preprocess import n4
+from fishtools.utils.zarr_utils import default_zarr_codecs
 
 
 pytestmark = pytest.mark.timeout(30)
+
 
 def _make_fused(workspace: Path, roi: str, codebook: str, shape=(1, 8, 8, 3), names=None) -> Path:
     stitch_dir = workspace / f"analysis/deconv/stitch--{roi}+{codebook}"
@@ -22,6 +24,7 @@ def _make_fused(workspace: Path, roi: str, codebook: str, shape=(1, 8, 8, 3), na
         shape=shape,
         chunks=(1, shape[1], shape[2], 1),
         dtype=np.uint16,
+        codecs=default_zarr_codecs(),
     )
     store[...] = 100
     if names is not None:
