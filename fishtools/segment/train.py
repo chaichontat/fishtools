@@ -339,6 +339,7 @@ def build_trt_engine(
     device: torch.device,
     batch_size: int = 1,
     backend: Literal["sam", "unet"] = "sam",
+    opset: int = 22,
 ) -> Path:
     device_name_raw = torch.cuda.get_device_name(device)
     base_name = model_path.name
@@ -355,7 +356,7 @@ def build_trt_engine(
         str(onnx_path),
         batch_size=batch_size,
         bsize=bsize,
-        opset=20,
+        opset=opset,
         backend=backend,
     )
     trt_build.build_engine(

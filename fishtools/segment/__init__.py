@@ -225,7 +225,13 @@ def run_command(
     show_default=True,
     help="Segmentation backend to export (UNet uses a 2-channel input).",
 )
-def trt_build_cmd(model: Path, batch_size: int, backend: str) -> None:
+@click.option(
+    "--opset",
+    default=22,
+    show_default=True,
+    help="ONNX opset version to target during export.",
+)
+def trt_build_cmd(model: Path, batch_size: int, backend: str, opset:int) -> None:
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA GPU is required to build a TensorRT engine.")
 
@@ -238,6 +244,7 @@ def trt_build_cmd(model: Path, batch_size: int, backend: str) -> None:
         bsize=bsize,
         batch_size=batch_size,
         backend=backend,
+        opset=opset
     )
     click.echo(f"Saved TensorRT engine to {plan_path}")
 
