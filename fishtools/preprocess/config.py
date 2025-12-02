@@ -5,7 +5,7 @@ from typing import Annotated, Any, Literal
 
 import numpy as np
 from loguru import logger
-from pydantic import BaseModel, Field, PlainSerializer, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
 
 DATA = Path("/working/fishtools/data")
 
@@ -99,8 +99,7 @@ class Fiducial(BaseModel):
 
 
 class RegisterConfig(BaseModel):
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     fiducial: Fiducial
     downsample: int = Field(default=1, description="Downsample factor")

@@ -1,5 +1,6 @@
 import re
 from collections.abc import Iterable
+from hashlib import md5
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Literal, Pattern, Sequence, cast
@@ -65,6 +66,14 @@ def _cleanup_model_artifacts(model_path: Path) -> None:
         onnx_file.unlink(missing_ok=True)
 
 
+def _compute_model_md5(model_path: Path) -> str:
+    hasher = md5(usedforsecurity=False)
+    with model_path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 class TrainConfig(BaseModel):
     name: str
     base_model: str | None
@@ -97,6 +106,7 @@ class TrainConfig(BaseModel):
     pack_k: int = 2
     pack_guard: int = 16
     pack_stripe_height: int | None = 81
+    model_md5: str | None = None
 
 
 def _filter_images_by_patterns(
@@ -469,7 +479,7 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     return model_path, train_losses, test_losses
 
 
-def run_train(name: str, path: Path, train_config: TrainConfig):
+def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
     log_destination = setup_workspace_logging(
         workspace=path,
         component="segment.train",
@@ -710,8 +720,11 @@ def run_train(name: str, path: Path, train_config: TrainConfig):
             f" include={train_config.include}, exclude={train_config.exclude}"
         )
 
-    _model_path, train_losses, _test_losses = _train(filtered, path, train_config=train_config, name=name)
+    model_path, train_losses, _test_losses = _train(filtered, path, train_config=train_config, name=name)
+
+    model_md5 = _compute_model_md5(model_path)
+    logger.info(f"Model MD5 checksum (md5sum {model_path.name}) = {model_md5}")
 
     normalized_train_losses = train_losses.tolist() if hasattr(train_losses, "tolist") else list(train_losses)
 
-    return train_config.model_copy(update=dict(train_losses=normalized_train_losses))
+    return train_config.model_copy(update={"train_losses": normalized_train_losses, "model_md5": model_md5})

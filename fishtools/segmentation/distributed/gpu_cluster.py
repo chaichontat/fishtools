@@ -11,13 +11,60 @@ Expose a context-managed cluster wrapper `myGPUCluster` with `.client` and
 
 from __future__ import annotations
 
+import functools
+import getpass
 import os
+import pathlib
 import subprocess
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
+import dask
+import distributed
+import yaml
 from dask.distributed import Client
 
-DEFAULT_WORKER_MEMORY = "16GB"
+DEFAULT_WORKER_MEMORY = "32GB"
+DEFAULT_CONFIG_FILENAME = "distributed_cellpose_dask_config.yaml"
+
+
+# ----------------------- config stuff ----------------------------------------#
+def _config_path(config_name: str) -> str:
+    return str(pathlib.Path.home()) + "/.config/dask/" + config_name
+
+
+def _modify_dask_config(
+    config: dict[str, Any],
+    config_name: str = DEFAULT_CONFIG_FILENAME,
+) -> None:
+    # Default: significantly quiet Dask/distributed logging so worker/scheduler
+    # noise does not obscure application-level exceptions. Users can override
+    # these levels by providing their own "logging" section in ``config``.
+    logging_defaults: dict[str, Any] = {
+        "logging": {
+            "distributed": "error",
+            "distributed.scheduler": "error",
+            # Hide worker chatter entirely (including warnings) by raising
+            # its threshold to CRITICAL.
+            "distributed.worker": "critical",
+            "distributed.nanny": "error",
+            "distributed.worker_state_machine": "critical",
+        }
+    }
+    merged_config: dict[str, Any] = {**logging_defaults, **config}
+    dask.config.set(merged_config)
+    cfg_path = Path(_config_path(config_name))
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg_path, "w") as f:
+        yaml.dump(dask.config.config, f, default_flow_style=False)
+
+
+def _remove_config_file(
+    config_name: str = DEFAULT_CONFIG_FILENAME,
+) -> None:
+    config_path = _config_path(config_name)
+    if os.path.exists(config_path):
+        os.remove(config_path)
 
 
 def _auto_device_tokens() -> list[str]:
@@ -69,6 +116,10 @@ def _build_worker_spec(*, devices: list[str], workers_per_gpu: int, threads_per_
 def _start_speccluster(*, workers_per_gpu: int, threads_per_worker: int) -> tuple[Client, str | None]:
     from distributed import Scheduler
     from distributed.deploy.spec import SpecCluster
+
+    # Ensure dask config (including logging defaults) is written so that
+    # scheduler and worker processes inherit the quieter logging setup.
+    _modify_dask_config({}, DEFAULT_CONFIG_FILENAME)
 
     devices = _visible_devices()
     if not devices:
@@ -155,4 +206,112 @@ class myGPUCluster:
             if self._client is not None:
                 self._client.close()
         finally:
+            # Clean up transient dask config used for logging control.
+            _remove_config_file(DEFAULT_CONFIG_FILENAME)
             self._client = None
+
+
+# ----------------------- CPU LocalCluster ------------------------------------#
+class myLocalCluster(distributed.LocalCluster):
+    """
+    This is a thin wrapper extending dask.distributed.LocalCluster to set
+    configs before the cluster or workers are initialized.
+
+    For a list of full arguments (how to specify your worker resources) see:
+    https://distributed.dask.org/en/latest/api.html#distributed.LocalCluster
+    You need to know how many cpu cores and how much RAM your machine has.
+
+    Most users will only need to specify:
+    n_workers
+    ncpus (number of physical cpu cores per worker)
+    memory_limit (which is the limit per worker, should be a string like '16GB')
+    threads_per_worker (for most workflows this should be 1)
+
+    You can also modify any dask configuration option through the
+    config argument.
+
+    If your workstation has a GPU, one of the workers will have exclusive
+    access to it by default. That worker will be much faster than the others.
+    You may want to consider creating only one worker (which will have access
+    to the GPU) and letting that worker process all blocks serially.
+    """
+
+    def __init__(
+        self,
+        ncpus: int,
+        config: dict[str, Any] | None = None,
+        config_name: str = DEFAULT_CONFIG_FILENAME,
+        persist_config: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        # config
+        self.config_name = config_name
+        self.persist_config = persist_config
+        scratch_dir = f"{os.getcwd()}/"
+        scratch_dir += f".{getpass.getuser()}_distributed_cellpose/"
+        config_defaults = {"temporary-directory": scratch_dir}
+        if config is None:
+            config = {}
+        config = {**config_defaults, **config}
+        _modify_dask_config(config, config_name)
+
+        # construct
+        if "host" not in kwargs:
+            kwargs["host"] = ""
+        super().__init__(**kwargs)
+        self.client = distributed.Client(self)
+
+        # set environment variables for workers (threading)
+        environment_vars = {
+            "MKL_NUM_THREADS": str(2 * ncpus),
+            "NUM_MKL_THREADS": str(2 * ncpus),
+            "OPENBLAS_NUM_THREADS": str(2 * ncpus),
+            "OPENMP_NUM_THREADS": str(2 * ncpus),
+            "OMP_NUM_THREADS": str(2 * ncpus),
+        }
+
+        def set_environment_vars():
+            for k, v in environment_vars.items():
+                os.environ[k] = v
+
+        self.client.run(set_environment_vars)
+
+        print("Cluster dashboard link: ", self.dashboard_link)
+
+    def __enter__(self) -> "myLocalCluster":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        if not self.persist_config:
+            _remove_config_file(self.config_name)
+        self.client.close()
+        super().__exit__(exc_type, exc_value, traceback)
+
+
+# ----------------------- decorator -------------------------------------------#
+def cluster(func: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    This decorator ensures a function will run inside a cluster
+    as a context manager. The decorated function, "func", must
+    accept "cluster" and "cluster_kwargs" as parameters. If
+    "cluster" is not None then the user has provided an existing
+    cluster and we just run func. If "cluster" is None then
+    "cluster_kwargs" are used to construct a new cluster, and
+    the function is run inside that cluster context.
+    """
+
+    @functools.wraps(func)
+    def create_or_pass_cluster(*args: Any, **kwargs: Any) -> Any:
+        # TODO: this only checks if args are explicitly present in function call
+        #       it does not check if they are set correctly in any way
+        assert "cluster" in kwargs or "cluster_kwargs" in kwargs, (
+            "Either cluster or cluster_kwargs must be defined"
+        )
+        if not "cluster" in kwargs:
+            ck = dict(kwargs.get("cluster_kwargs", {}) or {})
+            with myGPUCluster(**ck) as cluster:
+                kwargs["cluster"] = cluster
+                return func(*args, **kwargs)
+        return func(*args, **kwargs)
+
+    return create_or_pass_cluster

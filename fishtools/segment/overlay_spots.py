@@ -25,11 +25,6 @@ from skimage import measure
 from skimage.measure import regionprops
 from skimage.measure._regionprops import RegionProperties
 
-from fishtools.analysis.labelimage import (
-    isotropic_label_closing,
-    isotropic_label_dilation,
-    isotropic_label_opening,
-)
 from fishtools.io.workspace import Workspace
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.logging import setup_cli_logging
@@ -56,31 +51,6 @@ def load_segmentation_slice(segmentation_zarr_path: Path, idx: int) -> np.ndarra
     except Exception as e:
         logger.error(f"Slice {idx}: Failed to load segmentation Zarr slice: {e}")
         raise
-
-
-def apply_morphological_smoothing(
-    img: np.ndarray,
-    opening_radius: float,
-    closing_radius: float,
-    dilation_radius: float,
-    idx: int,
-) -> np.ndarray:
-    """Applies morphological smoothing operations to the segmentation mask."""
-    logger.info(
-        f"Slice {idx}: Applying morphological smoothing (open={opening_radius}, close={closing_radius}, dilate={dilation_radius})."
-    )
-    try:
-        opened_mask = isotropic_label_opening(img, radius=opening_radius)
-        closed_mask = isotropic_label_closing(opened_mask, radius=closing_radius)
-        if dilation_radius > 0:
-            smoothed_img = isotropic_label_dilation(closed_mask, radius=dilation_radius)
-        else:
-            smoothed_img = closed_mask
-        logger.info(f"Slice {idx}: Smoothing complete.")
-        return smoothed_img
-    except Exception as e:
-        logger.error(f"Slice {idx}: Error during smoothing: {e}. Returning original image.")
-        return img
 
 
 def calculate_coordinate_offsets(
@@ -512,10 +482,6 @@ def process_slice(
     spots_parquet_path: Path,
     tile_config_path: Path | None,
     output_dir: Path,
-    apply_smoothing: bool,
-    opening_radius: float,
-    closing_radius: float,
-    dilation_radius: float,
     overwrite: bool,
     debug: bool,
     max_proj: bool = False,
@@ -529,9 +495,6 @@ def process_slice(
 
     try:
         img = load_segmentation_slice(segmentation_zarr_path, idx)
-
-        if apply_smoothing:
-            img = apply_morphological_smoothing(img, opening_radius, closing_radius, dilation_radius, idx)
 
         x_offset, y_offset = 0.0, 0.0
         if tile_config_path:
@@ -638,9 +601,6 @@ def run_(
     spots: Path,
     tile_config_path: Path,
     idx: int,
-    opening_radius: float,
-    closing_radius: float,
-    dilation_radius: float,
     overwrite: bool,
     debug: bool,
     max_proj: bool = False,
@@ -687,10 +647,6 @@ def run_(
             spots_parquet_path=spots_path,
             tile_config_path=tile_config_path,
             output_dir=output_chunk_dir,
-            apply_smoothing=False,
-            opening_radius=opening_radius,
-            closing_radius=closing_radius,
-            dilation_radius=dilation_radius,
             overwrite=overwrite,
             debug=debug,
             max_proj=max_proj,
@@ -738,22 +694,9 @@ def initialize() -> None:
 @click.option(
     "--segmentation-name",
     type=str,
-    default="output_segmentation.zarr",
+    default="output_segmentation-sam.zarr",
     show_default=True,
     help="Relative path to the segmentation Zarr store within the input directory.",
-)
-@click.option(
-    "--opening-radius", type=float, default=4.0, show_default=True, help="Radius for morphological opening."
-)
-@click.option(
-    "--closing-radius", type=float, default=6.0, show_default=True, help="Radius for morphological closing."
-)
-@click.option(
-    "--dilation-radius",
-    type=float,
-    default=2.0,
-    show_default=True,
-    help="Radius for final dilation (0 to disable).",
 )
 @click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing output files.")
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging and generate debug plots.")
@@ -764,9 +707,6 @@ def overlay(
     spots_opt: Path | None,
     seg_codebook: str | None,
     segmentation_name: str,
-    opening_radius: float,
-    closing_radius: float,
-    dilation_radius: float,
     overwrite: bool,
     debug: bool,
 ) -> None:
@@ -842,9 +782,6 @@ def overlay(
                             spots,
                             ws.tileconfig_dir(current_roi) / "TileConfiguration.registered.txt",
                             i,
-                            opening_radius,
-                            closing_radius,
-                            dilation_radius,
                             overwrite,
                             debug,
                             max_proj=z.shape[0] == 1,

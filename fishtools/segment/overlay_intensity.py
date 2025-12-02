@@ -17,10 +17,7 @@ from fishtools.io.workspace import Workspace
 # Share the exact same region detection primitives used by
 # `segment overlay spots` to keep behavior identical up to the
 # intersection step.
-from fishtools.segment.overlay_spots import (
-    extract_polygons_from_mask,
-    load_segmentation_slice,
-)
+from fishtools.segment.overlay_spots import extract_polygons_from_mask, load_segmentation_slice
 from fishtools.segment.utils import (
     StitchPaths,
     compute_regionprops_table,
@@ -202,7 +199,7 @@ def _run_overlay_for_roi(
 @click.option(
     "--segmentation-name",
     type=str,
-    default="output_segmentation.zarr",
+    default="output_segmentation-sam.zarr",
     show_default=True,
     help="Relative path to the segmentation Zarr within the stitched ROI directory.",
 )

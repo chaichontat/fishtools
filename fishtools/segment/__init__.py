@@ -170,6 +170,11 @@ def distill_command(path: Path, outdir: str) -> None:
     show_default=True,
     help="Segmentation backend to use.",
 )
+@click.option(
+    "--ortho-model",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
+    help="Path to an orthogonal-view UNet checkpoint; applies when --backend unet.",
+)
 def run_command(
     volume: Path,
     model_path: Path,
@@ -179,6 +184,8 @@ def run_command(
     overwrite: bool,
     normalize_percentiles: str,
     save_flows: bool,
+    ortho_model: Optional[Path],
+    *,
     ortho_weights: Optional[str],
     backend: str,
 ) -> None:
@@ -193,6 +200,7 @@ def run_command(
         overwrite=overwrite,
         normalize=normalize_percentiles,
         save_flows=save_flows,
+        ortho_model=ortho_model,
         ortho_weights=ortho_weights,
         backend=backend,
     )
@@ -484,15 +492,6 @@ def overlay() -> None:
     help="Relative segmentation Zarr path within the ROI directory.",
 )
 @click.option(
-    "--opening-radius", default=4.0, show_default=True, type=float, help="Radius for morphological opening."
-)
-@click.option(
-    "--closing-radius", default=6.0, show_default=True, type=float, help="Radius for morphological closing."
-)
-@click.option(
-    "--dilation-radius", default=2.0, show_default=True, type=float, help="Radius for final dilation."
-)
-@click.option(
     "--overwrite/--no-overwrite",
     default=False,
     show_default=True,
@@ -508,25 +507,22 @@ def overlay_spots(
     seg_codebook: Optional[str],
     spots_opt: Optional[Path],
     segmentation_name: str,
-    opening_radius: float,
-    closing_radius: float,
-    dilation_radius: float,
     overwrite: bool,
     debug: bool,
 ) -> None:
     current_roi = roi if roi is not None else "*"
     from fishtools.segment.overlay_spots import overlay as overlay_impl
 
-    overlay_impl(
+    # Call the underlying callback function instead of the Click/RichCommand wrapper.
+    # `overlay_impl` is a Click command object; invoking it directly would route
+    # positional arguments through `RichCommand.main`, causing the TypeError you saw.
+    overlay_impl.callback(
         path,
         current_roi,
         codebook,
         spots_opt,
         seg_codebook,
         segmentation_name,
-        opening_radius,
-        closing_radius,
-        dilation_radius,
         overwrite,
         debug,
     )

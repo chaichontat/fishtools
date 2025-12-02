@@ -19,6 +19,7 @@ from skimage.measure import regionprops_table
 
 from fishtools.io.workspace import Workspace
 from fishtools.segment.train import plan_path_for_device
+from fishtools.utils.logging import setup_cli_logging
 
 # warnings.filterwarnings('error')
 
@@ -186,19 +187,19 @@ def _cellpose(model, image: np.ndarray, *, config: RunConfig):
     }
 
     masks, flows, styles = model.eval(
-        image,
+        image,#[:, :, :400, :1386],
         channel_axis=1,
         normalize=normalization,
         batch_size=2,
         anisotropy=4,
         flow_threshold=0.4,
-        cellprob_threshold=0,
-        flow3D_smooth=2,
-        niter=1000,
+        cellprob_threshold=0.5,
+        flow3D_smooth=0.5,
+        niter=2000,
         # stitch_threshold=0.24,
         diameter=50,
         do_3D=True,
-        # ortho_weights=config.ortho_weights,
+        ortho_weights=config.ortho_weights,
         # bsize=224,
         # augment=True,
         **({"channels": config.channels} if backend == "unet" else {"z_axis": 0}),
@@ -279,10 +280,22 @@ def run(
     ortho_model: Path | None = None,
     ortho_weights: str | None = None,
     backend: str = "sam",
+    debug_3d_slices: bool = False,
+    debug_3d_tag: str | None = None,
 ):
     backend_normalized = backend.lower()
     if backend_normalized not in {"sam", "unet"}:
         raise click.BadParameter(f"Unsupported backend {backend!r}; choose 'sam' or 'unet'.")
+
+    setup_cli_logging(
+        volume,
+        component="segment.run",
+        file="segment-run",
+        extra={
+            "backend": backend_normalized,
+            "volume": volume.name,
+        },
+    )
 
     channels_tuple = tuple(map(int, channels.split(",")))
     normalize_tuple = tuple(map(float, normalize.split(",")))
@@ -352,7 +365,7 @@ def run(
         cellpose_model = TRTModel(**trt_kwargs)
 
     else:
-        logger.info("TensorRT plan not found; falling back to Torch for backend=%s.", config.backend)
+        logger.info(f"TensorRT plan not found; falling back to Torch for backend={config.backend}.")
         # For PyTorch fallback, use the original model path (not TRT plan)
         ortho_kwargs = {}
         if config.ortho_model_path is not None:

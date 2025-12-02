@@ -385,7 +385,7 @@ def _build_anndata(counts_by_gene: pl.DataFrame, cells: pl.DataFrame) -> "anndat
     n_genes = adata.n_vars
     percent_top = _percent_top_tuple(n_genes)
     sc.pp.calculate_qc_metrics(adata, inplace=True, percent_top=percent_top)
-    sc.pp.filter_cells(adata, min_counts=30)
+    # sc.pp.filter_cells(adata, min_counts=30)
     sc.pp.filter_cells(adata, max_counts=1200)
     sc.pp.filter_genes(adata, min_cells=10)
     if adata.n_obs == 0 or adata.n_vars == 0:
