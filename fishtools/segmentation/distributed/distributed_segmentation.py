@@ -12,6 +12,7 @@ from typing import Annotated, Any, cast
 import cellpose.io
 import dask_jobqueue
 import distributed
+from distributed import WorkerPlugin
 import imagecodecs
 import numpy as np
 import tifffile
@@ -55,12 +56,46 @@ logging.getLogger("cellpose").setLevel(logging.WARNING)
 
 logger = logging.getLogger("rich")
 
-# Per-worker cache for PackedCellpose models (keyed by backend and model path).
-_MODEL_CACHE: dict[tuple[str, str], Any] = {}
-
 # Per-worker initialization flag to avoid repeated setup overhead.
 _WORKER_INITIALIZED: bool = False
 _WORKER_LOGS_DIR: str | None = None
+
+
+class CellposeModelPlugin(WorkerPlugin):
+    """Plugin to initialize and cache CellPose model once per worker.
+
+    Uses the officially documented pattern of storing state on worker attributes
+    (get_worker().my_attribute) rather than get_worker().data which is reserved
+    for Dask's internal memory management.
+
+    References:
+    - https://distributed.dask.org/en/latest/plugins.html
+    - https://stackoverflow.com/questions/58126830/
+    """
+
+    name = "cellpose-model-cache"
+
+    def __init__(self, model_kwargs: dict[str, Any]):
+        self.model_kwargs = model_kwargs
+
+    def setup(self, worker):
+        """Initialize model when worker starts. Stores on worker.cellpose_model."""
+        if hasattr(worker, "cellpose_model"):
+            logger.info(f"Worker {worker.name}: Model already initialized, skipping")
+            return
+
+        backend = self.model_kwargs.get("backend", "sam")
+        logger.info(f"Worker {worker.name}: Initializing CellPose model (backend={backend})")
+        model = _build_packed_cellpose_model(self.model_kwargs)
+        worker.cellpose_model = model
+        worker.cellpose_model_kwargs = self.model_kwargs
+        logger.info(f"Worker {worker.name}: Model cached on worker.cellpose_model")
+
+    def teardown(self, worker):
+        """Clean up model when worker shuts down."""
+        if hasattr(worker, "cellpose_model"):
+            del worker.cellpose_model
+            logger.info(f"Worker {worker.name}: Cleared cellpose_model")
 
 
 ######################## Checkpoint/Resume Functions ###########################
@@ -611,6 +646,24 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
     return base_cls(**resolved_kwargs)
 
 
+def _get_cached_model(model_kwargs: dict[str, Any]):
+    """Get model from worker attribute, building if necessary (fallback).
+
+    Uses Dask's documented pattern of storing state on worker.my_attribute.
+    Falls back to building the model if the CellposeModelPlugin wasn't registered.
+    """
+    worker = distributed.get_worker()
+
+    if hasattr(worker, "cellpose_model"):
+        return worker.cellpose_model
+
+    # Fallback: build and cache (handles case where plugin wasn't registered)
+    logger.warning(f"Worker {worker.name}: Model not cached, building fresh")
+    model = _build_packed_cellpose_model(model_kwargs)
+    worker.cellpose_model = model
+    return model
+
+
 def read_preprocess_and_segment(
     input_zarr: zarr.Array,
     crop: tuple[slice, ...],
@@ -679,7 +732,7 @@ def read_preprocess_and_segment(
         log_file = pathlib.Path(worker_logs_directory).joinpath(log_file)
     cellpose.io.logger_setup(stdout_file_replacement=log_file)
 
-    model = _build_packed_cellpose_model(model_kwargs)
+    model = _get_cached_model(model_kwargs)
     backend = model_kwargs.get("backend", "sam")
     filtered_eval_kwargs = dict(eval_kwargs)
     if backend == "unet":
@@ -1062,6 +1115,10 @@ def distributed_eval(
     if not remaining_block_indices:
         logger.info("All blocks already completed, proceeding to merge")
     else:
+        # Register plugin to cache model on workers (initialized once per worker)
+        plugin = CellposeModelPlugin(model_kwargs)
+        cluster.client.register_plugin(plugin)
+
         futures = cluster.client.map(
             process_block,
             remaining_block_indices,
@@ -1105,13 +1162,21 @@ def distributed_eval(
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
         cluster.scale(0)
 
-    faces, boxes_, box_ids_ = list(zip(*results))
-    boxes = [box for sublist in boxes_ for box in sublist]
-    box_ids = np.concatenate(box_ids_).astype(int)  # unsure how but without cast these are float64
+    # Filter to non-empty blocks only
+    faces_list, boxes_list, box_ids_list, non_empty_indices = [], [], [], []
+    for i, (faces, boxes, box_ids) in enumerate(results):
+        if len(box_ids) > 0:
+            faces_list.append(faces)
+            boxes_list.append(boxes)
+            box_ids_list.append(box_ids)
+            non_empty_indices.append(final_block_indices[i])
+
+    boxes = [box for sublist in boxes_list for box in sublist]
+    box_ids = np.concatenate(box_ids_list).astype(int)  # unsure how but without cast these are float64
 
     print(f"Box IDs: {len(box_ids)}")
     new_labeling = determine_merge_relabeling(
-        [(bi[0], bi[1], bi[2]) for bi in final_block_indices], faces, box_ids
+        [(bi[0], bi[1], bi[2]) for bi in non_empty_indices], faces_list, box_ids
     )
     new_labeling_path = Path(temporary_directory) / "new_labeling.npy"
     np.save(new_labeling_path, new_labeling)
