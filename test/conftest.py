@@ -203,27 +203,33 @@ if "cupy" not in sys.modules:
     cupyx_scipy.sparse = cupyx_scipy_sparse
     cupyx.scipy = cupyx_scipy
 
-if "cucim" not in sys.modules:
-    cucim = types.ModuleType("cucim")
-    cucim_skimage = types.ModuleType("cucim.skimage")
-    cucim_transform = types.ModuleType("cucim.skimage.transform")
-    cucim_transform.downscale_local_mean = _skimage_downscale_local_mean
+# Try to import real cucim first; only stub if unavailable
+try:
+    import cucim  # noqa: F401
+    import cucim.skimage.filters  # noqa: F401
+    import cucim.skimage.transform  # noqa: F401
+except ImportError:
+    if "cucim" not in sys.modules:
+        cucim = types.ModuleType("cucim")
+        cucim_skimage = types.ModuleType("cucim.skimage")
+        cucim_transform = types.ModuleType("cucim.skimage.transform")
+        cucim_transform.downscale_local_mean = _skimage_downscale_local_mean
 
-    cucim_filters = types.ModuleType("cucim.skimage.filters")
+        cucim_filters = types.ModuleType("cucim.skimage.filters")
 
-    def _cucim_unimplemented(*_args: object, **_kwargs: object) -> None:  # pragma: no cover - GPU stub
-        raise RuntimeError("cucim stub invoked during tests; GPU-specific path not supported.")
+        def _cucim_unimplemented(*_args: object, **_kwargs: object) -> None:  # pragma: no cover - GPU stub
+            raise RuntimeError("cucim stub invoked during tests; GPU-specific path not supported.")
 
-    cucim_filters.unsharp_mask = _cucim_unimplemented  # type: ignore[attr-defined]
+        cucim_filters.unsharp_mask = _cucim_unimplemented  # type: ignore[attr-defined]
 
-    sys.modules["cucim"] = cucim
-    sys.modules["cucim.skimage"] = cucim_skimage
-    sys.modules["cucim.skimage.transform"] = cucim_transform
-    sys.modules["cucim.skimage.filters"] = cucim_filters
+        sys.modules["cucim"] = cucim
+        sys.modules["cucim.skimage"] = cucim_skimage
+        sys.modules["cucim.skimage.transform"] = cucim_transform
+        sys.modules["cucim.skimage.filters"] = cucim_filters
 
-    cucim.skimage = cucim_skimage
-    cucim_skimage.transform = cucim_transform
-    cucim_skimage.filters = cucim_filters
+        cucim.skimage = cucim_skimage
+        cucim_skimage.transform = cucim_transform
+        cucim_skimage.filters = cucim_filters
 
     class _CudaRuntime(types.SimpleNamespace):
         @staticmethod
@@ -287,9 +293,7 @@ if "cucim" not in sys.modules:
                 Event=_CudaEvent,
                 get_current_stream=_get_current_stream,
                 get_elapsed_time=_get_elapsed_time,
-                nvtx=types.SimpleNamespace(
-                    RangePush=lambda *_args, **_kwargs: None, RangePop=lambda: None
-                ),
+                nvtx=types.SimpleNamespace(RangePush=lambda *_args, **_kwargs: None, RangePop=lambda: None),
             ),
         )
 

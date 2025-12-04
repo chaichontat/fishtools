@@ -40,11 +40,12 @@ Key Design Decisions
    - Final relabeling via dask.array.map_blocks
 
 4. **Overlap sizing for Gaussian smoothing**
-   Gaussian smoothing with sigma=4 has effective radius ~4*sigma = 16 voxels.
-   With 10% overlap on 2048×2048 XY blocks (~205px) and 50px margin crop, the
-   core region still sits well inside the chunk boundary, comfortably beyond
-   16px. This ensures Gaussian voting at the core boundary has essentially
-   identical context from neighboring chunks.
+   Gaussian smoothing with per-axis sigma has effective radius ~4*max(sigma) voxels.
+   With default sigma=(1,2,2), the radius is ~8 voxels. With 10% overlap on
+   2048×2048 XY blocks (~205px) and 50px margin crop, the core region still sits
+   well inside the chunk boundary, comfortably beyond 8px. This ensures Gaussian
+   voting at the core boundary has essentially identical context from neighboring
+   chunks.
 
 5. **Small cell donation at boundaries**
    Small cells near chunk boundaries might have their best neighbor in another
@@ -84,17 +85,17 @@ Usage
 CLI:
     python -m fishtools.segmentation.distributed.distributed_postproc \\
         /path/to/segmentation.zarr \\
-        --blocksize 512 --sigma 4.0 --v-min 8000
+        --blocksize 512 --sigma \"1,2,2\" --v-min 8000
 
 Programmatic:
     from fishtools.segmentation.distributed.distributed_postproc import distributed_postproc
-    result = distributed_postproc(input_zarr, write_path, sigma=4.0, V_min=8000, ...)
+    result = distributed_postproc(input_zarr, write_path, sigma=(1, 2, 2), V_min=8000, ...)
 """
 
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Union, Tuple
 
 import dask
 import dask.array
@@ -119,6 +120,24 @@ from fishtools.segmentation.distributed.merge_utils import (
 
 logging.basicConfig(level="INFO", handlers=[RichHandler(level="INFO")])
 logger = logging.getLogger("rich")
+
+
+def _parse_sigma_option(val: str) -> Union[float, Tuple[float, float, float]]:
+    """
+    Parse --sigma value as either a scalar or a Z,Y,X triple.
+
+    Examples:
+    - "4" or "4.0" -> 4.0
+    - "2,1.5,1.5" or "2 1.5 1.5" -> (2.0, 1.5, 1.5)
+    """
+    s = val.strip().replace(" ", ",")
+    parts = [p for p in s.split(",") if p]
+    if len(parts) == 1:
+        return float(parts[0])
+    if len(parts) == 3:
+        z, y, x = (float(p) for p in parts)
+        return (z, y, x)
+    raise typer.BadParameter("sigma must be a number or a 'z,y,x' triple")
 
 
 def process_postproc_block(
@@ -213,7 +232,13 @@ def process_postproc_block(
         in_place=True,
     )
 
-    logger.info(f"Block {block_index}: {int(masks.max())} labels after postproc")
+    if V_min > 0:
+        # After donation, only labels with volume >= V_min remain.
+        n_labels = int(np.count_nonzero(volumes >= V_min))
+    else:
+        # No donation happened; all non-zero volumes remain as labels.
+        n_labels = int(np.count_nonzero(volumes > 0))
+    logger.info(f"Block {block_index}: {n_labels} labels after postproc")
 
     # 3. Remove overlaps to match distributed_segmentation behavior
     masks_cropped, crop_trimmed = remove_overlaps(
@@ -268,7 +293,7 @@ def distributed_postproc(
     write_path: Path | str,
     blocksize: tuple[int, ...] | None = None,
     margin: int = 100,
-    sigma: float = 4.0,
+    sigma: float | tuple[float, float, float] = (1.0, 2.0, 2.0),
     V_min: int = 8000,
     bg_scale: float = 1.0,
     max_expansion: int = 1,
@@ -456,10 +481,10 @@ def main(
     input_path: Path = typer.Argument(..., help="Path to input segmentation zarr"),
     output_path: Path = typer.Option(None, help="Output path (default: input_postproc.zarr)"),
     blocksize: int = typer.Option(1024, help="XY block size for tiled processing"),
-    sigma: float = typer.Option(4.0, help="Gaussian smoothing sigma"),
-    v_min: int = typer.Option(3000, help="Minimum volume threshold for small cell donation"),
+    sigma: str = typer.Option("1,2,2", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
+    v_min: int = typer.Option(2000, help="Minimum volume threshold for small cell donation"),
     margin: int = typer.Option(50, help="Margin parameter (overlap = 2*margin for overlap removal)"),
-    workers_per_gpu: int = typer.Option(2, help="Workers per GPU"),
+    workers_per_gpu: int = typer.Option(4, help="Workers per GPU"),
 ) -> None:
     """
     Post-process 3D segmentation masks with Gaussian smoothing and small cell donation.
@@ -474,12 +499,14 @@ def main(
         "threads_per_worker": 1,
     }
 
+    sigma_val = _parse_sigma_option(sigma)
+
     distributed_postproc(
         input_zarr=input_zarr,
         write_path=output_path,
         blocksize=(input_zarr.shape[0], blocksize, blocksize),
         margin=margin,
-        sigma=sigma,
+        sigma=sigma_val,
         V_min=v_min,
         input_path=input_path,
         cluster_kwargs=cluster_kwargs,

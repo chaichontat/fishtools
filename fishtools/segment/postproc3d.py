@@ -16,7 +16,11 @@ Phase 1: Gaussian Smooth Labels (`gaussian_smooth_labels`, `gaussian_smooth_labe
     on label boundaries while preserving discrete identities.
 
     Key parameters:
-    - sigma: Gaussian standard deviation. Features smaller than ~sigma are smoothed away.
+    - sigma: Gaussian standard deviation in voxel units. Can be a scalar
+      (isotropic smoothing) or a 3-tuple ``(sigma_z, sigma_y, sigma_x)``
+      matching the ``(Z, Y, X)`` array axes. Features smaller than the
+      corresponding sigma along each axis are smoothed away. The default
+      is anisotropic ``(1.5, 3.0, 3.0)`` in ZYX order.
     - bg_scale: Multiplicative factor on background scores (values <1 favor expansion).
     - max_expansion: Limits how far labels can expand beyond original foreground.
 
@@ -89,18 +93,50 @@ Performance Notes
 """
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
-from numba import njit  # type: ignore[import]
+from numba import njit, prange  # type: ignore[import]
 
 try:  # Provided by kernprof/line_profiler when profiling
     profile  # type: ignore[name-defined]
 except NameError:  # pragma: no cover - fallback when not profiling
+
     def profile(func):
         return func
 
 
 NUMBA_MAX_LABELS_FOR_CONTACT = 10000
+
+
+def _normalize_sigma_zyx(sigma: float | Sequence[float]) -> tuple[float, float, float]:
+    """
+    Normalize a sigma specification to a 3-tuple in ZYX order.
+
+    Parameters
+    ----------
+    sigma
+        Either a scalar (isotropic smoothing) or a sequence of three
+        values ``(sigma_z, sigma_y, sigma_x)`` matching the
+        ``(Z, Y, X)`` axes of the masks.
+
+    Returns
+    -------
+    tuple[float, float, float]
+        Normalized per-axis sigmas in ZYX order.
+    """
+    if isinstance(sigma, (int, float)):
+        v = float(sigma)
+        return (v, v, v)
+
+    if not isinstance(sigma, Sequence):
+        raise TypeError("sigma must be a float or a sequence of three floats (sigma_z, sigma_y, sigma_x)")
+
+    if len(sigma) != 3:
+        raise ValueError("sigma sequence must have length 3 in ZYX order (sigma_z, sigma_y, sigma_x)")
+
+    sz, sy, sx = (float(s) for s in sigma)
+    return (sz, sy, sx)
 
 
 @njit(cache=True, nogil=True, parallel=True)  # pragma: no cover - exercised via runtime profiling
@@ -129,9 +165,9 @@ def _contact_matrix_numba(masks: np.ndarray, max_label: int) -> np.ndarray:
         zmax = Z - dz
         ymax = Y - dy
         xmax = X - dx
-        for z in range(zmax):
-            for y in range(ymax):
-                for x in range(xmax):
+        for z in prange(zmax):
+            for y in prange(ymax):
+                for x in prange(xmax):
                     a = masks[z, y, x]
                     b = masks[z + dz, y + dy, x + dx]
                     if a > 0 and b > 0 and a != b:
@@ -199,8 +235,9 @@ def compute_metadata_and_adjacency(
         # Caller only requested volumes; adjacency/contact_areas stay empty.
         return volumes, adjacency, contact_areas
 
-    # Get unique labels (excluding background 0) and count them
-    unique_labels = np.unique(masks)
+    # Get unique labels (excluding background 0) from volumes array
+    # This is O(K) vs O(N log N) for np.unique on the full volume
+    unique_labels = np.nonzero(volumes)[0]
     unique_labels = unique_labels[unique_labels != 0]
     n_labels = len(unique_labels)
 
@@ -259,7 +296,6 @@ def compute_metadata_and_adjacency(
             contact_areas[orig_k][orig_neighbor] = v
 
     return volumes, adjacency, contact_areas
-
 
 
 @profile
@@ -336,9 +372,7 @@ def donate_small_cells(
         # This prevents small↔small donation cycles where fragments swap
         # labels without being truly removed.
         neighbors_k = {
-            int(label)
-            for label in neighbors_k
-            if label > 0 and label != k and volumes[int(label)] >= V_min
+            int(label) for label in neighbors_k if label > 0 and label != k and volumes[int(label)] >= V_min
         }
 
         if not neighbors_k:
@@ -544,9 +578,9 @@ def smooth_masks_3d(
         second_label = other_max  # The other label (valid when exactly_one_other)
 
         two_label_interface = (
-            fg &  # current voxel is labeled
-            exactly_one_other &  # exactly one other label (not Case C)
-            ((n_self_flip + n_other) >= min_labeled_for_flip)  # edge guard
+            fg  # current voxel is labeled
+            & exactly_one_other  # exactly one other label (not Case C)
+            & ((n_self_flip + n_other) >= min_labeled_for_flip)  # edge guard
         )
         flip_mask = two_label_interface & (n_other > n_self_flip + interface_margin)
 
@@ -679,9 +713,7 @@ def opening_correct_protrusions(
                 (0, 0, -1),
                 (0, 0, 1),
             ]:
-                shifted = padded[
-                    1 + dz : 1 + dz + sz, 1 + dy : 1 + dy + sy, 1 + dx : 1 + dx + sx
-                ]
+                shifted = padded[1 + dz : 1 + dz + sz, 1 + dy : 1 + dy + sy, 1 + dx : 1 + dx + sx]
                 neighbors.append(shifted[comp_mask])
 
             all_neighbors = np.concatenate(neighbors)
@@ -715,7 +747,7 @@ def opening_correct_protrusions(
 
 def gaussian_smooth_labels(
     masks: np.ndarray,
-    sigma: float = 1.5,
+    sigma: float | Sequence[float] = (1.5, 3.0, 3.0),
     in_place: bool = True,
     bg_scale: float = 1.0,
     max_expansion: int = 2,
@@ -732,9 +764,13 @@ def gaussian_smooth_labels(
     ----------
     masks : np.ndarray
         3D integer label array, background = 0.
-    sigma : float
-        Gaussian sigma. Larger values = more smoothing. Features smaller
-        than ~sigma will be removed/smoothed. Typical range: 1-3.
+    sigma : float or sequence of float, optional
+        Gaussian sigma in voxel units. Larger values = more smoothing.
+        If a scalar is provided, smoothing is isotropic. If a sequence
+        of length 3 is provided, it is interpreted as
+        ``(sigma_z, sigma_y, sigma_x)`` matching the ``(Z, Y, X)`` axes.
+        Features smaller than ~sigma along each axis will be removed/
+        smoothed. Default is ``(1.5, 3.0, 3.0)``. Typical scalar range: 1-3.
     in_place : bool
         Modify masks in place or return copy.
     max_expansion : int
@@ -756,13 +792,19 @@ def gaussian_smooth_labels(
     if max_label == 0:
         return masks_out
 
+    # Normalize sigma to ZYX per-axis form and derive a conservative
+    # spatial margin from the largest sigma so the Gaussian kernel
+    # support is fully contained in the expanded bounding boxes.
+    sigma_zyx = _normalize_sigma_zyx(sigma)
+    sigma_max = max(sigma_zyx)
+    if sigma_max <= 0:
+        raise ValueError("sigma must be positive (all components > 0)")
+
     # Compute dilated constraint mask to prevent labels from expanding too far
     original_foreground = masks_out > 0
     if max_expansion > 0:
         struct = np.ones((3, 3, 3), dtype=bool)
-        dilated_constraint = binary_dilation(
-            original_foreground, structure=struct, iterations=max_expansion
-        )
+        dilated_constraint = binary_dilation(original_foreground, structure=struct, iterations=max_expansion)
     else:
         dilated_constraint = original_foreground
 
@@ -775,15 +817,16 @@ def gaussian_smooth_labels(
 
     # Background: full volume convolution
     bg_indicator = (masks_out == 0).astype(np.float32)
-    bg_score = gaussian_filter(bg_indicator, sigma)
+    bg_score = gaussian_filter(bg_indicator, sigma_zyx)
     if bg_scale != 1.0:
         bg_score *= float(bg_scale)
     update = bg_score > best_score
     result[update] = 0
     best_score[update] = bg_score[update]
 
-    # Gaussian extends ~4σ effectively
-    margin = int(np.ceil(4 * sigma))
+    # Gaussian extends ~4σ effectively along each axis; use the largest
+    # sigma to derive a scalar margin for bounding box expansion.
+    margin = int(np.ceil(4 * sigma_max))
 
     for k in range(1, max_label + 1):
         if slices_list[k - 1] is None:
@@ -799,7 +842,7 @@ def gaussian_smooth_labels(
         # Local indicator and Gaussian convolution
         local_mask = masks_out[exp_slices]
         local_indicator = (local_mask == k).astype(np.float32)
-        local_score = gaussian_filter(local_indicator, sigma)
+        local_score = gaussian_filter(local_indicator, sigma_zyx)
 
         # Update where this label wins
         local_best = best_score[exp_slices]
@@ -820,7 +863,7 @@ def gaussian_smooth_labels(
 
 def gaussian_smooth_labels_cupy(
     masks: np.ndarray,
-    sigma: float = 1.5,
+    sigma: float | Sequence[float] = (1.5, 3.0, 3.0),
     in_place: bool = True,
     bg_scale: float = 1.0,
     max_expansion: int = 2,
@@ -837,8 +880,11 @@ def gaussian_smooth_labels_cupy(
     ----------
     masks : np.ndarray
         3D integer label array, background = 0.
-    sigma : float
-        Gaussian sigma. Larger values = more smoothing.
+    sigma : float or sequence of float, optional
+        Gaussian sigma in voxel units. Larger values = more smoothing.
+        If a scalar is provided, smoothing is isotropic. If a sequence
+        of length 3 is provided, it is interpreted as
+        ``(sigma_z, sigma_y, sigma_x)`` matching the ``(Z, Y, X)`` axes.
     in_place : bool
         If True, write results back into ``masks``; otherwise return
         a new array.
@@ -872,6 +918,14 @@ def gaussian_smooth_labels_cupy(
     if max_label == 0:
         return masks_host
 
+    # Normalize sigma to ZYX per-axis form and derive a conservative
+    # spatial margin from the largest sigma so the Gaussian kernel
+    # support is fully contained in the expanded bounding boxes.
+    sigma_zyx = _normalize_sigma_zyx(sigma)
+    sigma_max = max(sigma_zyx)
+    if sigma_max <= 0:
+        raise ValueError("sigma must be positive (all components > 0)")
+
     # Compute bounding boxes on CPU (cheap O(N) pass).
     slices_list = find_objects(masks_host)
 
@@ -884,9 +938,7 @@ def gaussian_smooth_labels_cupy(
         struct = cp.ones((3, 3, 3), dtype=bool)
         dilated_constraint = original_foreground
         for _ in range(max_expansion):
-            dilated_constraint = cp_binary_dilation(
-                dilated_constraint, structure=struct, iterations=1
-            )
+            dilated_constraint = cp_binary_dilation(dilated_constraint, structure=struct, iterations=1)
     else:
         dilated_constraint = original_foreground
 
@@ -896,15 +948,16 @@ def gaussian_smooth_labels_cupy(
 
     # Background: full volume convolution on device
     bg_indicator = (masks_dev == 0).astype(cp.float32)
-    bg_score = cp_gaussian_filter(bg_indicator, sigma)
+    bg_score = cp_gaussian_filter(bg_indicator, sigma_zyx)
     if bg_scale != 1.0:
         bg_score *= float(bg_scale)
     update = bg_score > best_score
     result[update] = 0
     best_score[update] = bg_score[update]
 
-    # Gaussian extends ~4σ effectively
-    margin = int(math.ceil(4.0 * sigma))
+    # Gaussian extends ~4σ effectively along each axis; use the largest
+    # sigma to derive a scalar margin for bounding box expansion.
+    margin = int(math.ceil(4.0 * sigma_max))
 
     for k in range(1, max_label + 1):
         sl = slices_list[k - 1] if k - 1 < len(slices_list) else None
@@ -924,7 +977,7 @@ def gaussian_smooth_labels_cupy(
         if not cp.any(local_indicator):
             continue
 
-        local_score = cp_gaussian_filter(local_indicator, sigma)
+        local_score = cp_gaussian_filter(local_indicator, sigma_zyx)
 
         # Update where this label wins
         local_best = best_score[exp_slices]

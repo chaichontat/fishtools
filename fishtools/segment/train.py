@@ -81,7 +81,7 @@ class TrainConfig(BaseModel):
     backend: Literal["sam", "unet"] = "sam"
     channels: tuple[int, int]
     training_paths: list[str]
-    diameter: float | None = 50  # target rescale diameter (px) for SAM training; if None, infer per-image
+    diameter: float | None = 60  # target rescale diameter (px) for SAM training; if None, infer per-image
     # Optional explicit test set roots. Accepts a single string or list of strings
     # using the same semantics as `training_paths` (relative to training root,
     # may point to files or directories; image directories are discovered by
@@ -103,9 +103,9 @@ class TrainConfig(BaseModel):
     use_te: bool = False
     te_fp8: bool = False
     packed: bool = False
-    pack_k: int = 2
+    pack_k: int = 3
     pack_guard: int = 16
-    pack_stripe_height: int | None = 81
+    pack_stripe_height: int | None = 68
     model_md5: str | None = None
 
 

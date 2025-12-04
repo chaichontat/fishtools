@@ -24,7 +24,7 @@ import distributed
 import yaml
 from dask.distributed import Client
 
-DEFAULT_WORKER_MEMORY = "32GB"
+DEFAULT_WORKER_MEMORY = "64GB"
 DEFAULT_CONFIG_FILENAME = "distributed_cellpose_dask_config.yaml"
 
 

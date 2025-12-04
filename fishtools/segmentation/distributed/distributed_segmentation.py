@@ -1246,7 +1246,7 @@ def main(
 
     (base_dir / "segmentation.done").unlink(missing_ok=True)
     ortho_weights = config.get("ortho_weights", [4, 1.0, 1.0])
-    diameter = config.get("diameter", 25)
+    diameter = config.get("diameter", 30)
     cellpose_model_kwargs = {
         "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
         "gpu": True,
@@ -1361,17 +1361,17 @@ def main(
 
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
-        "diameter": config.get("diameter", 25),  # MUST BE INT
+        "diameter": config.get("diameter", 30),  # MUST BE INT
         "batch_size": 16 if backend == "unet" else 4,
         "normalize": normalization,
         "flow_threshold": 0,  # Ignored in 3D
         "cellprob_threshold": 0,  # Default is 0.0, adjust if needed
         "anisotropy": 2.0,
         "resample": False,
-        "flow3D_smooth": 0.5,
+        "flow3D_smooth": 1,
         "niter": 1000,
         "do_3D": True,
-        "min_size": 200,
+        "min_size": 500,
         "channel_axis": 3,
     }
     if using_sam_backend:

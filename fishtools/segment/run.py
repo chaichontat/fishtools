@@ -193,12 +193,13 @@ def _cellpose(model, image: np.ndarray, *, config: RunConfig):
         batch_size=2,
         anisotropy=4,
         flow_threshold=0.4,
-        cellprob_threshold=0.5,
-        flow3D_smooth=0.5,
-        niter=2000,
+        cellprob_threshold=0,
+        flow3D_smooth=2,
+        niter=1000,
         # stitch_threshold=0.24,
-        diameter=50,
+        diameter=60,
         do_3D=True,
+        min_size=4000,
         ortho_weights=config.ortho_weights,
         # bsize=224,
         # augment=True,
@@ -329,7 +330,7 @@ def run(
         from cellpose.contrib.packed_infer import CellposeUNetModelTRT as TRTModel
 
     # Auto-detect TRT plan for main model
-    plan_selection = _find_trt_plan(config.model_path)
+    plan_selection =_find_trt_plan(config.model_path)
 
     # Auto-detect TRT plan for ortho model if provided
     ortho_plan_path = None

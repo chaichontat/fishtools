@@ -707,7 +707,7 @@ def cmd_extract(
     )
 
     # Validate mode-specific parameters
-    if mode == "z" and anisotropy != 6:
+    if mode == "z" and anisotropy != 4:
         raise typer.BadParameter("--anisotropy parameter is only valid for 'ortho' mode.")
 
     if mode == "ortho" and dz != 1:
@@ -1171,16 +1171,18 @@ def _process_volume(
             skipped_for_tile = 0
             for z_index in z_candidates:
                 plane = vol[z_index, y_slice_tile, x_slice_tile, :]
-                zero_tile = np.any(plane == 0)
+                zero_fraction = np.mean(plane == 0)
+                skip_tile = zero_fraction > 0.1
                 other_max = None
                 if other_vol is not None:
                     other_tile = other_vol[z_index, y_slice_tile, x_slice_tile, :]
-                    if not zero_tile:
-                        zero_tile = np.any(other_tile == 0)
-                    if not zero_tile:
+                    if not skip_tile:
+                        other_zero_fraction = np.mean(other_tile == 0)
+                        skip_tile = other_zero_fraction > 0.1
+                    if not skip_tile:
                         other_max = other_tile.max(axis=2)
 
-                if zero_tile:
+                if skip_tile:
                     skipped_for_tile += 1
                     if reporter is not None:
                         reporter.advance()
@@ -1236,8 +1238,12 @@ def _process_volume(
                 raise ValueError("Image after cropping is empty.")
             base_y = (np.linspace(int(0.1 * y_eff), int(0.9 * y_eff), n).astype(int) + crop).tolist()
             base_x = (np.linspace(int(0.1 * x_eff), int(0.9 * x_eff), n).astype(int) + crop).tolist()
-            y_positions = _expand_positions_with_context(base_y, crop=crop, axis_len=y_len)
-            x_positions = _expand_positions_with_context(base_x, crop=crop, axis_len=x_len)
+            y_positions = _expand_positions_with_context(
+                base_y, crop=crop, axis_len=y_len
+            )
+            x_positions = _expand_positions_with_context(
+                base_x, crop=crop, axis_len=x_len
+            )
         x_slice_main = slice(crop, x_len - crop) if crop > 0 else slice(None)
         y_slice_main = slice(crop, y_len - crop) if crop > 0 else slice(None)
 
