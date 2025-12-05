@@ -8,6 +8,10 @@ Provides:
 - Bounding box merging
 """
 
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +22,8 @@ import scipy.sparse
 import scipy.sparse.csgraph
 import zarr
 from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
 
 
 def determine_merge_relabeling(
@@ -400,9 +406,42 @@ def _compress_label_pairs_to_compact_space(
     return compact_flat.reshape(pairs.shape)
 
 
+def _process_single_face(
+    face: NDArray[Any],
+    structure: NDArray[Any],
+    unique_labels: NDArray[np.uint32],
+) -> NDArray[np.int64] | None:
+    """Process a single face pair to find which labels should merge.
+
+    Algorithm:
+    1. Split the 2-pixel-thick face slab into two 1-pixel slices (one from each block)
+    2. Shrink labels via distance transform to handle boundary artifacts
+    3. Concatenate slices and find label pairs that touch across the boundary
+    4. Map global label IDs to compact [1..N] space for sparse graph construction
+
+    Returns (2, M) array of compact label pairs, or None if no pairs found.
+    """
+    # Split face into the two adjacent block boundaries
+    sl0 = tuple(slice(0, 1) if d == 2 else slice(None) for d in face.shape)
+    sl1 = tuple(slice(1, 2) if d == 2 else slice(None) for d in face.shape)
+
+    a = shrink_labels(face[sl0], 1.0)
+    b = shrink_labels(face[sl1], 1.0)
+
+    face_combined = np.concatenate((a, b), axis=np.argmin(a.shape))
+    mapped_global = _find_label_pairs_across_boundary(face_combined, structure)
+
+    if mapped_global.size == 0:
+        return None
+
+    mapped_compact = _compress_label_pairs_to_compact_space(mapped_global, unique_labels)
+    return mapped_compact if mapped_compact.size > 0 else None
+
+
 def block_face_adjacency_graph(
     faces: list[NDArray[Any]],
     unique_labels: NDArray[np.uint32],
+    n_workers: int | None = None,
 ) -> scipy.sparse.csr_matrix:
     """
     Build adjacency graph from face pairs in a compact label space.
@@ -418,32 +457,45 @@ def block_face_adjacency_graph(
         Sorted 1D array of unique global label IDs (>0) present in the volume.
         These are mapped to node indices [1..N]; index 0 is reserved for
         background and never used.
+    n_workers
+        Number of parallel workers for face processing. Defaults to cpu_count - 4.
     """
+    if n_workers is None:
+        n_workers = max(1, (os.cpu_count() or 8) - 4)
+
     nlabels = int(unique_labels.size)
 
     if nlabels == 0:
         return scipy.sparse.csr_matrix((1, 1), dtype=np.int32)
 
-    all_mappings: list[NDArray[np.int64]] = []
     structure = scipy.ndimage.generate_binary_structure(3, 1)
-    for face in faces:
-        sl0 = tuple(slice(0, 1) if d == 2 else slice(None) for d in face.shape)
-        sl1 = tuple(slice(1, 2) if d == 2 else slice(None) for d in face.shape)
-        a = shrink_labels(face[sl0], 1.0)
-        b = shrink_labels(face[sl1], 1.0)
-        face_combined = np.concatenate((a, b), axis=np.argmin(a.shape))
-        mapped_global = _find_label_pairs_across_boundary(face_combined, structure)
-        if mapped_global.size > 0:
-            mapped_compact = _compress_label_pairs_to_compact_space(mapped_global, unique_labels)
-            if mapped_compact.size > 0:
-                all_mappings.append(mapped_compact)
+    n_faces = len(faces)
+
+    # Process faces in parallel
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        results = list(executor.map(
+            lambda f: _process_single_face(f, structure, unique_labels),
+            faces
+        ))
+    t_parallel = time.perf_counter() - t0
+
+    # Filter out None results and collect mappings
+    all_mappings = [r for r in results if r is not None]
+
+    logger.info(f"block_face_adjacency_graph ({n_faces} faces, {n_workers} workers):")
+    logger.info(f"  parallel processing: {t_parallel:.2f}s ({t_parallel/max(n_faces,1)*1000:.1f}ms/face)")
 
     if not all_mappings:
         return scipy.sparse.csr_matrix((nlabels + 1, nlabels + 1), dtype=np.int32)
 
+    t0 = time.perf_counter()
     i, j = np.concatenate(all_mappings, axis=1)
     v = np.ones_like(i)
-    return scipy.sparse.coo_matrix((v, (i, j)), shape=(nlabels + 1, nlabels + 1)).tocsr()
+    result = scipy.sparse.coo_matrix((v, (i, j)), shape=(nlabels + 1, nlabels + 1)).tocsr()
+    logger.info(f"  graph_construction: {time.perf_counter() - t0:.2f}s")
+
+    return result
 
 
 def merge_boxes(boxes: NDArray[Any]) -> tuple[slice, ...]:

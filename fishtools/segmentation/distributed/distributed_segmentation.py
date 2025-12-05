@@ -4,6 +4,7 @@ import logging
 import os
 import pathlib
 import shutil
+import time
 from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
@@ -17,15 +18,12 @@ import numpy as np
 import tifffile
 import typer
 import zarr
-from cellpose import transforms as cp_transforms
-from distributed import WorkerPlugin
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
 from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.segment.normalize import sample_percentile
-from fishtools.segment.train import IS_CELLPOSE_SAM, plan_path_for_device
 from fishtools.segmentation.distributed.cache_utils import (
     read_nonempty_cache,
     read_normalization_cache,
@@ -44,6 +42,11 @@ from fishtools.segmentation.distributed.merge_utils import (
     relabel_and_write,
     remove_overlaps,
 )
+from fishtools.segmentation.distributed.model_cache import (
+    CellposeModelPlugin,
+    get_cached_model,
+)
+from fishtools.segmentation.distributed.tiling import solve_internal_xy_for_tiles
 from fishtools.utils.pretty_print import progress_bar
 
 # logger.remove()
@@ -61,41 +64,32 @@ _WORKER_INITIALIZED: bool = False
 _WORKER_LOGS_DIR: str | None = None
 
 
-class CellposeModelPlugin(WorkerPlugin):
-    """Plugin to initialize and cache CellPose model once per worker.
+def _save_intermediate_state(
+    temp_dir: Path,
+    faces_list: list,
+    boxes_list: list,
+    box_ids_list: list,
+    non_empty_indices: list[tuple[int, ...]],
+) -> None:
+    """Save cellpose results for later stitching."""
+    np.savez(
+        temp_dir / "intermediate_state.npz",
+        faces=np.array(faces_list, dtype=object),
+        boxes=np.array(boxes_list, dtype=object),
+        box_ids=np.array(box_ids_list, dtype=object),
+        non_empty_indices=np.array(non_empty_indices),
+    )
 
-    Uses the officially documented pattern of storing state on worker attributes
-    (get_worker().my_attribute) rather than get_worker().data which is reserved
-    for Dask's internal memory management.
 
-    References:
-    - https://distributed.dask.org/en/latest/plugins.html
-    - https://stackoverflow.com/questions/58126830/
-    """
-
-    name = "cellpose-model-cache"
-
-    def __init__(self, model_kwargs: dict[str, Any]):
-        self.model_kwargs = model_kwargs
-
-    def setup(self, worker):
-        """Initialize model when worker starts. Stores on worker.cellpose_model."""
-        if hasattr(worker, "cellpose_model"):
-            logger.info(f"Worker {worker.name}: Model already initialized, skipping")
-            return
-
-        backend = self.model_kwargs.get("backend", "sam")
-        logger.info(f"Worker {worker.name}: Initializing CellPose model (backend={backend})")
-        model = _build_packed_cellpose_model(self.model_kwargs)
-        worker.cellpose_model = model
-        worker.cellpose_model_kwargs = self.model_kwargs
-        logger.info(f"Worker {worker.name}: Model cached on worker.cellpose_model")
-
-    def teardown(self, worker):
-        """Clean up model when worker shuts down."""
-        if hasattr(worker, "cellpose_model"):
-            del worker.cellpose_model
-            logger.info(f"Worker {worker.name}: Cleared cellpose_model")
+def _load_intermediate_state(temp_dir: Path) -> tuple[list, list, list, list[tuple[int, ...]]]:
+    """Load saved cellpose results for stitching."""
+    data = np.load(temp_dir / "intermediate_state.npz", allow_pickle=True)
+    return (
+        data["faces"].tolist(),
+        data["boxes"].tolist(),
+        data["box_ids"].tolist(),
+        [tuple(idx) for idx in data["non_empty_indices"]],
+    )
 
 
 ######################## Checkpoint/Resume Functions ###########################
@@ -589,81 +583,6 @@ def process_block(
 # ----------------------- component functions ---------------------------------#
 
 
-def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
-    """Instantiate a PackedCellpose model, preferring TensorRT plans when available."""
-    import torch
-    from cellpose.contrib.packed_infer import (
-        PackedCellposeModel,
-        PackedCellposeModelTRT,
-        PackedCellposeUNetModel,
-        PackedCellposeUNetModelTRT,
-    )
-
-    resolved_kwargs = dict(model_kwargs)
-    backend = resolved_kwargs.pop("backend", "sam").lower()
-    if backend not in {"sam", "unet"}:
-        raise ValueError("backend must be either 'sam' or 'unet'.")
-
-    pretrained_model = resolved_kwargs.get("pretrained_model")
-    if pretrained_model is None:
-        raise ValueError("model_kwargs must include 'pretrained_model'.")
-
-    pretrained_path = Path(pretrained_model)
-    resolved_kwargs["pretrained_model"] = str(pretrained_path)
-
-    plan_selection: tuple[Path, str] | None = None
-    if torch is not None and getattr(torch.cuda, "is_available", lambda: False)():
-        if getattr(torch.cuda, "device_count", lambda: 0)() > 0:
-            device_index = 0
-            device_name = torch.cuda.get_device_name(device_index)
-            plan_candidate = plan_path_for_device(pretrained_path, device_name)
-            if plan_candidate.is_file():
-                plan_selection = (plan_candidate, device_name)
-    plan_candidate = plan_candidate if "plan_candidate" in locals() else plan_path_for_device(pretrained_path, "cuda")
-
-    backend_to_classes = {
-        "sam": (PackedCellposeModel, PackedCellposeModelTRT),
-        "unet": (PackedCellposeUNetModel, PackedCellposeUNetModelTRT),
-    }
-    base_cls, trt_cls = backend_to_classes[backend]
-
-    if plan_selection is not None:
-        plan_path, device_name = plan_selection
-        logger.info(f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}'")
-        trt_kwargs = dict(resolved_kwargs)
-        trt_kwargs["pretrained_model"] = str(plan_path)
-        trt_kwargs.setdefault("gpu", True)
-        return trt_cls(**trt_kwargs)
-
-    raise FileNotFoundError(
-        f"TensorRT plan required. Expected plan at {plan_candidate} for the current GPU."
-    )
-
-    if backend == "sam" and IS_CELLPOSE_SAM:
-        resolved_kwargs.pop("pretrained_model_ortho", None)
-
-    resolved_kwargs.setdefault("gpu", True)
-    return base_cls(**resolved_kwargs)
-
-
-def _get_cached_model(model_kwargs: dict[str, Any]):
-    """Get model from worker attribute, building if necessary (fallback).
-
-    Uses Dask's documented pattern of storing state on worker.my_attribute.
-    Falls back to building the model if the CellposeModelPlugin wasn't registered.
-    """
-    worker = distributed.get_worker()
-
-    if hasattr(worker, "cellpose_model"):
-        return worker.cellpose_model
-
-    # Fallback: build and cache (handles case where plugin wasn't registered)
-    logger.warning(f"Worker {worker.name}: Model not cached, building fresh")
-    model = _build_packed_cellpose_model(model_kwargs)
-    worker.cellpose_model = model
-    return model
-
-
 def read_preprocess_and_segment(
     input_zarr: zarr.Array,
     crop: tuple[slice, ...],
@@ -732,118 +651,12 @@ def read_preprocess_and_segment(
         log_file = pathlib.Path(worker_logs_directory).joinpath(log_file)
     cellpose.io.logger_setup(stdout_file_replacement=log_file)
 
-    model = _get_cached_model(model_kwargs)
+    model = get_cached_model(model_kwargs)
     backend = model_kwargs.get("backend", "sam")
     filtered_eval_kwargs = dict(eval_kwargs)
     if backend == "unet":
         filtered_eval_kwargs.pop("ortho_weights", None)
     return model.eval(image, **filtered_eval_kwargs)[0].astype(np.uint32)
-
-
-def _padded_from_raw_y(Ly_raw: int, *, bsize: int) -> int:
-    """
-    Compute padded Y size seen by Cellpose tiler for a given raw Ly.
-
-    Uses the same padding rule as core.run_net via transforms.get_pad_yx.
-    """
-    ypad1, ypad2, _, _ = cp_transforms.get_pad_yx(Ly_raw, 0, min_size=(bsize, bsize))
-    return Ly_raw + ypad1 + ypad2
-
-
-def _padded_from_raw_x(Lx_raw: int, *, bsize: int) -> int:
-    """
-    Compute padded X size seen by Cellpose tiler for a given raw Lx.
-
-    Uses the same padding rule as core.run_net via transforms.get_pad_yx.
-    """
-    _, _, xpad1, xpad2 = cp_transforms.get_pad_yx(0, Lx_raw, min_size=(bsize, bsize))
-    return Lx_raw + xpad1 + xpad2
-
-
-def _find_raw_for_target_tiles(
-    n_target: int,
-    *,
-    bsize: int = 256,
-    tile_overlap: float = 0.1,
-    axis: str,
-    search_margin: int = 512,
-) -> tuple[int, int]:
-    """
-    Find the largest raw size whose padded size yields the desired tile count.
-
-    Returns (raw_size, padded_size) along the requested axis.
-    """
-    if n_target <= 0:
-        raise ValueError("n_target must be positive")
-
-    alpha = 1.0 + 2.0 * tile_overlap
-
-    if n_target == 1:
-        padded_min = 0
-        padded_max = bsize
-    else:
-        padded_min = int(np.floor((n_target - 1) * bsize / alpha)) + 1
-        padded_max = int(np.floor(n_target * bsize / alpha))
-        if padded_min <= bsize:
-            padded_min = bsize + 1
-
-    if padded_max < padded_min:
-        raise ValueError(f"No padded size range for n_target={n_target}")
-
-    if axis == "y":
-        mapper = _padded_from_raw_y
-    elif axis == "x":
-        mapper = _padded_from_raw_x
-    else:
-        raise ValueError("axis must be 'y' or 'x'")
-
-    raw_upper = max(bsize, padded_max + search_margin)
-    best_raw: int | None = None
-    best_padded: int | None = None
-
-    for raw in range(1, raw_upper + 1):
-        padded = mapper(raw, bsize=bsize)
-        if padded_min <= padded <= padded_max:
-            if best_raw is None or raw > best_raw:
-                best_raw = raw
-                best_padded = padded
-
-    if best_raw is None or best_padded is None:
-        raise ValueError(f"Could not find raw size for n_target={n_target} along axis={axis}")
-
-    return best_raw, best_padded
-
-
-def solve_internal_xy_for_tiles(
-    ny_target: int,
-    nx_target: int,
-    *,
-    bsize: int = 256,
-    tile_overlap: float = 0.1,
-) -> tuple[int, int]:
-    """
-    Solve for effective internal (Ly, Lx) that yield desired (ny, nx) tiles.
-
-    The returned Ly/Lx correspond to the dimensions seen by Cellpose's tiler
-    after padding and any diameter rescaling. This is exactly the geometry
-    that run_net operates on.
-    """
-    if ny_target <= 0 or nx_target <= 0:
-        raise ValueError("ny_target and nx_target must be positive")
-
-    Ly_raw, _ = _find_raw_for_target_tiles(
-        ny_target,
-        bsize=bsize,
-        tile_overlap=tile_overlap,
-        axis="y",
-    )
-    Lx_raw, _ = _find_raw_for_target_tiles(
-        nx_target,
-        bsize=bsize,
-        tile_overlap=tile_overlap,
-        axis="x",
-    )
-    return Ly_raw, Lx_raw
 
 
 ######################## Distributed Cellpose #################################
@@ -862,7 +675,8 @@ def distributed_eval(
     cluster: myLocalCluster | None = None,
     cluster_kwargs: dict[str, Any] | None = None,
     temporary_directory: Path | None = None,
-) -> tuple[zarr.Array, list[tuple[slice, ...]]]:
+    cellpose_only: bool = False,
+) -> tuple[zarr.Array, list[tuple[slice, ...]]] | None:
     """
     Evaluate a cellpose model on overlapping blocks of a big image.
     Distributed over workstation or cluster resources with Dask.
@@ -1171,6 +985,20 @@ def distributed_eval(
             box_ids_list.append(box_ids)
             non_empty_indices.append(final_block_indices[i])
 
+    # Save intermediate state for potential separate stitching
+    _save_intermediate_state(
+        Path(temporary_directory),
+        faces_list,
+        boxes_list,
+        box_ids_list,
+        non_empty_indices,
+    )
+
+    if cellpose_only:
+        logger.info("Cellpose-only mode: skipping merge phase")
+        logger.info(f"Intermediate results saved to: {temporary_directory}")
+        return None
+
     boxes = [box for sublist in boxes_list for box in sublist]
     box_ids = np.concatenate(box_ids_list).astype(int)  # unsure how but without cast these are float64
 
@@ -1206,11 +1034,73 @@ def distributed_eval(
     return zarr.open(write_path, mode="r"), merged_boxes
 
 
+def stitch_segmentation(
+    temp_dir: Path,
+    output_path: Path,
+) -> tuple[zarr.Array, NDArray]:
+    """
+    Run only the stitching/merging phase on pre-computed cellpose results.
+
+    Parameters
+    ----------
+    temp_dir : Path
+        Directory containing segmentation_unstitched.zarr and intermediate_state.npz
+    output_path : Path
+        Path for final stitched zarr output
+
+    Returns
+    -------
+    tuple[zarr.Array, NDArray]
+        Final segmentation zarr and merged bounding boxes
+    """
+    t_total_start = time.perf_counter()
+
+    t0 = time.perf_counter()
+    temp_zarr = zarr.open(temp_dir / "segmentation_unstitched.zarr", mode="r")
+    faces_list, boxes_list, box_ids_list, non_empty_indices = _load_intermediate_state(temp_dir)
+    logger.info(f"Load intermediate state: {time.perf_counter() - t0:.2f}s")
+
+    # Combine per-block data
+    boxes = [box for sublist in boxes_list for box in sublist]
+    box_ids = np.concatenate(box_ids_list).astype(int) if box_ids_list else np.array([], dtype=int)
+
+    logger.info(f"Loaded {len(non_empty_indices)} non-empty blocks, {len(box_ids)} segment IDs")
+
+    # Build relabeling LUT
+    t0 = time.perf_counter()
+    new_labeling = determine_merge_relabeling(
+        [(bi[0], bi[1], bi[2]) for bi in non_empty_indices], faces_list, box_ids
+    )
+    logger.info(f"determine_merge_relabeling: {time.perf_counter() - t0:.2f}s")
+
+    new_labeling_path = temp_dir / "new_labeling.npy"
+    np.save(new_labeling_path, new_labeling)
+
+    n_final_labels = int(new_labeling.max())
+    logger.info(f"Relabeling to {n_final_labels} final non-background labels (merged from {len(box_ids)} IDs)")
+
+    # Apply relabeling
+    t0 = time.perf_counter()
+    logger.info("Relabeling blocks...")
+    relabel_and_write(temp_zarr, new_labeling_path, output_path)
+    logger.info(f"relabel_and_write: {time.perf_counter() - t0:.2f}s")
+
+    # Merge bounding boxes
+    t0 = time.perf_counter()
+    logger.info("Merging boxes...")
+    merged_boxes = merge_all_boxes(boxes, new_labeling[box_ids])
+    logger.info(f"merge_all_boxes: {time.perf_counter() - t0:.2f}s")
+
+    logger.info(f"Total stitch_segmentation: {time.perf_counter() - t_total_start:.2f}s")
+
+    return zarr.open(output_path, mode="r"), merged_boxes
+
+
 app = typer.Typer(pretty_exceptions_show_locals=False)
 
 
 @app.command()
-def main(
+def run(
     path: Path = typer.Argument(..., help="Path to the folder containing the zarr file."),
     channels: str | None = typer.Option(None, help="Comma-separated list of channel names to use."),
     overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
@@ -1238,9 +1128,14 @@ def main(
         None,
         help="Desired internal Cellpose nx tiles (SAM backend only; overrides default 6).",
     ),
+    cellpose_only: bool = typer.Option(
+        False,
+        "--cellpose-only",
+        help="Stop after cellpose phase, save intermediate state for later stitching.",
+    ),
 ) -> None:
     """
-    Main CLI entry point for distributed Cellpose segmentation.
+    Run distributed Cellpose segmentation (full pipeline or cellpose-only).
 
     Orchestrates the complete distributed segmentation workflow including:
     - Loading and validating input data
@@ -1268,6 +1163,14 @@ def main(
     - path/output_segmentation-sam.zarr or path/output_segmentation-unet.zarr (segmentation results, backend-dependent)
     - path/segmentation.done (completion marker)
     - path/cellpose_temp/ (temporary processing files)
+
+    Cellpose normalization contract:
+    - We always pass a `normalize` dict with key `lowhigh` shaped (3, 2).
+    - Rows correspond to channels in the requested order (or default index order).
+    - Cached normalization is stored on disk in ascending channel index order (1-based)
+      and is reordered at load time to match the requested order before being sent to Cellpose.
+    - If fewer than 3 channels are requested, remaining rows are padded with [0, 1]
+      to align with Cellpose's internal conversion to exactly three channels.
     """
     # Normalize input paths:
     # - If given a directory named '*.zarr' → treat as the Zarr store
@@ -1394,9 +1297,14 @@ def main(
         logger.info(f"SAM backend: target tiles (ny={ny_target}, nx={nx_target}) → internal size ({Ly_internal}x{Lx_internal}) → blocksize ({by}x{bx})")
     normalization_path = base_dir / "normalization.json"
     normalization = read_normalization_cache(normalization_path)
+    lowhigh_selected: NDArray[np.float64] | None = None
+
     if normalization is not None:
-        logger.info("Loaded cached normalization thresholds from %s", normalization_path)
-    else:
+        try:
+            lowhigh_selected = np.array([normalization[str(ch)] for ch in channels_list], dtype=np.float64)
+        except KeyError:
+            logger.info("Normalization cache missing requested channels; recomputing.")
+    if lowhigh_selected is None:
         logger.info("Calculating normalization percentiles (cache miss).")
         perc, _ = sample_percentile(
             input_zarr_array,
@@ -1406,27 +1314,27 @@ def main(
             low=1,
             high=99.9,
         )
-        normalization = {"lowhigh": perc}
-        write_normalization_cache(normalization_path, normalization)
+        lowhigh_selected = np.asarray(perc, dtype=float)
+        write_normalization_cache(
+            normalization_path,
+            {str(ch): lh.tolist() for ch, lh in zip(channels_list, lowhigh_selected)},
+        )
         logger.info("Saved normalization thresholds to %s", normalization_path)
 
-    if len(channels_list) == 1:
-        channels_list = [channels_list[0], channels_list[0]]
-        normalization = {"lowhigh": [normalization["lowhigh"], normalization["lowhigh"]]}
+    # Align normalization rows to requested channel order
+    lowhigh_eval = np.asarray(lowhigh_selected, dtype=float)
 
-    if using_sam_backend and IS_CELLPOSE_SAM and len(channels_list) < 3:
-        print(np.repeat([[0], [1]], repeats=3 - len(channels_list), axis=0).shape)
-        normalization = {
-            "lowhigh": np.concatenate(
-                [
-                    normalization["lowhigh"],
-                    np.repeat([[0, 1]], repeats=3 - len(channels_list), axis=0),
-                ],
-                axis=0,
-            )
-        }
+    # Cellpose (convert_image) always produces 3 channels; pad missing ones with identity ranges
+    if lowhigh_eval.shape[0] < 3:
+        pad = np.repeat([[0.0, 1.0]], repeats=3 - lowhigh_eval.shape[0], axis=0)
+        lowhigh_eval = np.concatenate([lowhigh_eval, pad], axis=0)
 
-    logger.info(f"Normalization params: {normalization}")
+    normalization = {"lowhigh": lowhigh_eval.tolist()}
+    logger.info(f"Normalization params (requested order): {normalization}")
+
+    channels_for_cellpose = list(channels_list)
+    if len(channels_for_cellpose) == 1:
+        channels_for_cellpose = [channels_for_cellpose[0], channels_for_cellpose[0]]
 
     # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
@@ -1446,9 +1354,9 @@ def main(
     if using_sam_backend:
         cellpose_eval_kwargs["z_axis"] = 0
         if not IS_CELLPOSE_SAM:
-            cellpose_eval_kwargs["channels"] = channels_list
+            cellpose_eval_kwargs["channels"] = channels_for_cellpose
     else:
-        cellpose_eval_kwargs["channels"] = channels_list
+        cellpose_eval_kwargs["channels"] = channels_for_cellpose
     if ortho_weights is not None:
         cellpose_eval_kwargs["ortho_weights"] = ortho_weights
 
@@ -1456,7 +1364,7 @@ def main(
     logger.info("Starting distributed Cellpose evaluation…")
     try:
         # The @cluster decorator handles cluster creation/management
-        final_segmentation_zarr, final_bounding_boxes = distributed_eval(
+        result = distributed_eval(
             input_zarr=input_zarr_array,
             blocksize=processing_blocksize,
             write_path=zarr_output_path,
@@ -1466,7 +1374,17 @@ def main(
             eval_kwargs=cellpose_eval_kwargs,
             cluster_kwargs=local_cluster_kwargs,
             temporary_directory=temporary_directory,
+            cellpose_only=cellpose_only,
         )
+
+        if cellpose_only:
+            logger.info("Cellpose-only mode complete.")
+            logger.info(f"Intermediate results saved to: {temporary_directory}")
+            logger.info("Run 'stitch' command to complete the pipeline.")
+            return
+
+        # Full pipeline: cleanup and finalize
+        final_segmentation_zarr, final_bounding_boxes = result
         (zarr_output_path.parent / "segmentation.done").touch()
         shutil.rmtree(temporary_directory)
         logger.info("Run Finished")
@@ -1479,6 +1397,36 @@ def main(
     except Exception as e:
         logger.exception("Error during distributed evaluation")
         raise e
+
+
+@app.command()
+def stitch(
+    temp_dir: Path = typer.Argument(..., help="Path to cellpose_temp directory with intermediate results."),
+    output_path: Path = typer.Argument(..., help="Path for output zarr file."),
+    cleanup: bool = typer.Option(True, help="Remove temp directory after successful stitching."),
+) -> None:
+    """
+    Stitch pre-computed cellpose results into final segmentation.
+
+    Use this after running with --cellpose-only to complete the pipeline.
+    """
+    if not (temp_dir / "segmentation_unstitched.zarr").exists():
+        raise FileNotFoundError(f"No segmentation_unstitched.zarr found in {temp_dir}")
+    if not (temp_dir / "intermediate_state.npz").exists():
+        raise FileNotFoundError(f"No intermediate_state.npz found in {temp_dir}")
+
+    logger.info(f"Stitching segmentation from {temp_dir}")
+    final_zarr, final_boxes = stitch_segmentation(temp_dir, output_path)
+
+    if cleanup:
+        shutil.rmtree(temp_dir)
+        logger.info(f"Cleaned up temp directory: {temp_dir}")
+
+    (output_path.parent / "segmentation.done").touch()
+    logger.info("Stitching complete")
+    logger.info(f"Final segmentation saved to: {output_path}")
+    logger.info(f"Output Zarr shape: {final_zarr.shape}, dtype: {final_zarr.dtype}")
+    logger.info(f"Number of segmented objects found: {len(final_boxes)}")
 
 
 if __name__ == "__main__":
