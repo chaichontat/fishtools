@@ -12,13 +12,13 @@ from typing import Annotated, Any, cast
 import cellpose.io
 import dask_jobqueue
 import distributed
-from distributed import WorkerPlugin
 import imagecodecs
 import numpy as np
 import tifffile
 import typer
 import zarr
 from cellpose import transforms as cp_transforms
+from distributed import WorkerPlugin
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
@@ -1162,13 +1162,22 @@ def distributed_eval(
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
         cluster.scale(0)
 
-    faces, boxes_, box_ids_ = list(zip(*results))
-    boxes = [box for sublist in boxes_ for box in sublist]
-    box_ids = np.concatenate(box_ids_).astype(np.uint32)
+    # Filter to non-empty blocks only
+    faces_list, boxes_list, box_ids_list, non_empty_indices = [], [], [], []
+    for i, (faces, boxes, box_ids) in enumerate(results):
+        if len(box_ids) > 0:
+            faces_list.append(faces)
+            boxes_list.append(boxes)
+            box_ids_list.append(box_ids)
+            non_empty_indices.append(final_block_indices[i])
+
+    boxes = [box for sublist in boxes_list for box in sublist]
+    box_ids = np.concatenate(box_ids_list).astype(int)  # unsure how but without cast these are float64
+
     print(f"Box IDs: {len(box_ids)}")
     # Determine merge relabeling (graph in compact label space; LUT over global IDs)
     new_labeling = determine_merge_relabeling(
-        [(bi[0], bi[1], bi[2]) for bi in final_block_indices], faces, box_ids,
+        [(bi[0], bi[1], bi[2]) for bi in non_empty_indices], faces_list, box_ids
     )
     new_labeling_path = Path(temporary_directory) / "new_labeling.npy"
     np.save(new_labeling_path, new_labeling)
