@@ -17,7 +17,8 @@ import os
 import pathlib
 import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 import dask
 import distributed
@@ -94,7 +95,9 @@ def _gpu_count() -> int:
     return len(_visible_devices())
 
 
-def _build_worker_spec(*, devices: list[str], workers_per_gpu: int, threads_per_worker: int) -> dict[str, Any]:
+def _build_worker_spec(
+    *, devices: list[str], workers_per_gpu: int, threads_per_worker: int
+) -> dict[str, Any]:
     """Construct a SpecCluster worker spec with env pinning per GPU."""
     from distributed.nanny import Nanny
 
@@ -113,7 +116,7 @@ def _build_worker_spec(*, devices: list[str], workers_per_gpu: int, threads_per_
     return worker_spec
 
 
-def _start_speccluster(*, workers_per_gpu: int, threads_per_worker: int) -> tuple[Client, str | None]:
+def _start_speccluster(*, workers_per_gpu: int, threads_per_worker: int) -> tuple[Client, Any, str | None]:
     from distributed import Scheduler
     from distributed.deploy.spec import SpecCluster
 
@@ -132,10 +135,10 @@ def _start_speccluster(*, workers_per_gpu: int, threads_per_worker: int) -> tupl
     )
     cluster = SpecCluster(workers=spec, scheduler={"cls": Scheduler, "options": {}})
     client = Client(cluster)
-    return client, getattr(cluster, "dashboard_link", None)
+    return client, cluster, getattr(cluster, "dashboard_link", None)
 
 
-def _start_localcuda(*, n_workers: int | None, threads_per_worker: int) -> tuple[Client, str | None]:
+def _start_localcuda(*, n_workers: int | None, threads_per_worker: int) -> tuple[Client, Any, str | None]:
     try:
         from dask_cuda import LocalCUDACluster  # type: ignore
     except Exception as e:  # pragma: no cover - env dependent
@@ -147,7 +150,7 @@ def _start_localcuda(*, n_workers: int | None, threads_per_worker: int) -> tuple
         memory_limit=DEFAULT_WORKER_MEMORY,
     )
     client = Client(cluster)
-    return client, getattr(cluster, "dashboard_link", None)
+    return client, cluster, getattr(cluster, "dashboard_link", None)
 
 
 class myGPUCluster:
@@ -176,21 +179,21 @@ class myGPUCluster:
         **_: Any,
     ) -> None:
         self._client: Client | None = None
+        self._cluster: Any = None
         self._dashboard: str | None = None
-        self._close: list[Any] = []
 
         if workers_per_gpu and workers_per_gpu > 1:
-            self._client, self._dashboard = _start_speccluster(
+            self._client, self._cluster, self._dashboard = _start_speccluster(
                 workers_per_gpu=workers_per_gpu, threads_per_worker=threads_per_worker
             )
         else:
             if use_localcuda:
-                self._client, self._dashboard = _start_localcuda(
+                self._client, self._cluster, self._dashboard = _start_localcuda(
                     n_workers=n_workers, threads_per_worker=threads_per_worker
                 )
             else:
                 # Fall back to SpecCluster with a single worker per GPU to avoid hard dependency on dask-cuda
-                self._client, self._dashboard = _start_speccluster(
+                self._client, self._cluster, self._dashboard = _start_speccluster(
                     workers_per_gpu=1, threads_per_worker=threads_per_worker
                 )
 
@@ -198,17 +201,33 @@ class myGPUCluster:
         self.client = self._client  # type: ignore[assignment]
         self.dashboard_link = self._dashboard
 
-    def __enter__(self) -> "myGPUCluster":
+    def __enter__(self) -> myGPUCluster:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        import logging
+
+        # Suppress noisy shutdown logs from distributed
+        for name in [
+            "distributed",
+            "distributed.scheduler",
+            "distributed.worker",
+            "distributed.nanny",
+            "distributed.batched",
+            "distributed.core",
+        ]:
+            logging.getLogger(name).setLevel(logging.CRITICAL)
+
         try:
             if self._client is not None:
                 self._client.close()
+            if self._cluster is not None:
+                self._cluster.close()
         finally:
             # Clean up transient dask config used for logging control.
             _remove_config_file(DEFAULT_CONFIG_FILENAME)
             self._client = None
+            self._cluster = None
 
 
 # ----------------------- CPU LocalCluster ------------------------------------#
@@ -278,7 +297,7 @@ class myLocalCluster(distributed.LocalCluster):
 
         print("Cluster dashboard link: ", self.dashboard_link)
 
-    def __enter__(self) -> "myLocalCluster":
+    def __enter__(self) -> myLocalCluster:
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:

@@ -32,12 +32,12 @@ Key Design Decisions
 
 3. **Reuse stitching from distributed_segmentation**
    After processing, chunks have locally-processed labels that need stitching:
-   - global_segment_ids() encodes block index into label IDs (avoids collisions)
+   - global_segment_ids() encodes block index into bit-packed label IDs (avoids collisions)
    - block_faces() extracts boundary faces
    - adjacent_faces() pairs faces between neighboring blocks
-   - block_face_adjacency_graph() finds which labels touch across boundaries
-   - scipy.sparse.csgraph.connected_components() determines merges (union-find)
-   - Final relabeling via dask.array.map_blocks
+   - block_face_adjacency_graph() builds a compact adjacency graph over only used labels
+   - scipy.sparse.csgraph.connected_components() determines merges (union-find) in this compact space
+   - Final relabeling LUT is applied over global IDs via dask.array.map_blocks
 
 4. **Overlap sizing for Gaussian smoothing**
    Gaussian smoothing with per-axis sigma has effective radius ~4*max(sigma) voxels.
@@ -94,9 +94,11 @@ Programmatic:
 
 import logging
 import os
+import shutil
 from pathlib import Path
-from typing import Any, Union, Tuple
+from typing import Any
 
+import cupy as cp
 import dask
 import dask.array
 import numpy as np
@@ -105,11 +107,17 @@ import zarr
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
-from fishtools.segment.postproc3d import compute_metadata_and_adjacency, donate_small_cells, gaussian_smooth_labels_cupy, relabel_connected_components
+from fishtools.segment.postproc3d import (  # noqa: F401
+    absorb_encircled_rois,
+    compute_metadata_and_adjacency,
+    donate_small_cells,
+    gaussian_erosion_to_margin_and_scale,
+    gaussian_smooth_labels_cupy,
+    relabel_connected_components,
+)
 from fishtools.segmentation.distributed.gpu_cluster import cluster, myGPUCluster, myLocalCluster
 from fishtools.segmentation.distributed.merge_utils import (
     block_faces,
-    bounding_boxes_in_global_coordinates,
     determine_merge_relabeling,
     get_block_crops,
     get_nblocks,
@@ -122,7 +130,7 @@ logging.basicConfig(level="INFO", handlers=[RichHandler(level="INFO")])
 logger = logging.getLogger("rich")
 
 
-def _parse_sigma_option(val: str) -> Union[float, Tuple[float, float, float]]:
+def _parse_sigma_option(val: str) -> float | tuple[float, float, float]:
     """
     Parse --sigma value as either a scalar or a Z,Y,X triple.
 
@@ -149,7 +157,7 @@ def process_postproc_block(
     overlap: int,
     nblocks: NDArray[np.int_],
     postproc_kwargs: dict[str, Any],
-) -> tuple[list[NDArray[Any]], list[tuple[slice, ...]], NDArray[np.uint32]]:
+) -> tuple[list[NDArray[Any]], NDArray[np.uint32]]:
     """
     Process one block through all 4 post-processing phases.
 
@@ -189,8 +197,14 @@ def process_postproc_block(
     # 2. Run 4-phase pipeline
     # Phase 1: Gaussian smooth
     sigma = postproc_kwargs.get("sigma", 4.0)
-    bg_scale = postproc_kwargs.get("bg_scale", 1.0)
     max_expansion = postproc_kwargs.get("max_expansion", 1)
+
+    # Compute bg_scale from FWHM fraction for slight dilation (matches profile script)
+    # Use max sigma if tuple, since gaussian_erosion_to_margin_and_scale expects scalar
+    sigma_for_scale = max(sigma) if isinstance(sigma, tuple) else sigma
+    _, bg_scale = gaussian_erosion_to_margin_and_scale(sigma=sigma_for_scale, fwhm_fraction=-0.1)
+    # Allow override if explicitly provided
+    bg_scale = postproc_kwargs.get("bg_scale", bg_scale)
 
     try:
         masks = gaussian_smooth_labels_cupy(
@@ -211,6 +225,9 @@ def process_postproc_block(
             bg_scale=bg_scale,
             max_expansion=max_expansion,
         )
+
+    # Phase 1.5: Absorb encircled ROIs (per 2D slice)
+    masks = absorb_encircled_rois(masks, in_place=True)
 
     # Phase 2: Relabel connected components
     masks = relabel_connected_components(masks, in_place=True)
@@ -240,6 +257,8 @@ def process_postproc_block(
         n_labels = int(np.count_nonzero(volumes > 0))
     logger.info(f"Block {block_index}: {n_labels} labels after postproc")
 
+    del volumes, adjacency, contact_areas
+
     # 3. Remove overlaps to match distributed_segmentation behavior
     masks_cropped, crop_trimmed = remove_overlaps(
         masks,
@@ -258,12 +277,12 @@ def process_postproc_block(
     # 6. Write to output zarr
     output_zarr[crop_trimmed] = masks_global.astype(np.uint32)
 
-    # 7. Compute boxes and IDs for this block
+    # 7. Compute IDs for this block
     box_ids = np.unique(masks_global)
     box_ids = box_ids[box_ids > 0].astype(np.uint32)
-    boxes = bounding_boxes_in_global_coordinates(masks_global, crop_trimmed)
 
-    return faces, boxes, box_ids
+    cp.get_default_memory_pool().free_all_blocks()
+    return faces, box_ids
 
 
 def _copy_zarr_metadata(input_zarr: zarr.Array, output_path: Path, input_path: Path | None = None) -> None:
@@ -293,9 +312,9 @@ def distributed_postproc(
     write_path: Path | str,
     blocksize: tuple[int, ...] | None = None,
     margin: int = 100,
-    sigma: float | tuple[float, float, float] = (1.0, 2.0, 2.0),
-    V_min: int = 8000,
-    bg_scale: float = 1.0,
+    sigma: float | tuple[float, float, float] = (1.5, 3, 3),
+    V_min: int = 2000,
+    bg_scale: float | None = None,
     max_expansion: int = 1,
     min_contact_fraction: float = 0.0,
     input_path: Path | None = None,
@@ -323,12 +342,13 @@ def distributed_postproc(
         Margin parameter (in voxels) used to derive the spatial overlap
         between blocks (default 100). The actual overlap passed to
         `get_block_crops` and `remove_overlaps` is `overlap = 2*margin`.
-    sigma : float
-        Gaussian smoothing sigma (default 4.0)
+    sigma : float or tuple
+        Gaussian smoothing sigma (default (1.5, 3, 3) for ZYX)
     V_min : int
-        Minimum volume threshold for small cell donation (default 8000)
-    bg_scale : float
-        Background scale factor for Gaussian voting (default 1.0)
+        Minimum volume threshold for small cell donation (default 2000)
+    bg_scale : float, optional
+        Background scale factor for Gaussian voting. If None (default),
+        computed from sigma with fwhm_fraction=-0.1 for slight dilation.
     max_expansion : int
         Maximum expansion for Gaussian smooth (default 1)
     min_contact_fraction : float
@@ -404,13 +424,15 @@ def distributed_postproc(
     )
 
     # Prepare postproc kwargs
-    postproc_kwargs = {
+    postproc_kwargs: dict[str, Any] = {
         "sigma": sigma,
         "V_min": V_min,
-        "bg_scale": bg_scale,
         "max_expansion": max_expansion,
         "min_contact_fraction": min_contact_fraction,
     }
+    # Only include bg_scale if explicitly provided; otherwise computed from sigma
+    if bg_scale is not None:
+        postproc_kwargs["bg_scale"] = bg_scale
 
     # Map over blocks
     assert cluster is not None
@@ -433,13 +455,11 @@ def distributed_postproc(
         [fut.add_done_callback(submit) for fut in futures]
         results = cluster.client.gather(futures)
 
+    del futures
+
     # Unpack results
-    faces_list, boxes_list, box_ids_list = [], [], []
-    for faces, boxes, box_ids in results:
-        if len(box_ids) > 0:
-            faces_list.append(faces)
-            boxes_list.extend(boxes)
-            box_ids_list.append(box_ids)
+    faces_list, box_ids_list = list(zip(*results))
+    box_ids_list = [b for b in box_ids_list if len(b) > 0]
 
     if len(box_ids_list) == 0:
         logger.warning("No labels found in any block")
@@ -448,24 +468,35 @@ def distributed_postproc(
         _copy_zarr_metadata(input_zarr, write_path, input_path=input_path)
         return zarr.open(write_path, mode="r")
 
-    # Flatten faces to match block_indices
-    # faces_list contains faces for non-empty blocks only
-    # Need to match with their block_indices
-    non_empty_indices = [block_indices[i] for i, (_, _, box_ids) in enumerate(results) if len(box_ids) > 0]
+    all_box_ids = np.concatenate(box_ids_list).astype(np.uint32)
 
-    all_box_ids = np.concatenate(box_ids_list)
+    logger.info(f"Stitching {len(all_box_ids)} labels across {len(block_indices)} blocks")
 
-    logger.info(f"Stitching {len(all_box_ids)} labels across {len(non_empty_indices)} non-empty blocks")
-
-    # Determine merge relabeling
-    new_labeling = determine_merge_relabeling(non_empty_indices, faces_list, all_box_ids, compact=True)
+    # Determine merge relabeling (graph in compact label space; LUT over global IDs)
+    new_labeling = determine_merge_relabeling(
+        [(bi[0], bi[1], bi[2]) for bi in block_indices],
+        faces_list,
+        all_box_ids,
+    )
     new_labeling_path = temporary_directory / "new_labeling.npy"
     np.save(new_labeling_path, new_labeling)
 
-    logger.info(f"Relabeling to {int(new_labeling.max())} final labels")
+    # new_labeling maps global IDs -> compact component IDs; because component
+    # IDs are contiguous and background is fixed at 0, max(new_labeling) gives
+    # the number of non-background components.
+    n_final_labels = int(new_labeling.max())
+    logger.info(
+        f"Relabeling to {n_final_labels} final non-background labels (merged from {len(all_box_ids)} IDs)"
+    )
+
+    # Free memory no longer needed on the driver
+    del results, faces_list, box_ids_list, all_box_ids
 
     # Apply relabeling via dask
     relabel_and_write(temp_zarr, new_labeling_path, write_path)
+
+    # Clean up temporary directory
+    shutil.rmtree(temporary_directory, ignore_errors=True)
 
     logger.info(f"Post-processing complete. Output saved to {write_path}")
 
@@ -481,10 +512,10 @@ def main(
     input_path: Path = typer.Argument(..., help="Path to input segmentation zarr"),
     output_path: Path = typer.Option(None, help="Output path (default: input_postproc.zarr)"),
     blocksize: int = typer.Option(1024, help="XY block size for tiled processing"),
-    sigma: str = typer.Option("1,2,2", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
+    sigma: str = typer.Option("3,3,3", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
     v_min: int = typer.Option(2000, help="Minimum volume threshold for small cell donation"),
     margin: int = typer.Option(50, help="Margin parameter (overlap = 2*margin for overlap removal)"),
-    workers_per_gpu: int = typer.Option(4, help="Workers per GPU"),
+    workers_per_gpu: int = typer.Option(6, help="Workers per GPU"),
 ) -> None:
     """
     Post-process 3D segmentation masks with Gaussian smoothing and small cell donation.
@@ -514,6 +545,5 @@ def main(
 
 
 if __name__ == "__main__":
-    import cupy as cp
     cp.cuda.set_allocator(None)
     app()
