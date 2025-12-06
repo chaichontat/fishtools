@@ -23,13 +23,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tifffile
 from fishtools.segment.postproc3d import (
+    absorb_encircled_rois,
     compute_metadata_and_adjacency,
     donate_small_cells,
     gaussian_erosion_to_margin_and_scale,
     gaussian_smooth_labels,
     gaussian_smooth_labels_cupy,
     relabel_connected_components,
-)
+)  # noqa: E501
 
 # %% [markdown]
 # ## Configuration
@@ -42,9 +43,7 @@ from fishtools.segment.postproc3d import (
 #   apply a background scale factor inside `gaussian_smooth_labels`.
 
 # %%
-MASKS_PATH = (
-    "/working/20251001_JaxA3_Coro11/analysis/deconv/segment2_5d/reg-0072_masks.tif"
-)
+MASKS_PATH = "/working/20251001_JaxA3_Coro11/analysis/deconv/segment2_5d/reg-0072_masks.tif"
 V_MIN = 4000
 MIN_CONTACT_FRACTION = 0.0
 GAUSSIAN_SIGMA = 3.5  # Features smaller than ~sigma will be smoothed away
@@ -89,7 +88,6 @@ print(f"Loaded masks {masks.shape}, dtype={masks.dtype}")
 
 # %% [markdown]
 # ## Utilities
-
 
 
 # %%
@@ -186,15 +184,18 @@ print(
     f"(eroded={smooth_breakdown['n_eroded']}, flipped={smooth_breakdown['n_flipped']}, filled={smooth_breakdown['n_filled']})"
 )
 
+# Phase 1.5: Absorb encircled ROIs (per 2D slice, before relabeling)
+print("Phase 1.5: Absorbing encircled ROIs (per 2D slice)...")
+masks_absorbed = absorb_encircled_rois(masks_smooth, in_place=False)
+t15 = time.perf_counter()
+absorb_breakdown = compute_change_breakdown(masks_smooth, masks_absorbed)
+print(f"  ✓ Phase 1.5 done: {(t15 - t1) * 1000:.1f} ms (flipped={absorb_breakdown['n_flipped']})")
+
 # Phase 2: Relabel connected components (fragments get unique IDs)
 print("Phase 2: Relabeling connected components...")
-masks_relabeled = relabel_connected_components(masks_smooth, in_place=False)
+masks_relabeled = relabel_connected_components(masks_absorbed, in_place=False)
 t2 = time.perf_counter()
-# num_labels_smooth = len(np.unique(masks_smooth)) - 1  # Exclude 0
-# num_labels_relabeled = len(np.unique(masks_relabeled)) - 1
-print(
-    f"  ✓ Phase 2 done: {(t2 - t1) * 1000:.1f} ms"
-)
+print(f"  ✓ Phase 2 done: {(t2 - t15) * 1000:.1f} ms")
 
 # Phase 3: Compute metadata
 print("Phase 3: Computing metadata and adjacency...")
@@ -215,10 +216,8 @@ masks_post = donate_small_cells(
 )
 t4 = time.perf_counter()
 donate_breakdown = compute_change_breakdown(masks_relabeled, masks_post)
-print(
-    f"  ✓ Phase 4 done: {(t4 - t3) * 1000:.1f} ms (flipped={donate_breakdown['n_flipped']})"
-)
-#%%
+print(f"  ✓ Phase 4 done: {(t4 - t3) * 1000:.1f} ms (flipped={donate_breakdown['n_flipped']})")
+# %%
 # # Final summary
 print(f"\nTotal time: {(t4 - t0) * 1000:.1f} ms")
 unique_before = np.unique(masks)
@@ -288,16 +287,12 @@ plt.show()
 # %%
 # Compute breakdowns for each phase
 smooth_eroded_slice = (orig_slice > 0) & (smooth_slice == 0)
-smooth_flipped_slice = (
-    (orig_slice > 0) & (smooth_slice > 0) & (orig_slice != smooth_slice)
-)
+smooth_flipped_slice = (orig_slice > 0) & (smooth_slice > 0) & (orig_slice != smooth_slice)
 smooth_filled_slice = (orig_slice == 0) & (smooth_slice > 0)
 # Note: relabeled_slice would show different labels, but visually same regions
 # donate_flipped compares relabeled (same visual regions) to final
 relabeled_slice = masks_relabeled[z, *sl]
-donate_flipped_slice = (
-    (relabeled_slice > 0) & (post_slice > 0) & (relabeled_slice != post_slice)
-)
+donate_flipped_slice = (relabeled_slice > 0) & (post_slice > 0) & (relabeled_slice != post_slice)
 
 # Create RGB visualization
 breakdown_rgb = np.zeros((*orig_slice.shape, 3), dtype=np.uint8)
@@ -320,14 +315,17 @@ ax.axis("off")
 # plt.show()
 
 # %%
-tifffile.imwrite("/working/20251001_JaxA3_Coro11/analysis/deconv/segment2_5d/reg-0072_masksfixed.tif", masks_post.astype(np.uint16))
+tifffile.imwrite(
+    "/working/20251001_JaxA3_Coro11/analysis/deconv/segment2_5d/reg-0072_masksfixed.tif",
+    masks_post.astype(np.uint16),
+)
 # %%
 # Histogram of ROI volumes (using existing data from Phase 4)
 # volumes is already computed in Phase 3, but it's for masks_relabeled
 # We need volumes for masks_post, so recompute or use the fact that
 # donate_small_cells only reassigns labels, not creates new ones
 volumes_post, _, _ = compute_metadata_and_adjacency(masks_post)
-#%%
+# %%
 
 # fig, ax = plt.subplots(figsize=(8, 5))
 # ax.hist(volumes_post[1:][np.nonzero(volumes_post[1:])[0]], bins=50, edgecolor="black", alpha=0.7)
@@ -340,5 +338,7 @@ volumes_post, _, _ = compute_metadata_and_adjacency(masks_post)
 # plt.tight_layout()
 # plt.show()
 
-print(f"Volume stats: min={volumes_post[1:].min()}, max={volumes_post[1:].max()}, median={np.median(volumes_post[1:]):.0f}, mean={volumes_post[1:].mean():.0f}")
+print(
+    f"Volume stats: min={volumes_post[1:].min()}, max={volumes_post[1:].max()}, median={np.median(volumes_post[1:]):.0f}, mean={volumes_post[1:].mean():.0f}"
+)
 # %%

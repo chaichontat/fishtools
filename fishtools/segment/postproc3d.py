@@ -40,8 +40,8 @@ Phase 3: Compute Metadata (`compute_metadata_and_adjacency`)
     - adjacency: Which labels are 6-connected neighbors
     - contact_areas: Size of shared interface between adjacent labels (in voxel-faces)
 
-    Uses a Numba-accelerated dense contact matrix for efficiency when label count
-    is moderate (<2000 labels).
+    Uses sparse contact computation with O(B) memory where B = boundary faces,
+    instead of O(K²) dense matrix. Scales to any number of labels.
 
 Phase 4: Donate Small Cells (`donate_small_cells`)
     Removes tiny fragments by "donating" their voxels to the neighbor with largest
@@ -61,7 +61,7 @@ Additional Utilities
 Typical Usage
 -------------
 ```python
-from cellpose.postproc3d import (
+from fishtools.segment.postproc3d import (
     gaussian_smooth_labels_cupy,
     relabel_connected_components,
     compute_metadata_and_adjacency,
@@ -87,9 +87,9 @@ which applies this pipeline in a chunked/tiled manner with Dask.
 Performance Notes
 -----------------
 - `gaussian_smooth_labels_cupy` uses GPU acceleration via CuPy (~10-100x faster)
-- `_contact_matrix_numba` uses Numba JIT for efficient contact area computation
+- Contact computation uses sparse edge-list aggregation: O(B) memory, O(B log B) time
 - Memory usage is O(N) for streaming argmax in Gaussian smoothing
-- Contact matrix is O(K^2) where K = number of labels (dense matrix)
+- `absorb_encircled_rois` uses O(K) memory per slice via min/max neighbor tracking
 """
 
 import math
@@ -104,9 +104,6 @@ except NameError:  # pragma: no cover - fallback when not profiling
 
     def profile(func):
         return func
-
-
-NUMBA_MAX_LABELS_FOR_CONTACT = 10000
 
 
 def _normalize_sigma_zyx(sigma: float | Sequence[float]) -> tuple[float, float, float]:
@@ -170,7 +167,8 @@ def _contact_matrix_numba(masks: np.ndarray, max_label: int) -> np.ndarray:
                 for x in prange(xmax):
                     a = masks[z, y, x]
                     b = masks[z + dz, y + dy, x + dx]
-                    if a > 0 and b > 0 and a != b:
+                    if a != b and a > 0 and b > 0:
+                        # Label-to-label contact
                         if a < b:
                             k = a
                             neighbor_label = b
@@ -179,7 +177,251 @@ def _contact_matrix_numba(masks: np.ndarray, max_label: int) -> np.ndarray:
                             neighbor_label = a
                         contact[k, neighbor_label] += 1
                         contact[neighbor_label, k] += 1
+
     return contact
+
+
+@njit(cache=True, nogil=True, parallel=True)  # pragma: no cover
+def _count_boundary_faces(masks: np.ndarray) -> int:
+    """Count total label-to-label boundary faces (6-connected)."""
+    Z, Y, X = masks.shape
+    count = 0
+
+    # Single prange loop - count all directions per z slice
+    for z in prange(Z):
+        local = 0
+        for y in range(Y):
+            for x in range(X):
+                a = masks[z, y, x]
+                if a <= 0:
+                    continue
+                # X direction (forward only)
+                if x + 1 < X:
+                    b = masks[z, y, x + 1]
+                    if b > 0 and b != a:
+                        local += 1
+                # Y direction (forward only)
+                if y + 1 < Y:
+                    b = masks[z, y + 1, x]
+                    if b > 0 and b != a:
+                        local += 1
+                # Z direction (forward only)
+                if z + 1 < Z:
+                    b = masks[z + 1, y, x]
+                    if b > 0 and b != a:
+                        local += 1
+        count += local
+
+    return count
+
+
+@njit(cache=True, nogil=True)  # pragma: no cover
+def _collect_boundary_pairs(masks: np.ndarray, out_a: np.ndarray, out_b: np.ndarray) -> int:
+    """
+    Collect all label-to-label boundary pairs into pre-allocated arrays.
+
+    Each boundary face is recorded once with (min(a,b), max(a,b)).
+    Returns the number of pairs written.
+    """
+    Z, Y, X = masks.shape
+    idx = 0
+
+    for z in range(Z):
+        for y in range(Y):
+            for x in range(X):
+                a = masks[z, y, x]
+                if a <= 0:
+                    continue
+                # X direction (forward only)
+                if x + 1 < X:
+                    b = masks[z, y, x + 1]
+                    if b > 0 and b != a:
+                        if a < b:
+                            out_a[idx] = a
+                            out_b[idx] = b
+                        else:
+                            out_a[idx] = b
+                            out_b[idx] = a
+                        idx += 1
+                # Y direction (forward only)
+                if y + 1 < Y:
+                    b = masks[z, y + 1, x]
+                    if b > 0 and b != a:
+                        if a < b:
+                            out_a[idx] = a
+                            out_b[idx] = b
+                        else:
+                            out_a[idx] = b
+                            out_b[idx] = a
+                        idx += 1
+                # Z direction (forward only)
+                if z + 1 < Z:
+                    b = masks[z + 1, y, x]
+                    if b > 0 and b != a:
+                        if a < b:
+                            out_a[idx] = a
+                            out_b[idx] = b
+                        else:
+                            out_a[idx] = b
+                            out_b[idx] = a
+                        idx += 1
+
+    return idx
+
+
+def _aggregate_boundary_pairs(
+    pairs_a: np.ndarray,
+    pairs_b: np.ndarray,
+    max_label: int,
+) -> tuple[list[set[int]], list[dict[int, int]]]:
+    """
+    Convert edge list to adjacency sets and contact_areas dicts.
+
+    Uses lexsort + run-length encoding for O(B log B) aggregation.
+    """
+    adjacency: list[set[int]] = [set() for _ in range(max_label + 1)]
+    contact_areas: list[dict[int, int]] = [dict() for _ in range(max_label + 1)]
+
+    if len(pairs_a) == 0:
+        return adjacency, contact_areas
+
+    # Sort by (a, b) - lexsort sorts by last key first, so (pairs_b, pairs_a)
+    order = np.lexsort((pairs_b, pairs_a))
+    sorted_a = pairs_a[order]
+    sorted_b = pairs_b[order]
+
+    # Find where pairs change using diff
+    diff_a = np.diff(sorted_a)
+    diff_b = np.diff(sorted_b)
+    change_mask = (diff_a != 0) | (diff_b != 0)
+    change_idx = np.nonzero(change_mask)[0] + 1
+
+    # Run starts and lengths
+    starts = np.concatenate([[0], change_idx])
+    ends = np.concatenate([change_idx, [len(sorted_a)]])
+    counts = ends - starts
+
+    # Unique pairs
+    unique_a = sorted_a[starts]
+    unique_b = sorted_b[starts]
+
+    # Build output structures
+    for i in range(len(unique_a)):
+        a, b, c = int(unique_a[i]), int(unique_b[i]), int(counts[i])
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+        contact_areas[a][b] = c
+        contact_areas[b][a] = c
+
+    return adjacency, contact_areas
+
+
+@njit(cache=True)
+def _compute_slice_encircled_inner(
+    slice_2d,
+    neighbor_min,
+    neighbor_max,
+    touches_background,
+    touches_edge,
+    is_encircled,
+    encircling_parent,
+):
+    """JIT-compiled inner loop for encirclement detection."""
+    Y, X = slice_2d.shape
+
+    # Horizontal neighbors (4-connectivity)
+    for y in range(Y):
+        for x in range(X - 1):
+            a = slice_2d[y, x]
+            b = slice_2d[y, x + 1]
+            if a != b:
+                if a > 0 and b > 0:
+                    if b < neighbor_min[a]:
+                        neighbor_min[a] = b
+                    if b > neighbor_max[a]:
+                        neighbor_max[a] = b
+                    if a < neighbor_min[b]:
+                        neighbor_min[b] = a
+                    if a > neighbor_max[b]:
+                        neighbor_max[b] = a
+                elif a > 0:
+                    touches_background[a] = True
+                elif b > 0:
+                    touches_background[b] = True
+
+    # Vertical neighbors (4-connectivity)
+    for y in range(Y - 1):
+        for x in range(X):
+            a = slice_2d[y, x]
+            b = slice_2d[y + 1, x]
+            if a != b:
+                if a > 0 and b > 0:
+                    if b < neighbor_min[a]:
+                        neighbor_min[a] = b
+                    if b > neighbor_max[a]:
+                        neighbor_max[a] = b
+                    if a < neighbor_min[b]:
+                        neighbor_min[b] = a
+                    if a > neighbor_max[b]:
+                        neighbor_max[b] = a
+                elif a > 0:
+                    touches_background[a] = True
+                elif b > 0:
+                    touches_background[b] = True
+
+    # Edge detection: y=0, y=Y-1, x=0, x=X-1
+    for x in range(X):
+        if slice_2d[0, x] > 0:
+            touches_edge[slice_2d[0, x]] = True
+        if slice_2d[Y - 1, x] > 0:
+            touches_edge[slice_2d[Y - 1, x]] = True
+    for y in range(Y):
+        if slice_2d[y, 0] > 0:
+            touches_edge[slice_2d[y, 0]] = True
+        if slice_2d[y, X - 1] > 0:
+            touches_edge[slice_2d[y, X - 1]] = True
+
+    # Determine encirclement: exactly one neighbor, no bg/edge contact
+    max_label = len(neighbor_min) - 1
+    for k in range(1, max_label + 1):
+        if touches_background[k] or touches_edge[k]:
+            continue
+        if neighbor_min[k] == neighbor_max[k] and neighbor_min[k] > 0:
+            is_encircled[k] = True
+            encircling_parent[k] = neighbor_min[k]
+
+
+def _compute_slice_encircled_numba(
+    slice_2d: np.ndarray,
+    max_label: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute encirclement info for a single slice (4-connected).
+
+    Uses O(K) memory instead of O(K²) by tracking min/max neighbors.
+    A label is encircled if neighbor_min == neighbor_max (exactly one neighbor)
+    and it doesn't touch background or edge.
+    """
+    INT32_MAX = 2147483647
+
+    neighbor_min = np.full(max_label + 1, INT32_MAX, dtype=np.int32)
+    neighbor_max = np.zeros(max_label + 1, dtype=np.int32)
+    touches_background = np.zeros(max_label + 1, dtype=np.bool_)
+    touches_edge = np.zeros(max_label + 1, dtype=np.bool_)
+    is_encircled = np.zeros(max_label + 1, dtype=np.bool_)
+    encircling_parent = np.zeros(max_label + 1, dtype=np.int32)
+
+    _compute_slice_encircled_inner(
+        slice_2d,
+        neighbor_min,
+        neighbor_max,
+        touches_background,
+        touches_edge,
+        is_encircled,
+        encircling_parent,
+    )
+
+    return is_encircled, encircling_parent
 
 
 @profile
@@ -188,12 +430,11 @@ def compute_metadata_and_adjacency(
     compute_contact_areas: bool = True,
 ) -> tuple[np.ndarray, list[set[int]], list[dict[int, int]]]:
     """
-    Phase 1 helper: compute per-label volumes and a 3D adjacency graph.
+    Phase 3 helper: compute per-label volumes and adjacency graph.
 
     This operates on the 3D label volume produced by
     ``resize_and_compute_masks(..., do_3D=True)`` and is designed to be
-    the first, performance-measurable step in a phased 3D mask
-    post-processing pipeline.
+    a performance-measurable step in a phased 3D mask post-processing pipeline.
 
     Parameters
     ----------
@@ -232,68 +473,31 @@ def compute_metadata_and_adjacency(
         return volumes, adjacency, contact_areas
 
     if not compute_contact_areas:
-        # Caller only requested volumes; adjacency/contact_areas stay empty.
         return volumes, adjacency, contact_areas
-
-    # Get unique labels (excluding background 0) from volumes array
-    # This is O(K) vs O(N log N) for np.unique on the full volume
-    unique_labels = np.nonzero(volumes)[0]
-    unique_labels = unique_labels[unique_labels != 0]
-    n_labels = len(unique_labels)
-
-    # Check against limit using actual label count, not max ID
-    if n_labels > NUMBA_MAX_LABELS_FOR_CONTACT:
-        raise ValueError(
-            f"n_labels={n_labels} exceeds NUMBA_MAX_LABELS_FOR_CONTACT={NUMBA_MAX_LABELS_FOR_CONTACT}"
-        )
 
     if not np.issubdtype(masks.dtype, np.integer):
         raise ValueError("masks must have an integer dtype for contact area computation")
 
-    # Create compact labeling if max_label exceeds limit but n_labels doesn't
-    compact_to_label: dict[int, int] | None = None
-    if max_label > NUMBA_MAX_LABELS_FOR_CONTACT:
-        # Map: original_label -> compact_label (1-indexed)
-        label_to_compact = {int(lbl): i + 1 for i, lbl in enumerate(unique_labels)}
-        compact_to_label = {i + 1: int(lbl) for i, lbl in enumerate(unique_labels)}
+    # Sparse contact computation: O(B) memory instead of O(K²)
+    # Phase 1: Count boundary faces (parallel)
+    masks_int = masks.astype(np.int32, copy=False)
+    n_boundary = _count_boundary_faces(masks_int)
 
-        # Relabel masks to compact form using vectorized lookup
-        lookup = np.zeros(max_label + 1, dtype=np.int32)
-        for orig, compact in label_to_compact.items():
-            lookup[orig] = compact
-        masks_compact = lookup[masks]
+    if n_boundary == 0:
+        return volumes, adjacency, contact_areas
 
-        masks_for_contact = masks_compact
-        compact_max_label = n_labels
-    else:
-        masks_for_contact = masks
-        compact_max_label = max_label
+    # Phase 2: Collect boundary pairs (sequential but cache-friendly)
+    pairs_a = np.empty(n_boundary, dtype=np.int32)
+    pairs_b = np.empty(n_boundary, dtype=np.int32)
+    n_written = _collect_boundary_pairs(masks_int, pairs_a, pairs_b)
 
-    masks_int = masks_for_contact.astype(np.int32, copy=False)
-    contact_mat = _contact_matrix_numba(masks_int, compact_max_label)
+    # Trim to actual size (should match, but be safe)
+    if n_written < n_boundary:
+        pairs_a = pairs_a[:n_written]
+        pairs_b = pairs_b[:n_written]
 
-    for k in range(1, compact_max_label + 1):
-        row = contact_mat[k]
-        neighbors = np.nonzero(row)[0]
-        if neighbors.size == 0:
-            continue
-        for neighbor_label in neighbors:
-            if neighbor_label == 0 or neighbor_label == k:
-                continue
-            v = int(row[neighbor_label])
-            if v <= 0:
-                continue
-
-            # Map back to original labels if we used compact labeling
-            if compact_to_label is not None:
-                orig_k = compact_to_label[k]
-                orig_neighbor = compact_to_label[neighbor_label]
-            else:
-                orig_k = k
-                orig_neighbor = neighbor_label
-
-            adjacency[orig_k].add(orig_neighbor)
-            contact_areas[orig_k][orig_neighbor] = v
+    # Phase 3: Aggregate to adjacency/contact_areas using NumPy (O(B log B))
+    adjacency, contact_areas = _aggregate_boundary_pairs(pairs_a, pairs_b, max_label)
 
     return volumes, adjacency, contact_areas
 
@@ -404,6 +608,53 @@ def donate_small_cells(
     # non-small labels, so this is equivalent to selectively updating
     # only small labels but avoids the costly np.isin over the volume.
     masks_out[...] = remap[masks_out]
+
+    return masks_out
+
+
+@profile
+def absorb_encircled_rois(masks, in_place=True):
+    """
+    Absorb ROIs encircled by a single parent in each 2D slice.
+
+    For each z-slice independently: if label k only touches one other
+    label p in that slice (via 4-connectivity), and k doesn't touch
+    background or the xy edges in that slice, then k's voxels in that
+    slice are absorbed into p.
+
+    This allows partial absorption - the same ROI can be absorbed in
+    some slices but not others.
+
+    Parameters
+    ----------
+    masks
+        3D integer label volume, shape (Z, Y, X), background = 0.
+        Labels should be sequential (1, 2, 3, ...). Large label values
+        (e.g., bitmask-encoded) will cause O(max_label) memory allocation.
+    in_place
+        When True, modify ``masks`` in place; otherwise operate on a copy.
+
+    Returns
+    -------
+    np.ndarray
+        Label volume with encircled ROIs absorbed per slice.
+    """
+    masks_out = masks if in_place else masks.copy()
+    Z, _, _ = masks_out.shape
+
+    for z in range(Z):
+        slice_2d = masks_out[z]
+        max_label = int(slice_2d.max())
+        if max_label == 0:
+            continue
+
+        is_encircled, encircling_parent = _compute_slice_encircled_numba(
+            slice_2d.astype(np.int32, copy=False), max_label
+        )
+
+        remap = np.arange(max_label + 1, dtype=slice_2d.dtype)
+        remap[is_encircled] = encircling_parent[is_encircled]
+        slice_2d[...] = remap[slice_2d]
 
     return masks_out
 
@@ -829,11 +1080,12 @@ def gaussian_smooth_labels(
     margin = int(np.ceil(4 * sigma_max))
 
     for k in range(1, max_label + 1):
-        if slices_list[k - 1] is None:
+        sl = slices_list[k - 1] if k - 1 < len(slices_list) else None
+        if sl is None:
             continue
 
         # Expand bounding box by margin
-        base_slices = slices_list[k - 1]
+        base_slices = sl
         exp_slices = tuple(
             slice(max(0, s.start - margin), min(dim, s.stop + margin))
             for s, dim in zip(base_slices, masks_out.shape)
@@ -849,7 +1101,9 @@ def gaussian_smooth_labels(
         update = local_score > local_best
 
         # Update result and best_score in expanded region
-        result[exp_slices] = np.where(update, k, result[exp_slices])
+        result_slice = result[exp_slices]
+        result_slice = np.where(update, k, result_slice)
+        result[exp_slices] = result_slice
         best_score[exp_slices] = np.maximum(local_best, local_score)
 
     # Constrain result to dilated original foreground
@@ -949,11 +1203,13 @@ def gaussian_smooth_labels_cupy(
     # Background: full volume convolution on device
     bg_indicator = (masks_dev == 0).astype(cp.float32)
     bg_score = cp_gaussian_filter(bg_indicator, sigma_zyx)
+    del bg_indicator
     if bg_scale != 1.0:
         bg_score *= float(bg_scale)
     update = bg_score > best_score
     result[update] = 0
     best_score[update] = bg_score[update]
+    del bg_score, update
 
     # Gaussian extends ~4σ effectively along each axis; use the largest
     # sigma to derive a scalar margin for bounding box expansion.
@@ -993,7 +1249,7 @@ def gaussian_smooth_labels_cupy(
 
     # Copy result back to host, then drop large device arrays so they can be freed.
     result_host = cp.asnumpy(result).astype(masks_host.dtype, copy=False)
-    del result, best_score, masks_dev, original_foreground, dilated_constraint, bg_indicator, bg_score
+    del result, best_score, masks_dev, original_foreground, dilated_constraint
 
     if in_place:
         masks[:] = result_host
@@ -1026,7 +1282,7 @@ def gaussian_erosion_to_margin_and_scale(
     * ``erosion_voxels``: target erosion distance in voxels along the
       boundary normal.
     * ``fwhm_fraction``: target erosion as a fraction of the Gaussian
-      FWHM radius (~2.355 * sigma). This is independent of ``sigma``.
+      FWHM radius (~2.355 * sigma).
 
     It returns two quantities for that target erosion:
 
@@ -1121,7 +1377,7 @@ def relabel_connected_components(
     masks : np.ndarray
         3D integer label volume, background = 0.
     in_place : bool
-        Modify masks in place or return copy.
+        When True, modify ``masks`` in place; otherwise operate on a copy.
 
     Returns
     -------

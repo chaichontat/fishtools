@@ -69,9 +69,14 @@ def determine_merge_relabeling(
     # background), build the graph there, then expand back to a LUT over
     # global IDs.
     unique_labels = np.unique(used_labels)
+
+    t0 = time.perf_counter()
     faces_paired = adjacent_faces(block_indices, faces)
+    logger.info(f"[timing] adjacent_faces: {time.perf_counter() - t0:.2f}s ({len(faces_paired)} face pairs)")
 
     label_groups = block_face_adjacency_graph(faces_paired, unique_labels, pre_shrunk=pre_shrunk)
+
+    t0 = time.perf_counter()
     components = scipy.sparse.csgraph.connected_components(label_groups, directed=False)[1]
     # components has length N_labels + 1. Index 0 is the background node
     # (no edges); indices 1..N correspond to unique_labels[0..N-1].
@@ -244,11 +249,6 @@ def global_segment_ids(
     ValueError
         If block index or label count exceeds the bit allocation.
     """
-    unique, unique_inverse = np.unique(segmentation, return_inverse=True)
-    # Downcast unique_inverse from int64 to int32 to save memory
-    # (tiles always have <2^31 elements, so int32 is sufficient)
-    unique_inverse = unique_inverse.astype(np.int32)
-
     block_token = int(np.ravel_multi_index(block_index, tuple(nblocks.tolist())))
     max_blocks = 1 << (32 - label_bits)
     max_labels = 1 << label_bits
@@ -258,20 +258,23 @@ def global_segment_ids(
             f"Block index {block_token} exceeds max {max_blocks - 1} with {label_bits} label bits. "
             f"Consider reducing label_bits or using fewer/larger blocks."
         )
-    if len(unique) > max_labels:
+
+    # Assume labels are sequential 0..max_label (from prior relabeling in postproc).
+    # This avoids O(N log N) np.unique on 51M elements, making this O(N).
+    max_label = int(segmentation.max())
+    if max_label >= max_labels:
         raise ValueError(
-            f"Label count {len(unique)} exceeds max {max_labels} with {label_bits} label bits. "
+            f"Label count {max_label} exceeds max {max_labels} with {label_bits} label bits. "
             f"Consider increasing label_bits or using smaller blocks."
         )
 
-    # Pack: upper bits = block index, lower bits = sequential label index
-    # Use sequential indices (0, 1, 2, ...) for labels to ensure no collisions
-    # Vectorized: create remap array directly instead of Python loop
-    remap = np.arange(len(unique), dtype=np.uint32) | np.uint32(block_token << label_bits)
-    if unique[0] == 0:
-        remap[0] = 0  # Background stays 0
+    # Pack: upper bits = block index, lower bits = label value directly
+    # Since labels are sequential, we can index directly without unique_inverse
+    remap = np.arange(max_label + 1, dtype=np.uint32) | np.uint32(block_token << label_bits)
+    remap[0] = 0  # Background stays 0
 
-    segmentation_global = remap[unique_inverse.reshape(segmentation.shape)]
+    # Direct indexing - O(N) instead of O(N log N)
+    segmentation_global = remap[segmentation.ravel()].reshape(segmentation.shape)
     return segmentation_global, remap
 
 

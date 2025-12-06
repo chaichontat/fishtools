@@ -92,20 +92,19 @@ Programmatic:
     result = distributed_postproc(input_zarr, write_path, sigma=(1, 2, 2), V_min=8000, ...)
 """
 
-import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
 import cupy as cp
-import dask
 import dask.array
 import numpy as np
 import typer
 import zarr
+from loguru import logger
 from numpy.typing import NDArray
-from rich.logging import RichHandler
 
 from fishtools.segment.postproc3d import (  # noqa: F401
     absorb_encircled_rois,
@@ -125,9 +124,9 @@ from fishtools.segmentation.distributed.merge_utils import (
     relabel_and_write,
     remove_overlaps,
 )
+from fishtools.utils.logging import setup_cli_logging
 
-logging.basicConfig(level="INFO", handlers=[RichHandler(level="INFO")])
-logger = logging.getLogger("rich")
+setup_cli_logging(None, component="distributed_postproc", file="")
 
 
 def _parse_sigma_option(val: str) -> float | tuple[float, float, float]:
@@ -185,14 +184,39 @@ def process_postproc_block(
     tuple[list[NDArray], list[tuple[slice, ...]], NDArray[np.uint32]]
         (faces, boxes, box_ids) for stitching
     """
-    logger.info(f"Processing block {block_index}")
+    t_block_start = time.perf_counter()
+    logger.debug(f"Processing block {block_index}")
 
     # 1. Read chunk
+    t0 = time.perf_counter()
     masks = np.asarray(input_zarr[crop])
+    t_read = time.perf_counter()
+    logger.debug(f"  Block {block_index}: read {masks.shape} in {(t_read - t0) * 1000:.1f} ms")
+    logger.debug(
+        f"  Block {block_index}: dtype={masks.dtype}, contiguous={masks.flags.c_contiguous}, "
+        f"strides={masks.strides}, max_label={int(masks.max())}"
+    )
 
     # Ensure integer dtype
     if not np.issubdtype(masks.dtype, np.integer):
         masks = masks.astype(np.int32)
+
+    # Relabel to sequential values for efficient processing.
+    # Input from distributed_segmentation has sparse bit-packed global IDs which
+    # cause O(max_label) allocations in postproc functions. Sequential labels
+    # reduce max_label from millions to the actual label count (~1000).
+    # Use CuPy for fast GPU-accelerated unique (~100ms vs 4-8s on CPU).
+    max_label_before = int(masks.max())
+    t_relabel = time.perf_counter()
+    masks_gpu = cp.asarray(masks)
+    _, inverse = cp.unique(masks_gpu, return_inverse=True)
+    masks = cp.asnumpy(inverse.reshape(masks.shape)).astype(np.int32)
+    del masks_gpu, inverse
+    t_relabel_done = time.perf_counter()
+    logger.debug(
+        f"  Block {block_index}: relabeled {max_label_before} -> {int(masks.max())} "
+        f"in {(t_relabel_done - t_relabel) * 1000:.1f} ms"
+    )
 
     # 2. Run 4-phase pipeline
     # Phase 1: Gaussian smooth
@@ -206,6 +230,7 @@ def process_postproc_block(
     # Allow override if explicitly provided
     bg_scale = postproc_kwargs.get("bg_scale", bg_scale)
 
+    t1 = time.perf_counter()
     try:
         masks = gaussian_smooth_labels_cupy(
             masks,
@@ -225,20 +250,37 @@ def process_postproc_block(
             bg_scale=bg_scale,
             max_expansion=max_expansion,
         )
+    t_phase1 = time.perf_counter()
+    logger.debug(f"  Block {block_index}: Phase 1 (gaussian_smooth) in {(t_phase1 - t1) * 1000:.1f} ms")
+    logger.debug(f"  Block {block_index}: max_label after Phase 1 = {int(masks.max())}")
 
     # Phase 1.5: Absorb encircled ROIs (per 2D slice)
+    t15_start = time.perf_counter()
     masks = absorb_encircled_rois(masks, in_place=True)
+    t_phase15 = time.perf_counter()
+    logger.debug(
+        f"  Block {block_index}: Phase 1.5 (absorb_encircled) in {(t_phase15 - t15_start) * 1000:.1f} ms"
+    )
+    logger.debug(f"  Block {block_index}: max_label after Phase 1.5 = {int(masks.max())}")
 
     # Phase 2: Relabel connected components
+    t2_start = time.perf_counter()
     masks = relabel_connected_components(masks, in_place=True)
+    t_phase2 = time.perf_counter()
+    logger.debug(f"  Block {block_index}: Phase 2 (relabel_cc) in {(t_phase2 - t2_start) * 1000:.1f} ms")
+    logger.debug(f"  Block {block_index}: max_label after Phase 2 = {int(masks.max())}")
 
     # Phase 3: Compute metadata
     V_min = postproc_kwargs.get("V_min", 8000)
     min_contact_fraction = postproc_kwargs.get("min_contact_fraction", 0.0)
 
+    t3_start = time.perf_counter()
     volumes, adjacency, contact_areas = compute_metadata_and_adjacency(masks)
+    t_phase3 = time.perf_counter()
+    logger.debug(f"  Block {block_index}: Phase 3 (metadata) in {(t_phase3 - t3_start) * 1000:.1f} ms")
 
     # Phase 4: Donate small cells
+    t4_start = time.perf_counter()
     masks = donate_small_cells(
         masks,
         volumes=volumes,
@@ -248,6 +290,8 @@ def process_postproc_block(
         min_contact_fraction=min_contact_fraction,
         in_place=True,
     )
+    t_phase4 = time.perf_counter()
+    logger.debug(f"  Block {block_index}: Phase 4 (donate_small) in {(t_phase4 - t4_start) * 1000:.1f} ms")
 
     if V_min > 0:
         # After donation, only labels with volume >= V_min remain.
@@ -255,38 +299,79 @@ def process_postproc_block(
     else:
         # No donation happened; all non-zero volumes remain as labels.
         n_labels = int(np.count_nonzero(volumes > 0))
-    logger.info(f"Block {block_index}: {n_labels} labels after postproc")
+    logger.debug(f"  Block {block_index}: {n_labels} labels after postproc")
 
     del volumes, adjacency, contact_areas
 
     # 3. Remove overlaps to match distributed_segmentation behavior
+    t_overlap_start = time.perf_counter()
     masks_cropped, crop_trimmed = remove_overlaps(
         masks,
         crop,
         overlap,
         blocksize,
     )
+    # Make masks_cropped independent so we can free the original masks array
+    masks_cropped = masks_cropped.copy()
+    del masks
     crop_trimmed = tuple(crop_trimmed)
+    t_overlap = time.perf_counter()
+    logger.debug(f"  Block {block_index}: remove_overlaps in {(t_overlap - t_overlap_start) * 1000:.1f} ms")
 
-    # 4. Assign globally unique IDs
-    masks_global, _ = global_segment_ids(masks_cropped, block_index, nblocks)
+    # 4. Find existing local labels (O(N) via bincount, output size = max_label)
+    # Do this BEFORE global_segment_ids to avoid O(N log N) unique on huge IDs
+    t_unique_start = time.perf_counter()
+    max_local = int(masks_cropped.max())
+    counts = np.bincount(masks_cropped.ravel(), minlength=max_local + 1)
+    local_ids = np.nonzero(counts)[0]
+    local_ids = local_ids[local_ids > 0]  # Exclude background
+    t_unique = time.perf_counter()
+    logger.debug(f"  Block {block_index}: find local IDs in {(t_unique - t_unique_start) * 1000:.1f} ms")
 
-    # 5. Extract faces for stitching
-    faces = block_faces(masks_global)
+    # 5. Assign globally unique IDs
+    t_global_start = time.perf_counter()
+    masks_global, remap = global_segment_ids(masks_cropped, block_index, nblocks)
+    del masks_cropped  # No longer needed after global_segment_ids
+    # Convert local IDs to global IDs using remap
+    box_ids = remap[local_ids].astype(np.uint32)
+    t_global = time.perf_counter()
+    logger.debug(f"  Block {block_index}: global_segment_ids in {(t_global - t_global_start) * 1000:.1f} ms")
 
-    # 6. Write to output zarr
-    output_zarr[crop_trimmed] = masks_global.astype(np.uint32)
+    # 6. Extract faces for stitching
+    # Pre-shrink faces here to parallelize the expensive distance_transform_edt
+    # calls across workers (instead of doing it on the driver).
+    # Note: shrink_labels already returns independent copies (not views), so no
+    # additional .copy() is needed when shrink=True.
+    t_faces_start = time.perf_counter()
+    faces = block_faces(masks_global, shrink=True)
+    t_faces = time.perf_counter()
+    logger.debug(f"  Block {block_index}: block_faces in {(t_faces - t_faces_start) * 1000:.1f} ms")
 
-    # 7. Compute IDs for this block
-    box_ids = np.unique(masks_global)
-    box_ids = box_ids[box_ids > 0].astype(np.uint32)
+    # 7. Write to output zarr (masks_global is already uint32 from global_segment_ids)
+    t_write_start = time.perf_counter()
+    output_zarr[crop_trimmed] = masks_global
+    del masks_global
+    t_write = time.perf_counter()
+    logger.debug(f"  Block {block_index}: write zarr in {(t_write - t_write_start) * 1000:.1f} ms")
+
+    t_block_end = time.perf_counter()
+    logger.debug(
+        f"  Block {block_index}: TOTAL {(t_block_end - t_block_start) * 1000:.1f} ms "
+        f"(phases: {(t_phase4 - t1) * 1000:.1f} ms, overhead: {((t_block_end - t_block_start) - (t_phase4 - t1)) * 1000:.1f} ms)"
+    )
 
     cp.get_default_memory_pool().free_all_blocks()
     return faces, box_ids
 
 
-def _copy_zarr_metadata(input_zarr: zarr.Array, output_path: Path, input_path: Path | None = None) -> None:
-    """Copy metadata from input zarr to output zarr, including source mtime."""
+def _copy_zarr_metadata(
+    input_zarr: zarr.Array,
+    output_path: Path,
+    input_path: Path | None = None,
+    nblocks: tuple[int, ...] | None = None,
+    mapping_filename: str | None = None,
+) -> None:
+    """Copy metadata from input zarr to output zarr, including source mtime and label mapping info."""
     output_zarr = zarr.open(output_path, mode="r+")
 
     # Copy all attributes from input
@@ -304,6 +389,15 @@ def _copy_zarr_metadata(input_zarr: zarr.Array, output_path: Path, input_path: P
 
     # Add processing metadata
     output_zarr.attrs["postproc_version"] = "distributed_postproc_v1"
+
+    # Add label mapping metadata if provided
+    if mapping_filename is not None and nblocks is not None:
+        output_zarr.attrs["label_mapping"] = {
+            "file": mapping_filename,
+            "label_bits": 16,
+            "nblocks": list(nblocks),
+            "decode_global_id": "local = gid & 0xFFFF; block_token = gid >> 16; block_idx = np.unravel_index(block_token, nblocks)",
+        }
 
 
 @cluster
@@ -414,12 +508,7 @@ def distributed_postproc(
         dtype=np.uint32,
         codecs=[
             zarr.codecs.BytesCodec(),
-            zarr.codecs.BloscCodec(
-                cname="zstd",
-                clevel=4,
-                shuffle=zarr.codecs.BloscShuffle.shuffle,
-                typesize=2,
-            ),
+            zarr.codecs.BloscCodec(cname="zstd", clevel=4, shuffle=zarr.codecs.BloscShuffle.shuffle),
         ],
     )
 
@@ -434,8 +523,15 @@ def distributed_postproc(
     if bg_scale is not None:
         postproc_kwargs["bg_scale"] = bg_scale
 
+    # Shuffle block order for better load balancing across workers
+    rng = np.random.default_rng(42)
+    shuffle_idx = rng.permutation(len(block_indices))
+    block_indices = [block_indices[i] for i in shuffle_idx]
+    block_crops = [block_crops[i] for i in shuffle_idx]
+
     # Map over blocks
     assert cluster is not None
+    t_submit = time.perf_counter()
     futures = cluster.client.map(
         process_postproc_block,
         block_indices,
@@ -447,19 +543,30 @@ def distributed_postproc(
         nblocks=nblocks,
         postproc_kwargs=postproc_kwargs,
     )
+    logger.debug(f"[timing] submit: {time.perf_counter() - t_submit:.2f}s")
 
     # Gather results
     from fishtools.utils.pretty_print import progress_bar
 
+    t_gather = time.perf_counter()
     with progress_bar(len(block_indices)) as submit:
         [fut.add_done_callback(submit) for fut in futures]
         results = cluster.client.gather(futures)
+    gather_time = time.perf_counter() - t_gather
+    logger.debug(f"[timing] gather: {gather_time:.2f}s")
 
     del futures
 
     # Unpack results
     faces_list, box_ids_list = list(zip(*results))
     box_ids_list = [b for b in box_ids_list if len(b) > 0]
+
+    # Calculate face data size for profiling
+    total_face_bytes = sum(sum(f.nbytes for f in faces) for faces in faces_list)
+    logger.debug(
+        f"[timing] face_data: {total_face_bytes / 1e6:.1f} MB "
+        f"({total_face_bytes / 1e6 / gather_time:.1f} MB/s)"
+    )
 
     if len(box_ids_list) == 0:
         logger.warning("No labels found in any block")
@@ -473,11 +580,16 @@ def distributed_postproc(
     logger.info(f"Stitching {len(all_box_ids)} labels across {len(block_indices)} blocks")
 
     # Determine merge relabeling (graph in compact label space; LUT over global IDs)
+    # pre_shrunk=True because workers already shrunk faces in block_faces(shrink=True)
+    t_stitch = time.perf_counter()
     new_labeling = determine_merge_relabeling(
         [(bi[0], bi[1], bi[2]) for bi in block_indices],
         faces_list,
         all_box_ids,
+        pre_shrunk=True,
     )
+    logger.debug(f"[timing] stitch (determine_merge_relabeling): {time.perf_counter() - t_stitch:.2f}s")
+
     new_labeling_path = temporary_directory / "new_labeling.npy"
     np.save(new_labeling_path, new_labeling)
 
@@ -493,14 +605,28 @@ def distributed_postproc(
     del results, faces_list, box_ids_list, all_box_ids
 
     # Apply relabeling via dask
+    t_relabel = time.perf_counter()
     relabel_and_write(temp_zarr, new_labeling_path, write_path)
+    logger.debug(f"[timing] relabel_and_write: {time.perf_counter() - t_relabel:.2f}s")
+
+    # Copy label mapping to sidecar file before temp dir cleanup
+    mapping_filename = f"{write_path.stem}_label_mapping.npy"
+    mapping_path = write_path.parent / mapping_filename
+    shutil.copy(new_labeling_path, mapping_path)
+    logger.info(f"Saved label mapping to {mapping_path}")
 
     # Clean up temporary directory
     shutil.rmtree(temporary_directory, ignore_errors=True)
 
     logger.info(f"Post-processing complete. Output saved to {write_path}")
 
-    _copy_zarr_metadata(input_zarr, write_path, input_path=input_path)
+    _copy_zarr_metadata(
+        input_zarr,
+        write_path,
+        input_path=input_path,
+        nblocks=tuple(nblocks.tolist()),
+        mapping_filename=mapping_filename,
+    )
 
 
 # CLI
@@ -515,7 +641,7 @@ def main(
     sigma: str = typer.Option("3,3,3", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
     v_min: int = typer.Option(2000, help="Minimum volume threshold for small cell donation"),
     margin: int = typer.Option(50, help="Margin parameter (overlap = 2*margin for overlap removal)"),
-    workers_per_gpu: int = typer.Option(6, help="Workers per GPU"),
+    workers_per_gpu: int = typer.Option(4, help="Workers per GPU"),
 ) -> None:
     """
     Post-process 3D segmentation masks with Gaussian smoothing and small cell donation.

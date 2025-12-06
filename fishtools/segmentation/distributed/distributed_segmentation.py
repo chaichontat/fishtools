@@ -274,7 +274,7 @@ def numpy_array_to_zarr(write_path: Path | str, array: NDArray[Any], chunks: tup
                 cname="zstd",
                 clevel=4,
                 shuffle=zarr.codecs.BloscShuffle.shuffle,
-                typesize=2,
+                typesize=array.dtype.itemsize,
             ),
         ],
     )
@@ -826,7 +826,6 @@ def distributed_eval(
     except Exception as e:
         logger.warning("GPU probe failed: %s", e)
 
-
     offset = 0
     n = None
 
@@ -893,7 +892,9 @@ def distributed_eval(
             preprocessing_steps,
         )
         completed_indices = load_checkpoint(checkpoint_path)
-        logger.info(f"Resuming: {len(completed_indices)} of {len(final_block_indices)} blocks already completed")
+        logger.info(
+            f"Resuming: {len(completed_indices)} of {len(final_block_indices)} blocks already completed"
+        )
     else:
         save_run_config(
             run_config_path,
@@ -915,7 +916,9 @@ def distributed_eval(
             remaining_block_indices.append(idx)
             remaining_block_crops.append(crop)
 
-    logger.info(f"Blocks to process: {len(remaining_block_indices)} (skipped {len(completed_indices)} already completed)")
+    logger.info(
+        f"Blocks to process: {len(remaining_block_indices)} (skipped {len(completed_indices)} already completed)"
+    )
 
     zarr.config.set({"array.target_shard_size_bytes": "10MB"})
     temp_zarr = zarr.open(
@@ -1011,7 +1014,9 @@ def distributed_eval(
     np.save(new_labeling_path, new_labeling)
 
     n_final_labels = int(new_labeling.max())
-    logger.info(f"Relabeling to {n_final_labels} final non-background labels (merged from {len(box_ids)} IDs)")
+    logger.info(
+        f"Relabeling to {n_final_labels} final non-background labels (merged from {len(box_ids)} IDs)"
+    )
 
     # stitching step is cheap, we should release gpus and use small workers
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
@@ -1077,7 +1082,9 @@ def stitch_segmentation(
     np.save(new_labeling_path, new_labeling)
 
     n_final_labels = int(new_labeling.max())
-    logger.info(f"Relabeling to {n_final_labels} final non-background labels (merged from {len(box_ids)} IDs)")
+    logger.info(
+        f"Relabeling to {n_final_labels} final non-background labels (merged from {len(box_ids)} IDs)"
+    )
 
     # Apply relabeling
     t0 = time.perf_counter()
@@ -1235,10 +1242,12 @@ def run(
         "threads_per_worker": int(threads_per_worker),
     }
     if use_localcuda and workers_per_gpu <= 1:
-        local_cluster_kwargs.update({
-            "use_localcuda": True,
-            "n_workers": n_workers,
-        })
+        local_cluster_kwargs.update(
+            {
+                "use_localcuda": True,
+                "n_workers": n_workers,
+            }
+        )
 
     preprocessing_pipeline = [(unsharp_all, {})]
 
@@ -1294,7 +1303,9 @@ def run(
             bx,
             len(channels_list),
         )  # ZYXc tuned for SAM
-        logger.info(f"SAM backend: target tiles (ny={ny_target}, nx={nx_target}) → internal size ({Ly_internal}x{Lx_internal}) → blocksize ({by}x{bx})")
+        logger.info(
+            f"SAM backend: target tiles (ny={ny_target}, nx={nx_target}) → internal size ({Ly_internal}x{Lx_internal}) → blocksize ({by}x{bx})"
+        )
     normalization_path = base_dir / "normalization.json"
     normalization = read_normalization_cache(normalization_path)
     lowhigh_selected: NDArray[np.float64] | None = None
