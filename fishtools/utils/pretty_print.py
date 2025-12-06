@@ -27,15 +27,7 @@ from rich.progress import (
 )
 from rich.syntax import Syntax
 
-from fishtools.utils.logging import CONSOLE_SKIP_EXTRA
-
-# A single console shared by progress bars and any ad-hoc prints while a Live display is active.
-# Using the same Console prevents duplicate/redrawn bars when printing logs.
-_SHARED_CONSOLE = Console()
-
-
-def get_shared_console() -> Console:
-    return _SHARED_CONSOLE
+from fishtools.utils.logging import CONSOLE_SKIP_EXTRA, get_shared_console
 
 
 class _StepStats:
@@ -175,7 +167,7 @@ def progress_bar(
     if step_stats:
         columns += [TextColumn("•"), StepStatsColumn(stats, windows=step_stats)]
 
-    with Progress(*columns, console=_SHARED_CONSOLE) as p:
+    with Progress(*columns, console=get_shared_console()) as p:
         lock = threading.RLock()
         track = iter(p.track(range(n)))
         primed = False

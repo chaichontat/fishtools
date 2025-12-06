@@ -7,10 +7,24 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
+from rich.console import Console
 
 from fishtools.io.workspace import Workspace
 
 CONSOLE_SKIP_EXTRA = "_skip_console_sink"
+
+# Shared console for progress-bar-aware logging.
+# Using the same Console for logs and progress bars prevents duplicate redraws.
+_SHARED_CONSOLE: Console | None = None
+
+
+def get_shared_console() -> Console:
+    """Return the shared Rich Console, creating it lazily."""
+    global _SHARED_CONSOLE
+    if _SHARED_CONSOLE is None:
+        _SHARED_CONSOLE = Console()
+    return _SHARED_CONSOLE
+
 
 # Unified log line format for console and file sinks
 _DEFAULT_LOGGER_FORMAT = (
@@ -66,8 +80,6 @@ def configure_cli_logging(
     if use_shared_console:
         # Route console logs through the shared Rich Console so they play nicely
         # with progress bars (no duplicate bar redraws on each log line).
-        from fishtools.utils.pretty_print import get_shared_console  # local import to avoid cycle
-
         def _sink(message: str) -> None:
             # Print above any active Progress Live display
             get_shared_console().print(message, end="")
