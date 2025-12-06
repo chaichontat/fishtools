@@ -255,7 +255,6 @@ class TestRunWithExtractor:
     ) -> None:
         mock_actual_extractor_func = mocker.MagicMock()
         mocker.patch("fishtools.preprocess.cli_basic.fit_and_save_basic")
-
         # Create one file so that files[0] is valid, but len(files) < 100
         round_name = "R1Small"
         p_dir = tmp_path / f"{round_name}--pos0"
@@ -268,6 +267,45 @@ class TestRunWithExtractor:
         with pytest.raises(ValueError, match="Not enough files"):
             run_with_extractor(
                 tmp_path, round_=round_name, extractor_func=mock_actual_extractor_func, plot=False, zs=(0.5,)
+            )
+
+    def test_sampling_without_csv_raises_clear_error(
+        self,
+        tmp_path: Path,
+        mock_get_channels: MagicMock,
+        mock_basic_module_components: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        round_name = "R2NoCsv"
+        roi = "roiX"
+
+        d = tmp_path / f"{round_name}--{roi}"
+        d.mkdir(parents=True, exist_ok=True)
+
+        # Create 120 tiles (>=100 to satisfy minimum file count) with nonzero size.
+        all_files: list[Path] = []
+        for idx in range(120):
+            p = d / f"{round_name}-{idx:04d}.tif"
+            p.write_bytes(b"1")
+            all_files.append(p)
+
+        mock_get_channels.return_value = ["chA", "chB"]
+
+        mocker.patch("random.sample", side_effect=lambda x, k: list(x)[:k])
+        mocker.patch("numpy.loadtxt", return_value=None)
+        mocker.patch("fishtools.preprocess.cli_basic.fit_and_save_basic", return_value=[])
+
+        # No ROI CSVs are present, so interior filtering produces zero tiles.
+        # The minimal fix should now raise a clear error about missing CSVs.
+        with pytest.raises(ValueError, match="ROI layout CSV files"):
+            run_with_extractor(
+                tmp_path,
+                round_=round_name,
+                extractor_func=lambda files, zs, deconv_meta=None, max_files=800, nc=None: np.zeros(
+                    (len(files), 2, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32
+                ),
+                plot=False,
+                zs=(0.5,),
             )
 
     def test_sampling_filters_to_interior_tiles_when_csv_present(

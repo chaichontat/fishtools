@@ -280,7 +280,21 @@ def _correct_plane_gpu(
 
     The field must already be on GPU. This function copies the plane to GPU,
     performs division (+optional unsharp), sanitizes non-finite values, and returns CPU float32.
+
+    Set TILED=1 environment variable to use memory-efficient tiled processing for large images.
     """
+    # Use tiled processing if TILED=1 is set (reduces GPU memory for large images)
+    if os.environ.get("TILED", "").strip() == "1":
+        from fishtools.preprocess.n4_tiled import correct_plane_gpu_tiled
+
+        return correct_plane_gpu_tiled(
+            plane,
+            field_gpu=field_gpu,
+            use_unsharp_mask=use_unsharp_mask,
+            mask_cpu=mask_cpu,
+            tile_size=None,  # Auto-detect
+        )
+
     img_gpu = cp.asarray(np.asarray(plane, dtype=np.float32), dtype=cp.float32)
     img_gpu /= field_gpu
     if use_unsharp_mask:
@@ -755,20 +769,22 @@ def _write_fused_corrected_zyxc(
         guard_upper = max(guard_upper, float(params.upper))
         width_guard = max(guard_upper - params.lower, QUANT_MIN_RANGE)
         scale = uint16_range / width_guard
-        quant_channels.append({
-            "index": int(idx),
-            "name": str(name),
-            "lower": float(params.lower),
-            "upper": float(params.upper),
-            "observed_min": float(params.observed_min),
-            "observed_max": float(params.observed_max),
-            "scale": float(scale),
-            "upper_guard": float(guard_upper),
-            "upper_guard_percentile": float(guard_pct),
-            "lower_percentile": float(params.lower_percentile),
-            "upper_percentile": float(params.upper_percentile),
-            "samples": int(params.sample_count),
-        })
+        quant_channels.append(
+            {
+                "index": int(idx),
+                "name": str(name),
+                "lower": float(params.lower),
+                "upper": float(params.upper),
+                "observed_min": float(params.observed_min),
+                "observed_max": float(params.observed_max),
+                "scale": float(scale),
+                "upper_guard": float(guard_upper),
+                "upper_guard_percentile": float(guard_pct),
+                "lower_percentile": float(params.lower_percentile),
+                "upper_percentile": float(params.upper_percentile),
+                "samples": int(params.sample_count),
+            }
+        )
 
     default_quant = channel_quant[0] if channel_quant else None
     dest_attrs["quantization"] = {

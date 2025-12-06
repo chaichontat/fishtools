@@ -47,7 +47,7 @@ def configure_logging(
     else:
         if use_console:
             # Route parent logs through the shared Console to cooperate with Rich Progress
-            from fishtools.utils.pretty_print import get_shared_console
+            from fishtools.utils.logging import get_shared_console
 
             def _sink(message: str) -> None:
                 get_shared_console().print(message, end="")

@@ -55,8 +55,8 @@ from fishtools.preprocess.imageops import crop_xy as crop_xy_lib
 from fishtools.preprocess.stitching import walk_fused as _walk_fused
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.preprocess.tileconfig import copy_registered as _copy_registered
-from fishtools.utils.logging import CONSOLE_SKIP_EXTRA, setup_cli_logging
-from fishtools.utils.pretty_print import get_shared_console, progress_bar, progress_bar_threadpool
+from fishtools.utils.logging import CONSOLE_SKIP_EXTRA, get_shared_console, setup_cli_logging
+from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
 from fishtools.utils.tiff import compose_metadata as compose_meta
 from fishtools.utils.tiff import normalize_channel_names as norm_names
 from fishtools.utils.tiff import read_metadata_from_tif
