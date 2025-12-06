@@ -30,6 +30,7 @@ def determine_merge_relabeling(
     block_indices: list[tuple[int, ...]],
     faces: list[list[NDArray[Any]]],
     used_labels: NDArray[Any],
+    pre_shrunk: bool = False,
 ) -> NDArray[np.uint32]:
     """
     Determine boundary segment mergers and return a relabeling lookup table.
@@ -46,6 +47,9 @@ def determine_merge_relabeling(
         Boundary faces per block (from ``block_faces``).
     used_labels
         1D array of labels present in the volume.
+    pre_shrunk
+        If True, faces were already shrunk on workers; skip shrinking when
+        processing face pairs. This parallelizes expensive distance transforms.
 
     Returns
     -------
@@ -67,7 +71,7 @@ def determine_merge_relabeling(
     unique_labels = np.unique(used_labels)
     faces_paired = adjacent_faces(block_indices, faces)
 
-    label_groups = block_face_adjacency_graph(faces_paired, unique_labels)
+    label_groups = block_face_adjacency_graph(faces_paired, unique_labels, pre_shrunk=pre_shrunk)
     components = scipy.sparse.csgraph.connected_components(label_groups, directed=False)[1]
     # components has length N_labels + 1. Index 0 is the background node
     # (no edges); indices 1..N correspond to unique_labels[0..N-1].
@@ -158,16 +162,35 @@ def get_nblocks(shape: tuple[int, ...], blocksize: np.ndarray) -> NDArray[np.int
     return np.ceil(np.array(shape) / blocksize).astype(int)
 
 
-def block_faces(segmentation: NDArray[Any]) -> list[NDArray[Any]]:
-    """Extract start/end faces along each axis for a segmented block."""
+def block_faces(
+    segmentation: NDArray[Any], *, shrink: bool = False, shrink_threshold: float = 1.0
+) -> list[NDArray[Any]]:
+    """Extract start/end faces along each axis for a segmented block.
+
+    Parameters
+    ----------
+    segmentation
+        The segmented block array.
+    shrink
+        If True, apply shrink_labels to each face to erode label boundaries.
+        This moves expensive distance transform computation to workers.
+    shrink_threshold
+        Distance threshold for shrinking (only used if shrink=True).
+    """
     faces = []
     for iii in range(segmentation.ndim):
         a = [slice(None)] * segmentation.ndim
         a[iii] = slice(0, 1)
-        faces.append(segmentation[tuple(a)])
+        face = segmentation[tuple(a)]
+        if shrink:
+            face = shrink_labels(face, shrink_threshold)
+        faces.append(face)
         a = [slice(None)] * segmentation.ndim
         a[iii] = slice(-1, None)
-        faces.append(segmentation[tuple(a)])
+        face = segmentation[tuple(a)]
+        if shrink:
+            face = shrink_labels(face, shrink_threshold)
+        faces.append(face)
     return faces
 
 
@@ -222,6 +245,9 @@ def global_segment_ids(
         If block index or label count exceeds the bit allocation.
     """
     unique, unique_inverse = np.unique(segmentation, return_inverse=True)
+    # Downcast unique_inverse from int64 to int32 to save memory
+    # (tiles always have <2^31 elements, so int32 is sufficient)
+    unique_inverse = unique_inverse.astype(np.int32)
 
     block_token = int(np.ravel_multi_index(block_index, tuple(nblocks.tolist())))
     max_blocks = 1 << (32 - label_bits)
@@ -240,11 +266,12 @@ def global_segment_ids(
 
     # Pack: upper bits = block index, lower bits = sequential label index
     # Use sequential indices (0, 1, 2, ...) for labels to ensure no collisions
-    remap = [np.uint32((block_token << label_bits) | i) for i in range(len(unique))]
+    # Vectorized: create remap array directly instead of Python loop
+    remap = np.arange(len(unique), dtype=np.uint32) | np.uint32(block_token << label_bits)
     if unique[0] == 0:
-        remap[0] = np.uint32(0)  # Background stays 0
+        remap[0] = 0  # Background stays 0
 
-    segmentation_global = np.array(remap, dtype=np.uint32)[unique_inverse.reshape(segmentation.shape)]
+    segmentation_global = remap[unique_inverse.reshape(segmentation.shape)]
     return segmentation_global, remap
 
 
@@ -300,7 +327,7 @@ def adjacent_faces(
 
 def shrink_labels(plane: NDArray[Any], threshold: float) -> NDArray[Any]:
     """Shrink labels in plane by some distance from their boundary.
-    
+
     This erosion helps ensure robust matching by avoiding edge artifacts
     where labels may be slightly misaligned at chunk boundaries.
     """
@@ -410,14 +437,26 @@ def _process_single_face(
     face: NDArray[Any],
     structure: NDArray[Any],
     unique_labels: NDArray[np.uint32],
+    pre_shrunk: bool = False,
 ) -> NDArray[np.int64] | None:
     """Process a single face pair to find which labels should merge.
 
     Algorithm:
     1. Split the 2-pixel-thick face slab into two 1-pixel slices (one from each block)
-    2. Shrink labels via distance transform to handle boundary artifacts
+    2. Shrink labels via distance transform to handle boundary artifacts (unless pre_shrunk)
     3. Concatenate slices and find label pairs that touch across the boundary
     4. Map global label IDs to compact [1..N] space for sparse graph construction
+
+    Parameters
+    ----------
+    face
+        2-pixel-thick face slab (concatenation of adjacent block boundaries).
+    structure
+        Binary structure for connectivity analysis.
+    unique_labels
+        Sorted array of unique global label IDs.
+    pre_shrunk
+        If True, faces were already shrunk on workers; skip shrinking here.
 
     Returns (2, M) array of compact label pairs, or None if no pairs found.
     """
@@ -425,8 +464,13 @@ def _process_single_face(
     sl0 = tuple(slice(0, 1) if d == 2 else slice(None) for d in face.shape)
     sl1 = tuple(slice(1, 2) if d == 2 else slice(None) for d in face.shape)
 
-    a = shrink_labels(face[sl0], 1.0)
-    b = shrink_labels(face[sl1], 1.0)
+    if pre_shrunk:
+        # Faces already shrunk on workers - just extract slices
+        a = face[sl0]
+        b = face[sl1]
+    else:
+        a = shrink_labels(face[sl0], 1.0)
+        b = shrink_labels(face[sl1], 1.0)
 
     face_combined = np.concatenate((a, b), axis=np.argmin(a.shape))
     mapped_global = _find_label_pairs_across_boundary(face_combined, structure)
@@ -442,12 +486,13 @@ def block_face_adjacency_graph(
     faces: list[NDArray[Any]],
     unique_labels: NDArray[np.uint32],
     n_workers: int | None = None,
+    pre_shrunk: bool = False,
 ) -> scipy.sparse.csr_matrix:
     """
     Build adjacency graph from face pairs in a compact label space.
 
-    Shrinks labels in each face plane, then finds which labels touch across
-    the face boundary to build a sparse adjacency matrix for union-find.
+    Finds which labels touch across face boundaries to build a sparse
+    adjacency matrix for union-find.
 
     Parameters
     ----------
@@ -459,6 +504,9 @@ def block_face_adjacency_graph(
         background and never used.
     n_workers
         Number of parallel workers for face processing. Defaults to cpu_count - 4.
+    pre_shrunk
+        If True, faces were already shrunk on workers; skip shrinking in
+        _process_single_face. This parallelizes expensive distance transforms.
     """
     if n_workers is None:
         n_workers = max(1, (os.cpu_count() or 8) - 4)
@@ -474,17 +522,18 @@ def block_face_adjacency_graph(
     # Process faces in parallel
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        results = list(executor.map(
-            lambda f: _process_single_face(f, structure, unique_labels),
-            faces
-        ))
+        results = list(
+            executor.map(lambda f: _process_single_face(f, structure, unique_labels, pre_shrunk), faces)
+        )
     t_parallel = time.perf_counter() - t0
 
     # Filter out None results and collect mappings
     all_mappings = [r for r in results if r is not None]
 
     logger.info(f"block_face_adjacency_graph ({n_faces} faces, {n_workers} workers):")
-    logger.info(f"  parallel processing: {t_parallel:.2f}s ({t_parallel/max(n_faces,1)*1000:.1f}ms/face)")
+    logger.info(
+        f"  parallel processing: {t_parallel:.2f}s ({t_parallel / max(n_faces, 1) * 1000:.1f}ms/face)"
+    )
 
     if not all_mappings:
         return scipy.sparse.csr_matrix((nlabels + 1, nlabels + 1), dtype=np.int32)
@@ -512,16 +561,35 @@ def merge_boxes(boxes: NDArray[Any]) -> tuple[slice, ...]:
 
 
 def merge_all_boxes(boxes: list[tuple[slice, ...]], box_ids: NDArray[Any]) -> list[tuple[slice, ...]]:
-    """Merge all boxes that map to the same box_ids."""
-    merged_boxes = []
-    boxes_array = np.array(boxes, dtype=object)
-    box_ids = box_ids.astype(int)
+    """Merge all boxes that map to the same box_ids.
 
-    for iii in np.unique(box_ids):
-        merge_indices = np.argwhere(box_ids == iii).squeeze()
-        if merge_indices.shape:
-            merged_box = merge_boxes(boxes_array[merge_indices])
-        else:
-            merged_box = boxes_array[merge_indices]
-        merged_boxes.append(merged_box)
-    return merged_boxes
+    Uses vectorized sorting + group boundaries instead of Python loop over unique IDs.
+    Complexity: O(n log n) instead of O(n * k) where k = number of unique IDs.
+    """
+    if len(boxes) == 0:
+        return []
+
+    # Convert slices to numeric bounds: [start0, stop0, start1, stop1, ...]
+    ndim = len(boxes[0])
+    bounds = np.array([[s.start, s.stop] for box in boxes for s in box], dtype=np.int64).reshape(
+        len(boxes), ndim * 2
+    )
+    box_ids_arr = np.asarray(box_ids, dtype=np.int64)
+
+    # Sort by box_id
+    order = np.argsort(box_ids_arr)
+    sorted_ids = box_ids_arr[order]
+    sorted_bounds = bounds[order]
+
+    # Find group boundaries using diff
+    breaks = np.concatenate([[0], np.nonzero(np.diff(sorted_ids))[0] + 1, [len(sorted_ids)]])
+
+    merged = []
+    for i in range(len(breaks) - 1):
+        group = sorted_bounds[breaks[i] : breaks[i + 1]]
+        # Min of starts (even columns), max of stops (odd columns)
+        mins = group[:, 0::2].min(axis=0)
+        maxs = group[:, 1::2].max(axis=0)
+        merged.append(tuple(slice(int(lo), int(hi)) for lo, hi in zip(mins, maxs)))
+
+    return merged
