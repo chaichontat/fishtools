@@ -203,10 +203,19 @@ def bounding_boxes_in_global_coordinates(
     segmentation: NDArray[Any], crop: tuple[slice, ...]
 ) -> list[tuple[slice, ...]]:
     """Compute bounding boxes for all segments in global coordinates."""
-    boxes = scipy.ndimage.find_objects(segmentation)
-    boxes = [b for b in boxes if b is not None]
+    import cupy as cp
+
+    try:
+        from cupyx.scipy import ndimage as cpx_ndimage
+    except ImportError:
+        raise ImportError("CuPy >=14.0.0a1 needed for GPU-accelerated bounding box computation.")
+
+    seg_gpu = cp.asarray(segmentation)
+    boxes_local = cpx_ndimage.find_objects(seg_gpu)
+    # filter out labels that are not present in this block
+    boxes_local = [b for b in boxes_local if b is not None]
     translate = lambda a, b: slice(a.start + b.start, a.start + b.stop)
-    return [tuple(translate(a, b) for a, b in zip(crop, box)) for box in boxes]
+    return [tuple(translate(a, b) for a, b in zip(crop, box)) for box in boxes_local]
 
 
 def global_segment_ids(
@@ -596,3 +605,66 @@ def merge_all_boxes(boxes: list[tuple[slice, ...]], box_ids: NDArray[Any]) -> li
         merged.append(tuple(slice(int(lo), int(hi)) for lo, hi in zip(mins, maxs)))
 
     return merged
+
+
+def stitch_labels(
+    block_indices: list[tuple[int, int, int]],
+    faces_list: list[list[NDArray[Any]]],
+    box_ids_list: list[NDArray[np.uint32]],
+    temp_zarr: zarr.Array,
+    write_path: Path | str,
+    lut_path: Path | str,
+    *,
+    pre_shrunk: bool,
+) -> tuple[zarr.Array, NDArray[np.uint32]]:
+    """
+    Shared driver-side stitching: merge labels across block boundaries and write output.
+
+    Steps:
+    - Concatenate label IDs
+    - determine_merge_relabeling(...)
+    - Save LUT
+    - relabel_and_write(...)
+
+    Returns:
+        (final_zarr, new_labeling LUT)
+    """
+    all_box_ids = np.concatenate(box_ids_list).astype(np.uint32)
+
+    new_labeling = determine_merge_relabeling(
+        [(bi[0], bi[1], bi[2]) for bi in block_indices],
+        faces_list,
+        all_box_ids,
+        pre_shrunk=pre_shrunk,
+    )
+
+    lut_path = Path(lut_path)
+    np.save(lut_path, new_labeling)
+
+    n_final_labels = int(new_labeling.max())
+    logger.info(f"Relabeling to {n_final_labels} final labels (merged from {len(all_box_ids)} IDs)")
+
+    relabel_and_write(temp_zarr, lut_path, write_path)
+
+    return zarr.open(write_path, mode="r"), new_labeling
+
+
+def merge_boxes_for_labels(
+    boxes_list: list[list[tuple[slice, ...]]],
+    box_ids_list: list[NDArray[np.uint32]],
+    new_labeling: NDArray[np.uint32],
+) -> list[tuple[slice, ...]]:
+    """
+    Merge bounding boxes according to the label remapping from stitching.
+
+    Args:
+        boxes_list: Per-block lists of bounding boxes
+        box_ids_list: Per-block arrays of global label IDs
+        new_labeling: LUT from stitch_labels mapping old IDs to merged IDs
+
+    Returns:
+        Merged bounding boxes (one per final label)
+    """
+    boxes = [box for sublist in boxes_list for box in sublist]
+    box_ids = np.concatenate(box_ids_list).astype(np.uint32)
+    return merge_all_boxes(boxes, new_labeling[box_ids])

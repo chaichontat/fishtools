@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Annotated, Any, cast
 
 import cellpose.io
+import cupy as cp
 import dask_jobqueue
 import distributed
 import imagecodecs
@@ -25,7 +26,6 @@ from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.segment.normalize import sample_percentile
 from fishtools.segmentation.distributed.cache_utils import (
-    read_nonempty_cache,
     read_normalization_cache,
     write_nonempty_cache,
     write_normalization_cache,
@@ -34,18 +34,14 @@ from fishtools.segmentation.distributed.gpu_cluster import cluster, myLocalClust
 from fishtools.segmentation.distributed.merge_utils import (
     block_faces,
     bounding_boxes_in_global_coordinates,
-    determine_merge_relabeling,
     get_block_crops,
     get_nblocks,
     global_segment_ids,
-    merge_all_boxes,
-    relabel_and_write,
+    merge_boxes_for_labels,
     remove_overlaps,
+    stitch_labels,
 )
-from fishtools.segmentation.distributed.model_cache import (
-    CellposeModelPlugin,
-    get_cached_model,
-)
+from fishtools.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
 from fishtools.segmentation.distributed.tiling import solve_internal_xy_for_tiles
 from fishtools.utils.pretty_print import progress_bar
 
@@ -564,7 +560,9 @@ def process_block(
     output_zarr[crop_trimmed_3d] = segmentation_global_3d  # 3D[3D_slice] = 3D array (This should work)
 
     # --- Calculate faces (3D) ---
-    faces = block_faces(segmentation_global_3d)  # Faces are 3D
+    # Shrink labels on faces so expensive distance transforms happen on workers,
+    # matching the distributed_postproc stitching strategy.
+    faces = block_faces(segmentation_global_3d, shrink=True)  # Faces are 3D
 
     # --- Write checkpoint ---
     if checkpoint_path is not None:
@@ -786,6 +784,20 @@ def distributed_eval(
     if cluster_kwargs is None:
         cluster_kwargs = {}
 
+    # # DEBUG: Slice input for rapid iteration on real data
+    # # TODO: Remove before production use
+    # import tempfile
+
+
+    # _debug_dir = tempfile.mkdtemp(prefix="debug_slice_")
+    # _debug_path = Path(_debug_dir) / "sliced.zarr"
+    # _sliced = input_zarr[:, 5000:7000, 5000:7000, :]
+    # input_zarr = zarr.open_array(
+    #     _debug_path, mode="w", shape=_sliced.shape, dtype=input_zarr.dtype, chunks=input_zarr.chunks
+    # )
+    # input_zarr[:] = _sliced
+    # logger.warning(f"DEBUG MODE: Sliced input to {input_zarr.shape}, temp at {_debug_path}")
+
     # Derive a stable base directory for artifacts/logs
     if temporary_directory is None:
         base_parent = Path(write_path).parent if isinstance(write_path, (str, Path)) else Path.cwd()
@@ -830,7 +842,8 @@ def distributed_eval(
     n = None
 
     path_nonempty = Path(write_path).parent / "nonempty.json"
-    idxs = read_nonempty_cache(path_nonempty, blocksize)
+    # DEBUG: Disable cache for sliced input
+    idxs = None  # read_nonempty_cache(path_nonempty, blocksize)
     if idxs is not None:
         logger.info("Loaded cached non-empty block indices (%d entries).", len(idxs))
     else:
@@ -970,9 +983,9 @@ def distributed_eval(
         trimmed_crop = tuple(trimmed_crop)
 
         seg_block = temp_zarr[trimmed_crop]
-        faces = block_faces(seg_block)
+        faces = block_faces(seg_block, shrink=True)
         boxes = bounding_boxes_in_global_coordinates(seg_block, trimmed_crop)
-        unique_ids = np.unique(seg_block)
+        unique_ids = cp.asnumpy(cp.unique(cp.asarray(seg_block)))
         box_ids = unique_ids[unique_ids != 0]
         results.append((faces, boxes, box_ids))
 
@@ -1002,22 +1015,6 @@ def distributed_eval(
         logger.info(f"Intermediate results saved to: {temporary_directory}")
         return None
 
-    boxes = [box for sublist in boxes_list for box in sublist]
-    box_ids = np.concatenate(box_ids_list).astype(int)  # unsure how but without cast these are float64
-
-    print(f"Box IDs: {len(box_ids)}")
-    # Determine merge relabeling (graph in compact label space; LUT over global IDs)
-    new_labeling = determine_merge_relabeling(
-        [(bi[0], bi[1], bi[2]) for bi in non_empty_indices], faces_list, box_ids
-    )
-    new_labeling_path = Path(temporary_directory) / "new_labeling.npy"
-    np.save(new_labeling_path, new_labeling)
-
-    n_final_labels = int(new_labeling.max())
-    logger.info(
-        f"Relabeling to {n_final_labels} final non-background labels (merged from {len(box_ids)} IDs)"
-    )
-
     # stitching step is cheap, we should release gpus and use small workers
     if isinstance(cluster, dask_jobqueue.core.JobQueueCluster):
         cluster.change_worker_attributes(
@@ -1031,12 +1028,20 @@ def distributed_eval(
         )
         cluster.scale(32)
 
-    print("Relabeling blocks...")
-    relabel_and_write(temp_zarr, new_labeling_path, write_path)
+    new_labeling_path = Path(temporary_directory) / "new_labeling.npy"
+    final_seg_zarr, new_labeling = stitch_labels(
+        block_indices=non_empty_indices,
+        faces_list=faces_list,
+        box_ids_list=box_ids_list,
+        temp_zarr=temp_zarr,
+        write_path=write_path,
+        lut_path=new_labeling_path,
+        pre_shrunk=True,
+    )
 
-    print("Merging boxes...")
-    merged_boxes = merge_all_boxes(boxes, new_labeling[box_ids])
-    return zarr.open(write_path, mode="r"), merged_boxes
+    # Segmentation-specific: merge bounding boxes
+    merged_boxes = merge_boxes_for_labels(boxes_list, box_ids_list, new_labeling)
+    return final_seg_zarr, merged_boxes
 
 
 def stitch_segmentation(
@@ -1064,43 +1069,25 @@ def stitch_segmentation(
     temp_zarr = zarr.open(temp_dir / "segmentation_unstitched.zarr", mode="r")
     faces_list, boxes_list, box_ids_list, non_empty_indices = _load_intermediate_state(temp_dir)
     logger.info(f"Load intermediate state: {time.perf_counter() - t0:.2f}s")
-
-    # Combine per-block data
-    boxes = [box for sublist in boxes_list for box in sublist]
-    box_ids = np.concatenate(box_ids_list).astype(int) if box_ids_list else np.array([], dtype=int)
-
-    logger.info(f"Loaded {len(non_empty_indices)} non-empty blocks, {len(box_ids)} segment IDs")
-
-    # Build relabeling LUT
-    t0 = time.perf_counter()
-    new_labeling = determine_merge_relabeling(
-        [(bi[0], bi[1], bi[2]) for bi in non_empty_indices], faces_list, box_ids
-    )
-    logger.info(f"determine_merge_relabeling: {time.perf_counter() - t0:.2f}s")
+    logger.info(f"Loaded {len(non_empty_indices)} non-empty blocks")
 
     new_labeling_path = temp_dir / "new_labeling.npy"
-    np.save(new_labeling_path, new_labeling)
-
-    n_final_labels = int(new_labeling.max())
-    logger.info(
-        f"Relabeling to {n_final_labels} final non-background labels (merged from {len(box_ids)} IDs)"
+    final_seg_zarr, new_labeling = stitch_labels(
+        block_indices=non_empty_indices,
+        faces_list=faces_list,
+        box_ids_list=box_ids_list,
+        temp_zarr=temp_zarr,
+        write_path=output_path,
+        lut_path=new_labeling_path,
+        pre_shrunk=True,  # faces were pre-shrunk in block_faces(shrink=True)
     )
 
-    # Apply relabeling
-    t0 = time.perf_counter()
-    logger.info("Relabeling blocks...")
-    relabel_and_write(temp_zarr, new_labeling_path, output_path)
-    logger.info(f"relabel_and_write: {time.perf_counter() - t0:.2f}s")
-
-    # Merge bounding boxes
-    t0 = time.perf_counter()
-    logger.info("Merging boxes...")
-    merged_boxes = merge_all_boxes(boxes, new_labeling[box_ids])
-    logger.info(f"merge_all_boxes: {time.perf_counter() - t0:.2f}s")
+    # Segmentation-specific: merge bounding boxes
+    merged_boxes = merge_boxes_for_labels(boxes_list, box_ids_list, new_labeling)
 
     logger.info(f"Total stitch_segmentation: {time.perf_counter() - t_total_start:.2f}s")
 
-    return zarr.open(output_path, mode="r"), merged_boxes
+    return final_seg_zarr, merged_boxes
 
 
 app = typer.Typer(pretty_exceptions_show_locals=False)

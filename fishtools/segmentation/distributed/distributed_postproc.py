@@ -117,12 +117,11 @@ from fishtools.segment.postproc3d import (  # noqa: F401
 from fishtools.segmentation.distributed.gpu_cluster import cluster, myGPUCluster, myLocalCluster
 from fishtools.segmentation.distributed.merge_utils import (
     block_faces,
-    determine_merge_relabeling,
     get_block_crops,
     get_nblocks,
     global_segment_ids,
-    relabel_and_write,
     remove_overlaps,
+    stitch_labels,
 )
 from fishtools.utils.logging import setup_cli_logging
 
@@ -557,9 +556,13 @@ def distributed_postproc(
 
     del futures
 
-    # Unpack results
-    faces_list, box_ids_list = list(zip(*results))
-    box_ids_list = [b for b in box_ids_list if len(b) > 0]
+    # Filter to non-empty blocks only (must keep faces aligned with block_indices)
+    faces_list, box_ids_list, non_empty_indices = [], [], []
+    for i, (faces, box_ids) in enumerate(results):
+        if len(box_ids) > 0:
+            faces_list.append(faces)
+            box_ids_list.append(box_ids)
+            non_empty_indices.append(block_indices[i])
 
     # Calculate face data size for profiling
     total_face_bytes = sum(sum(f.nbytes for f in faces) for faces in faces_list)
@@ -575,39 +578,19 @@ def distributed_postproc(
         _copy_zarr_metadata(input_zarr, write_path, input_path=input_path)
         return zarr.open(write_path, mode="r")
 
-    all_box_ids = np.concatenate(box_ids_list).astype(np.uint32)
-
-    logger.info(f"Stitching {len(all_box_ids)} labels across {len(block_indices)} blocks")
-
-    # Determine merge relabeling (graph in compact label space; LUT over global IDs)
-    # pre_shrunk=True because workers already shrunk faces in block_faces(shrink=True)
-    t_stitch = time.perf_counter()
-    new_labeling = determine_merge_relabeling(
-        [(bi[0], bi[1], bi[2]) for bi in block_indices],
-        faces_list,
-        all_box_ids,
-        pre_shrunk=True,
-    )
-    logger.debug(f"[timing] stitch (determine_merge_relabeling): {time.perf_counter() - t_stitch:.2f}s")
-
     new_labeling_path = temporary_directory / "new_labeling.npy"
-    np.save(new_labeling_path, new_labeling)
-
-    # new_labeling maps global IDs -> compact component IDs; because component
-    # IDs are contiguous and background is fixed at 0, max(new_labeling) gives
-    # the number of non-background components.
-    n_final_labels = int(new_labeling.max())
-    logger.info(
-        f"Relabeling to {n_final_labels} final non-background labels (merged from {len(all_box_ids)} IDs)"
+    final_seg_zarr, new_labeling = stitch_labels(
+        block_indices=non_empty_indices,
+        faces_list=faces_list,
+        box_ids_list=box_ids_list,
+        temp_zarr=temp_zarr,
+        write_path=write_path,
+        lut_path=new_labeling_path,
+        pre_shrunk=True,
     )
 
     # Free memory no longer needed on the driver
-    del results, faces_list, box_ids_list, all_box_ids
-
-    # Apply relabeling via dask
-    t_relabel = time.perf_counter()
-    relabel_and_write(temp_zarr, new_labeling_path, write_path)
-    logger.debug(f"[timing] relabel_and_write: {time.perf_counter() - t_relabel:.2f}s")
+    del results, faces_list, box_ids_list
 
     # Copy label mapping to sidecar file before temp dir cleanup
     mapping_filename = f"{write_path.stem}_label_mapping.npy"
