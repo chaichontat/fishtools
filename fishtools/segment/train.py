@@ -10,6 +10,7 @@ import torch
 from cellpose.contrib.cellposetrt import trt_build
 from cellpose.models import CellposeModel
 from cellpose.train import train_seg as train_seg_transformer
+
 # from cellpose.train_unet import train_seg as train_seg_unet
 # from cellpose.unet import CellposeUNetModel
 from loguru import logger
@@ -351,14 +352,18 @@ def build_trt_engine(
         f"Building TensorRT engine {plan_path.name} (batch_size={batch_size}, bsize={bsize}, device={device_name_raw}, vram={vram_mb} MB)"
     )
 
-    trt_build.export_onnx(
-        str(model_path),
-        str(onnx_path),
-        batch_size=batch_size,
-        bsize=bsize,
-        opset=opset,
-        backend=backend,
-    )
+    # Skip ONNX export if ONNX file exists and is newer than the model file
+    if onnx_path.exists() and onnx_path.stat().st_mtime > model_path.stat().st_mtime:
+        logger.info(f"Skipping ONNX export: {onnx_path.name} is up-to-date")
+    else:
+        trt_build.export_onnx(
+            str(model_path),
+            str(onnx_path),
+            batch_size=batch_size,
+            bsize=bsize,
+            opset=opset,
+            backend=backend,
+        )
     trt_build.build_engine(
         str(onnx_path),
         str(plan_path),
@@ -366,10 +371,6 @@ def build_trt_engine(
         bsize=bsize,
         vram=vram_mb,
     )
-    try:
-        onnx_path.unlink()
-    except FileNotFoundError:
-        pass
     return plan_path
 
 
@@ -471,7 +472,7 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     _cleanup_model_artifacts(model_path)
     build_trt_engine(
         model_path=model_path,
-        bsize=train_config.bsize,
+        bsize=1,
         device=device,
         batch_size=train_config.batch_size,
         backend=train_config.backend,
