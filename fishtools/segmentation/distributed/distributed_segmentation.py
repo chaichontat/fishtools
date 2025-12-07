@@ -58,6 +58,36 @@ logger = logging.getLogger("rich")
 # Per-worker initialization flag to avoid repeated setup overhead.
 _WORKER_INITIALIZED: bool = False
 _WORKER_LOGS_DIR: str | None = None
+_WORKER_FIRST_TASK_DONE: bool = False
+
+
+def _apply_startup_stagger(stagger_seconds: float, workers_per_gpu: int) -> None:
+    """Apply one-time stagger delay based on worker's sequential index.
+
+    Workers are named "gpu-{dev}-w{k}". This function computes a linear index
+    and delays the first task on each worker to avoid GPU memory contention.
+    """
+    import re
+
+    global _WORKER_FIRST_TASK_DONE
+    if _WORKER_FIRST_TASK_DONE:
+        return
+    _WORKER_FIRST_TASK_DONE = True
+
+    worker = distributed.get_worker()
+    name = getattr(worker, "name", "")
+    match = re.match(r"gpu-(\d+)-w(\d+)", name)
+    if not match:
+        return
+
+    gpu_idx = int(match.group(1))
+    worker_idx = int(match.group(2))
+    linear_idx = gpu_idx * workers_per_gpu + worker_idx
+
+    if linear_idx > 0:
+        delay = linear_idx * stagger_seconds
+        logger.info(f"Worker {name}: staggering start by {delay}s")
+        time.sleep(delay)
 
 
 def _save_intermediate_state(
@@ -385,6 +415,8 @@ def process_block(
     worker_logs_directory: str | None = None,
     test_mode: bool = False,
     checkpoint_path: Path | None = None,
+    stagger_seconds: float = 0.0,
+    workers_per_gpu: int = 4,
 ) -> (
     tuple[NDArray[np.uint32], list[tuple[slice, ...]], NDArray[np.uint32]]
     | tuple[list[NDArray[Any]], list[tuple[slice, ...]], NDArray[np.uint32]]
@@ -498,6 +530,8 @@ def process_block(
                   boxes
     """
     import time
+
+    _apply_startup_stagger(stagger_seconds, workers_per_gpu)
 
     start_time = time.perf_counter()
     logger.info(f"RUNNING BLOCK: {block_index}\tREGION: [{format_slice(crop)}]")
@@ -630,12 +664,9 @@ def read_preprocess_and_segment(
 
         vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         dev = torch.cuda.current_device() if torch.cuda.is_available() else None
-        logger.info(
-            "Worker %s visible CUDA=%s torch_dev=%s",
-            getattr(distributed.get_worker(), "name", "unknown"),
-            vis,
-            None if dev is None else int(dev),
-        )
+        worker_name = getattr(distributed.get_worker(), "name", "unknown")
+        torch_dev = None if dev is None else int(dev)
+        logger.info(f"Worker {worker_name} visible CUDA={vis} torch_dev={torch_dev}")
     except Exception:
         pass
 
@@ -674,6 +705,7 @@ def distributed_eval(
     cluster_kwargs: dict[str, Any] | None = None,
     temporary_directory: Path | None = None,
     cellpose_only: bool = False,
+    stagger_seconds: float = 0.0,
 ) -> tuple[zarr.Array, list[tuple[slice, ...]]] | None:
     """
     Evaluate a cellpose model on overlapping blocks of a big image.
@@ -788,7 +820,6 @@ def distributed_eval(
     # # TODO: Remove before production use
     # import tempfile
 
-
     # _debug_dir = tempfile.mkdtemp(prefix="debug_slice_")
     # _debug_path = Path(_debug_dir) / "sliced.zarr"
     # _sliced = input_zarr[:, 5000:7000, 5000:7000, :]
@@ -834,9 +865,9 @@ def distributed_eval(
     # Optional: GPU preflight probe to confirm worker pinning
     try:
         probe = cluster.client.run(_gpu_probe)
-        logger.info("GPU probe results: %s", probe)
+        logger.info(f"GPU probe results: {probe}")
     except Exception as e:
-        logger.warning("GPU probe failed: %s", e)
+        logger.warning(f"GPU probe failed: {e}")
 
     offset = 0
     n = None
@@ -845,7 +876,7 @@ def distributed_eval(
     # DEBUG: Disable cache for sliced input
     idxs = None  # read_nonempty_cache(path_nonempty, blocksize)
     if idxs is not None:
-        logger.info("Loaded cached non-empty block indices (%d entries).", len(idxs))
+        logger.info(f"Loaded cached non-empty block indices ({len(idxs)} entries).")
     else:
         check_futures = cluster.client.map(
             check_block_has_data,
@@ -855,13 +886,13 @@ def distributed_eval(
         )
 
         total_tiles = len(check_futures)
-        logger.info("Checking non-zero blocks: 0/%d", total_tiles)
+        logger.info(f"Checking non-zero blocks: 0/{total_tiles}")
         try:
             with progress_bar(total_tiles) as submit:
                 [fut.add_done_callback(submit) for fut in check_futures]
 
                 non_zero_results = cluster.client.gather(check_futures, errors="raise")
-            logger.info("Checked non-zero blocks: %d/%d", total_tiles, total_tiles)
+            logger.info(f"Checked non-zero blocks: {total_tiles}/{total_tiles}")
         except Exception as e:
             logger.critical(f"Error gathering input check results: {e}")
             logger.critical("Skipping zero-input block filtering due to error.")
@@ -869,7 +900,7 @@ def distributed_eval(
 
         idxs = [i for i, is_non_zero in enumerate(non_zero_results, offset) if is_non_zero]
         write_nonempty_cache(path_nonempty, blocksize, idxs)
-        logger.info("Persisted %d non-empty block indices to %s", len(idxs), path_nonempty)
+        logger.info(f"Persisted {len(idxs)} non-empty block indices to {path_nonempty}")
 
     # final_block_indices, final_block_crops = [], []
     final_block_indices, final_block_crops = (
@@ -949,6 +980,7 @@ def distributed_eval(
         plugin = CellposeModelPlugin(model_kwargs)
         cluster.client.register_plugin(plugin)
 
+        workers_per_gpu = cluster_kwargs.get("workers_per_gpu", 4) if cluster_kwargs else 4
         futures = cluster.client.map(
             process_block,
             remaining_block_indices,
@@ -962,6 +994,8 @@ def distributed_eval(
             output_zarr=temp_zarr,
             worker_logs_directory=str(worker_logs_dir),
             checkpoint_path=checkpoint_path,
+            stagger_seconds=stagger_seconds,
+            workers_per_gpu=workers_per_gpu,
         )
 
         with progress_bar(len(remaining_block_indices)) as submit:
@@ -1126,6 +1160,11 @@ def run(
         False,
         "--cellpose-only",
         help="Stop after cellpose phase, save intermediate state for later stitching.",
+    ),
+    stagger_seconds: float = typer.Option(
+        5.0,
+        "--stagger-seconds",
+        help="Seconds to stagger worker starts on the same GPU (0 to disable).",
     ),
 ) -> None:
     """
@@ -1317,7 +1356,7 @@ def run(
             normalization_path,
             {str(ch): lh.tolist() for ch, lh in zip(channels_list, lowhigh_selected)},
         )
-        logger.info("Saved normalization thresholds to %s", normalization_path)
+        logger.info(f"Saved normalization thresholds to {normalization_path}")
 
     # Align normalization rows to requested channel order
     lowhigh_eval = np.asarray(lowhigh_selected, dtype=float)
@@ -1373,6 +1412,7 @@ def run(
             cluster_kwargs=local_cluster_kwargs,
             temporary_directory=temporary_directory,
             cellpose_only=cellpose_only,
+            stagger_seconds=stagger_seconds,
         )
 
         if cellpose_only:
