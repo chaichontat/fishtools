@@ -267,7 +267,7 @@ def concat_output(
     path: Path,
     samples: list[str],
     mask_filter: list[str] | str = "_seg.npy",
-    one_level_down: bool = False,
+    look_one_level_down: bool = False,
 ) -> tuple[list, ...]:
     from .cp_io import load_train_test_data
 
@@ -277,20 +277,20 @@ def concat_output(
     first: tuple = load_train_test_data(
         (path / samples[0]).as_posix(),
         mask_filter=mask_filter if isinstance(mask_filter, str) else mask_filter[0],
-        look_one_level_down=one_level_down,
+        look_one_level_down=look_one_level_down,
     )
     for i, sample in enumerate(samples[1:], 1):
         _out = load_train_test_data(
             (path / sample).as_posix(),
             # test_dir=(path.parent / "pi-wgatest").as_posix(),
             mask_filter=mask_filter if isinstance(mask_filter, str) else mask_filter[i],
-            look_one_level_down=one_level_down,
+            look_one_level_down=look_one_level_down,
         )
 
         for lis, new in zip(first, _out):
             if lis is not None and new is not None:
                 lis.extend(new)
-    if first[0] is not None:
+    if first[0] is not None and first[2] is not None:
         assert len(first[0]) == len(first[2])
 
     return first
@@ -301,7 +301,7 @@ def _concat_images_only(
     samples: list[str],
     *,
     mask_filter: str = "_seg.npy",
-    one_level_down: bool = True,
+    look_one_level_down: bool = False,
 ) -> tuple[list, list, list]:
     """Load and concatenate only images/labels/names from multiple sample roots.
 
@@ -318,7 +318,7 @@ def _concat_images_only(
     for i, sample in enumerate(samples):
         sample_dir = (path / sample).as_posix()
         images, labels, names = load_images_labels(
-            sample_dir, mask_filter=mask_filter, image_filter=None, look_one_level_down=one_level_down
+            sample_dir, mask_filter=mask_filter, image_filter=None, look_one_level_down=look_one_level_down
         )
         if images is not None:
             images_all.extend(images)
@@ -472,9 +472,9 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     _cleanup_model_artifacts(model_path)
     build_trt_engine(
         model_path=model_path,
-        bsize=1,
+        bsize=256,
         device=device,
-        batch_size=train_config.batch_size,
+        batch_size=1,
         backend=train_config.backend,
     )
 
@@ -546,7 +546,7 @@ def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
         path,
         [sample.as_posix() for sample in discovered_samples],
         mask_filter="_seg.npy",
-        one_level_down=True,
+        look_one_level_down=False,
     )
 
     logger.info(f"Pre-filter training discovered {len(out2[0])} images")
@@ -634,8 +634,6 @@ def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
                 final_test_labels = None
                 final_test_names = None
                 trimmed_test = 0
-                # Skip the rest of the explicit test loading
-                pass
         if discovered_test_samples:
             resolved_test_sample_map: dict[Path, Path] = {}
             for sample in discovered_test_samples:
@@ -655,7 +653,7 @@ def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
                 path,
                 [sample.as_posix() for sample in discovered_test_samples],
                 mask_filter="_seg.npy",
-                one_level_down=True,
+                look_one_level_down=False,
             )
 
             (
