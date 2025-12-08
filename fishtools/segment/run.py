@@ -3,7 +3,6 @@ from __future__ import annotations
 import datetime
 import pickle
 import shutil
-import warnings
 from pathlib import Path
 from typing import Literal
 
@@ -12,7 +11,6 @@ import numpy as np
 import polars as pl
 import tifffile
 import torch
-from cellpose import dynamics
 from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 from skimage.measure import regionprops_table
@@ -60,6 +58,49 @@ class RunConfig(BaseModel):
     ortho_weights: tuple[float, float, float] | None = Field(
         default=None,
         description="Optional weights applied to the (XY, YZ, ZX) passes when aggregating Cellpose 3D flows.",
+    )
+    momentum: float = Field(
+        default=0.95,
+        ge=0.0,
+        le=1.0,
+        description="Momentum coefficient for suppressed gradient descent (u-Segment3D). 0.0 = standard Euler, 0.95 = recommended.",
+    )
+    step_decay: float = Field(
+        default=0.01,
+        ge=0.0,
+        description="Step decay factor for gradient descent (u-Segment3D). 0.0 = constant step, ~0.01 = recommended.",
+    )
+    flow2D_smooth: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="Gaussian sigma for pre-smoothing 2D flows before 3D aggregation (u-Segment3D). 0.0 = no smoothing, 1.0 = recommended.",
+    )
+    use_kde_clustering: bool = Field(
+        default=True,
+        description="Use u-Segment3D KDE-based clustering instead of peak detection + seed growth.",
+    )
+    kde_sigma: float = Field(
+        default=1.0,
+        ge=0.0,
+        description="Gaussian sigma for KDE smoothing of endpoint histogram (u-Segment3D).",
+    )
+    kde_threshold_k: float = Field(
+        default=1.0,
+        description="Threshold multiplier k for adaptive threshold: mean(rho) + k*std(rho).",
+    )
+    use_variance_fusion: bool = Field(
+        default=True,
+        description="Use inverse-variance weighted fusion for 3D flow aggregation (u-Segment3D). Automatically downweights noisy planes.",
+    )
+    variance_alpha_flow: float = Field(
+        default=0.5,
+        gt=0.0,
+        description="Alpha for flow variance weighting. Larger = more averaging, smaller = trust smoothest. 0.5 = conservative.",
+    )
+    variance_alpha_cellprob: float = Field(
+        default=1e-5,
+        gt=0.0,
+        description="Alpha for cellprob variance weighting. 1e-5 = aggressive (strongly trust smooth predictions).",
     )
 
     @model_validator(mode="after")
@@ -190,17 +231,27 @@ def _cellpose(model, image: np.ndarray, *, config: RunConfig):
         image,#[:, :, :400, :1386],
         channel_axis=1,
         normalize=normalization,
-        batch_size=2,
+        batch_size=1,
         anisotropy=4,
         flow_threshold=0.4,
         cellprob_threshold=0,
-        flow3D_smooth=2,
+        flow3D_smooth=3,
+        resample=False,
         niter=1000,
         # stitch_threshold=0.24,
         diameter=60,
         do_3D=True,
-        min_size=4000,
+        min_size=8000,
         ortho_weights=config.ortho_weights,
+        momentum=config.momentum,
+        step_decay=config.step_decay,
+        flow2D_smooth=config.flow2D_smooth,
+        use_kde_clustering=config.use_kde_clustering,
+        kde_sigma=config.kde_sigma,
+        kde_threshold_k=config.kde_threshold_k,
+        use_variance_fusion=config.use_variance_fusion,
+        variance_alpha_flow=config.variance_alpha_flow,
+        variance_alpha_cellprob=config.variance_alpha_cellprob,
         # bsize=224,
         # augment=True,
         **({"channels": config.channels} if backend == "unet" else {"z_axis": 0}),
@@ -268,6 +319,112 @@ def _build_label_metadata(
     return metadata.select([*(c for c in primary if c in metadata.columns), *other_cols])
 
 
+def _sample_files_by_size(
+    directory: Path,
+    *,
+    n: int,
+    seed: int,
+    pattern: str = "*.tif",
+) -> list[Path]:
+    """Sample n files with uniform size coverage.
+
+    Strategy:
+    1. Glob all matching files
+    2. Randomly sample min(5*n, total) candidates
+    3. Sort candidates by file size
+    4. Pick every (len/n)th file for uniform size distribution
+    """
+    all_files = list(directory.glob(pattern))
+    if not all_files:
+        raise click.BadParameter(f"No files matching '{pattern}' found in {directory}")
+
+    rng = np.random.default_rng(seed)
+
+    # Sample 5x candidates (or all if fewer available)
+    candidate_count = min(5 * n, len(all_files))
+    if candidate_count < len(all_files):
+        indices = rng.choice(len(all_files), size=candidate_count, replace=False)
+        candidates = [all_files[i] for i in indices]
+    else:
+        candidates = all_files
+
+    # Sort by file size
+    candidates.sort(key=lambda p: p.stat().st_size)
+
+    # Pick every Nth for uniform size coverage
+    stride = max(1, len(candidates) // n)
+    selected = candidates[::stride][:n]
+
+    return selected
+
+
+def _run_single_volume(
+    volume_path: Path,
+    cellpose_model,
+    config: RunConfig,
+    *,
+    crop_size: int = 0,
+    crop_seed: int = 0,
+) -> Path:
+    """Run segmentation on a single volume and return mask path."""
+    img = tifffile.imread(volume_path)
+
+    # Random crop if enabled (assumes ZCYX or ZYX layout)
+    if crop_size > 0:
+        rng = np.random.default_rng(crop_seed)
+        *leading, h, w = img.shape
+        if h > crop_size and w > crop_size:
+            y0 = rng.integers(0, h - crop_size)
+            x0 = rng.integers(0, w - crop_size)
+            img = img[..., y0 : y0 + crop_size, x0 : x0 + crop_size]
+            logger.info(f"Cropped to {crop_size}x{crop_size} at ({y0}, {x0})")
+
+    masks, flows, styles = _cellpose(cellpose_model, img, config=config)
+    metadata_df = _build_label_metadata(masks, flows[1], use_gpu=config.use_gpu)
+
+    # Save outputs
+    out = volume_path.parent.parent / "segment2_5d"
+    out.mkdir(exist_ok=True)
+    pickle_path = out / f"{volume_path.stem}.pkl"
+    dest_volume = pickle_path.with_name(volume_path.name)
+    if dest_volume.resolve() != volume_path.resolve():
+        shutil.copyfile(volume_path, dest_volume)
+    mask_path = pickle_path.with_name(volume_path.stem + "_masks.tif")
+    tifffile.imwrite(
+        mask_path,
+        masks.astype(np.uint32),
+        compression="zstd",
+    )
+    metadata_path = pickle_path.with_name(volume_path.stem + "_labels.parquet")
+    metadata_df.write_parquet(metadata_path)
+
+    sidecar = {
+        "config": {
+            "model_path": str(config.model_path),
+            "backend": config.backend,
+            "channels": list(config.channels),
+            "anisotropy": config.anisotropy,
+            "normalize_percentiles": list(config.normalize_percentiles),
+            "ortho_model_path": str(config.ortho_model_path) if config.ortho_model_path else None,
+            "ortho_weights": list(config.ortho_weights) if config.ortho_weights is not None else None,
+        },
+    }
+    with pickle_path.open("wb") as handle:
+        pickle.dump({"flows": flows, "styles": styles, **sidecar}, handle)
+
+    if config.save_flows:
+        flow_path = pickle_path.with_name(volume_path.stem + "_flows.npz")
+        np.savez_compressed(
+            flow_path,
+            dp=np.asarray(flows[1], dtype=np.float32),
+            cellprob=np.asarray(flows[2], dtype=np.float32),
+        )
+        logger.info(f"Saved flows to {flow_path}")
+
+    logger.info(f"Wrote masks to {mask_path}")
+    return mask_path
+
+
 def run(
     volume: Path,
     *,
@@ -281,28 +438,61 @@ def run(
     ortho_model: Path | None = None,
     ortho_weights: str | None = None,
     backend: str = "sam",
-    debug_3d_slices: bool = False,
-    debug_3d_tag: str | None = None,
+    num_files: int = 20,
+    seed: int = 0,
+    pattern: str = "*.tif",
+    crop_size: int = 0,
+    momentum: float = 0.95,
+    step_decay: float = 0.01,
+    flow2D_smooth: float = 1.0,
+    use_kde_clustering: bool = True,
+    kde_sigma: float = 2.0,
+    kde_threshold_k: float = 1.0,
+    use_variance_fusion: bool = True,
+    variance_alpha_flow: float = 0.5,
+    variance_alpha_cellprob: float = 1e-5,
+    vanilla: bool = False,
 ):
+    # --vanilla overrides u-Segment3D params with standard Cellpose defaults
+    if vanilla:
+        momentum = 0.0
+        step_decay = 0.0
+        flow2D_smooth = 1
+        use_kde_clustering = True
+        use_variance_fusion = False
+
     backend_normalized = backend.lower()
     if backend_normalized not in {"sam", "unet"}:
         raise click.BadParameter(f"Unsupported backend {backend!r}; choose 'sam' or 'unet'.")
 
+    # Handle directory input (batch mode) vs single file
+    if volume.is_dir():
+        files = _sample_files_by_size(volume, n=num_files, seed=seed, pattern=pattern)
+        logger.info(f"Batch mode: processing {len(files)} files from {volume}")
+        batch_mode = True
+    else:
+        files = [volume]
+        batch_mode = False
+
     setup_cli_logging(
-        volume,
+        files[0],
         component="segment.run",
         file="segment-run",
         extra={
             "backend": backend_normalized,
             "volume": volume.name,
+            "batch_mode": batch_mode,
+            "num_files": len(files),
         },
     )
 
     channels_tuple = tuple(map(int, channels.split(",")))
     normalize_tuple = tuple(map(float, normalize.split(",")))
     ortho_tuple = tuple(map(float, ortho_weights.split(","))) if ortho_weights is not None else None
+
+    # Build config (volume_path will be updated per-file)
     config = RunConfig(
-        volume_path=volume,
+        volume_path=files[0],
         model_path=model,
         backend=backend_normalized,
         anisotropy=anisotropy,
@@ -314,25 +504,29 @@ def run(
         save_flows=save_flows,
         ortho_model_path=ortho_model,
         ortho_weights=ortho_tuple,
+        momentum=momentum,
+        step_decay=step_decay,
+        flow2D_smooth=flow2D_smooth,
+        use_kde_clustering=use_kde_clustering,
+        kde_sigma=kde_sigma,
+        kde_threshold_k=kde_threshold_k,
+        use_variance_fusion=use_variance_fusion,
+        variance_alpha_flow=variance_alpha_flow,
+        variance_alpha_cellprob=variance_alpha_cellprob,
     )
 
     logger.info(f"Segment run configuration: {config.model_dump()}")
 
-    img = tifffile.imread(volume)
-
+    # Load model once (expensive operation)
     if config.backend == "sam":
-        # from cellpose.contrib.cellposetrt import CellposeModelTRT as TRTModel
-
         from cellpose.contrib.packed_infer import PackedCellposeModel as TorchModel
         from cellpose.contrib.packed_infer import PackedCellposeModelTRT as TRTModel
     else:
         from cellpose.contrib.packed_infer import CellposeUNetModel as TorchModel
         from cellpose.contrib.packed_infer import CellposeUNetModelTRT as TRTModel
 
-    # Auto-detect TRT plan for main model
-    plan_selection =_find_trt_plan(config.model_path)
+    plan_selection = _find_trt_plan(config.model_path)
 
-    # Auto-detect TRT plan for ortho model if provided
     ortho_plan_path = None
     if config.ortho_model_path is not None:
         ortho_plan_selection = _find_trt_plan(config.ortho_model_path)
@@ -355,7 +549,6 @@ def run(
             f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}' "
             f"(backend={config.backend}, mtime={plan_time_local})."
         )
-        # Use TRT plan for ortho if found, otherwise fall back to PyTorch model
         ortho_kwargs = {}
         if ortho_plan_path is not None:
             ortho_kwargs["pretrained_model_ortho"] = str(ortho_plan_path)
@@ -364,10 +557,8 @@ def run(
 
         trt_kwargs = {"gpu": config.use_gpu, "pretrained_model": str(plan_path), **ortho_kwargs}
         cellpose_model = TRTModel(**trt_kwargs)
-
     else:
         logger.info(f"TensorRT plan not found; falling back to Torch for backend={config.backend}.")
-        # For PyTorch fallback, use the original model path (not TRT plan)
         ortho_kwargs = {}
         if config.ortho_model_path is not None:
             ortho_kwargs["pretrained_model_ortho"] = str(config.ortho_model_path)
@@ -378,46 +569,28 @@ def run(
             **ortho_kwargs,
         )
 
-    sidecar = {
-        "config": {
-            "model_path": str(config.model_path),
-            "backend": config.backend,
-            "channels": list(config.channels),
-            "anisotropy": config.anisotropy,
-            "normalize_percentiles": list(config.normalize_percentiles),
-            "ortho_model_path": str(config.ortho_model_path) if config.ortho_model_path else None,
-            "ortho_weights": list(config.ortho_weights) if config.ortho_weights is not None else None,
-        },
-    }
+    # Process files
+    results: list[Path] = []
+    for i, file_path in enumerate(files, 1):
+        logger.info(f"[{i}/{len(files)}] Processing {file_path.name}")
+        # Per-file seed for reproducible crops (combine global seed with file index)
+        crop_seed = seed + i
+        try:
+            mask_path = _run_single_volume(
+                file_path,
+                cellpose_model,
+                config,
+                crop_size=0,
+                crop_seed=crop_seed,
+            )
+            results.append(mask_path)
+        except Exception as e:
+            if batch_mode:
+                logger.warning(f"Failed {file_path.name}: {e}")
+                continue
+            raise
 
-    masks, flows, styles = _cellpose(cellpose_model, img, config=config)
-    metadata_df = _build_label_metadata(masks, flows[1], use_gpu=config.use_gpu)
+    if batch_mode:
+        logger.info(f"Batch complete: {len(results)}/{len(files)} succeeded")
 
-    # Save outputs
-    out = volume.parent.parent / "segment2_5d"
-    out.mkdir(exist_ok=True)
-    pickle_path = out / f"{volume.stem}.pkl"
-    dest_volume = pickle_path.with_name(volume.name)
-    if dest_volume.resolve() != volume.resolve():
-        shutil.copyfile(volume, dest_volume)
-    mask_path = pickle_path.with_name(volume.stem + "_masks.tif")
-    tifffile.imwrite(
-        mask_path,
-        masks.astype(np.uint32),
-        compression="zstd",
-    )
-    metadata_path = pickle_path.with_name(volume.stem + "_labels.parquet")
-    metadata_df.write_parquet(metadata_path)
-    with pickle_path.open("wb") as handle:
-        pickle.dump({"flows": flows, "styles": styles, **sidecar}, handle)
-
-    if config.save_flows:
-        flow_path = pickle_path.with_name(volume.stem + "_flows.npz")
-        np.savez_compressed(
-            flow_path,
-            dp=np.asarray(flows[1], dtype=np.float32),
-            cellprob=np.asarray(flows[2], dtype=np.float32),
-        )
-        logger.info(f"Saved flows to {flow_path}")
-
-    logger.info(f"Wrote masks to {mask_path}")
+    return results
