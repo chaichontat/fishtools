@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,6 +165,14 @@ def quantize(
         n_fids=n_fids,
         overwrite=overwrite,
     )
+
+    # Delete deconv32 directories for this round after quantization
+    deconv32_base = workspace / "analysis" / "deconv32"
+    pattern = f"{round_name}--*"
+    for roi_dir in deconv32_base.glob(pattern):
+        if roi_dir.is_dir():
+            shutil.rmtree(roi_dir)
+            logger.info(f"Deleted {roi_dir}")
 
 
 __all__ = [
@@ -995,7 +1004,7 @@ def prepare(
 )
 @click.option("--histogram-bins", type=int, default=8192, show_default=True)
 @click.option("--overwrite", is_flag=True)
-@click.option("--delete-origin", is_flag=True)
+@click.option("--delete-origin/--no-delete-origin", default=True, show_default=True)
 @click.option("--n-fids", type=int, default=2, show_default=True)
 @click.option(
     "--basic-name",
@@ -1141,7 +1150,7 @@ def run(
 )
 @click.option("--histogram-bins", type=int, default=8192, show_default=True)
 @click.option("--overwrite", is_flag=True)
-@click.option("--delete-origin", is_flag=True)
+@click.option("--delete-origin/--no-delete-origin", default=True, show_default=True)
 @click.option("--n-fids", type=int, default=2, show_default=True)
 @click.option(
     "--basic-name",
