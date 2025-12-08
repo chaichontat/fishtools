@@ -26,6 +26,7 @@ from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.segment.normalize import sample_percentile
 from fishtools.segmentation.distributed.cache_utils import (
+    read_nonempty_cache,
     read_normalization_cache,
     write_nonempty_cache,
     write_normalization_cache,
@@ -873,11 +874,11 @@ def distributed_eval(
     n = None
 
     path_nonempty = Path(write_path).parent / "nonempty.json"
-    # DEBUG: Disable cache for sliced input
-    idxs = None  # read_nonempty_cache(path_nonempty, blocksize)
+    idxs = read_nonempty_cache(path_nonempty, blocksize)
     if idxs is not None:
-        logger.info(f"Loaded cached non-empty block indices ({len(idxs)} entries).")
+        logger.info(f"Loaded cached non-empty block indices ({len(idxs)} entries) from {path_nonempty}.")
     else:
+        logger.info("Non-empty cache miss or invalidated; re-scanning input for non-zero blocks.")
         check_futures = cluster.client.map(
             check_block_has_data,
             block_crops[offset : None if n is None else offset + n],
@@ -1139,7 +1140,7 @@ def run(
         help="Explicit path to config.json. Defaults to <path>/../config.json when omitted.",
     ),
     workers_per_gpu: int = typer.Option(
-        2, help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster)"
+        4, help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster)"
     ),
     threads_per_worker: int = typer.Option(1, help="Threads per worker (GPU-bound work typically uses 1)"),
     use_localcuda: bool = typer.Option(
@@ -1250,7 +1251,7 @@ def run(
         shutil.rmtree(temporary_directory)
 
     (base_dir / "segmentation.done").unlink(missing_ok=True)
-    ortho_weights = config.get("ortho_weights", [4, 1.0, 1.0])
+    ortho_weights = config.get("ortho_weights", [3, 1.0, 1.0])
     diameter = config.get("diameter", 30)
     cellpose_model_kwargs = {
         "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
@@ -1382,11 +1383,12 @@ def run(
         "cellprob_threshold": 0,  # Default is 0.0, adjust if needed
         "anisotropy": 2.0,
         "resample": False,
-        "flow3D_smooth": 1,
+        "flow3D_smooth": 1.5,
         "niter": 1000,
         "do_3D": True,
         "min_size": 500,
         "channel_axis": 3,
+        "use_kde_clustering": True
     }
     if using_sam_backend:
         cellpose_eval_kwargs["z_axis"] = 0

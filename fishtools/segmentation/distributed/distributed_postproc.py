@@ -621,8 +621,8 @@ def main(
     input_path: Path = typer.Argument(..., help="Path to input segmentation zarr"),
     output_path: Path = typer.Option(None, help="Output path (default: input_postproc.zarr)"),
     blocksize: int = typer.Option(1024, help="XY block size for tiled processing"),
-    sigma: str = typer.Option("3,3,3", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
-    v_min: int = typer.Option(2000, help="Minimum volume threshold for small cell donation"),
+    sigma: str = typer.Option("1,2,2", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
+    v_min: int = typer.Option(1000, help="Minimum volume threshold for small cell donation"),
     margin: int = typer.Option(50, help="Margin parameter (overlap = 2*margin for overlap removal)"),
     workers_per_gpu: int = typer.Option(4, help="Workers per GPU"),
 ) -> None:
@@ -631,7 +631,7 @@ def main(
     """
     input_zarr = zarr.open(input_path, mode="r")
 
-    if output_path is None:
+    if output_path is None:  # type: ignore
         output_path = input_path.parent / f"{input_path.stem}_postproc.zarr"
 
     cluster_kwargs = {
