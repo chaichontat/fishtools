@@ -142,6 +142,7 @@ def build_corr_l2_table(
         exists=True, file_okay=False, dir_okay=True, readable=True, resolve_path=True, path_type=Path
     ),
 )
+@click.argument("roi", required=False, metavar="ROI")
 @click.option(
     "--codebook",
     "-c",
@@ -182,8 +183,9 @@ def build_corr_l2_table(
 )
 def check_shifts(
     path: Path,
+    roi: str | None,
     codebook_path: Path,
-    rois: list[str] | None,
+    rois: tuple[str, ...],
     output_dir: Path | None,
     cols: int,
     corr_threshold: float,
@@ -197,16 +199,30 @@ def check_shifts(
     - shifts_corr_hist: correlation histograms
     """
 
+    if roi is not None and rois:
+        msg = "Specify ROI either as a positional argument or via --roi, not both."
+        raise click.UsageError(msg)
+
+    selected_rois: list[str] | None
+    if roi is not None:
+        selected_rois = [roi]
+    elif rois:
+        selected_rois = list(rois)
+    else:
+        selected_rois = None
+
+    roi_label = ",".join(selected_rois) if selected_rois else "all"
+
     setup_cli_logging(
         path,
         component="preprocess.check_shifts",
         file=f"check-shifts-{codebook_path.stem}",
-        extra={"codebook": codebook_path.stem, "roi": ",".join(rois) if rois else "all"},
+        extra={"codebook": codebook_path.stem, "roi": roi_label},
     )
 
     ws = Workspace(path)
     codebook = Codebook(codebook_path)
-    roi_list = ws.resolve_rois(rois)
+    roi_list = ws.resolve_rois(selected_rois)
 
     # Default output directory mirrors cli_spotlook behavior
     if output_dir is None:
