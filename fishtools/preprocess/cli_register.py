@@ -21,15 +21,10 @@ from scipy.ndimage import shift
 from tifffile import TiffFile
 
 from fishtools.preprocess.chromatic import Affine
-from fishtools.preprocess.config import (
-    Config,
-    Fiducial,
-    NumpyEncoder,
-    RegisterConfig,
-)
+from fishtools.preprocess.config import Config, Fiducial, FiducialDetailedConfig, NumpyEncoder, RegisterConfig
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
-from fishtools.preprocess.fiducial import Shifts, align_fiducials
+from fishtools.preprocess.fiducial import Shifts, align_fiducials, shifts_from_anchor_roi
 from fishtools.utils.io import Workspace, safe_imwrite
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
@@ -205,6 +200,35 @@ def apply_deconv_scaling(
     )
 
 
+def _save_debug_overlay(
+    debug_dir: Path,
+    idx: int,
+    reference_name: str,
+    shifted: dict[str, np.ndarray],
+) -> None:
+    """Save red-green overlay: reference round (green) vs shifted round (red)."""
+    from PIL import Image as PILImage
+
+    ref = shifted[reference_name]
+
+    def norm_pct(arr: np.ndarray) -> np.ndarray:
+        p10, p99999 = np.percentile(arr, [10, 99.999])
+        scaled = np.clip((arr - p10) / (p99999 - p10 + 1e-8), 0, 1)
+        return np.sqrt(scaled)
+
+    ref_norm = (norm_pct(ref) * 255).astype(np.uint8)
+
+    for name, img in shifted.items():
+        if name == reference_name:
+            continue
+
+        img_norm = (norm_pct(img) * 255).astype(np.uint8)
+        # RGB: R=current round, G=reference round, B=0
+        rgb = np.stack([img_norm, ref_norm, np.zeros_like(ref_norm)], axis=-1)
+
+        PILImage.fromarray(rgb).save(debug_dir / f"{idx:04d}-{name}.png")
+
+
 @dataclass
 class Image:
     name: str
@@ -358,11 +382,13 @@ def run_fiducial(
     reference: str,
     debug: bool,
     no_priors: bool = False,
+    fids_raw: dict[str, np.ndarray] | None = None,
 ):
     prior_mapping: dict[str, str] = {}
 
     if (
         not config.registration.fiducial.use_fft
+        and config.registration.fiducial.anchor_roi is None  # Skip priors when using anchor ROI
         and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
         and not no_priors
     ):
@@ -382,11 +408,15 @@ def run_fiducial(
         }
         logger.debug(config.registration.fiducial.priors)
 
-    if config.registration.fiducial.priors is not None:
+    # Skip prior application when using anchor ROIs (anchor points are absolute)
+    if config.registration.fiducial.priors is not None and config.registration.fiducial.anchor_roi is None:
         for name, sh in config.registration.fiducial.priors.items():
             for file in fids:
                 if file.startswith(name):
                     fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
+                    # Also apply priors to raw fids for debug output
+                    if fids_raw is not None and file in fids_raw:
+                        fids_raw[file] = shift(fids_raw[file], [sh[1], sh[0]], order=1)
                     prior_mapping[name] = file
                     break
             else:
@@ -408,51 +438,85 @@ def run_fiducial(
     # Write reference fiducial
     (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
     crop = config.registration.crop
+    if crop:
+        fid_img = fids[reference][crop:-crop, crop:-crop]
+    else:
+        fid_img = fids[reference]
     safe_imwrite(
         fid_path / f"fids-{idx:04d}.tif",
-        fids[reference][crop:-crop, crop:-crop],
+        fid_img,
         compression=22610,
         compressionargs={"level": 0.65},
-        metadata={"axes": "YX"},
+        metadata={"axes": "YX", "key": [reference]},
     )
+
+    # Use a deterministic ordering for all multi-channel fiducial stacks
+    ordered_keys = sorted(fids.keys())
 
     _fids_path = path / f"registered--{roi}+{codebook_name}" / "_fids"
     _fids_path.mkdir(exist_ok=True, parents=True)
 
     safe_imwrite(
         _fids_path / f"_fids-{idx:04d}.tif",
-        np.stack([v for v in fids.values()]),
+        np.stack([fids[k] for k in ordered_keys]),
         compression=22610,
         compressionargs={"level": 0.65},
-        metadata={"axes": "CYX", "key": list(fids.keys())},
+        metadata={"axes": "CYX", "key": ordered_keys},
     )
 
-    shifts, residuals = align_fiducials(
-        fids,
-        reference=reference,
-        debug=debug,
-        max_iters=5,
-        threshold_sigma=config.registration.fiducial.threshold,
-        fwhm=config.registration.fiducial.fwhm,
-        use_fft=config.registration.fiducial.use_fft,
-    )
+    if config.registration.fiducial.anchor_roi is not None:
+        logger.info(f"Using anchor points from {config.registration.fiducial.anchor_roi}")
+        anchor_shifts = shifts_from_anchor_roi(
+            config.registration.fiducial.anchor_roi,
+            reference,
+            ordered_keys,
+        )
+        shifts = {k: anchor_shifts.get(k, np.array([0.0, 0.0])) for k in fids}
+        residuals = {k: 0.0 for k in fids}
+    else:
+        shifts, residuals = align_fiducials(
+            fids,
+            reference=reference,
+            debug=debug,
+            max_iters=5,
+            threshold_sigma=config.registration.fiducial.threshold,
+            fwhm=config.registration.fiducial.fwhm,
+            use_fft=config.registration.fiducial.use_fft,
+            use_itk=config.registration.fiducial.use_itk,
+            use_brightest=config.registration.fiducial.detailed.use_brightest,
+            detailed_config=config.registration.fiducial.detailed,
+        )
 
-    assert shifts  # type: ignore
-    assert residuals  # type: ignore
+        assert shifts  # type: ignore
+        assert residuals  # type: ignore
 
     shifted = {k: shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()}
 
     if debug:
+        debug_dir = path / "fids_debug"
+        debug_dir.mkdir(exist_ok=True)
+        # Ensure deterministic channel ordering for debug TIFFs so that the
+        # plane index matches the sorted fiducial keys used in QC tooling.
+        # Use raw fids with priors applied (not LoG treated)
+        debug_fids = fids_raw if fids_raw is not None else fids
         safe_imwrite(
-            path / f"fids_shifted-{idx:04d}.tif",
-            # Prior shifts already applied.
-            np.stack(list(shifted.values())),
+            debug_dir / f"fids-{idx:04d}.tif",
+            np.stack([debug_fids[k] for k in ordered_keys]),
             compression=22610,
             compressionargs={"level": 0.65},
-            metadata={"axes": "CYX"},
+            metadata={"axes": "CYX", "key": ordered_keys},
         )
+        safe_imwrite(
+            debug_dir / f"fids_shifted-{idx:04d}.tif",
+            np.stack([shifted[k] for k in ordered_keys]),
+            compression=22610,
+            compressionargs={"level": 0.65},
+            metadata={"axes": "CYX", "key": ordered_keys},
+        )
+        _save_debug_overlay(debug_dir, idx, reference, shifted)
 
-    if config.registration.fiducial.priors is not None:
+    # Add priors to final shifts (skip when using anchor ROIs - anchor points are absolute)
+    if config.registration.fiducial.priors is not None and config.registration.fiducial.anchor_roi is None:
         for name, sh in config.registration.fiducial.priors.items():
             if (
                 not config.registration.fiducial.overrides
@@ -566,9 +630,19 @@ def _run(
         raise FileNotFoundError(f"No files found in {path} with index {idx}")
 
     if not shifts:
+        # Use raw fiducials for FFT/ITK (ITK applies its own preprocessing)
+        # Use LoG-processed fiducials for spot-based alignment
+        use_fft = config.registration.fiducial.use_fft
+        use_itk = config.registration.fiducial.use_itk
+        use_raw = use_fft or use_itk
+        fid_images = {
+            name: img.fid_raw.astype(np.float32) if use_raw else img.fid
+            for name, img in imgs.items()
+        }
+        fid_raw_images = {name: img.fid_raw.astype(np.float32) for name, img in imgs.items()}
         shifts = run_fiducial(
             path,
-            {name: img.fid for name, img in imgs.items()},
+            fid_images,
             codebook_name,
             config,
             roi=roi,
@@ -576,6 +650,7 @@ def _run(
             debug=debug,
             idx=idx,
             no_priors=no_priors,
+            fids_raw=fid_raw_images,
         )
 
     for _img in imgs.values():
@@ -746,6 +821,16 @@ def register(): ...
 @click.option("--fwhm", type=float, default=4.0)
 @click.option("--overwrite", is_flag=True)
 @click.option("--no-priors", is_flag=True)
+@click.option("--use-fft", is_flag=True, help="Use FFT phase correlation instead of spot-based matching")
+@click.option("--use-itk", is_flag=True, help="Use SimpleITK gradient descent for alignment (more robust for low-contrast)")
+@click.option("--anchors", type=click.Path(exists=True, path_type=Path), help="Path to ImageJ RoiSet.zip with anchor points. Skips automatic registration.")
+@click.option(
+    "--use-brightest",
+    type=int,
+    default=0,
+    show_default=True,
+    help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
+)
 def run(
     path: Path,
     idx: int,
@@ -757,6 +842,10 @@ def run(
     threshold: float = 6,
     fwhm: float = 4,
     no_priors: bool = False,
+    use_fft: bool = False,
+    use_itk: bool = False,
+    anchors: Path | None = None,
+    use_brightest: int = 0,
 ):
     """Preprocess image sets before spot calling.
 
@@ -805,12 +894,15 @@ def run(
                         "750": str(DATA / "560to750.txt"),
                     },
                     fiducial=Fiducial(
-                        use_fft=False,
+                        use_fft=use_fft,
+                        use_itk=use_itk,
                         fwhm=fwhm,
                         threshold=threshold,
                         priors={},
                         overrides={},
+                        anchor_roi=anchors,
                         n_fids=2,
+                        detailed=FiducialDetailedConfig(use_brightest=max(use_brightest, 0)),
                     ),
                     reference=reference,
                     downsample=1,
@@ -847,6 +939,15 @@ def run(
         "the single 'run' command with --overwrite."
     ),
 )
+@click.option("--use-fft", is_flag=True, help="Use FFT phase correlation instead of spot-based matching")
+@click.option("--use-itk", is_flag=True, help="Use SimpleITK gradient descent for alignment (more robust for low-contrast)")
+@click.option(
+    "--use-brightest",
+    type=int,
+    default=0,
+    show_default=True,
+    help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
+)
 def batch(
     path: Path,
     roi: str,
@@ -858,6 +959,9 @@ def batch(
     overwrite: bool,
     debug: bool,
     verify: bool,
+    use_fft: bool = False,
+    use_itk: bool = False,
+    use_brightest: int = 0,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
@@ -916,6 +1020,9 @@ def batch(
                         ref,
                         f"--roi={roi}",
                         *(["--overwrite"] if overwrite else []),
+                        *(["--use-fft"] if use_fft else []),
+                        *(["--use-itk"] if use_itk else []),
+                        *( [f"--use-brightest={use_brightest}"] if use_brightest > 0 else [] ),
                     ],
                     check=True,
                 )
