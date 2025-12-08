@@ -169,7 +169,6 @@ class TestSortKey:
 
         # Sort using our sort_key function
         sorted_data = sorted(test_data, key=sort_key)
-        sorted_keys = [item[0] for item in sorted_data]
 
         # Numeric keys should be zero-padded and come first, then alphabetic
         expected_order = ["01", "02", "10", "20", "A", "B"]
@@ -500,7 +499,7 @@ class TestRunFiducial:
         priors: dict[str, tuple[float, float]] | None = None,
         overrides: dict[str, tuple[float, float]] | None = None,
         n_fids: int = 1,
-    ) -> Config:
+        ) -> Config:
         return Config(
             dataPath="/tmp",
             registration=RegisterConfig(
@@ -519,6 +518,199 @@ class TestRunFiducial:
                 reduce_bit_depth=0,
             ),
         )
+
+    def test_run_fiducial_debug_fids_shifted_ordering(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Debug fids_shifted stack should follow sorted fid keys."""
+        config = self._make_config(priors=None)
+
+        workspace = tmp_path / "ws"
+        deconv_path = workspace / "analysis" / "deconv"
+        deconv_path.mkdir(parents=True)
+
+        def fake_align(
+            fids: dict[str, np.ndarray], **_: Any
+        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+            shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
+            residuals = {name: 0.1 for name in fids}
+            return shifts, residuals
+
+        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
+
+        def fake_shift(arr: np.ndarray, shift_vec: Sequence[float], **kwargs: Any) -> np.ndarray:
+            return arr
+
+        monkeypatch.setattr(cli_register_module, "shift", fake_shift)
+
+        recorded: list[tuple[Path, np.ndarray, dict[str, Any]]] = []
+
+        def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
+            metadata = kwargs.get("metadata", {})
+            recorded.append((path, data, metadata))
+
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+
+        # Construct fids with deliberately unsorted keys to exercise ordering logic
+        fids: dict[str, np.ndarray] = {
+            "round_b": np.full((4, 4), 2, dtype=np.float32),
+            "round_a": np.full((4, 4), 1, dtype=np.float32),
+            "round_c": np.full((4, 4), 3, dtype=np.float32),
+        }
+
+        cli_register_module.run_fiducial(
+            path=deconv_path,
+            fids=fids,
+            codebook_name="cb",
+            config=config,
+            roi="roi",
+            idx=0,
+            reference="round_a",
+            debug=True,
+        )
+
+        shifted_records = [
+            (path, data, metadata) for path, data, metadata in recorded if "fids_shifted" in path.name
+        ]
+        assert shifted_records, "Expected a fids_shifted debug write when debug=True"
+
+        _, data, metadata = shifted_records[0]
+
+        assert data.shape[0] == len(fids)
+
+        expected_order = sorted(fids.keys())
+        assert metadata.get("key") == expected_order
+
+        means_by_plane = [float(np.mean(data[i])) for i in range(data.shape[0])]
+        expected_means = [float(np.mean(fids[name])) for name in expected_order]
+        assert means_by_plane == expected_means
+
+    def test_run_fiducial_writes__fids_with_sorted_keys(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """_fids stack should follow sorted keys with key metadata."""
+        config = self._make_config(priors=None)
+
+        workspace = tmp_path / "ws"
+        deconv_path = workspace / "analysis" / "deconv"
+        deconv_path.mkdir(parents=True)
+
+        def fake_align(
+            fids: dict[str, np.ndarray], **_: Any
+        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+            shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
+            residuals = {name: 0.05 for name in fids}
+            return shifts, residuals
+
+        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
+
+        def fake_shift(arr: np.ndarray, shift_vec: Sequence[float], **kwargs: Any) -> np.ndarray:
+            return arr
+
+        monkeypatch.setattr(cli_register_module, "shift", fake_shift)
+
+        records: list[tuple[Path, np.ndarray, dict[str, Any]]] = []
+
+        def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
+            metadata = kwargs.get("metadata", {})
+            records.append((path, data, metadata))
+
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+
+        fids: dict[str, np.ndarray] = {
+            "round_z": np.full((4, 4), 3, dtype=np.float32),
+            "round_x": np.full((4, 4), 1, dtype=np.float32),
+            "round_y": np.full((4, 4), 2, dtype=np.float32),
+        }
+
+        cli_register_module.run_fiducial(
+            path=deconv_path,
+            fids=fids,
+            codebook_name="cb",
+            config=config,
+            roi="roi",
+            idx=0,
+            reference="round_x",
+            debug=False,
+        )
+
+        fids_stack_records = [
+            (path, data, metadata)
+            for path, data, metadata in records
+            if "_fids-" in path.name
+        ]
+        assert fids_stack_records, "Expected _fids stack to be written"
+
+        _, data, metadata = fids_stack_records[0]
+        expected_order = sorted(fids.keys())
+
+        assert data.shape[0] == len(expected_order)
+        assert metadata.get("key") == expected_order
+
+        means_by_plane = [float(np.mean(data[i])) for i in range(data.shape[0])]
+        expected_means = [float(np.mean(fids[name])) for name in expected_order]
+        assert means_by_plane == expected_means
+
+    def test_run_fiducial_reference_fid_metadata_has_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Reference fid image should record its key in metadata."""
+        config = self._make_config(priors=None)
+
+        workspace = tmp_path / "ws"
+        deconv_path = workspace / "analysis" / "deconv"
+        deconv_path.mkdir(parents=True)
+
+        def fake_align(
+            fids: dict[str, np.ndarray], **_: Any
+        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+            shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
+            residuals = {name: 0.05 for name in fids}
+            return shifts, residuals
+
+        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
+
+        def fake_shift(arr: np.ndarray, shift_vec: Sequence[float], **kwargs: Any) -> np.ndarray:
+            return arr
+
+        monkeypatch.setattr(cli_register_module, "shift", fake_shift)
+
+        records: list[tuple[Path, np.ndarray, dict[str, Any]]] = []
+
+        def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
+            metadata = kwargs.get("metadata", {})
+            records.append((path, data, metadata))
+
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+
+        fids: dict[str, np.ndarray] = {
+            "round_b": np.ones((4, 4), dtype=np.float32),
+            "round_a": np.ones((4, 4), dtype=np.float32) * 2,
+        }
+        reference = "round_a"
+
+        cli_register_module.run_fiducial(
+            path=deconv_path,
+            fids=fids,
+            codebook_name="cb",
+            config=config,
+            roi="roi",
+            idx=1,
+            reference=reference,
+            debug=False,
+        )
+
+        ref_fid_records = [
+            (path, data, metadata)
+            for path, data, metadata in records
+            if path.name.startswith("fids-")
+        ]
+        assert ref_fid_records, "Expected reference fid image to be written"
+
+        _, data, metadata = ref_fid_records[0]
+        assert data.shape == (4, 4)
+        assert metadata.get("axes") == "YX"
+        assert metadata.get("key") == [reference]
 
     def test_run_fiducial_does_not_mutate_config_priors(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
