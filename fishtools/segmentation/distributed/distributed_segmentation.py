@@ -1298,7 +1298,6 @@ def run(
                 logger.warning(
                     f"Selected channels {channels_list} do not match total channels {list(range(1, input_zarr_array.shape[3] + 1))}"
                 )
-                input("Do you want to continue? Press Enter to continue or Ctrl+C to abort.")
         except ValueError:
             raise ValueError(f"Channel names {channels} not found in {key}")
     del channels
