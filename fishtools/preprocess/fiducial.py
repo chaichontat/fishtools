@@ -194,6 +194,160 @@ def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2) -> np.ndar
     return phase_cross_correlation(ref, img, upsample_factor=int(10**precision))[0]
 
 
+def itk_shift(
+    ref: np.ndarray,
+    img: np.ndarray,
+    max_shift: float = 20.0,
+) -> np.ndarray:
+    """Calculate image translation using SimpleITK 1+1 evolutionary optimizer (2D translation).
+
+    Uses a correlation metric and the OnePlusOne evolutionary strategy over a small
+    multi-resolution pyramid. The optimization is centered on the initial transform
+    (zero shift). The final shift is clipped to ``[-max_shift, max_shift]`` per axis
+    to guard against implausibly large drifts.
+
+    Args:
+        ref: Reference image.
+        img: Target image to be aligned to reference.
+        max_shift: Maximum absolute translation (in pixels, assuming unit spacing)
+            allowed along each axis. Results exceeding this are clipped.
+
+    Returns:
+        Translation vector [dy, dx] in pixels to align img to ref.
+    """
+    import SimpleITK as sitk
+
+    fixed_sitk = sitk.GetImageFromArray(ref.astype(np.float32))
+    moving_sitk = sitk.GetImageFromArray(img.astype(np.float32))
+
+    registration = sitk.ImageRegistrationMethod()
+
+    # Same-modality metric and linear interpolation
+    registration.SetMetricAsMattesMutualInformation()
+    registration.SetInterpolator(sitk.sitkLinear)
+
+    # Multi-resolution pyramid for robustness
+    registration.SetShrinkFactorsPerLevel([4, 2, 1])
+    registration.SetSmoothingSigmasPerLevel([4, 2, 0])
+    registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOff()
+
+    # Pure 2D translation
+    initial_transform = sitk.TranslationTransform(2)
+    registration.SetInitialTransform(initial_transform, inPlace=True)
+
+    # 1+1 evolutionary optimizer; scales derived from physical shifts
+    registration.SetOptimizerAsOnePlusOneEvolutionary(
+        numberOfIterations=200,
+        epsilon=1.5e-4,
+        initialRadius=1.01,
+    )
+    registration.SetOptimizerScalesFromPhysicalShift()
+
+    final_transform = registration.Execute(fixed_sitk, moving_sitk)
+    params = final_transform.GetParameters()
+
+    # Debug: log optimizer diagnostics and final shift
+    logger.debug(f"ITK optimizer stop: {registration.GetOptimizerStopConditionDescription()}")
+    logger.debug(f"ITK iterations: {registration.GetOptimizerIteration()}")
+    logger.debug(f"ITK metric: {registration.GetMetricValue()}")
+    logger.debug(f"ITK final translation (tx, ty) = ({params[0]:.4f}, {params[1]:.4f})")
+
+    # SITK returns [tx, ty], convert to [dy, dx] = [ty, tx]
+    shift = np.array([params[1], params[0]], dtype=float)
+
+    if np.any(np.abs(shift) > max_shift):
+        logger.warning(
+            f"ITK shift {shift} exceeds max_shift={max_shift:.1f}px; clipping to bounds."
+        )
+        shift = np.clip(shift, -max_shift, max_shift)
+
+    logger.debug(f"ITK final shift [dy, dx] = ({shift[0]:.4f}, {shift[1]:.4f})")
+    return shift
+
+
+def shifts_from_anchor_roi(
+    roi_path: Path, reference: str, ordered_keys: list[str]
+) -> dict[str, np.ndarray]:
+    """Calculate shifts from ImageJ ROI anchor points using channel position.
+
+    Points are matched to rounds by their channel position (c_position) in the ROI.
+    Channel indices correspond to the sorted round names in the fids TIFF.
+    Points are matched by nearest-neighbor - user doesn't need to mark in same order.
+
+    Args:
+        roi_path: Path to ImageJ RoiSet.zip or .roi file
+        reference: Name of the reference round
+        ordered_keys: Sorted list of round names (channel order in fids TIFF)
+
+    Returns:
+        Dict mapping round name to [dx, dy] shift in pixels
+    """
+    from collections import defaultdict
+
+    import roifile
+
+    rois = roifile.roiread(roi_path)
+    if not isinstance(rois, list):
+        rois = [rois]
+
+    # Find reference channel index
+    ref_channel = ordered_keys.index(reference)
+
+    # Group points by channel (c_position is 1-indexed in ImageJ)
+    points_by_channel: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    for roi in rois:
+        if roi.roitype != roifile.ROI_TYPE.POINT:
+            continue
+        # c_position is 1-indexed, convert to 0-indexed
+        channel = roi.c_position - 1 if roi.c_position > 0 else 0
+        for coord in roi.coordinates():
+            points_by_channel[channel].append((coord[0], coord[1]))
+
+    # Map channel indices to round names
+    points_by_round: dict[str, list[tuple[float, float]]] = {}
+    for channel, points in points_by_channel.items():
+        if channel < len(ordered_keys):
+            points_by_round[ordered_keys[channel]] = points
+        else:
+            logger.warning(f"Channel {channel} exceeds number of rounds ({len(ordered_keys)})")
+
+    if reference not in points_by_round:
+        raise ValueError(f"No anchor points found for reference round '{reference}'")
+
+    ref_points = np.array(points_by_round[reference])
+    logger.info(f"Loaded {len(ref_points)} anchor points for reference '{reference}'")
+
+    shifts: dict[str, np.ndarray] = {reference: np.array([0.0, 0.0])}
+
+    for round_name in rounds:
+        if round_name == reference:
+            continue
+        if round_name not in points_by_round:
+            logger.warning(f"No anchor points found for round '{round_name}', using zero shift")
+            shifts[round_name] = np.array([0.0, 0.0])
+            continue
+
+        round_points = np.array(points_by_round[round_name])
+
+        if len(round_points) != len(ref_points):
+            raise ValueError(
+                f"Round '{round_name}' has {len(round_points)} points but reference has {len(ref_points)}"
+            )
+
+        # Nearest-neighbor matching (permutation invariant)
+        tree = cKDTree(round_points)
+        distances, indices = tree.query(ref_points)
+        matched_round_points = round_points[indices]
+
+        # Shift = ref - matched_round (to move round to align with ref)
+        # Returns [dx, dy] where dx is column shift, dy is row shift
+        shift = np.median(ref_points - matched_round_points, axis=0)
+        shifts[round_name] = shift
+        logger.debug(f"Anchor shift for {round_name}: {shift}, mean distance: {distances.mean():.2f}")
+
+    return shifts
+
+
 def background(
     img: np.ndarray, box_size: tuple[int, int] | None = None, sigma_clip: float = 2.0
 ) -> np.ndarray:
@@ -566,7 +720,7 @@ def individual_align_fiducial(
                         break
                     initial_drift = drift
 
-                if np.max(drift) > detailed_config.max_drift_threshold:
+                if np.max(np.abs(drift)) > detailed_config.max_drift_threshold:
                     local_σ += detailed_config.threshold_step
                     raise DriftTooLarge(f"{bitname}: drift very large {np.hypot(*drift):.2f}.")
 
@@ -628,6 +782,8 @@ def align_fiducials(
     *,
     reference: str,
     use_fft: bool = False,
+    use_itk: bool = False,
+    use_brightest: int = 0,
     threads: int = 4,
     overrides: dict[str, tuple[float, float]] | None = None,
     subtract_background: bool = False,
@@ -647,6 +803,8 @@ def align_fiducials(
         fids: Dictionary mapping image names to fiducial channel arrays
         reference: Regex pattern to identify reference image name
         use_fft: Use FFT phase correlation instead of spot-based matching
+        use_itk: Use SimpleITK gradient descent for alignment
+        use_brightest: If >0, use only the N brightest target spots when estimating drift
         threads: Number of parallel processing threads
         overrides: Manual drift overrides for specific images
         subtract_background: Apply background subtraction before detection
@@ -678,9 +836,18 @@ def align_fiducials(
         threshold_sigma=threshold_sigma,
         threshold_residual=threshold_residual,
         fwhm=fwhm,
-        use_brightest=0,
+        use_brightest=use_brightest,
         detailed_config=detailed_config,
     )
+
+    def spot_with_itk_fallback(img: np.ndarray, bitname: str, limit: int) -> tuple[np.ndarray, float]:
+        """Try spot-based registration, fall back to SimpleITK if it fails."""
+        try:
+            return corr(img, bitname=bitname, limit=limit)
+        except (NotEnoughSpots, TooManySpots, ResidualTooLarge, DriftTooLarge) as e:
+            logger.warning(f"{bitname}: Spot-based registration failed ({e.__class__.__name__}), falling back to SimpleITK")
+            # itk_shift returns [dy, dx], swap to [dx, dy] for consistency
+            return (itk_shift(fids[ref], img)[::-1], -1.0)  # residual=-1 indicates ITK fallback
 
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
         futs: dict[str, Future] = {}
@@ -688,10 +855,15 @@ def align_fiducials(
             if k == ref or (overrides is not None and k in overrides):
                 continue
             if use_fft:
-                # shifts, residual
-                futs[k] = exc.submit(lambda x: (phase_shift(fids[ref], x), 0.0), img)
+                # phase_shift returns [dy, dx] (row, col) from phase_cross_correlation.
+                # Swap to [dx, dy] to match spot-based convention used elsewhere.
+                futs[k] = exc.submit(lambda x: (phase_shift(fids[ref], x)[::-1], 0.0), img)
+            elif use_itk:
+                # itk_shift returns [dy, dx], swap to [dx, dy] for consistency.
+                futs[k] = exc.submit(lambda x: (itk_shift(fids[ref], x)[::-1], 0.0), img)
             else:
-                futs[k] = exc.submit(corr, img, bitname=k, limit=max_iters)
+                # Spot-based with ITK fallback
+                futs[k] = exc.submit(spot_with_itk_fallback, img, bitname=k, limit=max_iters)
 
             if debug:
                 futs[k].result()

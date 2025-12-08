@@ -60,6 +60,14 @@ class FiducialDetailedConfig(BaseModel):
     max_drift_threshold: float = Field(default=40.0, description="Maximum allowed drift in pixels")
     warning_spots_threshold: int = Field(default=1000, description="Warn if more than this many spots found")
     min_spots_for_mode: int = Field(default=100, description="Minimum spots required to use mode calculation")
+    use_brightest: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "If >0, use only the N brightest fiducial spots when estimating drift. "
+            "0 means use all detected spots."
+        ),
+    )
 
     # Alignment quality thresholds
     bin_size: float = Field(default=0.5, description="Bin size for mode calculation in drift estimation")
@@ -71,7 +79,11 @@ class FiducialDetailedConfig(BaseModel):
 class Fiducial(BaseModel):
     use_fft: bool = Field(
         default=False,
-        description="Use FFT to find fiducial spots. Overrides everything else.",
+        description="Use FFT phase correlation for alignment.",
+    )
+    use_itk: bool = Field(
+        default=False,
+        description="Use SimpleITK gradient descent for alignment. More robust for low-contrast images.",
     )
     fwhm: float = Field(
         default=4.5,
@@ -90,6 +102,10 @@ class Fiducial(BaseModel):
     overrides: dict[str, tuple[float, float]] | None = Field(
         default=None,
         description="Overrides for fiducial spot detection. Name must match round name.",
+    )
+    anchor_roi: Path | None = Field(
+        default=None,
+        description="Path to ImageJ RoiSet.zip with named anchor points for manual registration. Skips automatic registration.",
     )
     n_fids: int = Field(default=2, ge=0, description="Number of fiducial frames in each image.")
     detailed: FiducialDetailedConfig = Field(

@@ -14,6 +14,7 @@ from fishtools.utils.pretty_print import (
     TaskCancelledException,
     get_cancel_event,
     register_subprocess,
+    run_subprocess_streaming,
     unregister_subprocess,
 )
 
@@ -26,11 +27,17 @@ def run_imagej(
     threshold: float | None = None,
     name: str = "TileConfiguration.txt",
     capture_output: bool = False,
+    stream_to_console: bool = False,
     sc: StitchingConfig | None = None,
 ) -> None:
     """Execute ImageJ's Grid/Collection stitching macro in headless mode.
 
     Centralized wrapper so CLIs can reuse consistent defaults and behavior.
+
+    Args:
+        capture_output: If True, capture output to PIPE (silent mode).
+        stream_to_console: If True, stream output through shared Rich console
+            (avoids interleaving with progress bars). Ignored if capture_output=True.
     """
     options = "subpixel_accuracy"
     if compute_overlap:
@@ -75,6 +82,17 @@ def run_imagej(
         else:
             # Windows: CREATE_NEW_PROCESS_GROUP allows CTRL_BREAK_EVENT later if needed
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        # Use run_subprocess_streaming when streaming to console to avoid
+        # interleaving with progress bars.
+        if stream_to_console and not capture_output:
+            run_subprocess_streaming(
+                cmd,
+                start_new_session=(os.name == "posix"),
+                creationflags=creationflags,
+                check=True,
+            )
+            return
 
         stdout = subprocess.PIPE if capture_output else None
         stderr = subprocess.STDOUT if capture_output else None
