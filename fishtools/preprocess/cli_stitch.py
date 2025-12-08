@@ -228,6 +228,7 @@ def run_imagej(
     threshold: float | None = None,
     name: str = "TileConfiguration.txt",
     capture_output: bool = False,
+    stream_to_console: bool = False,
     sc: StitchingConfig | None = None,
 ):  # shim for callers/tests
     return _run_imagej(
@@ -237,6 +238,7 @@ def run_imagej(
         threshold=threshold,
         name=name,
         capture_output=capture_output,
+        stream_to_console=stream_to_console,
         sc=sc,
     )
 
@@ -658,6 +660,7 @@ def register(
         threshold=threshold,
         name="TileConfiguration",
         capture_output=not debug,
+        stream_to_console=debug,
         sc=sc,
     )
     # Post-check: verify registered tile configuration and emit a layout plot
@@ -1217,7 +1220,7 @@ def fuse(
                     field_zarr=field_zarr,
                 )
 
-    def run_folder(folder: Path, capture_output: bool = False):
+    def run_folder(folder: Path, capture_output: bool = False, stream_to_console: bool = False):
         def log_progress(message: str) -> None:
             if capture_output:
                 logger.info(message)
@@ -1237,6 +1240,7 @@ def fuse(
                     folder,
                     name=f"TileConfiguration{i + 1}",
                     capture_output=capture_output,
+                    stream_to_console=stream_to_console,
                     sc=sc,
                 )
             except Exception as e:
@@ -1269,7 +1273,7 @@ def fuse(
 
     with progress_bar_threadpool(len(to_runs), threads=threads, stop_on_exception=True) as submit:
         for folder in to_runs:
-            submit(run_folder, folder, capture_output=not debug)
+            submit(run_folder, folder, capture_output=not debug, stream_to_console=debug)
 
     if split > 1:
         for folder in folders:
