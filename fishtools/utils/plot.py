@@ -1138,3 +1138,74 @@ def _compute_border_mask(
             )
 
     return mask
+
+
+def plot_segmentation_comparison(
+    img: np.ndarray,
+    mask: np.ndarray,
+    *,
+    channel: int = 0,
+    alpha: float = 0.4,
+    scale_bar_um: float = 20,
+    pixel_size_um: float = 0.216,
+    figsize: tuple[float, float] = (12, 6),
+    dpi: int = 200,
+) -> tuple[Figure, np.ndarray]:
+    """Plot side-by-side comparison of image with and without segmentation outline.
+
+    Parameters
+    ----------
+    img
+        Image array with shape (Y, X, C) or (Y, X).
+    mask
+        Segmentation mask with shape (Y, X).
+    channel
+        Channel to display if img has multiple channels (default: 0).
+    alpha
+        Opacity of segmentation overlay (default: 0.4).
+    scale_bar_um
+        Scale bar length in micrometers (default: 20).
+    pixel_size_um
+        Pixel size in micrometers (default: 0.216).
+    figsize
+        Figure size (default: (12, 6)).
+    dpi
+        Figure DPI (default: 200).
+
+    Returns
+    -------
+    fig, axs
+        Matplotlib figure and axes array.
+    """
+    # Extract channel if needed
+    if img.ndim == 3:
+        img_ch = img[..., channel]
+    else:
+        img_ch = img
+
+    # Create segmentation outline colormap
+    cmap, norm, lut = tableau20_label_cmap(
+        mask, fill_interiors=False, add_border=True, border_color=(1, 1, 1, 1)
+    )
+    index_img = encode_labels_for_colormap(mask, lut, border_label=-1, connectivity=8)
+
+    # Plot side-by-side
+    fig, axs = plt.subplots(1, 2, figsize=figsize, dpi=dpi)
+
+    # Column 1: with outline
+    axs[0].imshow(img_ch, zorder=1)
+    axs[0].imshow(index_img, cmap=cmap, norm=norm, zorder=1, alpha=alpha)
+    axs[0].set_title("With segmentation")
+
+    # Column 2: without outline
+    axs[1].imshow(img_ch, zorder=1)
+    axs[1].set_title("Without segmentation")
+
+    # Add scale bars and clean up
+    scale_bar_px = scale_bar_um / pixel_size_um
+    for ax in axs:
+        add_scale_bar(ax, scale_bar_px, f"{scale_bar_um} μm", color="white")
+        ax.axis("off")
+
+    plt.tight_layout()
+    return fig, axs
