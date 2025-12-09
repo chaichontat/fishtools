@@ -1,14 +1,16 @@
+import csv
 import datetime
 import json
 import logging
 import os
 import pathlib
 import shutil
+import subprocess
 import time
 from collections.abc import Callable
 from importlib.metadata import version
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Any, cast
 
 import cellpose.io
 import cupy as cp
@@ -60,6 +62,44 @@ logger = logging.getLogger("rich")
 _WORKER_INITIALIZED: bool = False
 _WORKER_LOGS_DIR: str | None = None
 _WORKER_FIRST_TASK_DONE: bool = False
+
+
+def _log_slurm_tile_summary(total_tiles: int, processed_tiles: int, elapsed_seconds: float) -> None:
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if not job_id:
+        return
+
+    summary = f"Processed {processed_tiles}/{total_tiles} tiles in {elapsed_seconds:.1f}s"
+    usage_suffix = ""
+
+    if shutil.which("nvidia-smi") is None:
+        logger.info(summary)
+        return
+
+    cmd = [
+        "nvidia-smi",
+        "--query-gpu=index,memory.used,memory.total,utilization.gpu",
+        "--format=csv,noheader",
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=True)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        logger.info(summary)
+        return
+
+    reader = csv.reader(result.stdout.splitlines())
+    stats = []
+    for row in reader:
+        if len(row) < 4:
+            continue
+        idx, mem_used, mem_total, util = [field.strip() for field in row[:4]]
+        stats.append(f"{idx}: {mem_used}/{mem_total} mem, util {util}")
+
+    if stats:
+        usage_suffix = f" | usage snapshot — {'; '.join(stats)}"
+
+    logger.info(summary + usage_suffix)
 
 
 def _apply_startup_stagger(stagger_seconds: float, workers_per_gpu: int) -> None:
@@ -244,26 +284,13 @@ def append_checkpoint(
 
 def _gpu_probe() -> dict[str, Any]:
     """Executed on workers to report CUDA visibility and current device."""
-    import distributed as _dist  # local import to avoid serialization surprises
+    import distributed as _dist
     import torch  # type: ignore
 
-    info: dict[str, Any] = {}
-    try:
-        info["worker"] = getattr(_dist.get_worker(), "name", "unknown")
-    except Exception:
-        info["worker"] = "unknown"
-    try:
-        info["cuda_visible_devices"] = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    except Exception:
-        info["cuda_visible_devices"] = ""
-    try:
-        if torch.cuda.is_available():
-            info["torch_current_device"] = int(torch.cuda.current_device())
-        else:
-            info["torch_current_device"] = None
-    except Exception:
-        info["torch_current_device"] = None
-    return info
+    worker = getattr(_dist.get_worker(), "name", "unknown")
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    torch_dev = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+    return {"worker": worker, "cuda_visible_devices": cuda_visible, "torch_current_device": torch_dev}
 
 
 ######################## File format functions ################################
@@ -371,19 +398,7 @@ def wrap_folder_of_tiffs(
 
 
 def format_slice(s: slice | tuple[slice, ...]) -> str:
-    """
-    Format a slice or tuple of slices as a human-readable string.
-
-    This function converts slice objects into string representation
-    suitable for logging and debugging purposes.
-
-    Examples
-    --------
-    >>> format_slice(slice(1, 10, 2))
-    '1:10:2'
-    >>> format_slice((slice(0, 5), slice(10, 20)))
-    '0:5,10:20'
-    """
+    """Format a slice or tuple of slices as a human-readable string."""
     if isinstance(s, tuple):
         return ",".join(format_slice(item) for item in s)
     if not isinstance(s, slice):  # type: ignore
@@ -423,112 +438,26 @@ def process_block(
     | tuple[list[NDArray[Any]], list[tuple[slice, ...]], NDArray[np.uint32]]
 ):
     """
-    Preprocess and segment one block, of many, with eventual merger
-    of all blocks in mind. The block is processed as follows:
+    Preprocess and segment one block with eventual merger in mind.
 
-    (1) Read block from disk, preprocess, and segment.
-    (2) Remove overlaps.
-    (3) Get bounding boxes for every segment.
-    (4) Remap segment IDs to globally unique values.
-    (5) Write segments to disk.
-    (6) Get segmented block faces.
-
-    A user may want to test this function on one block before running
-    the distributed function. When test_mode=True, steps (5) and (6)
-    are omitted and replaced with:
-
-    (5) return remapped segments as a numpy array, boxes, and box_ids
-
-    **Absolutely cannot use `logger` in mapped functions since it cannot be pickled**
+    Steps: read/preprocess/segment → remove overlaps → compute bounding boxes
+    → remap to global IDs → write to output_zarr → compute block faces.
 
     Parameters
     ----------
-    block_index : tuple
-        The (i, j, k, ...) index of the block in the overall block grid
+    preprocessing_steps : list of tuples
+        Must be in the format: [(func, {'arg1': val1, ...}), ...]
+        Each function must have signature: def F(image, ..., crop=None)
+        The crop kwarg is injected automatically.
 
-    crop : tuple of slice objects
-        The bounding box of the data to read from the input_zarr array
-
-    input_zarr : zarr.core.Array
-        The image data we want to segment
-
-    preprocessing_steps : list of tuples (default: the empty list)
-        Optionally apply an arbitrary pipeline of preprocessing steps
-        to the image block before running cellpose.
-
-        Must be in the following format:
-        [(f, {'arg1':val1, ...}), ...]
-        That is, each tuple must contain only two elements, a function
-        and a dictionary. The function must have the following signature:
-        def F(image, ..., crop=None)
-        That is, the first argument must be a numpy array, which will later
-        be populated by the image data. The function must also take a keyword
-        argument called crop, even if it is not used in the function itself.
-        All other arguments to the function are passed using the dictionary.
-        Here is an example:
-
-        def F(image, sigma, crop=None):
-            return gaussian_filter(image, sigma)
-        def G(image, radius, crop=None):
-            return median_filter(image, radius)
-        preprocessing_steps = [(F, {'sigma':2.0}), (G, {'radius':4})]
-
-    model_kwargs : dict
-        Arguments passed to PackedCellposeModel
-        This is how you select and parameterize a model.
-
-    eval_kwargs : dict
-        Arguments passed to the eval function of the PackedCellpose model
-        This is how you parameterize model evaluation.
-
-    blocksize : iterable (list, tuple, np.ndarray)
-        The number of voxels (the shape) of blocks without overlaps
-
-    overlap : int
-        The number of voxels added to the blocksize to provide context
-        at the edges
-
-    output_zarr : zarr.core.Array
-        A location where segments can be stored temporarily before
-        merger is complete
-
-    worker_logs_directory : string (default: None)
-        A directory path where log files for each worker can be created
-        The directory must exist
-
-    test_mode : bool (default: False)
-        The primary use case of this function is to be called by
-        distributed_eval (defined later in this same module). However
-        you may want to call this function manually to test what
-        happens to an individual block; this is a good idea before
-        ramping up to process big data and also useful for debugging.
-
-        When test_mode is False (default) this function stores
-        the segments and returns objects needed for merging between
-        blocks.
-
-        When test_mode is True this function does not store the
-        segments, and instead returns them to the caller as a numpy
-        array. The boxes and box IDs are also returned. When test_mode
-        is True, you can supply dummy values for many of the inputs,
-        such as:
-
-        block_index = (0, 0, 0)
-        output_zarr=None
+    test_mode : bool
+        When True, returns (segmentation, boxes, box_ids) without writing
+        to disk. Useful for testing individual blocks before full runs.
 
     Returns
     -------
-    If test_mode == False (the default), three things are returned:
-        faces : a list of numpy arrays - the faces of the block segments
-        boxes : a list of crops (tuples of slices), bounding boxes of segments
-        box_ids : 1D numpy array, parallel to boxes, the segment IDs of the
-                  boxes
-
-    If test_mode == True, three things are returned:
-        segments : np.ndarray containing the segments with globally unique IDs
-        boxes : a list of crops (tuples of slices), bounding boxes of segments
-        box_ids : 1D numpy array, parallel to boxes, the segment IDs of the
-                  boxes
+    If test_mode=False: (faces, boxes, box_ids)
+    If test_mode=True: (segmentation_array, boxes, box_ids)
     """
     import time
 
@@ -545,61 +474,36 @@ def process_block(
         worker_logs_directory,
     )
     logger.info(f"Block {block_index}: {np.max(segmentation_3d)} masks found.")
-    # print(f"Block {block_index}: Segmentation result shape (3D): {segmentation_3d.shape}")
 
-    # --- Define 3D spatial parameters for overlap removal and writing ---
-    spatial_crop_slices = crop[:-1]  # Get ZYX slices from the 4D crop
-    spatial_blocksize = blocksize[:-1]  # Get ZYX blocksize
-    # print(f"Block {block_index}: Spatial crop (3D): {spatial_crop_slices}")
-    # print(f"Block {block_index}: Spatial blocksize (3D): {spatial_blocksize}")
+    spatial_crop_slices = crop[:-1]
+    spatial_blocksize = blocksize[:-1]
 
-    # --- Remove overlaps on the 3D segmentation ---
-    # Pass 3D segmentation, 3D crop slices, 3D blocksize to remove_overlaps
     segmentation_trimmed_3d, crop_trimmed_3d = remove_overlaps(
-        segmentation_3d,  # Operate on 3D data
-        spatial_crop_slices,  # Use 3D crop info
+        segmentation_3d,
+        spatial_crop_slices,
         overlap,
-        spatial_blocksize,  # Use 3D blocksize info
+        spatial_blocksize,
     )
-    crop_trimmed_3d = tuple(crop_trimmed_3d)  # Convert to tuple
-    # print(f"Block {block_index}: Trimmed segmentation shape (3D): {segmentation_trimmed_3d.shape}")
-    # print(f"Block {block_index}: Trimmed crop (3D): {crop_trimmed_3d}")
+    crop_trimmed_3d = tuple(crop_trimmed_3d)
 
-    # --- Calculate bounding boxes (3D) ---
-    # Pass 3D trimmed segmentation and 3D trimmed crop
     boxes = bounding_boxes_in_global_coordinates(segmentation_trimmed_3d, crop_trimmed_3d)
 
-    # --- Calculate global IDs (operates on labels, dimensions not critical here) ---
-    # Need nblocks in 3D for correct mapping if using ravel_multi_index on 3D indices
-    nblocks_3d = get_nblocks(input_zarr.shape[:-1], spatial_blocksize)  # Use 3D shapes
-    # Assuming block_index is ZYX index (needs verification how it's generated/used)
-    # If block_index is ZYXC, need to adapt. Let's assume we only need ZYX index part
-    # If block_indices were generated using 4D nblocks, adjust here:
-    block_index_3d = block_index[:-1]  # Assume we only need ZYX index part
+    nblocks_3d = get_nblocks(input_zarr.shape[:-1], spatial_blocksize)
+    block_index_3d = block_index[:-1]
 
     segmentation_global_3d, remap = global_segment_ids(segmentation_trimmed_3d, block_index_3d, nblocks_3d)
 
-    # Extract non-zero IDs for this block from the *final* global 3D segmentation
     final_unique_ids_3d = np.unique(segmentation_global_3d)
     box_ids_for_this_block = final_unique_ids_3d[final_unique_ids_3d != 0]
 
     if test_mode:
-        return (
-            segmentation_global_3d,
-            boxes,
-            box_ids_for_this_block,
-        )  # Return 3D results
+        return (segmentation_global_3d, boxes, box_ids_for_this_block)
 
-    # --- Write 3D results to 3D output Zarr ---
-    # print(f"Block {block_index}: Writing to output Zarr at {crop_trimmed_3d}")
-    output_zarr[crop_trimmed_3d] = segmentation_global_3d  # 3D[3D_slice] = 3D array (This should work)
+    output_zarr[crop_trimmed_3d] = segmentation_global_3d
 
-    # --- Calculate faces (3D) ---
-    # Shrink labels on faces so expensive distance transforms happen on workers,
-    # matching the distributed_postproc stitching strategy.
-    faces = block_faces(segmentation_global_3d, shrink=True)  # Faces are 3D
+    # Shrink labels on faces so expensive distance transforms happen on workers
+    faces = block_faces(segmentation_global_3d, shrink=True)
 
-    # --- Write checkpoint ---
     if checkpoint_path is not None:
         append_checkpoint(
             checkpoint_path,
@@ -609,7 +513,6 @@ def process_block(
             int(np.max(segmentation_global_3d)),
         )
 
-    # Return 3D faces, 3D boxes, and corresponding IDs
     return faces, boxes, box_ids_for_this_block
 
 
@@ -623,51 +526,23 @@ def read_preprocess_and_segment(
     model_kwargs: dict[str, Any],
     eval_kwargs: dict[str, Any],
     worker_logs_directory: str | None,
-) -> Annotated[NDArray[np.uint32], "Segmentation masks"]:
+) -> NDArray[np.uint32]:
     """
-    Read image block from zarr array, apply preprocessing pipeline, and run Cellpose segmentation.
+    Read block, apply preprocessing pipeline, and run Cellpose segmentation.
 
-    This function forms the core of the distributed segmentation pipeline. It handles loading
-    a specific block of image data, applies user-defined preprocessing steps, and runs
-    Cellpose segmentation on the processed block.
-
-    Parameters
-    ----------
-    input_zarr : zarr.Array
-        Input zarr array containing image data
-    crop : tuple of slice
-        Crop coordinates defining the block to process
-    preprocessing_steps : list of tuple
-        List of (function, kwargs) pairs for preprocessing pipeline
-    model_kwargs : dict
-        Arguments passed to PackedCellposeModel constructor
-    eval_kwargs : dict
-        Arguments passed to CellposeModel.eval method
-    worker_logs_directory : str, optional
-        Directory for worker log files, by default None
-
-    Returns
-    -------
-    NDArray[np.uint32]
-        Segmentation masks with uint32 labels
-
-    Notes
-    -----
-    The preprocessing pipeline allows arbitrary image processing before segmentation.
-    Each preprocessing function must accept an image array and a 'crop' keyword argument.
+    preprocessing_steps format: [(func, kwargs_dict), ...]
+    Each func must accept (image, ..., crop=None). The crop kwarg is injected.
     """
     if preprocessing_steps is None:
         preprocessing_steps = []
 
-    # Minimal per-worker GPU probe for visibility during bring-up
     try:
         import torch
 
         vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
         dev = torch.cuda.current_device() if torch.cuda.is_available() else None
         worker_name = getattr(distributed.get_worker(), "name", "unknown")
-        torch_dev = None if dev is None else int(dev)
-        logger.info(f"Worker {worker_name} visible CUDA={vis} torch_dev={torch_dev}")
+        logger.info(f"Worker {worker_name} visible CUDA={vis} torch_dev={dev}")
     except Exception:
         pass
 
@@ -807,7 +682,8 @@ def distributed_eval(
         ID is the first tuple in the list, the largest segment ID is the last
         tuple in the list.
     """
-    # Handle default parameters
+    overall_start = time.perf_counter()
+
     if preprocessing_steps is None:
         preprocessing_steps = []
     if model_kwargs is None:
@@ -816,21 +692,6 @@ def distributed_eval(
         eval_kwargs = {}
     if cluster_kwargs is None:
         cluster_kwargs = {}
-
-    # # DEBUG: Slice input for rapid iteration on real data
-    # # TODO: Remove before production use
-    # import tempfile
-
-    # _debug_dir = tempfile.mkdtemp(prefix="debug_slice_")
-    # _debug_path = Path(_debug_dir) / "sliced.zarr"
-    # _sliced = input_zarr[:, 5000:7000, 5000:7000, :]
-    # input_zarr = zarr.open_array(
-    #     _debug_path, mode="w", shape=_sliced.shape, dtype=input_zarr.dtype, chunks=input_zarr.chunks
-    # )
-    # input_zarr[:] = _sliced
-    # logger.warning(f"DEBUG MODE: Sliced input to {input_zarr.shape}, temp at {_debug_path}")
-
-    # Derive a stable base directory for artifacts/logs
     if temporary_directory is None:
         base_parent = Path(write_path).parent if isinstance(write_path, (str, Path)) else Path.cwd()
         temporary_directory = base_parent / "cellpose_temp"
@@ -849,21 +710,11 @@ def distributed_eval(
     assert cluster is not None
 
     def check_block_has_data(crop: tuple[slice, ...], zarr_array: zarr.Array, threshold: int = 0) -> bool:
-        """
-        Checks if a given crop in a Zarr array contains any data above a threshold.
-        Returns True if data exists, False otherwise.
-        """
-        try:
-            data_slice = zarr_array[crop]
-            if threshold == 0:
-                return data_slice.any()
-            else:
-                return (data_slice > threshold).any()
-        except Exception as e:
-            print(f"Error checking block crop {crop}: {e}")
-            return False
+        """Check if a given crop in a Zarr array contains any data above threshold."""
+        data_slice = zarr_array[crop]
+        return data_slice.any() if threshold == 0 else (data_slice > threshold).any()
 
-    # Optional: GPU preflight probe to confirm worker pinning
+    # GPU preflight probe to confirm worker pinning
     try:
         probe = cluster.client.run(_gpu_probe)
         logger.info(f"GPU probe results: {probe}")
@@ -903,16 +754,16 @@ def distributed_eval(
         write_nonempty_cache(path_nonempty, blocksize, idxs)
         logger.info(f"Persisted {len(idxs)} non-empty block indices to {path_nonempty}")
 
-    # final_block_indices, final_block_crops = [], []
     final_block_indices, final_block_crops = (
         [block_indices[i] for i in idxs],
         [block_crops[i] for i in idxs],
     )
+    total_non_empty_blocks = len(final_block_indices)
     del block_indices, block_crops
 
-    print(f"Selected {len(final_block_indices)} blocks with non-zero input data.")
+    logger.info(f"Selected {len(final_block_indices)} blocks with non-zero input data.")
 
-    output_shape = input_zarr.shape[:-1]  # Get ZYX dimensions
+    output_shape = input_zarr.shape[:-1]
     output_blocksize = blocksize[:-1]
 
     Path(temporary_directory).mkdir(parents=True, exist_ok=True)
@@ -1048,6 +899,11 @@ def distributed_eval(
     if cellpose_only:
         logger.info("Cellpose-only mode: skipping merge phase")
         logger.info(f"Intermediate results saved to: {temporary_directory}")
+        _log_slurm_tile_summary(
+            total_non_empty_blocks,
+            len(remaining_block_indices),
+            time.perf_counter() - overall_start,
+        )
         return None
 
     # stitching step is cheap, we should release gpus and use small workers
@@ -1076,6 +932,13 @@ def distributed_eval(
 
     # Segmentation-specific: merge bounding boxes
     merged_boxes = merge_boxes_for_labels(boxes_list, box_ids_list, new_labeling)
+
+    _log_slurm_tile_summary(
+        total_non_empty_blocks,
+        len(remaining_block_indices),
+        time.perf_counter() - overall_start,
+    )
+
     return final_seg_zarr, merged_boxes
 
 
@@ -1171,44 +1034,19 @@ def run(
     """
     Run distributed Cellpose segmentation (full pipeline or cellpose-only).
 
-    Orchestrates the complete distributed segmentation workflow including:
-    - Loading and validating input data
-    - Setting up distributed computing cluster
-    - Running preprocessing and segmentation
-    - Post-processing and result saving
-
-    Parameters
-    ----------
-    path : Path
-        Path to folder containing 'fused.zarr' input file and 'config.json'
-    channels : str
-        Comma-separated channel names to use for segmentation
-    overwrite : bool, optional
-        Whether to overwrite existing segmentation results, by default False
-
-    Notes
-    -----
     Expected folder structure:
     - path/fused.zarr (input image data)
-    - path/config.json (segmentation parameters)
+    - path/../config.json (segmentation parameters)
     - path/normalization.json (auto-generated if missing)
 
     Output files:
-    - path/output_segmentation-sam.zarr or path/output_segmentation-unet.zarr (segmentation results, backend-dependent)
+    - path/output_segmentation-{sam,unet}.zarr
     - path/segmentation.done (completion marker)
-    - path/cellpose_temp/ (temporary processing files)
+    - path/cellpose_temp/ (temporary files, removed on success)
 
-    Cellpose normalization contract:
-    - We always pass a `normalize` dict with key `lowhigh` shaped (3, 2).
-    - Rows correspond to channels in the requested order (or default index order).
-    - Cached normalization is stored on disk in ascending channel index order (1-based)
-      and is reordered at load time to match the requested order before being sent to Cellpose.
-    - If fewer than 3 channels are requested, remaining rows are padded with [0, 1]
-      to align with Cellpose's internal conversion to exactly three channels.
+    Normalization: We pass a `normalize` dict with `lowhigh` shaped (3, 2).
+    If fewer than 3 channels requested, remaining rows are padded with [0, 1].
     """
-    # Normalize input paths:
-    # - If given a directory named '*.zarr' → treat as the Zarr store
-    # - If given a parent directory → expect 'fused.zarr' inside it
     input_path = Path(path)
     if input_path.suffix == ".zarr" and input_path.exists():
         zarr_input_path = input_path
@@ -1221,7 +1059,6 @@ def run(
     else:
         raise FileNotFoundError(f"Path {input_path} must be a directory or a '.zarr' store.")
 
-    # Short-circuit if results already present (unless overwrite)
     if not overwrite and (base_dir / "segmentation.done").exists():
         logger.warning("Segmentation already exists. Exiting.")
         exit()
@@ -1230,7 +1067,6 @@ def run(
     if not IS_CELLPOSE_SAM:
         raise RuntimeError("This script requires Cellpose version 4.x for SAM backend support.")
 
-    # ---- 1. Configuration ----
     if config_path is None:
         config_path = base_dir.parent / "config.json"
     if not config_path.is_file():
@@ -1245,7 +1081,6 @@ def run(
     zarr_output_path = base_dir / f"output_segmentation-{backend}.zarr"
     temporary_directory = base_dir / "cellpose_temp"
 
-    # Clear temp directory if --overwrite is set (forces fresh start, no resume)
     if overwrite and temporary_directory.exists():
         logger.info(f"--overwrite: removing existing temp directory {temporary_directory}")
         shutil.rmtree(temporary_directory)
@@ -1254,7 +1089,7 @@ def run(
     ortho_weights = config.get("ortho_weights", [3, 1.0, 1.0])
     diameter = config.get("diameter", 30)
     cellpose_model_kwargs = {
-        "pretrained_model": config["pretrained_model"],  # Or 'nuclei', 'cyto', or path to custom model
+        "pretrained_model": config["pretrained_model"],
         "gpu": True,
         "backend": backend,
     }
@@ -1263,7 +1098,6 @@ def run(
     else:
         cellpose_model_kwargs["pretrained_model_ortho"] = config.get("pretrained_model_ortho", None)
 
-    # Dask Cluster Configuration (always GPU-backed)
     local_cluster_kwargs = {
         "workers_per_gpu": int(8 if backend == "unet" else workers_per_gpu),
         "threads_per_worker": int(threads_per_worker),
@@ -1281,14 +1115,14 @@ def run(
     mask_path = None
     foreground_mask = None
     if mask_path and os.path.exists(mask_path):
-        print(f"Loading mask from {mask_path}")
+        logger.info(f"Loading mask from {mask_path}")
         foreground_mask = tifffile.imread(mask_path) > 1.0
 
     input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
 
     key = cast(str, input_zarr_array.attrs["key"])
     if channels is None:
-        channels_list = list(range(1, input_zarr_array.shape[3] + 1))  # All channels
+        channels_list = list(range(1, input_zarr_array.shape[3] + 1))
         logger.info(f"No channels specified. Using all channels: {channels_list}")
     else:
         try:
@@ -1308,9 +1142,8 @@ def run(
             224,
             224 * 4,
             len(channels_list),
-        )  # ZYXc tuned for UNet
+        )
     else:
-        # Determine effective internal tiling size for SAM backend.
         ny_target = target_ny if target_ny is not None else 2
         nx_target = target_nx if target_nx is not None else 6
         Ly_internal, Lx_internal = solve_internal_xy_for_tiles(
@@ -1319,7 +1152,6 @@ def run(
             bsize=256,
             tile_overlap=0.1,
         )
-        # Map internal (post-diameter-rescale) back to raw block size.
         scale_back = float(diameter) / 30.0
         by = int(Ly_internal * scale_back)
         bx = int(Lx_internal * scale_back)
@@ -1328,7 +1160,7 @@ def run(
             by,
             bx,
             len(channels_list),
-        )  # ZYXc tuned for SAM
+        )
         logger.info(
             f"SAM backend: target tiles (ny={ny_target}, nx={nx_target}) → internal size ({Ly_internal}x{Lx_internal}) → blocksize ({by}x{bx})"
         )
@@ -1358,10 +1190,9 @@ def run(
         )
         logger.info(f"Saved normalization thresholds to {normalization_path}")
 
-    # Align normalization rows to requested channel order
     lowhigh_eval = np.asarray(lowhigh_selected, dtype=float)
 
-    # Cellpose (convert_image) always produces 3 channels; pad missing ones with identity ranges
+    # Cellpose always produces 3 channels; pad missing ones with identity ranges
     if lowhigh_eval.shape[0] < 3:
         pad = np.repeat([[0.0, 1.0]], repeats=3 - lowhigh_eval.shape[0], axis=0)
         lowhigh_eval = np.concatenate([lowhigh_eval, pad], axis=0)
@@ -1373,13 +1204,12 @@ def run(
     if len(channels_for_cellpose) == 1:
         channels_for_cellpose = [channels_for_cellpose[0], channels_for_cellpose[0]]
 
-    # Cellpose Evaluation Configuration
     cellpose_eval_kwargs = {
-        "diameter": config.get("diameter", 30),  # MUST BE INT
+        "diameter": config.get("diameter", 30),
         "batch_size": 16 if backend == "unet" else 1,
         "normalize": normalization,
-        "flow_threshold": 0,  # Ignored in 3D
-        "cellprob_threshold": 0,  # Default is 0.0, adjust if needed
+        "flow_threshold": 0,
+        "cellprob_threshold": 0,
         "anisotropy": 2.0,
         "resample": False,
         "flow3D_smooth": 1.5,
@@ -1398,10 +1228,8 @@ def run(
     if ortho_weights is not None:
         cellpose_eval_kwargs["ortho_weights"] = ortho_weights
 
-    # ---- 3. Run Distributed Evaluation ----
     logger.info("Starting distributed Cellpose evaluation…")
     try:
-        # The @cluster decorator handles cluster creation/management
         result = distributed_eval(
             input_zarr=input_zarr_array,
             blocksize=processing_blocksize,
@@ -1422,7 +1250,6 @@ def run(
             logger.info("Run 'stitch' command to complete the pipeline.")
             return
 
-        # Full pipeline: cleanup and finalize
         final_segmentation_zarr, final_bounding_boxes = result
         (zarr_output_path.parent / "segmentation.done").touch()
         shutil.rmtree(temporary_directory)
