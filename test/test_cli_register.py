@@ -13,6 +13,7 @@ from fishtools.preprocess.cli_register import (
     Fiducial,
     RegisterConfig,
     _copy_codebook_to_workspace,
+    _debug_fid_paths,
     _run,
 )
 from fishtools.preprocess.cli_register import (
@@ -32,6 +33,14 @@ def _make_workspace(tmp_path: Path) -> tuple[Path, Path]:
     deconv.mkdir(parents=True)
     (root / "workspace.DONE").write_text("")
     return root, deconv
+
+
+def test_debug_fid_paths_include_roi(tmp_path: Path) -> None:
+    base = tmp_path / "ws"
+    debug_dir, raw, shifted = _debug_fid_paths(base, "roiA", 7)
+    assert debug_dir == base / "fids_debug"
+    assert raw == "roiA-0007.tif"
+    assert shifted == "roiA-shifted-0007.tif"
 
 
 def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> None:
@@ -182,6 +191,7 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
             "--overwrite",
             "--threads",
             "1",
+            "--allow-large-drifts",
         ],
     )
 
@@ -197,6 +207,68 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
     # Batch should forward default fwhm/threshold into child command
     assert any(a.startswith("--fwhm=") and float(a.split("=", 1)[1]) == 4.0 for a in argv)
     assert any(a.startswith("--threshold=") and float(a.split("=", 1)[1]) == 6.0 for a in argv)
+    assert "--allow-large-drifts" in argv
+
+
+def test_cli_register_batch_verify_respects_allow_large_drifts(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        assert check is True
+        calls.append(argv)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--threads",
+            "1",
+            "--verify",
+            "--allow-large-drifts",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    # Missing outputs trigger verification reruns, so expect two calls with the flag.
+    assert len(calls) == 2
+    assert "--allow-large-drifts" in calls[0]
+    assert "--allow-large-drifts" in calls[1]
+    assert "--overwrite" in calls[1]
 
 
 def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: Any) -> None:

@@ -147,8 +147,9 @@ def _write_spots(ws: Path, roi: str, codebook: str, rows: list[dict[str, float |
     return path
 
 
-def _overlay_chunks_dir(seg_dir: Path, codebook: str) -> Path:
-    return seg_dir / f"chunks+{_sanitize_codebook(codebook)}"
+def _overlay_chunks_dir(seg_dir: Path, codebook: str, seg_name: str = "output_segmentation.zarr") -> Path:
+    # Chunks are inside the segmentation zarr folder
+    return seg_dir / seg_name / f"chunks+{_sanitize_codebook(codebook)}"
 
 
 def _invoke_overlay_spots(
