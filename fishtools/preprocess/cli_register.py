@@ -831,6 +831,11 @@ def register(): ...
     show_default=True,
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
+@click.option(
+    "--allow-large-drifts",
+    is_flag=True,
+    help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
+)
 def run(
     path: Path,
     idx: int,
@@ -846,6 +851,7 @@ def run(
     use_itk: bool = False,
     anchors: Path | None = None,
     use_brightest: int = 0,
+    allow_large_drifts: bool = False,
 ):
     """Preprocess image sets before spot calling.
 
@@ -902,7 +908,10 @@ def run(
                         overrides={},
                         anchor_roi=anchors,
                         n_fids=2,
-                        detailed=FiducialDetailedConfig(use_brightest=max(use_brightest, 0)),
+                        detailed=FiducialDetailedConfig(
+                            use_brightest=max(use_brightest, 0),
+                            allow_large_drifts=allow_large_drifts,
+                        ),
                     ),
                     reference=reference,
                     downsample=1,
@@ -948,6 +957,11 @@ def run(
     show_default=True,
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
+@click.option(
+    "--allow-large-drifts",
+    is_flag=True,
+    help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
+)
 def batch(
     path: Path,
     roi: str,
@@ -962,6 +976,7 @@ def batch(
     use_fft: bool = False,
     use_itk: bool = False,
     use_brightest: int = 0,
+    allow_large_drifts: bool = False,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
@@ -1023,6 +1038,7 @@ def batch(
                         *(["--use-fft"] if use_fft else []),
                         *(["--use-itk"] if use_itk else []),
                         *( [f"--use-brightest={use_brightest}"] if use_brightest > 0 else [] ),
+                        *( ["--allow-large-drifts"] if allow_large_drifts else [] ),
                     ],
                     check=True,
                 )
@@ -1094,6 +1110,7 @@ def batch(
                         ref,
                         f"--roi={roi}",
                         "--overwrite",
+                        *( ["--allow-large-drifts"] if allow_large_drifts else [] ),
                     ],
                     check=True,
                 )
