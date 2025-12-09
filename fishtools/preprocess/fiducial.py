@@ -721,8 +721,16 @@ def individual_align_fiducial(
                     initial_drift = drift
 
                 if np.max(np.abs(drift)) > detailed_config.max_drift_threshold:
-                    local_σ += detailed_config.threshold_step
-                    raise DriftTooLarge(f"{bitname}: drift very large {np.hypot(*drift):.2f}.")
+                    if detailed_config.allow_large_drifts:
+                        logger.warning(
+                            f"{bitname}: drift {np.hypot(*drift):.2f} exceeds threshold "
+                            f"{detailed_config.max_drift_threshold}px but allow_large_drifts is enabled; accepting."
+                        )
+                    else:
+                        local_σ += detailed_config.threshold_step
+                        raise DriftTooLarge(
+                            f"{bitname}: drift very large {np.hypot(*drift):.2f}."
+                        )
 
                 if residual > threshold_residual:
                     local_σ += detailed_config.threshold_step
