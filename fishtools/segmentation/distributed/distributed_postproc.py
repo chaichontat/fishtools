@@ -369,6 +369,7 @@ def _copy_zarr_metadata(
     input_path: Path | None = None,
     nblocks: tuple[int, ...] | None = None,
     mapping_filename: str | None = None,
+    postproc_params: dict[str, Any] | None = None,
 ) -> None:
     """Copy metadata from input zarr to output zarr, including source mtime and label mapping info."""
     output_zarr = zarr.open(output_path, mode="r+")
@@ -389,6 +390,10 @@ def _copy_zarr_metadata(
     # Add processing metadata
     output_zarr.attrs["postproc_version"] = "distributed_postproc_v1"
 
+    # Add postproc parameters
+    if postproc_params is not None:
+        output_zarr.attrs["postproc_params"] = postproc_params
+
     # Add label mapping metadata if provided
     if mapping_filename is not None and nblocks is not None:
         output_zarr.attrs["label_mapping"] = {
@@ -406,7 +411,7 @@ def distributed_postproc(
     blocksize: tuple[int, ...] | None = None,
     margin: int = 100,
     sigma: float | tuple[float, float, float] = (1.5, 3, 3),
-    V_min: int = 2000,
+    V_min: int = 1000,
     bg_scale: float | None = None,
     max_expansion: int = 1,
     min_contact_fraction: float = 0.0,
@@ -575,7 +580,9 @@ def distributed_postproc(
         logger.warning("No labels found in any block")
         # Just copy temp to output
         dask.array.to_zarr(dask.array.from_zarr(temp_zarr), str(write_path), overwrite=True)
-        _copy_zarr_metadata(input_zarr, write_path, input_path=input_path)
+        _copy_zarr_metadata(
+            input_zarr, write_path, input_path=input_path, postproc_params={**postproc_kwargs, "margin": margin}
+        )
         return zarr.open(write_path, mode="r")
 
     new_labeling_path = temporary_directory / "new_labeling.npy"
@@ -609,6 +616,7 @@ def distributed_postproc(
         input_path=input_path,
         nblocks=tuple(nblocks.tolist()),
         mapping_filename=mapping_filename,
+        postproc_params={**postproc_kwargs, "margin": margin},
     )
 
 
@@ -621,10 +629,11 @@ def main(
     input_path: Path = typer.Argument(..., help="Path to input segmentation zarr"),
     output_path: Path = typer.Option(None, help="Output path (default: input_postproc.zarr)"),
     blocksize: int = typer.Option(1024, help="XY block size for tiled processing"),
-    sigma: str = typer.Option("1,2,2", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
-    v_min: int = typer.Option(1000, help="Minimum volume threshold for small cell donation"),
+    sigma: str = typer.Option("1,3,3", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
+    v_min: int = typer.Option(500, help="Minimum volume threshold for small cell donation"),
     margin: int = typer.Option(50, help="Margin parameter (overlap = 2*margin for overlap removal)"),
     workers_per_gpu: int = typer.Option(4, help="Workers per GPU"),
+    overwrite: bool = typer.Option(False, help="Overwrite existing output"),
 ) -> None:
     """
     Post-process 3D segmentation masks with Gaussian smoothing and small cell donation.
@@ -632,7 +641,13 @@ def main(
     input_zarr = zarr.open(input_path, mode="r")
 
     if output_path is None:  # type: ignore
-        output_path = input_path.parent / f"{input_path.stem}_postproc.zarr"
+        # Format sigma for filename: replace commas with dashes
+        sigma_str = sigma.replace(",", "-").replace(" ", "")
+        output_path = input_path.parent / f"{input_path.stem}_postproc_s{sigma_str}_v{v_min}.zarr"
+
+    if output_path.exists() and not overwrite:
+        logger.info(f"Output already exists: {output_path}. Skipping (use --overwrite to force).")
+        return
 
     cluster_kwargs = {
         "workers_per_gpu": workers_per_gpu,
