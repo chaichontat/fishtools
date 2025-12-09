@@ -131,13 +131,16 @@ def check_stitch(
     if all(tc is None for tc in tileconfigs.values()):
         raise click.ClickException("No TileConfiguration files found for requested ROIs.")
 
+    stitch_output_dir = output_dir / "stitch_layout"
+    stitch_output_dir.mkdir(parents=True, exist_ok=True)
+
     fig, _ = make_combined_stitch_layout(
         roi_list,
         tileconfigs,
         ncols=cols,
         options=options,
     )
-    combined = (output_dir / "stitch_layout_all.png").resolve()
+    combined = (stitch_output_dir / "stitch_layout_all.png").resolve()
     fig.savefig(combined.as_posix(), bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved combined stitch panel: {combined}")
@@ -148,7 +151,7 @@ def check_stitch(
             if tc is None:
                 continue
             fig_roi = make_roi_stitch_layout(tc, roi, options=options)
-            out = (output_dir / f"stitch_layout--{roi}.png").resolve()
+            out = (stitch_output_dir / f"stitch_layout--{roi}.png").resolve()
             fig_roi.savefig(out.as_posix(), bbox_inches="tight")
             plt.close(fig_roi)
             total = int(len(tc))

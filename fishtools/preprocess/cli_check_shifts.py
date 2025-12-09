@@ -150,8 +150,9 @@ def build_corr_l2_table(
     type=click.Path(
         exists=True, file_okay=True, dir_okay=False, readable=True, resolve_path=True, path_type=Path
     ),
-    required=True,
-    help="Path to the codebook JSON used for registration/decoding.",
+    required=False,
+    default=None,
+    help="Path to the codebook JSON. If omitted, auto-discovers codebooks from registered directories.",
 )
 @click.option(
     "--roi",
@@ -184,7 +185,7 @@ def build_corr_l2_table(
 def check_shifts(
     path: Path,
     roi: str | None,
-    codebook_path: Path,
+    codebook_path: Path | None,
     rois: tuple[str, ...],
     output_dir: Path | None,
     cols: int,
@@ -211,18 +212,29 @@ def check_shifts(
     else:
         selected_rois = None
 
+    ws = Workspace(path)
+    roi_list = ws.resolve_rois(selected_rois)
+
+    # Discover codebooks if not provided
+    if codebook_path is not None:
+        codebook_names = [Codebook(codebook_path).name]
+    else:
+        codebook_names = ws.registered_codebooks(rois=roi_list)
+        if not codebook_names:
+            raise click.UsageError(
+                "No codebooks found. Provide --codebook or ensure registered directories exist."
+            )
+        logger.info(f"Auto-discovered codebooks: {codebook_names}")
+
     roi_label = ",".join(selected_rois) if selected_rois else "all"
+    codebook_label = codebook_path.stem if codebook_path else ",".join(codebook_names)
 
     setup_cli_logging(
         path,
         component="preprocess.check_shifts",
-        file=f"check-shifts-{codebook_path.stem}",
-        extra={"codebook": codebook_path.stem, "roi": roi_label},
+        file=f"check-shifts-{codebook_label}",
+        extra={"codebook": codebook_label, "roi": roi_label},
     )
-
-    ws = Workspace(path)
-    codebook = Codebook(codebook_path)
-    roi_list = ws.resolve_rois(selected_rois)
 
     # Default output directory mirrors cli_spotlook behavior
     if output_dir is None:
@@ -230,56 +242,57 @@ def check_shifts(
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.debug(f"Output directory: {output_dir}")
 
-    for roi in roi_list:
-        logger.info(f"Analyzing shifts for ROI '{roi}' / codebook '{codebook.name}'")
-        shift_dir = ws.deconved / f"shifts--{roi}+{codebook.name}"
-        if not shift_dir.exists():
-            logger.warning(f"Shifts directory not found; skipping ROI {roi}: {shift_dir}")
-            continue
+    for codebook_name in codebook_names:
+        for roi in roi_list:
+            logger.info(f"Analyzing shifts for ROI '{roi}' / codebook '{codebook_name}'")
+            shift_dir = ws.deconved / f"shifts--{roi}+{codebook_name}"
+            if not shift_dir.exists():
+                logger.warning(f"Shifts directory not found; skipping ROI {roi}: {shift_dir}")
+                continue
 
-        _check_missing_tiles(ws, roi, codebook.name, ref_round, shift_dir)
-        shifts_by_tile = _load_shifts(shift_dir)
-        if not shifts_by_tile:
-            logger.warning(f"No shift records loaded for ROI {roi}")
-            continue
+            _check_missing_tiles(ws, roi, codebook_name, ref_round, shift_dir)
+            shifts_by_tile = _load_shifts(shift_dir)
+            if not shifts_by_tile:
+                logger.warning(f"No shift records loaded for ROI {roi}")
+                continue
 
-        fig1 = make_shifts_scatter_figure(shifts_by_tile, ncols=cols, corr_threshold=corr_threshold)
-        save_figure(fig1, output_dir, "shifts_scatter", roi, codebook.name, log_level="INFO")
+            fig1 = make_shifts_scatter_figure(shifts_by_tile, ncols=cols, corr_threshold=corr_threshold)
+            save_figure(fig1, output_dir / "shifts_scatter", "shifts_scatter", roi, codebook_name, log_level="INFO")
 
-        fig2 = make_corr_vs_l2_figure(shifts_by_tile, ncols=cols, corr_threshold=corr_threshold)
-        save_figure(fig2, output_dir, "shifts_corr_vs_l2", roi, codebook.name, log_level="INFO")
+            fig2 = make_corr_vs_l2_figure(shifts_by_tile, ncols=cols, corr_threshold=corr_threshold)
+            save_figure(fig2, output_dir / "shifts_corr_vs_l2", "shifts_corr_vs_l2", roi, codebook_name, log_level="INFO")
 
-        fig3 = make_corr_hist_figure(shifts_by_tile, ncols=cols)
-        save_figure(fig3, output_dir, "shifts_corr_hist", roi, codebook.name, log_level="INFO")
+            fig3 = make_corr_hist_figure(shifts_by_tile, ncols=cols)
+            save_figure(fig3, output_dir / "shifts_corr_hist", "shifts_corr_hist", roi, codebook_name, log_level="INFO")
 
-        corr_l2_df = build_corr_l2_table(shifts_by_tile, roi=roi)
-        csv_path = output_dir / f"shifts_corr_l2--{roi}+{codebook.name}.csv"
-        if corr_l2_df.empty:
-            logger.warning(f"No correlation/L2 records produced for ROI '{roi}'. Skipping CSV export.")
-        else:
-            corr_l2_df.to_csv(csv_path, index=False)
-            logger.info(f"Saved correlation/L2 CSV: {csv_path}")
+            corr_l2_df = build_corr_l2_table(shifts_by_tile, roi=roi)
+            csv_path = output_dir / "shifts_corr_vs_l2" / f"shifts_corr_l2--{roi}+{codebook_name}.csv"
+            if corr_l2_df.empty:
+                logger.warning(f"No correlation/L2 records produced for ROI '{roi}'. Skipping CSV export.")
+            else:
+                corr_l2_df.to_csv(csv_path, index=False)
+                logger.info(f"Saved correlation/L2 CSV: {csv_path}")
 
-        # New: per-round layout scatter using TileConfiguration centers offset by shifts
-        try:
-            tc = ws.tileconfig(roi)
-        except FileNotFoundError:
-            logger.warning(f"TileConfiguration not found for ROI {roi}; skipping shifts layout plot.")
-            continue
-        tile_size_px = _infer_tile_size_px(ws, roi, codebook.name, default=1968.0)
-        centers = {
-            int(idx): (float(x) + 0.5 * tile_size_px, float(y) + 0.5 * tile_size_px)
-            for idx, x, y in tc.df.select(["index", "x", "y"]).iter_rows()
-        }
-        records = build_shift_layout_table(centers, shifts_by_tile, roi=roi)
-        try:
-            fig_layout = make_shifts_layout_figure(
-                records,
-                tile_size_px=tile_size_px,
-                pixel_size_um=0.108,
-                label_skip=2,
-                corr_threshold=corr_threshold,
-            )
-            save_figure(fig_layout, output_dir, "shifts_layout", roi, codebook.name, log_level="INFO")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Failed to render shifts_layout for ROI {roi}: {e}")
+            # New: per-round layout scatter using TileConfiguration centers offset by shifts
+            try:
+                tc = ws.tileconfig(roi)
+            except FileNotFoundError:
+                logger.warning(f"TileConfiguration not found for ROI {roi}; skipping shifts layout plot.")
+                continue
+            tile_size_px = _infer_tile_size_px(ws, roi, codebook_name, default=1968.0)
+            centers = {
+                int(idx): (float(x) + 0.5 * tile_size_px, float(y) + 0.5 * tile_size_px)
+                for idx, x, y in tc.df.select(["index", "x", "y"]).iter_rows()
+            }
+            records = build_shift_layout_table(centers, shifts_by_tile, roi=roi)
+            try:
+                fig_layout = make_shifts_layout_figure(
+                    records,
+                    tile_size_px=tile_size_px,
+                    pixel_size_um=0.108,
+                    label_skip=2,
+                    corr_threshold=corr_threshold,
+                )
+                save_figure(fig_layout, output_dir / "shifts_layout", "shifts_layout", roi, codebook_name, log_level="INFO")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Failed to render shifts_layout for ROI {roi}: {e}")

@@ -232,7 +232,9 @@ def _save_combined_spots_plot(
     fig.suptitle(f"Spots Overview — {codebook}", color=DARK_PANEL_STYLE["axes.titlecolor"])
     fig.tight_layout(rect=(0, 0, 1, 0.96))
 
-    combined_path = (output_dir / f"spots_all--{codebook}.png").resolve()
+    spots_final_dir = output_dir / "spots_final"
+    spots_final_dir.mkdir(parents=True, exist_ok=True)
+    combined_path = (spots_final_dir / f"spots_all--{codebook}.png").resolve()
     # Clamp DPI to avoid exceeding Agg backend limits (~65535 px on a side)
     save_dpi = render_dpi
     fig.savefig(combined_path.as_posix(), dpi=save_dpi, bbox_inches="tight")
@@ -620,8 +622,9 @@ def _save_threshold_plot(
 
     ax1.set_title(f"Filter Threshold Selection for ROI: {roi}")
     fig_thresh.tight_layout()
-    save_figure(fig_thresh, output_dir, "threshold_selection", roi, codebook)
-    return (output_dir / f"threshold_selection--{roi}+{codebook}.png").resolve()
+    thresh_dir = output_dir / "threshold_selection"
+    save_figure(fig_thresh, thresh_dir, "threshold_selection", roi, codebook)
+    return (thresh_dir / f"threshold_selection--{roi}+{codebook}.png").resolve()
 
 
 def _save_combined_threshold_plot(
@@ -673,7 +676,9 @@ def _save_combined_threshold_plot(
     ax1.add_artist(legend1)
 
     fig.tight_layout()
-    combined_path = (output_dir / f"threshold_selection_all+{codebook}.png").resolve()
+    thresh_dir = output_dir / "threshold_selection"
+    thresh_dir.mkdir(parents=True, exist_ok=True)
+    combined_path = (thresh_dir / f"threshold_selection_all+{codebook}.png").resolve()
     fig.savefig(combined_path.as_posix(), dpi=params.dpi, bbox_inches="tight")
     plt.close(fig)
     logger.debug(f"Saved plot: {combined_path}")
@@ -693,7 +698,7 @@ def _prompt_threshold_levels(
     if not ordered_rois:
         return {}
 
-    combined_plot_path = output_dir / f"threshold_selection_all+{codebook}.png"
+    combined_plot_path = output_dir / "threshold_selection" / f"threshold_selection_all+{codebook}.png"
     lines = ["Generated artifacts:"]
     for roi in ordered_rois:
         artifacts = contexts[roi].artifact_paths
@@ -803,12 +808,15 @@ def _generate_final_outputs(
     else:
         ax.set_xlabel(x_col)
         ax.set_ylabel(y_col)
-    save_figure(fig_spots, output_dir, "spots_final", roi, codebook, log_level="INFO")
+    save_figure(fig_spots, output_dir / "spots_final", "spots_final", roi, codebook, log_level="INFO")
 
-    # Save blank counts
+    # Save blank counts and scree plot together
+    scree_dir = output_dir / "scree_final"
+    scree_dir.mkdir(parents=True, exist_ok=True)
+
     per_gene_final = count_by_gene(spots_ok)
     per_gene_final.filter(pl.col("is_blank")).sort("count", descending=True).write_csv(
-        output_dir / f"blanks--{roi}+{codebook}.csv"
+        scree_dir / f"blanks--{roi}+{codebook}.csv"
     )
 
     # Final Scree Plot
@@ -832,7 +840,7 @@ def _generate_final_outputs(
         loc="left",
     )
     fig_scree.tight_layout()
-    save_figure(fig_scree, output_dir, "scree_final", roi, codebook, log_level="INFO")
+    save_figure(fig_scree, scree_dir, "scree_final", roi, codebook, log_level="INFO")
 
     # Save final filtered data
     output_parquet = output_dir / f"{roi}+{codebook}.parquet"
@@ -1016,8 +1024,9 @@ def threshold(
         density_results = _calculate_density_map(spots_intermediate, params)
 
         fig_contours, contours, interp_func, surface = density_results
-        save_figure(fig_contours, output_dir, "contours", roi, codebook.name)
-        contour_path = (output_dir / f"contours--{roi}+{codebook.name}.png").resolve()
+        contours_dir = output_dir / "contours"
+        save_figure(fig_contours, contours_dir, "contours", roi, codebook.name)
+        contour_path = (contours_dir / f"contours--{roi}+{codebook.name}.png").resolve()
 
         fig_blank_panels = _create_spots_contours_figure(
             spots_intermediate,
@@ -1028,8 +1037,9 @@ def threshold(
         )
         spots_contours_path: Path | None = None
         if fig_blank_panels is not None:
-            save_figure(fig_blank_panels, output_dir, "spots_contours", roi, codebook.name)
-            spots_contours_path = (output_dir / f"spots_contours--{roi}+{codebook.name}.png").resolve()
+            spots_contours_dir = output_dir / "spots_contours"
+            save_figure(fig_blank_panels, spots_contours_dir, "spots_contours", roi, codebook.name)
+            spots_contours_path = (spots_contours_dir / f"spots_contours--{roi}+{codebook.name}.png").resolve()
 
         logger.debug("Computing threshold curve statistics")
         curve = _compute_threshold_curve(spots_intermediate, contours, interp_func)
