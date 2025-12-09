@@ -39,15 +39,18 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
     pretrained_path = Path(pretrained_model)
     resolved_kwargs["pretrained_model"] = str(pretrained_path)
 
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available. TensorRT requires CUDA.")
+    if torch.cuda.device_count() == 0:
+        raise RuntimeError("No CUDA devices found. TensorRT requires a GPU.")
+
+    device_index = 0
+    device_name = torch.cuda.get_device_name(device_index)
+    plan_candidate = plan_path_for_device(pretrained_path, device_name)
+
     plan_selection: tuple[Path, str] | None = None
-    if torch is not None and getattr(torch.cuda, "is_available", lambda: False)():
-        if getattr(torch.cuda, "device_count", lambda: 0)() > 0:
-            device_index = 0
-            device_name = torch.cuda.get_device_name(device_index)
-            plan_candidate = plan_path_for_device(pretrained_path, device_name)
-            if plan_candidate.is_file():
-                plan_selection = (plan_candidate, device_name)
-    plan_candidate = plan_candidate if "plan_candidate" in locals() else plan_path_for_device(pretrained_path, "cuda")
+    if plan_candidate.is_file():
+        plan_selection = (plan_candidate, device_name)
 
     backend_to_classes = {
         "sam": (PackedCellposeModel, PackedCellposeModelTRT),
