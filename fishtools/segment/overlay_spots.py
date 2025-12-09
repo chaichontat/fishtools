@@ -616,7 +616,8 @@ def run_(
             cb_for_chunks = spots_path.stem.split("+")[1]
         except Exception:
             cb_for_chunks = "spots"
-    output_chunk_dir = output_dir / f"chunks+{cb_for_chunks}"
+    # Put chunks inside the segmentation zarr folder
+    output_chunk_dir = segmentation_path / f"chunks+{cb_for_chunks}"
 
     try:
         output_chunk_dir.mkdir(parents=True, exist_ok=True)

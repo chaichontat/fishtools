@@ -314,6 +314,12 @@ def trt_build_cmd(model: Path, batch_size: int, backend: str, opset: int) -> Non
     help="Decoded spots codebook labels to include in the export (repeatable).",
 )
 @click.option(
+    "--segmentation-name",
+    default="output_segmentation.zarr",
+    show_default=True,
+    help="Segmentation zarr name (contains chunks and intensity outputs).",
+)
+@click.option(
     "--channels",
     default="auto",
     show_default=True,
@@ -335,6 +341,7 @@ def export_command(
     roi: str | None,
     seg_codebook: str,
     codebooks: tuple[str, ...],
+    segmentation_name: str,
     channels: str,
     out_dir: Path | None,
     diag: bool,
@@ -348,6 +355,7 @@ def export_command(
         roi=roi,
         seg_codebook=seg_codebook,
         codebooks=codebooks,
+        segmentation_name=segmentation_name,
         channels=channels,
         out_dir=out_dir,
         diag=diag,

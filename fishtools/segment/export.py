@@ -20,15 +20,15 @@ class _IntensityKey:
     channel: str
 
 
-def _discover_channels(stitch_root: Path) -> list[str]:
-    """Discover channels by scanning intensity_* subdirectories.
+def _discover_channels(seg_zarr_path: Path) -> list[str]:
+    """Discover channels by scanning intensity_* subdirectories inside segmentation zarr.
 
     Returns a sorted list of channel names.
     """
     channels: list[str] = []
-    if not stitch_root.exists():
+    if not seg_zarr_path.exists():
         return channels
-    for p in stitch_root.iterdir():
+    for p in seg_zarr_path.iterdir():
         if p.is_dir() and p.name.startswith("intensity_"):
             channels.append(p.name.removeprefix("intensity_"))
     return sorted(set(channels))
@@ -104,14 +104,15 @@ def _resolve_channels(
     deconv: Path,
     rois: Iterable[str],
     seg_codebook: str,
+    segmentation_name: str,
     channels: str,
 ) -> list[str]:
     candidate = channels.strip()
     if candidate.lower() == "auto":
         discovered: set[str] = set()
         for roi in rois:
-            stitched = deconv / f"stitch--{roi}+{seg_codebook}"
-            discovered.update(_discover_channels(stitched))
+            seg_zarr = deconv / f"stitch--{roi}+{seg_codebook}" / segmentation_name
+            discovered.update(_discover_channels(seg_zarr))
         if not discovered:
             raise ValueError(
                 "No intensity_* directories found; run 'segment overlay intensity' first or pass --channels."
@@ -129,10 +130,12 @@ def _load_ident_shards(
     rois: Iterable[str],
     codebooks: Iterable[str],
     seg_codebook: str,
+    segmentation_name: str,
 ) -> dict[tuple[str, str], pl.DataFrame]:
     dfs: dict[tuple[str, str], pl.DataFrame] = {}
     for roi, codebook in product(rois, codebooks):
-        root = deconv / f"stitch--{roi}+{seg_codebook}" / f"chunks+{codebook}"
+        # Chunks are inside the segmentation zarr folder
+        root = deconv / f"stitch--{roi}+{seg_codebook}" / segmentation_name / f"chunks+{codebook}"
         glob_path = root / "ident_*.parquet"
         if not any(root.glob("ident_*.parquet")):
             logger.warning(f"ROI={roi} codebook={codebook}: no ident shards under {root}")
@@ -162,11 +165,13 @@ def _load_intensity_shards(
     deconv: Path,
     rois: Iterable[str],
     seg_codebook: str,
+    segmentation_name: str,
     channel_list: Iterable[str],
 ) -> dict[_IntensityKey, pl.DataFrame]:
     intensities: dict[_IntensityKey, pl.DataFrame] = {}
     for channel, roi in product(channel_list, rois):
-        channel_dir = deconv / f"stitch--{roi}+{seg_codebook}" / f"intensity_{channel}"
+        # Intensity outputs are inside the segmentation zarr folder
+        channel_dir = deconv / f"stitch--{roi}+{seg_codebook}" / segmentation_name / f"intensity_{channel}"
         if not channel_dir.exists():
             logger.warning(f"ROI={roi} channel={channel}: intensity directory missing under {channel_dir}")
             continue
@@ -202,11 +207,13 @@ def _load_polygon_shards(
     deconv: Path,
     rois: Iterable[str],
     seg_codebook: str,
+    segmentation_name: str,
     primary_codebook: str,
 ) -> dict[str, pl.DataFrame]:
     polygons_by_roi: dict[str, pl.DataFrame] = {}
     for roi in rois:
-        chunks_dir = deconv / f"stitch--{roi}+{seg_codebook}" / f"chunks+{primary_codebook}"
+        # Chunks are inside the segmentation zarr folder
+        chunks_dir = deconv / f"stitch--{roi}+{seg_codebook}" / segmentation_name / f"chunks+{primary_codebook}"
         glob_path = chunks_dir / "polygons_*.parquet"
         if not any(chunks_dir.glob("polygons_*.parquet")):
             logger.warning(f"ROI={roi}: no polygons shards under {chunks_dir}")
@@ -399,6 +406,7 @@ def export_cmd(
     roi: str | None,
     seg_codebook: str,
     codebooks: Iterable[str],
+    segmentation_name: str,
     channels: str,
     out_dir: Path | None,
     diag: bool,
@@ -416,29 +424,35 @@ def export_cmd(
     cb_list = _resolve_codebooks(codebooks)
 
     deconv = ws.deconved
-    segmented_root = _prepare_output_dir(ws.output / "segmented", out_dir)
 
-    ident_frames = _load_ident_shards(deconv, rois, cb_list, seg_codebook)
-    channel_list = _resolve_channels(deconv, rois, seg_codebook, channels)
-    intensities = _load_intensity_shards(deconv, rois, seg_codebook, channel_list)
+    ident_frames = _load_ident_shards(deconv, rois, cb_list, seg_codebook, segmentation_name)
+    channel_list = _resolve_channels(deconv, rois, seg_codebook, segmentation_name, channels)
+    intensities = _load_intensity_shards(deconv, rois, seg_codebook, segmentation_name, channel_list)
 
     primary_cb = cb_list[0]
-    polygons_by_roi = _load_polygon_shards(deconv, rois, seg_codebook, primary_cb)
+    polygons_by_roi = _load_polygon_shards(deconv, rois, seg_codebook, segmentation_name, primary_cb)
 
     if diag:
         _emit_pairing_diagnostics(polygons_by_roi, intensities, channel_list)
 
     cells = _build_cells_dataframe(polygons_by_roi, intensities, channel_list)
-
-    roi_token = rois[0] if len(rois) == 1 else "all"
-    cb_token = Workspace.sanitize_codebook_name(primary_cb)
-    cells_path = segmented_root / f"polygons--{roi_token}+{seg_codebook}.parquet"
-    _write_cells_parquet(cells, cells_path)
-
     counts_by_gene = _build_counts_matrix(ident_frames)
     adata = _build_anndata(counts_by_gene, cells)
 
-    ws.output.mkdir(parents=True, exist_ok=True)
-    out_h5ad = ws.output / f"{roi_token}+{cb_token}.h5ad"
+    cb_token = Workspace.sanitize_codebook_name(primary_cb)
+    seg_stem = Path(segmentation_name).stem
+
+    if len(rois) == 1:
+        # Single ROI: put outputs inside the segmentation zarr folder
+        seg_zarr_path = deconv / f"stitch--{rois[0]}+{seg_codebook}" / segmentation_name
+        cells_path = seg_zarr_path / f"polygons+{cb_token}.parquet"
+        out_h5ad = seg_zarr_path / f"{cb_token}.h5ad"
+    else:
+        # Multiple ROIs: put in output/ with segmentation identifier
+        ws.output.mkdir(parents=True, exist_ok=True)
+        cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
+        out_h5ad = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+
+    _write_cells_parquet(cells, cells_path)
     adata.write_h5ad(out_h5ad)
     logger.info(f"Wrote AnnData export to {out_h5ad}")

@@ -141,6 +141,9 @@ def _run_overlay_for_roi(
     channels = _discover_channels(intensity_zarr_path, channel)
     logger.info(f"ROI '{roi}': Processing channels {channels} from {intensity_zarr_path}.")
 
+    # Put intensity outputs inside the segmentation zarr folder
+    output_dir = segmentation_zarr_path
+
     processed_count = 0
     failed_count = 0
     with ProcessPoolExecutor(max_workers=threads, mp_context=get_context("spawn")) as executor:
@@ -153,7 +156,7 @@ def _run_overlay_for_roi(
                     segmentation_zarr_path,
                     intensity_zarr_path,
                     ch,
-                    stitch_paths.stitch_root,
+                    output_dir,
                     overwrite,
                 )
                 futures[fut] = (ch, idx)

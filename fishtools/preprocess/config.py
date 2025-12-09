@@ -75,6 +75,14 @@ class FiducialDetailedConfig(BaseModel):
         default=99.0, description="Percentile for intensity normalization in plotting"
     )
 
+    allow_large_drifts: bool = Field(
+        default=False,
+        description=(
+            "If true, accept drifts larger than max_drift_threshold without raising DriftTooLarge. "
+            "Use cautiously; large drifts may indicate mis-registration."
+        ),
+    )
+
 
 class Fiducial(BaseModel):
     use_fft: bool = Field(

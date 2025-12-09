@@ -229,6 +229,13 @@ def _save_debug_overlay(
         PILImage.fromarray(rgb).save(debug_dir / f"{idx:04d}-{name}.png")
 
 
+def _debug_fid_paths(path: Path, roi: str, idx: int) -> tuple[Path, str, str]:
+    debug_dir = path / "fids_debug"
+    fids_name = f"{roi}-{idx:04d}.tif"
+    shifted_name = f"{roi}-shifted-{idx:04d}.tif"
+    return debug_dir, fids_name, shifted_name
+
+
 @dataclass
 class Image:
     name: str
@@ -493,21 +500,21 @@ def run_fiducial(
     shifted = {k: shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()}
 
     if debug:
-        debug_dir = path / "fids_debug"
-        debug_dir.mkdir(exist_ok=True)
+        debug_dir, fids_name, shifted_name = _debug_fid_paths(path, roi, idx)
+        debug_dir.mkdir(exist_ok=True, parents=True)
         # Ensure deterministic channel ordering for debug TIFFs so that the
         # plane index matches the sorted fiducial keys used in QC tooling.
         # Use raw fids with priors applied (not LoG treated)
         debug_fids = fids_raw if fids_raw is not None else fids
         safe_imwrite(
-            debug_dir / f"fids-{idx:04d}.tif",
+            debug_dir / fids_name,
             np.stack([debug_fids[k] for k in ordered_keys]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX", "key": ordered_keys},
         )
         safe_imwrite(
-            debug_dir / f"fids_shifted-{idx:04d}.tif",
+            debug_dir / shifted_name,
             np.stack([shifted[k] for k in ordered_keys]),
             compression=22610,
             compressionargs={"level": 0.65},
