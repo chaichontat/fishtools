@@ -24,7 +24,12 @@ from fishtools.preprocess.chromatic import Affine
 from fishtools.preprocess.config import Config, Fiducial, FiducialDetailedConfig, NumpyEncoder, RegisterConfig
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
-from fishtools.preprocess.fiducial import Shifts, align_fiducials, align_fiducials_with_stats, shifts_from_anchor_roi
+from fishtools.preprocess.fiducial import (
+    Shifts,
+    align_fiducials,
+    align_fiducials_with_stats,
+    shifts_from_anchor_roi,
+)
 from fishtools.utils.io import FiducialPaths, Workspace, safe_imwrite
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
@@ -123,6 +128,16 @@ def _run_child_cli(
     """Wrapper around subprocess execution for easy monkeypatching in tests."""
 
     return run_subprocess_streaming(argv, check=check)
+
+
+def _parse_repaired_option(value: str | None) -> set[str] | None:
+    """Convert --repaired CLI input into a normalized set of round names."""
+
+    if value is None:
+        return None
+
+    rounds = {token.strip() for token in value.split(",") if token.strip()}
+    return rounds or None
 
 
 def _copy_codebook_to_workspace(cli_path: Path, codebook_path: Path) -> Path:
@@ -612,8 +627,9 @@ def _run(
     codebook_bits = {str(bit) for bit in chain.from_iterable(cb.values())}
 
     # Build list of round directories, redirecting repaired rounds to --repaired folders
-    repaired_rounds = repaired_rounds or set()
+    repaired_rounds = set(repaired_rounds or set())
     roi_dirs = []
+    used_repaired: set[str] = set()
     for p in Path(path).glob(f"*--{roi}"):
         if not p.is_dir():
             continue
@@ -626,11 +642,17 @@ def _run(
             if repaired_path.exists():
                 roi_dirs.append(repaired_path)
                 logger.info(f"Using repaired folder for round {round_name}: {repaired_path}")
+                used_repaired.add(round_name)
             else:
-                logger.warning(f"Repaired folder not found for {round_name}, using original: {p}")
-                roi_dirs.append(p)
+                raise FileNotFoundError(f"Repaired folder for round {round_name} not found: {repaired_path}")
         else:
             roi_dirs.append(p)
+
+    if repaired_rounds:
+        unused_repaired = repaired_rounds - used_repaired
+        if unused_repaired:
+            missing_list = ", ".join(sorted(unused_repaired))
+            logger.warning(f"Requested --repaired rounds not found for ROI {roi}: {missing_list}")
 
     available_bits = {bit for p in roi_dirs for bit in p.name.split("--")[0].split("_") if bit}
 
@@ -925,7 +947,7 @@ def run(
         )
 
         # Parse repaired rounds
-        repaired_rounds = set(repaired.split(",")) if repaired else None
+        repaired_rounds = _parse_repaired_option(repaired)
 
         _run(
             path,
@@ -1007,6 +1029,12 @@ def run(
     is_flag=True,
     help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
 )
+@click.option(
+    "--repaired",
+    type=str,
+    default=None,
+    help="Comma-separated round names to use from --repaired folders (e.g., '1_9_17,2_10_18')",
+)
 def batch(
     path: Path,
     roi: str,
@@ -1022,6 +1050,7 @@ def batch(
     use_itk: bool = False,
     use_brightest: int = 0,
     allow_large_drifts: bool = False,
+    repaired: str | None = None,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
@@ -1080,6 +1109,7 @@ def batch(
                         ref,
                         f"--roi={roi}",
                         *(["--overwrite"] if overwrite else []),
+                        *( [f"--repaired={repaired}"] if repaired else [] ),
                         *(["--use-fft"] if use_fft else []),
                         *(["--use-itk"] if use_itk else []),
                         *( [f"--use-brightest={use_brightest}"] if use_brightest > 0 else [] ),
@@ -1155,6 +1185,7 @@ def batch(
                         ref,
                         f"--roi={roi}",
                         "--overwrite",
+                        *( [f"--repaired={repaired}"] if repaired else [] ),
                         *( ["--allow-large-drifts"] if allow_large_drifts else [] ),
                     ],
                     check=True,

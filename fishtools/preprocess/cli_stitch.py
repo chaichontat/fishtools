@@ -1299,13 +1299,12 @@ def fuse(
                 f"Tiles in TileConfiguration but not in coarse_shifts (using 0,0): {sorted(missing)}"
             )
 
-        # Apply shifts: dx > 0 means content shifted RIGHT → position moves LEFT
-        # Note: Sign convention should be verified empirically
+
         def apply_shift(row: dict) -> dict:
             tile_idx = int(row["index"])
             dx, dy = shift_lookup.get(tile_idx, (0.0, 0.0))
-            row["x"] = row["x"] - dx / downsample
-            row["y"] = row["y"] - dy / downsample
+            row["x"] = row["x"] + dx / downsample
+            row["y"] = row["y"] + dy / downsample
             return row
 
         adjusted_rows = [apply_shift(row) for row in tileconfig.df.iter_rows(named=True)]
@@ -1318,7 +1317,8 @@ def fuse(
             logger.info(f"  dx: [{min(dxs):.1f}, {max(dxs):.1f}], dy: [{min(dys):.1f}, {max(dys):.1f}]")
 
         # Save shifted TileConfiguration for slice step
-        shifted_tc_path = path / "TileConfiguration.shifted.txt"
+        stitch_dir.mkdir(parents=True, exist_ok=True)
+        shifted_tc_path = stitch_dir / "TileConfiguration.shifted.txt"
         tileconfig.write(shifted_tc_path)
         logger.info(f"Saved shifted TileConfiguration to {shifted_tc_path}")
 
@@ -1908,6 +1908,29 @@ def extract_patch(mosaic: np.ndarray, x0: int, y0: int, size: int) -> np.ndarray
     return patch
 
 
+def load_fiducial_mosaics(fid_dir: Path) -> dict[int, np.ndarray]:
+    """Load fiducial mosaics from ImageJ fused outputs (fused_<z>-1.tif)."""
+
+    fid_mosaics: dict[int, np.ndarray] = {}
+    if not fid_dir.exists():
+        return fid_mosaics
+
+    for fid_z_folder in sorted(fid_dir.iterdir()):
+        if not (fid_z_folder.is_dir() and fid_z_folder.name.isdigit()):
+            continue
+
+        fid_index = int(fid_z_folder.name)
+        fused_path = fid_z_folder / f"fused_{fid_z_folder.name}-1.tif"
+        if not fused_path.exists():
+            logger.warning(f"No fiducial mosaic found under {fid_z_folder}")
+            continue
+
+        fid_mosaics[fid_index] = imread(fused_path)
+        logger.info(f"Loaded fiducial Z={fid_z_folder.name} from {fused_path.name}")
+
+    return fid_mosaics
+
+
 def slice_tile_from_zarr(
     zarr_array,
     fid_mosaics: dict[int, np.ndarray],
@@ -2023,16 +2046,8 @@ def slice_mosaic(
     origin_y = shifted_tc.df["y"].min()
     logger.info(f"Mosaic origin (min of shifted positions): ({origin_x:.1f}, {origin_y:.1f})")
 
-    # Load fiducial mosaics
-    fid_mosaics: dict[int, np.ndarray] = {}
-    fid_dir = stitch_dir / "fid"
-    if fid_dir.exists():
-        for fid_z_folder in sorted(fid_dir.iterdir()):
-            if fid_z_folder.is_dir() and fid_z_folder.name.isdigit():
-                fused_path = fid_z_folder / "fused_00-1.tif"
-                if fused_path.exists():
-                    fid_mosaics[int(fid_z_folder.name)] = imread(fused_path)
-                    logger.info(f"Loaded fiducial Z={fid_z_folder.name}")
+    # Load fiducial mosaics (supports fused_00-1 and fused_{z}-1 naming)
+    fid_mosaics = load_fiducial_mosaics(stitch_dir / "fid")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Output directory: {out_dir}")
@@ -2043,18 +2058,13 @@ def slice_mosaic(
         logger.warning(f"Source directory {source_dir} not found - output files will have no metadata")
 
     skipped = 0
-    # Build lookup from shifted TC (tile positions as used in mosaic)
-    shifted_positions = {int(r["index"]): (r["x"], r["y"]) for r in shifted_tc.df.iter_rows(named=True)}
-
     rows = list(tileconfig.df.iter_rows(named=True))
     with progress_bar(len(rows)) as update:
         for row in rows:
             tile_idx = int(row["index"])
-            # Slice at SHIFTED position relative to SHIFTED origin
-            # The mosaic was built with shifted positions, so we slice from those coordinates
-            shifted_x, shifted_y = shifted_positions[tile_idx]
-            slice_x = int(round(shifted_x - origin_x))
-            slice_y = int(round(shifted_y - origin_y))
+            # Slice at ORIGINAL position relative to SHIFTED origin
+            slice_x = int(round(row["x"] - origin_x))
+            slice_y = int(round(row["y"] - origin_y))
 
             out_path = out_dir / f"{round_name}-{tile_idx:04d}.tif"
             if out_path.exists() and not overwrite:
