@@ -24,8 +24,8 @@ from fishtools.preprocess.chromatic import Affine
 from fishtools.preprocess.config import Config, Fiducial, FiducialDetailedConfig, NumpyEncoder, RegisterConfig
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
-from fishtools.preprocess.fiducial import Shifts, align_fiducials, shifts_from_anchor_roi
-from fishtools.utils.io import Workspace, safe_imwrite
+from fishtools.preprocess.fiducial import Shifts, align_fiducials, align_fiducials_with_stats, shifts_from_anchor_roi
+from fishtools.utils.io import FiducialPaths, Workspace, safe_imwrite
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
 
@@ -230,7 +230,8 @@ def _save_debug_overlay(
 
 
 def _debug_fid_paths(path: Path, roi: str, idx: int) -> tuple[Path, str, str]:
-    debug_dir = path / "fids_debug"
+    paths = FiducialPaths(path, roi)
+    debug_dir = paths.debug_dir
     fids_name = f"{roi}-{idx:04d}.tif"
     shifted_name = f"{roi}-shifted-{idx:04d}.tif"
     return debug_dir, fids_name, shifted_name
@@ -443,14 +444,16 @@ def run_fiducial(
                 raise ValueError(f"Could not find file that starts with {name} for override shift.")
 
     # Write reference fiducial
-    (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
+    fid_paths = FiducialPaths(path, roi)
+    fid_path = fid_paths.fid_dir
+    fid_path.mkdir(exist_ok=True)
     crop = config.registration.crop
     if crop:
         fid_img = fids[reference][crop:-crop, crop:-crop]
     else:
         fid_img = fids[reference]
     safe_imwrite(
-        fid_path / f"fids-{idx:04d}.tif",
+        fid_paths.fid_tile(idx),
         fid_img,
         compression=22610,
         compressionargs={"level": 0.65},
@@ -480,8 +483,9 @@ def run_fiducial(
         )
         shifts = {k: anchor_shifts.get(k, np.array([0.0, 0.0])) for k in fids}
         residuals = {k: 0.0 for k in fids}
+        stats: dict[str, Any] = {k: None for k in fids}
     else:
-        shifts, residuals = align_fiducials(
+        shifts, residuals, stats = align_fiducials_with_stats(
             fids,
             reference=reference,
             debug=debug,
@@ -535,16 +539,24 @@ def run_fiducial(
     (shift_path := path / f"shifts--{roi}+{codebook_name}").mkdir(exist_ok=True)
 
     _fid_ref = fids[reference][500:-500:2, 500:-500:2].flatten()
-    validated = Shifts.validate_python({
-        k: {
-            "shifts": (shifts[k][0], shifts[k][1]),
-            "residual": residuals[k],
-            "corr": 1.0
-            if reference == k
-            else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1],
+    validated = Shifts.validate_python(
+        {
+            k: {
+                "shifts": (shifts[k][0], shifts[k][1]),
+                "residual": residuals[k],
+                "corr": 1.0
+                if reference == k
+                else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1],
+                "iterations": (stats.get(k).iterations if stats.get(k) is not None else None),
+                "final_fwhm": (stats.get(k).final_fwhm if stats.get(k) is not None else None),
+                "final_threshold": (stats.get(k).final_threshold if stats.get(k) is not None else None),
+                "n_spots": (stats.get(k).n_spots if stats.get(k) is not None else None),
+                "mode": (stats.get(k).mode if stats.get(k) is not None else None),
+                "algorithm": (stats.get(k).algorithm if stats.get(k) is not None else None),
+            }
+            for k in fids
         }
-        for k in fids
-    })
+    )
     jsoned = Shifts.dump_json(validated)
     (shift_path / f"shifts-{idx:04d}.json").write_bytes(jsoned)
     logger.debug({k: f"{r.corr:03f}" for k, r in validated.items()})
@@ -562,6 +574,7 @@ def _run(
     debug: bool = False,
     overwrite: bool = False,
     no_priors: bool = False,
+    repaired_rounds: set[str] | None = None,
 ):
     logger.info("Starting")
     codebook_name = Path(codebook).stem
@@ -598,12 +611,26 @@ def _run(
     cb = json.loads(Path(codebook).read_text())
     codebook_bits = {str(bit) for bit in chain.from_iterable(cb.values())}
 
-    roi_dirs = [
-        p
-        for p in Path(path).glob(f"*--{roi}")
-        if p.is_dir()
-        and not any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
-    ]
+    # Build list of round directories, redirecting repaired rounds to --repaired folders
+    repaired_rounds = repaired_rounds or set()
+    roi_dirs = []
+    for p in Path(path).glob(f"*--{roi}"):
+        if not p.is_dir():
+            continue
+        if any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or [])):
+            continue
+        # Check if this round should use repaired folder
+        round_name = p.name.split("--")[0]
+        if round_name in repaired_rounds:
+            repaired_path = path / f"{round_name}--{roi}--repaired"
+            if repaired_path.exists():
+                roi_dirs.append(repaired_path)
+                logger.info(f"Using repaired folder for round {round_name}: {repaired_path}")
+            else:
+                logger.warning(f"Repaired folder not found for {round_name}, using original: {p}")
+                roi_dirs.append(p)
+        else:
+            roi_dirs.append(p)
 
     available_bits = {bit for p in roi_dirs for bit in p.name.split("--")[0].split("_") if bit}
 
@@ -843,6 +870,12 @@ def register(): ...
     is_flag=True,
     help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
 )
+@click.option(
+    "--repaired",
+    type=str,
+    default=None,
+    help="Comma-separated round names to use from --repaired folders (e.g., '1_9_17,2_10_18')",
+)
 def run(
     path: Path,
     idx: int,
@@ -859,6 +892,7 @@ def run(
     anchors: Path | None = None,
     use_brightest: int = 0,
     allow_large_drifts: bool = False,
+    repaired: str | None = None,
 ):
     """Preprocess image sets before spot calling.
 
@@ -889,6 +923,9 @@ def run(
             debug=debug,
             extra={"roi": roi, "codebook": codebook_name},
         )
+
+        # Parse repaired rounds
+        repaired_rounds = set(repaired.split(",")) if repaired else None
 
         _run(
             path,
@@ -929,6 +966,7 @@ def run(
                 ),
             ),
             overwrite=overwrite,
+            repaired_rounds=repaired_rounds,
         )
 
 
@@ -1135,6 +1173,206 @@ def batch(
 
 
 register.add_command(batch)
+
+
+@register.command("fix-shifts")
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.option("--roi", "-o", type=str, required=True, help="ROI to process")
+@click.option("--reference", "-r", type=str, default="2_10_18", help="Reference round name")
+@click.option(
+    "--rounds",
+    type=str,
+    required=True,
+    help="Comma-separated list of rounds to fix (e.g., '1_9_17,3_11_19')",
+)
+@click.option("--use-fft/--use-spots", default=False, help="Use FFT phase correlation or spot-based (default)")
+@click.option("--n-fids", type=int, default=2, help="Number of fiducial frames per image")
+@click.option("--threshold", type=float, default=5.0, help="Spot detection threshold (sigma)")
+@click.option("--fwhm", type=float, default=4.0, help="Fiducial spot FWHM")
+@click.option("--prior", type=str, default=None, help="Prior shift as 'dx,dy' (e.g., '150,-30'). Applied to all rounds.")
+@click.option("--debug", is_flag=True)
+def fix_shifts(
+    path: Path,
+    roi: str,
+    reference: str,
+    rounds: str,
+    use_fft: bool,
+    n_fids: int,
+    threshold: float,
+    fwhm: float,
+    prior: str | None,
+    debug: bool,
+):
+    """Detect large drift offsets and write shifts to JSON.
+
+    Uses the SAME registration algorithm as the main pipeline (align_fiducials)
+    but with allow_large_drifts=True. Only detects and writes shifts - does NOT
+    apply them to images.
+
+    The output JSON can be used to inform priors for `register batch`.
+
+    Example:
+
+    \b
+        # Detect large shifts
+        preprocess register fix-shifts /ws --roi roi1 \\
+            --rounds "1_9_17,3_11_19" --reference 2_10_18
+
+    \b
+        # Review detected shifts
+        cat /ws/analysis/deconv/shifts--roi1/coarse_shifts.json
+    """
+    import json as json_module
+
+    setup_cli_logging(
+        path,
+        component="preprocess.register.fix-shifts",
+        file=f"fix-shifts-{roi}",
+        debug=debug,
+        extra={"roi": roi, "reference": reference},
+    )
+
+    rounds_to_fix = [r.strip() for r in rounds.split(",")]
+
+    # Parse prior if provided
+    prior_shift: tuple[float, float] | None = None
+    if prior:
+        try:
+            parts = prior.split(",")
+            prior_shift = (float(parts[0]), float(parts[1]))
+            logger.info(f"Using prior shift: dx={prior_shift[0]}, dy={prior_shift[1]}")
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Invalid prior format '{prior}'. Expected 'dx,dy' (e.g., '150,-30')") from e
+
+    logger.info(f"Processing rounds: {rounds_to_fix}")
+    logger.info(f"Reference round: {reference}")
+    logger.info(f"ROI: {roi}")
+
+    # Validate rounds exist
+    ref_dir = path / f"{reference}--{roi}"
+    if not ref_dir.exists():
+        raise ValueError(f"Reference round directory not found: {ref_dir}")
+
+    for round_name in rounds_to_fix:
+        round_dir = path / f"{round_name}--{roi}"
+        if not round_dir.exists():
+            raise ValueError(f"Round directory not found: {round_dir}")
+
+    # Get list of tile indices from reference
+    ref_tiles = sorted(ref_dir.glob(f"{reference}-*.tif"))
+    if not ref_tiles:
+        raise ValueError(f"No tiles found in reference directory: {ref_dir}")
+
+    idxs = [int(p.stem.split("-")[1]) for p in ref_tiles]
+    logger.info(f"Found {len(idxs)} tiles to process")
+
+    # Results storage: {idx: {round_name: {dx, dy, residual, corr}}}
+    all_results: dict[int, dict[str, dict[str, float]]] = {}
+
+    # Process each tile - same logic as _run() but for specified rounds only
+    for idx in idxs:
+        logger.info(f"Processing tile {idx}")
+
+        # Load fiducial images - same as _run()
+        fids: dict[str, np.ndarray] = {}
+
+        def normalize_fid(fid: np.ndarray) -> np.ndarray:
+            """Normalize fiducial to 0-1 range to avoid overflow in FFT."""
+            fid = fid.astype(np.float32)
+            fmin, fmax = fid.min(), fid.max()
+            if fmax - fmin > 0:
+                return (fid - fmin) / (fmax - fmin)
+            return fid - fmin
+
+        # Load reference fiducial
+        ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
+        ref_img = Image.from_file(ref_path, n_fids=n_fids)
+        # Use raw fiducials for FFT (normalized), LoG-processed for spot-based (same as _run)
+        fids[reference] = normalize_fid(ref_img.fid_raw) if use_fft else ref_img.fid
+
+        # Load target fiducials
+        for round_name in rounds_to_fix:
+            round_dir = path / f"{round_name}--{roi}"
+            target_path = round_dir / f"{round_name}-{idx:04d}.tif"
+            if not target_path.exists():
+                logger.warning(f"Target tile not found: {target_path}, skipping")
+                continue
+            target_img = Image.from_file(target_path, n_fids=n_fids)
+            fid = normalize_fid(target_img.fid_raw) if use_fft else target_img.fid
+
+            # Apply prior shift if provided (pre-shift to approximate alignment)
+            if prior_shift is not None:
+                fid = shift(fid, [prior_shift[1], prior_shift[0]], order=1)
+
+            fids[round_name] = fid
+
+        # Call align_fiducials - SAME as _run() but with allow_large_drifts=True
+        shifts, residuals = align_fiducials(
+            fids,
+            reference=reference,
+            debug=debug,
+            max_iters=5,
+            threshold_sigma=threshold,
+            fwhm=fwhm,
+            use_fft=use_fft,
+            use_itk=False,
+            use_brightest=0,
+            detailed_config=FiducialDetailedConfig(
+                allow_large_drifts=True,  # Key difference from normal registration
+            ),
+        )
+
+        # Store results
+        tile_results: dict[str, dict[str, float]] = {}
+        for round_name in rounds_to_fix:
+            if round_name in shifts:
+                # Add prior back to get total shift
+                dx = float(shifts[round_name][0])
+                dy = float(shifts[round_name][1])
+                if prior_shift is not None:
+                    dx += prior_shift[0]
+                    dy += prior_shift[1]
+                magnitude = float(np.hypot(dx, dy))
+                tile_results[round_name] = {
+                    "dx": dx,
+                    "dy": dy,
+                    "magnitude": magnitude,
+                    "residual": float(residuals.get(round_name, 0.0)),
+                }
+                logger.info(f"  {round_name}: dx={dx:.2f}, dy={dy:.2f}, mag={magnitude:.1f}")
+
+        all_results[idx] = tile_results
+
+    # Write results JSON
+    shifts_dir = path / f"shifts--{roi}"
+    shifts_dir.mkdir(exist_ok=True)
+    output_path = shifts_dir / "coarse_shifts.json"
+
+    output_data: dict[str, Any] = {
+        "reference": reference,
+        "use_fft": use_fft,
+        "tiles": {f"{idx:04d}": results for idx, results in sorted(all_results.items())},
+    }
+    if prior_shift is not None:
+        output_data["prior"] = {"dx": prior_shift[0], "dy": prior_shift[1]}
+    output_path.write_text(json_module.dumps(output_data, indent=2))
+    logger.info(f"Wrote coarse shifts to {output_path}")
+
+    # Summary
+    for round_name in rounds_to_fix:
+        magnitudes = [
+            r[round_name]["magnitude"]
+            for r in all_results.values()
+            if round_name in r
+        ]
+        if magnitudes:
+            median_dx = np.median([r[round_name]["dx"] for r in all_results.values() if round_name in r])
+            median_dy = np.median([r[round_name]["dy"] for r in all_results.values() if round_name in r])
+            logger.info(
+                f"{round_name}: median=({median_dx:.1f}, {median_dy:.1f}), "
+                f"mean mag={np.mean(magnitudes):.1f}px, max mag={np.max(magnitudes):.1f}px"
+            )
+
 
 if __name__ == "__main__":
     register()

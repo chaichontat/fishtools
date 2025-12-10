@@ -38,11 +38,13 @@ from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import rich_click as click
 from loguru import logger
 from PIL import Image
 from tifffile import TiffFile, TiffFileError, imread
 
+from fishtools import IMWRITE_KWARGS
 from fishtools.gpu.memory import release_all as gpu_release_all
 from fishtools.io.workspace import Workspace, safe_imwrite
 from fishtools.preprocess.config import StitchingConfig
@@ -61,7 +63,8 @@ from fishtools.utils.tiff import compose_metadata as compose_meta
 from fishtools.utils.tiff import normalize_channel_names as norm_names
 from fishtools.utils.tiff import read_metadata_from_tif
 from fishtools.utils.utils import add_file_context, batch_roi
-from fishtools.utils.zarr_utils import default_zarr_codecs, numpy_array_to_zarr as _numpy_array_to_zarr
+from fishtools.utils.zarr_utils import default_zarr_codecs
+from fishtools.utils.zarr_utils import numpy_array_to_zarr as _numpy_array_to_zarr
 
 # Expose subprocess for tests that monkeypatch cli_stitch.subprocess.run
 _subprocess_run_for_tests = subprocess.run
@@ -760,6 +763,9 @@ def extract(
     roi_for_ws: str | None = None,
     debug: bool = False,
     field_zarr: Path | None = None,
+    n_channels_reshape: int | None = None,
+    n_fids: int = 0,
+    include_fiducials: bool = False,
 ) -> None:
     """
     Extract and format images for downstream segmentation analysis.
@@ -779,6 +785,9 @@ def extract(
         is_2d: Process as 2D image (max project if 4D input)
         channels: List of channel indices to extract
         max_from: Additional file to merge for max projection
+        n_channels_reshape: If set, reshape [ZC]YX to ZCYX with this many channels
+        n_fids: Number of fiducial frames to remove from end before reshape
+        include_fiducials: If True, also extract fiducial frames to fid_XX folders
 
     Raises:
         ValueError: If is_2d=False but max_proj required for 4D input
@@ -794,6 +803,23 @@ def extract(
     except Exception as exc:
         add_file_context(exc, path)
         raise
+
+    # Handle [ZC]YX deconvolved images: remove fiducials and reshape to ZCYX
+    fiducials: np.ndarray | None = None
+    if n_channels_reshape is not None and img.ndim == 3:
+        # Image is [ZC]YX with fiducials appended at end
+        if n_fids > 0:
+            if include_fiducials:
+                fiducials = img[-n_fids:]  # Extract fiducial frames (n_fids, H, W)
+            img = img[:-n_fids]  # Remove fiducial frames from main image
+        zc, h, w = img.shape
+        if zc % n_channels_reshape != 0:
+            raise ValueError(
+                f"Cannot reshape [ZC]YX image: {zc} frames not divisible by {n_channels_reshape} channels"
+            )
+        n_z = zc // n_channels_reshape
+        # Reshape from [ZC]YX to ZCYX - frames are interleaved as Z0C0, Z0C1, Z0C2, Z1C0, Z1C1, Z1C2, ...
+        img = img.reshape(n_z, n_channels_reshape, h, w)
 
     Path(out_path).mkdir(exist_ok=True)
     # Determine channel labels directly from metadata 'key' when present;
@@ -1005,6 +1031,51 @@ def extract(
                     raise
 
         del img
+
+        # Save fiducial frames if extracted
+        if fiducials is not None:
+            # Apply same processing as main image: trim, downsample
+            fid_img = fiducials
+            clip_range = _clip_range_for_dtype(fid_img.dtype)
+            fid_img = _crop_xy(fid_img, trim)
+            if downsample > 1:
+                try:
+                    fid_img = gpu_downsample_xy(
+                        fid_img,
+                        crop=0,
+                        factor=downsample,
+                        clip_range=clip_range,
+                        output_dtype=fid_img.dtype,
+                    )
+                finally:
+                    try:
+                        gpu_release_all()
+                    except Exception:
+                        pass
+
+            # Save fiducials as 1 channel with n_fids Z slices: fid/00/, fid/01/
+            for fid_z in range(fid_img.shape[0]):
+                fid_folder = out_path / "fid" / f"{fid_z:02d}"
+                fid_folder.mkdir(exist_ok=True, parents=True)
+                target = fid_folder / (path.stem.split("-")[1] + ".tif")
+                metadata_out = _compose_metadata(
+                    "YX",
+                    ["fiducial"],
+                    extra={"processing": {"fiducial_z": fid_z}},
+                )
+                try:
+                    safe_imwrite(
+                        target,
+                        fid_img[fid_z],
+                        compression=22610,
+                        metadata=metadata_out,
+                        compressionargs={"level": 0.75},
+                    )
+                except Exception as exc:
+                    add_file_context(exc, path, target)
+                    raise
+            del fid_img
+
     except Exception as exc:
         add_file_context(exc, path)
         raise
@@ -1030,7 +1101,7 @@ def walk_fused(path: Path) -> dict[int, list[Path]]:  # shim
     help="Split tiles into this many parts. Mainly to avoid overflows in very large images.",
 )
 @click.option("--overwrite", is_flag=True)
-@click.option("--downsample", "-d", type=int, default=2)
+@click.option("--downsample", "-d", type=int, default=1)
 @click.option("--subsample-z", type=int, default=1)
 @click.option("--is-2d", is_flag=True)
 @click.option("--threads", "-t", type=int, default=8)
@@ -1053,17 +1124,29 @@ def walk_fused(path: Path) -> dict[int, list[Path]]:  # shim
     default=None,
     help="Optional project config to populate stitching defaults.",
 )
+@click.option(
+    "--coarse-shifts",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path),
+    default=None,
+    help="Path to coarse_shifts.json from fix-shifts. Adjusts tile positions for large drifts.",
+)
+@click.option(
+    "--round-name",
+    type=str,
+    default=None,
+    help="Round name to use from coarse_shifts.json (required if multiple rounds in file).",
+)
 # @click.option("--skip-extract", is_flag=True)
 @batch_roi("registered--*", include_codebook=True, split_codebook=True)
 def fuse(
     path: Path,
     roi: str,
-    codebook: str,
+    codebook: str | None = None,
     *,
     tile_config: Path | None = None,
     split: int = 1,
     overwrite: bool = False,
-    downsample: int = 2,
+    downsample: int = 1,
     is_2d: bool = False,
     threads: int = 8,
     channels: str = "all",
@@ -1074,14 +1157,75 @@ def fuse(
     json_config: Path | None = None,
     # skip_extract: bool = False,
     field_zarr: Path | None = None,
+    coarse_shifts: Path | None = None,
+    round_name: str | None = None,
 ):
+    # Validate: either codebook OR round_name must be provided
+    if codebook is None and round_name is None:
+        raise ValueError("Either --codebook or --round-name must be provided.")
+
+    ws = Workspace(path)
+
+    # Load coarse shifts if round_name mode
+    shifts_data: dict | None = None
+    shift_lookup: dict[int, tuple[float, float]] = {}
+    coarse_round_name: str | None = None
+
+    if round_name is not None:
+        # Auto-detect coarse_shifts path if not provided
+        if coarse_shifts is None:
+            coarse_shifts = ws.deconved / f"shifts--{roi}" / "coarse_shifts.json"
+            if not coarse_shifts.exists():
+                raise ValueError(
+                    f"Coarse shifts file not found at {coarse_shifts}. "
+                    f"Run 'preprocess register fix-shifts' first or provide --coarse-shifts."
+                )
+            logger.info(f"Auto-detected coarse shifts: {coarse_shifts}")
+        import json as json_module
+        shifts_data = json_module.loads(coarse_shifts.read_text())
+        tiles_shifts = shifts_data.get("tiles", {})
+
+        # Validate round_name exists in coarse_shifts
+        available_rounds: set[str] = set()
+        for tile_shifts in tiles_shifts.values():
+            available_rounds.update(tile_shifts.keys())
+
+        if round_name not in available_rounds:
+            raise ValueError(f"Round '{round_name}' not in coarse_shifts. Available: {available_rounds}")
+        coarse_round_name = round_name
+
+        # Build shift lookup for the selected round
+        for tile_idx_str, round_shifts in tiles_shifts.items():
+            if coarse_round_name in round_shifts:
+                shift_data = round_shifts[coarse_round_name]
+                shift_lookup[int(tile_idx_str)] = (shift_data["dx"], shift_data["dy"])
+
+        # Output folder and source path for coarse-shifted fusion
+        stitch_dir = ws.deconved / f"stitch--{roi}--shifted-{coarse_round_name}"
+        path_img = ws.deconved / f"{coarse_round_name}--{roi}"
+        logger.info(f"Coarse-shifted fusion: reading from {path_img}, output to {stitch_dir}")
+
+        # For deconvolved images: calculate n_channels from round name (e.g., "1_9_17" -> 3 channels)
+        n_channels_reshape = len(coarse_round_name.split("_"))
+        n_fids_reshape = 2  # Default fiducial count; could be made configurable
+        logger.info(f"Deconvolved image reshape: {n_channels_reshape} channels, {n_fids_reshape} fiducials")
+    else:
+        # Standard registered fusion
+        assert codebook is not None  # validated above
+        stitch_dir = ws.stitch(roi, codebook)
+        path_img = ws.registered(roi, codebook)
+        n_channels_reshape = None
+        n_fids_reshape = 0
+
+    # Set up logging after determining paths
+    log_label = codebook if codebook else coarse_round_name
     setup_cli_logging(
         path,
         component="preprocess.stitch.fuse",
-        file=f"stitch-fuse-{roi}+{codebook}",
-        extra={"roi": roi, "codebook": codebook, "threads": threads},
+        file=f"stitch-fuse-{roi}+{log_label}",
+        extra={"roi": roi, "codebook": codebook, "round": coarse_round_name, "threads": threads},
     )
-    ws = Workspace(path)
+
     sc: StitchingConfig | None = None
     if json_config:
         try:
@@ -1091,7 +1235,6 @@ def fuse(
     if "--" in path.as_posix():
         raise ValueError("Please be in the workspace folder.")
 
-    stitch_dir = ws.stitch(roi, codebook)
     existing_fused = [
         candidate
         for candidate in (stitch_dir / "fused.zarr", stitch_dir / "fused_n4.zarr")
@@ -1100,12 +1243,10 @@ def fuse(
     if existing_fused and not overwrite:
         existing_names = ", ".join(sorted(p.name for p in existing_fused))
         logger.info(
-            f"Skipping ROI '{roi}' with codebook '{codebook}' — existing fused outputs ({existing_names}) present. "
+            f"Skipping ROI '{roi}' — existing fused outputs ({existing_names}) present. "
             "Re-run with --overwrite to regenerate."
         )
         return
-
-    path_img = ws.registered(roi, codebook)
     path = stitch_dir
     files = sorted(path_img.glob("*.tif"))
     if not len(files):
@@ -1119,7 +1260,11 @@ def fuse(
             if p.is_dir():
                 shutil.rmtree(p)
 
-    correct_count = len(list(path_img.glob("reg*.tif")))
+    # File pattern differs: registered uses "reg*.tif", deconvolved rounds use "{round}-*.tif"
+    if coarse_round_name:
+        correct_count = len(list(path_img.glob(f"{coarse_round_name}-*.tif")))
+    else:
+        correct_count = len(list(path_img.glob("reg*.tif")))
 
     if skip_extract:
         try:
@@ -1141,34 +1286,94 @@ def fuse(
         logger.info(f"Getting tile configuration from {tile_config.resolve()}")
 
     tileconfig = TileConfiguration.from_file(tile_config).downsample(downsample)
+
+    # Apply per-tile coarse shifts
+    if shift_lookup:
+        logger.info(f"Applying coarse shifts for round '{coarse_round_name}' to {len(shift_lookup)} tiles")
+
+        # Validate: warn if TileConfiguration has tiles not in shift_lookup
+        tc_indices = set(int(r["index"]) for r in tileconfig.df.iter_rows(named=True))
+        missing = tc_indices - set(shift_lookup.keys())
+        if missing:
+            logger.warning(
+                f"Tiles in TileConfiguration but not in coarse_shifts (using 0,0): {sorted(missing)}"
+            )
+
+        # Apply shifts: dx > 0 means content shifted RIGHT → position moves LEFT
+        # Note: Sign convention should be verified empirically
+        def apply_shift(row: dict) -> dict:
+            tile_idx = int(row["index"])
+            dx, dy = shift_lookup.get(tile_idx, (0.0, 0.0))
+            row["x"] = row["x"] - dx / downsample
+            row["y"] = row["y"] - dy / downsample
+            return row
+
+        adjusted_rows = [apply_shift(row) for row in tileconfig.df.iter_rows(named=True)]
+        tileconfig = TileConfiguration(pl.DataFrame(adjusted_rows, schema=tileconfig.df.schema))
+
+        # Log summary
+        applied = [(dx, dy) for dx, dy in shift_lookup.values()]
+        if applied:
+            dxs, dys = zip(*applied)
+            logger.info(f"  dx: [{min(dxs):.1f}, {max(dxs):.1f}], dy: [{min(dys):.1f}, {max(dys):.1f}]")
+
+        # Save shifted TileConfiguration for slice step
+        shifted_tc_path = path / "TileConfiguration.shifted.txt"
+        tileconfig.write(shifted_tc_path)
+        logger.info(f"Saved shifted TileConfiguration to {shifted_tc_path}")
+
     n = len(tileconfig) // split
 
-    if channels == "all":
-        try:
-            first_image = imread(files[0])
-        except Exception as exc:
-            add_file_context(exc, files[0])
-            raise
-        channels = ",".join(map(str, range(first_image.shape[1])))
-
-    channel_indices = [int(c) for c in channels.split(",") if c]
-
+    # Read metadata first to properly determine channel count
     try:
         with TiffFile(files[0]) as tif_first:
             metadata_first = _read_tiff_metadata(tif_first)
-        key_raw = metadata_first.get("key")
-        if isinstance(key_raw, str):
-            channel_names_all = _normalize_channel_names(1, metadata_first)
-        elif isinstance(key_raw, (list, tuple)):
-            channel_names_all = _normalize_channel_names(len(key_raw), metadata_first)
-        elif isinstance(key_raw, np.ndarray):
-            channel_names_all = _normalize_channel_names(len(key_raw), metadata_first)
+            first_image_shape = tif_first.asarray().shape
+            first_image_ndim = len(first_image_shape)
+    except Exception as exc:
+        add_file_context(exc, files[0])
+        raise
+
+    # Get metadata key for channel names (used later regardless of source)
+    key_raw = metadata_first.get("key")
+
+    # Determine channel count - use n_channels_reshape if set (deconvolved images)
+    if n_channels_reshape is not None:
+        n_channels = n_channels_reshape
+        logger.info(f"Using {n_channels} channels from round name")
+    elif isinstance(key_raw, str):
+        n_channels = 1
+    elif isinstance(key_raw, (list, tuple)):
+        n_channels = len(key_raw)
+    elif isinstance(key_raw, np.ndarray):
+        n_channels = len(key_raw)
+    else:
+        # Infer from shape: 4D ZCYX -> shape[1], 3D CYX/ZYX -> need is_2d context
+        if first_image_ndim >= 4:
+            n_channels = first_image_shape[1]
+        elif first_image_ndim == 3 and is_2d:
+            n_channels = first_image_shape[0]  # CYX format
+        elif first_image_ndim == 3:
+            n_channels = 1  # ZYX format (single channel 3D)
         else:
-            count_guess = (max(channel_indices) + 1) if channel_indices else 0
-            channel_names_all = _normalize_channel_names(count_guess, metadata_first)
-    except Exception:
-        count_guess = (max(channel_indices) + 1) if channel_indices else 0
-        channel_names_all = [f"channel_{i}" for i in range(count_guess)]
+            n_channels = 1  # 2D image
+
+    if channels == "all":
+        channels = ",".join(map(str, range(n_channels)))
+        logger.info(f"Auto-detected {n_channels} channels")
+
+    channel_indices = [int(c) for c in channels.split(",") if c]
+
+    # Build channel names from metadata
+    if isinstance(key_raw, str):
+        channel_names_all = _normalize_channel_names(1, metadata_first)
+    elif isinstance(key_raw, (list, tuple)):
+        channel_names_all = _normalize_channel_names(len(key_raw), metadata_first)
+    elif isinstance(key_raw, np.ndarray):
+        channel_names_all = _normalize_channel_names(len(key_raw), metadata_first)
+    else:
+        count_guess = (max(channel_indices) + 1) if channel_indices else n_channels
+        channel_names_all = _normalize_channel_names(count_guess, metadata_first)
 
     if channel_indices:
         channel_labels_selected = [
@@ -1218,6 +1423,9 @@ def fuse(
                     workspace_root=ws.path,
                     roi_for_ws=roi,
                     field_zarr=field_zarr,
+                    n_channels_reshape=n_channels_reshape,
+                    n_fids=n_fids_reshape,
+                    include_fiducials=n_channels_reshape is not None,  # Always include in round-name mode
                 )
 
     def run_folder(folder: Path, capture_output: bool = False, stream_to_console: bool = False):
@@ -1253,13 +1461,22 @@ def fuse(
     # Get all folders without subfolders
     folders = list(chain.from_iterable(walk_fused(path).values()))
 
+    # Also include fiducial folders if they exist (fid/00/, fid/01/)
+    fid_base = path / "fid"
+    if fid_base.exists():
+        fid_subfolders = sorted([f for f in fid_base.iterdir() if f.is_dir() and f.name.isdigit()])
+        if fid_subfolders:
+            logger.info(f"Found {len(fid_subfolders)} fiducial Z-planes to fuse")
+            folders.extend(fid_subfolders)
+
     logger.info(f"Calling ImageJ on {len(folders)} folders.")
     to_runs = []
     for folder in folders:
         if not folder.is_dir():
             raise Exception("Invalid folder")
+        # Allow digit folders (channels/Z) - parent can be digit (main) or "fid" (fiducials)
         if not folder.name.isdigit():
-            raise ValueError(f"Invalid folder name {folder.name}. No external folders allowed.")
+            raise ValueError(f"Invalid folder name {folder.name}. Expected digit.")
 
         existings = list(folder.glob("fused*"))
         if existings and not overwrite:
@@ -1289,16 +1506,29 @@ def numpy_array_to_zarr(write_path: Path | str, array: np.ndarray, chunks: tuple
 @stitch.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("roi", type=str, default="*")
-@click.option("--codebook", type=str)
+@click.option("--codebook", type=str, default=None)
+@click.option("--round-name", type=str, default=None, help="Round name for shifted fusion folder (e.g., 1_9_17)")
 @click.option("--chunk-size", type=int, default=2048)
 @click.option("--overwrite", is_flag=True)
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
-def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwrite: bool = True):
+def combine(
+    path: Path,
+    roi: str,
+    codebook: str | None = None,
+    round_name: str | None = None,
+    chunk_size: int = 2048,
+    overwrite: bool = True,
+):
+    # Validate: either codebook OR round_name must be provided
+    if codebook is None and round_name is None:
+        raise ValueError("Either --codebook or --round-name must be provided.")
+
+    log_label = codebook if codebook else round_name
     setup_cli_logging(
         path,
         component="preprocess.stitch.combine",
-        file=f"stitch-combine-{roi}+{codebook}",
-        extra={"roi": roi, "codebook": codebook, "chunk_size": chunk_size},
+        file=f"stitch-combine-{roi}+{log_label}",
+        extra={"roi": roi, "codebook": codebook, "round_name": round_name, "chunk_size": chunk_size},
     )
     import zarr
 
@@ -1308,7 +1538,12 @@ def combine(path: Path, roi: str, codebook: str, chunk_size: int = 2048, overwri
     target_rois = ws.resolve_rois(None if roi == "*" else [roi])
 
     for current_roi in target_rois:
-        stitched_dir = ws.stitch(current_roi, codebook)
+        # Determine stitched directory based on codebook or round_name
+        if round_name is not None:
+            stitched_dir = ws.deconved / f"stitch--{current_roi}--shifted-{round_name}"
+        else:
+            assert codebook is not None
+            stitched_dir = ws.stitch(current_roi, codebook)
         # Group folders by Z index (parent directory name)
         try:
             folders_by_z = walk_fused(stitched_dir)
@@ -1659,6 +1894,190 @@ def final_stitch(
         metadata=metadata_out,
     )
     del out
+
+
+def extract_patch(mosaic: np.ndarray, x0: int, y0: int, size: int) -> np.ndarray:
+    """Extract size×size patch from 2D mosaic with zero-padding for boundaries."""
+    h, w = mosaic.shape[-2:]
+    y_start, x_start = max(0, y0), max(0, x0)
+    y_end, x_end = min(h, y0 + size), min(w, x0 + size)
+
+    patch = np.zeros((size, size), dtype=mosaic.dtype)
+    dy, dx = max(0, -y0), max(0, -x0)
+    patch[dy : dy + (y_end - y_start), dx : dx + (x_end - x_start)] = mosaic[y_start:y_end, x_start:x_end]
+    return patch
+
+
+def slice_tile_from_zarr(
+    zarr_array,
+    fid_mosaics: dict[int, np.ndarray],
+    slice_x: int,
+    slice_y: int,
+    tile_size: int,
+) -> np.ndarray:
+    """Extract tile from zarr and reconstruct [ZC]YX + fiducials format.
+
+    Args:
+        zarr_array: Zarr array with shape (Z, Y, X, C)
+        fid_mosaics: Dict mapping fiducial Z index to 2D mosaic array
+        slice_x: X coordinate in mosaic (original_x - mosaic_origin_x)
+        slice_y: Y coordinate in mosaic (original_y - mosaic_origin_y)
+        tile_size: Output tile size in pixels
+
+    Returns:
+        Array of shape (Z*C + n_fids, tile_size, tile_size)
+    """
+    z_dim, mosaic_h, mosaic_w, c_dim = zarr_array.shape
+
+    # Boundary-safe slicing
+    y_start, y_end = max(0, slice_y), min(mosaic_h, slice_y + tile_size)
+    x_start, x_end = max(0, slice_x), min(mosaic_w, slice_x + tile_size)
+
+    # Read from zarr (lazy, efficient)
+    patch_zyxc = zarr_array[:, y_start:y_end, x_start:x_end, :]  # (Z, h, w, C)
+
+    # Zero-pad if at boundary
+    if patch_zyxc.shape[1:3] != (tile_size, tile_size):
+        padded = np.zeros((z_dim, tile_size, tile_size, c_dim), dtype=patch_zyxc.dtype)
+        dy, dx = max(0, -slice_y), max(0, -slice_x)
+        padded[:, dy : dy + patch_zyxc.shape[1], dx : dx + patch_zyxc.shape[2], :] = patch_zyxc
+        patch_zyxc = padded
+
+    # ZYXC → ZCYX → [ZC]YX
+    patch_zcyx = patch_zyxc.transpose(0, 3, 1, 2)  # (Z, C, Y, X)
+    z, c, h, w = patch_zcyx.shape
+    patch_flat = patch_zcyx.reshape(z * c, h, w)
+
+    # Append fiducials: fid/01 = original[-1], fid/00 = original[-2]
+    # So ascending order [0, 1] gives [original[-2], original[-1]] which is correct
+    fid_frames = []
+    for fid_z in sorted(fid_mosaics.keys()):
+        fid_patch = extract_patch(fid_mosaics[fid_z], slice_x, slice_y, tile_size)
+        fid_frames.append(fid_patch)
+
+    if fid_frames:
+        return np.concatenate([patch_flat, np.stack(fid_frames)], axis=0)
+    return patch_flat
+
+
+@stitch.command(name="slice")
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str)
+@click.option("--round-name", type=str, required=True, help="Round name (e.g., 1_9_17)")
+@click.option("--tile-size", type=int, default=2048, help="Tile size in pixels")
+@click.option("--overwrite", is_flag=True)
+def slice_mosaic(
+    path: Path,
+    roi: str,
+    round_name: str,
+    tile_size: int = 2048,
+    overwrite: bool = False,
+):
+    """Slice shifted mosaic back into tiles in [ZC]YX format with fiducials.
+
+    This command extracts tiles from a fused.zarr mosaic that was created with
+    coarse shift correction, producing tiles that can feed back into the standard
+    pipeline at their original positions.
+
+    The coordinate logic:
+    - ImageJ sets mosaic (0,0) at min(shifted_x), min(shifted_y)
+    - We slice at original_position - mosaic_origin to get reference-aligned content
+    """
+    import zarr
+
+    setup_cli_logging(
+        path,
+        component="preprocess.stitch.slice",
+        file=f"stitch-slice-{roi}+{round_name}",
+        extra={"roi": roi, "round_name": round_name, "tile_size": tile_size},
+    )
+
+    ws = Workspace(path)
+    stitch_dir = ws.deconved / f"stitch--{roi}--shifted-{round_name}"
+    out_dir = ws.deconved / f"{round_name}--{roi}--repaired"
+
+    zarr_path = stitch_dir / "fused.zarr"
+    if not zarr_path.exists():
+        raise click.ClickException(f"fused.zarr not found at {zarr_path}. Run 'stitch combine' first.")
+
+    zarr_array = zarr.open(zarr_path, mode="r")
+    logger.info(f"Opened zarr with shape {zarr_array.shape}")
+
+    # Load ORIGINAL TileConfiguration (for output tile positions)
+    original_tc_path = ws.tileconfig_dir(roi) / "TileConfiguration.registered.txt"
+    tileconfig = TileConfiguration.from_file(original_tc_path)
+    logger.info(f"Loaded original TileConfiguration from {original_tc_path}")
+
+    # Load SHIFTED TileConfiguration (to compute mosaic origin)
+    shifted_tc_path = stitch_dir / "TileConfiguration.shifted.txt"
+    if not shifted_tc_path.exists():
+        raise click.ClickException(
+            f"Shifted TileConfiguration not found at {shifted_tc_path}. "
+            "Run 'stitch fuse --round-name' first (requires recent version that saves shifted config)."
+        )
+    shifted_tc = TileConfiguration.from_file(shifted_tc_path)
+    logger.info(f"Loaded shifted TileConfiguration from {shifted_tc_path}")
+
+    # Mosaic origin = min(shifted positions) - this is what ImageJ used as (0,0)
+    origin_x = shifted_tc.df["x"].min()
+    origin_y = shifted_tc.df["y"].min()
+    logger.info(f"Mosaic origin (min of shifted positions): ({origin_x:.1f}, {origin_y:.1f})")
+
+    # Load fiducial mosaics
+    fid_mosaics: dict[int, np.ndarray] = {}
+    fid_dir = stitch_dir / "fid"
+    if fid_dir.exists():
+        for fid_z_folder in sorted(fid_dir.iterdir()):
+            if fid_z_folder.is_dir() and fid_z_folder.name.isdigit():
+                fused_path = fid_z_folder / "fused_00-1.tif"
+                if fused_path.exists():
+                    fid_mosaics[int(fid_z_folder.name)] = imread(fused_path)
+                    logger.info(f"Loaded fiducial Z={fid_z_folder.name}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output directory: {out_dir}")
+
+    # Load metadata from original deconvolved files
+    source_dir = ws.deconved / f"{round_name}--{roi}"
+    if not source_dir.exists():
+        logger.warning(f"Source directory {source_dir} not found - output files will have no metadata")
+
+    skipped = 0
+    # Build lookup from shifted TC (tile positions as used in mosaic)
+    shifted_positions = {int(r["index"]): (r["x"], r["y"]) for r in shifted_tc.df.iter_rows(named=True)}
+
+    rows = list(tileconfig.df.iter_rows(named=True))
+    with progress_bar(len(rows)) as update:
+        for row in rows:
+            tile_idx = int(row["index"])
+            # Slice at SHIFTED position relative to SHIFTED origin
+            # The mosaic was built with shifted positions, so we slice from those coordinates
+            shifted_x, shifted_y = shifted_positions[tile_idx]
+            slice_x = int(round(shifted_x - origin_x))
+            slice_y = int(round(shifted_y - origin_y))
+
+            out_path = out_dir / f"{round_name}-{tile_idx:04d}.tif"
+            if out_path.exists() and not overwrite:
+                skipped += 1
+                update()
+                continue
+
+            # Read metadata from original file
+            metadata = None
+            source_file = source_dir / f"{round_name}-{tile_idx:04d}.tif"
+            if source_file.exists():
+                with TiffFile(source_file) as tif:
+                    shaped = getattr(tif, "shaped_metadata", None)
+                    if shaped:
+                        metadata = dict(shaped[0])
+
+            tile_data = slice_tile_from_zarr(zarr_array, fid_mosaics, slice_x, slice_y, tile_size)
+            safe_imwrite(out_path, tile_data, metadata=metadata, **IMWRITE_KWARGS)
+            update()
+
+    if skipped:
+        logger.info(f"Skipped {skipped} existing tiles (use --overwrite to regenerate)")
+    logger.info(f"Sliced {len(tileconfig)} tiles to {out_dir}")
 
 
 if __name__ == "__main__":

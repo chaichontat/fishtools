@@ -1,5 +1,6 @@
 import re
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -247,8 +248,10 @@ def itk_shift(
     params = final_transform.GetParameters()
 
     # Debug: log optimizer diagnostics and final shift
-    logger.debug(f"ITK optimizer stop: {registration.GetOptimizerStopConditionDescription()}")
-    logger.debug(f"ITK iterations: {registration.GetOptimizerIteration()}")
+    stop_reason = registration.GetOptimizerStopConditionDescription()
+    n_iters = int(registration.GetOptimizerIteration())
+    logger.debug(f"ITK optimizer stop: {stop_reason}")
+    logger.debug(f"ITK iterations: {n_iters}")
     logger.debug(f"ITK metric: {registration.GetMetricValue()}")
     logger.debug(f"ITK final translation (tx, ty) = ({params[0]:.4f}, {params[1]:.4f})")
 
@@ -262,7 +265,7 @@ def itk_shift(
         shift = np.clip(shift, -max_shift, max_shift)
 
     logger.debug(f"ITK final shift [dy, dx] = ({shift[0]:.4f}, {shift[1]:.4f})")
-    return shift
+    return shift, n_iters
 
 
 def shifts_from_anchor_roi(
@@ -535,6 +538,18 @@ class ResidualTooLarge(Exception): ...
 class DriftTooLarge(Exception): ...
 
 
+@dataclass(slots=True)
+class FiducialAlignmentStats:
+    """Per-image fiducial alignment diagnostics."""
+
+    iterations: int
+    final_threshold: float | None
+    final_fwhm: float | None
+    n_spots: int
+    mode: str | None = None
+    algorithm: str | None = None
+
+
 def handle_exception(
     local_σ: float,
     local_fwhm: float,
@@ -664,6 +679,16 @@ def individual_align_fiducial(
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
 
+    stats: dict[str, FiducialAlignmentStats] = {}
+    stats[name] = FiducialAlignmentStats(
+        iterations=0,
+        final_threshold=float(thr),
+        final_fwhm=float(fwhm),
+        n_spots=int(len(fixed)),
+        mode="spots",
+        algorithm=None,
+    )
+
     def inner(img: np.ndarray, *, limit: int = 4, bitname: str = "", local_σ: float = thr):
         # img = np.clip(img, np.percentile(ref, 50), None)
         if subtract_background:
@@ -676,6 +701,7 @@ def individual_align_fiducial(
         drift = np.array([0, 0])
         local_fwhm = fwhm
         tried: set[tuple[float, float]] = set()
+        iterations = 0
 
         # Iteratively reduce threshold_sigma until we get enough fiducials.
         while _attempt < detailed_config.max_drift_attempts:
@@ -710,6 +736,7 @@ def individual_align_fiducial(
                         bin_size=detailed_config.bin_size,
                     )
                     residual = np.hypot(*(drift - initial_drift))
+                    iterations = n + 1
                     if n == 0:
                         logger.debug(f"{bitname} - attempt {n}: starting drift: {drift}.")
                     else:
@@ -754,8 +781,19 @@ def individual_align_fiducial(
             logger.critical(f"Fiducial matching failed after {_attempt} attempts.")
             raise NotEnoughSpots
 
+        key = bitname or name
+        stats[key] = FiducialAlignmentStats(
+            iterations=iterations,
+            final_threshold=float(local_σ),
+            final_fwhm=float(local_fwhm),
+            n_spots=int(len(moving)),
+            mode="spots",
+            algorithm=None,
+        )
+
         return drift, residual
 
+    inner.stats = stats
     return inner
 
 
@@ -785,7 +823,7 @@ def align_phase(
     return {k: v.result().astype(float) for k, v in futs.items()} | {ref: np.zeros(2)}
 
 
-def align_fiducials(
+def _align_fiducials_internal(
     fids: dict[str, np.ndarray[Any, Any]],
     *,
     reference: str,
@@ -801,31 +839,15 @@ def align_fiducials(
     threshold_residual: float = 0.2,
     fwhm: float = 4,
     detailed_config: FiducialDetailedConfig | None = None,
-) -> tuple[dict[str, np.ndarray[float, Any]], dict[str, np.ndarray[float, Any]]]:
-    """Calculate drift vectors for all images relative to reference using fiducial alignment.
+) -> tuple[
+    dict[str, np.ndarray[float, Any]],
+    dict[str, np.ndarray[float, Any]],
+    dict[str, FiducialAlignmentStats | None],
+]:
+    """Shared implementation for align_fiducials with optional diagnostics."""
+    if detailed_config is None:
+        detailed_config = FiducialDetailedConfig()
 
-    Main entry point for fiducial-based image registration. Computes drift corrections
-    for each image by detecting and matching fiducial spots against a reference image.
-
-    Args:
-        fids: Dictionary mapping image names to fiducial channel arrays
-        reference: Regex pattern to identify reference image name
-        use_fft: Use FFT phase correlation instead of spot-based matching
-        use_itk: Use SimpleITK gradient descent for alignment
-        use_brightest: If >0, use only the N brightest target spots when estimating drift
-        threads: Number of parallel processing threads
-        overrides: Manual drift overrides for specific images
-        subtract_background: Apply background subtraction before detection
-        debug: Enable debug mode with detailed logging
-        max_iters: Maximum iterations for iterative drift refinement
-        threshold_sigma: Spot detection threshold in standard deviations
-        threshold_residual: Convergence threshold for drift residual
-        fwhm: Expected fiducial spot FWHM in pixels
-        detailed_config: Detailed processing configuration parameters
-
-    Returns:
-        Tuple of (drift_dict, residual_dict) with computed shifts and residuals
-    """
     keys = list(fids.keys())
     for name in keys:
         if re.search(reference, name):
@@ -848,14 +870,32 @@ def align_fiducials(
         detailed_config=detailed_config,
     )
 
+    # ITK max_shift: use larger limit when allow_large_drifts is enabled
+    itk_max_shift = 500.0 if detailed_config.allow_large_drifts else detailed_config.max_drift_threshold
+
+    mode_map: dict[str, str] = {}
+    itk_iterations: dict[str, int] = {}
+
+    def _itk_wrapper(img: np.ndarray, bitname: str) -> tuple[np.ndarray, float]:
+        """Pure ITK-based registration wrapper for thread pool."""
+        shift_vec, n_iters = itk_shift(fids[ref], img, max_shift=itk_max_shift)
+        itk_iterations[bitname] = n_iters
+        # itk_shift returns [dy, dx], swap to [dx, dy] for consistency.
+        return shift_vec[::-1], 0.0
+
     def spot_with_itk_fallback(img: np.ndarray, bitname: str, limit: int) -> tuple[np.ndarray, float]:
         """Try spot-based registration, fall back to SimpleITK if it fails."""
         try:
             return corr(img, bitname=bitname, limit=limit)
         except (NotEnoughSpots, TooManySpots, ResidualTooLarge, DriftTooLarge) as e:
-            logger.warning(f"{bitname}: Spot-based registration failed ({e.__class__.__name__}), falling back to SimpleITK")
-            # itk_shift returns [dy, dx], swap to [dx, dy] for consistency
-            return (itk_shift(fids[ref], img)[::-1], -1.0)  # residual=-1 indicates ITK fallback
+            logger.warning(
+                f"{bitname}: Spot-based registration failed ({e.__class__.__name__}), falling back to SimpleITK"
+            )
+            shift_vec, n_iters = itk_shift(fids[ref], img, max_shift=itk_max_shift)
+            itk_iterations[bitname] = n_iters
+            mode_map[bitname] = "itk"
+            # residual=-1 indicates ITK fallback
+            return shift_vec[::-1], -1.0
 
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
         futs: dict[str, Future] = {}
@@ -863,14 +903,16 @@ def align_fiducials(
             if k == ref or (overrides is not None and k in overrides):
                 continue
             if use_fft:
+                mode_map[k] = "fft"
                 # phase_shift returns [dy, dx] (row, col) from phase_cross_correlation.
                 # Swap to [dx, dy] to match spot-based convention used elsewhere.
                 futs[k] = exc.submit(lambda x: (phase_shift(fids[ref], x)[::-1], 0.0), img)
             elif use_itk:
-                # itk_shift returns [dy, dx], swap to [dx, dy] for consistency.
-                futs[k] = exc.submit(lambda x: (itk_shift(fids[ref], x)[::-1], 0.0), img)
+                mode_map[k] = "itk"
+                futs[k] = exc.submit(_itk_wrapper, img, k)
             else:
                 # Spot-based with ITK fallback
+                mode_map[k] = "spots"
                 futs[k] = exc.submit(spot_with_itk_fallback, img, bitname=k, limit=max_iters)
 
             if debug:
@@ -879,17 +921,129 @@ def align_fiducials(
         for fut in as_completed(futs.values()):
             fut.result()
 
-    # Shifts and residuals
-    return (
-        (
-            {k: v.result()[0] for k, v in futs.items()}
-            | {ref: np.zeros(2)}
-            | ({k: np.array(v) for k, v in overrides.items()} if overrides else {})
-        ),
-        ({k: v.result()[1] for k, v in futs.items()} | {ref: 0.0}),
+    drift_dict: dict[str, np.ndarray[float, Any]] = (
+        {k: v.result()[0] for k, v in futs.items()}
+        | {ref: np.zeros(2)}
+        | ({k: np.array(v) for k, v in overrides.items()} if overrides else {})
     )
+    residual_dict: dict[str, np.ndarray[float, Any]] = {k: v.result()[1] for k, v in futs.items()} | {ref: 0.0}
 
-    # logger.debug(f"Corr: {[x['corr'] for x in to_dump.values()]}")
+    raw_stats = getattr(corr, "stats", {}) if isinstance(getattr(corr, "stats", None), dict) else {}
+    stats_dict: dict[str, FiducialAlignmentStats | None] = {}
+    for name in fids.keys():
+        base_stat = raw_stats.get(name) if isinstance(raw_stats, dict) else None
+        stat: FiducialAlignmentStats | None
+        if isinstance(base_stat, FiducialAlignmentStats):
+            stat = base_stat
+        else:
+            stat = None
+
+        mode = mode_map.get(name)
+        if mode == "fft":
+            stat = FiducialAlignmentStats(
+                iterations=0,
+                final_threshold=None,
+                final_fwhm=None,
+                n_spots=0,
+                mode="fft",
+                algorithm=None,
+            )
+        elif mode == "itk":
+            stat = FiducialAlignmentStats(
+                iterations=itk_iterations.get(name, 0),
+                final_threshold=None,
+                final_fwhm=None,
+                n_spots=0,
+                mode="itk",
+                algorithm="OnePlusOneEvo",
+            )
+        elif stat is not None:
+            # Spot-based stats from the fiducial matcher
+            stat.mode = "spots"
+
+        stats_dict[name] = stat
+
+    return drift_dict, residual_dict, stats_dict
+
+
+def align_fiducials(
+    fids: dict[str, np.ndarray[Any, Any]],
+    *,
+    reference: str,
+    use_fft: bool = False,
+    use_itk: bool = False,
+    use_brightest: int = 0,
+    threads: int = 4,
+    overrides: dict[str, tuple[float, float]] | None = None,
+    subtract_background: bool = False,
+    debug: bool = False,
+    max_iters: int = 4,
+    threshold_sigma: float = 3,
+    threshold_residual: float = 0.2,
+    fwhm: float = 4,
+    detailed_config: FiducialDetailedConfig | None = None,
+) -> tuple[dict[str, np.ndarray[float, Any]], dict[str, np.ndarray[float, Any]]]:
+    """Calculate drift vectors for all images relative to reference using fiducial alignment.
+
+    This public entry point preserves the original (shifts, residuals) return contract.
+    """
+    shifts, residuals, _ = _align_fiducials_internal(
+        fids,
+        reference=reference,
+        use_fft=use_fft,
+        use_itk=use_itk,
+        use_brightest=use_brightest,
+        threads=threads,
+        overrides=overrides,
+        subtract_background=subtract_background,
+        debug=debug,
+        max_iters=max_iters,
+        threshold_sigma=threshold_sigma,
+        threshold_residual=threshold_residual,
+        fwhm=fwhm,
+        detailed_config=detailed_config,
+    )
+    return shifts, residuals
+
+
+def align_fiducials_with_stats(
+    fids: dict[str, np.ndarray[Any, Any]],
+    *,
+    reference: str,
+    use_fft: bool = False,
+    use_itk: bool = False,
+    use_brightest: int = 0,
+    threads: int = 4,
+    overrides: dict[str, tuple[float, float]] | None = None,
+    subtract_background: bool = False,
+    debug: bool = False,
+    max_iters: int = 4,
+    threshold_sigma: float = 3,
+    threshold_residual: float = 0.2,
+    fwhm: float = 4,
+    detailed_config: FiducialDetailedConfig | None = None,
+) -> tuple[
+    dict[str, np.ndarray[float, Any]],
+    dict[str, np.ndarray[float, Any]],
+    dict[str, FiducialAlignmentStats | None],
+]:
+    """Calculate drift vectors and expose per-image alignment diagnostics."""
+    return _align_fiducials_internal(
+        fids,
+        reference=reference,
+        use_fft=use_fft,
+        use_itk=use_itk,
+        use_brightest=use_brightest,
+        threads=threads,
+        overrides=overrides,
+        subtract_background=subtract_background,
+        debug=debug,
+        max_iters=max_iters,
+        threshold_sigma=threshold_sigma,
+        threshold_residual=threshold_residual,
+        fwhm=fwhm,
+        detailed_config=detailed_config,
+    )
 
 
 def plot_alignment(fids: dict[str, np.ndarray[float, Any]], sl: slice = np.s_[500:600]):
@@ -912,6 +1066,12 @@ class Shift(BaseModel):
     shifts: list[float] | tuple[float, float]
     corr: float
     residual: float
+    iterations: int | None = None
+    final_threshold: float | None = None
+    final_fwhm: float | None = None
+    n_spots: int | None = None
+    mode: str | None = None
+    algorithm: str | None = None
 
 
 Shifts = TypeAdapter(dict[str, Shift])
