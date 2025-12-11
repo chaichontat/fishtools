@@ -21,6 +21,7 @@ from fishtools.preprocess.cli_stitch import (
     extract,
     extract_channel,
     final_stitch,
+    load_fiducial_mosaics,
     run_imagej,
     stitch,
     walk_fused,
@@ -960,6 +961,22 @@ class TestFinalStitchMetadata:
 
         meta = read_metadata(fused_file)
         assert meta.get("key") == ["bitX"]
+
+
+class TestLoadFiducialMosaics:
+    def test_loads_all_planes_with_dynamic_names(self, tmp_path: Path) -> None:
+        fid_dir = tmp_path / "fid"
+        for fid_idx, value in enumerate((111, 222), start=0):
+            folder = fid_dir / f"{fid_idx:02d}"
+            folder.mkdir(parents=True, exist_ok=True)
+            data = np.full((4, 4), value, dtype=np.uint16)
+            imwrite(folder / f"fused_{folder.name}-1.tif", data)
+
+        fid_mosaics = load_fiducial_mosaics(fid_dir)
+
+        assert list(fid_mosaics.keys()) == [0, 1]
+        assert fid_mosaics[0].shape == (4, 4)
+        assert fid_mosaics[1][0, 0] == 222
 
 
 class TestSliceMosaic:

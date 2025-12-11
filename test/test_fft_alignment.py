@@ -57,6 +57,32 @@ class TestPhaseShiftCoordinates:
             f"Y-shift should be near zero: expected ~0, got {detected_dy}"
         )
 
+    def test_phase_shift_normalizes_inputs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """phase_shift should zero-center and scale inputs before FFT."""
+        from fishtools.preprocess import fiducial as fiducial_module
+
+        captured: dict[str, float] = {}
+
+        def fake_phase_cross_correlation(ref: np.ndarray, img: np.ndarray, upsample_factor: int):
+            captured["ref_mean"] = float(ref.mean())
+            captured["ref_std"] = float(ref.std())
+            captured["img_mean"] = float(img.mean())
+            captured["img_std"] = float(img.std())
+            return np.array([0.0, 0.0]), None, None
+
+        monkeypatch.setattr(fiducial_module, "phase_cross_correlation", fake_phase_cross_correlation)
+
+        base = np.arange(64, dtype=np.float32).reshape(8, 8)
+        moving = base * 4.0 + 500.0
+
+        fiducial_module.phase_shift(base, moving)
+
+        assert captured, "phase_cross_correlation should have been invoked"
+        assert captured["ref_mean"] == pytest.approx(0.0, abs=1e-6)
+        assert captured["img_mean"] == pytest.approx(0.0, abs=1e-6)
+        assert captured["ref_std"] == pytest.approx(1.0, rel=1e-3)
+        assert captured["img_std"] == pytest.approx(1.0, rel=1e-3)
+
     def test_phase_shift_vs_spot_based_coordinate_order(self) -> None:
         """Compare coordinate ordering between FFT and spot-based alignment.
 

@@ -58,10 +58,10 @@ class FiducialDetailedConfig(BaseModel):
     # Drift calculation parameters
     max_drift_attempts: int = Field(default=30, description="Maximum attempts for drift calculation")
     max_drift_threshold: float = Field(default=40.0, description="Maximum allowed drift in pixels")
-    warning_spots_threshold: int = Field(default=1000, description="Warn if more than this many spots found")
+    warning_spots_threshold: int = Field(default=400, description="Warn if more than this many spots found")
     min_spots_for_mode: int = Field(default=100, description="Minimum spots required to use mode calculation")
     use_brightest: int = Field(
-        default=0,
+        default=20,
         ge=0,
         description=(
             "If >0, use only the N brightest fiducial spots when estimating drift. "

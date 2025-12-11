@@ -1,4 +1,5 @@
 # %%
+import csv
 import json
 import pickle
 import shutil
@@ -25,8 +26,8 @@ from fishtools.preprocess.config import Config, Fiducial, FiducialDetailedConfig
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import (
+    FiducialAlignmentStats,
     Shifts,
-    align_fiducials,
     align_fiducials_with_stats,
     shifts_from_anchor_roi,
 )
@@ -215,8 +216,139 @@ def apply_deconv_scaling(
     )
 
 
+def _apply_priors_to_fids(
+    fids: dict[str, np.ndarray],
+    fid_raw_images: dict[str, np.ndarray] | None,
+    *,
+    priors: dict[str, tuple[float, float]] | None,
+    anchor_roi: Path | None,
+    idx: int,
+) -> dict[str, str]:
+    """Shift fiducials in-place using priors. Returns prior key → fid name mapping."""
+    if priors is None or anchor_roi is not None:
+        return {}
+
+    prior_mapping: dict[str, str] = {}
+    for name, sh in priors.items():
+        for file in fids:
+            if file.startswith(name):
+                fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
+                if fid_raw_images is not None and file in fid_raw_images:
+                    fid_raw_images[file] = shift(fid_raw_images[file], [sh[1], sh[0]], order=1)
+                prior_mapping[name] = file
+                break
+        else:
+            raise ValueError(
+                f"{idx}: Searched {list(fids.keys())}. Could not find file that starts with {name} for prior shift."
+            )
+
+    return prior_mapping
+
+
+def _add_priors_to_shifts(
+    shifts: dict[str, np.ndarray],
+    *,
+    priors: dict[str, tuple[float, float]] | None,
+    prior_mapping: dict[str, str],
+    anchor_roi: Path | None,
+):
+    """Add prior offsets back onto solved shift vectors."""
+    if priors is None or anchor_roi is not None:
+        return
+
+    for name, sh in priors.items():
+        mapped = prior_mapping.get(name)
+        if mapped is None:
+            continue
+        shifts[mapped][0] += sh[0]
+        shifts[mapped][1] += sh[1]
+
+
+def _parse_priors_file(path: Path | None) -> dict[str, tuple[float, float]] | None:
+    """Load explicit priors from a JSON or CSV file."""
+
+    if path is None:
+        return None
+
+    raw = path.read_text().strip()
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        pairs: dict[str, tuple[float, float]] = {}
+        reader = csv.reader(raw.splitlines())
+        for row in reader:
+            if not row:
+                continue
+            # Allow optional header row
+            if len(row) == 3 and row[0].strip().lower() == "round":
+                continue
+            if len(row) != 3:
+                raise ValueError("CSV priors must have exactly three columns: round,dx,dy.")
+            name, dx_str, dy_str = row
+            pairs[name.strip()] = (float(dx_str), float(dy_str))
+        return pairs or None
+
+    if not isinstance(data, dict):
+        raise ValueError("--priors JSON must map round → [dx, dy].")
+
+    parsed: dict[str, tuple[float, float]] = {}
+    for key, value in data.items():
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError("Each prior entry must be a two-element array of [dx, dy].")
+        parsed[str(key)] = (float(value[0]), float(value[1]))
+    return parsed or None
+
+
+def _build_register_config(
+    *,
+    reference: str,
+    threshold: float,
+    fwhm: float,
+    use_fft: bool,
+    use_itk: bool,
+    use_brightest: int,
+    allow_large_drifts: bool,
+    n_fids: int,
+    anchor_roi: Path | None = None,
+    priors: dict[str, tuple[float, float]] | None = None,
+) -> RegisterConfig:
+    """Create a RegisterConfig with consistent defaults for fiducial alignment."""
+
+    resolved_priors = priors if priors is not None else {}
+    return RegisterConfig(
+        chromatic_shifts={
+            "650": str(DATA / "560to650.txt"),
+            "750": str(DATA / "560to750.txt"),
+        },
+        fiducial=Fiducial(
+            use_fft=use_fft,
+            use_itk=use_itk,
+            fwhm=fwhm,
+            threshold=threshold,
+            priors=resolved_priors,
+            overrides={},
+            anchor_roi=anchor_roi,
+            n_fids=n_fids,
+            detailed=FiducialDetailedConfig(
+                use_brightest=max(use_brightest, 0),
+                allow_large_drifts=allow_large_drifts,
+            ),
+        ),
+        reference=reference,
+        downsample=1,
+        crop=40,
+        slices=slice(None),
+        reduce_bit_depth=0,
+        discards=None,
+    )
+
+
 def _save_debug_overlay(
     debug_dir: Path,
+    roi: str,
     idx: int,
     reference_name: str,
     shifted: dict[str, np.ndarray],
@@ -241,7 +373,7 @@ def _save_debug_overlay(
         # RGB: R=current round, G=reference round, B=0
         rgb = np.stack([img_norm, ref_norm, np.zeros_like(ref_norm)], axis=-1)
 
-        PILImage.fromarray(rgb).save(debug_dir / f"{idx:04d}-{name}.png")
+        PILImage.fromarray(rgb).save(debug_dir / f"{roi}-{idx:04d}-{name}.png")
 
 
 def _debug_fid_paths(path: Path, roi: str, idx: int) -> tuple[Path, str, str]:
@@ -250,6 +382,22 @@ def _debug_fid_paths(path: Path, roi: str, idx: int) -> tuple[Path, str, str]:
     fids_name = f"{roi}-{idx:04d}.tif"
     shifted_name = f"{roi}-shifted-{idx:04d}.tif"
     return debug_dir, fids_name, shifted_name
+
+
+def _spot_registration_failures(
+    stats: dict[str, FiducialAlignmentStats | None],
+    *,
+    fiducial_cfg: Fiducial,
+) -> list[str]:
+    """Return rounds that fell back to ITK after spot registration failed."""
+
+    if fiducial_cfg.use_itk or fiducial_cfg.use_fft:
+        return []
+
+    failures = [
+        name for name, stat in stats.items() if stat is not None and stat.mode == "itk"
+    ]
+    return failures
 
 
 @dataclass
@@ -414,6 +562,7 @@ def run_fiducial(
         and config.registration.fiducial.anchor_roi is None  # Skip priors when using anchor ROI
         and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
         and not no_priors
+        and config.registration.fiducial.priors is None
     ):
         _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
         for shift_path in shifts_existing:
@@ -431,21 +580,13 @@ def run_fiducial(
         }
         logger.debug(config.registration.fiducial.priors)
 
-    # Skip prior application when using anchor ROIs (anchor points are absolute)
-    if config.registration.fiducial.priors is not None and config.registration.fiducial.anchor_roi is None:
-        for name, sh in config.registration.fiducial.priors.items():
-            for file in fids:
-                if file.startswith(name):
-                    fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
-                    # Also apply priors to raw fids for debug output
-                    if fids_raw is not None and file in fids_raw:
-                        fids_raw[file] = shift(fids_raw[file], [sh[1], sh[0]], order=1)
-                    prior_mapping[name] = file
-                    break
-            else:
-                raise ValueError(
-                    f"{idx}: Searched {list(fids.keys())}. Could not find file that starts with {name} for prior shift."
-                )
+    prior_mapping |= _apply_priors_to_fids(
+        fids,
+        fids_raw,
+        priors=config.registration.fiducial.priors,
+        anchor_roi=config.registration.fiducial.anchor_roi,
+        idx=idx,
+    )
 
     if config.registration.fiducial.overrides is not None:
         for name, sh in config.registration.fiducial.overrides.items():
@@ -498,7 +639,8 @@ def run_fiducial(
         )
         shifts = {k: anchor_shifts.get(k, np.array([0.0, 0.0])) for k in fids}
         residuals = {k: 0.0 for k in fids}
-        stats: dict[str, Any] = {k: None for k in fids}
+        stats: dict[str, FiducialAlignmentStats | None] = {k: None for k in fids}
+        failed_spot_rounds: list[str] = []
     else:
         shifts, residuals, stats = align_fiducials_with_stats(
             fids,
@@ -515,10 +657,16 @@ def run_fiducial(
 
         assert shifts  # type: ignore
         assert residuals  # type: ignore
+        failed_spot_rounds = _spot_registration_failures(
+            stats,
+            fiducial_cfg=config.registration.fiducial,
+        )
 
     shifted = {k: shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()}
 
-    if debug:
+    should_write_debug = debug or bool(failed_spot_rounds)
+
+    if should_write_debug:
         debug_dir, fids_name, shifted_name = _debug_fid_paths(path, roi, idx)
         debug_dir.mkdir(exist_ok=True, parents=True)
         # Ensure deterministic channel ordering for debug TIFFs so that the
@@ -539,17 +687,20 @@ def run_fiducial(
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX", "key": ordered_keys},
         )
-        _save_debug_overlay(debug_dir, idx, reference, shifted)
+        _save_debug_overlay(debug_dir, roi, idx, reference, shifted)
+        if failed_spot_rounds and not debug:
+            failed = ", ".join(sorted(failed_spot_rounds))
+            logger.warning(
+                f"Spot-based registration failed for {failed}; debug fiducials saved to {debug_dir}."
+            )
 
     # Add priors to final shifts (skip when using anchor ROIs - anchor points are absolute)
-    if config.registration.fiducial.priors is not None and config.registration.fiducial.anchor_roi is None:
-        for name, sh in config.registration.fiducial.priors.items():
-            if (
-                not config.registration.fiducial.overrides
-                or name not in config.registration.fiducial.overrides
-            ):
-                shifts[prior_mapping[name]][0] += sh[0]
-                shifts[prior_mapping[name]][1] += sh[1]
+    _add_priors_to_shifts(
+        shifts,
+        priors=config.registration.fiducial.priors,
+        prior_mapping=prior_mapping,
+        anchor_roi=config.registration.fiducial.anchor_roi,
+    )
 
     (shift_path := path / f"shifts--{roi}+{codebook_name}").mkdir(exist_ok=True)
 
@@ -883,7 +1034,7 @@ def register(): ...
 @click.option(
     "--use-brightest",
     type=int,
-    default=0,
+    default=20,
     show_default=True,
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
@@ -891,6 +1042,11 @@ def register(): ...
     "--allow-large-drifts",
     is_flag=True,
     help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
+)
+@click.option(
+    "--ignore-large-shifts",
+    is_flag=True,
+    help="Alias for --allow-large-drifts; accept drifts beyond the threshold without failure.",
 )
 @click.option(
     "--repaired",
@@ -912,8 +1068,9 @@ def run(
     use_fft: bool = False,
     use_itk: bool = False,
     anchors: Path | None = None,
-    use_brightest: int = 0,
+    use_brightest: int = 20,
     allow_large_drifts: bool = False,
+    ignore_large_shifts: bool = False,
     repaired: str | None = None,
 ):
     """Preprocess image sets before spot calling.
@@ -960,31 +1117,16 @@ def run(
             config=Config(
                 dataPath=str(DATA),
                 exclude=None,
-                registration=RegisterConfig(
-                    chromatic_shifts={
-                        "650": str(DATA / "560to650.txt"),
-                        "750": str(DATA / "560to750.txt"),
-                    },
-                    fiducial=Fiducial(
-                        use_fft=use_fft,
-                        use_itk=use_itk,
-                        fwhm=fwhm,
-                        threshold=threshold,
-                        priors={},
-                        overrides={},
-                        anchor_roi=anchors,
-                        n_fids=2,
-                        detailed=FiducialDetailedConfig(
-                            use_brightest=max(use_brightest, 0),
-                            allow_large_drifts=allow_large_drifts,
-                        ),
-                    ),
+                registration=_build_register_config(
                     reference=reference,
-                    downsample=1,
-                    crop=40,
-                    slices=slice(None),
-                    reduce_bit_depth=0,
-                    discards=None,
+                    threshold=threshold,
+                    fwhm=fwhm,
+                    use_fft=use_fft,
+                    use_itk=use_itk,
+                    use_brightest=use_brightest,
+                    allow_large_drifts=allow_large_drifts or ignore_large_shifts,
+                    n_fids=2,
+                    anchor_roi=anchors,
                 ),
             ),
             overwrite=overwrite,
@@ -1020,7 +1162,7 @@ def run(
 @click.option(
     "--use-brightest",
     type=int,
-    default=0,
+    default=20,
     show_default=True,
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
@@ -1048,7 +1190,7 @@ def batch(
     verify: bool,
     use_fft: bool = False,
     use_itk: bool = False,
-    use_brightest: int = 0,
+    use_brightest: int = 20,
     allow_large_drifts: bool = False,
     repaired: str | None = None,
 ):
@@ -1220,7 +1362,25 @@ register.add_command(batch)
 @click.option("--n-fids", type=int, default=2, help="Number of fiducial frames per image")
 @click.option("--threshold", type=float, default=5.0, help="Spot detection threshold (sigma)")
 @click.option("--fwhm", type=float, default=4.0, help="Fiducial spot FWHM")
-@click.option("--prior", type=str, default=None, help="Prior shift as 'dx,dy' (e.g., '150,-30'). Applied to all rounds.")
+@click.option(
+    "--use-brightest",
+    type=int,
+    default=20,
+    show_default=True,
+    help="If >0, use only the N brightest fiducials (matches register run).",
+)
+@click.option(
+    "--allow-large-drifts/--strict-drifts",
+    default=True,
+    show_default=True,
+    help="Enable the same allow_large_drifts toggle used in register run.",
+)
+@click.option(
+    "--priors",
+    type=str,
+    default=None,
+    help="Prior shift as 'dx,dy' for the target round, or path to JSON/CSV mapping round→dx,dy.",
+)
 @click.option("--debug", is_flag=True)
 def fix_shifts(
     path: Path,
@@ -1231,7 +1391,9 @@ def fix_shifts(
     n_fids: int,
     threshold: float,
     fwhm: float,
-    prior: str | None,
+    use_brightest: int,
+    allow_large_drifts: bool,
+    priors: str | None,
     debug: bool,
 ):
     """Detect large drift offsets and write shifts to JSON.
@@ -1265,15 +1427,41 @@ def fix_shifts(
 
     rounds_to_fix = [r.strip() for r in rounds.split(",")]
 
-    # Parse prior if provided
-    prior_shift: tuple[float, float] | None = None
-    if prior:
-        try:
-            parts = prior.split(",")
-            prior_shift = (float(parts[0]), float(parts[1]))
-            logger.info(f"Using prior shift: dx={prior_shift[0]}, dy={prior_shift[1]}")
-        except (ValueError, IndexError) as e:
-            raise ValueError(f"Invalid prior format '{prior}'. Expected 'dx,dy' (e.g., '150,-30')") from e
+    cli_priors: dict[str, tuple[float, float]] | None = None
+    if priors is not None:
+        priors_value = priors.strip()
+        # First, try simple "dx,dy" format; this requires exactly one target round.
+        parts = [p.strip() for p in priors_value.split(",")]
+        if len(parts) == 2:
+            if len(rounds_to_fix) != 1:
+                raise click.ClickException(
+                    "--priors as 'dx,dy' requires exactly one --rounds entry."
+                )
+            dx, dy = float(parts[0]), float(parts[1])
+            cli_priors = {rounds_to_fix[0]: (dx, dy)}
+        else:
+            # Fallback: treat as path to JSON/CSV mapping round→[dx,dy]
+            cli_priors = _parse_priors_file(Path(priors_value))
+
+    if cli_priors:
+        logger.info(f"Using explicit priors for rounds: {sorted(cli_priors)}")
+
+    config = Config(
+        dataPath=str(DATA),
+        exclude=None,
+        registration=_build_register_config(
+            reference=reference,
+            threshold=threshold,
+            fwhm=fwhm,
+            use_fft=use_fft,
+            use_itk=False,
+            use_brightest=use_brightest,
+            allow_large_drifts=allow_large_drifts,
+            n_fids=n_fids,
+            priors=cli_priors,
+        ),
+    )
+    fiducial_cfg = config.registration.fiducial
 
     logger.info(f"Processing rounds: {rounds_to_fix}")
     logger.info(f"Reference round: {reference}")
@@ -1304,22 +1492,19 @@ def fix_shifts(
     for idx in idxs:
         logger.info(f"Processing tile {idx}")
 
-        # Load fiducial images - same as _run()
+        # Load fiducial images using the same preprocessing as register run
         fids: dict[str, np.ndarray] = {}
-
-        def normalize_fid(fid: np.ndarray) -> np.ndarray:
-            """Normalize fiducial to 0-1 range to avoid overflow in FFT."""
-            fid = fid.astype(np.float32)
-            fmin, fmax = fid.min(), fid.max()
-            if fmax - fmin > 0:
-                return (fid - fmin) / (fmax - fmin)
-            return fid - fmin
+        use_raw = fiducial_cfg.use_fft or fiducial_cfg.use_itk
 
         # Load reference fiducial
         ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
         ref_img = Image.from_file(ref_path, n_fids=n_fids)
-        # Use raw fiducials for FFT (normalized), LoG-processed for spot-based (same as _run)
-        fids[reference] = normalize_fid(ref_img.fid_raw) if use_fft else ref_img.fid
+        fids[reference] = ref_img.fid_raw.astype(np.float32) if use_raw else ref_img.fid
+
+        # Track raw fiducials for debug overlays (optional)
+        fid_raw_images: dict[str, np.ndarray] | None = None
+        if debug:
+            fid_raw_images = {reference: ref_img.fid_raw.astype(np.float32)}
 
         # Load target fiducials
         for round_name in rounds_to_fix:
@@ -1329,28 +1514,37 @@ def fix_shifts(
                 logger.warning(f"Target tile not found: {target_path}, skipping")
                 continue
             target_img = Image.from_file(target_path, n_fids=n_fids)
-            fid = normalize_fid(target_img.fid_raw) if use_fft else target_img.fid
-
-            # Apply prior shift if provided (pre-shift to approximate alignment)
-            if prior_shift is not None:
-                fid = shift(fid, [prior_shift[1], prior_shift[0]], order=1)
-
+            fid = target_img.fid_raw.astype(np.float32) if use_raw else target_img.fid
             fids[round_name] = fid
+            if fid_raw_images is not None:
+                fid_raw_images[round_name] = target_img.fid_raw.astype(np.float32)
 
-        # Call align_fiducials - SAME as _run() but with allow_large_drifts=True
-        shifts, residuals = align_fiducials(
+        prior_mapping = _apply_priors_to_fids(
+            fids,
+            fid_raw_images,
+            priors=fiducial_cfg.priors,
+            anchor_roi=fiducial_cfg.anchor_roi,
+            idx=idx,
+        )
+
+        shifts, residuals, _ = align_fiducials_with_stats(
             fids,
             reference=reference,
             debug=debug,
             max_iters=5,
-            threshold_sigma=threshold,
-            fwhm=fwhm,
-            use_fft=use_fft,
-            use_itk=False,
-            use_brightest=0,
-            detailed_config=FiducialDetailedConfig(
-                allow_large_drifts=True,  # Key difference from normal registration
-            ),
+            threshold_sigma=fiducial_cfg.threshold,
+            fwhm=fiducial_cfg.fwhm,
+            use_fft=fiducial_cfg.use_fft,
+            use_itk=fiducial_cfg.use_itk,
+            use_brightest=fiducial_cfg.detailed.use_brightest,
+            detailed_config=fiducial_cfg.detailed,
+        )
+
+        _add_priors_to_shifts(
+            shifts,
+            priors=fiducial_cfg.priors,
+            prior_mapping=prior_mapping,
+            anchor_roi=fiducial_cfg.anchor_roi,
         )
 
         # Store results
@@ -1360,9 +1554,6 @@ def fix_shifts(
                 # Add prior back to get total shift
                 dx = float(shifts[round_name][0])
                 dy = float(shifts[round_name][1])
-                if prior_shift is not None:
-                    dx += prior_shift[0]
-                    dy += prior_shift[1]
                 magnitude = float(np.hypot(dx, dy))
                 tile_results[round_name] = {
                     "dx": dx,
@@ -1384,25 +1575,34 @@ def fix_shifts(
         "use_fft": use_fft,
         "tiles": {f"{idx:04d}": results for idx, results in sorted(all_results.items())},
     }
-    if prior_shift is not None:
-        output_data["prior"] = {"dx": prior_shift[0], "dy": prior_shift[1]}
+    if cli_priors is not None:
+        output_data["priors"] = {
+            name: {"dx": dx, "dy": dy}
+            for name, (dx, dy) in sorted(cli_priors.items())
+        }
     output_path.write_text(json_module.dumps(output_data, indent=2))
     logger.info(f"Wrote coarse shifts to {output_path}")
 
     # Summary
     for round_name in rounds_to_fix:
-        magnitudes = [
-            r[round_name]["magnitude"]
-            for r in all_results.values()
-            if round_name in r
-        ]
+        per_round = [r[round_name] for r in all_results.values() if round_name in r]
+        magnitudes = [rec["magnitude"] for rec in per_round]
         if magnitudes:
-            median_dx = np.median([r[round_name]["dx"] for r in all_results.values() if round_name in r])
-            median_dy = np.median([r[round_name]["dy"] for r in all_results.values() if round_name in r])
+            dx_vals = [rec["dx"] for rec in per_round]
+            dy_vals = [rec["dy"] for rec in per_round]
+            median_dx = np.median(dx_vals)
+            median_dy = np.median(dy_vals)
             logger.info(
                 f"{round_name}: median=({median_dx:.1f}, {median_dy:.1f}), "
                 f"mean mag={np.mean(magnitudes):.1f}px, max mag={np.max(magnitudes):.1f}px"
             )
+            max_abs_dx = float(np.max(np.abs(dx_vals)))
+            max_abs_dy = float(np.max(np.abs(dy_vals)))
+            if max_abs_dx < 35.0 and max_abs_dy < 35.0:
+                logger.warning(
+                    f"{round_name}: all detected drifts are <35 px in both X and Y; "
+                    "fix-shifts may not be necessary for this round."
+                )
 
 
 if __name__ == "__main__":

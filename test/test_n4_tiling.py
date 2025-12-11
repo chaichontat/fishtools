@@ -93,17 +93,15 @@ class TestTiledEquivalence:
 
     def test_tiled_matches_full_no_unsharp(self, random_plane, random_field):
         """Tiled processing without unsharp mask should be bit-exact."""
-        field_gpu = cp.asarray(random_field)
-
         result_full = _correct_plane_gpu(
             random_plane,
-            field_gpu=field_gpu,
+            field_cpu=random_field,
             use_unsharp_mask=False,
             mask_cpu=None,
         )
         result_tiled = correct_plane_gpu_tiled(
             random_plane,
-            field_gpu=field_gpu,
+            field_cpu=random_field,
             use_unsharp_mask=False,
             mask_cpu=None,
             tile_size=512,
@@ -115,18 +113,17 @@ class TestTiledEquivalence:
     @requires_cucim
     def test_tiled_matches_full_with_unsharp(self, random_plane, random_field):
         """Tiled processing with unsharp mask should match within tolerance."""
-        field_gpu = cp.asarray(random_field)
         mask = random_plane > 200
 
         result_full = _correct_plane_gpu(
             random_plane,
-            field_gpu=field_gpu,
+            field_cpu=random_field,
             use_unsharp_mask=True,
             mask_cpu=mask,
         )
         result_tiled = correct_plane_gpu_tiled(
             random_plane,
-            field_gpu=field_gpu,
+            field_cpu=random_field,
             use_unsharp_mask=True,
             mask_cpu=mask,
             tile_size=512,
@@ -152,17 +149,15 @@ class TestTiledEquivalence:
         plane = (np.random.rand(H, W).astype(np.float32) * 1000 + 100).astype(np.float32)
         field = (np.ones((H, W), dtype=np.float32) + np.random.rand(H, W) * 0.2).astype(np.float32)
 
-        field_gpu = cp.asarray(field)
-
         result_full = _correct_plane_gpu(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=False,
             mask_cpu=None,
         )
         result_tiled = correct_plane_gpu_tiled(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=False,
             mask_cpu=None,
             tile_size=tile_size,
@@ -194,13 +189,13 @@ class TestTiledEquivalence:
 
         result_full = _correct_plane_gpu(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
         )
         result_tiled = correct_plane_gpu_tiled(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
             tile_size=tile_size,
@@ -230,13 +225,13 @@ class TestMaskBoundaries:
 
         result_full = _correct_plane_gpu(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
         )
         result_tiled = correct_plane_gpu_tiled(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
             tile_size=tile_size,
@@ -262,13 +257,13 @@ class TestMaskBoundaries:
 
         result_full = _correct_plane_gpu(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
         )
         result_tiled = correct_plane_gpu_tiled(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
             tile_size=tile_size,
@@ -295,13 +290,13 @@ class TestEdgeContinuity:
 
         result_full = _correct_plane_gpu(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
         )
         result_tiled = correct_plane_gpu_tiled(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
             tile_size=tile_size,
@@ -344,13 +339,13 @@ class TestTileSizeVariations:
 
         result_full = _correct_plane_gpu(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
         )
         result_tiled = correct_plane_gpu_tiled(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=mask,
             tile_size=tile_size,
@@ -375,13 +370,13 @@ class TestNoMask:
 
         result_full = _correct_plane_gpu(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=None,
         )
         result_tiled = correct_plane_gpu_tiled(
             plane,
-            field_gpu=field_gpu,
+            field_cpu=field,
             use_unsharp_mask=True,
             mask_cpu=None,
             tile_size=512,

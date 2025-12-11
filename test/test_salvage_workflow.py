@@ -3,14 +3,10 @@
 from pathlib import Path
 
 import numpy as np
-import polars as pl
 import pytest
-import zarr
 from tifffile import imread, imwrite
 
-from fishtools.io.workspace import Workspace
-from fishtools.preprocess.cli_stitch import extract, slice_mosaic
-from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.preprocess.cli_stitch import extract
 
 
 class TestExtractWithFiducials:
@@ -159,78 +155,3 @@ class TestExtractWithFiducials:
                 trim=0,
             )
 
-
-class TestSliceMosaicIntegration:
-    """Integration-style tests for slice_mosaic coordinate logic."""
-
-    def test_slice_mosaic_recovers_shifted_tile(self, tmp_path: Path) -> None:
-        """slice_mosaic should reconstruct tiles from shifted mosaic using original positions."""
-        workspace = tmp_path / "ws"
-        deconv_root = workspace / "analysis" / "deconv"
-        deconv_root.mkdir(parents=True)
-        (workspace / "workspace.DONE").write_text("ok")
-
-        roi = "roi1"
-        round_name = "1_9_17"
-        tile_size = 8
-
-        ws = Workspace(deconv_root)
-        stitch_dir = ws.deconved / f"stitch--{roi}--shifted-{round_name}"
-        stitch_dir.mkdir(parents=True)
-
-        # Synthetic mosaic: one Z-plane, one channel
-        mosaic_h, mosaic_w = 32, 32
-        zarr_path = stitch_dir / "fused.zarr"
-        arr = zarr.open_array(zarr_path, mode="w", shape=(1, mosaic_h, mosaic_w, 1), dtype=np.uint16)
-        arr[:] = 0
-
-        # Original vs shifted tile positions (world coordinates)
-        x_orig, y_orig = 10.0, 20.0
-        dx, dy = 5.0, 7.0  # coarse shift (content moved right/down)
-        x_shifted = x_orig - dx
-        y_shifted = y_orig - dy
-
-        # According to slice_mosaic: origin = min(shifted), slice = original - origin
-        slice_x = int(round(x_orig - x_shifted))
-        slice_y = int(round(y_orig - y_shifted))
-
-        # Place a distinguishable tile payload at the expected slice location
-        tile_payload = np.arange(tile_size * tile_size, dtype=np.uint16).reshape(tile_size, tile_size)
-        arr[0, slice_y : slice_y + tile_size, slice_x : slice_x + tile_size, 0] = tile_payload
-
-        # Write ORIGINAL TileConfiguration.registered.txt
-        original_tc_path = ws.tileconfig_dir(roi) / "TileConfiguration.registered.txt"
-        original_tc_path.parent.mkdir(parents=True, exist_ok=True)
-        df_orig = pl.DataFrame(
-            {"index": [1], "x": [x_orig], "y": [y_orig]},
-            schema=pl.Schema({"index": pl.UInt32, "x": pl.Float32, "y": pl.Float32}),
-        )
-        TileConfiguration(df_orig).write(original_tc_path)
-
-        # Write SHIFTED TileConfiguration.shifted.txt
-        shifted_tc_path = stitch_dir / "TileConfiguration.shifted.txt"
-        df_shift = pl.DataFrame(
-            {"index": [1], "x": [x_shifted], "y": [y_shifted]},
-            schema=pl.Schema({"index": pl.UInt32, "x": pl.Float32, "y": pl.Float32}),
-        )
-        TileConfiguration(df_shift).write(shifted_tc_path)
-
-        # Create empty source round dir so slice_mosaic can resolve metadata (optional)
-        (ws.deconved / f"{round_name}--{roi}").mkdir(parents=True, exist_ok=True)
-
-        # Run slice_mosaic against the synthetic workspace
-        slice_mosaic(
-            path=deconv_root,
-            roi=roi,
-            round_name=round_name,
-            tile_size=tile_size,
-            overwrite=True,
-        )
-
-        repaired_dir = ws.deconved / f"{round_name}--{roi}--repaired"
-        out_path = repaired_dir / f"{round_name}-0001.tif"
-        assert out_path.exists()
-
-        out = imread(out_path)
-        assert out.shape == (1, tile_size, tile_size)
-        np.testing.assert_array_equal(out[0], tile_payload)

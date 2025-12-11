@@ -171,6 +171,17 @@ def find_spots(
     return df
 
 
+def _normalize_for_fft(img: np.ndarray) -> np.ndarray:
+    """Return a zero-mean, unit-scale copy for FFT-based alignment."""
+    arr = np.asarray(img, dtype=np.float32)
+    centered = arr - float(np.median(arr))
+    scale = float(np.std(centered))
+    if not np.isfinite(scale) or scale < 1e-6:
+        max_abs = float(np.max(np.abs(centered)))
+        scale = max_abs if max_abs > 0 else 1.0
+    return centered / scale
+
+
 def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2) -> np.ndarray:
     """Calculate sub-pixel image translation using phase cross-correlation.
 
@@ -192,7 +203,9 @@ def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2) -> np.ndar
         centipixel accuracy, sufficient for most microscopy applications requiring
         nanometer-scale registration precision.
     """
-    return phase_cross_correlation(ref, img, upsample_factor=int(10**precision))[0]
+    ref_norm = _normalize_for_fft(ref)
+    img_norm = _normalize_for_fft(img)
+    return phase_cross_correlation(ref_norm, img_norm, upsample_factor=int(10**precision))[0]
 
 
 def itk_shift(
@@ -399,7 +412,7 @@ def _calculate_drift(
     # subtract_background: bool = False,
     plot: bool = False,
     precision: int = 2,
-    warning_spots_threshold: int = 1000,
+    warning_spots_threshold: int = 400,
     min_spots_for_mode: int = 100,
     max_drift_threshold: float = 40.0,
     bin_size: float = 0.5,

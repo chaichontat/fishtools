@@ -460,7 +460,12 @@ def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int, j
 @click.option("--threshold", type=float, default=None)
 @click.option("--overwrite", is_flag=True)
 @click.option("--max-proj", is_flag=True)
-@click.option("--debug", is_flag=True)
+@click.option(
+    "--debug/--no-debug",
+    default=True,
+    show_default=True,
+    help="Write debug overlays + metadata alongside fused tiles.",
+)
 @click.option(
     "--drop-disconnected/--keep-disconnected",
     default=True,
@@ -1107,7 +1112,12 @@ def walk_fused(path: Path) -> dict[int, list[Path]]:  # shim
 @click.option("--threads", "-t", type=int, default=8)
 @click.option("--channels", type=str, default="all")
 @click.option("--max-proj", is_flag=True)
-@click.option("--debug", is_flag=True)
+@click.option(
+    "--debug/--no-debug",
+    default=True,
+    show_default=True,
+    help="Write debug overlays + metadata alongside fused tiles.",
+)
 @click.option("--max-from", type=str)
 @click.option(
     "--field-zarr",
@@ -1152,7 +1162,7 @@ def fuse(
     channels: str = "all",
     subsample_z: int = 1,
     max_proj: bool = False,
-    debug: bool = False,
+    debug: bool = True,
     max_from: str | None = None,
     json_config: Path | None = None,
     # skip_extract: bool = False,
@@ -1735,6 +1745,18 @@ def combine(
     show_default=True,
     help="Pre-filter the N4 source plane with cucim.skimage.filters.unsharp_mask (requires GPU/CuPy).",
 )
+@click.option(
+    "--tile-size",
+    type=int,
+    default=None,
+    help="Optional explicit GPU tile size (pixels). Defaults to auto when unset.",
+)
+@click.option(
+    "--tile-threshold",
+    type=int,
+    default=None,
+    help="Auto-tiling threshold in pixels (max dimension). Set <=0 to disable auto-tiling.",
+)
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def n4(
     path: Path,
@@ -1753,6 +1775,8 @@ def n4(
     single_plane: bool,
     debug: bool,
     unsharp_mask: bool,
+    tile_size: int | None,
+    tile_threshold: int | None,
 ) -> None:
     """Run N4 bias-field correction against stitched mosaics."""
 
@@ -1781,6 +1805,8 @@ def n4(
             single_plane=single_plane,
             debug=debug,
             use_unsharp_mask=unsharp_mask,
+            tile_size=tile_size,
+            tile_threshold=tile_threshold,
         )
     except Exception as exc:
         raise click.ClickException(str(exc)) from exc
