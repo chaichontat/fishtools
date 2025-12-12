@@ -629,7 +629,7 @@ def main(
     input_path: Path = typer.Argument(..., help="Path to input segmentation zarr"),
     output_path: Path = typer.Option(None, help="Output path (default: input_postproc.zarr)"),
     blocksize: int = typer.Option(1024, help="XY block size for tiled processing"),
-    sigma: str = typer.Option("1,3,3", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
+    sigma: str = typer.Option("1,2,2", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
     v_min: int = typer.Option(500, help="Minimum volume threshold for small cell donation"),
     margin: int = typer.Option(50, help="Margin parameter (overlap = 2*margin for overlap removal)"),
     workers_per_gpu: int = typer.Option(4, help="Workers per GPU"),

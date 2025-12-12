@@ -3,6 +3,20 @@ Cellpose model caching for distributed workers.
 
 Provides a Dask WorkerPlugin that initializes and caches a CellPose model
 once per worker, avoiding repeated model loading overhead.
+
+Per-worker state pattern
+------------------------
+Dask workers serialize functions via pickle/cloudpickle, which captures module
+references rather than module state. Module-level globals do NOT reliably
+persist across task invocations on the same worker.
+
+The correct pattern for per-worker state is to store attributes on the worker
+object itself (via `distributed.get_worker()`), or use a WorkerPlugin with a
+`setup()` method that runs once when the worker starts.
+
+References:
+    - https://distributed.dask.org/en/stable/plugins.html
+    - https://distributed.dask.org/en/stable/serialization.html
 """
 
 import logging
@@ -14,7 +28,24 @@ from distributed import WorkerPlugin
 
 from fishtools.segment.train import IS_CELLPOSE_SAM, plan_path_for_device
 
-logger = logging.getLogger("rich")
+
+def _get_worker_logger() -> logging.Logger:
+    """Get a logger safe for use in Dask workers.
+
+    Returns a logger that uses only basic handlers (no Rich) to avoid
+    ContextVar pickling issues when Dask serializes worker functions.
+    """
+    worker_logger = logging.getLogger(f"{__name__}.worker")
+    if not worker_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "\n%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+        worker_logger.addHandler(handler)
+        worker_logger.setLevel(logging.INFO)
+        worker_logger.propagate = False  # Don't propagate to root (which may have Rich)
+    return worker_logger
 
 
 def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
@@ -60,7 +91,7 @@ def _build_packed_cellpose_model(model_kwargs: dict[str, Any]):
 
     if plan_selection is not None:
         plan_path, device_name = plan_selection
-        logger.info(f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}'")
+        _get_worker_logger().info(f"Using TensorRT plan {plan_path.name} for CUDA device '{device_name}'")
         trt_kwargs = dict(resolved_kwargs)
         trt_kwargs["pretrained_model"] = str(plan_path)
         trt_kwargs.setdefault("gpu", True)
@@ -89,7 +120,7 @@ def get_cached_model(model_kwargs: dict[str, Any]):
         return worker.cellpose_model
 
     # Fallback: build and cache (handles case where plugin wasn't registered)
-    logger.warning(f"Worker {worker.name}: Model not cached, building fresh")
+    _get_worker_logger().warning(f"Worker {worker.name}: Model not cached, building fresh")
     model = _build_packed_cellpose_model(model_kwargs)
     worker.cellpose_model = model
     return model
@@ -114,19 +145,20 @@ class CellposeModelPlugin(WorkerPlugin):
 
     def setup(self, worker):
         """Initialize model when worker starts. Stores on worker.cellpose_model."""
+        wlog = _get_worker_logger()
         if hasattr(worker, "cellpose_model"):
-            logger.info(f"Worker {worker.name}: Model already initialized, skipping")
+            wlog.info(f"Worker {worker.name}: Model already initialized, skipping")
             return
 
         backend = self.model_kwargs.get("backend", "sam")
-        logger.info(f"Worker {worker.name}: Initializing CellPose model (backend={backend})")
+        wlog.info(f"Worker {worker.name}: Initializing CellPose model (backend={backend})")
         model = _build_packed_cellpose_model(self.model_kwargs)
         worker.cellpose_model = model
         worker.cellpose_model_kwargs = self.model_kwargs
-        logger.info(f"Worker {worker.name}: Model cached on worker.cellpose_model")
+        wlog.info(f"Worker {worker.name}: Model cached on worker.cellpose_model")
 
     def teardown(self, worker):
         """Clean up model when worker shuts down."""
         if hasattr(worker, "cellpose_model"):
             del worker.cellpose_model
-            logger.info(f"Worker {worker.name}: Cleared cellpose_model")
+            _get_worker_logger().info(f"Worker {worker.name}: Cleared cellpose_model")

@@ -14,6 +14,7 @@ from typing import Any, cast
 
 import cellpose.io
 import cupy as cp
+import dask
 import dask_jobqueue
 import distributed
 import imagecodecs
@@ -24,8 +25,6 @@ import zarr
 from cellpose import transforms as cp_transforms
 from distributed import WorkerPlugin
 from numpy.typing import NDArray
-from rich.logging import RichHandler
-
 from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.segment.normalize import sample_percentile
@@ -48,23 +47,40 @@ from fishtools.segmentation.distributed.merge_utils import (
 )
 from fishtools.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
 from fishtools.segmentation.distributed.tiling import solve_internal_xy_for_tiles
-from fishtools.utils.pretty_print import progress_bar
 
-# logger.remove()
-# console = Console()
-# logger.add(RichHandler(console=console, rich_tracebacks=True), format="{message}", level="INFO")
+# Increase Dask timeouts to prevent "Event loop was unresponsive" warnings
+# during long-running GPU operations (Cellpose inference can hold the GIL for seconds)
+dask.config.set({
+    "distributed.comm.timeouts.connect": "60s",
+    "distributed.comm.timeouts.tcp": "120s",
+    "distributed.scheduler.worker-ttl": "10m",
+    "distributed.admin.tick.limit": "10m",
+})
+
+# IMPORTANT: No Rich logging at module level - RichHandler uses ContextVar which
+# cannot be pickled. This causes "cannot pickle '_contextvars.ContextVar'" errors
+# when Dask serializes functions/objects that capture loggers with Rich handlers.
+# CLI commands set up their own Rich logging independently (causes duplicate progress bars).
+logger = logging.getLogger(__name__)
 
 
-logging.basicConfig(level="INFO", handlers=[RichHandler(level="INFO")])
-logging.getLogger("cellpose").setLevel(logging.WARNING)
+def _get_worker_logger() -> logging.Logger:
+    """Get a logger safe for use in Dask workers.
 
-logger = logging.getLogger("rich")
-
-# Per-worker initialization flag to avoid repeated setup overhead.
-_WORKER_INITIALIZED: bool = False
-_WORKER_LOGS_DIR: str | None = None
-_WORKER_FIRST_TASK_DONE: bool = False
-
+    Returns a logger that uses only basic handlers (no Rich) to avoid
+    ContextVar pickling issues when Dask serializes worker functions.
+    """
+    worker_logger = logging.getLogger(f"{__name__}.worker")
+    if not worker_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "\n%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+        worker_logger.addHandler(handler)
+        worker_logger.setLevel(logging.INFO)
+        worker_logger.propagate = False  # Don't propagate to root (which may have Rich)
+    return worker_logger
 
 def _log_slurm_tile_summary(total_tiles: int, processed_tiles: int, elapsed_seconds: float) -> None:
     job_id = os.environ.get("SLURM_JOB_ID")
@@ -112,12 +128,13 @@ def _apply_startup_stagger(stagger_seconds: float, workers_per_gpu: int) -> None
     """
     import re
 
-    global _WORKER_FIRST_TASK_DONE
-    if _WORKER_FIRST_TASK_DONE:
-        return
-    _WORKER_FIRST_TASK_DONE = True
-
     worker = distributed.get_worker()
+
+    # Store state on worker object (not module global) - persists across tasks
+    if getattr(worker, "_stagger_done", False):
+        return
+    worker._stagger_done = True
+
     name = getattr(worker, "name", "")
     match = re.match(r"gpu-(\d+)-w(\d+)", name)
     if not match:
@@ -129,7 +146,7 @@ def _apply_startup_stagger(stagger_seconds: float, workers_per_gpu: int) -> None
 
     if linear_idx > 0:
         delay = linear_idx * stagger_seconds
-        logger.info(f"Worker {name}: staggering start by {delay}s")
+        _get_worker_logger().info(f"Worker {name}: staggering start by {delay}s")
         time.sleep(delay)
 
 
@@ -465,8 +482,10 @@ def process_block(
 
     _apply_startup_stagger(stagger_seconds, workers_per_gpu)
 
+    wlog = _get_worker_logger()
+    worker_name = getattr(distributed.get_worker(), "name", "unknown")
     start_time = time.perf_counter()
-    logger.info(f"RUNNING BLOCK: {block_index}\tREGION: [{format_slice(crop)}]")
+    wlog.info(f"Worker {worker_name} RUNNING BLOCK: {block_index}\tREGION: [{format_slice(crop)}]")
     segmentation_3d = read_preprocess_and_segment(
         input_zarr,
         crop,
@@ -475,7 +494,7 @@ def process_block(
         eval_kwargs,
         worker_logs_directory,
     )
-    logger.info(f"Block {block_index}: {np.max(segmentation_3d)} masks found.")
+    wlog.info(f"Block {block_index}: {np.max(segmentation_3d)} masks found.")
 
     spatial_crop_slices = crop[:-1]
     spatial_blocksize = blocksize[:-1]
@@ -537,16 +556,6 @@ def read_preprocess_and_segment(
     """
     if preprocessing_steps is None:
         preprocessing_steps = []
-
-    try:
-        import torch
-
-        vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        dev = torch.cuda.current_device() if torch.cuda.is_available() else None
-        worker_name = getattr(distributed.get_worker(), "name", "unknown")
-        logger.info(f"Worker {worker_name} visible CUDA={vis} torch_dev={dev}")
-    except Exception:
-        pass
 
     image = input_zarr[crop]
     for pp_step in preprocessing_steps:
@@ -684,6 +693,8 @@ def distributed_eval(
         ID is the first tuple in the list, the largest segment ID is the last
         tuple in the list.
     """
+    from fishtools.utils.pretty_print import progress_bar
+
     overall_start = time.perf_counter()
 
     if preprocessing_steps is None:
@@ -1049,6 +1060,17 @@ def run(
     Normalization: We pass a `normalize` dict with `lowhigh` shaped (3, 2).
     If fewer than 3 channels requested, remaining rows are padded with [0, 1].
     """
+    # Set up Rich logging fresh for this CLI invocation
+    from rich.logging import RichHandler
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[RichHandler(rich_tracebacks=True)],
+        force=True,
+    )
+    logging.getLogger("cellpose").setLevel(logging.WARNING)
+
     input_path = Path(path)
     if input_path.suffix == ".zarr" and input_path.exists():
         zarr_input_path = input_path
@@ -1278,6 +1300,16 @@ def stitch(
 
     Use this after running with --cellpose-only to complete the pipeline.
     """
+    # Set up Rich logging fresh for this CLI invocation
+    from rich.logging import RichHandler
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[RichHandler(rich_tracebacks=True)],
+        force=True,
+    )
+
     if not (temp_dir / "segmentation_unstitched.zarr").exists():
         raise FileNotFoundError(f"No segmentation_unstitched.zarr found in {temp_dir}")
     if not (temp_dir / "intermediate_state.npz").exists():
