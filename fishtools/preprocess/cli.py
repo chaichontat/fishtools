@@ -12,6 +12,7 @@ LAZY_COMMANDS: dict[str, SimpleNamespace] = {
     "spots": SimpleNamespace(module="fishtools.preprocess.spots.align_prod", attr="spots"),
     "inspect": SimpleNamespace(module="fishtools.preprocess.cli_inspect", attr="inspect_cli"),
     "verify": SimpleNamespace(module="fishtools.preprocess.cli_verify", attr="verify"),
+    "status": SimpleNamespace(module="fishtools.preprocess.cli_status", attr="status"),
     "correct-illum": SimpleNamespace(module="fishtools.preprocess.cli_correct_illum", attr="correct_illum"),
     "check-shifts": SimpleNamespace(module="fishtools.preprocess.cli_check_shifts", attr="check_shifts"),
     "check-stitch": SimpleNamespace(module="fishtools.preprocess.cli_check_stitch", attr="check_stitch"),
