@@ -15,11 +15,11 @@ from fishtools.io.workspace import Workspace
 from fishtools.plot.diagnostics.shifts import (
     Shift,
     ShiftsAdapter,
-    infer_rounds,
     build_shift_layout_table,
-    make_shifts_layout_figure,
+    infer_rounds,
     make_corr_hist_figure,
     make_corr_vs_l2_figure,
+    make_shifts_layout_figure,
     make_shifts_scatter_figure,
 )
 from fishtools.utils.logging import setup_cli_logging
@@ -95,12 +95,12 @@ def _infer_tile_size_px(ws: Workspace, roi: str, codebook: str, default: float =
         return float(default)
 
 
-def build_corr_l2_table(
+def build_metrics_table(
     shifts_by_tile: Mapping[int, Mapping[str, Shift]],
     *,
     roi: str,
 ) -> pd.DataFrame:
-    """Return per-round correlation and L2 distances for each tile."""
+    """Return per-round metrics for each tile including correlation, L2, and additional diagnostics."""
 
     rounds = infer_rounds(shifts_by_tile)
     records: list[dict[str, object]] = []
@@ -116,8 +116,8 @@ def build_corr_l2_table(
             continue
 
         shifts = np.array([shift.shifts for _, shift in per_round], dtype=float)
-        mean_shift = shifts.mean(axis=0)
-        l2 = np.linalg.norm(shifts - mean_shift, axis=1)
+        center_shift = np.median(shifts, axis=0)
+        l2 = np.linalg.norm(shifts - center_shift, axis=1)
 
         for (tile_id, shift), dist in zip(per_round, l2, strict=False):
             records.append({
@@ -126,10 +126,20 @@ def build_corr_l2_table(
                 "tile": int(tile_id),
                 "correlation": float(shift.corr),
                 "L2": float(dist),
+                "residual": float(shift.residual),
+                "iterations": shift.iterations,
+                "final_threshold": shift.final_threshold,
+                "final_fwhm": shift.final_fwhm,
+                "n_spots": shift.n_spots,
+                "mode": shift.mode,
+                "algorithm": shift.algorithm,
             })
 
     records.sort(key=lambda item: (str(item["round"]), int(item["tile"])))
-    return pd.DataFrame.from_records(records, columns=["roi", "round", "tile", "correlation", "L2"])
+    return pd.DataFrame.from_records(records, columns=[
+        "roi", "round", "tile", "correlation", "L2", "residual",
+        "iterations", "final_threshold", "final_fwhm", "n_spots", "mode", "algorithm"
+    ])
 
 
 ## Saving is unified via fishtools.utils.plot.save_figure
@@ -265,13 +275,14 @@ def check_shifts(
             fig3 = make_corr_hist_figure(shifts_by_tile, ncols=cols)
             save_figure(fig3, output_dir / "shifts_corr_hist", "shifts_corr_hist", roi, codebook_name, log_level="INFO")
 
-            corr_l2_df = build_corr_l2_table(shifts_by_tile, roi=roi)
-            csv_path = output_dir / "shifts_corr_vs_l2" / f"shifts_corr_l2--{roi}+{codebook_name}.csv"
-            if corr_l2_df.empty:
-                logger.warning(f"No correlation/L2 records produced for ROI '{roi}'. Skipping CSV export.")
+            metrics_df = build_metrics_table(shifts_by_tile, roi=roi)
+            csv_path = output_dir / "shifts_metrics" / f"shifts_metrics--{roi}+{codebook_name}.csv"
+            if metrics_df.empty:
+                logger.warning(f"No metrics records produced for ROI '{roi}'. Skipping CSV export.")
             else:
-                corr_l2_df.to_csv(csv_path, index=False)
-                logger.info(f"Saved correlation/L2 CSV: {csv_path}")
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                metrics_df.to_csv(csv_path, index=False)
+                logger.info(f"Saved metrics CSV: {csv_path}")
 
             # New: per-round layout scatter using TileConfiguration centers offset by shifts
             try:

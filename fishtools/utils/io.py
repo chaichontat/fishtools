@@ -8,18 +8,14 @@ Prefer importing from:
 
 from __future__ import annotations
 
-from fishtools.io.workspace import (
-    Workspace,
-    OptimizePath,
-    CorruptedTiffError,
-    safe_imwrite,
-)
+from fishtools.io.workspace import CorruptedTiffError, FiducialPaths, OptimizePath, Workspace, safe_imwrite
 from fishtools.utils.tiff import get_metadata, get_channels
 from fishtools.utils.fs import download, get_file_name, set_cwd
 
 __all__ = [
     "Workspace",
     "OptimizePath",
+    "FiducialPaths",
     "CorruptedTiffError",
     "safe_imwrite",
     "get_metadata",

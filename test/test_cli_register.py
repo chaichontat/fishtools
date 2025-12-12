@@ -15,6 +15,7 @@ from fishtools.preprocess.cli_register import (
     _copy_codebook_to_workspace,
     _debug_fid_paths,
     _run,
+    _save_debug_overlay,
 )
 from fishtools.preprocess.cli_register import (
     register as register_cli,
@@ -38,9 +39,18 @@ def _make_workspace(tmp_path: Path) -> tuple[Path, Path]:
 def test_debug_fid_paths_include_roi(tmp_path: Path) -> None:
     base = tmp_path / "ws"
     debug_dir, raw, shifted = _debug_fid_paths(base, "roiA", 7)
-    assert debug_dir == base / "fids_debug"
+    assert debug_dir == base / "fids_debug" / "roiA"
     assert raw == "roiA-0007.tif"
     assert shifted == "roiA-shifted-0007.tif"
+
+
+def test_save_debug_overlay_prefixes_roi(tmp_path: Path) -> None:
+    shifted = {
+        "reference": np.ones((6, 6), dtype=np.float32),
+        "round2": np.ones((6, 6), dtype=np.float32) * 5,
+    }
+    _save_debug_overlay(tmp_path, "roiZ", 12, "reference", shifted)
+    assert (tmp_path / "roiZ-0012-round2.png").exists()
 
 
 def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> None:
@@ -84,6 +94,7 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
         debug: bool,
         overwrite: bool,
         no_priors: bool,
+        repaired_rounds: set[str] | None = None,
     ) -> None:  # type: ignore[no-untyped-def]
         called.update({
             "path": path,
@@ -95,6 +106,7 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
             "debug": debug,
             "overwrite": overwrite,
             "no_priors": no_priors,
+            "repaired_rounds": repaired_rounds,
         })
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
@@ -125,7 +137,6 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
     assert called["path"] == deconv
     assert called["roi"] == "roiA"
     assert called["idx"] == 42
-    dest_codebook = deconv / "codebooks" / cb.name
     assert called["reference"] == "4_12_20"
     assert called["overwrite"] is True
     # Defaults: fwhm=4.0 (from click default), threshold=5.0
@@ -135,8 +146,29 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
     # Sanity on other core defaults plumbed through
     assert cfg.registration.crop == 40
     assert cfg.registration.downsample == 1
-    assert dest_codebook.exists()
-    assert dest_codebook.read_text() == cb.read_text()
+    assert cfg.registration.fiducial.detailed.use_brightest == 20
+    assert cfg.registration.fiducial.detailed.allow_large_drifts is False
+
+    # Alias flag should toggle the same setting
+    called.clear()
+    result_alias = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(deconv),
+            "42",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--reference",
+            "4_12_20",
+            "--ignore-large-shifts",
+        ],
+    )
+    assert result_alias.exit_code == 0, result_alias.output
+    cfg_alias = called["config"]
+    assert cfg_alias.registration.fiducial.detailed.allow_large_drifts is True
 
 
 def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) -> None:
@@ -289,6 +321,7 @@ def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: An
         debug: bool,
         overwrite: bool,
         no_priors: bool,
+        repaired_rounds: set[str] | None = None,
     ) -> None:  # type: ignore[no-untyped-def]
         seen.update({"config": config, "roi": roi, "idx": idx, "reference": reference})
 
@@ -321,18 +354,16 @@ def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: An
     assert seen["roi"] == "roiB"
     assert seen["idx"] == 7
     assert seen["reference"] == "7_15_23"
-    copied = deconv / "codebooks" / cb.name
-    assert copied.exists()
-    assert copied.read_text() == cb.read_text()
 
 
-def test_cli_register_run_skips_when_shifts_exist(tmp_path: Path, monkeypatch: Any) -> None:
+def test_cli_register_run_skips_when_reg_file_exists(tmp_path: Path, monkeypatch: Any) -> None:
     _root, deconv = _make_workspace(tmp_path)
     cb = _make_codebook(tmp_path)
 
-    shift_dir = deconv / "shifts--roiA+cb"
-    shift_dir.mkdir(parents=True)
-    (shift_dir / "shifts-0042.json").write_text("{}")
+    # Create the registered output file that triggers skip
+    reg_dir = deconv / "registered--roiA+cb"
+    reg_dir.mkdir(parents=True)
+    (reg_dir / "reg-0042.tif").write_text("")
 
     called = False
 
@@ -360,18 +391,16 @@ def test_cli_register_run_skips_when_shifts_exist(tmp_path: Path, monkeypatch: A
 
     assert result.exit_code == 0, result.output
     assert called is False
-    assert (deconv / "codebooks" / cb.name).exists()
 
 
-def test_run_internal_returns_early_when_shifts_exist(tmp_path: Path) -> None:
-    shift_dir = tmp_path / "shifts--roiA+cb"
-    shift_dir.mkdir(parents=True)
-    (shift_dir / "shifts-0007.json").write_text("{}")
-
+def test_run_internal_returns_early_when_reg_file_exists(tmp_path: Path) -> None:
+    """Test that _run returns early when the output reg file already exists."""
     codebook_path = _make_codebook(tmp_path)
     reg_dir = tmp_path / "registered--roiA+cb"
     reg_dir.mkdir(parents=True)
-    (reg_dir / "reg-0007.tif").write_text("")
+    # Create the output file to trigger early return
+    reg_file = reg_dir / "reg-0007.tif"
+    reg_file.write_text("existing")
 
     cfg = Config(
         dataPath=str(DATA),
@@ -410,7 +439,8 @@ def test_run_internal_returns_early_when_shifts_exist(tmp_path: Path) -> None:
         no_priors=False,
     )
 
-    assert not (tmp_path / "registered--roiA+cb").exists()
+    # The file should still have the original content (not overwritten)
+    assert reg_file.read_text() == "existing"
 
 
 def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: Any) -> None:
@@ -455,7 +485,7 @@ def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: A
 
         return _R()
 
-    monkeypatch.setattr("fishtools.preprocess.cli_register.subprocess.run", fake_run)
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -637,8 +667,9 @@ def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_child)
 
-    # TiffFile stub: 0001 fails once (triggers rerun); 0002 always OK
-    attempts: dict[str, int] = {"reg-0001.tif": 0}
+    # TiffFile stub: 0001 always fails until fake_child "fixes" it; 0002 always OK
+    # Track whether the child CLI has been called to fix the file
+    fixed_files: set[str] = set()
     baseline_shape = (1, 1, 4, 4)
 
     class _TF:
@@ -653,12 +684,22 @@ def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
 
         def asarray(self):  # type: ignore[no-untyped-def]
             name = self.p.name
-            if name == "reg-0001.tif":
-                attempts[name] += 1
-                if attempts[name] == 1:
-                    raise OSError("simulated read error")
-                return np.zeros(baseline_shape, dtype=np.uint16)
+            # 0001 fails until the child CLI "fixes" it
+            if name == "reg-0001.tif" and name not in fixed_files:
+                raise OSError("simulated read error")
             return np.zeros(baseline_shape, dtype=np.uint16)
+
+    # Update fake_child to mark files as fixed
+    original_fake_child = fake_child
+
+    def fake_child_with_fix(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        result = original_fake_child(argv, check=check)
+        # Mark the file as fixed after child CLI runs
+        idx = int(argv[4])
+        fixed_files.add(f"reg-{idx:04d}.tif")
+        return result
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_child_with_fix)
 
     monkeypatch.setattr("fishtools.preprocess.cli_register.TiffFile", _TF)
 

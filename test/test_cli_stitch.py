@@ -21,6 +21,7 @@ from fishtools.preprocess.cli_stitch import (
     extract,
     extract_channel,
     final_stitch,
+    load_fiducial_mosaics,
     run_imagej,
     stitch,
     walk_fused,
@@ -960,6 +961,194 @@ class TestFinalStitchMetadata:
 
         meta = read_metadata(fused_file)
         assert meta.get("key") == ["bitX"]
+
+
+class TestLoadFiducialMosaics:
+    def test_loads_all_planes_with_dynamic_names(self, tmp_path: Path) -> None:
+        fid_dir = tmp_path / "fid"
+        for fid_idx, value in enumerate((111, 222), start=0):
+            folder = fid_dir / f"{fid_idx:02d}"
+            folder.mkdir(parents=True, exist_ok=True)
+            data = np.full((4, 4), value, dtype=np.uint16)
+            imwrite(folder / f"fused_{folder.name}-1.tif", data)
+
+        fid_mosaics = load_fiducial_mosaics(fid_dir)
+
+        assert list(fid_mosaics.keys()) == [0, 1]
+        assert fid_mosaics[0].shape == (4, 4)
+        assert fid_mosaics[1][0, 0] == 222
+
+
+class TestSliceMosaic:
+    """Test slice_mosaic functionality for salvage workflow."""
+
+    def test_extract_patch_basic(self, tmp_path: Path) -> None:
+        """Test extract_patch helper function."""
+        from fishtools.preprocess.cli_stitch import extract_patch
+
+        # Create test mosaic
+        mosaic = np.arange(100, dtype=np.uint16).reshape(10, 10)
+
+        # Extract center patch
+        patch = extract_patch(mosaic, x0=2, y0=3, size=4)
+        assert patch.shape == (4, 4)
+        assert patch.dtype == np.uint16
+
+        # Verify correct region extracted (row 3-6, col 2-5)
+        expected = mosaic[3:7, 2:6]
+        np.testing.assert_array_equal(patch, expected)
+
+    def test_extract_patch_boundary_padding(self) -> None:
+        """Test extract_patch with boundary padding."""
+        from fishtools.preprocess.cli_stitch import extract_patch
+
+        mosaic = np.ones((10, 10), dtype=np.uint16) * 100
+
+        # Extract patch at boundary (should zero-pad)
+        patch = extract_patch(mosaic, x0=8, y0=8, size=4)
+        assert patch.shape == (4, 4)
+
+        # Top-left should have data, rest should be zero-padded
+        assert patch[0, 0] == 100
+        assert patch[0, 1] == 100
+        assert patch[1, 0] == 100
+        assert patch[1, 1] == 100
+        assert patch[2, 2] == 0  # Padded region
+        assert patch[3, 3] == 0
+
+    def test_extract_patch_negative_coords(self) -> None:
+        """Test extract_patch with negative starting coordinates."""
+        from fishtools.preprocess.cli_stitch import extract_patch
+
+        mosaic = np.ones((10, 10), dtype=np.uint16) * 100
+
+        # Extract patch starting before origin
+        patch = extract_patch(mosaic, x0=-2, y0=-2, size=4)
+        assert patch.shape == (4, 4)
+
+        # Top-left should be zero-padded, bottom-right has data
+        assert patch[0, 0] == 0
+        assert patch[1, 1] == 0
+        assert patch[2, 2] == 100
+        assert patch[3, 3] == 100
+
+    def test_slice_tile_from_zarr_basic(self, tmp_path: Path) -> None:
+        """Test slice_tile_from_zarr function."""
+        import zarr
+
+        from fishtools.preprocess.cli_stitch import slice_tile_from_zarr
+
+        # Create test zarr array (Z=2, Y=64, X=64, C=3)
+        zarr_path = tmp_path / "test.zarr"
+        arr = zarr.open_array(zarr_path, mode="w", shape=(2, 64, 64, 3), dtype=np.uint16)
+        arr[:] = np.arange(2 * 64 * 64 * 3, dtype=np.uint16).reshape(2, 64, 64, 3)
+
+        # Create fiducial mosaics (2 Z-planes)
+        fid_mosaics = {
+            0: np.ones((64, 64), dtype=np.uint16) * 1000,
+            1: np.ones((64, 64), dtype=np.uint16) * 2000,
+        }
+
+        # Slice a tile
+        tile = slice_tile_from_zarr(arr, fid_mosaics, slice_x=10, slice_y=20, tile_size=32)
+
+        # Expected shape: Z*C + n_fids = 2*3 + 2 = 8 frames
+        assert tile.shape == (8, 32, 32)
+        assert tile.dtype == np.uint16
+
+        # Verify fiducials are appended at end
+        assert tile[-2].mean() == 1000  # Fiducial Z=0
+        assert tile[-1].mean() == 2000  # Fiducial Z=1
+
+    def test_slice_tile_from_zarr_no_fiducials(self, tmp_path: Path) -> None:
+        """Test slice_tile_from_zarr without fiducials."""
+        import zarr
+
+        from fishtools.preprocess.cli_stitch import slice_tile_from_zarr
+
+        zarr_path = tmp_path / "test.zarr"
+        arr = zarr.open_array(zarr_path, mode="w", shape=(2, 64, 64, 3), dtype=np.uint16)
+        arr[:] = 500
+
+        tile = slice_tile_from_zarr(arr, fid_mosaics={}, slice_x=0, slice_y=0, tile_size=32)
+
+        # Should be just Z*C = 6 frames
+        assert tile.shape == (6, 32, 32)
+
+    def test_slice_tile_from_zarr_boundary(self, tmp_path: Path) -> None:
+        """Test slice_tile_from_zarr at mosaic boundary."""
+        import zarr
+
+        from fishtools.preprocess.cli_stitch import slice_tile_from_zarr
+
+        zarr_path = tmp_path / "test.zarr"
+        arr = zarr.open_array(zarr_path, mode="w", shape=(1, 50, 50, 2), dtype=np.uint16)
+        arr[:] = 100
+
+        # Request tile that extends past boundary
+        tile = slice_tile_from_zarr(arr, fid_mosaics={}, slice_x=30, slice_y=30, tile_size=32)
+
+        # Should be padded to full size
+        assert tile.shape == (2, 32, 32)
+
+        # Top-left 20x20 should have data, rest should be zero
+        assert tile[0, 0, 0] == 100
+        assert tile[0, 19, 19] == 100
+        assert tile[0, 20, 20] == 0  # Padded
+
+    def test_slice_mosaic_cli_missing_zarr(self, tmp_path: Path) -> None:
+        """Test slice CLI error when fused.zarr doesn't exist."""
+        runner = CliRunner()
+
+        # Create minimal workspace structure
+        workspace = tmp_path / "workspace"
+        (workspace / "analysis" / "deconv" / "stitch--roi1--shifted-1_9_17").mkdir(parents=True)
+        (workspace / "analysis" / "logs").mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("ok")
+
+        result = runner.invoke(
+            stitch,
+            ["slice", str(workspace / "analysis" / "deconv"), "roi1", "--round-name", "1_9_17"],
+        )
+
+        assert result.exit_code != 0
+        assert "fused.zarr not found" in result.output
+
+    def test_slice_mosaic_cli_missing_shifted_tc(self, tmp_path: Path) -> None:
+        """Test slice CLI error when TileConfiguration.shifted.txt doesn't exist."""
+        import zarr
+
+        runner = CliRunner()
+
+        # Create workspace with zarr but no shifted TileConfiguration
+        workspace = tmp_path / "workspace"
+        stitch_dir = workspace / "analysis" / "deconv" / "stitch--roi1--shifted-1_9_17"
+        stitch_dir.mkdir(parents=True)
+        (workspace / "analysis" / "logs").mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("ok")
+        (workspace / "stitch--roi1").mkdir(parents=True)
+
+        # Create minimal zarr
+        zarr_path = stitch_dir / "fused.zarr"
+        arr = zarr.open_array(zarr_path, mode="w", shape=(1, 64, 64, 1), dtype=np.uint16)
+        arr[:] = 100
+
+        # Create original tile config (but NOT the shifted one)
+        tc = TileConfiguration.from_pos(pd.DataFrame({0: [0.0], 1: [0.0]}))
+        tc.write(workspace / "stitch--roi1" / "TileConfiguration.registered.txt")
+
+        result = runner.invoke(
+            stitch,
+            ["slice", str(workspace / "analysis" / "deconv"), "roi1", "--round-name", "1_9_17"],
+        )
+
+        # Should fail - either via exit code or exception
+        assert result.exit_code != 0 or result.exception is not None
+        # Check error mentions missing shifted TileConfiguration
+        error_text = result.output + (str(result.exception) if result.exception else "")
+        assert "shifted" in error_text.lower() or "tileconfiguration" in error_text.lower() or isinstance(
+            result.exception, FileNotFoundError
+        )
 
 
 if __name__ == "__main__":

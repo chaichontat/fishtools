@@ -1,4 +1,5 @@
 # %%
+import csv
 import json
 import pickle
 import shutil
@@ -24,8 +25,13 @@ from fishtools.preprocess.chromatic import Affine
 from fishtools.preprocess.config import Config, Fiducial, FiducialDetailedConfig, NumpyEncoder, RegisterConfig
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
-from fishtools.preprocess.fiducial import Shifts, align_fiducials, shifts_from_anchor_roi
-from fishtools.utils.io import Workspace, safe_imwrite
+from fishtools.preprocess.fiducial import (
+    FiducialAlignmentStats,
+    Shifts,
+    align_fiducials_with_stats,
+    shifts_from_anchor_roi,
+)
+from fishtools.utils.io import FiducialPaths, Workspace, safe_imwrite
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
 
@@ -125,6 +131,16 @@ def _run_child_cli(
     return run_subprocess_streaming(argv, check=check)
 
 
+def _parse_repaired_option(value: str | None) -> set[str] | None:
+    """Convert --repaired CLI input into a normalized set of round names."""
+
+    if value is None:
+        return None
+
+    rounds = {token.strip() for token in value.split(",") if token.strip()}
+    return rounds or None
+
+
 def _copy_codebook_to_workspace(cli_path: Path, codebook_path: Path) -> Path:
     """Materialize the provided codebook inside the workspace for reproducibility.
 
@@ -200,8 +216,139 @@ def apply_deconv_scaling(
     )
 
 
+def _apply_priors_to_fids(
+    fids: dict[str, np.ndarray],
+    fid_raw_images: dict[str, np.ndarray] | None,
+    *,
+    priors: dict[str, tuple[float, float]] | None,
+    anchor_roi: Path | None,
+    idx: int,
+) -> dict[str, str]:
+    """Shift fiducials in-place using priors. Returns prior key → fid name mapping."""
+    if priors is None or anchor_roi is not None:
+        return {}
+
+    prior_mapping: dict[str, str] = {}
+    for name, sh in priors.items():
+        for file in fids:
+            if file.startswith(name):
+                fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
+                if fid_raw_images is not None and file in fid_raw_images:
+                    fid_raw_images[file] = shift(fid_raw_images[file], [sh[1], sh[0]], order=1)
+                prior_mapping[name] = file
+                break
+        else:
+            raise ValueError(
+                f"{idx}: Searched {list(fids.keys())}. Could not find file that starts with {name} for prior shift."
+            )
+
+    return prior_mapping
+
+
+def _add_priors_to_shifts(
+    shifts: dict[str, np.ndarray],
+    *,
+    priors: dict[str, tuple[float, float]] | None,
+    prior_mapping: dict[str, str],
+    anchor_roi: Path | None,
+):
+    """Add prior offsets back onto solved shift vectors."""
+    if priors is None or anchor_roi is not None:
+        return
+
+    for name, sh in priors.items():
+        mapped = prior_mapping.get(name)
+        if mapped is None:
+            continue
+        shifts[mapped][0] += sh[0]
+        shifts[mapped][1] += sh[1]
+
+
+def _parse_priors_file(path: Path | None) -> dict[str, tuple[float, float]] | None:
+    """Load explicit priors from a JSON or CSV file."""
+
+    if path is None:
+        return None
+
+    raw = path.read_text().strip()
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        pairs: dict[str, tuple[float, float]] = {}
+        reader = csv.reader(raw.splitlines())
+        for row in reader:
+            if not row:
+                continue
+            # Allow optional header row
+            if len(row) == 3 and row[0].strip().lower() == "round":
+                continue
+            if len(row) != 3:
+                raise ValueError("CSV priors must have exactly three columns: round,dx,dy.")
+            name, dx_str, dy_str = row
+            pairs[name.strip()] = (float(dx_str), float(dy_str))
+        return pairs or None
+
+    if not isinstance(data, dict):
+        raise ValueError("--priors JSON must map round → [dx, dy].")
+
+    parsed: dict[str, tuple[float, float]] = {}
+    for key, value in data.items():
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise ValueError("Each prior entry must be a two-element array of [dx, dy].")
+        parsed[str(key)] = (float(value[0]), float(value[1]))
+    return parsed or None
+
+
+def _build_register_config(
+    *,
+    reference: str,
+    threshold: float,
+    fwhm: float,
+    use_fft: bool,
+    use_itk: bool,
+    use_brightest: int,
+    allow_large_drifts: bool,
+    n_fids: int,
+    anchor_roi: Path | None = None,
+    priors: dict[str, tuple[float, float]] | None = None,
+) -> RegisterConfig:
+    """Create a RegisterConfig with consistent defaults for fiducial alignment."""
+
+    resolved_priors = priors if priors is not None else {}
+    return RegisterConfig(
+        chromatic_shifts={
+            "650": str(DATA / "560to650.txt"),
+            "750": str(DATA / "560to750.txt"),
+        },
+        fiducial=Fiducial(
+            use_fft=use_fft,
+            use_itk=use_itk,
+            fwhm=fwhm,
+            threshold=threshold,
+            priors=resolved_priors,
+            overrides={},
+            anchor_roi=anchor_roi,
+            n_fids=n_fids,
+            detailed=FiducialDetailedConfig(
+                use_brightest=max(use_brightest, 0),
+                allow_large_drifts=allow_large_drifts,
+            ),
+        ),
+        reference=reference,
+        downsample=1,
+        crop=40,
+        slices=slice(None),
+        reduce_bit_depth=0,
+        discards=None,
+    )
+
+
 def _save_debug_overlay(
     debug_dir: Path,
+    roi: str,
     idx: int,
     reference_name: str,
     shifted: dict[str, np.ndarray],
@@ -226,14 +373,31 @@ def _save_debug_overlay(
         # RGB: R=current round, G=reference round, B=0
         rgb = np.stack([img_norm, ref_norm, np.zeros_like(ref_norm)], axis=-1)
 
-        PILImage.fromarray(rgb).save(debug_dir / f"{idx:04d}-{name}.png")
+        PILImage.fromarray(rgb).save(debug_dir / f"{roi}-{idx:04d}-{name}.png")
 
 
 def _debug_fid_paths(path: Path, roi: str, idx: int) -> tuple[Path, str, str]:
-    debug_dir = path / "fids_debug"
+    paths = FiducialPaths(path, roi)
+    debug_dir = paths.debug_dir
     fids_name = f"{roi}-{idx:04d}.tif"
     shifted_name = f"{roi}-shifted-{idx:04d}.tif"
     return debug_dir, fids_name, shifted_name
+
+
+def _spot_registration_failures(
+    stats: dict[str, FiducialAlignmentStats | None],
+    *,
+    fiducial_cfg: Fiducial,
+) -> list[str]:
+    """Return rounds that fell back to ITK after spot registration failed."""
+
+    if fiducial_cfg.use_itk or fiducial_cfg.use_fft:
+        return []
+
+    failures = [
+        name for name, stat in stats.items() if stat is not None and stat.mode == "itk"
+    ]
+    return failures
 
 
 @dataclass
@@ -398,6 +562,7 @@ def run_fiducial(
         and config.registration.fiducial.anchor_roi is None  # Skip priors when using anchor ROI
         and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
         and not no_priors
+        and config.registration.fiducial.priors is None
     ):
         _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
         for shift_path in shifts_existing:
@@ -415,21 +580,13 @@ def run_fiducial(
         }
         logger.debug(config.registration.fiducial.priors)
 
-    # Skip prior application when using anchor ROIs (anchor points are absolute)
-    if config.registration.fiducial.priors is not None and config.registration.fiducial.anchor_roi is None:
-        for name, sh in config.registration.fiducial.priors.items():
-            for file in fids:
-                if file.startswith(name):
-                    fids[file] = shift(fids[file], [sh[1], sh[0]], order=1)
-                    # Also apply priors to raw fids for debug output
-                    if fids_raw is not None and file in fids_raw:
-                        fids_raw[file] = shift(fids_raw[file], [sh[1], sh[0]], order=1)
-                    prior_mapping[name] = file
-                    break
-            else:
-                raise ValueError(
-                    f"{idx}: Searched {list(fids.keys())}. Could not find file that starts with {name} for prior shift."
-                )
+    prior_mapping |= _apply_priors_to_fids(
+        fids,
+        fids_raw,
+        priors=config.registration.fiducial.priors,
+        anchor_roi=config.registration.fiducial.anchor_roi,
+        idx=idx,
+    )
 
     if config.registration.fiducial.overrides is not None:
         for name, sh in config.registration.fiducial.overrides.items():
@@ -443,14 +600,16 @@ def run_fiducial(
                 raise ValueError(f"Could not find file that starts with {name} for override shift.")
 
     # Write reference fiducial
-    (fid_path := path / f"fids--{roi}").mkdir(exist_ok=True)
+    fid_paths = FiducialPaths(path, roi)
+    fid_path = fid_paths.fid_dir
+    fid_path.mkdir(exist_ok=True)
     crop = config.registration.crop
     if crop:
         fid_img = fids[reference][crop:-crop, crop:-crop]
     else:
         fid_img = fids[reference]
     safe_imwrite(
-        fid_path / f"fids-{idx:04d}.tif",
+        fid_paths.fid_tile(idx),
         fid_img,
         compression=22610,
         compressionargs={"level": 0.65},
@@ -480,8 +639,10 @@ def run_fiducial(
         )
         shifts = {k: anchor_shifts.get(k, np.array([0.0, 0.0])) for k in fids}
         residuals = {k: 0.0 for k in fids}
+        stats: dict[str, FiducialAlignmentStats | None] = {k: None for k in fids}
+        failed_spot_rounds: list[str] = []
     else:
-        shifts, residuals = align_fiducials(
+        shifts, residuals, stats = align_fiducials_with_stats(
             fids,
             reference=reference,
             debug=debug,
@@ -496,10 +657,16 @@ def run_fiducial(
 
         assert shifts  # type: ignore
         assert residuals  # type: ignore
+        failed_spot_rounds = _spot_registration_failures(
+            stats,
+            fiducial_cfg=config.registration.fiducial,
+        )
 
     shifted = {k: shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()}
 
-    if debug:
+    should_write_debug = debug or bool(failed_spot_rounds)
+
+    if should_write_debug:
         debug_dir, fids_name, shifted_name = _debug_fid_paths(path, roi, idx)
         debug_dir.mkdir(exist_ok=True, parents=True)
         # Ensure deterministic channel ordering for debug TIFFs so that the
@@ -520,31 +687,42 @@ def run_fiducial(
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX", "key": ordered_keys},
         )
-        _save_debug_overlay(debug_dir, idx, reference, shifted)
+        _save_debug_overlay(debug_dir, roi, idx, reference, shifted)
+        if failed_spot_rounds and not debug:
+            failed = ", ".join(sorted(failed_spot_rounds))
+            logger.warning(
+                f"Spot-based registration failed for {failed}; debug fiducials saved to {debug_dir}."
+            )
 
     # Add priors to final shifts (skip when using anchor ROIs - anchor points are absolute)
-    if config.registration.fiducial.priors is not None and config.registration.fiducial.anchor_roi is None:
-        for name, sh in config.registration.fiducial.priors.items():
-            if (
-                not config.registration.fiducial.overrides
-                or name not in config.registration.fiducial.overrides
-            ):
-                shifts[prior_mapping[name]][0] += sh[0]
-                shifts[prior_mapping[name]][1] += sh[1]
+    _add_priors_to_shifts(
+        shifts,
+        priors=config.registration.fiducial.priors,
+        prior_mapping=prior_mapping,
+        anchor_roi=config.registration.fiducial.anchor_roi,
+    )
 
     (shift_path := path / f"shifts--{roi}+{codebook_name}").mkdir(exist_ok=True)
 
     _fid_ref = fids[reference][500:-500:2, 500:-500:2].flatten()
-    validated = Shifts.validate_python({
-        k: {
-            "shifts": (shifts[k][0], shifts[k][1]),
-            "residual": residuals[k],
-            "corr": 1.0
-            if reference == k
-            else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1],
+    validated = Shifts.validate_python(
+        {
+            k: {
+                "shifts": (shifts[k][0], shifts[k][1]),
+                "residual": residuals[k],
+                "corr": 1.0
+                if reference == k
+                else np.corrcoef(shifted[k][500:-500:2, 500:-500:2].flatten(), _fid_ref)[0, 1],
+                "iterations": (stats.get(k).iterations if stats.get(k) is not None else None),
+                "final_fwhm": (stats.get(k).final_fwhm if stats.get(k) is not None else None),
+                "final_threshold": (stats.get(k).final_threshold if stats.get(k) is not None else None),
+                "n_spots": (stats.get(k).n_spots if stats.get(k) is not None else None),
+                "mode": (stats.get(k).mode if stats.get(k) is not None else None),
+                "algorithm": (stats.get(k).algorithm if stats.get(k) is not None else None),
+            }
+            for k in fids
         }
-        for k in fids
-    })
+    )
     jsoned = Shifts.dump_json(validated)
     (shift_path / f"shifts-{idx:04d}.json").write_bytes(jsoned)
     logger.debug({k: f"{r.corr:03f}" for k, r in validated.items()})
@@ -562,6 +740,7 @@ def _run(
     debug: bool = False,
     overwrite: bool = False,
     no_priors: bool = False,
+    repaired_rounds: set[str] | None = None,
 ):
     logger.info("Starting")
     codebook_name = Path(codebook).stem
@@ -598,12 +777,33 @@ def _run(
     cb = json.loads(Path(codebook).read_text())
     codebook_bits = {str(bit) for bit in chain.from_iterable(cb.values())}
 
-    roi_dirs = [
-        p
-        for p in Path(path).glob(f"*--{roi}")
-        if p.is_dir()
-        and not any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
-    ]
+    # Build list of round directories, redirecting repaired rounds to --repaired folders
+    repaired_rounds = set(repaired_rounds or set())
+    roi_dirs = []
+    used_repaired: set[str] = set()
+    for p in Path(path).glob(f"*--{roi}"):
+        if not p.is_dir():
+            continue
+        if any(p.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or [])):
+            continue
+        # Check if this round should use repaired folder
+        round_name = p.name.split("--")[0]
+        if round_name in repaired_rounds:
+            repaired_path = path / f"{round_name}--{roi}--repaired"
+            if repaired_path.exists():
+                roi_dirs.append(repaired_path)
+                logger.info(f"Using repaired folder for round {round_name}: {repaired_path}")
+                used_repaired.add(round_name)
+            else:
+                raise FileNotFoundError(f"Repaired folder for round {round_name} not found: {repaired_path}")
+        else:
+            roi_dirs.append(p)
+
+    if repaired_rounds:
+        unused_repaired = repaired_rounds - used_repaired
+        if unused_repaired:
+            missing_list = ", ".join(sorted(unused_repaired))
+            logger.warning(f"Requested --repaired rounds not found for ROI {roi}: {missing_list}")
 
     available_bits = {bit for p in roi_dirs for bit in p.name.split("--")[0].split("_") if bit}
 
@@ -834,7 +1034,7 @@ def register(): ...
 @click.option(
     "--use-brightest",
     type=int,
-    default=0,
+    default=20,
     show_default=True,
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
@@ -842,6 +1042,17 @@ def register(): ...
     "--allow-large-drifts",
     is_flag=True,
     help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
+)
+@click.option(
+    "--ignore-large-shifts",
+    is_flag=True,
+    help="Alias for --allow-large-drifts; accept drifts beyond the threshold without failure.",
+)
+@click.option(
+    "--repaired",
+    type=str,
+    default=None,
+    help="Comma-separated round names to use from --repaired folders (e.g., '1_9_17,2_10_18')",
 )
 def run(
     path: Path,
@@ -857,8 +1068,10 @@ def run(
     use_fft: bool = False,
     use_itk: bool = False,
     anchors: Path | None = None,
-    use_brightest: int = 0,
+    use_brightest: int = 20,
     allow_large_drifts: bool = False,
+    ignore_large_shifts: bool = False,
+    repaired: str | None = None,
 ):
     """Preprocess image sets before spot calling.
 
@@ -890,6 +1103,9 @@ def run(
             extra={"roi": roi, "codebook": codebook_name},
         )
 
+        # Parse repaired rounds
+        repaired_rounds = _parse_repaired_option(repaired)
+
         _run(
             path,
             roi,
@@ -901,34 +1117,20 @@ def run(
             config=Config(
                 dataPath=str(DATA),
                 exclude=None,
-                registration=RegisterConfig(
-                    chromatic_shifts={
-                        "650": str(DATA / "560to650.txt"),
-                        "750": str(DATA / "560to750.txt"),
-                    },
-                    fiducial=Fiducial(
-                        use_fft=use_fft,
-                        use_itk=use_itk,
-                        fwhm=fwhm,
-                        threshold=threshold,
-                        priors={},
-                        overrides={},
-                        anchor_roi=anchors,
-                        n_fids=2,
-                        detailed=FiducialDetailedConfig(
-                            use_brightest=max(use_brightest, 0),
-                            allow_large_drifts=allow_large_drifts,
-                        ),
-                    ),
+                registration=_build_register_config(
                     reference=reference,
-                    downsample=1,
-                    crop=40,
-                    slices=slice(None),
-                    reduce_bit_depth=0,
-                    discards=None,
+                    threshold=threshold,
+                    fwhm=fwhm,
+                    use_fft=use_fft,
+                    use_itk=use_itk,
+                    use_brightest=use_brightest,
+                    allow_large_drifts=allow_large_drifts or ignore_large_shifts,
+                    n_fids=2,
+                    anchor_roi=anchors,
                 ),
             ),
             overwrite=overwrite,
+            repaired_rounds=repaired_rounds,
         )
 
 
@@ -960,7 +1162,7 @@ def run(
 @click.option(
     "--use-brightest",
     type=int,
-    default=0,
+    default=20,
     show_default=True,
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
@@ -968,6 +1170,12 @@ def run(
     "--allow-large-drifts",
     is_flag=True,
     help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
+)
+@click.option(
+    "--repaired",
+    type=str,
+    default=None,
+    help="Comma-separated round names to use from --repaired folders (e.g., '1_9_17,2_10_18')",
 )
 def batch(
     path: Path,
@@ -982,8 +1190,9 @@ def batch(
     verify: bool,
     use_fft: bool = False,
     use_itk: bool = False,
-    use_brightest: int = 0,
+    use_brightest: int = 20,
     allow_large_drifts: bool = False,
+    repaired: str | None = None,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
@@ -1042,6 +1251,7 @@ def batch(
                         ref,
                         f"--roi={roi}",
                         *(["--overwrite"] if overwrite else []),
+                        *( [f"--repaired={repaired}"] if repaired else [] ),
                         *(["--use-fft"] if use_fft else []),
                         *(["--use-itk"] if use_itk else []),
                         *( [f"--use-brightest={use_brightest}"] if use_brightest > 0 else [] ),
@@ -1117,6 +1327,7 @@ def batch(
                         ref,
                         f"--roi={roi}",
                         "--overwrite",
+                        *( [f"--repaired={repaired}"] if repaired else [] ),
                         *( ["--allow-large-drifts"] if allow_large_drifts else [] ),
                     ],
                     check=True,
@@ -1135,6 +1346,264 @@ def batch(
 
 
 register.add_command(batch)
+
+
+@register.command("fix-shifts")
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.option("--roi", "-o", type=str, required=True, help="ROI to process")
+@click.option("--reference", "-r", type=str, default="2_10_18", help="Reference round name")
+@click.option(
+    "--rounds",
+    type=str,
+    required=True,
+    help="Comma-separated list of rounds to fix (e.g., '1_9_17,3_11_19')",
+)
+@click.option("--use-fft/--use-spots", default=False, help="Use FFT phase correlation or spot-based (default)")
+@click.option("--n-fids", type=int, default=2, help="Number of fiducial frames per image")
+@click.option("--threshold", type=float, default=5.0, help="Spot detection threshold (sigma)")
+@click.option("--fwhm", type=float, default=4.0, help="Fiducial spot FWHM")
+@click.option(
+    "--use-brightest",
+    type=int,
+    default=20,
+    show_default=True,
+    help="If >0, use only the N brightest fiducials (matches register run).",
+)
+@click.option(
+    "--allow-large-drifts/--strict-drifts",
+    default=True,
+    show_default=True,
+    help="Enable the same allow_large_drifts toggle used in register run.",
+)
+@click.option(
+    "--priors",
+    type=str,
+    default=None,
+    help="Prior shift as 'dx,dy' for the target round, or path to JSON/CSV mapping round→dx,dy.",
+)
+@click.option("--debug", is_flag=True)
+def fix_shifts(
+    path: Path,
+    roi: str,
+    reference: str,
+    rounds: str,
+    use_fft: bool,
+    n_fids: int,
+    threshold: float,
+    fwhm: float,
+    use_brightest: int,
+    allow_large_drifts: bool,
+    priors: str | None,
+    debug: bool,
+):
+    """Detect large drift offsets and write shifts to JSON.
+
+    Uses the SAME registration algorithm as the main pipeline (align_fiducials)
+    but with allow_large_drifts=True. Only detects and writes shifts - does NOT
+    apply them to images.
+
+    The output JSON can be used to inform priors for `register batch`.
+
+    Example:
+
+    \b
+        # Detect large shifts
+        preprocess register fix-shifts /ws --roi roi1 \\
+            --rounds "1_9_17,3_11_19" --reference 2_10_18
+
+    \b
+        # Review detected shifts
+        cat /ws/analysis/deconv/shifts--roi1/coarse_shifts.json
+    """
+    import json as json_module
+
+    setup_cli_logging(
+        path,
+        component="preprocess.register.fix-shifts",
+        file=f"fix-shifts-{roi}",
+        debug=debug,
+        extra={"roi": roi, "reference": reference},
+    )
+
+    rounds_to_fix = [r.strip() for r in rounds.split(",")]
+
+    cli_priors: dict[str, tuple[float, float]] | None = None
+    if priors is not None:
+        priors_value = priors.strip()
+        # First, try simple "dx,dy" format; this requires exactly one target round.
+        parts = [p.strip() for p in priors_value.split(",")]
+        if len(parts) == 2:
+            if len(rounds_to_fix) != 1:
+                raise click.ClickException(
+                    "--priors as 'dx,dy' requires exactly one --rounds entry."
+                )
+            dx, dy = float(parts[0]), float(parts[1])
+            cli_priors = {rounds_to_fix[0]: (dx, dy)}
+        else:
+            # Fallback: treat as path to JSON/CSV mapping round→[dx,dy]
+            cli_priors = _parse_priors_file(Path(priors_value))
+
+    if cli_priors:
+        logger.info(f"Using explicit priors for rounds: {sorted(cli_priors)}")
+
+    config = Config(
+        dataPath=str(DATA),
+        exclude=None,
+        registration=_build_register_config(
+            reference=reference,
+            threshold=threshold,
+            fwhm=fwhm,
+            use_fft=use_fft,
+            use_itk=False,
+            use_brightest=use_brightest,
+            allow_large_drifts=allow_large_drifts,
+            n_fids=n_fids,
+            priors=cli_priors,
+        ),
+    )
+    fiducial_cfg = config.registration.fiducial
+
+    logger.info(f"Processing rounds: {rounds_to_fix}")
+    logger.info(f"Reference round: {reference}")
+    logger.info(f"ROI: {roi}")
+
+    # Validate rounds exist
+    ref_dir = path / f"{reference}--{roi}"
+    if not ref_dir.exists():
+        raise ValueError(f"Reference round directory not found: {ref_dir}")
+
+    for round_name in rounds_to_fix:
+        round_dir = path / f"{round_name}--{roi}"
+        if not round_dir.exists():
+            raise ValueError(f"Round directory not found: {round_dir}")
+
+    # Get list of tile indices from reference
+    ref_tiles = sorted(ref_dir.glob(f"{reference}-*.tif"))
+    if not ref_tiles:
+        raise ValueError(f"No tiles found in reference directory: {ref_dir}")
+
+    idxs = [int(p.stem.split("-")[1]) for p in ref_tiles]
+    logger.info(f"Found {len(idxs)} tiles to process")
+
+    # Results storage: {idx: {round_name: {dx, dy, residual, corr}}}
+    all_results: dict[int, dict[str, dict[str, float]]] = {}
+
+    # Process each tile - same logic as _run() but for specified rounds only
+    for idx in idxs:
+        logger.info(f"Processing tile {idx}")
+
+        # Load fiducial images using the same preprocessing as register run
+        fids: dict[str, np.ndarray] = {}
+        use_raw = fiducial_cfg.use_fft or fiducial_cfg.use_itk
+
+        # Load reference fiducial
+        ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
+        ref_img = Image.from_file(ref_path, n_fids=n_fids)
+        fids[reference] = ref_img.fid_raw.astype(np.float32) if use_raw else ref_img.fid
+
+        # Track raw fiducials for debug overlays (optional)
+        fid_raw_images: dict[str, np.ndarray] | None = None
+        if debug:
+            fid_raw_images = {reference: ref_img.fid_raw.astype(np.float32)}
+
+        # Load target fiducials
+        for round_name in rounds_to_fix:
+            round_dir = path / f"{round_name}--{roi}"
+            target_path = round_dir / f"{round_name}-{idx:04d}.tif"
+            if not target_path.exists():
+                logger.warning(f"Target tile not found: {target_path}, skipping")
+                continue
+            target_img = Image.from_file(target_path, n_fids=n_fids)
+            fid = target_img.fid_raw.astype(np.float32) if use_raw else target_img.fid
+            fids[round_name] = fid
+            if fid_raw_images is not None:
+                fid_raw_images[round_name] = target_img.fid_raw.astype(np.float32)
+
+        prior_mapping = _apply_priors_to_fids(
+            fids,
+            fid_raw_images,
+            priors=fiducial_cfg.priors,
+            anchor_roi=fiducial_cfg.anchor_roi,
+            idx=idx,
+        )
+
+        shifts, residuals, _ = align_fiducials_with_stats(
+            fids,
+            reference=reference,
+            debug=debug,
+            max_iters=5,
+            threshold_sigma=fiducial_cfg.threshold,
+            fwhm=fiducial_cfg.fwhm,
+            use_fft=fiducial_cfg.use_fft,
+            use_itk=fiducial_cfg.use_itk,
+            use_brightest=fiducial_cfg.detailed.use_brightest,
+            detailed_config=fiducial_cfg.detailed,
+        )
+
+        _add_priors_to_shifts(
+            shifts,
+            priors=fiducial_cfg.priors,
+            prior_mapping=prior_mapping,
+            anchor_roi=fiducial_cfg.anchor_roi,
+        )
+
+        # Store results
+        tile_results: dict[str, dict[str, float]] = {}
+        for round_name in rounds_to_fix:
+            if round_name in shifts:
+                # Add prior back to get total shift
+                dx = float(shifts[round_name][0])
+                dy = float(shifts[round_name][1])
+                magnitude = float(np.hypot(dx, dy))
+                tile_results[round_name] = {
+                    "dx": dx,
+                    "dy": dy,
+                    "magnitude": magnitude,
+                    "residual": float(residuals.get(round_name, 0.0)),
+                }
+                logger.info(f"  {round_name}: dx={dx:.2f}, dy={dy:.2f}, mag={magnitude:.1f}")
+
+        all_results[idx] = tile_results
+
+    # Write results JSON
+    shifts_dir = path / f"shifts--{roi}"
+    shifts_dir.mkdir(exist_ok=True)
+    output_path = shifts_dir / "coarse_shifts.json"
+
+    output_data: dict[str, Any] = {
+        "reference": reference,
+        "use_fft": use_fft,
+        "tiles": {f"{idx:04d}": results for idx, results in sorted(all_results.items())},
+    }
+    if cli_priors is not None:
+        output_data["priors"] = {
+            name: {"dx": dx, "dy": dy}
+            for name, (dx, dy) in sorted(cli_priors.items())
+        }
+    output_path.write_text(json_module.dumps(output_data, indent=2))
+    logger.info(f"Wrote coarse shifts to {output_path}")
+
+    # Summary
+    for round_name in rounds_to_fix:
+        per_round = [r[round_name] for r in all_results.values() if round_name in r]
+        magnitudes = [rec["magnitude"] for rec in per_round]
+        if magnitudes:
+            dx_vals = [rec["dx"] for rec in per_round]
+            dy_vals = [rec["dy"] for rec in per_round]
+            median_dx = np.median(dx_vals)
+            median_dy = np.median(dy_vals)
+            logger.info(
+                f"{round_name}: median=({median_dx:.1f}, {median_dy:.1f}), "
+                f"mean mag={np.mean(magnitudes):.1f}px, max mag={np.max(magnitudes):.1f}px"
+            )
+            max_abs_dx = float(np.max(np.abs(dx_vals)))
+            max_abs_dy = float(np.max(np.abs(dy_vals)))
+            if max_abs_dx < 35.0 and max_abs_dy < 35.0:
+                logger.warning(
+                    f"{round_name}: all detected drifts are <35 px in both X and Y; "
+                    "fix-shifts may not be necessary for this round."
+                )
+
 
 if __name__ == "__main__":
     register()

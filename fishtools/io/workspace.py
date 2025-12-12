@@ -97,6 +97,42 @@ class OptimizePath:
         return self.path / "global_scale.txt"
 
 
+@dataclass
+class FiducialPaths:
+    """Fiducial and fiducial-debug paths scoped to a single ROI.
+
+    This helper centralizes the on-disk layout for fiducial artifacts under
+    the deconvolved tree (analysis/deconv), including:
+
+    - Fiducial thumbnails per ROI/tile index:
+      ``<deconved>/fids--{roi}/fids-{idx:04d}.tif``
+    - Debug stacks and overlays (when registration runs with --debug):
+      ``<deconved>/fids_debug/{roi}/``.
+    """
+
+    deconved_root: Path
+    roi: str
+
+    @property
+    def fid_dir(self) -> Path:
+        """Directory containing fiducial thumbnails for this ROI."""
+        return self.deconved_root / f"fids--{self.roi}"
+
+    def fid_tile(self, idx: int | str) -> Path:
+        """Path to a fiducial TIFF for the specified tile index."""
+        if isinstance(idx, int):
+            suffix = f"{idx:04d}"
+        else:
+            idx_str = str(idx)
+            suffix = f"{int(idx_str):04d}" if idx_str.isdigit() else idx_str
+        return self.fid_dir / f"fids-{suffix}.tif"
+
+    @property
+    def debug_dir(self) -> Path:
+        """Directory containing debug fiducial stacks and overlays."""
+        return self.deconved_root / "fids_debug" / self.roi
+
+
 # Backward compatibility: codebook utilities are resolved elsewhere
 
 
@@ -295,6 +331,9 @@ class Workspace:
                 match = self.ROI_CODEBOOK_PATTERN.match(p.name)
                 if match:
                     roi_name = match.group(1)
+                    # Discard everything after second '--' (e.g., 'roi1--shifted-1_9_17' → 'roi1')
+                    if "--" in roi_name:
+                        roi_name = roi_name.split("--")[0]
                     rois_set.add(roi_name)
 
         return sorted(rois_set)
@@ -655,17 +694,12 @@ class Workspace:
     def fids(self, roi: str) -> Path:
         """Return path to fiducial marker directory for a given ROI."""
 
-        return self.deconved / f"fids--{roi}"
+        return FiducialPaths(self.deconved, roi).fid_dir
 
     def fid(self, roi: str, idx: int | str) -> Path:
         """Return path to a fiducial TIFF for the specified ROI and tile index."""
 
-        if isinstance(idx, int):
-            suffix = f"{idx:04d}"
-        else:
-            idx_str = str(idx)
-            suffix = f"{int(idx_str):04d}" if idx_str.isdigit() else idx_str
-        return self.fids(roi) / f"fids-{suffix}.tif"
+        return FiducialPaths(self.deconved, roi).fid_tile(idx)
 
     def tile_positions_csv(self, roi: str, *, position_file: Path | None = None) -> Path:
         """Resolve the CSV containing tile positions for a given ROI."""
