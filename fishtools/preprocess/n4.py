@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 import shutil
+import threading
 from concurrent.futures import as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +57,10 @@ QUANT_MIN_RANGE = 1e-6
 # Add a small headroom above the chosen upper percentile so that
 # a tiny fraction of very bright pixels do not saturate to 0xFFFF.
 # This does not change the recorded percentile but widens the scale used.
+
+
+_GPU_SEMAPHORE = threading.Semaphore(4)
+_UNSHARP_SEMAPHORE = threading.Semaphore(1)
 
 
 # Custom CuPy kernels removed for simplicity. We perform per‑plane division and
@@ -126,6 +131,61 @@ def _write_png_normalized(field: np.ndarray, png_path: Path, long_edge_max: int 
     f_small = f[::stride, ::stride]
     img8 = _normalize_to_uint8_by_percentile(f_small, 1.0, 99.0)
     Image.fromarray(img8, mode="L").save(png_path)
+
+
+def _normalize_channel_to_uint8(img: np.ndarray, p_lo: float = 1.0, p_hi: float = 99.0) -> np.ndarray:
+    """Normalize a single channel to uint8 using percentile-based scaling.
+
+    Uses the same approach as _normalize_to_uint8_by_percentile but works on
+    any numeric dtype and handles the downsampled thumbnail case.
+    """
+    f = np.asarray(img, dtype=np.float32)
+    # Exclude zeros from percentile calculation (background)
+    nonzero_mask = f > 0
+    if not np.any(nonzero_mask):
+        return np.zeros(f.shape, dtype=np.uint8)
+
+    sample = f[nonzero_mask]
+    # Subsample if too large
+    if sample.size > 50_000:
+        rng = np.random.default_rng(0)
+        idx = rng.choice(sample.size, size=50_000, replace=False)
+        sample = sample[idx]
+
+    p1, p99 = np.percentile(sample, [p_lo, p_hi])
+    if not np.isfinite(p1):
+        p1 = 0.0
+    if not np.isfinite(p99) or p99 <= p1:
+        p99 = p1 + 1.0
+
+    fn = np.clip((f - p1) / (p99 - p1), 0.0, 1.0)
+    return (fn * 255.0 + 0.5).astype(np.uint8)
+
+
+def _write_corrected_thumbnail(
+    planes_u16: Sequence[np.ndarray],
+    png_path: Path,
+    downsample: int = 8,
+) -> None:
+    """Write RGB thumbnail from up to 3 uint16 channel planes.
+
+    Downsamples spatially and normalizes each channel independently using
+    percentile-based scaling (1-99%) to match the visual appearance of
+    non-N4-corrected thumbnails.
+    """
+    if not planes_u16:
+        return
+    channels: list[np.ndarray] = []
+    for p in planes_u16[:3]:
+        small = np.asarray(p, dtype=np.uint16)[::downsample, ::downsample]
+        channels.append(_normalize_channel_to_uint8(small, p_lo=1.0, p_hi=99.0))
+
+    h, w = channels[0].shape
+    while len(channels) < 3:
+        channels.append(np.zeros((h, w), dtype=np.uint8))
+
+    rgb = np.stack(channels, axis=-1)
+    Image.fromarray(rgb, mode="RGB").save(png_path)
 
 
 def _ensure_float32(arr: np.ndarray) -> np.ndarray:
@@ -228,6 +288,237 @@ def _summarize_threshold_spec(threshold: float | str | None) -> dict[str, Any]:
 
 
 QUANT_MAX_SAMPLES = 50_000
+QUANT_STRATIFICATION_GRID = 4  # 4x4 = 16 strata for spatial coverage
+# Exclude strata with >90% zero values (i.e., require at least 10% non-zero pixels)
+QUANT_STRATUM_ZERO_THRESHOLD = 0.90
+
+
+def _random_sample_masked_values(
+    arr: np.ndarray,
+    mask: np.ndarray,
+    *,
+    max_samples: int = QUANT_MAX_SAMPLES,
+    seed: int = 0,
+) -> tuple[np.ndarray, int]:
+    """Pure random sampling (non-stratified) from masked values."""
+    data = _ensure_float32(arr)
+    mask_bool = np.asarray(mask, dtype=bool)
+    if data.shape != mask_bool.shape:
+        raise ValueError(f"Mask shape {mask_bool.shape} does not match data shape {data.shape}")
+
+    flat_mask = mask_bool.ravel()
+    flat_data = data.ravel()
+    total = flat_mask.size
+    n_true = int(np.count_nonzero(flat_mask))
+
+    if n_true == 0:
+        # Fallback: no mask coverage; operate on all finite pixels.
+        finite = np.isfinite(flat_data)
+        if not np.any(finite):
+            return np.zeros(0, dtype=np.float32), 0
+        full = flat_data[finite]
+        if full.size <= max_samples:
+            return full.astype(np.float32, copy=False), full.size
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(full.size, size=max_samples, replace=False)
+        return full[idx].astype(np.float32, copy=False), full.size
+
+    if n_true <= max_samples:
+        # Small mask: materialize full masked values.
+        values = flat_data[flat_mask]
+        return values.astype(np.float32, copy=False), n_true
+
+    rng = np.random.default_rng(seed)
+    samples: list[np.ndarray] = []
+    remaining = max_samples
+    # Batch size balances vectorization with rejection rate; upper-bounded by total.
+    batch_size = min(max_samples * 4, total)
+    while remaining > 0:
+        idx = rng.integers(0, total, size=batch_size)
+        valid_idx = idx[flat_mask[idx]]
+        if valid_idx.size == 0:
+            continue
+        take = min(remaining, int(valid_idx.size))
+        samples.append(flat_data[valid_idx[:take]])
+        remaining -= take
+
+    sample_arr = np.concatenate(samples, axis=0)
+    return sample_arr.astype(np.float32, copy=False), n_true
+
+
+def _stratified_sample_masked_values(
+    arr: np.ndarray,
+    mask: np.ndarray,
+    *,
+    max_samples: int = QUANT_MAX_SAMPLES,
+    grid_size: int = QUANT_STRATIFICATION_GRID,
+    seed: int = 0,
+) -> tuple[np.ndarray, int]:
+    """
+    Stratified random sampling for robust percentile estimation.
+
+    Divides the image into a grid of strata and samples proportionally from each,
+    guaranteeing spatial coverage across the image. This reduces variance in
+    percentile estimates when intensity distributions vary spatially.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        2D array of values to sample from.
+    mask : np.ndarray
+        2D boolean mask indicating valid pixels.
+    max_samples : int
+        Maximum total samples to return.
+    grid_size : int
+        Number of divisions along each axis (grid_size x grid_size strata).
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    samples : np.ndarray
+        Stratified random samples from masked region.
+    population_count : int
+        Total number of masked pixels across all strata.
+    """
+    data = _ensure_float32(arr)
+    mask_bool = np.asarray(mask, dtype=bool)
+
+    if data.ndim != 2:
+        # Fall back to random sampling for non-2D arrays
+        return _random_sample_masked_values(arr, mask, max_samples=max_samples, seed=seed)
+
+    if data.shape != mask_bool.shape:
+        raise ValueError(f"Mask shape {mask_bool.shape} does not match data shape {data.shape}")
+
+    h, w = data.shape
+    rng = np.random.default_rng(seed)
+
+    # Count masked pixels per stratum to allocate samples proportionally.
+    # Exclude strata with >90% zero values to avoid edge artifacts.
+    stratum_info: list[tuple[int, int, int, int, int]] = []  # (y0, y1, x0, x1, count)
+    total_masked = 0
+    excluded_strata = 0
+
+    for i in range(grid_size):
+        for j in range(grid_size):
+            y0 = i * h // grid_size
+            y1 = ((i + 1) * h // grid_size) if i < grid_size - 1 else h
+            x0 = j * w // grid_size
+            x1 = ((j + 1) * w // grid_size) if j < grid_size - 1 else w
+
+            tile_size = (y1 - y0) * (x1 - x0)
+            count = int(np.count_nonzero(mask_bool[y0:y1, x0:x1]))
+            zero_fraction = 1.0 - (count / tile_size) if tile_size > 0 else 1.0
+            # Only include strata with <=90% zeros (i.e., at least 10% non-zero)
+            if zero_fraction <= QUANT_STRATUM_ZERO_THRESHOLD:
+                stratum_info.append((y0, y1, x0, x1, count))
+                total_masked += count
+            elif count > 0:
+                excluded_strata += 1
+
+    if total_masked == 0:
+        # Fall back to random sampling (handles empty mask case)
+        return _random_sample_masked_values(arr, mask, max_samples=max_samples, seed=seed)
+
+    n_strata_total = grid_size * grid_size
+    n_strata_active = len(stratum_info)
+    logger.debug(
+        "Stratified sampling: {active}/{total} strata included ({excluded} excluded for >{thresh:.0%} zeros), {masked} total pixels",
+        active=n_strata_active,
+        total=n_strata_total,
+        excluded=excluded_strata,
+        thresh=QUANT_STRATUM_ZERO_THRESHOLD,
+        masked=total_masked,
+    )
+
+    if total_masked <= max_samples:
+        # Small enough to return all masked values
+        values = data[mask_bool]
+        return values.astype(np.float32, copy=False), total_masked
+
+    # Allocate samples proportionally to each stratum (blank strata already excluded)
+    all_samples: list[np.ndarray] = []
+
+    for y0, y1, x0, x1, stratum_count in stratum_info:
+        # Proportional allocation
+        n_samples = max(1, int(round(max_samples * stratum_count / total_masked)))
+
+        tile_data = data[y0:y1, x0:x1]
+        tile_mask = mask_bool[y0:y1, x0:x1]
+        masked_values = tile_data[tile_mask]
+
+        if len(masked_values) <= n_samples:
+            # Take all values from this stratum
+            all_samples.append(masked_values.astype(np.float32, copy=False))
+        else:
+            # Random sample within stratum
+            idx = rng.choice(len(masked_values), size=n_samples, replace=False)
+            all_samples.append(masked_values[idx].astype(np.float32, copy=False))
+
+    samples = np.concatenate(all_samples, axis=0)
+
+    # Trim to max_samples if proportional allocation exceeded it
+    if len(samples) > max_samples:
+        idx = rng.choice(len(samples), size=max_samples, replace=False)
+        samples = samples[idx]
+
+    return samples, total_masked
+
+
+def _sample_masked_values(
+    arr: np.ndarray,
+    mask: np.ndarray,
+    *,
+    max_samples: int = QUANT_MAX_SAMPLES,
+    seed: int = 0,
+    stratified: bool = True,
+    grid_size: int = QUANT_STRATIFICATION_GRID,
+) -> tuple[np.ndarray, int]:
+    """
+    Return up to `max_samples` finite samples from `arr[mask]` plus the population count.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Array of values to sample from.
+    mask : np.ndarray
+        Boolean mask indicating valid pixels.
+    max_samples : int
+        Maximum number of samples to return.
+    seed : int
+        Random seed for reproducibility.
+    stratified : bool
+        If True (default), use stratified spatial sampling to ensure coverage
+        across all regions of the image. If False, use pure random sampling.
+    grid_size : int
+        Number of divisions per axis for stratification (grid_size x grid_size strata).
+
+    Returns
+    -------
+    samples : np.ndarray
+        Up to `max_samples` values drawn from arr[mask]. If mask is empty,
+        falls back to sampling from all finite pixels.
+    population_count : int
+        The total number of masked elements, representing the statistical
+        population from which samples were drawn.
+
+    Notes
+    -----
+    Stratified sampling divides the image into a grid and samples proportionally
+    from each cell, guaranteeing spatial coverage. This reduces variance in
+    percentile estimates when intensity distributions vary spatially (e.g., due
+    to illumination gradients or tissue heterogeneity).
+
+    The population_count is used downstream to decide percentile reliability:
+    with fewer than ~200k population elements, high percentiles (99.99%) become
+    statistically unreliable and a fallback (99.9%) is used instead.
+    """
+    if stratified and arr.ndim == 2:
+        return _stratified_sample_masked_values(
+            arr, mask, max_samples=max_samples, grid_size=grid_size, seed=seed
+        )
+    return _random_sample_masked_values(arr, mask, max_samples=max_samples, seed=seed)
 
 
 def _float_store_path(path: Path) -> Path:
@@ -243,7 +534,13 @@ def _cupy_to_numpy(array: cupy_ndarray) -> np.ndarray:
     return np.asarray(cp.asnumpy(array), dtype=np.float32)
 
 
-def _apply_unsharp_mask_if_enabled(image: np.ndarray, *, mask: np.ndarray, enabled: bool) -> np.ndarray:
+def _apply_unsharp_mask_if_enabled(
+    image: np.ndarray,
+    *,
+    mask: np.ndarray,
+    enabled: bool,
+    context: str | None = None,
+) -> np.ndarray:
     """Apply CuCIM unsharp mask to `image` within `mask` when enabled."""
 
     if not enabled:
@@ -253,20 +550,55 @@ def _apply_unsharp_mask_if_enabled(image: np.ndarray, *, mask: np.ndarray, enabl
     if not np.any(mask_bool):
         return _ensure_float32(image)
 
-    image_gpu = cp.asarray(image, dtype=cp.float32)
-    mask_gpu = cp.asarray(mask_bool, dtype=cp.bool_)
-    # Explicit radius for consistency across pipeline components
-    sharpened_gpu = cucim_filters.unsharp_mask(image_gpu, radius=3, preserve_range=True)
-    result_gpu = cp.where(mask_gpu, sharpened_gpu, image_gpu)
-    result = _cupy_to_numpy(result_gpu)
-    # Explicitly drop GPU references before forcing pool cleanup
-    del result_gpu
-    del sharpened_gpu
-    del mask_gpu
-    del image_gpu
+    ctx = f" ({context})" if context else ""
+    with _UNSHARP_SEMAPHORE:
+        logger.debug("Running standalone unsharp mask%s", ctx)
+        image_gpu = cp.asarray(image, dtype=cp.float32)
+        mask_gpu = cp.asarray(mask_bool, dtype=cp.bool_)
+        # Explicit radius for consistency across pipeline components
+        sharpened_gpu = cucim_filters.unsharp_mask(image_gpu, radius=3, preserve_range=True)
+        result_gpu = cp.where(mask_gpu, sharpened_gpu, image_gpu)
+        result = _cupy_to_numpy(result_gpu)
+        # Explicitly drop GPU references before forcing pool cleanup
+        del result_gpu
+        del sharpened_gpu
+        del mask_gpu
+        del image_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
     # Force clear VRAM after the initial unsharp mask: free CuPy pools
     # Memory pool cleanup omitted for simplicity.
     return result
+
+
+def _correct_plane_cpu_for_quant(
+    plane: np.ndarray,
+    *,
+    field_cpu: np.ndarray,
+    mask_cpu: np.ndarray | None,
+    use_unsharp_mask: bool,
+) -> np.ndarray:
+    """CPU-only correction path used for percentile sampling."""
+
+    plane_f = np.asarray(plane, dtype=np.float32)
+    field_f = np.asarray(field_cpu, dtype=np.float32)
+    if plane_f.shape != field_f.shape:
+        raise ValueError(f"Plane shape {plane_f.shape} does not match field {field_f.shape}")
+    corrected = plane_f / field_f
+    if mask_cpu is not None:
+        mask_bool = np.asarray(mask_cpu, dtype=bool)
+        if mask_bool.shape != corrected.shape:
+            raise ValueError(f"Mask shape {mask_bool.shape} does not match plane shape {corrected.shape}")
+    else:
+        mask_bool = corrected > 0.0
+
+    if use_unsharp_mask and np.any(mask_bool):
+        sharpened = filters.unsharp_mask(corrected, radius=3, preserve_range=True)
+        corrected = np.where(mask_bool, sharpened, corrected)
+    else:
+        corrected = np.where(mask_bool, corrected, 0.0)
+    np.nan_to_num(corrected, copy=False)
+    return corrected.astype(np.float32, copy=False)
 
 
 def _correct_plane_gpu(
@@ -275,44 +607,57 @@ def _correct_plane_gpu(
     field_gpu: cupy_ndarray,
     use_unsharp_mask: bool,
     mask_cpu: np.ndarray | None = None,
+    tile_size: int | None = None,
+    tile_threshold: int | None = None,
 ) -> np.ndarray:
     """Return corrected plane as float32 (CPU): (plane / field) with optional unsharp mask.
 
     The field must already be on GPU. This function copies the plane to GPU,
     performs division (+optional unsharp), sanitizes non-finite values, and returns CPU float32.
 
-    Set TILED=1 environment variable to use memory-efficient tiled processing for large images.
+    Tiled processing is enabled by default; set TILED=0 (or "false") to force
+    the legacy full-plane mode for debugging.
     """
-    # Use tiled processing if TILED=1 is set (reduces GPU memory for large images)
-    if os.environ.get("TILED", "").strip() == "1":
+    tiled_env = os.environ.get("TILED", "").strip().lower()
+    use_tiled = tiled_env not in {"0", "false"}
+    if use_tiled:
         from fishtools.preprocess.n4_tiled import correct_plane_gpu_tiled
+        with _GPU_SEMAPHORE:
+            logger.debug(
+                "Correcting plane on GPU (tiled) -- unsharp_mask=%s",
+                use_unsharp_mask,
+            )
+            return correct_plane_gpu_tiled(
+                plane,
+                field_gpu=field_gpu,
+                use_unsharp_mask=use_unsharp_mask,
+                mask_cpu=mask_cpu,
+                tile_size=tile_size,
+                tile_threshold=tile_threshold,
+            )
 
-        return correct_plane_gpu_tiled(
-            plane,
-            field_gpu=field_gpu,
-            use_unsharp_mask=use_unsharp_mask,
-            mask_cpu=mask_cpu,
-            tile_size=None,  # Auto-detect
+    with _GPU_SEMAPHORE:
+        logger.debug(
+            "Correcting plane on GPU (full-frame) -- unsharp_mask=%s (tiles disabled)", use_unsharp_mask
         )
-
-    img_gpu = cp.asarray(np.asarray(plane, dtype=np.float32), dtype=cp.float32)
-    img_gpu /= field_gpu
-    if use_unsharp_mask:
-        # Apply explicit radius to match segmentation and normalization defaults
-        sharpened_gpu = cucim_filters.unsharp_mask(img_gpu, radius=3, preserve_range=True)
-        if mask_cpu is not None:
-            if mask_cpu.shape != plane.shape:
-                raise ValueError(f"Mask shape {mask_cpu.shape} does not match plane shape {plane.shape}")
-            mask_gpu = cp.asarray(mask_cpu, dtype=cp.bool_)
-        else:
-            # Fallback to >0 mask on corrected plane
-            mask_gpu = img_gpu > 0.0
-        img_gpu = cp.where(mask_gpu, sharpened_gpu, img_gpu)
-        del sharpened_gpu, mask_gpu
-    # Replace non-finite with zeros for safety
-    cp.nan_to_num(img_gpu, copy=False)
-    corrected = cp.asnumpy(img_gpu).astype(np.float32, copy=False)
-    del img_gpu
+        img_gpu = cp.asarray(np.asarray(plane, dtype=np.float32), dtype=cp.float32)
+        img_gpu /= field_gpu
+        if use_unsharp_mask:
+            # Apply explicit radius to match segmentation and normalization defaults
+            sharpened_gpu = cucim_filters.unsharp_mask(img_gpu, radius=3, preserve_range=True)
+            if mask_cpu is not None:
+                if mask_cpu.shape != plane.shape:
+                    raise ValueError(f"Mask shape {mask_cpu.shape} does not match plane shape {plane.shape}")
+                mask_gpu = cp.asarray(mask_cpu, dtype=cp.bool_)
+            else:
+                # Fallback to >0 mask on corrected plane
+                mask_gpu = img_gpu > 0.0
+            img_gpu = cp.where(mask_gpu, sharpened_gpu, img_gpu)
+            del sharpened_gpu, mask_gpu
+        # Replace non-finite with zeros for safety
+        cp.nan_to_num(img_gpu, copy=False)
+        corrected = cp.asnumpy(img_gpu).astype(np.float32, copy=False)
+        del img_gpu
     return corrected
 
 
@@ -321,19 +666,35 @@ def _compute_channel_quant_from_single_plane(
     mask: np.ndarray,
 ) -> QuantizationParams:
     """Compute channel quantization from a single corrected plane using fixed percentiles."""
-    arr = np.asarray(corrected_plane, dtype=np.float32)
-    arr = np.where(np.isfinite(arr), arr, 0.0)
+    arr = _ensure_float32(corrected_plane)
     maskb = np.asarray(mask, dtype=bool)
     if maskb.shape != arr.shape:
         raise ValueError(f"Quantization mask shape {maskb.shape} does not match corrected plane {arr.shape}")
-    data = arr[maskb]
+
+    # Deterministic random subsampling to keep memory bounded on large planes.
+    # population_count is the total masked pixels (not sample size) - used for percentile reliability.
+    data, population_count = _sample_masked_values(arr, maskb, max_samples=QUANT_MAX_SAMPLES, seed=0)
     if data.size == 0:
-        # Fallback to the whole plane if mask is empty
-        data = arr.ravel()
+        # No finite samples; fall back to zeros with minimal range.
+        lower = 0.0
+        upper = QUANT_MIN_RANGE
+        observed_min = 0.0
+        observed_max = 0.0
+        return QuantizationParams(
+            lower=lower,
+            upper=upper,
+            observed_min=observed_min,
+            observed_max=observed_max,
+            lower_percentile=QUANT_LOWER_PERCENTILE,
+            upper_percentile=QUANT_FALLBACK_UPPER_PERCENTILE,
+            sample_count=population_count,
+        )
+
     lower = float(np.percentile(data, QUANT_LOWER_PERCENTILE))
-    # When very few finite pixels exist, fall back to 99.9 for stability
+    # When population is small (<200k pixels), 99.99th percentile represents <20 actual
+    # pixels which is statistically unreliable; fall back to 99.9 for stability.
     upper_pct = QUANT_UPPER_PERCENTILE
-    if data.size < QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE:
+    if population_count < QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE:
         upper_pct = QUANT_FALLBACK_UPPER_PERCENTILE
     upper = float(np.percentile(data, upper_pct))
     if not math.isfinite(lower):
@@ -345,14 +706,16 @@ def _compute_channel_quant_from_single_plane(
         center = (upper + lower) * 0.5
         lower = center - QUANT_MIN_RANGE * 0.5
         upper = center + QUANT_MIN_RANGE * 0.5
+    observed_min = float(np.nanmin(data))
+    observed_max = float(np.nanmax(data))
     return QuantizationParams(
         lower=lower,
         upper=upper,
-        observed_min=float(np.nanmin(data)),
-        observed_max=float(np.nanmax(data)),
+        observed_min=observed_min,
+        observed_max=observed_max,
         lower_percentile=QUANT_LOWER_PERCENTILE,
         upper_percentile=upper_pct,
-        sample_count=int(data.size),
+        sample_count=population_count,
     )
 
 
@@ -424,6 +787,9 @@ class N4RuntimeConfig:
     debug: bool = False
     threshold: float | str | None = None
     use_unsharp_mask: bool = False
+    threads: int | None = None
+    tile_size: int | None = None
+    tile_threshold: int | None = None
 
 
 @dataclass(slots=True)
@@ -551,8 +917,18 @@ def _write_fused_corrected_zyxc(
     output_path: Path | None,
     debug: bool,
     use_unsharp_mask: bool,
+    tile_size: int | None,
+    tile_threshold: int | None,
 ) -> Path:
-    """Write corrected imagery to Zarr with axes ordered as ZYXC."""
+    """
+    Write corrected imagery to Zarr with axes ordered as ZYXC.
+
+    Quantization uses a per-channel reference plane to estimate lower/upper
+    percentiles (0.01% and 99.9%) on a foreground mask. Percentiles are computed
+    from a deterministic random subsample (≤50k pixels) to keep memory bounded.
+    When the masked population is small (<200k pixels), 99.9% is used instead of
+    99.99% since high percentiles become unreliable with few data points.
+    """
 
     src = zarr.open_array(fused_path, mode="r")
     if src.ndim != 4:
@@ -582,7 +958,8 @@ def _write_fused_corrected_zyxc(
     # Use .partial directory for atomic write, then rename to final path
     partial_dest_path = dest_path.with_name(f"{dest_path.name}.partial")
     if dest_path.exists() and not overwrite:
-        raise FileExistsError(f"{dest_path} already exists. Use --overwrite to replace it.")
+        logger.warning("{path} already exists; skipping (use --overwrite to replace).", path=dest_path)
+        return dest_path
     # Clean up any stale partial from previous failed runs
     if partial_dest_path.exists():
         shutil.rmtree(partial_dest_path, ignore_errors=True)
@@ -592,8 +969,10 @@ def _write_fused_corrected_zyxc(
         float_dest_path = _float_store_path(dest_path)
         float_partial_path = float_dest_path.with_name(f"{float_dest_path.name}.partial")
         if float_dest_path.exists() and not overwrite:
-            raise FileExistsError(f"{float_dest_path} already exists. Use --overwrite to replace it.")
-        if float_partial_path.exists():
+            logger.warning("{path} already exists; skipping float store (use --overwrite to replace).", path=float_dest_path)
+            float_dest_path = None
+            float_partial_path = None
+        if float_partial_path is not None and float_partial_path.exists():
             shutil.rmtree(float_partial_path, ignore_errors=True)
 
     if src.chunks is not None and len(src.chunks) == 4:
@@ -638,8 +1017,13 @@ def _write_fused_corrected_zyxc(
             dt=perf_counter() - t0_fopen,
         )
 
+    # Create thumbnails directory for corrected image previews
+    thumbnail_dir = dest_path.parent / "thumbnails"
+    thumbnail_dir.mkdir(exist_ok=True)
+
     field_arrays = [_ensure_float32(field) for field in fields]
     channel_quant: list[QuantizationParams] = []
+    channel_scales: list[float] = []
 
     # Validate field shapes
     for field_arr in field_arrays:
@@ -650,59 +1034,84 @@ def _write_fused_corrected_zyxc(
             )
 
     uint16_max = np.iinfo(np.uint16).max
-    with progress_bar(max(1, len(channels) * len(z_sel))) as advance:
+    gpu_kwargs: dict[str, Any] = {}
+    if tile_size is not None:
+        gpu_kwargs["tile_size"] = tile_size
+    if tile_threshold is not None:
+        gpu_kwargs["tile_threshold"] = tile_threshold
+    plane_total = max(1, len(z_sel))
+    with progress_bar(max(1, len(channels) * plane_total)) as advance:
         for ci, (ch, field_arr) in enumerate(zip(channels, field_arrays)):
+            channel_name = names[ci] if ci < len(names) else f"channel_{ch}"
+            logger.info(
+                "Channel {ch} ({name}) start: {planes} plane(s), tile_size={tile}, tile_threshold={thresh}",
+                ch=ch,
+                name=channel_name,
+                planes=len(z_sel),
+                tile="auto" if tile_size is None else int(tile_size),
+                thresh="auto" if tile_threshold is None else int(tile_threshold),
+            )
             # Upload field once per channel
             field_gpu = _prepare_gpu_field(field_arr)
+            if use_unsharp_mask:
+                logger.debug(
+                    "Unsharp mask enabled for ROI={roi}, codebook={codebook}, channel={ch}",
+                    roi=roi,
+                    codebook=codebook,
+                    ch=ch,
+                )
 
             # Determine quantization from the z-index plane (or first selected plane)
             qz = int(z_index) if z_index is not None else int(z_sel[0])
             # Build global mask once for all channels/planes from union across channels
             global_mask = _build_global_mask_from_fused(src, qz)
             plane0 = np.asarray(src[qz, :, :, ch], dtype=np.float32)
-            corrected0 = _correct_plane_gpu(
+            logger.info(
+                "Channel {ch} ({name}) computing quant reference plane z={z}",
+                ch=ch,
+                name=channel_name,
+                z=qz,
+            )
+            corrected0 = _correct_plane_cpu_for_quant(
                 plane0,
-                field_gpu=field_gpu,
-                use_unsharp_mask=use_unsharp_mask,
+                field_cpu=field_arr,
                 mask_cpu=global_mask,
+                use_unsharp_mask=use_unsharp_mask,
             )
             params = _compute_channel_quant_from_single_plane(corrected0, global_mask)
             channel_quant.append(params)
             logger.info(
-                "Quant params for channel {ch} from z={z}: lower={lo:.4f}, upper={hi:.4f}",
+                "Quant params for channel {ch} from z={z}: lower={lo:.4f}, upper={hi:.4f} (p{lo_pct:.2f}-p{hi_pct:.2f}, n={n})",
                 ch=ch,
                 z=qz,
                 lo=float(params.lower),
                 hi=float(params.upper),
+                lo_pct=float(params.lower_percentile),
+                hi_pct=float(params.upper_percentile),
+                n=int(params.sample_count),
             )
 
-            # Adaptive high-percentile guard to maximize range without overflow.
-            # Compute an additional upper percentile from the same reference plane.
-            data_masked = np.asarray(corrected0, dtype=np.float32)[global_mask]
-            sample_n = data_masked.size
-            if sample_n >= 2_000_000:
-                guard_pct = 99.999
-            elif sample_n >= QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE:
-                guard_pct = 99.995
-            else:
-                guard_pct = 99.95
-            try:
-                guard_upper = float(np.percentile(data_masked, guard_pct))
-            except Exception:
-                guard_upper = float(params.upper)
-            if not math.isfinite(guard_upper) or guard_upper <= params.lower:
-                guard_upper = float(params.upper)
-            guard_upper = max(guard_upper, float(params.upper))
-            width_guard = max(guard_upper - params.lower, QUANT_MIN_RANGE)
-            scale = uint16_max / width_guard
+            # Compute scale for uint16 quantization
+            width = max(params.upper - params.lower, QUANT_MIN_RANGE)
+            scale = uint16_max / width
+            channel_scales.append(scale)
 
             for zi, z_slot in enumerate(z_sel):
                 plane = np.asarray(src[z_slot, :, :, ch], dtype=np.float32)
+                logger.info(
+                    "Channel {ch} ({name}) correcting z={z} ({idx}/{total})",
+                    ch=ch,
+                    name=channel_name,
+                    z=z_slot,
+                    idx=zi + 1,
+                    total=plane_total,
+                )
                 corrected = _correct_plane_gpu(
                     plane,
                     field_gpu=field_gpu,
                     use_unsharp_mask=use_unsharp_mask,
                     mask_cpu=global_mask,
+                    **gpu_kwargs,
                 )
                 # Zero-out correction outside per-plane foreground (union across channels) to
                 # guarantee masked regions remain exactly 0 after quantization.
@@ -716,7 +1125,7 @@ def _write_fused_corrected_zyxc(
                         f"Union mask shape {plane_union_mask.shape} does not match corrected plane {corrected.shape}"
                     )
                 corrected = np.where(plane_union_mask, corrected, 0.0).astype(np.float32, copy=False)
-                # Quantize on CPU using adaptive guard scale
+                # Quantize to uint16 using percentile-based scale
                 y = (corrected - params.lower) * scale
                 np.clip(y, 0.0, float(uint16_max), out=y)
                 u16 = np.rint(y).astype(np.uint16)
@@ -727,6 +1136,21 @@ def _write_fused_corrected_zyxc(
                     float_dest[zi, :, :, ci] = corrected
                 dest[zi, :, :, ci] = u16
                 advance()
+
+    # Generate thumbnails for every 8th Z-plane
+    n_thumb_channels = min(3, len(channels))
+    for zi, z_slot in enumerate(z_sel):
+        if z_slot % 8 != 0:
+            continue
+        thumb_planes: list[np.ndarray] = []
+        for ci in range(n_thumb_channels):
+            thumb_planes.append(np.asarray(dest[zi, :, :, ci], dtype=np.uint16))
+        thumb_path = thumbnail_dir / f"thumbnail_n4_z{z_slot:03d}.png"
+        try:
+            _write_corrected_thumbnail(thumb_planes, thumb_path)
+            logger.debug("Wrote corrected thumbnail to {path}", path=thumb_path)
+        except Exception:
+            logger.exception("Failed to write corrected thumbnail for z={z}", z=z_slot)
 
     src_attrs: dict[str, Any] = {}
     try:
@@ -740,35 +1164,7 @@ def _write_fused_corrected_zyxc(
     dest_attrs["codebook"] = codebook
     dest_attrs["n4"] = n4_params
     quant_channels: list[dict[str, Any]] = []
-    uint16_range = np.iinfo(np.uint16).max
-    for idx, name, params in zip(channels, names, channel_quant):
-        # Mirror the adaptive guard logic for metadata computation
-        qz = int(z_index) if z_index is not None else 0
-        global_mask = _build_global_mask_from_fused(src, qz)
-        plane0 = np.asarray(src[qz, :, :, idx], dtype=np.float32)
-        corrected0 = _correct_plane_gpu(
-            plane0,
-            field_gpu=_prepare_gpu_field(field_arrays[list(channels).index(idx)]),
-            use_unsharp_mask=use_unsharp_mask,
-            mask_cpu=global_mask,
-        )
-        data_masked = np.asarray(corrected0, dtype=np.float32)[global_mask]
-        sample_n = data_masked.size
-        if sample_n >= 2_000_000:
-            guard_pct = 99.999
-        elif sample_n >= QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE:
-            guard_pct = 99.995
-        else:
-            guard_pct = 99.95
-        try:
-            guard_upper = float(np.percentile(data_masked, guard_pct))
-        except Exception:
-            guard_upper = float(params.upper)
-        if not math.isfinite(guard_upper) or guard_upper <= params.lower:
-            guard_upper = float(params.upper)
-        guard_upper = max(guard_upper, float(params.upper))
-        width_guard = max(guard_upper - params.lower, QUANT_MIN_RANGE)
-        scale = uint16_range / width_guard
+    for idx, name, params, scale in zip(channels, names, channel_quant, channel_scales):
         quant_channels.append(
             {
                 "index": int(idx),
@@ -778,11 +1174,9 @@ def _write_fused_corrected_zyxc(
                 "observed_min": float(params.observed_min),
                 "observed_max": float(params.observed_max),
                 "scale": float(scale),
-                "upper_guard": float(guard_upper),
-                "upper_guard_percentile": float(guard_pct),
                 "lower_percentile": float(params.lower_percentile),
                 "upper_percentile": float(params.upper_percentile),
-                "samples": int(params.sample_count),
+                "population_count": int(params.sample_count),
             }
         )
 
@@ -930,9 +1324,16 @@ def compute_correction_field(
         cps.append(n_ctrl_dim)
     n4.SetNumberOfControlPoints(cps)  # mesh size = cps - order
 
-    # Run N4 on the downsampled image and reconstruct the log-bias field at full-res
+    # Run N4 on the downsampled image
     _ = n4.Execute(img_small, mask_small)
-    log_bias_full = sitk.Cast(n4.GetLogBiasFieldAsImage(img_full), sitk.sitkFloat32)
+    # Reconstruct at small resolution first to avoid ITK B-spline boundary bug
+    # (occurs when full image dims cause parametric domain boundary to be hit exactly),
+    # then resample to full resolution.
+    log_bias_small = sitk.Cast(n4.GetLogBiasFieldAsImage(img_small), sitk.sitkFloat32)
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(img_full)
+    resampler.SetInterpolator(sitk.sitkBSpline)
+    log_bias_full = resampler.Execute(log_bias_small)
     # GetArrayFromImage returns a writable numpy array; avoids read-only view issues.
     field = sitk.GetArrayFromImage(sitk.Exp(log_bias_full)).astype(np.float32, copy=False)
 
@@ -974,7 +1375,8 @@ def _write_multi_channel_field(
     meta_extra: dict[str, Any] | None = None,
 ) -> Path:
     if output_path.exists() and not overwrite:
-        raise FileExistsError(f"{output_path} already exists. Use --overwrite to replace it.")
+        logger.warning("{path} already exists; skipping (use --overwrite to replace).", path=output_path)
+        return output_path
     fields_cyx = np.asarray(fields_cyx, dtype=np.float32)
     if fields_cyx.ndim != 3:
         raise ValueError("fields_cyx must be a 3D array with shape (C, Y, X)")
@@ -1098,7 +1500,12 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
         if config.use_unsharp_mask:
             logger.info(f"Applying unsharp mask to channel {ch} plane prior to N4")
             mask = image_yx > 0.0
-            image_yx = _apply_unsharp_mask_if_enabled(image_yx, mask=mask, enabled=True)
+            image_yx = _apply_unsharp_mask_if_enabled(
+                image_yx,
+                mask=mask,
+                enabled=True,
+                context=f"roi={config.roi},channel={ch}",
+            )
 
         field = compute_correction_field(
             image_yx,
@@ -1113,8 +1520,15 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
 
         return ch, ch_name, field
 
+    def _resolve_max_workers() -> int:
+        if config.threads is not None:
+            if config.threads <= 0:
+                raise ValueError("--threads must be a positive integer when provided.")
+            return int(config.threads)
+        return min(len(channels), max(1, (os.cpu_count() or 1) // 2))
+
     if not reuse_existing:
-        max_workers = min(len(channels), max(1, (os.cpu_count() or 1) // 2))
+        max_workers = _resolve_max_workers()
         logger.info(
             "Submitting N4 field computations for {n} channel(s) using {w} worker thread(s)...",
             n=len(channels),
@@ -1170,7 +1584,7 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
             logger.opt(exception=True).warning("Failed to reuse existing correction field; recomputing.")
             # Fall back to recompute
             reuse_existing = False
-            max_workers = min(len(channels), max(1, (os.cpu_count() or 1) // 2))
+            max_workers = _resolve_max_workers()
             results = {}
             if len(channels) == 1:
                 ch = channels[0]
@@ -1257,6 +1671,8 @@ def compute_fields_from_workspace(config: N4RuntimeConfig) -> list[N4Result]:
             output_path=corrected_output,
             debug=config.debug,
             use_unsharp_mask=config.use_unsharp_mask,
+            tile_size=config.tile_size,
+            tile_threshold=config.tile_threshold,
         )
 
     logger.info("Finished N4 workflow for {n} channel(s)", n=len(channels))
@@ -1280,6 +1696,9 @@ def run_cli_workflow(
     single_plane: bool,
     debug: bool,
     use_unsharp_mask: bool,
+    threads: int | None,
+    tile_size: int | None,
+    tile_threshold: int | None,
 ) -> list[N4Result]:
     """Shared CLI workflow for Click- and Typer-based entrypoints."""
 
@@ -1367,6 +1786,9 @@ def run_cli_workflow(
         debug=debug,
         threshold=threshold_value,
         use_unsharp_mask=use_unsharp_mask,
+        threads=threads,
+        tile_size=tile_size,
+        tile_threshold=tile_threshold,
     )
 
     return compute_fields_from_workspace(config)

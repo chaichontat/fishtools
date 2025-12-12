@@ -19,7 +19,6 @@ import numpy as np
 import pytest
 import tifffile
 from numpy.typing import NDArray
-from scipy import ndimage
 
 import fishtools.preprocess.cli_register as cli_register_module
 from fishtools.preprocess import downsample as downsample_module
@@ -499,7 +498,9 @@ class TestRunFiducial:
         priors: dict[str, tuple[float, float]] | None = None,
         overrides: dict[str, tuple[float, float]] | None = None,
         n_fids: int = 1,
-        ) -> Config:
+        use_itk: bool = False,
+        use_fft: bool = False,
+    ) -> Config:
         return Config(
             dataPath="/tmp",
             registration=RegisterConfig(
@@ -508,7 +509,8 @@ class TestRunFiducial:
                     priors=priors,
                     overrides=overrides,
                     n_fids=n_fids,
-                    use_fft=False,
+                    use_fft=use_fft,
+                    use_itk=use_itk,
                     fwhm=3.0,
                     threshold=3.0,
                 ),
@@ -529,14 +531,15 @@ class TestRunFiducial:
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
 
-        def fake_align(
+        def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
-        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.1 for name in fids}
-            return shifts, residuals
+            stats = {name: None for name in fids}
+            return shifts, residuals, stats
 
-        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
 
         def fake_shift(arr: np.ndarray, shift_vec: Sequence[float], **kwargs: Any) -> np.ndarray:
             return arr
@@ -570,9 +573,9 @@ class TestRunFiducial:
         )
 
         shifted_records = [
-            (path, data, metadata) for path, data, metadata in recorded if "fids_shifted" in path.name
+            (path, data, metadata) for path, data, metadata in recorded if "-shifted-" in path.name
         ]
-        assert shifted_records, "Expected a fids_shifted debug write when debug=True"
+        assert shifted_records, "Expected a shifted debug write when debug=True"
 
         _, data, metadata = shifted_records[0]
 
@@ -585,6 +588,136 @@ class TestRunFiducial:
         expected_means = [float(np.mean(fids[name])) for name in expected_order]
         assert means_by_plane == expected_means
 
+    def test_run_fiducial_writes_debug_on_spot_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When spot registration falls back to ITK, debug stacks are saved automatically."""
+        config = self._make_config(priors=None)
+
+        workspace = tmp_path / "ws"
+        deconv_path = workspace / "analysis" / "deconv"
+        deconv_path.mkdir(parents=True)
+
+        reference = "round_a"
+        failing_round = "round_b"
+
+        fallback_stat = cli_register_module.FiducialAlignmentStats(
+            iterations=0,
+            final_threshold=None,
+            final_fwhm=None,
+            n_spots=0,
+            mode="itk",
+            algorithm="OnePlusOneEvo",
+        )
+
+        def fake_align_with_stats(
+            fids: dict[str, np.ndarray], **_: Any
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
+            shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
+            residuals = {name: 0.05 for name in fids}
+            stats = {reference: None, failing_round: fallback_stat}
+            return shifts, residuals, stats
+
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+        monkeypatch.setattr(cli_register_module, "shift", lambda arr, *_args, **_kwargs: arr)
+        monkeypatch.setattr(cli_register_module, "_save_debug_overlay", lambda *args, **kwargs: None)
+
+        recorded_paths: list[Path] = []
+
+        def _under_debug_dir(path: Path) -> bool:
+            return path.parent.parent.name == "fids_debug"
+
+        def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
+            recorded_paths.append(Path(path))
+
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+
+        fids = {
+            reference: np.ones((4, 4), dtype=np.float32),
+            failing_round: np.ones((4, 4), dtype=np.float32) * 2,
+        }
+
+        roi = "roi_dbg"
+        idx = 2
+
+        cli_register_module.run_fiducial(
+            path=deconv_path,
+            fids=fids,
+            codebook_name="cb",
+            config=config,
+            roi=roi,
+            idx=idx,
+            reference=reference,
+            debug=False,
+        )
+
+        debug_writes = [path for path in recorded_paths if _under_debug_dir(path)]
+        expected_files = {f"{roi}-{idx:04d}.tif", f"{roi}-shifted-{idx:04d}.tif"}
+        assert {path.name for path in debug_writes} == expected_files
+
+    def test_run_fiducial_respects_forced_itk_without_extra_debug(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """If the user explicitly requests ITK, auto-debug should not trigger."""
+        config = self._make_config(priors=None, use_itk=True)
+
+        workspace = tmp_path / "ws"
+        deconv_path = workspace / "analysis" / "deconv"
+        deconv_path.mkdir(parents=True)
+
+        reference = "round_a"
+        target = "round_b"
+
+        itk_stat = cli_register_module.FiducialAlignmentStats(
+            iterations=5,
+            final_threshold=None,
+            final_fwhm=None,
+            n_spots=0,
+            mode="itk",
+            algorithm="OnePlusOneEvo",
+        )
+
+        def fake_align_with_stats(
+            fids: dict[str, np.ndarray], **_: Any
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
+            shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
+            residuals = {name: 0.05 for name in fids}
+            stats = {reference: None, target: itk_stat}
+            return shifts, residuals, stats
+
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+        monkeypatch.setattr(cli_register_module, "shift", lambda arr, *_args, **_kwargs: arr)
+        monkeypatch.setattr(cli_register_module, "_save_debug_overlay", lambda *args, **kwargs: None)
+
+        recorded_paths: list[Path] = []
+
+        def _under_debug_dir(path: Path) -> bool:
+            return path.parent.parent.name == "fids_debug"
+
+        def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
+            recorded_paths.append(Path(path))
+
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+
+        fids = {
+            reference: np.ones((4, 4), dtype=np.float32),
+            target: np.ones((4, 4), dtype=np.float32) * 3,
+        }
+
+        cli_register_module.run_fiducial(
+            path=deconv_path,
+            fids=fids,
+            codebook_name="cb",
+            config=config,
+            roi="roi_force_itk",
+            idx=1,
+            reference=reference,
+            debug=False,
+        )
+
+        debug_writes = [path for path in recorded_paths if _under_debug_dir(path)]
+        assert not debug_writes
+
     def test_run_fiducial_writes__fids_with_sorted_keys(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -595,14 +728,15 @@ class TestRunFiducial:
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
 
-        def fake_align(
+        def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
-        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.05 for name in fids}
-            return shifts, residuals
+            stats = {name: None for name in fids}
+            return shifts, residuals, stats
 
-        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
 
         def fake_shift(arr: np.ndarray, shift_vec: Sequence[float], **kwargs: Any) -> np.ndarray:
             return arr
@@ -661,14 +795,15 @@ class TestRunFiducial:
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
 
-        def fake_align(
+        def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
-        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.05 for name in fids}
-            return shifts, residuals
+            stats = {name: None for name in fids}
+            return shifts, residuals, stats
 
-        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
 
         def fake_shift(arr: np.ndarray, shift_vec: Sequence[float], **kwargs: Any) -> np.ndarray:
             return arr
@@ -712,6 +847,70 @@ class TestRunFiducial:
         assert metadata.get("axes") == "YX"
         assert metadata.get("key") == [reference]
 
+    def test_run_fiducial_writes_diagnostics_to_shifts_json(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """shifts-{idx}.json should include alignment diagnostics fields."""
+        config = self._make_config(priors=None)
+
+        workspace = tmp_path / "ws"
+        deconv_path = workspace / "analysis" / "deconv"
+        deconv_path.mkdir(parents=True)
+
+        def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
+            # No-op to avoid filesystem dependencies; metadata not needed here.
+            return None
+
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+        monkeypatch.setattr(cli_register_module, "shift", lambda arr, *_args, **_kwargs: arr)
+
+        class _Stats:
+            def __init__(self) -> None:
+                self.iterations = 3
+                self.final_threshold = 2.5
+                self.final_fwhm = 4.5
+                self.n_spots = 42
+                self.mode = "spot"
+                self.algorithm = "threshold"
+
+        def fake_align_with_stats(
+            fids: dict[str, np.ndarray], **_: Any
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
+            shifts = {name: np.array([1.5, -2.5], dtype=np.float32) for name in fids}
+            residuals = {name: 0.123 for name in fids}
+            stats = {name: _Stats() for name in fids}
+            return shifts, residuals, stats
+
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+
+        fids: dict[str, np.ndarray] = {"round_a": np.ones((4, 4), dtype=np.float32)}
+        roi = "roi_diag"
+        codebook_name = "cbdiag"
+        idx = 5
+
+        cli_register_module.run_fiducial(
+            path=deconv_path,
+            fids=fids,
+            codebook_name=codebook_name,
+            config=config,
+            roi=roi,
+            idx=idx,
+            reference="round_a",
+            debug=False,
+        )
+
+        shift_dir = deconv_path / f"shifts--{roi}+{codebook_name}"
+        json_path = shift_dir / f"shifts-{idx:04d}.json"
+        assert json_path.exists()
+
+        payload = json.loads(json_path.read_text())
+        record = payload["round_a"]
+
+        assert record["iterations"] == 3
+        assert record["final_threshold"] == pytest.approx(2.5)
+        assert record["final_fwhm"] == pytest.approx(4.5)
+        assert record["n_spots"] == 42
+
     def test_run_fiducial_does_not_mutate_config_priors(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -726,15 +925,16 @@ class TestRunFiducial:
             np.zeros((3, 3, 3), dtype=np.uint16),
         )
 
-        def fake_align(
+        def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
-        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.1 for name in fids}
-            return shifts, residuals
+            stats = {name: None for name in fids}
+            return shifts, residuals, stats
 
-        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
-        monkeypatch.setattr(cli_register_module.tifffile, "imwrite", lambda *args, **kwargs: None)
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *args, **kwargs: None)
 
         fids = {"fidA-0000": np.ones((4, 4), dtype=np.float32)}
 
@@ -761,15 +961,16 @@ class TestRunFiducial:
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
 
-        def fake_align(
+        def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
-        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.05 for name in fids}
-            return shifts, residuals
+            stats = {name: None for name in fids}
+            return shifts, residuals, stats
 
-        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
-        monkeypatch.setattr(cli_register_module.tifffile, "imwrite", lambda *args, **kwargs: None)
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *args, **kwargs: None)
 
         shift_calls: list[tuple[float, float]] = []
 
@@ -817,40 +1018,37 @@ class TestRunFiducial:
         )
 
         assert shift_calls[0] == (-0.4, 0.3)
-        assert config.registration.fiducial.priors is None
+        # Note: run_fiducial caches derived priors into the config for performance
+        assert config.registration.fiducial.priors == {"fidB-0001": (0.3, -0.4)}
 
-    def test_run_fiducial_filters_unused_derived_priors(
+    def test_run_fiducial_raises_on_unmatched_derived_priors(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        """When derived priors don't match any fid, run_fiducial raises ValueError."""
         config = self._make_config(priors=None)
 
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
 
-        def fake_align(
+        def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
-        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.02 for name in fids}
-            return shifts, residuals
+            stats = {name: None for name in fids}
+            return shifts, residuals, stats
 
-        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
-        monkeypatch.setattr(cli_register_module.tifffile, "imwrite", lambda *args, **kwargs: None)
-
-        shift_calls: list[tuple[float, float]] = []
-
-        def fake_shift(arr: np.ndarray, shift_vec: Sequence[float], **kwargs: Any) -> np.ndarray:
-            shift_calls.append(tuple(float(v) for v in shift_vec))
-            return arr
-
-        monkeypatch.setattr(cli_register_module, "shift", fake_shift)
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *args, **kwargs: None)
+        monkeypatch.setattr(cli_register_module, "shift", lambda arr, *args, **kwargs: arr)
 
         roi = "roi"
         codebook_name = "cb"
         shift_dir = deconv_path / f"shifts--{roi}+{codebook_name}"
         shift_dir.mkdir(parents=True)
 
+        # Create shifts for a round that doesn't exist in fids
         payload = {
             "unused-0001": {
                 "shifts": [1.0, -1.0],
@@ -863,19 +1061,17 @@ class TestRunFiducial:
 
         fids = {"fidC-0002": np.ones((4, 4), dtype=np.float32)}
 
-        cli_register_module.run_fiducial(
-            path=deconv_path,
-            fids=fids,
-            codebook_name=codebook_name,
-            config=config,
-            roi=roi,
-            idx=2,
-            reference="fidC-0002",
-            debug=False,
-        )
-
-        assert all(abs(x) < 1e-9 and abs(y) < 1e-9 for x, y in shift_calls)
-        assert config.registration.fiducial.priors is None
+        with pytest.raises(ValueError, match="Could not find file that starts with unused-0001"):
+            cli_register_module.run_fiducial(
+                path=deconv_path,
+                fids=fids,
+                codebook_name=codebook_name,
+                config=config,
+                roi=roi,
+                idx=2,
+                reference="fidC-0002",
+                debug=False,
+            )
 
     def test_run_fiducial_missing_channel_metadata_errors(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -896,12 +1092,13 @@ class TestRunFiducial:
             ) -> np.ndarray:
                 return img
 
-        def fake_align(
+        def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
-        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.01 for name in fids}
-            return shifts, residuals
+            stats = {name: None for name in fids}
+            return shifts, residuals, stats
 
         def fake_scale(
             img: np.ndarray,
@@ -946,13 +1143,14 @@ class TestRunFiducial:
         codebook_path = tmp_path / "cb.json"
         codebook_path.write_text(json.dumps({"gene": [1, 2]}))
 
-        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
         monkeypatch.setattr(cli_register_module, "scale_deconv", fake_scale)
         monkeypatch.setattr(cli_register_module, "Affine", DummyAffine)
         monkeypatch.setattr(cli_register_module.Image, "from_file", staticmethod(fake_from_file))
-        monkeypatch.setattr(cli_register_module.tifffile, "imwrite", lambda *args, **kwargs: None)
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *args, **kwargs: None)
 
-        with pytest.raises(ValueError, match="Missing channel metadata"):
+        # When channel metadata is missing for a bit, _run raises KeyError
+        with pytest.raises(KeyError, match="2"):
             cli_register_module._run(
                 deconv_path,
                 roi,
@@ -974,12 +1172,13 @@ class TestRunFiducial:
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
 
-        def fake_align(
+        def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
-        ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
+        ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.02 for name in fids}
-            return shifts, residuals
+            stats = {name: None for name in fids}
+            return shifts, residuals, stats
 
         def fake_scale(
             img: np.ndarray,
@@ -1022,12 +1221,13 @@ class TestRunFiducial:
         codebook_path = tmp_path / "cb.json"
         codebook_path.write_text(json.dumps({"gene": [1, 2]}))
 
-        monkeypatch.setattr(cli_register_module, "align_fiducials", fake_align)
+        monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
         monkeypatch.setattr(cli_register_module, "scale_deconv", fake_scale)
         monkeypatch.setattr(cli_register_module.Image, "from_file", staticmethod(fake_from_file))
-        monkeypatch.setattr(cli_register_module.tifffile, "imwrite", lambda *args, **kwargs: None)
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *args, **kwargs: None)
 
-        with pytest.raises(FileNotFoundError, match="Missing registered tiles"):
+        # Codebook requires bits [1, 2] but only bit 1 is available
+        with pytest.raises(ValueError, match="Missing codebook bits"):
             cli_register_module._run(
                 deconv_path,
                 roi,
@@ -1039,6 +1239,131 @@ class TestRunFiducial:
                 overwrite=False,
                 no_priors=True,
             )
+
+
+def test_run_prefers_repaired_round_directories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verify --repaired switches tile discovery to the repaired folder."""
+
+    config = Config(
+        dataPath="/tmp",
+        registration=RegisterConfig(
+            chromatic_shifts={"650": "dummy", "750": "dummy"},
+            fiducial=Fiducial(
+                priors=None,
+                overrides=None,
+                n_fids=1,
+                use_fft=False,
+                use_itk=False,
+                fwhm=3.0,
+                threshold=3.0,
+            ),
+            downsample=1,
+            crop=0,
+            slices=slice(None),
+            reduce_bit_depth=0,
+        ),
+    )
+
+    workspace = tmp_path / "ws"
+    deconv_path = workspace / "analysis" / "deconv"
+    deconv_path.mkdir(parents=True)
+
+    roi = "roiA"
+    round_name = "r1"
+    idx = 1
+
+    original_dir = deconv_path / f"{round_name}--{roi}"
+    original_dir.mkdir()
+    (original_dir / f"{round_name}-{idx:04d}.tif").write_bytes(b"")
+
+    repaired_dir = deconv_path / f"{round_name}--{roi}--repaired"
+    repaired_dir.mkdir()
+    repaired_tile = repaired_dir / f"{round_name}-{idx:04d}.tif"
+    repaired_tile.write_bytes(b"")
+
+    codebook_path = tmp_path / "codebook.json"
+    codebook_path.write_text(json.dumps({"gene": [round_name]}))
+
+    called_files: list[Path] = []
+
+    def fake_from_file(path: Path, **_kwargs: Any) -> SimpleNamespace:
+        called_files.append(path)
+        name, idx_token = path.stem.split("-")
+        bits = name.split("_")
+        nofid = np.zeros((1, len(bits), 4, 4), dtype=np.float32)
+        fid = np.zeros((4, 4), dtype=np.float32)
+        fid_raw = np.zeros((4, 4), dtype=np.float32)
+        powers = {"560": 1.0}
+        return SimpleNamespace(
+            name=name,
+            idx=int(idx_token),
+            nofid=nofid,
+            fid=fid,
+            fid_raw=fid_raw,
+            bits=bits,
+            powers=powers,
+            metadata={"prenormalized": True},
+            global_deconv_scaling=None,
+            basic=lambda: None,
+        )
+
+    def fake_run_fiducial(
+        _path: Path,
+        fid_images: dict[str, np.ndarray],
+        _codebook_name: str,
+        _config: Config,
+        *,
+        roi: str,
+        idx: int,
+        reference: str,
+        debug: bool,
+        no_priors: bool,
+        fids_raw: dict[str, np.ndarray] | None = None,
+    ) -> dict[str, np.ndarray]:
+        assert roi == "roiA"
+        assert idx == 1
+        assert reference == round_name
+        assert not debug
+        assert no_priors is False
+        return {name: np.zeros(2, dtype=np.float32) for name in fid_images}
+
+    class DummyAffine:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.ref_image: np.ndarray | None = None
+
+        def __call__(
+            self,
+            img: np.ndarray,
+            *,
+            channel: str,
+            shiftpx: np.ndarray,
+            debug: bool,
+        ) -> np.ndarray:
+            return img
+
+    def fake_safe_imwrite(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(cli_register_module.Image, "from_file", staticmethod(fake_from_file))
+    monkeypatch.setattr(cli_register_module, "run_fiducial", fake_run_fiducial)
+    monkeypatch.setattr(cli_register_module, "Affine", DummyAffine)
+    monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+
+    cli_register_module._run(
+        deconv_path,
+        roi,
+        idx,
+        codebook=codebook_path,
+        reference=round_name,
+            config=config,
+            debug=False,
+            overwrite=True,
+        repaired_rounds={round_name},
+    )
+
+    assert called_files == [repaired_tile]
 
 
 # Test fixtures for realistic data
@@ -1205,6 +1530,7 @@ class TestGpuDownsample:
 
     def test_downsample_xy_gpu_matches_numpy_reference(self, monkeypatch: Any) -> None:
         """Validate CuPy pipeline (patched) matches NumPy reference implementation."""
+        from skimage.transform import downscale_local_mean as np_downscale
 
         fake_cuda = SimpleNamespace(runtime=SimpleNamespace(getDeviceCount=lambda: 1))
 
@@ -1222,18 +1548,7 @@ class TestGpuDownsample:
         )
 
         monkeypatch.setattr(downsample_module, "cp", fake_cp)
-        monkeypatch.setattr(
-            downsample_module,
-            "cp_zoom",
-            lambda arr, zoom, output, order, mode, grid_mode: ndimage.zoom(
-                arr,
-                zoom,
-                output=output,
-                order=order,
-                mode=mode,
-                grid_mode=grid_mode,
-            ),
-        )
+        monkeypatch.setattr(downsample_module, "downscale_local_mean", np_downscale)
 
         data = np.arange(64, dtype=np.float32).reshape(1, 8, 8)
         result = gpu_downsample_xy(
@@ -1245,15 +1560,7 @@ class TestGpuDownsample:
         )
 
         cropped = data[:, 2:-2, 2:-2]
-        target_shape = (cropped.shape[0], cropped.shape[1] // 2, cropped.shape[2] // 2)
-        reference = ndimage.zoom(
-            cropped,
-            (1.0, 0.5, 0.5),
-            output=np.empty(target_shape, dtype=np.float32),
-            order=3,
-            mode="reflect",
-            grid_mode=True,
-        )
+        reference = np_downscale(cropped, (1, 2, 2))
         reference = np.clip(reference, 0, 65534).astype(np.uint16)
 
         np.testing.assert_array_equal(result, reference)

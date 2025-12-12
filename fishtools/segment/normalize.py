@@ -69,10 +69,14 @@ def sample_percentiles(
         if taken >= n:
             break
         crop = arr[::2, x : x + block[0], y : y + block[1], :]
-        # Skip crops containing any zero pixel in the selected channels (avoid stitched borders)
         logger.info(f"Sampled crop {taken} at ({x}, {y})")
-        if np.sum(np.sum(crop[..., ch_idx] == 1) / crop[..., ch_idx].size) > 0.2:
-            logger.info("Crop contains many zero pixels; skipping.")
+        # Skip crops dominated by 0s or 1s (stitched borders / saturated regions)
+        sel = crop[..., ch_idx]
+        total = sel.size
+        zero_ratio = float(np.count_nonzero(sel == 0)) / max(total, 1)
+        one_ratio = float(np.count_nonzero(sel == 1)) / max(total, 1)
+        if zero_ratio > 0.10 or one_ratio > 0.10:
+            logger.info(f"Crop rejected: zero_ratio={zero_ratio:.3f}, one_ratio={one_ratio:.3f} (>0.10 threshold)")
             continue
 
         # Light sharpening before measuring percentiles

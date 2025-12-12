@@ -37,7 +37,7 @@ UNSHARP_HALO = 16
 AUTO_TILE_THRESHOLD = 4096  # Auto-tile when image exceeds this in any dimension
 
 
-def get_auto_tile_size(H: int, W: int, tile_size: int | None) -> int:
+def get_auto_tile_size(H: int, W: int, tile_size: int | None, tile_threshold: int | None = None) -> int:
     """Determine tile size based on image dimensions and user preference.
 
     Args:
@@ -47,6 +47,8 @@ def get_auto_tile_size(H: int, W: int, tile_size: int | None) -> int:
             - None: Auto-detect (tile if image > 4096 in any dimension)
             - 0: Disabled (process full plane)
             - int > 0: Explicit tile size
+        tile_threshold: Optional override for the auto-tiling threshold. When
+            <= 0 the auto path is disabled unless an explicit tile size is set.
 
     Returns:
         Effective tile size to use. Returns max(H, W) if tiling disabled.
@@ -56,7 +58,8 @@ def get_auto_tile_size(H: int, W: int, tile_size: int | None) -> int:
     if tile_size is not None and tile_size > 0:
         return tile_size
     # Auto: tile when plane exceeds threshold
-    if H > AUTO_TILE_THRESHOLD or W > AUTO_TILE_THRESHOLD:
+    threshold = AUTO_TILE_THRESHOLD if tile_threshold is None else tile_threshold
+    if threshold is not None and threshold > 0 and (H > threshold or W > threshold):
         return DEFAULT_TILE_SIZE
     return max(H, W)  # Full plane for smaller images
 
@@ -94,7 +97,7 @@ def _process_tile(
             # Fallback to >0 mask on corrected plane
             mask_gpu = img_gpu > 0.0
 
-        img_gpu = cp.where(mask_gpu, sharpened_gpu, img_gpu)
+        cp.copyto(img_gpu, sharpened_gpu, where=mask_gpu)
         del sharpened_gpu, mask_gpu
 
     # Replace non-finite values with zeros for safety
@@ -110,10 +113,12 @@ def _process_tile(
 def correct_plane_gpu_tiled(
     plane: np.ndarray,
     *,
-    field_gpu: cupy_ndarray,
+    field_gpu: cupy_ndarray | None = None,
+    field_cpu: np.ndarray | None = None,
     use_unsharp_mask: bool,
     mask_cpu: np.ndarray | None = None,
     tile_size: int | None = None,
+    tile_threshold: int | None = None,
 ) -> np.ndarray:
     """Tiled version of _correct_plane_gpu - same interface, lower memory.
 
@@ -123,13 +128,15 @@ def correct_plane_gpu_tiled(
 
     Args:
         plane: Input 2D plane (Y, X) as CPU float32
-        field_gpu: Correction field on GPU (Y, X) - must match plane shape
+        field_gpu: Correction field on GPU (Y, X) - must match plane shape.
+        field_cpu: Optional CPU copy of the field (converted when field_gpu is None).
         use_unsharp_mask: Whether to apply unsharp mask after correction
         mask_cpu: Optional foreground mask (Y, X) as CPU bool array
         tile_size: Tile size for processing:
             - None: Auto-detect based on image size
             - 0: Disabled (process full plane)
             - int > 0: Explicit tile size
+        tile_threshold: Override for auto-tiling threshold (pixels). <=0 disables auto-tiling.
 
     Returns:
         Corrected plane as CPU float32 array with same shape as input
@@ -137,21 +144,27 @@ def correct_plane_gpu_tiled(
     H, W = plane.shape
 
     # Validate input shapes
+    if field_gpu is None:
+        if field_cpu is None:
+            raise ValueError("correct_plane_gpu_tiled requires field_gpu or field_cpu.")
+        field_gpu = cp.asarray(np.asarray(field_cpu, dtype=np.float32), dtype=cp.float32)
+
     if field_gpu.shape != (H, W):
         raise ValueError(f"Field shape {field_gpu.shape} does not match plane shape {(H, W)}")
     if mask_cpu is not None and mask_cpu.shape != (H, W):
         raise ValueError(f"Mask shape {mask_cpu.shape} does not match plane shape {(H, W)}")
 
-    effective_tile_size = get_auto_tile_size(H, W, tile_size)
+    effective_tile_size = get_auto_tile_size(H, W, tile_size, tile_threshold)
 
     # If tile size >= image size, process full plane (no tiling overhead)
     if effective_tile_size >= max(H, W):
-        return _process_tile(
+        result = _process_tile(
             plane,
             field_gpu,
             mask_cpu,
             use_unsharp_mask,
         )
+        return result
 
     # Determine halo size based on whether unsharp mask is used
     halo = UNSHARP_HALO if use_unsharp_mask else 0
