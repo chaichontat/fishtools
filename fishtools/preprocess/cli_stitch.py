@@ -40,6 +40,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import rich_click as click
+from click.core import ParameterSource
 from loguru import logger
 from PIL import Image
 from tifffile import TiffFile, TiffFileError, imread
@@ -671,6 +672,7 @@ def register(
         stream_to_console=debug,
         sc=sc,
     )
+
     # Post-check: verify registered tile configuration and emit a layout plot
     try:
         tc_reg_path = out_path / "TileConfiguration.registered.txt"
@@ -736,19 +738,6 @@ def register(
         # Keep CLI resilient; log full context for diagnostics
         logger.opt(exception=True).warning("Post-registration checks encountered an error; continuing.")
 
-    # Remove all digit-named per-tile TIFFs; these are intermediate extracts
-    # used solely to feed ImageJ registration.
-    all_tile_tifs = [p for p in out_path.glob("*.tif") if p.stem.isdigit()]
-    if all_tile_tifs:
-        removed = 0
-        for tif_path in all_tile_tifs:
-            try:
-                tif_path.unlink(missing_ok=True)
-            except Exception as exc:
-                logger.warning(f"Failed to remove intermediate tile TIFF {tif_path}: {exc}")
-            else:
-                removed += 1
-        logger.info(f"Removed {removed} intermediate tile TIFF(s) from {out_path} after registration.")
 
 
 def extract(
@@ -1106,7 +1095,7 @@ def walk_fused(path: Path) -> dict[int, list[Path]]:  # shim
     help="Split tiles into this many parts. Mainly to avoid overflows in very large images.",
 )
 @click.option("--overwrite", is_flag=True)
-@click.option("--downsample", "-d", type=int, default=1)
+@click.option("--downsample", "-d", type=int, default=2)
 @click.option("--subsample-z", type=int, default=1)
 @click.option("--is-2d", is_flag=True)
 @click.option("--threads", "-t", type=int, default=8)
@@ -1146,6 +1135,11 @@ def walk_fused(path: Path) -> dict[int, list[Path]]:  # shim
     default=None,
     help="Round name to use from coarse_shifts.json (required if multiple rounds in file).",
 )
+@click.option(
+    "--fuse-only",
+    is_flag=True,
+    help="Only run fusion without combining into Zarr array.",
+)
 # @click.option("--skip-extract", is_flag=True)
 @batch_roi("registered--*", include_codebook=True, split_codebook=True)
 def fuse(
@@ -1169,6 +1163,7 @@ def fuse(
     field_zarr: Path | None = None,
     coarse_shifts: Path | None = None,
     round_name: str | None = None,
+    fuse_only: bool = False,
 ):
     # Validate: either codebook OR round_name must be provided
     if codebook is None and round_name is None:
@@ -1182,6 +1177,25 @@ def fuse(
     coarse_round_name: str | None = None
 
     if round_name is not None:
+        # In coarse-shifted fusion, default to downsample=1 unless the user
+        # explicitly provided --downsample/-d. This keeps shifts aligned to
+        # the pixel grid used when coarse_shifts.json was computed.
+        try:
+            ctx = click.get_current_context(silent=True)
+        except RuntimeError:
+            ctx = None
+        if ctx is not None:
+            try:
+                source = ctx.get_parameter_source("downsample")
+            except Exception:
+                source = None
+            if source is None or source is ParameterSource.DEFAULT:
+                if downsample != 1:
+                    logger.info(
+                        "Coarse-shifted fusion without explicit --downsample; "
+                        "overriding default to downsample=1 for alignment."
+                    )
+                downsample = 1
         # Auto-detect coarse_shifts path if not provided
         if coarse_shifts is None:
             coarse_shifts = ws.deconved / f"shifts--{roi}" / "coarse_shifts.json"
@@ -1494,19 +1508,25 @@ def fuse(
             continue
         to_runs.append(folder)
 
-    if not len(to_runs):
-        logger.warning("No folders to run.")
-        return
+    if len(to_runs):
+        with progress_bar_threadpool(len(to_runs), threads=threads, stop_on_exception=True) as submit:
+            for folder in to_runs:
+                submit(run_folder, folder, capture_output=not debug, stream_to_console=debug)
 
-    with progress_bar_threadpool(len(to_runs), threads=threads, stop_on_exception=True) as submit:
-        for folder in to_runs:
-            submit(run_folder, folder, capture_output=not debug, stream_to_console=debug)
+        if split > 1:
+            for folder in folders:
+                channel_position = int(folder.name)
+                channel_name = channel_labels_by_position.get(channel_position)
+                final_stitch(folder, split, channel_name=channel_name, sc=sc)
 
-    if split > 1:
-        for folder in folders:
-            channel_position = int(folder.name)
-            channel_name = channel_labels_by_position.get(channel_position)
-            final_stitch(folder, split, channel_name=channel_name, sc=sc)
+    if not fuse_only:
+        logger.info("Automatically running combine step...")
+        subprocess.run(
+            ["preprocess", "stitch", "combine", ws.path, roi,
+             *(["--codebook", codebook] if codebook else []),
+             *(["--overwrite"] if overwrite else [])],
+             check=True
+        )
 
 
 def numpy_array_to_zarr(write_path: Path | str, array: np.ndarray, chunks: tuple[int, ...]):  # shim
@@ -1746,6 +1766,12 @@ def combine(
     help="Pre-filter the N4 source plane with cucim.skimage.filters.unsharp_mask (requires GPU/CuPy).",
 )
 @click.option(
+    "--threads",
+    type=int,
+    default=None,
+    help="Override number of CPU threads used for SimpleITK field estimation (defaults to ~half cores).",
+)
+@click.option(
     "--tile-size",
     type=int,
     default=None,
@@ -1775,6 +1801,7 @@ def n4(
     single_plane: bool,
     debug: bool,
     unsharp_mask: bool,
+    threads: int | None,
     tile_size: int | None,
     tile_threshold: int | None,
 ) -> None:
@@ -1784,6 +1811,7 @@ def n4(
         path,
         component="preprocess.stitch.n4",
         file=f"stitch-n4-{roi}+{codebook}",
+        debug=debug,
         extra={"roi": roi, "codebook": codebook},
     )
 
@@ -1805,6 +1833,7 @@ def n4(
             single_plane=single_plane,
             debug=debug,
             use_unsharp_mask=unsharp_mask,
+            threads=threads,
             tile_size=tile_size,
             tile_threshold=tile_threshold,
         )
