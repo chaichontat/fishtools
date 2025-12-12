@@ -7,10 +7,11 @@ from typing import Iterable, Mapping
 
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib import colors, colormaps
+from matplotlib import colormaps, colors
 from matplotlib.figure import Figure
-from pydantic import BaseModel, TypeAdapter
+from pydantic import TypeAdapter
 
+from fishtools.preprocess.fiducial import Shift
 from fishtools.utils.plot import micron_tick_formatter
 
 __all__ = [
@@ -25,14 +26,6 @@ __all__ = [
     "build_shift_layout_table",
     "make_shifts_layout_figure",
 ]
-
-
-class Shift(BaseModel):
-    """Per-tile registration metadata for a single round."""
-
-    shifts: tuple[float, float]
-    corr: float
-    residual: float
 
 
 ShiftsAdapter = TypeAdapter(dict[str, Shift])
@@ -145,7 +138,7 @@ def make_corr_vs_l2_figure(
     ncols: int = 4,
     corr_threshold: float = 0.8,
 ) -> Figure:
-    """Plot correlation vs L2 distance from mean shift panels."""
+    """Plot correlation vs L2 distance from median shift panels."""
 
     rounds = infer_rounds(shifts_by_tile)
     panels = grid_panels(rounds, ncols)
@@ -155,8 +148,12 @@ def make_corr_vs_l2_figure(
     for ax, round_ in zip(axs, panels.rounds, strict=False):
         corrs = np.array([v[round_].corr for v in shifts_by_tile.values()])
         pts = np.array([v[round_].shifts for v in shifts_by_tile.values()])
-        mean_shift = np.mean(pts, axis=0) if pts.size else np.array([0.0, 0.0])
-        l2 = np.linalg.norm(pts - mean_shift, axis=1) if pts.size else np.array([])
+        if pts.size:
+            median_shift = np.median(pts, axis=0)
+            l2 = np.linalg.norm(pts - median_shift, axis=1)
+        else:
+            median_shift = np.array([np.nan, np.nan])
+            l2 = np.array([])
 
         low = corrs < corr_threshold if corrs.size else np.array([])
         ax.scatter(corrs, l2, c=corrs, alpha=0.6, s=8, cmap="bwr_r", vmin=0.0, vmax=1.0)
@@ -173,8 +170,13 @@ def make_corr_vs_l2_figure(
                 if is_low and corr < corr_threshold:
                     ax.text(float(corr) + 0.01, float(dist) + 0.1, str(tile_id), fontsize=6, color="yellow")
         ax.set_xlabel("Correlation")
-        ax.set_ylabel("L2 distance from mean (px)")
-        ax.set_title(f"{round_}")
+        ax.set_ylabel("L2 distance from median (px)")
+        if l2.size:
+            median_x = float(median_shift[0])
+            median_y = float(median_shift[1]) if median_shift.shape[0] > 1 else 0.0
+            ax.set_title(f"{round_} median=({median_x:.2f}, {median_y:.2f}) px")
+        else:
+            ax.set_title(f"{round_} (no data)")
         if corrs.size:
             ax.set_xlim(min(0.0, float(corrs.min()) - 0.1), 1.0)
         ax.set_ylim(0, max(2.0, float(l2.max()) + 1.0) if l2.size else 2.0)
@@ -225,7 +227,7 @@ def _apply_micron_ticks(ax: plt.Axes, pixel_size_um: float | None) -> None:
 
 
 def _compute_round_l2(shifts_by_tile: Mapping[int, Mapping[str, Shift]]) -> dict[str, dict[int, float]]:
-    """Compute L2 distance from the per-round mean shift for each tile."""
+    """Compute L2 distance from the per-round median shift for each tile."""
 
     l2_lookup: dict[str, dict[int, float]] = {}
     rounds = infer_rounds(shifts_by_tile)
@@ -239,8 +241,8 @@ def _compute_round_l2(shifts_by_tile: Mapping[int, Mapping[str, Shift]]) -> dict
         if not vectors:
             continue
         stacked = np.vstack([vec for _tile_id, vec in vectors])
-        mean_vec = stacked.mean(axis=0)
-        distances = np.linalg.norm(stacked - mean_vec, axis=1)
+        median_vec = np.median(stacked, axis=0)
+        distances = np.linalg.norm(stacked - median_vec, axis=1)
         l2_lookup[round_name] = {
             tile_id: float(dist)
             for (tile_id, _), dist in zip(vectors, distances, strict=False)
@@ -399,7 +401,7 @@ def make_shifts_layout_figure(
         right_ax = axs[1, -1]
         divider = make_axes_locatable(right_ax)
         cax = divider.append_axes("right", size="3%", pad=0.05)
-        fig.colorbar(l2_mappable, cax=cax, orientation="vertical", label="L2 distance from mean (px)")
+        fig.colorbar(l2_mappable, cax=cax, orientation="vertical", label="L2 distance from median (px)")
 
     # Bottom row keeps X-axis labels; first column retains Y-axis labels
 

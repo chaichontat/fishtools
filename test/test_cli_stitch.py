@@ -1,3 +1,4 @@
+import json
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -1114,7 +1115,7 @@ class TestSliceMosaic:
         assert result.exit_code != 0
         assert "fused.zarr not found" in result.output
 
-    def test_slice_mosaic_cli_missing_shifted_tc(self, tmp_path: Path) -> None:
+def test_slice_mosaic_cli_missing_shifted_tc(self, tmp_path: Path) -> None:
         """Test slice CLI error when TileConfiguration.shifted.txt doesn't exist."""
         import zarr
 
@@ -1149,6 +1150,202 @@ class TestSliceMosaic:
         assert "shifted" in error_text.lower() or "tileconfiguration" in error_text.lower() or isinstance(
             result.exception, FileNotFoundError
         )
+
+
+def test_fuse_cli_default_downsample_is_two(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ensure `stitch fuse` defaults to downsample=2 when not provided."""
+    from fishtools.preprocess import cli_stitch as cli_stitch_module
+
+    captured: dict[str, Any] = {}
+
+    def fake_fuse(**kwargs: Any) -> None:  # type: ignore[no-untyped-def]
+        captured["params"] = kwargs
+
+    monkeypatch.setattr(cli_stitch_module.fuse, "callback", fake_fuse)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        stitch,
+        ["fuse", str(workspace), "roi1", "--codebook", "cb1"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert captured["params"]["downsample"] == 2
+
+
+def test_fuse_cli_respects_explicit_downsample(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ensure `stitch fuse -d` overrides the default downsample."""
+    from fishtools.preprocess import cli_stitch as cli_stitch_module
+
+    captured: dict[str, Any] = {}
+
+    def fake_fuse(**kwargs: Any) -> None:  # type: ignore[no-untyped-def]
+        captured["params"] = kwargs
+
+    monkeypatch.setattr(cli_stitch_module.fuse, "callback", fake_fuse)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        stitch,
+        ["fuse", str(workspace), "roi1", "--codebook", "cb1", "-d", "4"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert captured["params"]["downsample"] == 4
+
+
+def test_fuse_cli_coarse_shifts_default_downsample_is_one(tmp_path: Path, monkeypatch: Any) -> None:
+    """Coarse-shifted fusion should default to downsample=1."""
+    roi = "roi1"
+    round_name = "1_9_17"
+
+    # Minimal workspace with OK.DONE marker
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "OK.DONE").write_text("ok\n")
+
+    deconv_root = workspace / "analysis" / "deconv"
+    deconv_root.mkdir(parents=True)
+
+    # Coarse shifts JSON
+    shifts_dir = deconv_root / f"shifts--{roi}"
+    shifts_dir.mkdir(parents=True)
+    coarse_path = shifts_dir / "coarse_shifts.json"
+    coarse_path.write_text(
+        json.dumps(
+            {
+                "reference": "ref",
+                "tiles": {
+                    "0": {
+                        round_name: {
+                            "dx": 1.0,
+                            "dy": 2.0,
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    # Minimal deconvolved tile directory so fuse sees at least one .tif
+    tiles_dir = deconv_root / f"{round_name}--{roi}"
+    tiles_dir.mkdir(parents=True)
+    (tiles_dir / f"{round_name}-0001.tif").write_text("")
+
+    captured: dict[str, Any] = {}
+
+    def fake_from_file(path: Path):  # type: ignore[no-untyped-def]
+        class DummyTileConfig:
+            def downsample(self, factor: int) -> "DummyTileConfig":
+                captured["downsample"] = factor
+                # Stop execution after we observe the factor
+                raise RuntimeError("stop after downsample")
+
+        return DummyTileConfig()
+
+    monkeypatch.setattr(
+        "fishtools.preprocess.cli_stitch.TileConfiguration.from_file",
+        fake_from_file,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        stitch,
+        [
+            "fuse",
+            str(deconv_root),
+            roi,
+            "--round-name",
+            round_name,
+            "--coarse-shifts",
+            str(coarse_path),
+        ],
+        catch_exceptions=True,
+    )
+
+    # CLI should have reached our stub and used downsample=1 by default
+    assert captured["downsample"] == 1
+    assert isinstance(result.exception, RuntimeError)
+
+
+def test_fuse_cli_coarse_shifts_respects_explicit_downsample(tmp_path: Path, monkeypatch: Any) -> None:
+    """Coarse-shifted fusion should honor an explicit --downsample value."""
+    roi = "roi1"
+    round_name = "1_9_17"
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "OK.DONE").write_text("ok\n")
+
+    deconv_root = workspace / "analysis" / "deconv"
+    deconv_root.mkdir(parents=True)
+
+    shifts_dir = deconv_root / f"shifts--{roi}"
+    shifts_dir.mkdir(parents=True)
+    coarse_path = shifts_dir / "coarse_shifts.json"
+    coarse_path.write_text(
+        json.dumps(
+            {
+                "reference": "ref",
+                "tiles": {
+                    "0": {
+                        round_name: {
+                            "dx": 1.0,
+                            "dy": 2.0,
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    tiles_dir = deconv_root / f"{round_name}--{roi}"
+    tiles_dir.mkdir(parents=True)
+    (tiles_dir / f"{round_name}-0001.tif").write_text("")
+
+    captured: dict[str, Any] = {}
+
+    def fake_from_file(path: Path):  # type: ignore[no-untyped-def]
+        class DummyTileConfig:
+            def downsample(self, factor: int) -> "DummyTileConfig":
+                captured["downsample"] = factor
+                raise RuntimeError("stop after downsample")
+
+        return DummyTileConfig()
+
+    monkeypatch.setattr(
+        "fishtools.preprocess.cli_stitch.TileConfiguration.from_file",
+        fake_from_file,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        stitch,
+        [
+            "fuse",
+            str(deconv_root),
+            roi,
+            "--round-name",
+            round_name,
+            "--coarse-shifts",
+            str(coarse_path),
+            "-d",
+            "4",
+        ],
+        catch_exceptions=True,
+    )
+
+    # Explicit -d 4 should be preserved even in coarse-shift mode
+    assert captured["downsample"] == 4
+    assert isinstance(result.exception, RuntimeError)
 
 
 if __name__ == "__main__":
