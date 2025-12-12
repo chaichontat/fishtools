@@ -175,3 +175,4 @@ squid/
 *.pdf
 *.h5
 .vscode/
+logs/

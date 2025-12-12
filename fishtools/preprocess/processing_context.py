@@ -5,10 +5,13 @@ Provides dependency injection pattern for configuration, workspace management,
 and scientific parameter caching with validation at initialization.
 """
 
+import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+_DEFAULT_DATA_PATH = os.environ.get("DATA_PATH", "/working/fishtools/data")
 
 import numpy as np
 from loguru import logger
@@ -285,7 +288,7 @@ def create_legacy_processing_context(
     from fishtools.preprocess.cli_register_migrated import create_configuration
 
     config = create_configuration(
-        config_file=config_file, data_path=data_path or "/working/fishtools/data", **legacy_overrides
+        config_file=config_file, data_path=data_path or _DEFAULT_DATA_PATH, **legacy_overrides
     )
 
     return ProcessingContext.create(workspace_path, config)

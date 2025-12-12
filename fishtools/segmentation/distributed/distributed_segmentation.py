@@ -21,6 +21,8 @@ import numpy as np
 import tifffile
 import typer
 import zarr
+from cellpose import transforms as cp_transforms
+from distributed import WorkerPlugin
 from numpy.typing import NDArray
 from rich.logging import RichHandler
 
@@ -1053,9 +1055,9 @@ def run(
         base_dir = input_path.parent
     elif input_path.is_dir():
         base_dir = input_path
-        zarr_input_path = base_dir / "fused.zarr"
+        zarr_input_path = base_dir / "fused_n4.zarr"
         if not zarr_input_path.exists():
-            raise FileNotFoundError(f"Expected 'fused.zarr' in {base_dir} but it was not found.")
+            raise FileNotFoundError(f"Expected 'fused_n4.zarr' in {base_dir} but it was not found.")
     else:
         raise FileNotFoundError(f"Path {input_path} must be a directory or a '.zarr' store.")
 
@@ -1063,7 +1065,7 @@ def run(
         logger.warning("Segmentation already exists. Exiting.")
         exit()
 
-    IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
+    IS_CELLPOSE_SAM = version("cellpose").startswith("4.") or "dev" in version("cellpose")
     if not IS_CELLPOSE_SAM:
         raise RuntimeError("This script requires Cellpose version 4.x for SAM backend support.")
 

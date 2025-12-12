@@ -49,7 +49,7 @@ from fishtools.gpu.memory import release_all as gpu_release_all
 from fishtools.io.workspace import Workspace, safe_imwrite
 from fishtools.preprocess.config import StitchingConfig
 from fishtools.preprocess.config_loader import load_config
-from fishtools.preprocess.downsample import gpu_downsample_xy
+from fishtools.preprocess.downsample import downsample_xy
 from fishtools.preprocess.illumination import parse_tile_index_from_path, resolve_roi_for_field, tile_origin
 from fishtools.preprocess.imagej import run_imagej as _run_imagej
 from fishtools.preprocess.imageops import clip_range_for_dtype as clip_range_for_dtype_lib
@@ -335,7 +335,7 @@ def extract_channel(
         if downsample > 1:
             clip_range = _clip_range_for_dtype(img.dtype)
             try:
-                img = gpu_downsample_xy(
+                img = downsample_xy(
                     img,
                     crop=0,
                     factor=downsample,
@@ -897,7 +897,7 @@ def extract(
             img = _crop_xy(img, trim)
             if downsample > 1:
                 try:
-                    img = gpu_downsample_xy(
+                    img = downsample_xy(
                         img,
                         crop=0,
                         factor=downsample,
@@ -966,7 +966,7 @@ def extract(
         img = _crop_xy(img, trim)
         if downsample > 1:
             try:
-                img = gpu_downsample_xy(
+                img = downsample_xy(
                     img,
                     crop=0,
                     factor=downsample,

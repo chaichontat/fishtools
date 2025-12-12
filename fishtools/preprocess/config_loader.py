@@ -1,10 +1,13 @@
 import json
+import os
 from pathlib import Path
 
 from loguru import logger
 from pydantic import ValidationError
 
-from .config import Config, Fiducial, RegisterConfig
+from .config import Config, Fiducial
+
+_DEFAULT_DATA_PATH = os.environ.get("DATA_PATH", "/working/fishtools/data")
 
 
 def load_config_from_json(config_path: Path, data_path: str, **overrides) -> Config:
@@ -59,7 +62,7 @@ def load_config_from_json(config_path: Path, data_path: str, **overrides) -> Con
 
 
 def load_minimal_config(
-    data_path: str = "/working/fishtools/data", reference: str = "4_12_20", **fiducial_overrides
+    data_path: str = _DEFAULT_DATA_PATH, reference: str = "4_12_20", **fiducial_overrides
 ) -> Config:
     """Create a minimal config for backward compatibility.
 
@@ -91,7 +94,7 @@ def generate_config_template(output_path: Path) -> None:
 
 # Convenience functions for backward compatibility
 def load_config(
-    config_path: Path | None = None, data_path: str = "/working/fishtools/data", **overrides
+    config_path: Path | None = None, data_path: str = _DEFAULT_DATA_PATH, **overrides
 ) -> Config:
     """Load configuration from JSON file or create minimal config.
 

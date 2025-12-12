@@ -1,6 +1,7 @@
 # %%
 import csv
 import json
+import os
 import pickle
 import shutil
 from collections import defaultdict
@@ -43,7 +44,7 @@ if TYPE_CHECKING:
 
 # %%
 
-DATA = Path("/working/fishtools/data")
+DATA = Path(os.environ["DATA_PATH"]).expanduser().resolve() if "DATA_PATH" in os.environ else Path("/working/fishtools/data")
 
 
 # %%

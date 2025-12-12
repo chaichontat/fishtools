@@ -1,3 +1,4 @@
+import os
 from enum import Enum
 from json import JSONEncoder
 from pathlib import Path
@@ -7,7 +8,7 @@ import numpy as np
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
 
-DATA = Path("/working/fishtools/data")
+DATA = Path(os.environ["DATA_PATH"]).expanduser().resolve() if "DATA_PATH" in os.environ else Path("/working/fishtools/data")
 
 
 class DeconvolutionOutputMode(str, Enum):

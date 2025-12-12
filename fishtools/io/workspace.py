@@ -791,6 +791,110 @@ class Workspace:
         """
         return OptimizePath(self.deconved / f"opt_{codebook}")
 
+    @staticmethod
+    def is_bit_round(round_name: str) -> bool:
+        """Determine if a round is a bit round (vs. named/non-bit round).
+
+        Bit rounds typically have numeric prefixes like "1_9_17" indicating
+        channel indices, while non-bit rounds have descriptive names like
+        "dapi", "polyA", etc.
+
+        Args:
+            round_name: The round identifier to check
+
+        Returns:
+            True if the round is a bit round, False otherwise
+
+        Example:
+            >>> Workspace.is_bit_round("1_9_17")  # True
+            >>> Workspace.is_bit_round("dapi")    # False
+        """
+        if not round_name:
+            return False
+        first_token = round_name.split("_")[0]
+        return first_token.isdigit()
+
+    def pending_deconv_tasks(
+        self, include_nonbit: bool = False
+    ) -> list[tuple[str, str, Literal["run", "prepare", "run_u16"]]]:
+        """Discover pending deconvolution tasks for this workspace.
+
+        Scans the workspace to identify which rounds and ROIs still need
+        deconvolution processing. Bit rounds require a "run" task that produces
+        float32 output. Non-bit rounds (when include_nonbit=True) require a
+        "prepare" task followed by "run_u16" tasks for each ROI.
+
+        Args:
+            include_nonbit: If True, include prepare/run_u16 tasks for non-bit rounds
+
+        Returns:
+            List of (round_name, roi, task_type) tuples where task_type is:
+            - "run": Deconvolution needed for a bit round
+            - "prepare": Scaling computation needed for a non-bit round
+            - "run_u16": U16 deconvolution needed for a non-bit round
+
+        Example:
+            >>> ws.pending_deconv_tasks()
+            [('1_9_17', 'roi1', 'run'), ('1_9_17', 'roi2', 'run')]
+            >>> ws.pending_deconv_tasks(include_nonbit=True)
+            [('1_9_17', 'roi1', 'run'), ('dapi', '', 'prepare')]
+        """
+        tasks: list[tuple[str, str, Literal["run", "prepare", "run_u16"]]] = []
+
+        for round_name in self.rounds:
+            is_bit = self.is_bit_round(round_name)
+
+            if is_bit:
+                # Bit rounds: check each ROI for deconvolved output
+                for roi in self.rois:
+                    src_dir = self.path / f"{round_name}--{roi}"
+                    if not src_dir.exists():
+                        continue
+
+                    # Count source tiles
+                    src_tiles = list(src_dir.glob(f"{round_name}-*.tif"))
+                    if not src_tiles:
+                        continue
+
+                    # Check if deconvolved output exists
+                    deconv_dir = self.deconved / f"{round_name}--{roi}"
+                    if deconv_dir.exists():
+                        deconv_tiles = list(deconv_dir.glob(f"{round_name}-*.tif"))
+                        if len(deconv_tiles) >= len(src_tiles):
+                            continue
+
+                    # Deconvolution needed
+                    tasks.append((round_name, roi, "run"))
+
+            elif include_nonbit:
+                # Non-bit rounds: check if prepare/precompute has been done
+                scaling_file = self.deconv_scaling(round_name)
+                if not scaling_file.exists():
+                    # Need to run prepare + precompute
+                    tasks.append((round_name, "", "prepare"))
+                else:
+                    # Scaling exists, now check run_u16 for each ROI with source tiles
+                    for roi in self.rois:
+                        src_dir = self.path / f"{round_name}--{roi}"
+                        if not src_dir.exists():
+                            continue
+
+                        src_tiles = list(src_dir.glob(f"{round_name}-*.tif"))
+                        if not src_tiles:
+                            continue
+
+                        # Check if u16 deconvolved output exists
+                        deconv_dir = self.deconved / f"{round_name}--{roi}"
+                        if deconv_dir.exists():
+                            deconv_tiles = list(deconv_dir.glob(f"{round_name}-*.tif"))
+                            if len(deconv_tiles) >= len(src_tiles):
+                                continue
+
+                        # U16 deconvolution needed
+                        tasks.append((round_name, roi, "run_u16"))
+
+        return tasks
+
 
 def get_metadata(file: Path):  # re-export from utils.tiff
     return _ft_get_metadata(file)

@@ -44,9 +44,15 @@ def run_imagej(
         options += " compute_overlap"
     fusion = "Linear Blending" if fuse else "Do not fuse images (only write TileConfiguration)"
 
-    if not (imagej_path := Path.home() / "Fiji.app/ImageJ-linux64").exists():
+    if env_path := os.environ.get("IMAGEJ_PATH"):
+        imagej_path = Path(env_path)
+    else:
+        imagej_path = Path.home() / "Fiji.app/ImageJ-linux64"
+
+    if not imagej_path.exists():
         raise FileNotFoundError(
-            f"ImageJ not found at {imagej_path}. Please install ImageJ in your home directory."
+            f"ImageJ not found at {imagej_path}. Set IMAGEJ_PATH environment variable "
+            "or install ImageJ at ~/Fiji.app/ImageJ-linux64."
         )
 
     max_mem = sc.max_memory_mb if sc else 102400

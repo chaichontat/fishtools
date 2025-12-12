@@ -13,8 +13,17 @@ class GpuTimer:
     """
 
     def __init__(self, stream: cp.cuda.Stream | None = None):
-        self.stream = stream or cp.cuda.get_current_stream()
+        self._stream = stream
+        self._stream_initialized = stream is not None
         self.times: Dict[str, float] = {}
+
+    @property
+    def stream(self) -> cp.cuda.Stream:
+        """Lazy initialization of CUDA stream - only accessed when timer is actually used."""
+        if not self._stream_initialized:
+            self._stream = cp.cuda.get_current_stream()
+            self._stream_initialized = True
+        return self._stream
 
     @contextmanager
     def section(self, name: str):
