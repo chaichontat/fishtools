@@ -475,9 +475,8 @@ def _calculate_drift(
         how="horizontal",
     )
 
-    # Remove duplicate mapping, priority on closest
-    # thresh = np.percentile(dist, 10), np.percentile(dist, 90)
-    finite = mapping.sort("dist").unique("fixed_idx", keep="first")
+    # Remove pairs with distance > 50px and duplicate mappings (priority on closest)
+    finite = mapping.filter(pl.col("dist") <= 50.0).sort("dist").unique("fixed_idx", keep="first")
     joined = finite.join(
         ref_points[["idx", *cols]], left_on="fixed_idx", right_on="idx", how="left", suffix="_fixed"
     ).with_columns(
@@ -896,19 +895,19 @@ def _align_fiducials_internal(
         # itk_shift returns [dy, dx], swap to [dx, dy] for consistency.
         return shift_vec[::-1], 0.0
 
-    def spot_with_itk_fallback(img: np.ndarray, bitname: str, limit: int) -> tuple[np.ndarray, float]:
-        """Try spot-based registration, fall back to SimpleITK if it fails."""
+    def spot_with_fft_fallback(img: np.ndarray, bitname: str, limit: int) -> tuple[np.ndarray, float]:
+        """Try spot-based registration, fall back to FFT if it fails."""
         try:
             return corr(img, bitname=bitname, limit=limit)
         except (NotEnoughSpots, TooManySpots, ResidualTooLarge, DriftTooLarge) as e:
             logger.warning(
-                f"{bitname}: Spot-based registration failed ({e.__class__.__name__}), falling back to SimpleITK"
+                f"{bitname}: Spot-based registration failed ({e.__class__.__name__}), falling back to FFT"
             )
-            shift_vec, n_iters = itk_shift(fids[ref], img, max_shift=itk_max_shift)
-            itk_iterations[bitname] = n_iters
-            mode_map[bitname] = "itk"
-            # residual=-1 indicates ITK fallback
-            return shift_vec[::-1], -1.0
+            # phase_shift returns [dy, dx], swap to [dx, dy] to match spot-based convention
+            shift_vec = phase_shift(fids[ref], img)[::-1]
+            mode_map[bitname] = "fft"
+            # residual=-1 indicates fallback
+            return shift_vec, -1.0
 
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
         futs: dict[str, Future] = {}
@@ -924,9 +923,9 @@ def _align_fiducials_internal(
                 mode_map[k] = "itk"
                 futs[k] = exc.submit(_itk_wrapper, img, k)
             else:
-                # Spot-based with ITK fallback
+                # Spot-based with FFT fallback
                 mode_map[k] = "spots"
-                futs[k] = exc.submit(spot_with_itk_fallback, img, bitname=k, limit=max_iters)
+                futs[k] = exc.submit(spot_with_fft_fallback, img, bitname=k, limit=max_iters)
 
             if debug:
                 futs[k].result()

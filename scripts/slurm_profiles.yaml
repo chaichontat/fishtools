@@ -1,0 +1,97 @@
+# Default profile (inherited by all others)
+default:
+  partition: cpu
+  gpus: 0
+  cpus: 8
+  mem: 64G
+  time: "02:00:00"
+
+# Per-phase overrides
+profiles:
+  prepare:
+    gpus: 1
+    cpus: 4
+    mem: 32G
+    time: "00:30:00"
+
+  basic:
+    partition: cpu
+    gpus: 0
+    cpus: 24
+    mem: 256G
+    time: "02:00:00"
+
+  deconv:
+    partition: l40s
+    gpus: 2
+    cpus: 6
+    mem: 64G
+    time: "02:00:00"
+
+  register:
+    gpus: 1
+    cpus: 16
+    mem: 64G
+    time: "01:00:00"
+
+  stitch:
+    gpus: 0
+    cpus: 54
+    mem: 128G
+    time: "02:00:00"
+
+  compute-range:
+    partition: cpu
+    gpus: 0
+    cpus: 2
+    mem: 16G
+    time: "00:30:00"
+
+  register-batch:
+    partition: cpu
+    gpus: 0
+    cpus: 44
+    mem: 320G
+    time: "06:00:00"
+
+  spots-optimize:
+    partition: l40s
+    gpus: 1
+    cpus: 36
+    mem: 360G
+    time: "04:00:00"
+
+  spots-batch:
+    partition: l40s
+    gpus: 1
+    cpus: 36
+    mem: 360G
+    time: "04:00:00"
+
+  stitch-register:
+    partition: cpu
+    gpus: 0
+    cpus: 32
+    mem: 128G
+    time: "02:00:00"
+
+  stitch-fuse:
+    partition: cpu
+    gpus: 0
+    cpus: 32
+    mem: 256G
+    time: "02:00:00"
+
+  n4:
+    partition: l40s
+    gpus: 1
+    cpus: 16
+    mem: 128G
+    time: "02:00:00"
+
+  spots-stitch:
+    partition: cpu
+    gpus: 0
+    cpus: 16
+    mem: 64G
+    time: "02:00:00"

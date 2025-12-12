@@ -107,11 +107,15 @@ class FiducialPaths:
     - Fiducial thumbnails per ROI/tile index:
       ``<deconved>/fids--{roi}/fids-{idx:04d}.tif``
     - Debug stacks and overlays (when registration runs with --debug):
-      ``<deconved>/fids_debug/{roi}/``.
+      ``<analysis>/output/fids_debug/{roi}/``.
     """
 
     deconved_root: Path
     roi: str
+
+    def __init__(self, deconved_root: Path, roi: str) -> None:
+        self.deconved_root = Path(deconved_root).resolve()
+        self.roi = roi
 
     @property
     def fid_dir(self) -> Path:
@@ -130,7 +134,7 @@ class FiducialPaths:
     @property
     def debug_dir(self) -> Path:
         """Directory containing debug fiducial stacks and overlays."""
-        return self.deconved_root / "fids_debug" / self.roi
+        return self.deconved_root.parent / "output" / "fids_debug" / self.roi
 
 
 # Backward compatibility: codebook utilities are resolved elsewhere

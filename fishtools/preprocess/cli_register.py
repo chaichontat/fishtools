@@ -354,8 +354,8 @@ def _save_debug_overlay(
     reference_name: str,
     shifted: dict[str, np.ndarray],
 ) -> None:
-    """Save red-green overlay: reference round (green) vs shifted round (red)."""
-    from PIL import Image as PILImage
+    """Save red-green overlay figure: reference round (green) vs shifted rounds (red)."""
+    import matplotlib.pyplot as plt
 
     ref = shifted[reference_name]
 
@@ -366,15 +366,39 @@ def _save_debug_overlay(
 
     ref_norm = (norm_pct(ref) * 255).astype(np.uint8)
 
-    for name, img in shifted.items():
-        if name == reference_name:
-            continue
+    # Get non-reference rounds
+    other_names = sorted(k for k in shifted.keys() if k != reference_name)
+    n_panels = len(other_names)
+    if n_panels == 0:
+        return
 
-        img_norm = (norm_pct(img) * 255).astype(np.uint8)
+    # Calculate grid layout
+    ncols = min(4, n_panels)
+    nrows = (n_panels + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), dpi=200, facecolor="black")
+    if n_panels == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    for ax, name in zip(axes, other_names):
+        img_norm = (norm_pct(shifted[name]) * 255).astype(np.uint8)
         # RGB: R=current round, G=reference round, B=0
         rgb = np.stack([img_norm, ref_norm, np.zeros_like(ref_norm)], axis=-1)
+        ax.imshow(rgb)
+        ax.set_title(name, fontsize=10, color="white")
+        ax.set_facecolor("black")
+        ax.axis("off")
 
-        PILImage.fromarray(rgb).save(debug_dir / f"{roi}-{idx:04d}-{name}.png")
+    # Hide unused axes
+    for ax in axes[n_panels:]:
+        ax.set_facecolor("black")
+        ax.axis("off")
+
+    fig.suptitle(f"{roi}-{idx:04d} (green=ref:{reference_name})", fontsize=12, color="white")
+    fig.tight_layout()
+    fig.savefig(debug_dir / f"{roi}-{idx:04d}-overlay.png", facecolor="black")
+    plt.close(fig)
 
 
 def _debug_fid_paths(path: Path, roi: str, idx: int) -> tuple[Path, str, str]:
@@ -390,13 +414,13 @@ def _spot_registration_failures(
     *,
     fiducial_cfg: Fiducial,
 ) -> list[str]:
-    """Return rounds that fell back to ITK after spot registration failed."""
+    """Return rounds that fell back to FFT after spot registration failed."""
 
     if fiducial_cfg.use_itk or fiducial_cfg.use_fft:
         return []
 
     failures = [
-        name for name, stat in stats.items() if stat is not None and stat.mode == "itk"
+        name for name, stat in stats.items() if stat is not None and stat.mode == "fft"
     ]
     return failures
 
@@ -555,12 +579,12 @@ def run_fiducial(
     debug: bool,
     no_priors: bool = False,
     fids_raw: dict[str, np.ndarray] | None = None,
+    max_iters: int = 5,
 ):
     prior_mapping: dict[str, str] = {}
 
     if (
-        not config.registration.fiducial.use_fft
-        and config.registration.fiducial.anchor_roi is None  # Skip priors when using anchor ROI
+        config.registration.fiducial.anchor_roi is None  # Skip priors when using anchor ROI
         and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
         and not no_priors
         and config.registration.fiducial.priors is None
@@ -647,7 +671,7 @@ def run_fiducial(
             fids,
             reference=reference,
             debug=debug,
-            max_iters=5,
+            max_iters=max_iters,
             threshold_sigma=config.registration.fiducial.threshold,
             fwhm=config.registration.fiducial.fwhm,
             use_fft=config.registration.fiducial.use_fft,
@@ -742,6 +766,7 @@ def _run(
     overwrite: bool = False,
     no_priors: bool = False,
     repaired_rounds: set[str] | None = None,
+    max_iters: int = 5,
 ):
     logger.info("Starting")
     codebook_name = Path(codebook).stem
@@ -859,6 +884,7 @@ def _run(
             idx=idx,
             no_priors=no_priors,
             fids_raw=fid_raw_images,
+            max_iters=max_iters,
         )
 
     for _img in imgs.values():
@@ -1019,7 +1045,7 @@ def register(): ...
 
 
 @register.command()
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path, resolve_path=True))
 @click.argument("idx", type=int)
 @click.option("--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path))
 @click.option("--roi", type=str, default="*")
@@ -1055,6 +1081,13 @@ def register(): ...
     default=None,
     help="Comma-separated round names to use from --repaired folders (e.g., '1_9_17,2_10_18')",
 )
+@click.option(
+    "--max-iters",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Maximum iterations for spot-based drift refinement.",
+)
 def run(
     path: Path,
     idx: int,
@@ -1073,6 +1106,7 @@ def run(
     allow_large_drifts: bool = False,
     ignore_large_shifts: bool = False,
     repaired: str | None = None,
+    max_iters: int = 5,
 ):
     """Preprocess image sets before spot calling.
 
@@ -1132,6 +1166,7 @@ def run(
             ),
             overwrite=overwrite,
             repaired_rounds=repaired_rounds,
+            max_iters=max_iters,
         )
 
 
@@ -1178,6 +1213,13 @@ def run(
     default=None,
     help="Comma-separated round names to use from --repaired folders (e.g., '1_9_17,2_10_18')",
 )
+@click.option(
+    "--max-iters",
+    type=int,
+    default=5,
+    show_default=True,
+    help="Maximum iterations for spot-based drift refinement.",
+)
 def batch(
     path: Path,
     roi: str,
@@ -1194,6 +1236,7 @@ def batch(
     use_brightest: int = 20,
     allow_large_drifts: bool = False,
     repaired: str | None = None,
+    max_iters: int = 5,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
@@ -1251,6 +1294,7 @@ def batch(
                         "--reference",
                         ref,
                         f"--roi={roi}",
+                        f"--max-iters={max_iters}",
                         *(["--overwrite"] if overwrite else []),
                         *( [f"--repaired={repaired}"] if repaired else [] ),
                         *(["--use-fft"] if use_fft else []),
@@ -1350,7 +1394,7 @@ register.add_command(batch)
 
 
 @register.command("fix-shifts")
-@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path, resolve_path=True))
 @click.option("--roi", "-o", type=str, required=True, help="ROI to process")
 @click.option("--reference", "-r", type=str, default="2_10_18", help="Reference round name")
 @click.option(

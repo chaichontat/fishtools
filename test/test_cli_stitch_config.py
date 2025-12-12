@@ -10,13 +10,11 @@ from fishtools.preprocess.config import StitchingConfig
 
 
 def test_run_imagej_uses_stitching_config(monkeypatch: Any, tmp_path: Path) -> None:
-    # Create fake ImageJ binary under a temp $HOME
-    home = tmp_path / "home"
-    imagej = home / "Fiji.app" / "ImageJ-linux64"
-    imagej.parent.mkdir(parents=True)
+    # Create fake ImageJ binary and set IMAGEJ_PATH env var
+    imagej = tmp_path / "ImageJ-linux64"
     imagej.write_text("")
 
-    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("IMAGEJ_PATH", str(imagej))
 
     # Capture subprocess invocation and read the macro file path
     recorded: dict[str, str] = {}

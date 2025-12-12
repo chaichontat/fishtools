@@ -37,11 +37,27 @@ def _make_workspace(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_debug_fid_paths_include_roi(tmp_path: Path) -> None:
-    base = tmp_path / "ws"
+    base = tmp_path / "ws" / "analysis" / "deconv"
     debug_dir, raw, shifted = _debug_fid_paths(base, "roiA", 7)
-    assert debug_dir == base / "fids_debug" / "roiA"
+    assert debug_dir == base.parent / "output" / "fids_debug" / "roiA"
     assert raw == "roiA-0007.tif"
     assert shifted == "roiA-shifted-0007.tif"
+
+
+def test_debug_fid_paths_with_relative_path(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ensure debug_dir resolves correctly even when given a relative path like '.'"""
+    base = tmp_path / "ws" / "analysis" / "deconv"
+    base.mkdir(parents=True)
+    monkeypatch.chdir(base)
+
+    # Use "." as the path (simulating running from deconv directory)
+    debug_dir, raw, shifted = _debug_fid_paths(Path("."), "roiA", 7)
+
+    # Should resolve to absolute path under output/fids_debug
+    expected = base.parent / "output" / "fids_debug" / "roiA"
+    assert debug_dir == expected
+    assert "output" in debug_dir.parts
+    assert "fids_debug" in debug_dir.parts
 
 
 def test_save_debug_overlay_prefixes_roi(tmp_path: Path) -> None:
