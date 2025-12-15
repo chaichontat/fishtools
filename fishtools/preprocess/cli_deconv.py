@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -8,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 
-import cupy as cp
 import numpy as np
 import rich_click as click
 from loguru import logger
@@ -16,6 +14,7 @@ from loguru import logger
 from fishtools.io.workspace import Workspace, get_channels
 from fishtools.preprocess.config import DeconvolutionConfig, DeconvolutionOutputMode
 from fishtools.preprocess.deconv.backend import (
+    DeconvolutionTileProcessor,  # noqa: F401 - re-exported for tests/consumers
     Float32HistBackend,
     LegacyPerTileU16Backend,
     OutputBackend,
@@ -167,7 +166,8 @@ def quantize(
     )
 
     # Delete deconv32 directories for this round after quantization
-    deconv32_base = workspace / "analysis" / "deconv32"
+    ws = Workspace(workspace)
+    deconv32_base = ws.deconv32
     pattern = f"{round_name}--*"
     for roi_dir in deconv32_base.glob(pattern):
         if roi_dir.is_dir():
@@ -250,13 +250,11 @@ class _PrefixedLogger:
         logger.error(self._format(message, prefix))
 
 
-def _is_candidate_tile(path: Path) -> bool:
+def _is_candidate_tile(path: Path, *, deconv_root: Path) -> bool:
     parent_name = path.parent.name
-    return (
-        "analysis/deconv" not in str(path)
-        and not parent_name.endswith("basic")
-        and not path.name.startswith("fid")
-    )
+    if path.is_relative_to(deconv_root):
+        return False
+    return not parent_name.endswith("basic") and not path.name.startswith("fid")
 
 
 def _parse_roi(directory_name: str) -> str | None:
@@ -283,13 +281,17 @@ def _collect_round_tiles(
 ) -> list[Path]:
     """Discover tiles for a round, optionally constrained by ROI and reference indices."""
 
+    ws = Workspace(root)
+    scan_root = ws.path
+    deconv_root = ws.deconved
+
     roi_filter = set(rois) if rois else None
 
     ref_indices: dict[str, set[int]] = {}
     if ref_round is not None:
         ref_pattern = f"{ref_round}--*/{ref_round}-*.tif"
-        for ref_tile in root.glob(ref_pattern):
-            if not _is_candidate_tile(ref_tile):
+        for ref_tile in scan_root.glob(ref_pattern):
+            if not _is_candidate_tile(ref_tile, deconv_root=deconv_root):
                 continue
             roi_name = _parse_roi(ref_tile.parent.name)
             if roi_name is None:
@@ -306,8 +308,8 @@ def _collect_round_tiles(
 
     tiles: list[Path] = []
     pattern = f"{round_name}--*/{round_name}-*.tif"
-    for tile in sorted(root.glob(pattern)):
-        if not _is_candidate_tile(tile):
+    for tile in sorted(scan_root.glob(pattern)):
+        if not _is_candidate_tile(tile, deconv_root=deconv_root):
             continue
         roi_name = _parse_roi(tile.parent.name)
         if roi_name is None:
@@ -762,6 +764,7 @@ def multi_run(
     ref: str | Path | None,
     limit: int | None,
     mode: str = _PREPARE_DEFAULT_MODE.value,
+    backend: str | None = None,
     histogram_bins: int = 8192,
     skip_quantized: bool = False,
     overwrite: bool,
@@ -777,6 +780,9 @@ def multi_run(
 
     if configure_logging:
         _configure_logging(debug, process_label=process_label)
+
+    if backend is not None:
+        mode = backend
 
     selected_mode = _normalize_mode(mode)
 
@@ -1035,7 +1041,8 @@ def run(
     roi_name: str,
     ref_round: str | None,
     limit: int | None,
-    mode: str,
+    mode: str = _DEFAULT_OUTPUT_MODE.value,
+    backend: str | None = None,
     histogram_bins: int,
     overwrite: bool,
     delete_origin: bool,
@@ -1048,6 +1055,8 @@ def run(
     skip_non_bit: bool = False,
 ) -> None:
     """Run multi-GPU deconvolution across selected rounds and ROIs."""
+    if backend is not None:
+        mode = backend
     round_tag = round_name or "all"
     _setup_cli_logging(
         path,
@@ -1228,8 +1237,9 @@ def easy(path: Path, round_name: str | None):
     import subprocess
 
     rounds = [round_name] if round_name else Workspace.discover_rounds(path)
+    ws = Workspace(path)
     for round_ in rounds:
-        if not (path / "analysis" / "deconv_scaling" / f"{round_}.txt").exists():
+        if not ws.deconv_scaling(round_).exists():
             subprocess.run(["preprocess", "deconvnew", "prepare", str(path), round_], check=True)
             subprocess.run(["preprocess", "deconvnew", "precompute", str(path), round_], check=True)
 

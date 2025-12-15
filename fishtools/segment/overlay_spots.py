@@ -762,6 +762,14 @@ def overlay(
                     continue
                 raise click.ClickException(msg)
 
+            tileconfig_path = ws.tileconfig_registered_txt(current_roi)
+            if not tileconfig_path.exists():
+                msg = f"Skipping ROI '{current_roi}': TileConfiguration not found at {tileconfig_path}."
+                if batch_mode:
+                    logger.warning(msg)
+                    continue
+                raise click.ClickException(msg)
+
             with ProcessPoolExecutor(max_workers=8, mp_context=get_context("spawn")) as executor:
                 futures = []
                 try:
@@ -781,7 +789,7 @@ def overlay(
                             input_dir,
                             segmentation_name,
                             spots,
-                            ws.tileconfig_dir(current_roi) / "TileConfiguration.registered.txt",
+                            tileconfig_path,
                             i,
                             overwrite,
                             debug,

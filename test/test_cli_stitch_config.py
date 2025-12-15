@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -19,21 +20,21 @@ def test_run_imagej_uses_stitching_config(monkeypatch: Any, tmp_path: Path) -> N
     # Capture subprocess invocation and read the macro file path
     recorded: dict[str, str] = {}
 
-    def fake_run(cmd: str, capture_output: bool, check: bool, shell: bool):  # type: ignore[no-untyped-def]
-        assert shell is True
-        # Extract macro file path
-        assert "-macro" in cmd
-        macro_path = cmd.split("-macro ", 1)[1].strip()
-        with open(macro_path, "r") as f:
-            macro = f.read()
-        recorded["macro"] = macro
+    class _FakeProc:
+        pid = 12345
 
-        class _R:
-            returncode = 0
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
 
-        return _R()
+    def fake_popen(cmd, **kwargs):  # noqa: ANN001
+        macro_path = Path(cmd[cmd.index("-macro") + 1])
+        recorded["macro"] = macro_path.read_text(encoding="utf-8")
+        return _FakeProc()
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("fishtools.preprocess.imagej.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("fishtools.preprocess.imagej.register_subprocess", lambda proc: None)
+    monkeypatch.setattr("fishtools.preprocess.imagej.unregister_subprocess", lambda proc: None)
+    monkeypatch.setattr("fishtools.preprocess.imagej.get_cancel_event", lambda: threading.Event())
 
     sc = StitchingConfig(
         max_memory_mb=2048,
@@ -80,12 +81,12 @@ def test_extract_channel_uses_compression_level(monkeypatch: Any, tmp_path: Path
     def fake_tifffile(path: Path):  # type: ignore[no-untyped-def]
         return _Tiff()
 
-    def fake_imwrite(out: Path, img: np.ndarray, compression: int, metadata: dict, compressionargs: dict):  # type: ignore[no-untyped-def]
+    def fake_safe_imwrite(out: Path, img: np.ndarray, *, compression: int, metadata: dict, compressionargs: dict):  # type: ignore[no-untyped-def]
         recorded["compressionargs"] = compressionargs
         recorded["out"] = out
 
     monkeypatch.setattr("fishtools.preprocess.cli_stitch.TiffFile", fake_tifffile)
-    monkeypatch.setattr("fishtools.preprocess.cli_stitch.imwrite", fake_imwrite)
+    monkeypatch.setattr("fishtools.preprocess.cli_stitch.safe_imwrite", fake_safe_imwrite)
 
     sc = StitchingConfig(compression_levels={"low": 0.61, "medium": 0.71, "high": 0.81})
 

@@ -166,7 +166,7 @@ class StitchPaths:
 
     @property
     def stitch_root(self) -> Path:
-        return self.workspace.deconved / f"stitch--{self.roi}+{self.seg_codebook}"
+        return self.workspace.stitch(self.roi, self.seg_codebook)
 
     def segmentation(self, name: str = "output_segmentation.zarr") -> Path:
         return self.stitch_root / name

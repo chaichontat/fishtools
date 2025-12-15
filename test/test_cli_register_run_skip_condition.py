@@ -9,7 +9,10 @@ import fishtools.preprocess.cli_register as cli_register_module
 
 def test_run_does_not_skip_when_only_shifts_exist(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Arrange a minimal workspace under analysis/deconv
-    deconv_path = tmp_path / "analysis" / "deconv"
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    (workspace_root / "workspace.DONE").touch()
+    deconv_path = workspace_root / "analysis" / "deconv"
     round_name = "2_10_18"
     roi = "4"
     idx = 55

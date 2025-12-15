@@ -255,7 +255,7 @@ def check_shifts(
     for codebook_name in codebook_names:
         for roi in roi_list:
             logger.info(f"Analyzing shifts for ROI '{roi}' / codebook '{codebook_name}'")
-            shift_dir = ws.deconved / f"shifts--{roi}+{codebook_name}"
+            shift_dir = ws.shifts(roi, codebook_name)
             if not shift_dir.exists():
                 logger.warning(f"Shifts directory not found; skipping ROI {roi}: {shift_dir}")
                 continue

@@ -92,9 +92,7 @@ os.environ["TQDM_DISABLE"] = "1"
 
 
 def _field_store_path(ws: Workspace, roi: str, codebook_label: str) -> Path:
-    slug = Workspace.sanitize_codebook_name(codebook_label)
-    base = ws.path / "analysis" / "deconv" / f"fields+{slug}"
-    return base / f"field--{roi}+{slug}.zarr"
+    return ws.field_zarr(roi, codebook_label)
 
 
 def _discover_field_store(ws: Workspace, roi: str, codebook_label: str) -> Path:
@@ -607,8 +605,13 @@ def sample_imgs(
     rand = np.random.default_rng(round_num)
     if roi is None:
         roi = "*"
+    ws = Workspace(path)
+    mapping, _missing = ws.registered_file_map(codebook, rois=None if roi == "*" else [roi])
     paths = sorted(
-        (p for p in path.glob(f"registered--{roi}+{codebook}/reg*.tif") if not p.name.endswith(".hp.tif"))
+        p
+        for registered_files in mapping.values()
+        for p in registered_files
+        if not p.name.endswith(".hp.tif")
     )
     if batch_size > len(paths):
         logger.info(f"Batch size {batch_size} is larger than {len(paths)}. Returning all images.")
@@ -777,11 +780,12 @@ def find_threshold(
         },
     )
     SUBFOLDER = "_highpassed"
-    paths = sorted(path.glob(f"registered--{roi}+{codebook.stem}/reg*.tif"))
     path_out = path / (f"opt_{codebook.stem}" + (f"+{roi}" if roi != "*" else ""))
     jsonfile = path_out / "percentiles.json"
 
     ws = Workspace(path)
+    mapping, _missing = ws.registered_file_map(codebook.stem, rois=None if roi == "*" else [roi])
+    paths = sorted(p for registered_files in mapping.values() for p in registered_files)
     if field_correct:
         if roi == "*":
             rois_needed = set(ws.rois)
@@ -824,7 +828,11 @@ def find_threshold(
             split=[0],
         )
 
-    highpasses = list(path.glob(f"registered--{roi}+{codebook.stem}/{SUBFOLDER}/*_{codebook.stem}.hp.tif"))
+    highpasses: list[Path] = []
+    for current_roi in (ws.rois if roi == "*" else [roi]):
+        highpasses.extend(
+            (ws.registered(current_roi, codebook.stem) / SUBFOLDER).glob(f"*_{codebook.stem}.hp.tif")
+        )
     logger.info(f"Found {len(highpasses)} images to get percentiles from.")
 
     norms = {}
@@ -939,20 +947,8 @@ def _sanitize_codebook_name(codebook: str) -> str:
 
 
 def _resolve_spots_parquet(base: Path, roi: str, codebook: str) -> Path:
-    cb_s = _sanitize_codebook_name(codebook)
-    candidates = [
-        base / "analysis" / "output" / f"{roi}+{cb_s}.parquet",
-        base / "analysis" / "output" / f"{roi}+{codebook}.parquet",
-        base / "analysis" / "deconv" / f"{roi}+{cb_s}.parquet",
-        base / "analysis" / "deconv" / f"{roi}+{codebook}.parquet",
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        f"Could not find spots parquet for ROI '{roi}', codebook '{codebook}'.\n"
-        f"Searched: {', '.join(map(str, candidates))}"
-    )
+    ws = Workspace(base)
+    return ws.spots_parquet(roi, codebook, must_exist=True)
 
 
 def _render_one_roi_plot(
@@ -1111,7 +1107,7 @@ def plot_all_genes_cli(
 
     # Output directory
     if outdir is None:
-        outdir = ws.path / "analysis" / "output" / "plots"
+        outdir = ws.output / "plots"
     outdir.mkdir(parents=True, exist_ok=True)
 
     # Dispatch per-ROI rendering jobs
@@ -1888,11 +1884,12 @@ def run(
             f"Path {path.parent.name} does not match expected format 'registered--<roi>+<codebook>'"
         )
     _roi, _codebook = match.groups()
+    ws_registered = Workspace(path.parent.parent)
 
     _slc_blank = tuple(np.s_[::subsample_z, :]) + tuple(split_slice)
     _stack_blank = (
         make_fetcher(
-            path.parent.parent / f"registered--{_roi}+{blank}" / path.name,
+            ws_registered.registered(_roi, blank) / path.name,
             _slc_blank,
             max_proj=max_proj,
             field_correct=field_correct,

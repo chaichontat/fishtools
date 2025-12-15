@@ -23,6 +23,7 @@ def _write_hist_csv(
 
 
 def test_deconv_normalize_precompute(tmp_path: Path) -> None:
+    (tmp_path / "workspace.DONE").touch()
     round_name = "pi"
     rows = [
         (0, 0.0, 1.0, 10),
@@ -65,6 +66,8 @@ def test_deconv_normalize_precompute(tmp_path: Path) -> None:
 
 def test_deconv_normalize_quantize(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
     round_name = "1_2"
     roi = "cortex"
     n_fids = 2

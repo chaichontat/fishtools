@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 import polars as pl
 from loguru import logger
@@ -101,7 +101,7 @@ def _prepare_output_dir(default_path: Path, override: Path | None) -> Path:
 
 
 def _resolve_channels(
-    deconv: Path,
+    ws: Workspace,
     rois: Iterable[str],
     seg_codebook: str,
     segmentation_name: str,
@@ -111,7 +111,7 @@ def _resolve_channels(
     if candidate.lower() == "auto":
         discovered: set[str] = set()
         for roi in rois:
-            seg_zarr = deconv / f"stitch--{roi}+{seg_codebook}" / segmentation_name
+            seg_zarr = ws.stitch(roi, seg_codebook) / segmentation_name
             discovered.update(_discover_channels(seg_zarr))
         if not discovered:
             raise ValueError(
@@ -126,7 +126,7 @@ def _resolve_channels(
 
 
 def _load_ident_shards(
-    deconv: Path,
+    ws: Workspace,
     rois: Iterable[str],
     codebooks: Iterable[str],
     seg_codebook: str,
@@ -135,7 +135,7 @@ def _load_ident_shards(
     dfs: dict[tuple[str, str], pl.DataFrame] = {}
     for roi, codebook in product(rois, codebooks):
         # Chunks are inside the segmentation zarr folder
-        root = deconv / f"stitch--{roi}+{seg_codebook}" / segmentation_name / f"chunks+{codebook}"
+        root = ws.stitch(roi, seg_codebook) / segmentation_name / f"chunks+{codebook}"
         glob_path = root / "ident_*.parquet"
         if not any(root.glob("ident_*.parquet")):
             logger.warning(f"ROI={roi} codebook={codebook}: no ident shards under {root}")
@@ -162,7 +162,7 @@ def _load_ident_shards(
 
 
 def _load_intensity_shards(
-    deconv: Path,
+    ws: Workspace,
     rois: Iterable[str],
     seg_codebook: str,
     segmentation_name: str,
@@ -171,7 +171,7 @@ def _load_intensity_shards(
     intensities: dict[_IntensityKey, pl.DataFrame] = {}
     for channel, roi in product(channel_list, rois):
         # Intensity outputs are inside the segmentation zarr folder
-        channel_dir = deconv / f"stitch--{roi}+{seg_codebook}" / segmentation_name / f"intensity_{channel}"
+        channel_dir = ws.stitch(roi, seg_codebook) / segmentation_name / f"intensity_{channel}"
         if not channel_dir.exists():
             logger.warning(f"ROI={roi} channel={channel}: intensity directory missing under {channel_dir}")
             continue
@@ -204,7 +204,7 @@ def _load_intensity_shards(
 
 
 def _load_polygon_shards(
-    deconv: Path,
+    ws: Workspace,
     rois: Iterable[str],
     seg_codebook: str,
     segmentation_name: str,
@@ -213,7 +213,7 @@ def _load_polygon_shards(
     polygons_by_roi: dict[str, pl.DataFrame] = {}
     for roi in rois:
         # Chunks are inside the segmentation zarr folder
-        chunks_dir = deconv / f"stitch--{roi}+{seg_codebook}" / segmentation_name / f"chunks+{primary_codebook}"
+        chunks_dir = ws.stitch(roi, seg_codebook) / segmentation_name / f"chunks+{primary_codebook}"
         glob_path = chunks_dir / "polygons_*.parquet"
         if not any(chunks_dir.glob("polygons_*.parquet")):
             logger.warning(f"ROI={roi}: no polygons shards under {chunks_dir}")
@@ -341,9 +341,8 @@ def _build_counts_matrix(dfs: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFra
     duplicate_set = set(duplicate_genes)
     if duplicate_set:
         logger.debug(
-            "[export] duplicate gene bases require full transcript labels (%d): %s",
-            len(duplicate_set),
-            sorted(duplicate_set),
+            f"[export] duplicate gene bases require full transcript labels ({len(duplicate_set)}): "
+            f"{sorted(duplicate_set)}"
         )
 
     counts_by_gene = (
@@ -362,7 +361,7 @@ def _build_counts_matrix(dfs: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFra
     if counts_by_gene.is_empty():
         raise ValueError("Failed to construct gene expression matrix for export.")
     gene_cols = [col for col in counts_by_gene.columns if col != "roilabel"]
-    logger.debug("[export] counts matrix gene columns (%d): %s", len(gene_cols), gene_cols)
+    logger.debug(f"[export] counts matrix gene columns ({len(gene_cols)}): {gene_cols}")
     return counts_by_gene
 
 
@@ -423,14 +422,12 @@ def export_cmd(
     rois = _resolve_rois(ws, roi)
     cb_list = _resolve_codebooks(codebooks)
 
-    deconv = ws.deconved
-
-    ident_frames = _load_ident_shards(deconv, rois, cb_list, seg_codebook, segmentation_name)
-    channel_list = _resolve_channels(deconv, rois, seg_codebook, segmentation_name, channels)
-    intensities = _load_intensity_shards(deconv, rois, seg_codebook, segmentation_name, channel_list)
+    ident_frames = _load_ident_shards(ws, rois, cb_list, seg_codebook, segmentation_name)
+    channel_list = _resolve_channels(ws, rois, seg_codebook, segmentation_name, channels)
+    intensities = _load_intensity_shards(ws, rois, seg_codebook, segmentation_name, channel_list)
 
     primary_cb = cb_list[0]
-    polygons_by_roi = _load_polygon_shards(deconv, rois, seg_codebook, segmentation_name, primary_cb)
+    polygons_by_roi = _load_polygon_shards(ws, rois, seg_codebook, segmentation_name, primary_cb)
 
     if diag:
         _emit_pairing_diagnostics(polygons_by_roi, intensities, channel_list)
@@ -444,7 +441,7 @@ def export_cmd(
 
     if len(rois) == 1:
         # Single ROI: put outputs inside the segmentation zarr folder
-        seg_zarr_path = deconv / f"stitch--{rois[0]}+{seg_codebook}" / segmentation_name
+        seg_zarr_path = ws.stitch(rois[0], seg_codebook) / segmentation_name
         cells_path = seg_zarr_path / f"polygons+{cb_token}.parquet"
         out_h5ad = seg_zarr_path / f"{cb_token}.h5ad"
     else:

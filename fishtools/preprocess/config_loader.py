@@ -1,13 +1,12 @@
 import json
-import os
 from pathlib import Path
 
 from loguru import logger
 from pydantic import ValidationError
 
-from .config import Config, Fiducial
+from .config import Config, Fiducial, resolve_data_path
 
-_DEFAULT_DATA_PATH = os.environ.get("DATA_PATH", "/working/fishtools/data")
+_DEFAULT_DATA_PATH = str(resolve_data_path())
 
 
 def load_config_from_json(config_path: Path, data_path: str, **overrides) -> Config:

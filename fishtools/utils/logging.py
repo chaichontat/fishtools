@@ -114,7 +114,7 @@ def configure_cli_logging(
     if workspace is None:
         return None
 
-    log_root = workspace / "analysis" / "logs"
+    log_root = Workspace(workspace).logs
     log_root.mkdir(parents=True, exist_ok=True)
     log_file = log_root / f"{component}.log"
 
@@ -225,7 +225,7 @@ def resolve_workspace_root(path: Path | str) -> tuple[Path, bool]:
         workspace = Workspace(base)
     except (NotADirectoryError, ValueError):
         for candidate in (base, *base.parents):
-            analysis_dir = candidate / "analysis"
+            analysis_dir = candidate / Workspace.ANALYSIS_DIRNAME
             if analysis_dir.is_dir():
                 return candidate, True
         return base, False

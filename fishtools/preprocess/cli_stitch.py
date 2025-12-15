@@ -50,7 +50,7 @@ from fishtools.gpu.memory import release_all as gpu_release_all
 from fishtools.io.workspace import Workspace, safe_imwrite
 from fishtools.preprocess.config import StitchingConfig
 from fishtools.preprocess.config_loader import load_config
-from fishtools.preprocess.downsample import downsample_xy
+from fishtools.preprocess.downsample import downsample_xy, gpu_downsample_xy
 from fishtools.preprocess.illumination import parse_tile_index_from_path, resolve_roi_for_field, tile_origin
 from fishtools.preprocess.imagej import run_imagej as _run_imagej
 from fishtools.preprocess.imageops import clip_range_for_dtype as clip_range_for_dtype_lib
@@ -508,8 +508,8 @@ def register(
         except Exception as e:
             logger.warning(f"Failed to load config {json_config}: {e}")
     ws = Workspace(path)
-    out_path = ws.stitch(roi)
-    tileconfig_registered = out_path / "TileConfiguration.registered.txt"
+    out_path = ws.tileconfig_dir(roi)
+    tileconfig_registered = ws.tileconfig_registered_txt(roi)
     if tileconfig_registered.exists() and not overwrite:
         logger.info(
             f"TileConfiguration.registered.txt already exists for roi={roi}; "
@@ -626,7 +626,7 @@ def register(
                     sc=sc,
                 )
 
-    if overwrite or not (out_path / "TileConfiguration.registered.txt").exists():
+    if overwrite or not tileconfig_registered.exists():
         files = sorted(f for f in out_path.glob("*.tif") if not f.name.endswith(".hp.tif"))
         files_idx = [int(file.stem.split("-")[-1]) for file in files if file.stem.split("-")[-1].isdigit()]
         logger.debug(f"Using {files_idx}")
@@ -675,7 +675,7 @@ def register(
 
     # Post-check: verify registered tile configuration and emit a layout plot
     try:
-        tc_reg_path = out_path / "TileConfiguration.registered.txt"
+        tc_reg_path = tileconfig_registered
         if not tc_reg_path.exists():
             logger.warning(
                 f"Registered TileConfiguration not found at {tc_reg_path.resolve()}; ImageJ may have failed to write it."
@@ -1198,7 +1198,7 @@ def fuse(
                 downsample = 1
         # Auto-detect coarse_shifts path if not provided
         if coarse_shifts is None:
-            coarse_shifts = ws.deconved / f"shifts--{roi}" / "coarse_shifts.json"
+            coarse_shifts = ws.coarse_shifts_json(roi)
             if not coarse_shifts.exists():
                 raise ValueError(
                     f"Coarse shifts file not found at {coarse_shifts}. "
@@ -1225,8 +1225,8 @@ def fuse(
                 shift_lookup[int(tile_idx_str)] = (shift_data["dx"], shift_data["dy"])
 
         # Output folder and source path for coarse-shifted fusion
-        stitch_dir = ws.deconved / f"stitch--{roi}--shifted-{coarse_round_name}"
-        path_img = ws.deconved / f"{coarse_round_name}--{roi}"
+        stitch_dir = ws.stitch_shifted(roi, coarse_round_name)
+        path_img = ws.deconv_round_dir(coarse_round_name, roi)
         logger.info(f"Coarse-shifted fusion: reading from {path_img}, output to {stitch_dir}")
 
         # For deconvolved images: calculate n_channels from round name (e.g., "1_9_17" -> 3 channels)
@@ -1306,7 +1306,7 @@ def fuse(
                     break
 
     if tile_config is None:
-        tile_config = ws.tileconfig_dir(roi) / "TileConfiguration.registered.txt"
+        tile_config = ws.tileconfig_registered_txt(roi)
         logger.info(f"Getting tile configuration from {tile_config.resolve()}")
 
     tileconfig = TileConfiguration.from_file(tile_config).downsample(downsample)
@@ -1570,7 +1570,7 @@ def combine(
     for current_roi in target_rois:
         # Determine stitched directory based on codebook or round_name
         if round_name is not None:
-            stitched_dir = ws.deconved / f"stitch--{current_roi}--shifted-{round_name}"
+            stitched_dir = ws.stitch_shifted(current_roi, round_name)
         else:
             assert codebook is not None
             stitched_dir = ws.stitch(current_roi, codebook)
@@ -2071,8 +2071,8 @@ def slice_mosaic(
     )
 
     ws = Workspace(path)
-    stitch_dir = ws.deconved / f"stitch--{roi}--shifted-{round_name}"
-    out_dir = ws.deconved / f"{round_name}--{roi}--repaired"
+    stitch_dir = ws.stitch_shifted(roi, round_name)
+    out_dir = ws.deconv_repaired_dir(round_name, roi)
 
     zarr_path = stitch_dir / "fused.zarr"
     if not zarr_path.exists():
@@ -2082,7 +2082,7 @@ def slice_mosaic(
     logger.info(f"Opened zarr with shape {zarr_array.shape}")
 
     # Load ORIGINAL TileConfiguration (for output tile positions)
-    original_tc_path = ws.tileconfig_dir(roi) / "TileConfiguration.registered.txt"
+    original_tc_path = ws.tileconfig_registered_txt(roi)
     tileconfig = TileConfiguration.from_file(original_tc_path)
     logger.info(f"Loaded original TileConfiguration from {original_tc_path}")
 

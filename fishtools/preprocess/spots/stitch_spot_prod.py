@@ -220,33 +220,49 @@ def stitch(
     if path_wd.name.startswith("registered--"):
         raise ValueError("Path must be the main working directory, not registered.")
 
-    paths_wd = sorted(path_wd.glob(f"registered--{_roi}+{codebook.stem}"))
-    if not paths_wd:
-        raise ValueError(f"No registered--{_roi}+{codebook.stem} found in {path_wd}")
+    ws = Workspace(path_wd)
+    cb = codebook.stem
+    target_rois = ws.rois if _roi in {"*", "all"} else ws.resolve_rois([_roi])
+
+    registered_dirs: list[tuple[str, Path]] = []
+    for roi_name in target_rois:
+        reg_dir = ws.registered(roi_name, cb)
+        if reg_dir.exists():
+            registered_dirs.append((roi_name, reg_dir))
+
+    if not registered_dirs:
+        joined = ", ".join(target_rois) if target_rois else "<none>"
+        raise ValueError(
+            f"No registered outputs found for roi={_roi} codebook={cb} under {ws.path}. "
+            f"Checked ROIs: {joined}"
+        )
 
     # Get size
-    img = imread(next(path_wd.glob(f"registered--{_roi}+{codebook.stem}/*.tif")))
+    first_tile: Path | None = None
+    for _roi_name, reg_dir in registered_dirs:
+        first_tile = next(reg_dir.glob("reg-*.tif"), None)
+        if first_tile is not None:
+            break
+    if first_tile is None:
+        raise ValueError(f"No registered tiles found under {ws.path} for codebook={cb}")
+    img = imread(first_tile)
     size = img.shape[-1]
     logger.info(f"Size: {size}")
     del img
 
-    for reg_path in paths_wd:
-        roi = reg_path.name.split("--")[1]
-        path = path_wd / f"registered--{roi}"
-        path_cb = path / ("decoded-" + codebook.stem)
+    for roi_name, reg_dir in registered_dirs:
+        path_cb = ws.decoded_dir(roi_name, cb)
         try:
-            coords = load_coords(path_wd, roi.split("+")[0])
-        except FileNotFoundError:
-            logger.error(
-                f"Could not find {path_wd / f'stitch--{roi}' / 'TileConfiguration.registered.txt'}. Skipping {roi}."
-            )
+            coords = load_coords(ws.path, roi_name)
+        except FileNotFoundError as e:
+            logger.error(f"Skipping {roi_name}: {e}")
             continue
 
         assert len(coords) == len(set(coords["index"]))
         files = sorted(file for file in path_cb.glob("*.pkl"))
 
         if not files:
-            raise ValueError(f"No files found in {path / codebook.stem}")
+            raise ValueError(f"No decoded tiles found under {path_cb}")
         logger.info(f"Found {len(files)} files.")
 
         # Filter coords to only include files that exist

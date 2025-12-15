@@ -12,7 +12,7 @@ from fishtools.preprocess.deconv.core import (
     PSF_FILENAME,
     deconvolve_lucyrichardson_guo,
     deconvolve_lucyrichardson_guo_fft,
-    load_projectors_cached,
+    projectors,
     make_projector,
 )
 
@@ -39,9 +39,10 @@ def test_load_projectors_handles_small_psf(tmp_path: Path, monkeypatch) -> None:
     psf_path = psf_dir / "PSF GL.tif"
     _write_synthetic_psf(psf_path, (11, 15, 13))
 
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("fishtools.preprocess.deconv.core.DATA_DIR", psf_dir)
+    projectors.cache_clear()
 
-    forward, backward = load_projectors_cached(step=7)
+    forward, backward = projectors(step=7)
 
     assert forward.ndim == 4 and backward.ndim == 4
     assert forward.shape == backward.shape

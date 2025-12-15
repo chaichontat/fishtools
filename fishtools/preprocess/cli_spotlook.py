@@ -184,15 +184,9 @@ def _save_combined_spots_plot(
     fig_height = 4 * n_rows
 
     logger.debug(
-        "CombSpots grid: rois=%d, rows=%d, cols=%d, size=(%.2f in, %.2f in) @ %d dpi (~%dx%d px)",
-        n_rois,
-        n_rows,
-        n_cols,
-        fig_width,
-        fig_height,
-        params.dpi,
-        int(fig_width * params.dpi),
-        int(fig_height * params.dpi),
+        f"CombSpots grid: rois={n_rois}, rows={n_rows}, cols={n_cols}, "
+        f"size=({fig_width:.2f} in, {fig_height:.2f} in) @ {params.dpi} dpi "
+        f"(~{int(fig_width * params.dpi)}x{int(fig_height * params.dpi)} px)"
     )
 
     max_inches = max(fig_width, fig_height)
@@ -319,7 +313,8 @@ def _load_spots_data(path: Path, roi: str, codebook: Codebook) -> pl.DataFrame |
     ``x``, ``y``, ``z``, ``area``, ``distance``, ``norm``, ``tile``,
     ``passes_thresholds`` (see module ``fishtools.analysis.spots``).
     """
-    spots_path = path / f"registered--{roi}+{codebook.name}" / f"decoded-{codebook.name}" / "spots.parquet"
+    ws = Workspace(path)
+    spots_path = ws.decoded_spots_parquet(roi, codebook.name)
     if not spots_path.exists():
         logger.warning(f"Spots file not found for ROI {roi}, skipping: {spots_path}")
         return None
@@ -1003,17 +998,18 @@ def threshold(
         logger.info(f"Analyzing spot density patterns for ROI {roi}...")
         logger.debug("Attempting to load raw spots parquet")
         spots_raw = _load_spots_data(path, roi, codebook)
-        shutil.copy(
-            path / f"registered--{roi}+{codebook.name}" / f"decoded-{codebook.name}" / "spots.parquet",
-            output_dir / f"{roi}+{codebook.name}.raw.parquet",
-        )
+        if spots_raw is not None:
+            shutil.copy(
+                ws.decoded_spots_parquet(roi, codebook.name),
+                output_dir / f"{roi}+{codebook.name}.raw.parquet",
+            )
 
         if spots_raw is None or spots_raw.is_empty():
             logger.warning(f"No data loaded for ROI {roi}. Skipping to next.")
             skipped_rois.append(roi)
             continue
 
-        logger.debug("Applying initial filters to %d raw spots", len(spots_raw))
+        logger.debug(f"Applying initial filters to {len(spots_raw)} raw spots")
         spots_intermediate = _apply_initial_filters(spots_raw, rng, params)
         if spots_intermediate.is_empty():
             logger.warning(f"No spots remained after initial filters for ROI {roi}. Skipping.")

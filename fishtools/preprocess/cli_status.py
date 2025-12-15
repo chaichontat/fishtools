@@ -143,7 +143,7 @@ def check_registration(ws: Workspace, roi: str, codebook: str) -> StageStatus:
 
     # Try to determine expected count from shifts or deconv
     expected = None
-    shifts_path = ws.deconved / f"shifts--{roi}+{codebook}"
+    shifts_path = ws.shifts(roi, codebook)
     if shifts_path.exists():
         shift_files = list(shifts_path.glob("shifts-*.json"))
         if shift_files:
@@ -174,7 +174,7 @@ def check_registration(ws: Workspace, roi: str, codebook: str) -> StageStatus:
 
 def check_stitch_register(ws: Workspace, roi: str) -> StageStatus:
     """Check for TileConfiguration.registered.txt."""
-    tileconfig_path = ws.tileconfig_dir(roi) / "TileConfiguration.registered.txt"
+    tileconfig_path = ws.tileconfig_registered_txt(roi)
     if not tileconfig_path.exists():
         return StageStatus()
 

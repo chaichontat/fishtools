@@ -4,7 +4,7 @@ import json
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import cupy as cp
 import matplotlib
@@ -248,16 +248,16 @@ def precompute_global_quantization(
         m_glob: (C,) float64
         s_glob: (C,) float64  (includes gamma)
     """
-    path = Path(path)
+    ws = Workspace(path)
     # Save global scaling outside deconv32 artifacts, at analysis/deconv_scaling
-    scale_dir = path / "analysis" / "deconv_scaling"
+    scale_dir = ws.deconv_scaling()
     scale_dir.mkdir(parents=True, exist_ok=True)
-    out_txt = scale_dir / f"{round_name}.txt"
+    out_txt = ws.deconv_scaling(round_name)
     out_json = scale_dir / f"{round_name}.json"
 
     # --- 1) discover histogram CSVs and/or float32 stacks ---
     hist_paths = sorted(
-        (path / "analysis" / "deconv32").glob(f"{round_name}--*/*{round_name}-*.histogram.csv")
+        ws.deconv32.glob(f"{round_name}--*/*{round_name}-*.histogram.csv")
     )
     logger.info(f"[{round_name}] Aggregating {len(hist_paths)} histogram CSVs …")
     # Single pass using Polars parsing: cache per-file hists and track global ranges per channel
@@ -484,7 +484,8 @@ def _iter_float32_tiles(
 ) -> Iterable[tuple[str, Path]]:
     """Yield (roi_name, float32_path) pairs for the requested round."""
 
-    base = workspace / "analysis" / "deconv32"
+    ws = Workspace(workspace)
+    base = ws.deconv32
     if not base.exists():
         return
 
@@ -508,15 +509,16 @@ def quantize(
     n_fids: int = 2,
     overwrite: bool = False,
 ) -> None:
-    """Quantize float32 deconvolved tiles in analysis/deconv32 to uint16 deliverables."""
+    """Quantize float32 deconvolved tiles in ws.deconv32 to uint16 deliverables."""
 
     if n_fids <= 0:
         raise click.BadParameter("--n-fids must be positive.")
 
-    workspace = workspace.resolve()
+    ws = Workspace(workspace)
+    workspace = ws.path
     logger.info(f"Workspace: {workspace}")
 
-    scaling_path = workspace / "analysis" / "deconv_scaling" / f"{round_name}.txt"
+    scaling_path = ws.deconv_scaling(round_name)
     if not scaling_path.exists():
         raise click.ClickException(
             f"Scaling file not found at {scaling_path}. Run precompute_global_quantization first."
@@ -531,9 +533,9 @@ def quantize(
 
     float32_tiles = list(_iter_float32_tiles(workspace, round_name, rois or None))
     if not float32_tiles:
-        raise click.ClickException(f"No float32 tiles found for round '{round_name}' in analysis/deconv32.")
+        raise click.ClickException(f"No float32 tiles found for round '{round_name}' in {ws.deconv32}.")
 
-    out_root = workspace / "analysis" / "deconv"
+    out_root = ws.deconved
     out_root.mkdir(parents=True, exist_ok=True)
 
     processed = 0
@@ -582,8 +584,7 @@ def quantize(
                 )
 
             z_slices = payload_stack.shape[0] // channels
-            gpu_stack = cp.asarray(payload_stack, dtype=cp.float32)
-            reshaped = gpu_stack.reshape(z_slices, channels, float32_stack.shape[1], float32_stack.shape[2])
+            reshaped = payload_stack.reshape(z_slices, channels, float32_stack.shape[1], float32_stack.shape[2])
 
             quantized = quantize_global(
                 reshaped,
@@ -781,7 +782,8 @@ if __name__ == "__main__":
 
 
 def load_global_scaling(path: Path, round_name: str) -> tuple[np.ndarray, np.ndarray]:
-    scale_path = path / "analysis" / "deconv_scaling" / f"{round_name}.txt"
+    ws = Workspace(path)
+    scale_path = ws.deconv_scaling(round_name)
     if not scale_path.exists():
         raise FileNotFoundError(
             f"Missing global scaling at {scale_path}. Run 'multi_deconv prepare' to generate histogram scaling first."

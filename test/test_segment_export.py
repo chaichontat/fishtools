@@ -67,15 +67,18 @@ def _write_parquet(path: Path, frame: pl.DataFrame) -> None:
 
 def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
-    analysis_deconv = workspace / "analysis/deconv"
-    analysis_deconv.mkdir(parents=True)
+    workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
+    ws.deconved.mkdir(parents=True, exist_ok=True)
 
     roi = "roi1"
     seg_codebook = "seg"
     codebook = "gene"
-    stitch_root = analysis_deconv / f"stitch--{roi}+{seg_codebook}"
-    chunks_root = stitch_root / f"chunks+{codebook}"
+    segmentation_name = "output_segmentation.zarr"
+    stitch_root = ws.stitch(roi, seg_codebook)
+    seg_root = stitch_root / segmentation_name
+    chunks_root = seg_root / f"chunks+{codebook}"
 
     ident_path = chunks_root / "ident_0000.parquet"
     ident_df = pl.DataFrame({
@@ -94,7 +97,7 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
     })
     _write_parquet(polygons_path, polygons_df)
 
-    intensity_root = stitch_root / "intensity_marker"
+    intensity_root = seg_root / "intensity_marker"
     intensity_path = intensity_root / "intensity-0000.parquet"
     intensity_df = pl.DataFrame({
         "label": [1, 2],
@@ -106,40 +109,40 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
 
     export_cmd = _export_cmd()
     export_cmd(
-        path=analysis_deconv,
+        path=ws.deconved,
         roi=roi,
         seg_codebook=seg_codebook,
         codebooks=(codebook,),
+        segmentation_name=segmentation_name,
         channels="marker",
         out_dir=None,
         diag=False,
     )
 
-    cells_path = workspace / "analysis/output/segmented" / f"polygons--{roi}+{seg_codebook}.parquet"
+    cells_path = seg_root / "polygons+gene.parquet"
     assert cells_path.exists()
     cells_df = pl.read_parquet(cells_path)
     assert set(["x", "y", "roi", "area", "marker_mean"]).issubset(set(cells_df.columns))
 
-    h5ad_path = workspace / "analysis/output" / f"{roi}+{codebook}.h5ad"
+    h5ad_path = seg_root / "gene.h5ad"
     assert h5ad_path.exists()
     adata = ad.read_h5ad(h5ad_path)
     assert adata.n_obs == 2
     assert {"marker_mean"}.issubset(set(adata.obs.columns))
     assert {"GeneA-1", "GeneA-2", "GeneB", "GeneC"}.issubset(set(adata.var_names))
 
-    baysor_path = analysis_deconv / "baysor" / "spots.csv"
+    baysor_path = ws.deconved / "baysor" / "spots.csv"
     assert not baysor_path.exists()
 
 
 def test_resolve_rois_defaults_to_workspace_rois(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
-    analysis_deconv = workspace / "analysis/deconv"
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
     for roi in ("roi_a", "roi_b"):
-        (analysis_deconv / f"stitch--{roi}+seg").mkdir(parents=True, exist_ok=True)
+        ws.stitch(roi, "seg").mkdir(parents=True, exist_ok=True)
 
-    ws = Workspace(analysis_deconv)
     resolve_rois = _resolve_rois_func()
     assert resolve_rois(ws, None) == ["roi_a", "roi_b"]
     assert resolve_rois(ws, "roi_a") == ["roi_a"]
@@ -147,19 +150,20 @@ def test_resolve_rois_defaults_to_workspace_rois(tmp_path: Path) -> None:
 
 def test_resolve_channels_auto_and_manual(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
-    analysis_deconv = workspace / "analysis/deconv"
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
+    segmentation_name = "output_segmentation.zarr"
     for roi in ("roi_a", "roi_b"):
-        base = analysis_deconv / f"stitch--{roi}+seg"
+        base = ws.stitch(roi, "seg") / segmentation_name
         (base / "intensity_marker2").mkdir(parents=True, exist_ok=True)
         (base / "intensity_marker1").mkdir(parents=True, exist_ok=True)
 
     resolve_channels = _resolve_channels_func()
-    auto_channels = resolve_channels(analysis_deconv, ["roi_a", "roi_b"], "seg", "auto")
+    auto_channels = resolve_channels(ws, ["roi_a", "roi_b"], "seg", segmentation_name, "auto")
     assert auto_channels == ["marker1", "marker2"]
 
-    manual_channels = resolve_channels(analysis_deconv, ["roi_a"], "seg", "marker2 , marker1")
+    manual_channels = resolve_channels(ws, ["roi_a"], "seg", segmentation_name, "marker2 , marker1")
     assert manual_channels == ["marker2", "marker1"]
 
 

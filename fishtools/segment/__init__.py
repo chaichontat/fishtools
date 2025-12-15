@@ -362,6 +362,96 @@ def export_command(
     )
 
 
+def _parse_xyz_triple(name: str, val: str) -> tuple[float, float, float]:
+    s = val.strip().replace(" ", ",")
+    parts = [p for p in s.split(",") if p]
+    if len(parts) != 3:
+        raise click.BadParameter(f"{name} must be a triple like 'x,y,z' (commas/spaces ok).")
+    try:
+        x, y, z = (float(p) for p in parts)
+    except ValueError as exc:
+        raise click.BadParameter(f"{name} must contain numeric values.") from exc
+    return (x, y, z)
+
+
+def _parse_labels_csv(val: str) -> list[int]:
+    raw = val.strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.replace(" ", ",").split(",") if p.strip()]
+    try:
+        return [int(p) for p in parts]
+    except ValueError as exc:
+        raise click.BadParameter("--labels must be a comma-separated list of integers.") from exc
+
+
+@app.command("export-mesh")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.argument("roi", required=False)
+@click.option(
+    "--seg-codebook",
+    required=True,
+    help="Codebook label used for segmentation artifacts (stitch--<roi>+<seg_codebook>).",
+)
+@click.option(
+    "--segmentation-name",
+    default="output_segmentation.zarr",
+    show_default=True,
+    help="Segmentation zarr name (Z,Y,X integer labels).",
+)
+@click.option(
+    "--output",
+    type=click.Path(file_okay=True, dir_okay=False, path_type=Path),
+    help="Optional output .ply path (defaults to <segmentation.zarr>/mesh.ply).",
+)
+@click.option(
+    "--labels",
+    default="",
+    show_default=False,
+    help="Optional comma-separated label IDs to export (defaults to all non-zero labels).",
+)
+@click.option(
+    "--spacing",
+    default="1,1,1",
+    show_default=True,
+    help="Voxel spacing in XYZ order, as 'x,y,z' (commas/spaces ok).",
+)
+@click.option(
+    "--origin",
+    default="0,0,0",
+    show_default=True,
+    help="World-space origin in XYZ order, as 'x,y,z' (commas/spaces ok).",
+)
+def export_mesh_command(
+    path: Path,
+    roi: str | None,
+    seg_codebook: str,
+    segmentation_name: str,
+    output: Path | None,
+    labels: str,
+    spacing: str,
+    origin: str,
+) -> None:
+    """Export surface meshes for Blender (PLY)."""
+
+    from fishtools.segment.export_mesh import export_mesh_cmd
+
+    label_ids = _parse_labels_csv(labels) if labels.strip() else None
+    export_mesh_cmd(
+        path=path,
+        roi=roi,
+        seg_codebook=seg_codebook,
+        segmentation_name=segmentation_name,
+        output=output,
+        labels=label_ids,
+        spacing_xyz=_parse_xyz_triple("--spacing", spacing),
+        origin_xyz=_parse_xyz_triple("--origin", origin),
+    )
+
+
 def _postproc_single(
     masks_path: Path,
     output: Path | None,
@@ -968,71 +1058,13 @@ def extract_single_command(
 
 _OVERLAY_LAZY_COMMANDS = {
     "intensity": SimpleNamespace(module="fishtools.segment.overlay_intensity", attr="overlay_intensity"),
+    "spots": SimpleNamespace(module="fishtools.segment.overlay_spots", attr="overlay"),
 }
 
 
 @app.group(cls=_LazyCommandGroup, lazy_commands=_OVERLAY_LAZY_COMMANDS)
 def overlay() -> None:
     """Visualization helpers for segmentation outputs."""
-
-
-@overlay.command("spots", help="Overlay decoded spots onto segmentation masks.")
-@click.argument("path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
-@click.argument("roi", required=False)
-@click.option("--codebook", required=True, help="Codebook name used for decoded spots.")
-@click.option(
-    "--seg-codebook", help="Codebook label used for segmentation artifacts (defaults to --codebook)."
-)
-@click.option(
-    "--spots", "spots_opt", type=click.Path(path_type=Path), help="Explicit spots parquet path or directory."
-)
-@click.option(
-    "--segmentation-name",
-    default="output_segmentation.zarr",
-    show_default=True,
-    help="Relative segmentation Zarr path within the ROI directory.",
-)
-@click.option(
-    "--overwrite/--no-overwrite",
-    default=False,
-    show_default=True,
-    help="Overwrite existing overlay artifacts.",
-)
-@click.option(
-    "--debug/--no-debug", default=False, show_default=True, help="Enable verbose logging and debug plots."
-)
-def overlay_spots(
-    path: Path,
-    roi: str | None,
-    codebook: str,
-    seg_codebook: str | None,
-    spots_opt: Path | None,
-    segmentation_name: str,
-    overwrite: bool,
-    debug: bool,
-) -> None:
-    current_roi = roi if roi is not None else "*"
-    from fishtools.segment.overlay_spots import overlay as overlay_impl
-
-    # Call the underlying callback function instead of the Click/RichCommand wrapper.
-    # `overlay_impl` is a Click command object; invoking it directly would route
-    # positional arguments through `RichCommand.main`, causing the TypeError you saw.
-    overlay_impl.callback(
-        path,
-        current_roi,
-        codebook,
-        spots_opt,
-        seg_codebook,
-        segmentation_name,
-        overwrite,
-        debug,
-    )
-
-
-def run(*args, **kwargs):
-    from fishtools.segment.run import run as run_cli
-
-    return run_cli(*args, **kwargs)
 
 
 _LAZY_EXPORT_ATTRS = {
@@ -1052,12 +1084,7 @@ __all__ = [
     "extract_command",
     "extract_single_command",
     "overlay",
-    "overlay_spots",
-    "run",
-    "cp_io",
     "TrainConfig",
-    "build_trt_engine",
-    "run_train",
 ]
 
 

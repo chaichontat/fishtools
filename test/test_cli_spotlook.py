@@ -165,7 +165,7 @@ def test_save_combined_spots_plot_creates_grid(monkeypatch, tmp_path: Path) -> N
 
     path = _save_combined_spots_plot(contexts, tmp_path, "cb1", params)
 
-    expected_path = (tmp_path / "spots_all--cb1.png").resolve()
+    expected_path = (tmp_path / "spots_final" / "spots_all--cb1.png").resolve()
     assert path == expected_path
     assert captured["path"] == expected_path
 
@@ -212,7 +212,7 @@ def test_save_combined_spots_plot_clamps_dpi(monkeypatch, tmp_path: Path) -> Non
 
     path = _save_combined_spots_plot(contexts, tmp_path, "cb1", params)
 
-    expected_path = (tmp_path / "spots_all--cb1.png").resolve()
+    expected_path = (tmp_path / "spots_final" / "spots_all--cb1.png").resolve()
     assert path == expected_path
     assert captured["path"] == expected_path
 
@@ -236,7 +236,7 @@ def test_save_combined_threshold_plot_sets_line_styles(monkeypatch, tmp_path: Pa
 
     path = _save_combined_threshold_plot(curves, tmp_path, "cb1", params)
 
-    assert path == (tmp_path / "threshold_selection_all+cb1.png").resolve()
+    assert path == (tmp_path / "threshold_selection" / "threshold_selection_all+cb1.png").resolve()
     assert captured["path"] == path
 
     fig = captured["fig"]
@@ -296,6 +296,9 @@ def test_threshold_cli_accepts_roi_argument(monkeypatch, tmp_path: Path) -> None
         def __init__(self, root: Path):
             self.path = Path(root)
             self.rois = ["alpha", "beta"]
+
+        def decoded_spots_parquet(self, roi: str, codebook: str) -> Path:
+            return self.path / f"{roi}+{codebook}.parquet"
 
         def resolve_rois(self, rois: list[str]) -> list[str]:
             DummyWorkspace.last_resolved = list(rois)

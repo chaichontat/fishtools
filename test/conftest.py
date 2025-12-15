@@ -130,78 +130,80 @@ if "scanpy" not in sys.modules:
     sys.modules["scanpy"] = _sc
 
 
-if "cupy" not in sys.modules:
+class _CuPyModule(types.ModuleType):
+    """NumPy-backed stub providing a minimal CuPy surface for tests."""
 
-    class _CuPyModule(types.ModuleType):
-        """NumPy-backed stub providing a minimal CuPy surface for tests."""
+    ndarray = type("_CupyNdarray", (), {})
 
-        ndarray = np.ndarray
+    def __getattr__(self, name: str):  # type: ignore[override]
+        if hasattr(np, name):
+            return getattr(np, name)
+        raise AttributeError(name)
 
-        def __getattr__(self, name: str):  # type: ignore[override]
-            if hasattr(np, name):
-                return getattr(np, name)
-            raise AttributeError(name)
+    def array(self, *args, **kwargs):
+        return np.array(*args, **kwargs)
 
-        def array(self, *args, **kwargs):
-            return np.array(*args, **kwargs)
+    def asarray(self, *args, **kwargs):
+        return np.asarray(*args, **kwargs)
 
-        def asarray(self, *args, **kwargs):
-            return np.asarray(*args, **kwargs)
+    def zeros_like(self, *args, **kwargs):
+        return np.zeros_like(*args, **kwargs)
 
-        def zeros_like(self, *args, **kwargs):
-            return np.zeros_like(*args, **kwargs)
+    def ones_like(self, *args, **kwargs):
+        return np.ones_like(*args, **kwargs)
 
-        def ones_like(self, *args, **kwargs):
-            return np.ones_like(*args, **kwargs)
+    def empty_like(self, *args, **kwargs):
+        return np.empty_like(*args, **kwargs)
 
-        def empty_like(self, *args, **kwargs):
-            return np.empty_like(*args, **kwargs)
+    def empty(self, *args, **kwargs):
+        return np.empty(*args, **kwargs)
 
-        def empty(self, *args, **kwargs):
-            return np.empty(*args, **kwargs)
+    def clip(self, *args, **kwargs):
+        return np.clip(*args, **kwargs)
 
-        def clip(self, *args, **kwargs):
-            return np.clip(*args, **kwargs)
+    def ElementwiseKernel(self, *_args, **_kwargs):  # type: ignore[invalid-name]
+        # Minimal implementation for the deconv BaSiC correction kernel:
+        #   y = max((x - df) * inv_ff, 0)
+        def _kernel(x, df, inv_ff, out):  # type: ignore[no-untyped-def]
+            np.multiply(np.subtract(x, df), inv_ff, out=out)
+            np.maximum(out, 0.0, out=out)
 
-        def ElementwiseKernel(self, *args, **kwargs):  # type: ignore[invalid-name]
-            def _kernel(*_args: object, **_kwargs: object) -> None:
-                raise RuntimeError("ElementwiseKernel stub invoked in tests; GPU path not supported.")
+        return _kernel
 
-            return _kernel
+    def asnumpy(self, array, *args, **kwargs):
+        return np.asarray(array, *args, **kwargs)
 
-        def asnumpy(self, array, *args, **kwargs):
-            return np.asarray(array, *args, **kwargs)
+    def get_array_module(self, *_: object, **__: object):
+        return np
 
-        def get_array_module(self, *_: object, **__: object):
-            return np
 
-    _cupy = _CuPyModule("cupy")
-    sys.modules["cupy"] = _cupy
+_cupy = _CuPyModule("cupy")
+sys.modules["cupy"] = _cupy
 
-    cupyx = types.ModuleType("cupyx")
-    sys.modules["cupyx"] = cupyx
+cupyx = types.ModuleType("cupyx")
+sys.modules["cupyx"] = cupyx
 
-    cupyx_scipy = types.ModuleType("cupyx.scipy")
-    sys.modules["cupyx.scipy"] = cupyx_scipy
+cupyx_scipy = types.ModuleType("cupyx.scipy")
+sys.modules["cupyx.scipy"] = cupyx_scipy
 
-    cupyx_ndimage = types.ModuleType("cupyx.scipy.ndimage")
-    cupyx_ndimage.convolve = _scipy_ndimage.convolve
-    cupyx_ndimage.gaussian_filter = _scipy_ndimage.gaussian_filter
-    cupyx_ndimage.zoom = _scipy_ndimage.zoom
-    cupyx_ndimage.rank_filter = _scipy_ndimage.rank_filter
-    cupyx_ndimage.uniform_filter = _scipy_ndimage.uniform_filter
-    sys.modules["cupyx.scipy.ndimage"] = cupyx_ndimage
+cupyx_ndimage = types.ModuleType("cupyx.scipy.ndimage")
+cupyx_ndimage.convolve = _scipy_ndimage.convolve
+cupyx_ndimage.gaussian_filter = _scipy_ndimage.gaussian_filter
+cupyx_ndimage.zoom = _scipy_ndimage.zoom
+cupyx_ndimage.rank_filter = _scipy_ndimage.rank_filter
+cupyx_ndimage.uniform_filter = _scipy_ndimage.uniform_filter
+sys.modules["cupyx.scipy.ndimage"] = cupyx_ndimage
 
-    cupyx_scipy_sparse = types.ModuleType("cupyx.scipy.sparse")
-    cupyx_scipy_sparse.csc_matrix = _scipy_sparse.csc_matrix
-    cupyx_scipy_sparse.csr_matrix = _scipy_sparse.csr_matrix
-    cupyx_scipy_sparse.coo_matrix = _scipy_sparse.coo_matrix
-    cupyx_scipy_sparse.spmatrix = _scipy_sparse.spmatrix
-    sys.modules["cupyx.scipy.sparse"] = cupyx_scipy_sparse
+cupyx_scipy_sparse = types.ModuleType("cupyx.scipy.sparse")
+cupyx_scipy_sparse.csc_matrix = _scipy_sparse.csc_matrix
+cupyx_scipy_sparse.csr_matrix = _scipy_sparse.csr_matrix
+cupyx_scipy_sparse.coo_matrix = _scipy_sparse.coo_matrix
+cupyx_scipy_sparse.spmatrix = _scipy_sparse.spmatrix
+sys.modules["cupyx.scipy.sparse"] = cupyx_scipy_sparse
 
-    cupyx_scipy.ndimage = cupyx_ndimage
-    cupyx_scipy.sparse = cupyx_scipy_sparse
-    cupyx.scipy = cupyx_scipy
+cupyx_scipy.ndimage = cupyx_ndimage
+cupyx_scipy.sparse = cupyx_scipy_sparse
+cupyx.scipy = cupyx_scipy
 
 # Try to import real cucim first; only stub if unavailable
 try:
@@ -234,7 +236,13 @@ except ImportError:
     class _CudaRuntime(types.SimpleNamespace):
         @staticmethod
         def getDeviceCount() -> int:
-            return 1
+            return 0
+
+        CUDARuntimeError = RuntimeError
+
+        @staticmethod
+        def getDevice() -> int:
+            raise RuntimeError("CUDA device unavailable in test stub")
 
         @staticmethod
         def deviceSynchronize() -> None:

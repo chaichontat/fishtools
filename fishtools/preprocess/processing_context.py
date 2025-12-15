@@ -5,20 +5,19 @@ Provides dependency injection pattern for configuration, workspace management,
 and scientific parameter caching with validation at initialization.
 """
 
-import os
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-_DEFAULT_DATA_PATH = os.environ.get("DATA_PATH", "/working/fishtools/data")
-
 import numpy as np
 from loguru import logger
 from numpy.typing import NDArray
 
-from fishtools.preprocess.config import Config
 from fishtools.io.workspace import Workspace
+from fishtools.preprocess.config import Config, resolve_data_path
+
+_DEFAULT_DATA_PATH = str(resolve_data_path())
 
 
 @dataclass

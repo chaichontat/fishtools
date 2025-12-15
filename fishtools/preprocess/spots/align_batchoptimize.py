@@ -11,8 +11,7 @@ from fishtools.io.workspace import Workspace
 
 
 def _field_store_path(ws: Workspace, roi: str, codebook_label: str) -> Path:
-    slug = Workspace.sanitize_codebook_name(codebook_label)
-    return ws.path / "analysis" / "deconv" / f"fields+{slug}" / f"field--{roi}+{slug}.zarr"
+    return ws.field_zarr(roi, codebook_label)
 
 
 def _ensure_field_stores(ws: Workspace, rois: list[str], codebook_label: str) -> None:
@@ -103,7 +102,9 @@ def optimize(
     json_config: Path | None = None,
     field_correct: bool = False,
 ):
-    if not len(list(path.glob(f"registered--{roi}{'*' if roi != '*' else ''}"))):
+    ws = Workspace(path)
+    rois_needed = ws.rois if roi == "*" else [roi]
+    if not any(ws.registered(r, codebook.stem).exists() for r in rois_needed):
         raise ValueError(
             f"No registered images found under registered--{roi}. Verify that you're in the base working directory, not the registered folder."
         )
@@ -119,10 +120,9 @@ def optimize(
         field_correct,
     )
     if field_correct:
-        workspace = Workspace(path)
-        rois_needed = workspace.rois if roi == "*" else [roi]
+        rois_needed = ws.rois if roi == "*" else [roi]
         logger.info("Checking illumination field stores for ROI(s): {}", ", ".join(sorted(rois_needed)))
-        _ensure_field_stores(workspace, rois_needed, codebook.stem)
+        _ensure_field_stores(ws, rois_needed, codebook.stem)
         logger.info("All required illumination field stores present.")
 
     wd = path / f"opt_{codebook.stem}{f'+{roi}' if roi != '*' else ''}"

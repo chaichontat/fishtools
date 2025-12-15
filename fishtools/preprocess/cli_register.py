@@ -1,7 +1,6 @@
 # %%
 import csv
 import json
-import os
 import pickle
 import shutil
 from collections import defaultdict
@@ -23,7 +22,14 @@ from scipy.ndimage import shift
 from tifffile import TiffFile
 
 from fishtools.preprocess.chromatic import Affine
-from fishtools.preprocess.config import Config, Fiducial, FiducialDetailedConfig, NumpyEncoder, RegisterConfig
+from fishtools.preprocess.config import (
+    Config,
+    Fiducial,
+    FiducialDetailedConfig,
+    NumpyEncoder,
+    RegisterConfig,
+    resolve_data_path,
+)
 from fishtools.preprocess.deconv.helpers import scale_deconv
 from fishtools.preprocess.downsample import gpu_downsample_xy
 from fishtools.preprocess.fiducial import (
@@ -44,7 +50,7 @@ if TYPE_CHECKING:
 
 # %%
 
-DATA = Path(os.environ["DATA_PATH"]).expanduser().resolve() if "DATA_PATH" in os.environ else Path("/working/fishtools/data")
+DATA = resolve_data_path()
 
 
 # %%
@@ -578,14 +584,15 @@ def run_fiducial(
     reference: str,
     debug: bool,
     no_priors: bool = False,
-    fids_raw: dict[str, np.ndarray] | None = None,
+    fids_raw: dict[str, np.ndarray],
     max_iters: int = 5,
 ):
+    ws = Workspace(path)
     prior_mapping: dict[str, str] = {}
 
     if (
         config.registration.fiducial.anchor_roi is None  # Skip priors when using anchor ROI
-        and len(shifts_existing := sorted((path / f"shifts--{roi}+{codebook_name}").glob("*.json"))) > 10
+        and len(shifts_existing := sorted(ws.shifts(roi, codebook_name).glob("*.json"))) > 10
         and not no_priors
         and config.registration.fiducial.priors is None
     ):
@@ -644,12 +651,12 @@ def run_fiducial(
     # Use a deterministic ordering for all multi-channel fiducial stacks
     ordered_keys = sorted(fids.keys())
 
-    _fids_path = path / f"registered--{roi}+{codebook_name}" / "_fids"
+    _fids_path = ws.registered_fids(roi, codebook_name)
     _fids_path.mkdir(exist_ok=True, parents=True)
 
     safe_imwrite(
         _fids_path / f"_fids-{idx:04d}.tif",
-        np.stack([fids[k] for k in ordered_keys]),
+        np.stack([fids_raw[k] for k in ordered_keys]),
         compression=22610,
         compressionargs={"level": 0.65},
         metadata={"axes": "CYX", "key": ordered_keys},
@@ -696,11 +703,9 @@ def run_fiducial(
         debug_dir.mkdir(exist_ok=True, parents=True)
         # Ensure deterministic channel ordering for debug TIFFs so that the
         # plane index matches the sorted fiducial keys used in QC tooling.
-        # Use raw fids with priors applied (not LoG treated)
-        debug_fids = fids_raw if fids_raw is not None else fids
         safe_imwrite(
             debug_dir / fids_name,
-            np.stack([debug_fids[k] for k in ordered_keys]),
+            np.stack([fids_raw[k] for k in ordered_keys]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX", "key": ordered_keys},
@@ -727,7 +732,7 @@ def run_fiducial(
         anchor_roi=config.registration.fiducial.anchor_roi,
     )
 
-    (shift_path := path / f"shifts--{roi}+{codebook_name}").mkdir(exist_ok=True)
+    (shift_path := ws.shifts(roi, codebook_name)).mkdir(exist_ok=True)
 
     _fid_ref = fids[reference][500:-500:2, 500:-500:2].flatten()
     validated = Shifts.validate_python(
@@ -770,8 +775,9 @@ def _run(
 ):
     logger.info("Starting")
     codebook_name = Path(codebook).stem
-    out_path = path / f"registered--{roi}+{codebook_name}"
-    reg_file = out_path / f"reg-{idx:04d}.tif"
+    ws = Workspace(path)
+    out_path = ws.registered(roi, codebook_name)
+    reg_file = ws.regimg(roi, codebook_name, idx)
 
     if not overwrite and reg_file.exists():
         logger.info(f"Skipping {idx}")
@@ -815,7 +821,7 @@ def _run(
         # Check if this round should use repaired folder
         round_name = p.name.split("--")[0]
         if round_name in repaired_rounds:
-            repaired_path = path / f"{round_name}--{roi}--repaired"
+            repaired_path = ws.deconv_repaired_dir(round_name, roi)
             if repaired_path.exists():
                 roi_dirs.append(repaired_path)
                 logger.info(f"Using repaired folder for round {round_name}: {repaired_path}")
@@ -1121,9 +1127,10 @@ def run(
     """
     rois = get_rois(path, roi)
     codebook_name = codebook.stem
+    ws = Workspace(path)
 
     for roi in rois:
-        reg_file = path / f"registered--{roi}+{codebook_name}" / f"reg-{idx:04d}.tif"
+        reg_file = ws.regimg(roi, codebook_name, idx)
         if not overwrite and reg_file.exists():
             logger.info(f"Skipping {idx}: registration already present at {reg_file}")
             continue
@@ -1271,7 +1278,7 @@ def batch(
             int(name.stem.split("-")[1])
             for name in names
             if overwrite
-            or not (path / f"registered--{roi}+{codebook.stem}/reg-{name.stem.split('-')[1]}.tif").exists()
+            or not ws.regimg(roi, codebook.stem, int(name.stem.split("-")[1])).exists()
         ]
 
         if not idxs and not verify:
@@ -1308,7 +1315,7 @@ def batch(
         # Optional verification phase: ensure files are readable and shapes match.
         if verify:
             codebook_name = codebook.stem
-            reg_dir = path / f"registered--{roi}+{codebook_name}"
+            reg_dir = ws.registered(roi, codebook_name)
             expected_shape: tuple[int, int, int, int] | None = None
             verify_idxs = sorted({int(name.stem.split("-")[1]) for name in names})
 
@@ -1470,6 +1477,7 @@ def fix_shifts(
         extra={"roi": roi, "reference": reference},
     )
 
+    ws = Workspace(path)
     rounds_to_fix = [r.strip() for r in rounds.split(",")]
 
     cli_priors: dict[str, tuple[float, float]] | None = None
@@ -1611,9 +1619,9 @@ def fix_shifts(
         all_results[idx] = tile_results
 
     # Write results JSON
-    shifts_dir = path / f"shifts--{roi}"
+    shifts_dir = ws.shifts(roi)
     shifts_dir.mkdir(exist_ok=True)
-    output_path = shifts_dir / "coarse_shifts.json"
+    output_path = ws.coarse_shifts_json(roi)
 
     output_data: dict[str, Any] = {
         "reference": reference,

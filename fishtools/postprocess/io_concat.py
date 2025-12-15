@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, MutableMapping, Sequence
+from typing import Mapping, MutableMapping
 
 import polars as pl
 from loguru import logger
@@ -90,7 +90,7 @@ def load_ident_tables(spec: ConcatDataSpec) -> dict[tuple[str, str], pl.DataFram
     missing: list[str] = []
     for roi in spec.rois:
         for codebook in spec.analysis_codebooks:
-            chunks_dir = spec.stitch_root / f"stitch--{roi}+{spec.seg_codebook}" / f"chunks+{codebook}"
+            chunks_dir = spec.workspace.stitch(roi, spec.seg_codebook) / f"chunks+{codebook}"
             files = _matching_files(chunks_dir, "ident_*.parquet")
             if not files:
                 missing.append(f"{roi}+{codebook}")
@@ -146,7 +146,7 @@ def load_intensity_tables(
     missing: list[str] = []
 
     for roi in spec.rois:
-        intensity_dir = spec.stitch_root / f"stitch--{roi}+{spec.seg_codebook}" / f"intensity_{channel}"
+        intensity_dir = spec.workspace.stitch(roi, spec.seg_codebook) / f"intensity_{channel}"
         files = _matching_files(intensity_dir, "intensity-*.parquet")
         if not files:
             missing.append(roi)
@@ -199,7 +199,7 @@ def load_spot_tables(spec: ConcatDataSpec) -> dict[tuple[str, str], pl.DataFrame
 
     for roi in spec.rois:
         for codebook in spec.analysis_codebooks:
-            spots_path = spec.stitch_root / f"{roi}+{codebook}.parquet"
+            spots_path = spec.workspace.spots_parquet(roi, codebook)
             if not spots_path.exists():
                 missing.append(f"{roi}+{codebook}")
                 continue
@@ -245,7 +245,7 @@ def load_polygon_tables(
     missing: list[str] = []
 
     for roi in spec.rois:
-        chunks_dir = spec.stitch_root / f"stitch--{roi}+{spec.seg_codebook}" / f"chunks+{target_codebook}"
+        chunks_dir = spec.workspace.stitch(roi, spec.seg_codebook) / f"chunks+{target_codebook}"
         files = _matching_files(chunks_dir, "polygons_*.parquet")
         if not files:
             missing.append(roi)

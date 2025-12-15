@@ -34,20 +34,22 @@ def _install_cuda_stub() -> None:
 
 _install_cuda_stub()
 
-from fishtools.preprocess.cli_deconv import (
-    DeconvolutionTileProcessor,
+from fishtools.preprocess.cli_deconv import (  # noqa: E402
     ProcessorConfig,
     filter_pending_files,
     load_global_scaling,
     make_processor_factory,
     multi_run,
-    _DEFAULT_OUTPUT_MODE,
     parse_device_spec,
     run,
     run_multi_gpu,
 )
-from fishtools.preprocess.deconv.backend import Float32HistBackend, OutputArtifacts, U16PrenormBackend
-from fishtools.preprocess.config import DeconvolutionOutputMode
+from fishtools.preprocess.deconv.backend import (  # noqa: E402
+    Float32HistBackend,
+    OutputArtifacts,
+    U16PrenormBackend,
+)
+from fishtools.preprocess.config import DeconvolutionOutputMode  # noqa: E402
 
 
 class DummyBasic:
@@ -127,6 +129,9 @@ def minimal_workspace(tmp_path: Path) -> tuple[Path, str, str]:
     round_name = "r1"
     roi = "roiA"
 
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
+
     data_dir = workspace / f"{round_name}--{roi}"
     data_dir.mkdir(parents=True)
 
@@ -145,7 +150,7 @@ def minimal_workspace(tmp_path: Path) -> tuple[Path, str, str]:
     with open(basic_dir / "all-000.pkl", "wb") as fh:
         pickle.dump({"basic": basic_obj}, fh)
 
-    scale_dir = workspace / "analysis" / "deconv32" / "deconv_scaling"
+    scale_dir = workspace / "analysis" / "deconv_scaling"
     scale_dir.mkdir(parents=True, exist_ok=True)
     np.savetxt(scale_dir / f"{round_name}.txt", np.array([[0.0], [1.0]], dtype=np.float32))
 
@@ -161,6 +166,8 @@ def stub_cupy_cuda(monkeypatch):
 
 def _workspace_with_tile(base: Path, *, round_name: str = "r1", roi: str = "roiA") -> Path:
     workspace = base / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
     tile_dir = workspace / f"{round_name}--{roi}"
     tile_dir.mkdir(parents=True, exist_ok=True)
     payload = np.zeros((1, 8, 8), dtype=np.uint16)
@@ -370,17 +377,15 @@ def _write_basic_profiles(base: Path, *, channels: int, shape: tuple[int, int]) 
 
 
 def _patch_deconv_stubs(monkeypatch, channels: int, height: int, width: int) -> None:
-    import cupy as cp
-
     monkeypatch.setattr(
-        "fishtools.preprocess.deconv.core.load_projectors_cached",
-        lambda step: (
-            cp.ones((channels, height, width), dtype=cp.float32),
-            cp.ones((channels, height, width), dtype=cp.float32),
+        "fishtools.preprocess.deconv.backend.projectors",
+        lambda step=6: (
+            np.ones((channels, height, width), dtype=np.float32),
+            np.ones((channels, height, width), dtype=np.float32),
         ),
     )
     monkeypatch.setattr(
-        "fishtools.preprocess.deconv.core.deconvolve_lucyrichardson_guo",
+        "fishtools.preprocess.deconv.backend.deconvolve_lucyrichardson_guo",
         lambda payload, projectors, iters: payload,
     )
 
@@ -537,7 +542,6 @@ def test_deconvolution_histogram_deterministic(tmp_path: Path, monkeypatch):
 
 
 def test_load_basics_mismatched_shapes(tmp_path: Path):
-    roi = "roiC"
     round_name = "rShape"
     basic_dir = tmp_path / "basic"
     basic_dir.mkdir(parents=True, exist_ok=True)
@@ -582,11 +586,11 @@ def test_run_multi_gpu_stop_on_error_cancels_remaining(tmp_path: Path, monkeypat
             target=target, kwargs=kwargs, daemon=daemon, **extra
         ),
     )
-    monkeypatch.setattr("fishtools.preprocess.cli_deconv._MP_CTX", dummy_ctx)
-    monkeypatch.setattr("fishtools.preprocess.cli_deconv._configure_logging", lambda *a, **k: None)
-    monkeypatch.setattr("fishtools.preprocess.cli_deconv.signal.signal", lambda *a, **k: None)
+    monkeypatch.setattr("fishtools.preprocess.deconv.worker.MP_CONTEXT", dummy_ctx)
+    monkeypatch.setattr("fishtools.preprocess.deconv.worker.configure_worker_logging", lambda *a, **k: None)
+    monkeypatch.setattr("fishtools.preprocess.deconv.worker.signal.signal", lambda *a, **k: None)
     monkeypatch.setattr(
-        "fishtools.preprocess.cli_deconv.cp.cuda",
+        "fishtools.preprocess.deconv.worker.cp.cuda",
         types.SimpleNamespace(
             runtime=types.SimpleNamespace(getDeviceCount=lambda: 1, CUDARuntimeError=RuntimeError),
             Device=lambda _: types.SimpleNamespace(use=lambda: None),
@@ -607,12 +611,14 @@ def test_run_multi_gpu_stop_on_error_cancels_remaining(tmp_path: Path, monkeypat
 
 
 def test_load_global_scaling_missing(tmp_path: Path):
+    (tmp_path / "workspace.DONE").touch()
     with pytest.raises(FileNotFoundError):
         load_global_scaling(tmp_path, "missing")
 
 
-def test_multi_run_end_to_end(minimal_workspace: tuple[Path, str, str]):
+def test_multi_run_end_to_end(minimal_workspace: tuple[Path, str, str], monkeypatch: pytest.MonkeyPatch):
     workspace, round_name, roi = minimal_workspace
+    _patch_deconv_stubs(monkeypatch, channels=1, height=2048, width=2048)
 
     multi_run(
         workspace,

@@ -8,7 +8,38 @@ import numpy as np
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
 
-DATA = Path(os.environ["DATA_PATH"]).expanduser().resolve() if "DATA_PATH" in os.environ else Path("/working/fishtools/data")
+
+def _find_project_root(start: Path) -> Path | None:
+    for candidate in (start, *start.parents):
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    return None
+
+
+def resolve_data_path() -> Path:
+    """Resolve the shared resource data directory.
+
+    Precedence:
+      1) `DATA_PATH` env var (absolute or relative).
+      2) `<repo_root>/data` (found via `pyproject.toml` from CWD or this file).
+      3) `<cwd>/data` (even if missing; downstream code will fail fast if files are required).
+    """
+
+    if "DATA_PATH" in os.environ:
+        return Path(os.environ["DATA_PATH"]).expanduser().resolve()
+
+    for start in (Path.cwd().resolve(), Path(__file__).resolve()):
+        root = _find_project_root(start)
+        if root is None:
+            continue
+        candidate = root / "data"
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    return (Path.cwd() / "data").resolve()
+
+
+DATA = resolve_data_path()
 
 
 class DeconvolutionOutputMode(str, Enum):

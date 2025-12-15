@@ -6,7 +6,6 @@ dependencies. These focus on small, deterministic behaviors.
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -161,6 +160,8 @@ def test_deviations_append_and_read(tmp_path: Path) -> None:
 
 def test_batch_delete_corrupted_uses_workspace_helpers(monkeypatch, tmp_path: Path) -> None:
     workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    (workspace_root / "workspace.DONE").touch()
     registered = workspace_root / "analysis" / "deconv" / "registered--cortex+cb"
     registered.mkdir(parents=True)
 

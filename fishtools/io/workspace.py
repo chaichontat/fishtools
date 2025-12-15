@@ -190,6 +190,9 @@ class Workspace:
         path: Workspace root path (auto-detects from subdirectories)
     """
 
+    ANALYSIS_DIRNAME = "analysis"
+    TILECONFIG_REGISTERED_FILENAME = "TileConfiguration.registered.txt"
+
     # Regex patterns for robust directory name parsing
     ROUND_ROI_PATTERN = re.compile(
         r"^([^-]+)--([^+]+)(?:\+.*)?$"
@@ -230,6 +233,10 @@ class Workspace:
             deconved: Unused parameter (backward compatibility)
         """
         oripath = path = Path(path).expanduser().resolve()
+        if not path.exists():
+            raise ValueError(f"Path {oripath} does not exist.")
+        if not path.is_dir():
+            raise ValueError(f"Path {oripath} is not a directory.")
         stepped_up = 0
         while True:
             if stepped_up > 2:
@@ -255,7 +262,12 @@ class Workspace:
     @property
     def analysis(self) -> Path:
         """Return path to analysis directory."""
-        return self.path / "analysis"
+        return self.path / self.ANALYSIS_DIRNAME
+
+    @property
+    def logs(self) -> Path:
+        """Return path to workspace-scoped logs directory."""
+        return self.analysis / "logs"
 
     @property
     def output(self) -> Path:
@@ -268,6 +280,11 @@ class Workspace:
             >>> ws.output  # PosixPath('/experiment/analysis/output')
         """
         return self.analysis / "output"
+
+    @property
+    def deconv32(self) -> Path:
+        """Return path to float32 staging deconvolution directory."""
+        return self.analysis / "deconv32"
 
     def deconv_scaling(self, round_: str | None = None) -> Path:
         """Return path to deconvolution scaling directory."""
@@ -556,6 +573,33 @@ class Workspace:
         """
         return self.path / "analysis" / "deconv"
 
+    def deconv_round_dir(self, round_name: str, roi: str) -> Path:
+        """Return path to a deconvolved round/ROI directory under analysis/deconv."""
+
+        return self.deconved / f"{round_name}--{roi}"
+
+    def deconv_repaired_dir(self, round_name: str, roi: str) -> Path:
+        """Return path to a repaired deconvolved round/ROI directory under analysis/deconv."""
+
+        return self.deconved / f"{round_name}--{roi}--repaired"
+
+    def shifts(self, roi: str, codebook: str | None = None) -> Path:
+        """Return path to the shifts directory for a ROI (optionally codebook-scoped)."""
+
+        if codebook is None:
+            return self.deconved / f"shifts--{roi}"
+        return self.deconved / f"shifts--{roi}+{codebook}"
+
+    def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+        """Return path to a per-tile shifts JSON file."""
+
+        return self.shifts(roi, codebook) / f"shifts-{idx:04d}.json"
+
+    def coarse_shifts_json(self, roi: str) -> Path:
+        """Return path to the coarse shifts JSON produced by fix-shifts."""
+
+        return self.shifts(roi) / "coarse_shifts.json"
+
     @overload
     def img(self, round_: str, roi: str, idx: int, *, read: Literal[False] = ...) -> Path: ...
     @overload
@@ -600,6 +644,21 @@ class Workspace:
         """
         return self.deconved / f"registered--{roi}+{codebook}"
 
+    def registered_fids(self, roi: str, codebook: str) -> Path:
+        """Return the `_fids` directory under a registration output directory."""
+
+        return self.registered(roi, codebook) / "_fids"
+
+    def decoded_dir(self, roi: str, codebook: str) -> Path:
+        """Return the decoded output directory under a registration output directory."""
+
+        return self.registered(roi, codebook) / f"decoded-{codebook}"
+
+    def decoded_spots_parquet(self, roi: str, codebook: str) -> Path:
+        """Return the decoded spots parquet path under the registered output tree."""
+
+        return self.decoded_dir(roi, codebook) / "spots.parquet"
+
     @overload
     def regimg(self, roi: str, codebook: str, idx: int, *, read: Literal[False] = ...) -> Path: ...
     @overload
@@ -633,7 +692,7 @@ class Workspace:
 
         Naming and location semantics:
         - Tile configuration (TileConfiguration.registered.txt) is ROI-specific and
-          lives at the workspace root under ``stitch--{roi}/``.
+          lives under ``analysis/deconv/stitch--{roi}/``.
         - Stitched outputs are ROI+codebook-specific and live under
           ``analysis/deconv/stitch--{roi}+{codebook}/``.
 
@@ -655,6 +714,11 @@ class Workspace:
         if codebook is None:
             return self.deconved / f"stitch--{roi}"
         return self.deconved / f"stitch--{roi}+{codebook}"
+
+    def stitch_shifted(self, roi: str, round_name: str) -> Path:
+        """Return path to a coarse-shifted stitch directory for a ROI and round name."""
+
+        return self.deconved / f"stitch--{roi}--shifted-{round_name}"
 
     @staticmethod
     def sanitize_codebook_name(codebook: str) -> str:
@@ -727,18 +791,26 @@ class Workspace:
     def tileconfig_dir(self, roi: str) -> Path:
         """Return the ROI-level directory containing the TileConfiguration file.
 
-        Note: This directory is separate from stitched outputs (which live
-        under ``analysis/deconv/stitch--{roi}[+{codebook}]``).
+        Contract:
+        - ROI-level TileConfiguration directories live under the deconvolved tree:
+          ``<workspace>/analysis/deconv/stitch--{roi}/``.
         """
         return self.deconved / f"stitch--{roi}"
+
+    def tileconfig_registered_txt(self, roi: str) -> Path:
+        """Return the canonical ROI-level TileConfiguration file path.
+
+        Contract:
+        - ``<workspace_root>/analysis/deconv/stitch--{roi}/TileConfiguration.registered.txt``.
+        """
+        return self.tileconfig_dir(roi) / self.TILECONFIG_REGISTERED_FILENAME
 
     def tileconfig(self, roi: str) -> "TileConfiguration":
         """Load the ROI-level TileConfiguration.
 
-        Reads from ``<workspace_root>/stitch--{roi}/TileConfiguration.registered.txt``.
-        For backward compatibility, if the file is not present at the workspace
-        root, a secondary lookup is attempted under
-        ``analysis/deconv/stitch--{roi}/``.
+        Reads from the canonical location:
+
+        - ``<workspace_root>/analysis/deconv/stitch--{roi}/TileConfiguration.registered.txt``.
 
         Args:
             roi: Region of interest identifier
@@ -753,13 +825,24 @@ class Workspace:
             >>> config = ws.tileconfig('cortex')
             >>> print(config.tiles)  # Access tile positions
         """
-        file = self.deconved / f"stitch--{roi}" / "TileConfiguration.registered.txt"
-        if file.exists():
-            return TileConfiguration.from_file(file)
+        path = self.tileconfig_registered_txt(roi)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"No registered TileConfig found at {path}. Run `preprocess stitch register` first."
+            )
+        return TileConfiguration.from_file(path)
 
-        raise FileNotFoundError(
-            f"No registered TileConfig found at {file}. Run preprocess stitch register first."
-        )
+    def fields_dir(self, codebook: str) -> Path:
+        """Return path to the illumination field store directory for a codebook."""
+
+        slug = self.sanitize_codebook_name(codebook)
+        return self.deconved / f"fields+{slug}"
+
+    def field_zarr(self, roi: str, codebook: str) -> Path:
+        """Return path to a TCYX illumination field Zarr store."""
+
+        slug = self.sanitize_codebook_name(codebook)
+        return self.fields_dir(slug) / f"field--{roi}+{slug}.zarr"
 
     def segment(self, roi: str, codebook: str) -> Path:
         """Return path to segmentation results directory.

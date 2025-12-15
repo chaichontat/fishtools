@@ -214,7 +214,7 @@ def _ensure_fields_dir(ws: Workspace, codebook: str) -> tuple[Path, str, str]:
     codebook_path = Path(codebook)
     codebook_label = codebook_path.stem if codebook_path.suffix else str(codebook_path)
     codebook_slug = Workspace.sanitize_codebook_name(codebook_label)
-    fields_dir = ws.deconved / f"fields+{codebook_slug}"
+    fields_dir = ws.fields_dir(codebook_slug)
     fields_dir.mkdir(parents=True, exist_ok=True)
     return fields_dir, codebook_label, codebook_slug
 

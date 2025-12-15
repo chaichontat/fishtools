@@ -98,14 +98,14 @@ def _patch_deconv_stubs(monkeypatch, channels: int, height: int, width: int) -> 
     import cupy as cp
 
     monkeypatch.setattr(
-        "fishtools.preprocess.deconv.core.load_projectors_cached",
-        lambda step: (
+        "fishtools.preprocess.deconv.backend.projectors",
+        lambda step=6: (
             cp.ones((channels, height, width), dtype=cp.float32),
             cp.ones((channels, height, width), dtype=cp.float32),
         ),
     )
     monkeypatch.setattr(
-        "fishtools.preprocess.deconv.core.deconvolve_lucyrichardson_guo",
+        "fishtools.preprocess.deconv.backend.deconvolve_lucyrichardson_guo",
         lambda payload, projectors, iters: payload,
     )
 

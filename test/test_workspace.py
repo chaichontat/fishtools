@@ -7,12 +7,15 @@ robustness, memory efficiency, and performance benchmarks.
 
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import tifffile
 from fishtools.utils.io import CorruptedTiffError, OptimizePath, Workspace
+
+
+def _write_done_sentinel(workspace_root: Path) -> None:
+    (workspace_root / "workspace.DONE").write_text("ok\n", encoding="utf-8")
 
 
 class TestWorkspaceInitialization:
@@ -22,6 +25,7 @@ class TestWorkspaceInitialization:
         """Test initialization with workspace root path."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir)
+            _write_done_sentinel(workspace_path)
             ws = Workspace(workspace_path)
             assert ws.path == workspace_path.resolve()
 
@@ -29,6 +33,7 @@ class TestWorkspaceInitialization:
         """Test initialization with analysis/deconv subdirectory auto-resolves to root."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir)
+            _write_done_sentinel(workspace_path)
             deconv_path = workspace_path / "analysis" / "deconv"
             deconv_path.mkdir(parents=True)
 
@@ -38,13 +43,18 @@ class TestWorkspaceInitialization:
     def test_init_with_string_path(self):
         """Test initialization with string path."""
         with tempfile.TemporaryDirectory() as tmpdir:
+            _write_done_sentinel(Path(tmpdir))
             ws = Workspace(tmpdir)
             assert ws.path == Path(tmpdir).resolve()
 
-    def test_init_expands_user_path(self):
+    def test_init_expands_user_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Test that ~ is expanded in paths."""
-        ws = Workspace("~/test")
-        assert str(ws.path).startswith("/")  # Should be expanded
+        monkeypatch.setenv("HOME", str(tmp_path))
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
+        ws = Workspace("~/workspace")
+        assert ws.path == workspace_path.resolve()
 
 
 class TestWorkspaceRegexPatterns:
@@ -121,6 +131,7 @@ class TestWorkspaceStructureDiscovery:
         """Create mock workspace with specified directories."""
         tmpdir = tempfile.mkdtemp()
         workspace_path = Path(tmpdir)
+        _write_done_sentinel(workspace_path)
 
         for dirname in directories:
             (workspace_path / dirname).mkdir(parents=True, exist_ok=True)
@@ -229,6 +240,7 @@ class TestWorkspaceImageAccess:
         """Create workspace with deconv directory structure."""
         tmpdir = tempfile.mkdtemp()
         workspace_path = Path(tmpdir)
+        _write_done_sentinel(workspace_path)
         deconv_path = workspace_path / "analysis" / "deconv"
 
         # Create directory structure
@@ -254,18 +266,18 @@ class TestWorkspaceImageAccess:
         expected_path = ws.deconved / "1_9_17--cortex" / "1_9_17-0042.tif"
         assert img_path == expected_path
 
-    @patch("fishtools.utils.io.imread")
-    def test_img_with_read_true(self, mock_imread):
+    def test_img_with_read_true(self):
         """Test img method with read=True loads image data."""
-        mock_array = np.zeros((10, 10), dtype=np.uint16)
-        mock_imread.return_value = mock_array
-
         workspace_path = self.create_mock_workspace_with_deconv()
         ws = Workspace(workspace_path)
 
+        img_path = ws.img("1_9_17", "cortex", 42)
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        expected = np.zeros((10, 10), dtype=np.uint16)
+        tifffile.imwrite(img_path, expected)
+
         img_data = ws.img("1_9_17", "cortex", 42, read=True)
-        assert np.array_equal(img_data, mock_array)
-        mock_imread.assert_called_once()
+        assert np.array_equal(img_data, expected)
 
     def test_registered_path_construction(self):
         """Test registered method constructs correct paths."""
@@ -285,53 +297,61 @@ class TestWorkspaceImageAccess:
         expected_path = ws.deconved / "registered--cortex+codebook_v1" / "reg-0042.tif"
         assert regimg_path == expected_path
 
-    @patch("fishtools.utils.io.imread")
-    def test_regimg_with_read_true(self, mock_imread):
+    def test_regimg_with_read_true(self):
         """Test regimg method with read=True loads image data."""
-        mock_array = np.zeros((5, 10, 10), dtype=np.uint16)
-        mock_imread.return_value = mock_array
-
         workspace_path = self.create_mock_workspace_with_deconv()
         ws = Workspace(workspace_path)
 
+        regimg_path = ws.regimg("cortex", "cb", 42)
+        regimg_path.parent.mkdir(parents=True, exist_ok=True)
+        expected = np.zeros((5, 10, 10), dtype=np.uint16)
+        tifffile.imwrite(regimg_path, expected)
+
         regimg_data = ws.regimg("cortex", "cb", 42, read=True)
-        assert np.array_equal(regimg_data, mock_array)
-        mock_imread.assert_called_once()
+        assert np.array_equal(regimg_data, expected)
 
 
 class TestWorkspaceProcessingDirectories:
     """Test methods for accessing processing result directories."""
 
-    def test_stitch_without_codebook(self):
+    def test_stitch_without_codebook(self, tmp_path: Path):
         """Test stitch method without codebook parameter."""
-        workspace_path = Path("/test")
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         stitch_path = ws.stitch("cortex")
         expected_path = workspace_path / "analysis" / "deconv" / "stitch--cortex"
         assert stitch_path == expected_path
 
-    def test_stitch_with_codebook(self):
+    def test_stitch_with_codebook(self, tmp_path: Path):
         """Test stitch method with codebook parameter."""
-        workspace_path = Path("/test")
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         stitch_path = ws.stitch("cortex", "codebook_v1")
         expected_path = workspace_path / "analysis" / "deconv" / "stitch--cortex+codebook_v1"
         assert stitch_path == expected_path
 
-    def test_segment_path_construction(self):
+    def test_segment_path_construction(self, tmp_path: Path):
         """Test segment method constructs correct paths."""
-        workspace_path = Path("/test")
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         segment_path = ws.segment("cortex", "codebook_v1")
         expected_path = workspace_path / "analysis" / "deconv" / "segment--cortex+codebook_v1"
         assert segment_path == expected_path
 
-    def test_opt_path_construction(self):
+    def test_opt_path_construction(self, tmp_path: Path):
         """Test opt method constructs correct paths with underscore pattern."""
-        workspace_path = Path("/test")
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         opt_path = ws.opt("ebe_tricycle_targets")
@@ -339,9 +359,11 @@ class TestWorkspaceProcessingDirectories:
         assert opt_path.path == expected_path
         assert isinstance(opt_path, OptimizePath)
 
-    def test_opt_properties_access(self):
+    def test_opt_properties_access(self, tmp_path: Path):
         """Test OptimizePath properties are accessible with real codebook names."""
-        workspace_path = Path("/test")
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         opt_path = ws.opt("ebe_devprobeset_targets")
@@ -352,27 +374,51 @@ class TestWorkspaceProcessingDirectories:
         assert mse_path == base_path / "mse.txt"
         assert scaling_path == base_path / "global_scale.txt"
 
-    @patch("fishtools.preprocess.tileconfig.TileConfiguration.from_file")
-    def test_tileconfig_success(self, mock_from_file):
+    def test_tileconfig_success(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         """Test tileconfig method loads configuration successfully."""
-        mock_config = MagicMock()
-        mock_from_file.return_value = mock_config
-
-        workspace_path = Path("/test")
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
-        config = ws.tileconfig("cortex")
-        assert config == mock_config
+        expected_path = ws.tileconfig_registered_txt("cortex")
+        expected_path.parent.mkdir(parents=True, exist_ok=True)
+        expected_path.write_text("dim=2\n", encoding="utf-8")
 
-        expected_path = workspace_path / "stitch--cortex" / "TileConfiguration.registered.txt"
-        mock_from_file.assert_called_once_with(expected_path)
+        sentinel = object()
 
-    @patch("fishtools.preprocess.tileconfig.TileConfiguration.from_file")
-    def test_tileconfig_file_not_found(self, mock_from_file):
+        def _fake_from_file(p: Path) -> object:
+            assert p == expected_path
+            return sentinel
+
+        monkeypatch.setattr("fishtools.preprocess.tileconfig.TileConfiguration.from_file", _fake_from_file)
+        assert ws.tileconfig("cortex") is sentinel
+
+    def test_tileconfig_returns_canonical(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Test tileconfig loads from the canonical location."""
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
+        ws = Workspace(workspace_path)
+
+        expected = ws.tileconfig_registered_txt("cortex")
+        expected.parent.mkdir(parents=True, exist_ok=True)
+        expected.write_text("dim=2\n", encoding="utf-8")
+
+        sentinel = object()
+
+        def _fake_from_file(p: Path) -> object:
+            assert p == expected
+            return sentinel
+
+        monkeypatch.setattr("fishtools.preprocess.tileconfig.TileConfiguration.from_file", _fake_from_file)
+        assert ws.tileconfig("cortex") is sentinel
+
+    def test_tileconfig_file_not_found(self, tmp_path: Path):
         """Test tileconfig method raises meaningful error when file not found."""
-        mock_from_file.side_effect = FileNotFoundError()
-
-        workspace_path = Path("/test")
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         with pytest.raises(FileNotFoundError, match="No registered TileConfig found at"):
@@ -382,15 +428,19 @@ class TestWorkspaceProcessingDirectories:
 class TestWorkspaceFiducialsAndPositions:
     """Tests for fiducial and tile position helpers."""
 
-    def test_fids_directory_path(self):
-        workspace_path = Path("/test")
+    def test_fids_directory_path(self, tmp_path: Path):
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         expected = workspace_path / "analysis" / "deconv" / "fids--cortex"
         assert ws.fids("cortex") == expected
 
-    def test_fid_path_accepts_int_and_str(self):
-        workspace_path = Path("/test")
+    def test_fid_path_accepts_int_and_str(self, tmp_path: Path):
+        workspace_path = tmp_path / "ws"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         base = workspace_path / "analysis" / "deconv" / "fids--cortex"
@@ -400,6 +450,7 @@ class TestWorkspaceFiducialsAndPositions:
     def test_tile_positions_csv_prefers_override(self, tmp_path: Path):
         workspace_root = tmp_path / "ws"
         workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
         override = tmp_path / "custom.csv"
         override.write_text("0,0,0\n", encoding="utf-8")
 
@@ -409,6 +460,7 @@ class TestWorkspaceFiducialsAndPositions:
     def test_tile_positions_csv_from_workspace_root(self, tmp_path: Path):
         workspace_root = tmp_path / "ws"
         workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
         csv_path = workspace_root / "cortex.csv"
         csv_path.write_text("0,0,0\n", encoding="utf-8")
 
@@ -418,6 +470,7 @@ class TestWorkspaceFiducialsAndPositions:
     def test_tile_positions_csv_missing_raises(self, tmp_path: Path):
         workspace_root = tmp_path / "ws"
         workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
 
         ws = Workspace(workspace_root)
         with pytest.raises(FileNotFoundError, match="Tile position CSV not found"):
@@ -429,6 +482,8 @@ class TestWorkspaceRegisteredArtifacts:
 
     def test_registered_file_map_collects_registered_files(self, tmp_path: Path) -> None:
         workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
         registered_dir = workspace_root / "analysis" / "deconv" / "registered--cortex+cb1"
         registered_dir.mkdir(parents=True)
         tif_path = registered_dir / "reg-0000.tif"
@@ -442,6 +497,8 @@ class TestWorkspaceRegisteredArtifacts:
 
     def test_registered_file_map_reports_missing_roi(self, tmp_path: Path) -> None:
         workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
         (workspace_root / "analysis" / "deconv" / "registered--cortex+other").mkdir(parents=True)
 
         ws = Workspace(workspace_root)
@@ -452,6 +509,8 @@ class TestWorkspaceRegisteredArtifacts:
 
     def test_registered_codebooks_discovers_unique_sorted(self, tmp_path: Path) -> None:
         workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
         base = workspace_root / "analysis" / "deconv"
         (base / "registered--cortex+cb2").mkdir(parents=True)
         (base / "registered--cortex+cb1").mkdir(parents=True)
@@ -464,6 +523,8 @@ class TestWorkspaceRegisteredArtifacts:
 
     def test_registered_codebooks_filters_by_rois(self, tmp_path: Path) -> None:
         workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
         base = workspace_root / "analysis" / "deconv"
         (base / "registered--cortex+cb1").mkdir(parents=True)
         (base / "registered--hippocampus+cb2").mkdir(parents=True)
@@ -488,16 +549,20 @@ class TestWorkspaceRegisteredArtifacts:
 class TestWorkspaceStringRepresentation:
     """Test string representation methods."""
 
-    def test_str_method(self):
+    def test_str_method(self, tmp_path: Path):
         """Test __str__ returns path as string."""
-        workspace_path = Path("/test/workspace")
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         assert str(ws) == str(workspace_path.resolve())
 
-    def test_repr_method(self):
+    def test_repr_method(self, tmp_path: Path):
         """Test __repr__ returns formatted representation."""
-        workspace_path = Path("/test/workspace")
+        workspace_path = tmp_path / "workspace"
+        workspace_path.mkdir()
+        _write_done_sentinel(workspace_path)
         ws = Workspace(workspace_path)
 
         expected_repr = f"Workspace({workspace_path.resolve()})"
@@ -510,19 +575,14 @@ class TestWorkspaceEdgeCases:
     def test_nonexistent_directory(self):
         """Test behavior with nonexistent directory paths."""
         workspace_path = Path("/nonexistent/path")
-        ws = Workspace(workspace_path)
-
-        # Should not raise error during initialization
-        assert ws.path == workspace_path.resolve()
-
-        # But should raise when trying to access contents
-        with pytest.raises((FileNotFoundError, OSError, ValueError)):
-            _ = ws.rounds
+        with pytest.raises(ValueError, match="does not exist"):
+            _ = Workspace(workspace_path)
 
     def test_empty_directory(self):
         """Test behavior with empty directory."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir)
+            _write_done_sentinel(workspace_path)
             ws = Workspace(workspace_path)
 
             with pytest.raises(ValueError, match="No round subdirectories found"):
@@ -535,6 +595,7 @@ class TestWorkspaceEdgeCases:
         """Test that deconved directory existence affects path selection."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir)
+            _write_done_sentinel(workspace_path)
             deconv_path = workspace_path / "analysis" / "deconv"
 
             # Without deconv directory
@@ -564,6 +625,7 @@ class TestWorkspaceBackwardCompatibility:
         ]
 
         workspace_path = Path(tempfile.mkdtemp())
+        _write_done_sentinel(workspace_path)
         for dirname in directories:
             (workspace_path / dirname).mkdir(parents=True, exist_ok=True)
 
@@ -583,6 +645,7 @@ class TestWorkspaceBackwardCompatibility:
         ]
 
         workspace_path = Path(tempfile.mkdtemp())
+        _write_done_sentinel(workspace_path)
         for dirname in directories:
             (workspace_path / dirname).mkdir(parents=True, exist_ok=True)
 

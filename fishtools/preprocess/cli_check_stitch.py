@@ -47,7 +47,7 @@ sns.set_theme()
     "output_dir",
     type=click.Path(file_okay=False, dir_okay=True, writable=True, resolve_path=True, path_type=Path),
     default=None,
-    help="Output directory [default: '<workspace_parent>/output']",
+    help="Output directory [default: '<workspace>/analysis/output']",
 )
 @click.option("--cols", type=int, default=None, help="Grid columns; default sqrt(#ROIs)")
 @click.option(
@@ -105,7 +105,7 @@ def check_stitch(
         raise click.ClickException("No ROIs found.")
 
     if output_dir is None:
-        output_dir = path.parent / "output"
+        output_dir = ws.output
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.debug(f"Output directory: {output_dir}")
 
@@ -118,9 +118,11 @@ def check_stitch(
 
     tileconfigs: dict[str, TileConfiguration | None] = {}
     for roi in roi_list:
-        cfg_path = ws.deconved / f"stitch--{roi}" / "TileConfiguration.registered.txt"
         try:
-            tc = ws.tileconfig(roi)
+            cfg_path = ws.tileconfig_registered_txt(roi)
+            if not cfg_path.exists():
+                raise FileNotFoundError(str(cfg_path))
+            tc = TileConfiguration.from_file(cfg_path)
         except FileNotFoundError as exc:
             logger.warning(f"TileConfiguration not found for ROI {roi}: {exc}")
             tileconfigs[roi] = None
