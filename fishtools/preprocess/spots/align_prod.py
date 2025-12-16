@@ -2153,6 +2153,7 @@ def parse_duration(duration_str: str) -> timedelta:
 )
 @click.option("--threads", "-t", type=int, default=13)
 @click.option("--overwrite", is_flag=True)
+@click.option("--overwrite-stale", is_flag=True, help="Reprocess only tiles with registered images newer than their pkl files.")
 @click.option("--simple", is_flag=True)
 @click.option(
     "--since",
@@ -2194,6 +2195,7 @@ def batch(
     codebook_path: Path,
     threads: int = 13,
     overwrite: bool = False,
+    overwrite_stale: bool = False,
     simple: bool = False,
     split: bool = False,
     since: str | None = None,
@@ -2214,6 +2216,7 @@ def batch(
             "codebook": codebook_path.stem,
             "threads": threads,
             "overwrite": overwrite,
+            "overwrite_stale": overwrite_stale,
             "simple": simple,
             "local_opt": local_opt,
         },
@@ -2266,6 +2269,31 @@ def batch(
         if len(list(p.parent.glob(glob_pattern))) == num_expected_pkl:
             already_done.add(p)
 
+    # Check for stale files (registered tile newer than pkl files)
+    stale = set()
+    stale_pkls: list[Path] = []
+    if overwrite_stale:
+        for p in already_done:
+            glob_pattern = f"decoded-{codebook_path.stem}/{p.stem}{'-*' if split else ''}.pkl"
+            pkl_files = list(p.parent.glob(glob_pattern))
+            if pkl_files and any(p.stat().st_mtime > pkl.stat().st_mtime for pkl in pkl_files):
+                stale.add(p)
+                stale_pkls.extend(pkl_files)
+        if stale:
+            logger.info(f"Found {len(stale)} stale tiles to reprocess.")
+            # Delete stale pkl files and their associated parquets
+            deleted_parquets = 0
+            for pkl in stale_pkls:
+                logger.debug(f"Deleting stale pkl: {pkl}")
+                pkl.unlink()
+                # Delete associated parquet (stitch outputs {stem}_deduped.parquet)
+                parquet = pkl.with_name(pkl.stem + "_deduped.parquet")
+                if parquet.exists():
+                    logger.debug(f"Deleting stale parquet: {parquet}")
+                    parquet.unlink()
+                    deleted_parquets += 1
+            logger.info(f"Deleted {len(stale_pkls)} stale pkl files and {deleted_parquets} parquet files.")
+
     if overwrite:
         # Overwrite only applies to files within the scope (all or recent)
         paths_to_process = sorted(list(paths_in_scope))
@@ -2274,6 +2302,11 @@ def batch(
         overwritten_count = len(already_done)
         if overwritten_count > 0:
             logger.info(f"Overwriting {overwritten_count} already processed files within the scope.")
+    elif overwrite_stale:
+        # Process new files + stale files
+        paths_to_process = sorted(list((paths_in_scope - already_done) | stale))
+        new_count = len(paths_in_scope - already_done)
+        logger.info(f"Processing {len(paths_to_process)} files ({len(stale)} stale + {new_count} new).")
     else:
         # Process only files in scope that are not already done
         paths_to_process = sorted(list(paths_in_scope - already_done))
