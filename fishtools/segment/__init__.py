@@ -1,22 +1,13 @@
 import logging
-from functools import lru_cache
-from importlib import import_module
 from pathlib import Path
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import rich_click as click
-import torch
 
 from fishtools.utils.pretty_print import TaskCancelledException
 
 if TYPE_CHECKING:  # pragma: no cover
     from fishtools.segment.train import TrainConfig as TrainConfig
-
-
-@lru_cache(maxsize=None)
-def _import_cached(module: str):
-    return import_module(module)
 
 
 def _strip_line_comments(text: str) -> str:
@@ -32,29 +23,6 @@ class SegmentCLI(click.Group):
     def main(self, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("standalone_mode", False)
         return super().main(*args, **kwargs)
-
-
-class _LazyCommandGroup(click.Group):
-    def __init__(self, *args: Any, lazy_commands: dict[str, SimpleNamespace] | None = None, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        self._lazy_commands = lazy_commands or {}
-
-    def list_commands(self, ctx):  # type: ignore[override]
-        eager = super().list_commands(ctx)
-        lazy = sorted(self._lazy_commands)
-        return list(dict.fromkeys([*eager, *lazy]))
-
-    def get_command(self, ctx, cmd_name):  # type: ignore[override]
-        command = super().get_command(ctx, cmd_name)
-        if command is not None:
-            return command
-        spec = self._lazy_commands.get(cmd_name)
-        if spec is None:
-            return None
-        module = _import_cached(spec.module)
-        cmd = getattr(module, spec.attr)
-        self.add_command(cmd, cmd_name)
-        return cmd
 
 
 app = SegmentCLI(help="Segmentation tooling CLI.")
@@ -80,9 +48,7 @@ def train(
     te_fp8: bool,
     packed: bool,
 ) -> None:
-    train_module = _import_cached("fishtools.segment.train")
-    TrainConfigCls = train_module.TrainConfig
-    run_train = train_module.run_train
+    from fishtools.segment.train import TrainConfig as TrainConfigCls, run_train
 
     models_path = path / "models"
     if not models_path.exists():
@@ -124,8 +90,9 @@ def train(
 )
 @click.argument("outdir")
 def distill_command(path: Path, outdir: str) -> None:
-    distill_module = _import_cached("fishtools.segment.distill")
-    warnings = distill_module.run_distill(path, outdir)
+    from fishtools.segment.distill import run_distill
+
+    warnings = run_distill(path, outdir)
     for message in warnings:
         click.echo(message)
 
@@ -278,6 +245,8 @@ def run_command(
     help="ONNX opset version to target during export.",
 )
 def trt_build_cmd(model: Path, batch_size: int, backend: str, opset: int) -> None:
+    import torch
+
     if not torch.cuda.is_available():
         raise click.ClickException("CUDA GPU is required to build a TensorRT engine.")
 
@@ -1056,22 +1025,17 @@ def extract_single_command(
         click.echo(f"Completed processing {len(files)} files.")
 
 
-_OVERLAY_LAZY_COMMANDS = {
-    "intensity": SimpleNamespace(module="fishtools.segment.overlay_intensity", attr="overlay_intensity"),
-    "spots": SimpleNamespace(module="fishtools.segment.overlay_spots", attr="overlay"),
-}
-
-
-@app.group(cls=_LazyCommandGroup, lazy_commands=_OVERLAY_LAZY_COMMANDS)
+@app.group()
 def overlay() -> None:
     """Visualization helpers for segmentation outputs."""
 
 
-_LAZY_EXPORT_ATTRS = {
-    "TrainConfig": ("fishtools.segment.train", "TrainConfig"),
-    "build_trt_engine": ("fishtools.segment.train", "build_trt_engine"),
-    "run_train": ("fishtools.segment.train", "run_train"),
-}
+# Register overlay subcommands - imports happen here but only when overlay is accessed
+from fishtools.segment.overlay_intensity import overlay_intensity
+from fishtools.segment.overlay_spots import overlay as overlay_spots
+
+overlay.add_command(overlay_intensity, "intensity")
+overlay.add_command(overlay_spots, "spots")
 
 
 __all__ = [
@@ -1084,21 +1048,7 @@ __all__ = [
     "extract_command",
     "extract_single_command",
     "overlay",
-    "TrainConfig",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    if name == "cp_io":
-        module = _import_cached("fishtools.segment.cp_io")
-        globals()["cp_io"] = module
-        return module
-    if name in _LAZY_EXPORT_ATTRS:
-        module_name, attr = _LAZY_EXPORT_ATTRS[name]
-        value = getattr(_import_cached(module_name), attr)
-        globals()[name] = value
-        return value
-    raise AttributeError(name)
 
 
 def main() -> None:
