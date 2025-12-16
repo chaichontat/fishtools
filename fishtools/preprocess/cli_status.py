@@ -1,5 +1,3 @@
-"""CLI command to check preprocessing pipeline status for each ROI."""
-
 from __future__ import annotations
 
 import json
@@ -16,8 +14,6 @@ from fishtools.io.workspace import Workspace
 
 @dataclass
 class StageStatus:
-    """Status of a single pipeline stage."""
-
     complete: bool = False
     partial: bool = False
     count: int = 0
@@ -27,7 +23,6 @@ class StageStatus:
     stale: bool = False
 
     def to_cell(self, verbose: bool = False) -> str:
-        """Format for rich table display."""
         if self.count == 0:
             return "[dim]-[/dim]"
         symbol = "[green]✓[/green]" if self.complete else "[yellow]⧖[/yellow]"
@@ -41,8 +36,6 @@ class StageStatus:
 
 @dataclass
 class ROIStatus:
-    """Status of all pipeline stages for a single ROI."""
-
     roi: str
     raw: StageStatus = field(default_factory=StageStatus)
     deconv: StageStatus = field(default_factory=StageStatus)
@@ -54,92 +47,109 @@ class ROIStatus:
     spots_decode: StageStatus = field(default_factory=StageStatus)
     spots_stitch: StageStatus = field(default_factory=StageStatus)
     segment: StageStatus = field(default_factory=StageStatus)
+    postproc: StageStatus = field(default_factory=StageStatus)
+    overlay_spots: StageStatus = field(default_factory=StageStatus)
+    overlay_intensity: StageStatus = field(default_factory=StageStatus)
+    export: StageStatus = field(default_factory=StageStatus)
 
 
-def check_raw_tiles(ws: Workspace, roi: str) -> StageStatus:
-    """Check for raw tiles in workspace root."""
-    raw_dirs = []
-    for d in ws.path.iterdir():
+_TILE_TIF_RE = re.compile(r".+-\d{4}\.tif$")
+
+
+def _mtime(path: Path) -> float | None:
+    mtime = path.stat().st_mtime
+    return mtime if mtime > 0 else None
+
+
+def _last_modified(paths: list[Path]) -> float | None:
+    if not paths:
+        return None
+
+    max_mtime = 0.0
+    for p in paths:
+        max_mtime = max(max_mtime, p.stat().st_mtime)
+    return max_mtime if max_mtime > 0 else None
+
+
+def _find_roi_dirs(root: Path, roi: str, *, exclude_prefixes: tuple[str, ...]) -> list[Path]:
+    dirs: list[Path] = []
+    for d in root.iterdir():
         if not d.is_dir():
             continue
         if f"--{roi}" not in d.name:
             continue
-        # Skip processed directories
-        if d.name.startswith(("registered", "stitch", "shifts", "fids", "analysis")):
+        if d.name.startswith(exclude_prefixes):
             continue
-        raw_dirs.append(d)
+        dirs.append(d)
+    return dirs
 
+
+def _glob_tifs(dirs: list[Path], *, name_re: re.Pattern[str] | None = None) -> list[Path]:
+    tiles: list[Path] = []
+    for d in dirs:
+        for tile in d.glob("*.tif"):
+            if name_re is not None and not name_re.match(tile.name):
+                continue
+            tiles.append(tile)
+    return tiles
+
+
+def _stage_dict(
+    stage: StageStatus, *, include_count: bool = True, include_expected: bool = False
+) -> dict[str, bool | int | None]:
+    payload: dict[str, bool | int | None] = {"complete": stage.complete, "stale": stage.stale}
+    if include_count:
+        payload["count"] = stage.count
+    if include_expected:
+        payload["expected"] = stage.expected
+    return payload
+
+
+def check_raw_tiles(ws: Workspace, roi: str) -> StageStatus:
+    raw_dirs = _find_roi_dirs(ws.path, roi, exclude_prefixes=("registered", "stitch", "shifts", "fids", "analysis"))
     if not raw_dirs:
         return StageStatus()
 
-    total_tiles = 0
-    max_mtime = 0.0
-    for d in raw_dirs:
-        tiles = list(d.glob("*.tif"))
-        total_tiles += len(tiles)
-        for tile in tiles:
-            max_mtime = max(max_mtime, tile.stat().st_mtime)
-
+    tiles = _glob_tifs(raw_dirs)
     return StageStatus(
-        complete=total_tiles > 0,
+        complete=len(tiles) > 0,
         partial=False,
-        count=total_tiles,
+        count=len(tiles),
         expected=None,
         details=f"{len(raw_dirs)} rounds",
-        last_modified=max_mtime if max_mtime > 0 else None,
+        last_modified=_last_modified(tiles),
     )
 
 
 def check_deconv(ws: Workspace, roi: str) -> StageStatus:
-    """Check for deconvolved tiles in analysis/deconv."""
-    deconv_dirs = []
     if not ws.deconved.exists():
         return StageStatus()
 
-    for d in ws.deconved.iterdir():
-        if not d.is_dir():
-            continue
-        if f"--{roi}" not in d.name:
-            continue
-        # Only match {round}--{roi} pattern, not registered/stitch/etc
-        if d.name.startswith(("registered", "stitch", "shifts", "fids", "segment", "opt")):
-            continue
-        deconv_dirs.append(d)
-
+    deconv_dirs = _find_roi_dirs(
+        ws.deconved, roi, exclude_prefixes=("registered", "stitch", "shifts", "fids", "segment", "opt")
+    )
     if not deconv_dirs:
         return StageStatus()
 
-    total_tiles = 0
-    max_mtime = 0.0
-    for d in deconv_dirs:
-        # Match {round}-NNNN.tif pattern
-        tiles = [f for f in d.glob("*.tif") if re.match(r".+-\d{4}\.tif$", f.name)]
-        total_tiles += len(tiles)
-        for tile in tiles:
-            max_mtime = max(max_mtime, tile.stat().st_mtime)
-
+    tiles = _glob_tifs(deconv_dirs, name_re=_TILE_TIF_RE)
     return StageStatus(
-        complete=total_tiles > 0,
+        complete=len(tiles) > 0,
         partial=False,
-        count=total_tiles,
+        count=len(tiles),
         expected=None,
         details=f"{len(deconv_dirs)} rounds",
-        last_modified=max_mtime if max_mtime > 0 else None,
+        last_modified=_last_modified(tiles),
     )
 
 
 def check_registration(ws: Workspace, roi: str, codebook: str) -> StageStatus:
-    """Check for registered tiles."""
     reg_path = ws.registered(roi, codebook)
     if not reg_path.exists():
         return StageStatus()
 
     reg_files = list(reg_path.glob("reg-*.tif"))
     count = len(reg_files)
-
-    max_mtime = 0.0
-    for f in reg_files:
-        max_mtime = max(max_mtime, f.stat().st_mtime)
+    last_modified = _last_modified(reg_files)
 
     # Try to determine expected count from shifts or deconv
     expected = None
@@ -168,21 +178,19 @@ def check_registration(ws: Workspace, roi: str, codebook: str) -> StageStatus:
         partial=partial,
         count=count,
         expected=expected,
-        last_modified=max_mtime if max_mtime > 0 else None,
+        last_modified=last_modified,
     )
 
 
 def check_stitch_register(ws: Workspace, roi: str) -> StageStatus:
-    """Check for TileConfiguration.registered.txt."""
     tileconfig_path = ws.tileconfig_registered_txt(roi)
     if not tileconfig_path.exists():
         return StageStatus()
 
-    return StageStatus(complete=True, count=1, last_modified=tileconfig_path.stat().st_mtime)
+    return StageStatus(complete=True, count=1, last_modified=_mtime(tileconfig_path))
 
 
 def check_stitch_fuse(ws: Workspace, roi: str, codebook: str) -> StageStatus:
-    """Check for fused per-channel TIFFs."""
     stitch_path = ws.stitch(roi, codebook)
     if not stitch_path.exists():
         return StageStatus()
@@ -196,20 +204,15 @@ def check_stitch_fuse(ws: Workspace, roi: str, codebook: str) -> StageStatus:
     if count == 0:
         return StageStatus()
 
-    max_mtime = 0.0
-    for f in fused_files:
-        max_mtime = max(max_mtime, f.stat().st_mtime)
-
     return StageStatus(
         complete=count > 0,
         count=count,
         details=f"{len(channel_dirs)} ch" if channel_dirs else "",
-        last_modified=max_mtime if max_mtime > 0 else None,
+        last_modified=_last_modified(fused_files),
     )
 
 
 def check_stitch_combine(ws: Workspace, roi: str, codebook: str) -> StageStatus:
-    """Check for fused.zarr."""
     zarr_path = ws.stitch(roi, codebook) / "fused.zarr"
     if not zarr_path.exists():
         return StageStatus()
@@ -224,20 +227,18 @@ def check_stitch_combine(ws: Workspace, roi: str, codebook: str) -> StageStatus:
     if not is_valid:
         return StageStatus(partial=True, count=1, details="invalid zarr")
 
-    return StageStatus(complete=True, count=1, last_modified=zarr_path.stat().st_mtime)
+    return StageStatus(complete=True, count=1, last_modified=_mtime(zarr_path))
 
 
 def check_n4(ws: Workspace, roi: str, codebook: str) -> StageStatus:
-    """Check for N4-corrected zarr."""
     n4_path = ws.stitch(roi, codebook) / "fused_n4.zarr"
     if not n4_path.exists():
         return StageStatus()
 
-    return StageStatus(complete=True, count=1, last_modified=n4_path.stat().st_mtime)
+    return StageStatus(complete=True, count=1, last_modified=_mtime(n4_path))
 
 
 def check_spots_decode(ws: Workspace, roi: str, codebook: str) -> StageStatus:
-    """Check for decoded spot pickles."""
     decoded_path = ws.registered(roi, codebook) / f"decoded-{codebook}"
     if not decoded_path.exists():
         return StageStatus()
@@ -248,9 +249,7 @@ def check_spots_decode(ws: Workspace, roi: str, codebook: str) -> StageStatus:
     if count == 0:
         return StageStatus()
 
-    max_mtime = 0.0
-    for f in pkl_files:
-        max_mtime = max(max_mtime, f.stat().st_mtime)
+    last_modified = _last_modified(pkl_files)
 
     # Compare to registered tile count
     reg_status = check_registration(ws, roi, codebook)
@@ -264,51 +263,171 @@ def check_spots_decode(ws: Workspace, roi: str, codebook: str) -> StageStatus:
         partial=partial,
         count=count,
         expected=expected,
-        last_modified=max_mtime if max_mtime > 0 else None,
+        last_modified=last_modified,
     )
 
 
 def check_spots_stitch(ws: Workspace, roi: str, codebook: str) -> StageStatus:
-    """Check for final parquet output."""
     try:
         parquet_path = ws.spots_parquet(roi, codebook, must_exist=True)
-        return StageStatus(complete=True, count=1, last_modified=parquet_path.stat().st_mtime)
+        return StageStatus(complete=True, count=1, last_modified=_mtime(parquet_path))
     except FileNotFoundError:
         return StageStatus()
 
 
 def check_segmentation(ws: Workspace, roi: str, codebook: str) -> StageStatus:
-    """Check for segmentation zarr outputs."""
     stitch_path = ws.stitch(roi, codebook)
     if not stitch_path.exists():
         return StageStatus()
 
-    seg_files = list(stitch_path.glob("output_segmentation*.zarr"))
-    if not seg_files:
-        # Also check segment directory
+    seg_zarrs = [z for z in stitch_path.glob("output_segmentation*.zarr") if z.is_dir()]
+    if not seg_zarrs:
         seg_path = ws.segment(roi, codebook)
         if seg_path.exists():
-            seg_files = list(seg_path.glob("*.zarr"))
-
-    count = len(seg_files)
-    if count == 0:
+            seg_zarrs = [z for z in seg_path.glob("*.zarr") if z.is_dir()]
+    if not seg_zarrs:
         return StageStatus()
 
-    max_mtime = 0.0
-    for f in seg_files:
-        max_mtime = max(max_mtime, f.stat().st_mtime)
+    return StageStatus(complete=True, count=len(seg_zarrs), last_modified=_last_modified(seg_zarrs))
 
-    return StageStatus(complete=True, count=count, last_modified=max_mtime if max_mtime > 0 else None)
+
+def check_postproc(ws: Workspace, roi: str, codebook: str) -> StageStatus:
+    """Check for post-processed segmentation zarrs (output_segmentation*_postproc*.zarr)."""
+    stitch_path = ws.stitch(roi, codebook)
+    postproc_files: list[Path] = []
+
+    if stitch_path.exists():
+        postproc_files.extend(stitch_path.glob("output_segmentation*_postproc*.zarr"))
+
+    seg_path = ws.segment(roi, codebook)
+    if seg_path.exists():
+        postproc_files.extend(seg_path.glob("output_segmentation*_postproc*.zarr"))
+        postproc_files.extend(seg_path.glob("*_postproc*.zarr"))
+
+    # Filter to only directories (valid zarrs)
+    postproc_files = [f for f in postproc_files if f.is_dir()]
+
+    if not postproc_files:
+        return StageStatus()
+
+    return StageStatus(complete=True, count=len(postproc_files), last_modified=_last_modified(postproc_files))
+
+
+def _find_seg_zarrs(ws: Workspace, roi: str, codebook: str) -> list[Path]:
+    """Find all segmentation zarr directories for a given ROI and codebook."""
+    stitch_path = ws.stitch(roi, codebook)
+    seg_zarrs: list[Path] = []
+    if stitch_path.exists():
+        seg_zarrs.extend(stitch_path.glob("output_segmentation*.zarr"))
+
+    seg_path = ws.segment(roi, codebook)
+    if seg_path.exists():
+        seg_zarrs.extend(seg_path.glob("output_segmentation*.zarr"))
+        seg_zarrs.extend(seg_path.glob("*.zarr"))
+    return [z for z in seg_zarrs if z.is_dir()]
+
+
+def check_overlay_spots(ws: Workspace, roi: str, codebook: str) -> StageStatus:
+    """Check for overlay spots outputs (ident_*.parquet and polygons_*.parquet)."""
+    seg_zarrs = _find_seg_zarrs(ws, roi, codebook)
+    if not seg_zarrs:
+        return StageStatus()
+
+    ident_files: list[Path] = []
+    polygon_files: list[Path] = []
+
+    for seg_zarr in seg_zarrs:
+        chunks_dir = seg_zarr / f"chunks+{codebook}"
+        if chunks_dir.exists():
+            ident_files.extend(chunks_dir.glob("ident_*.parquet"))
+            polygon_files.extend(chunks_dir.glob("polygons_*.parquet"))
+
+    if not ident_files and not polygon_files:
+        return StageStatus()
+
+    # Complete if both types exist and counts match
+    complete = len(ident_files) > 0 and len(ident_files) == len(polygon_files)
+    partial = (len(ident_files) > 0 or len(polygon_files) > 0) and not complete
+
+    return StageStatus(
+        complete=complete,
+        partial=partial,
+        count=len(ident_files),
+        expected=len(polygon_files) if polygon_files else None,
+        last_modified=_last_modified(ident_files + polygon_files),
+    )
+
+
+def check_overlay_intensity(ws: Workspace, roi: str, codebook: str) -> StageStatus:
+    """Check for overlay intensity outputs (intensity_*/intensity-*.parquet)."""
+    seg_zarrs = _find_seg_zarrs(ws, roi, codebook)
+    stitch_path = ws.stitch(roi, codebook)
+
+    parquet_files: list[Path] = []
+    channel_dirs: set[str] = set()
+
+    def _collect_intensity_parquets(root: Path) -> None:
+        for intensity_dir in root.glob("intensity_*"):
+            if not intensity_dir.is_dir():
+                continue
+            channel_dirs.add(intensity_dir.name.removeprefix("intensity_"))
+            parquet_files.extend(intensity_dir.glob("intensity-*.parquet"))
+
+    for seg_zarr in seg_zarrs:
+        _collect_intensity_parquets(seg_zarr)
+
+    # Legacy layout: sibling directories under stitch folder
+    if stitch_path.exists():
+        _collect_intensity_parquets(stitch_path)
+
+    if not parquet_files:
+        return StageStatus()
+
+    details = f"{len(channel_dirs)} ch" if channel_dirs else ""
+    return StageStatus(
+        complete=True,
+        count=len(parquet_files),
+        details=details,
+        last_modified=_last_modified(parquet_files),
+    )
+
+
+def check_export(ws: Workspace, roi: str, codebook: str) -> StageStatus:
+    """Check for export outputs ({codebook}.h5ad or all+*.h5ad)."""
+    seg_zarrs = _find_seg_zarrs(ws, roi, codebook)
+
+    h5ad_files: list[Path] = []
+
+    # Check inside segmentation zarrs for single-ROI exports
+    for seg_zarr in seg_zarrs:
+        h5ad_files.extend(seg_zarr.glob(f"{codebook}.h5ad"))
+        h5ad_files.extend(seg_zarr.glob("*.h5ad"))
+
+    # Check workspace output directory for multi-ROI exports
+    if ws.output.exists():
+        h5ad_files.extend(ws.output.glob(f"all+{codebook}+*.h5ad"))
+        h5ad_files.extend(ws.output.glob(f"*+{codebook}+*.h5ad"))
+
+    # Deduplicate
+    h5ad_files = list(set(h5ad_files))
+
+    if not h5ad_files:
+        return StageStatus()
+
+    return StageStatus(
+        complete=True,
+        count=len(h5ad_files),
+        last_modified=_last_modified(h5ad_files),
+    )
 
 
 def mark_stale_stages(status: ROIStatus) -> None:
-    """Mark stages as stale if an upstream stage has a newer mtime.
-
-    Dependency graph:
-    - raw → deconv → register → stitch_register → stitch_fuse → stitch_combine → n4 → segment
-    - register → spots_decode → spots_stitch
-    """
-    # (stage, [upstream dependencies])
+    # Dependency graph:
+    # raw → deconv → register → stitch_register → stitch_fuse → stitch_combine → n4 → segment → postproc
+    # register → spots_decode → spots_stitch
+    # postproc + spots_stitch → overlay_spots
+    # postproc → overlay_intensity
+    # overlay_spots + overlay_intensity → export
     dependencies: list[tuple[StageStatus, list[StageStatus]]] = [
         (status.deconv, [status.raw]),
         (status.register, [status.deconv]),
@@ -317,8 +436,12 @@ def mark_stale_stages(status: ROIStatus) -> None:
         (status.stitch_combine, [status.stitch_fuse]),
         (status.n4, [status.stitch_combine]),
         (status.segment, [status.n4]),
+        (status.postproc, [status.segment]),
         (status.spots_decode, [status.register]),
         (status.spots_stitch, [status.register, status.spots_decode]),
+        (status.overlay_spots, [status.postproc, status.spots_stitch]),
+        (status.overlay_intensity, [status.postproc]),
+        (status.export, [status.overlay_spots, status.overlay_intensity]),
     ]
 
     for stage, upstreams in dependencies:
@@ -333,7 +456,6 @@ def mark_stale_stages(status: ROIStatus) -> None:
 
 
 def get_roi_status(ws: Workspace, roi: str, codebook: str) -> ROIStatus:
-    """Get status of all pipeline stages for a single ROI+codebook."""
     status = ROIStatus(
         roi=roi,
         raw=check_raw_tiles(ws, roi),
@@ -346,13 +468,16 @@ def get_roi_status(ws: Workspace, roi: str, codebook: str) -> ROIStatus:
         spots_decode=check_spots_decode(ws, roi, codebook),
         spots_stitch=check_spots_stitch(ws, roi, codebook),
         segment=check_segmentation(ws, roi, codebook),
+        postproc=check_postproc(ws, roi, codebook),
+        overlay_spots=check_overlay_spots(ws, roi, codebook),
+        overlay_intensity=check_overlay_intensity(ws, roi, codebook),
+        export=check_export(ws, roi, codebook),
     )
     mark_stale_stages(status)
     return status
 
 
 def is_spots_codebook(ws: Workspace, codebook: str, rois: list[str]) -> bool:
-    """Check if codebook is spots-type (has decoded-* directory) vs intensity-type."""
     for roi in rois:
         decoded_path = ws.registered(roi, codebook) / f"decoded-{codebook}"
         if decoded_path.exists():
@@ -361,7 +486,6 @@ def is_spots_codebook(ws: Workspace, codebook: str, rois: list[str]) -> bool:
 
 
 def render_status_table(ws: Workspace, codebook: str, rois: list[str], *, verbose: bool = False) -> Table:
-    """Create rich Table for a codebook's status across ROIs."""
     is_spots = is_spots_codebook(ws, codebook, rois)
 
     table = Table(
@@ -383,6 +507,10 @@ def render_status_table(ws: Workspace, codebook: str, rois: list[str], *, verbos
         table.add_column("Zarr", justify="center")
         table.add_column("N4", justify="center")
         table.add_column("Segment", justify="center")
+        table.add_column("Postproc", justify="center")
+        table.add_column("OvlSpots", justify="center")
+        table.add_column("OvlInt", justify="center")
+        table.add_column("Export", justify="center")
 
     for roi in rois:
         status = get_roi_status(ws, roi, codebook)
@@ -400,13 +528,16 @@ def render_status_table(ws: Workspace, codebook: str, rois: list[str], *, verbos
             row.append(status.stitch_combine.to_cell(verbose))
             row.append(status.n4.to_cell(verbose))
             row.append(status.segment.to_cell(verbose))
+            row.append(status.postproc.to_cell(verbose))
+            row.append(status.overlay_spots.to_cell(verbose))
+            row.append(status.overlay_intensity.to_cell(verbose))
+            row.append(status.export.to_cell(verbose))
         table.add_row(*row)
 
     return table
 
 
 def status_to_dict(ws: Workspace, codebook: str, rois: list[str]) -> dict:
-    """Convert status to JSON-serializable dictionary."""
     result = {
         "workspace": str(ws.path),
         "codebook": codebook,
@@ -416,26 +547,20 @@ def status_to_dict(ws: Workspace, codebook: str, rois: list[str]) -> dict:
     for roi in rois:
         status = get_roi_status(ws, roi, codebook)
         result["rois"][roi] = {
-            "raw": {"count": status.raw.count, "complete": status.raw.complete, "stale": status.raw.stale},
-            "deconv": {"count": status.deconv.count, "complete": status.deconv.complete, "stale": status.deconv.stale},
-            "register": {
-                "count": status.register.count,
-                "expected": status.register.expected,
-                "complete": status.register.complete,
-                "stale": status.register.stale,
-            },
-            "stitch_register": {"complete": status.stitch_register.complete, "stale": status.stitch_register.stale},
-            "stitch_fuse": {"count": status.stitch_fuse.count, "complete": status.stitch_fuse.complete, "stale": status.stitch_fuse.stale},
-            "stitch_combine": {"complete": status.stitch_combine.complete, "stale": status.stitch_combine.stale},
-            "n4": {"complete": status.n4.complete, "stale": status.n4.stale},
-            "spots_decode": {
-                "count": status.spots_decode.count,
-                "expected": status.spots_decode.expected,
-                "complete": status.spots_decode.complete,
-                "stale": status.spots_decode.stale,
-            },
-            "spots_stitch": {"complete": status.spots_stitch.complete, "stale": status.spots_stitch.stale},
-            "segment": {"count": status.segment.count, "complete": status.segment.complete, "stale": status.segment.stale},
+            "raw": _stage_dict(status.raw),
+            "deconv": _stage_dict(status.deconv),
+            "register": _stage_dict(status.register, include_expected=True),
+            "stitch_register": _stage_dict(status.stitch_register, include_count=False),
+            "stitch_fuse": _stage_dict(status.stitch_fuse),
+            "stitch_combine": _stage_dict(status.stitch_combine, include_count=False),
+            "n4": _stage_dict(status.n4, include_count=False),
+            "spots_decode": _stage_dict(status.spots_decode, include_expected=True),
+            "spots_stitch": _stage_dict(status.spots_stitch, include_count=False),
+            "segment": _stage_dict(status.segment),
+            "postproc": _stage_dict(status.postproc),
+            "overlay_spots": _stage_dict(status.overlay_spots),
+            "overlay_intensity": _stage_dict(status.overlay_intensity),
+            "export": _stage_dict(status.export),
         }
 
     return result
@@ -484,6 +609,10 @@ def status(path: Path, codebook: str | None, roi_filter: str | None, verbose: bo
     - Spots: Decoded spot pickles
     - Parquet: Final spots parquet
     - Segment: Segmentation zarr
+    - Postproc: Post-processed segmentation zarr
+    - OvlSpots: Overlay spots (ident/polygons parquets)
+    - OvlInt: Overlay intensity (intensity parquets)
+    - Export: Final h5ad export
 
     Symbols: ✓ Complete | ⧖ Partial | - Not started
     """
@@ -522,7 +651,7 @@ def status(path: Path, codebook: str | None, roi_filter: str | None, verbose: bo
             if cb == "(none)":
                 continue
             all_results.append(status_to_dict(ws, cb, rois))
-        console.print(json.dumps(all_results, indent=2))
+        click.echo(json.dumps(all_results, indent=2))
         return
 
     # Rich table output
