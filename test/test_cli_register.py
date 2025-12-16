@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pytest
 from click.testing import CliRunner
+from tifffile import imwrite
 
 from fishtools.preprocess.cli_register import (
     DATA,
@@ -14,12 +15,14 @@ from fishtools.preprocess.cli_register import (
     RegisterConfig,
     _copy_codebook_to_workspace,
     _debug_fid_paths,
+    _load_shifts_from_codebook,
     _run,
     _save_debug_overlay,
 )
 from fishtools.preprocess.cli_register import (
     register as register_cli,
 )
+from fishtools.preprocess.fiducial import Shifts
 
 
 def _make_codebook(tmp_path: Path) -> Path:
@@ -459,6 +462,99 @@ def test_run_internal_returns_early_when_reg_file_exists(tmp_path: Path) -> None
     assert reg_file.read_text() == "existing"
 
 
+def test_run_uses_previous_run_fids_when_reference_round_missing(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+    roi = "roiA"
+    reference = "2_10_18"
+    target_round = "1_9_17"
+    idx = 7
+
+    # Only the target round exists; the reference round directory is missing.
+    round_dir = deconv / f"{target_round}--{roi}"
+    round_dir.mkdir(parents=True)
+    (round_dir / f"{target_round}-{idx:04d}.tif").write_text("")
+
+    # Previous run fiducials provide the reference fid plane.
+    prev_fids_dir = deconv / f"registered--{roi}+cb" / "_fids"
+    prev_fids_dir.mkdir(parents=True)
+    ref_fid = np.arange(25, dtype=np.float32).reshape(5, 5)
+    other_fid = np.zeros((5, 5), dtype=np.float32)
+    imwrite(
+        prev_fids_dir / f"_fids-{idx:04d}.tif",
+        np.stack([ref_fid, other_fid]),
+        metadata={"axes": "CYX", "key": [reference, target_round]},
+    )
+
+    class _StubImage:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.fid_raw = np.ones((5, 5), dtype=np.float32) * 7
+            self.fid = np.ones((5, 5), dtype=np.float32) * 3
+
+    def fake_from_file(path: Path, *_: Any, **__: Any) -> _StubImage:
+        name, _idx = Path(path).stem.split("-")
+        return _StubImage(name=name)
+
+    def fake_run_fiducial(
+        _path: Path,
+        fids: dict[str, np.ndarray],
+        _codebook_name: str,
+        _config: Any,
+        *,
+        reference: str,
+        fids_raw: dict[str, np.ndarray],
+        **__: Any,
+    ) -> dict[str, np.ndarray]:
+        assert reference in fids
+        np.testing.assert_array_equal(fids[reference], ref_fid)
+        np.testing.assert_array_equal(fids_raw[reference], ref_fid)
+        raise RuntimeError("stop-after-fid-load")
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Image.from_file", fake_from_file)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.run_fiducial", fake_run_fiducial)
+
+    cb = tmp_path / "cb.json"
+    cb.write_text('{"g":[1]}')
+
+    cfg = Config(
+        dataPath=str(DATA),
+        exclude=None,
+        registration=RegisterConfig(
+            chromatic_shifts={},
+            fiducial=Fiducial(
+                use_fft=True,
+                fwhm=4.0,
+                threshold=6.0,
+                priors={},
+                overrides={},
+                n_fids=2,
+            ),
+            reference=reference,
+            downsample=1,
+            crop=40,
+            slices=slice(None),
+            reduce_bit_depth=0,
+            discards=None,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="stop-after-fid-load"):
+        _run(
+            path=deconv,
+            roi=roi,
+            idx=idx,
+            codebook=cb,
+            reference=reference,
+            config=cfg,
+            debug=False,
+            overwrite=True,
+            no_priors=False,
+        )
+
+
 def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: Any) -> None:
     _root, base = _make_workspace(tmp_path)
     (base / "2_10_18--roiA").mkdir(parents=True)
@@ -739,3 +835,265 @@ def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
     assert calls[0][:3] == ["preprocess", "register", "run"]
     assert calls[0][4] == "1"
     assert "--overwrite" in calls[0]
+
+
+def _make_shift_json(shifts: dict[str, tuple[float, float]]) -> str:
+    """Create shift JSON in the format used by Shifts TypeAdapter."""
+    data = {
+        name: {"shifts": list(s), "corr": 0.99, "residual": 0.1}
+        for name, s in shifts.items()
+    }
+    return Shifts.dump_json(Shifts.validate_python(data)).decode()
+
+
+def test_load_shifts_from_codebook_reads_existing_shifts(tmp_path: Path) -> None:
+    """Test that _load_shifts_from_codebook loads shifts from source codebook."""
+    from fishtools.io.workspace import Workspace
+
+    root, deconv = _make_workspace(tmp_path)
+    ws = Workspace(deconv)
+    roi = "roiA"
+    source_cb = "source_cb"
+    idx = 7
+
+    # Create shift file for source codebook
+    shift_dir = deconv / f"shifts--{roi}+{source_cb}"
+    shift_dir.mkdir(parents=True)
+    expected_shifts = {"2_10_18": (1.5, -2.3), "1_9_17": (0.5, 0.7)}
+    (shift_dir / f"shifts-{idx:04d}.json").write_text(_make_shift_json(expected_shifts))
+
+    result = _load_shifts_from_codebook(ws, roi=roi, source_codebook=source_cb, idx=idx)
+
+    assert set(result.keys()) == {"2_10_18", "1_9_17"}
+    np.testing.assert_array_almost_equal(result["2_10_18"], [1.5, -2.3])
+    np.testing.assert_array_almost_equal(result["1_9_17"], [0.5, 0.7])
+
+
+def test_load_shifts_from_codebook_raises_when_missing(tmp_path: Path) -> None:
+    """Test that _load_shifts_from_codebook raises FileNotFoundError when shift file missing."""
+    from fishtools.io.workspace import Workspace
+
+    _root, deconv = _make_workspace(tmp_path)
+    ws = Workspace(deconv)
+
+    with pytest.raises(FileNotFoundError, match="Shift file not found"):
+        _load_shifts_from_codebook(ws, roi="roiA", source_codebook="nonexistent", idx=1)
+
+
+def test_cli_register_run_use_shifts_from_skips_fiducial_registration(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Test that --use-shifts-from loads shifts and skips fiducial registration."""
+    _root, deconv = _make_workspace(tmp_path)
+    cb = _make_codebook(tmp_path)
+
+    # Create source shifts
+    source_cb = "source_cb"
+    shift_dir = deconv / f"shifts--roiA+{source_cb}"
+    shift_dir.mkdir(parents=True)
+    (shift_dir / "shifts-0042.json").write_text(
+        _make_shift_json({"2_10_18": (1.0, 2.0), "1_9_17": (0.5, 0.5)})
+    )
+
+    called: dict[str, Any] = {}
+    fiducial_called = False
+
+    def fake__run(
+        path: Path,
+        roi: str,
+        idx: int,
+        *,
+        codebook: str | Path,
+        reference: str,
+        config: Any,
+        debug: bool,
+        overwrite: bool,
+        no_priors: bool,
+        repaired_rounds: set[str] | None = None,
+        max_iters: int = 5,
+        use_shifts_from: str | None = None,
+    ) -> None:
+        called.update({
+            "path": path,
+            "roi": roi,
+            "idx": idx,
+            "use_shifts_from": use_shifts_from,
+        })
+
+    def fake_run_fiducial(*args: Any, **kwargs: Any) -> dict[str, np.ndarray]:
+        nonlocal fiducial_called
+        fiducial_called = True
+        return {}
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.run_fiducial", fake_run_fiducial)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(deconv),
+            "42",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--reference",
+            "2_10_18",
+            f"--use-shifts-from={source_cb}",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called["use_shifts_from"] == source_cb
+
+
+def test_cli_register_batch_forwards_use_shifts_from(tmp_path: Path, monkeypatch: Any) -> None:
+    """Test that batch command forwards --use-shifts-from to child CLI calls."""
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True) -> Any:
+        calls.append(argv)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--threads",
+            "1",
+            "--overwrite",
+            "--use-shifts-from=other_codebook",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert "--use-shifts-from=other_codebook" in calls[0]
+
+
+def test_run_internal_uses_shifts_from_source_codebook(tmp_path: Path, monkeypatch: Any) -> None:
+    """Test that _run loads shifts from source codebook and skips fiducial registration."""
+    _root, deconv = _make_workspace(tmp_path)
+    roi = "roiA"
+    target_round = "1_9_17"
+    reference = "2_10_18"
+    idx = 7
+    source_cb = "source_cb"
+
+    # Create target round directory with image
+    round_dir = deconv / f"{target_round}--{roi}"
+    round_dir.mkdir(parents=True)
+    (round_dir / f"{target_round}-{idx:04d}.tif").write_text("")
+
+    # Create source shifts
+    shift_dir = deconv / f"shifts--{roi}+{source_cb}"
+    shift_dir.mkdir(parents=True)
+    expected_shifts = {reference: (0.0, 0.0), target_round: (3.5, -1.2)}
+    (shift_dir / f"shifts-{idx:04d}.json").write_text(_make_shift_json(expected_shifts))
+
+    # Track whether run_fiducial is called (it shouldn't be)
+    fiducial_called = False
+
+    def fake_run_fiducial(*args: Any, **kwargs: Any) -> dict[str, np.ndarray]:
+        nonlocal fiducial_called
+        fiducial_called = True
+        return {}
+
+    # Stub Image.from_file to avoid actual file I/O
+    class _StubImage:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.fid_raw = np.ones((5, 5), dtype=np.float32)
+            self.fid = np.ones((5, 5), dtype=np.float32)
+            self.nofid = np.ones((1, 1, 5, 5), dtype=np.float32)
+            self.bits = [name.split("_")[0]]
+            self.powers = {"560": 1.0}
+            self.metadata = {"prenormalized": True}
+            self.global_deconv_scaling = None
+            self.basic = lambda: None
+
+    def fake_from_file(path: Path, *_: Any, **__: Any) -> _StubImage:
+        name, _idx = Path(path).stem.split("-")
+        return _StubImage(name=name)
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Image.from_file", fake_from_file)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.run_fiducial", fake_run_fiducial)
+
+    cb = tmp_path / "cb.json"
+    cb.write_text('{"g":["1"]}')
+
+    cfg = Config(
+        dataPath=str(DATA),
+        exclude=None,
+        registration=RegisterConfig(
+            chromatic_shifts={},
+            fiducial=Fiducial(
+                use_fft=True,
+                fwhm=4.0,
+                threshold=6.0,
+                priors={},
+                overrides={},
+                n_fids=2,
+            ),
+            reference=reference,
+            downsample=1,
+            crop=40,
+            slices=slice(None),
+            reduce_bit_depth=0,
+            discards=None,
+        ),
+    )
+
+    # The _run should fail later (no actual images), but fiducial should be skipped
+    with pytest.raises(Exception):  # Will fail when trying to process images
+        _run(
+            path=deconv,
+            roi=roi,
+            idx=idx,
+            codebook=cb,
+            reference=reference,
+            config=cfg,
+            debug=False,
+            overwrite=True,
+            no_priors=False,
+            use_shifts_from=source_cb,
+        )
+
+    # The key assertion: run_fiducial should NOT have been called
+    assert fiducial_called is False

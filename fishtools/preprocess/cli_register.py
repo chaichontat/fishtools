@@ -1,6 +1,7 @@
 # %%
 import csv
 import json
+import logging
 import pickle
 import shutil
 from collections import defaultdict
@@ -55,20 +56,30 @@ DATA = resolve_data_path()
 
 # %%
 
-As = {}
-ats = {}
-for λ in ["650", "750"]:
-    a_ = np.loadtxt(DATA / f"560to{λ}.txt")
-    A = np.zeros((3, 3), dtype=np.float64)
-    A[:2, :2] = a_[:4].reshape(2, 2)
-    t = np.zeros(3, dtype=np.float64)
-    t[:2] = a_[-2:]
 
-    A[2] = [0, 0, 1]
-    A[:, 2] = [0, 0, 1]
-    t[2] = 0
-    As[λ] = A
-    ats[λ] = t
+def _silence_matplotlib_debug_logs() -> None:
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
+
+
+def _load_chromatic_affines() -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    As: dict[str, np.ndarray] = {}
+    ats: dict[str, np.ndarray] = {}
+
+    for λ in ["650", "750"]:
+        a_ = np.loadtxt(DATA / f"560to{λ}.txt")
+        A = np.zeros((3, 3), dtype=np.float64)
+        A[:2, :2] = a_[:4].reshape(2, 2)
+        t = np.zeros(3, dtype=np.float64)
+        t[:2] = a_[-2:]
+
+        A[2] = [0, 0, 1]
+        A[:, 2] = [0, 0, 1]
+        t[2] = 0
+        As[λ] = A
+        ats[λ] = t
+
+    return As, ats
 
 
 def spillover_correction(spillee: np.ndarray, spiller: np.ndarray, corr: float):
@@ -772,6 +783,7 @@ def _run(
     no_priors: bool = False,
     repaired_rounds: set[str] | None = None,
     max_iters: int = 5,
+    use_shifts_from: str | None = None,
 ):
     logger.info("Starting")
     codebook_name = Path(codebook).stem
@@ -804,7 +816,12 @@ def _run(
     #     )
     #     del fids
     # else:
-    shifts = {}
+    shifts: dict[str, np.ndarray] = {}
+
+    # Load shifts from another codebook if requested
+    if use_shifts_from is not None:
+        logger.info(f"Loading shifts from codebook '{use_shifts_from}', skipping fiducial registration.")
+        shifts = _load_shifts_from_codebook(ws, roi=roi, source_codebook=use_shifts_from, idx=idx)
 
     cb = json.loads(Path(codebook).read_text())
     codebook_bits = {str(bit) for bit in chain.from_iterable(cb.values())}
@@ -879,6 +896,19 @@ def _run(
             for name, img in imgs.items()
         }
         fid_raw_images = {name: img.fid_raw.astype(np.float32) for name, img in imgs.items()}
+        if reference not in fid_raw_images:
+            logger.info(f"Loading reference fiducial {reference} from previous run.")
+            raw_ref = _load_reference_fid_from_previous_run(
+                ws,
+                roi=roi,
+                reference=reference,
+                idx=idx,
+                prefer_codebook=codebook_name,
+            )
+            fid_raw_images[reference] = raw_ref
+            fid_images[reference] = raw_ref if use_raw else Image.loG_fids(raw_ref)
+
+        # if not use_fft and not use_itk:
         shifts = run_fiducial(
             path,
             fid_images,
@@ -897,7 +927,7 @@ def _run(
         del _img.fid, _img.fid_raw
 
     # Remove reference if not in codebook since we're done with fiducials.
-    if not (set(reference.split("_")) & codebook_bits):
+    if reference in imgs and not (set(reference.split("_")) & codebook_bits):
         del imgs[reference]
 
     channels: dict[str, str] = {}
@@ -934,6 +964,7 @@ def _run(
     transformed: dict[str, np.ndarray] = {}
     ref = None
 
+    As, ats = _load_chromatic_affines()
     affine = Affine(As=As, ats=ats)
     bits_in_output = sorted(codebook_bits & set(bits))
     for i, bit in enumerate(bits_in_output):
@@ -1094,6 +1125,12 @@ def register(): ...
     show_default=True,
     help="Maximum iterations for spot-based drift refinement.",
 )
+@click.option(
+    "--use-shifts-from",
+    type=str,
+    default=None,
+    help="Codebook name to copy shifts from, skipping fiducial registration entirely.",
+)
 def run(
     path: Path,
     idx: int,
@@ -1113,6 +1150,7 @@ def run(
     ignore_large_shifts: bool = False,
     repaired: str | None = None,
     max_iters: int = 5,
+    use_shifts_from: str | None = None,
 ):
     """Preprocess image sets before spot calling.
 
@@ -1144,6 +1182,7 @@ def run(
             debug=debug,
             extra={"roi": roi, "codebook": codebook_name},
         )
+        _silence_matplotlib_debug_logs()
 
         # Parse repaired rounds
         repaired_rounds = _parse_repaired_option(repaired)
@@ -1174,6 +1213,7 @@ def run(
             overwrite=overwrite,
             repaired_rounds=repaired_rounds,
             max_iters=max_iters,
+            use_shifts_from=use_shifts_from,
         )
 
 
@@ -1227,6 +1267,12 @@ def run(
     show_default=True,
     help="Maximum iterations for spot-based drift refinement.",
 )
+@click.option(
+    "--use-shifts-from",
+    type=str,
+    default=None,
+    help="Codebook name to copy shifts from, skipping fiducial registration entirely.",
+)
 def batch(
     path: Path,
     roi: str,
@@ -1244,6 +1290,7 @@ def batch(
     allow_large_drifts: bool = False,
     repaired: str | None = None,
     max_iters: int = 5,
+    use_shifts_from: str | None = None,
 ):
     # idxs = None
     # use_custom_idx = idxs is not None
@@ -1256,6 +1303,7 @@ def batch(
         debug=debug,
         extra={"codebook": codebook_name},
     )
+    _silence_matplotlib_debug_logs()
     ws = Workspace(path.parent.parent)
     logger.info(f"Found {ws.rois}")
 
@@ -1308,6 +1356,7 @@ def batch(
                         *(["--use-itk"] if use_itk else []),
                         *( [f"--use-brightest={use_brightest}"] if use_brightest > 0 else [] ),
                         *( ["--allow-large-drifts"] if allow_large_drifts else [] ),
+                        *( [f"--use-shifts-from={use_shifts_from}"] if use_shifts_from else [] ),
                     ],
                     check=True,
                 )
@@ -1400,6 +1449,97 @@ def batch(
 register.add_command(batch)
 
 
+def _load_shifts_from_codebook(
+    ws: Workspace,
+    *,
+    roi: str,
+    source_codebook: str,
+    idx: int,
+) -> dict[str, np.ndarray]:
+    """Load shifts from another codebook's shift files.
+
+    Args:
+        ws: Workspace instance.
+        roi: ROI name.
+        source_codebook: Codebook name to load shifts from.
+        idx: Tile index.
+
+    Returns:
+        Dictionary mapping round names to shift vectors [dx, dy].
+
+    Raises:
+        FileNotFoundError: If the shift file doesn't exist for the source codebook.
+    """
+    shift_path = ws.shift_json(roi, source_codebook, idx)
+    if not shift_path.exists():
+        raise FileNotFoundError(
+            f"Shift file not found for codebook '{source_codebook}' at {shift_path}. "
+            f"Run registration with that codebook first."
+        )
+
+    shift_data = Shifts.validate_json(shift_path.read_text())
+    return {name: np.array(s.shifts) for name, s in shift_data.items()}
+
+
+def _load_reference_fid_from_previous_run(
+    ws: Workspace,
+    *,
+    roi: str,
+    reference: str,
+    idx: int,
+    prefer_codebook: str | None = None,
+) -> np.ndarray:
+    codebooks = ws.registered_codebooks(rois=[roi])
+    ordered: list[str] = []
+    if prefer_codebook is not None:
+        ordered.append(prefer_codebook)
+    ordered.extend([cb for cb in codebooks if cb != prefer_codebook])
+
+    for codebook in ordered:
+        fids_path = ws.registered_fids(roi, codebook) / f"_fids-{idx:04d}.tif"
+        if not fids_path.exists():
+            continue
+
+        with TiffFile(fids_path) as tif:
+            stack = tif.asarray()
+            metadata: dict[str, Any] | None = None
+            try:
+                metadata = tif.shaped_metadata[0]  # type: ignore[index]
+            except (AttributeError, IndexError, TypeError):
+                metadata = tif.imagej_metadata
+
+            keys: list[str] | None = None
+            if isinstance(metadata, dict):
+                raw_keys = metadata.get("key")
+                if isinstance(raw_keys, list) and all(isinstance(k, str) for k in raw_keys):
+                    keys = raw_keys
+                elif isinstance(raw_keys, str):
+                    try:
+                        decoded = json.loads(raw_keys)
+                    except json.JSONDecodeError:
+                        decoded = None
+                    if isinstance(decoded, list) and all(isinstance(k, str) for k in decoded):
+                        keys = decoded
+
+            if keys is None:
+                continue
+
+            try:
+                plane_idx = keys.index(reference)
+            except ValueError:
+                continue
+
+            plane = np.asarray(stack[plane_idx]).astype(np.float32)
+            logger.info(f"Loaded reference fiducial from previous run: {fids_path}")
+            return plane
+
+    searched = ", ".join(ordered) if ordered else "none"
+    raise FileNotFoundError(
+        f"Reference round directory is missing and no previous-run fiducial was found for "
+        f"reference={reference} idx={idx:04d} roi={roi}. Searched codebooks: {searched}."
+    )
+
+
 @register.command("fix-shifts")
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path, resolve_path=True))
 @click.option("--roi", "-o", type=str, required=True, help="ROI to process")
@@ -1476,6 +1616,7 @@ def fix_shifts(
         debug=debug,
         extra={"roi": roi, "reference": reference},
     )
+    _silence_matplotlib_debug_logs()
 
     ws = Workspace(path)
     rounds_to_fix = [r.strip() for r in rounds.split(",")]
@@ -1549,6 +1690,7 @@ def fix_shifts(
         fids: dict[str, np.ndarray] = {}
         use_raw = fiducial_cfg.use_fft or fiducial_cfg.use_itk
 
+        # Load reference fiducial
         # Load reference fiducial
         ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
         ref_img = Image.from_file(ref_path, n_fids=n_fids)
