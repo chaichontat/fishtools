@@ -106,6 +106,7 @@ import zarr
 from loguru import logger
 from numpy.typing import NDArray
 
+from fishtools.io.workspace import Workspace
 from fishtools.segment.postproc3d import (  # noqa: F401
     absorb_encircled_rois,
     compute_metadata_and_adjacency,
@@ -623,10 +624,30 @@ def distributed_postproc(
 # CLI
 app = typer.Typer(pretty_exceptions_show_locals=False)
 
+_DEFAULT_SEGMENTATION_NAME = "output_segmentation-sam.zarr"
+
+
+def _iter_segmentation_paths_for_roi(ws: Workspace, roi: str) -> list[Path]:
+    stitch_glob = f"stitch--{roi}+*"
+    stitch_dirs = sorted(ws.deconved.glob(stitch_glob))
+    seg_paths: list[Path] = []
+    for stitch_dir in stitch_dirs:
+        seg_path = stitch_dir / _DEFAULT_SEGMENTATION_NAME
+        if seg_path.exists():
+            seg_paths.append(seg_path)
+    return seg_paths
+
 
 @app.command()
 def main(
-    input_path: Path = typer.Argument(..., help="Path to input segmentation zarr"),
+    workspace_or_input_zarr: Path = typer.Argument(
+        ...,
+        help=(
+            "Workspace root (preferred) or a direct path to a segmentation zarr "
+            f"(legacy mode; e.g. {_DEFAULT_SEGMENTATION_NAME})."
+        ),
+    ),
+    roi: str = typer.Argument("*", help="ROI name (default: '*')."),
     output_path: Path = typer.Option(None, help="Output path (default: input_postproc.zarr)"),
     blocksize: int = typer.Option(1024, help="XY block size for tiled processing"),
     sigma: str = typer.Option("1,2,2", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
@@ -638,34 +659,61 @@ def main(
     """
     Post-process 3D segmentation masks with Gaussian smoothing and small cell donation.
     """
-    input_zarr = zarr.open(input_path, mode="r")
+    if workspace_or_input_zarr.suffix == ".zarr":
+        input_paths = [workspace_or_input_zarr]
+    else:
+        ws = Workspace(workspace_or_input_zarr)
+        if roi in {"*", "all"}:
+            rois = ws.rois
+        else:
+            rois = ws.resolve_rois([roi])
 
-    if output_path is None:  # type: ignore
-        # Format sigma for filename: replace commas with dashes
-        sigma_str = sigma.replace(",", "-").replace(" ", "")
-        output_path = input_path.parent / f"{input_path.stem}_postproc_s{sigma_str}_v{v_min}.zarr"
+        input_paths = []
+        for resolved_roi in rois:
+            seg_paths = _iter_segmentation_paths_for_roi(ws, resolved_roi)
+            if not seg_paths:
+                logger.info(f"[{resolved_roi}] No {_DEFAULT_SEGMENTATION_NAME} found; skipping.")
+                continue
+            input_paths.extend(seg_paths)
 
-    if output_path.exists() and not overwrite:
-        logger.info(f"Output already exists: {output_path}. Skipping (use --overwrite to force).")
+    if not input_paths:
+        logger.info("No segmentation zarrs found to post-process.")
         return
 
-    cluster_kwargs = {
-        "workers_per_gpu": workers_per_gpu,
-        "threads_per_worker": 1,
-    }
+    if output_path is not None and len(input_paths) > 1:
+        raise typer.BadParameter("--output-path can only be used when processing a single input zarr.")
 
-    sigma_val = _parse_sigma_option(sigma)
+    for input_path in input_paths:
+        input_zarr = zarr.open(input_path, mode="r")
 
-    distributed_postproc(
-        input_zarr=input_zarr,
-        write_path=output_path,
-        blocksize=(input_zarr.shape[0], blocksize, blocksize),
-        margin=margin,
-        sigma=sigma_val,
-        V_min=v_min,
-        input_path=input_path,
-        cluster_kwargs=cluster_kwargs,
-    )
+        resolved_output_path = output_path
+        if resolved_output_path is None:  # type: ignore
+            sigma_str = sigma.replace(",", "-").replace(" ", "")
+            resolved_output_path = input_path.parent / f"{input_path.stem}_postproc_s{sigma_str}_v{v_min}.zarr"
+
+        if resolved_output_path.exists() and not overwrite:
+            logger.info(
+                f"Output already exists: {resolved_output_path}. Skipping (use --overwrite to force)."
+            )
+            continue
+
+        cluster_kwargs = {
+            "workers_per_gpu": workers_per_gpu,
+            "threads_per_worker": 1,
+        }
+
+        sigma_val = _parse_sigma_option(sigma)
+
+        distributed_postproc(
+            input_zarr=input_zarr,
+            write_path=resolved_output_path,
+            blocksize=(input_zarr.shape[0], blocksize, blocksize),
+            margin=margin,
+            sigma=sigma_val,
+            V_min=v_min,
+            input_path=input_path,
+            cluster_kwargs=cluster_kwargs,
+        )
 
 
 if __name__ == "__main__":
