@@ -22,9 +22,9 @@ import numpy as np
 import tifffile
 import typer
 import zarr
-from cellpose import transforms as cp_transforms
-from distributed import WorkerPlugin
 from numpy.typing import NDArray
+
+from fishtools.io.workspace import Workspace
 from fishtools.preprocess.config import NumpyEncoder
 from fishtools.preprocess.segmentation import unsharp_all
 from fishtools.segment.normalize import sample_percentile
@@ -81,6 +81,34 @@ def _get_worker_logger() -> logging.Logger:
         worker_logger.setLevel(logging.INFO)
         worker_logger.propagate = False  # Don't propagate to root (which may have Rich)
     return worker_logger
+
+
+def _retire_worker_after_error(*, reason: str) -> None:
+    """Best-effort retire the current Dask worker after a task failure.
+
+    This prevents a worker that hit a fatal error (often GPU/CUDA state) from
+    picking up the next tile. The task exception is still re-raised to the
+    scheduler so remaining tiles can be rescheduled to healthy workers.
+    """
+    try:
+        worker = distributed.get_worker()
+    except ValueError:
+        return
+
+    setattr(worker, "_fishtools_fatal_error", True)
+
+    loop = getattr(worker, "loop", None)
+    if loop is None:
+        try:
+            worker.close(reason=reason)  # type: ignore[call-arg]
+        except Exception as close_exc:
+            _get_worker_logger().error(f"Failed to close worker after error: {close_exc!r}")
+        return
+
+    try:
+        loop.add_callback(worker.close, reason=reason)  # type: ignore[misc]
+    except Exception as close_exc:
+        _get_worker_logger().error(f"Failed to schedule worker close after error: {close_exc!r}")
 
 def _log_slurm_tile_summary(total_tiles: int, processed_tiles: int, elapsed_seconds: float) -> None:
     job_id = os.environ.get("SLURM_JOB_ID")
@@ -480,61 +508,81 @@ def process_block(
     """
     import time
 
-    _apply_startup_stagger(stagger_seconds, workers_per_gpu)
+    try:
+        worker = distributed.get_worker()
+    except ValueError:
+        worker = None
+
+    if worker is not None and getattr(worker, "_fishtools_fatal_error", False):
+        raise RuntimeError("Worker previously hit a fatal error; refusing further work")
+
+    if worker is not None:
+        _apply_startup_stagger(stagger_seconds, workers_per_gpu)
 
     wlog = _get_worker_logger()
-    worker_name = getattr(distributed.get_worker(), "name", "unknown")
+    worker_name = getattr(worker, "name", "local") if worker is not None else "local"
     start_time = time.perf_counter()
     wlog.info(f"Worker {worker_name} RUNNING BLOCK: {block_index}\tREGION: [{format_slice(crop)}]")
-    segmentation_3d = read_preprocess_and_segment(
-        input_zarr,
-        crop,
-        preprocessing_steps,
-        model_kwargs,
-        eval_kwargs,
-        worker_logs_directory,
-    )
-    wlog.info(f"Block {block_index}: {np.max(segmentation_3d)} masks found.")
 
-    spatial_crop_slices = crop[:-1]
-    spatial_blocksize = blocksize[:-1]
+    try:
+        segmentation_3d = read_preprocess_and_segment(
+            input_zarr,
+            crop,
+            preprocessing_steps,
+            model_kwargs,
+            eval_kwargs,
+            worker_logs_directory,
+        )
+        wlog.info(f"Block {block_index}: {np.max(segmentation_3d)} masks found.")
 
-    segmentation_trimmed_3d, crop_trimmed_3d = remove_overlaps(
-        segmentation_3d,
-        spatial_crop_slices,
-        overlap,
-        spatial_blocksize,
-    )
-    crop_trimmed_3d = tuple(crop_trimmed_3d)
+        spatial_crop_slices = crop[:-1]
+        spatial_blocksize = blocksize[:-1]
 
-    boxes = bounding_boxes_in_global_coordinates(segmentation_trimmed_3d, crop_trimmed_3d)
+        segmentation_trimmed_3d, crop_trimmed_3d = remove_overlaps(
+            segmentation_3d,
+            spatial_crop_slices,
+            overlap,
+            spatial_blocksize,
+        )
+        crop_trimmed_3d = tuple(crop_trimmed_3d)
 
-    nblocks_3d = get_nblocks(input_zarr.shape[:-1], spatial_blocksize)
-    block_index_3d = block_index[:-1]
+        boxes = bounding_boxes_in_global_coordinates(segmentation_trimmed_3d, crop_trimmed_3d)
 
-    segmentation_global_3d, remap = global_segment_ids(segmentation_trimmed_3d, block_index_3d, nblocks_3d)
+        nblocks_3d = get_nblocks(input_zarr.shape[:-1], spatial_blocksize)
+        block_index_3d = block_index[:-1]
 
-    final_unique_ids_3d = np.unique(segmentation_global_3d)
-    box_ids_for_this_block = final_unique_ids_3d[final_unique_ids_3d != 0]
-
-    if test_mode:
-        return (segmentation_global_3d, boxes, box_ids_for_this_block)
-
-    output_zarr[crop_trimmed_3d] = segmentation_global_3d
-
-    # Shrink labels on faces so expensive distance transforms happen on workers
-    faces = block_faces(segmentation_global_3d, shrink=True)
-
-    if checkpoint_path is not None:
-        append_checkpoint(
-            checkpoint_path,
-            block_index,
-            distributed.get_worker().name,
-            time.perf_counter() - start_time,
-            int(np.max(segmentation_global_3d)),
+        segmentation_global_3d, remap = global_segment_ids(
+            segmentation_trimmed_3d, block_index_3d, nblocks_3d
         )
 
-    return faces, boxes, box_ids_for_this_block
+        final_unique_ids_3d = np.unique(segmentation_global_3d)
+        box_ids_for_this_block = final_unique_ids_3d[final_unique_ids_3d != 0]
+
+        if test_mode:
+            return (segmentation_global_3d, boxes, box_ids_for_this_block)
+
+        output_zarr[crop_trimmed_3d] = segmentation_global_3d
+
+        # Shrink labels on faces so expensive distance transforms happen on workers
+        faces = block_faces(segmentation_global_3d, shrink=True)
+
+        if checkpoint_path is not None:
+            append_checkpoint(
+                checkpoint_path,
+                block_index,
+                getattr(worker, "name", "local") if worker is not None else "local",
+                time.perf_counter() - start_time,
+                int(np.max(segmentation_global_3d)),
+            )
+
+        return faces, boxes, box_ids_for_this_block
+    except Exception as exc:
+        wlog.exception(
+            f"Worker {worker_name} FAILED BLOCK: {block_index}\tREGION: [{format_slice(crop)}]\n{exc!r}"
+        )
+        if worker is not None:
+            _retire_worker_after_error(reason=f"fishtools process_block failed: {exc!r}")
+        raise
 
 
 # ----------------------- component functions ---------------------------------#
@@ -573,6 +621,25 @@ def read_preprocess_and_segment(
     if backend == "unet":
         filtered_eval_kwargs.pop("ortho_weights", None)
     return model.eval(image, **filtered_eval_kwargs)[0].astype(np.uint32)
+
+
+def _wait_for_futures_collect_errors(
+    *,
+    futures: list[distributed.Future],
+    future_labels: dict[distributed.Future, str],
+    stage: str,
+    log: logging.Logger,
+) -> list[str]:
+    failures: list[str] = []
+    for fut in distributed.as_completed(futures):
+        label = future_labels.get(fut, getattr(fut, "key", "<unknown>"))
+        try:
+            fut.result()
+        except Exception as exc:
+            msg = f"{label}: {exc!r}"
+            log.error(f"{stage} task failed: {msg}")
+            failures.append(msg)
+    return failures
 
 
 ######################## Distributed Cellpose #################################
@@ -752,16 +819,22 @@ def distributed_eval(
 
         total_tiles = len(check_futures)
         logger.info(f"Checking non-zero blocks: 0/{total_tiles}")
-        try:
-            with progress_bar(total_tiles) as submit:
-                [fut.add_done_callback(submit) for fut in check_futures]
-
-                non_zero_results = cluster.client.gather(check_futures, errors="raise")
-            logger.info(f"Checked non-zero blocks: {total_tiles}/{total_tiles}")
-        except Exception as e:
-            logger.critical(f"Error gathering input check results: {e}")
-            logger.critical("Skipping zero-input block filtering due to error.")
-            raise e
+        non_zero_results: list[bool] = [True] * total_tiles
+        future_to_index = {fut: i for i, fut in enumerate(check_futures)}
+        with progress_bar(total_tiles) as submit:
+            [fut.add_done_callback(submit) for fut in check_futures]
+            for fut in distributed.as_completed(check_futures):
+                i = future_to_index.get(fut)
+                if i is None:
+                    logger.error("Non-zero block check produced an unknown future; treating as non-empty")
+                    continue
+                try:
+                    non_zero_results[i] = bool(fut.result())
+                except Exception as exc:
+                    logger.error(
+                        f"Non-zero block check failed for block_check[{i}]: {exc!r}; treating as non-empty"
+                    )
+        logger.info(f"Checked non-zero blocks: {total_tiles}/{total_tiles}")
 
         idxs = [i for i, is_non_zero in enumerate(non_zero_results, offset) if is_non_zero]
         write_nonempty_cache(path_nonempty, blocksize, idxs)
@@ -865,7 +938,23 @@ def distributed_eval(
 
         with progress_bar(len(remaining_block_indices)) as submit:
             [fut.add_done_callback(submit) for fut in futures]
-            cluster.client.gather(futures)
+            future_labels = {
+                fut: f"block={idx}"
+                for fut, idx in zip(futures, remaining_block_indices, strict=True)
+            }
+            failures = _wait_for_futures_collect_errors(
+                futures=futures,
+                future_labels=future_labels,
+                stage="Segmentation",
+                log=logger,
+            )
+
+        if failures:
+            preview = "\n".join(failures[:10])
+            raise RuntimeError(
+                f"Segmentation failed for {len(failures)} blocks; run can be resumed after fixing the issue.\n"
+                f"First failures:\n{preview}"
+            )
 
     # Reconstruct faces/boxes from temp_zarr for ALL blocks (handles resume case)
     logger.info("Computing faces and bounding boxes from temp_zarr...")
@@ -1003,100 +1092,69 @@ def stitch_segmentation(
 
 app = typer.Typer(pretty_exceptions_show_locals=False)
 
+_DEFAULT_FUSED_NAME = "fused_n4.zarr"
 
-@app.command()
-def run(
-    path: Path = typer.Argument(..., help="Path to the folder containing the zarr file."),
-    channels: str | None = typer.Option(None, help="Comma-separated list of channel names to use."),
-    overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
-    config_path: Path | None = typer.Option(
-        None,
-        "--config",
-        "-c",
-        help="Explicit path to config.json. Defaults to <path>/../config.json when omitted.",
-    ),
-    workers_per_gpu: int = typer.Option(
-        4, help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster)"
-    ),
-    threads_per_worker: int = typer.Option(1, help="Threads per worker (GPU-bound work typically uses 1)"),
-    use_localcuda: bool = typer.Option(
-        False, help="If true and workers_per_gpu<=1, use dask-cuda LocalCUDACluster"
-    ),
-    n_workers: int | None = typer.Option(
-        None, help="For LocalCUDACluster: number of workers (defaults to #GPUs)"
-    ),
-    target_ny: int | None = typer.Option(
-        None,
-        help="Desired internal Cellpose ny tiles (SAM backend only; overrides default 4).",
-    ),
-    target_nx: int | None = typer.Option(
-        None,
-        help="Desired internal Cellpose nx tiles (SAM backend only; overrides default 6).",
-    ),
-    cellpose_only: bool = typer.Option(
-        False,
-        "--cellpose-only",
-        help="Stop after cellpose phase, save intermediate state for later stitching.",
-    ),
-    stagger_seconds: float = typer.Option(
-        5.0,
-        "--stagger-seconds",
-        help="Seconds to stagger worker starts on the same GPU (0 to disable).",
-    ),
-) -> None:
-    """
-    Run distributed Cellpose segmentation (full pipeline or cellpose-only).
 
-    Expected folder structure:
-    - path/fused.zarr (input image data)
-    - path/../config.json (segmentation parameters)
-    - path/normalization.json (auto-generated if missing)
+def _iter_fused_paths_for_roi(
+    ws: Workspace, roi: str, stitched_name: str, codebook: str
+) -> list[Path]:
+    stitch_dir = ws.stitch(roi, codebook)
+    fused_path = stitch_dir / stitched_name
+    return [fused_path] if fused_path.exists() else []
 
-    Output files:
-    - path/output_segmentation-{sam,unet}.zarr
-    - path/segmentation.done (completion marker)
-    - path/cellpose_temp/ (temporary files, removed on success)
 
-    Normalization: We pass a `normalize` dict with `lowhigh` shaped (3, 2).
-    If fewer than 3 channels requested, remaining rows are padded with [0, 1].
-    """
-    # Set up Rich logging fresh for this CLI invocation
-    from rich.logging import RichHandler
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        handlers=[RichHandler(rich_tracebacks=True)],
-        force=True,
-    )
-    logging.getLogger("cellpose").setLevel(logging.WARNING)
-
-    input_path = Path(path)
-    if input_path.suffix == ".zarr" and input_path.exists():
-        zarr_input_path = input_path
-        base_dir = input_path.parent
-    elif input_path.is_dir():
-        base_dir = input_path
-        zarr_input_path = base_dir / "fused_n4.zarr"
-        if not zarr_input_path.exists():
-            raise FileNotFoundError(f"Expected 'fused_n4.zarr' in {base_dir} but it was not found.")
+def _collect_input_paths(workspace: Path, roi: str, stitched_name: str, codebook: str) -> list[Path]:
+    ws = Workspace(workspace)
+    if roi in {"*", "all"}:
+        rois = ws.rois
     else:
-        raise FileNotFoundError(f"Path {input_path} must be a directory or a '.zarr' store.")
+        rois = ws.resolve_rois([roi])
+
+    input_paths: list[Path] = []
+    for resolved_roi in rois:
+        fused_paths = _iter_fused_paths_for_roi(ws, resolved_roi, stitched_name, codebook)
+        if not fused_paths:
+            logger.info(f"[{resolved_roi}] No {stitched_name} found; skipping.")
+            continue
+        input_paths.extend(fused_paths)
+    return input_paths
+
+
+def _run_single_input(
+    *,
+    input_path: Path,
+    channels: str | None,
+    overwrite: bool,
+    config_path: Path | None,
+    workers_per_gpu: int,
+    threads_per_worker: int,
+    use_localcuda: bool,
+    n_workers: int | None,
+    target_ny: int | None,
+    target_nx: int | None,
+    cellpose_only: bool,
+    stagger_seconds: float,
+) -> None:
+    if input_path.suffix != ".zarr" or not input_path.exists():
+        raise FileNotFoundError(f"Path {input_path} must be a '.zarr' store.")
+
+    base_dir = input_path.parent
 
     if not overwrite and (base_dir / "segmentation.done").exists():
-        logger.warning("Segmentation already exists. Exiting.")
-        exit()
+        logger.warning(f"{base_dir}: segmentation already exists. Skipping.")
+        return
 
     IS_CELLPOSE_SAM = version("cellpose").startswith("4.") or "dev" in version("cellpose")
     if not IS_CELLPOSE_SAM:
         raise RuntimeError("This script requires Cellpose version 4.x for SAM backend support.")
 
-    if config_path is None:
-        config_path = base_dir.parent / "config.json"
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Config file not found at {config_path}")
+    resolved_config_path = config_path
+    if resolved_config_path is None:
+        resolved_config_path = base_dir.parent / "config.json"
+    if not resolved_config_path.is_file():
+        raise FileNotFoundError(f"Config file not found at {resolved_config_path}")
 
-    config = json.loads(config_path.read_text())
+    config = json.loads(resolved_config_path.read_text())
     backend = config.get("backend", "sam").lower()
     if backend not in {"sam", "unet"}:
         raise ValueError("backend must be one of {'sam', 'unet'}.")
@@ -1136,13 +1194,8 @@ def run(
 
     preprocessing_pipeline = [(unsharp_all, {})]
 
-    mask_path = None
     foreground_mask = None
-    if mask_path and os.path.exists(mask_path):
-        logger.info(f"Loading mask from {mask_path}")
-        foreground_mask = tifffile.imread(mask_path) > 1.0
-
-    input_zarr_array = zarr.open_array(zarr_input_path, mode="r")
+    input_zarr_array = zarr.open_array(input_path, mode="r")
 
     key = cast(str, input_zarr_array.attrs["key"])
     if channels is None:
@@ -1241,7 +1294,7 @@ def run(
         "do_3D": True,
         "min_size": 500,
         "channel_axis": 3,
-        "use_kde_clustering": True
+        "use_kde_clustering": True,
     }
     if using_sam_backend:
         cellpose_eval_kwargs["z_axis"] = 0
@@ -1253,40 +1306,139 @@ def run(
         cellpose_eval_kwargs["ortho_weights"] = ortho_weights
 
     logger.info("Starting distributed Cellpose evaluation…")
-    try:
-        result = distributed_eval(
-            input_zarr=input_zarr_array,
-            blocksize=processing_blocksize,
-            write_path=zarr_output_path,
-            mask=foreground_mask,
-            preprocessing_steps=preprocessing_pipeline,
-            model_kwargs=cellpose_model_kwargs,
-            eval_kwargs=cellpose_eval_kwargs,
-            cluster_kwargs=local_cluster_kwargs,
-            temporary_directory=temporary_directory,
+    result = distributed_eval(
+        input_zarr=input_zarr_array,
+        blocksize=processing_blocksize,
+        write_path=zarr_output_path,
+        mask=foreground_mask,
+        preprocessing_steps=preprocessing_pipeline,
+        model_kwargs=cellpose_model_kwargs,
+        eval_kwargs=cellpose_eval_kwargs,
+        cluster_kwargs=local_cluster_kwargs,
+        temporary_directory=temporary_directory,
+        cellpose_only=cellpose_only,
+        stagger_seconds=stagger_seconds,
+    )
+
+    if cellpose_only:
+        logger.info("Cellpose-only mode complete.")
+        logger.info(f"Intermediate results saved to: {temporary_directory}")
+        logger.info("Run 'stitch' command to complete the pipeline.")
+        return
+
+    final_segmentation_zarr, final_bounding_boxes = result
+    (zarr_output_path.parent / "segmentation.done").touch()
+    shutil.rmtree(temporary_directory)
+    logger.info("Run Finished")
+    logger.info(f"Final segmentation saved to: {zarr_output_path}")
+    logger.info(
+        f"Output Zarr shape: {final_segmentation_zarr.shape}, dtype: {final_segmentation_zarr.dtype}"
+    )
+    logger.info(f"Number of segmented objects found: {len(final_bounding_boxes)}")
+
+
+@app.command()
+def run(
+    workspace: Path = typer.Argument(
+        ...,
+        help=(
+            "Workspace root containing analysis/deconv/stitch--ROI+CB folders with stitched zarr."
+        ),
+    ),
+    roi: str = typer.Argument("*", help="ROI name (default: '*')."),
+    codebook: str = typer.Option(
+        ...,
+        "--codebook",
+        help="Codebook label used to locate stitch--ROI+<codebook> folders.",
+    ),
+    channels: str | None = typer.Option(None, help="Comma-separated list of channel names to use."),
+    overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
+    stitched_name: str = typer.Option(
+        _DEFAULT_FUSED_NAME,
+        "--stitched-name",
+        help="Stitched zarr filename inside stitch--ROI+CB (default: fused_n4.zarr).",
+    ),
+    config_path: Path | None = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Explicit path to config.json. Defaults to <path>/../config.json when omitted.",
+    ),
+    workers_per_gpu: int = typer.Option(
+        4, help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster)"
+    ),
+    threads_per_worker: int = typer.Option(1, help="Threads per worker (GPU-bound work typically uses 1)"),
+    use_localcuda: bool = typer.Option(
+        False, help="If true and workers_per_gpu<=1, use dask-cuda LocalCUDACluster"
+    ),
+    n_workers: int | None = typer.Option(
+        None, help="For LocalCUDACluster: number of workers (defaults to #GPUs)"
+    ),
+    target_ny: int | None = typer.Option(
+        None,
+        help="Desired internal Cellpose ny tiles (SAM backend only; overrides default 4).",
+    ),
+    target_nx: int | None = typer.Option(
+        None,
+        help="Desired internal Cellpose nx tiles (SAM backend only; overrides default 6).",
+    ),
+    cellpose_only: bool = typer.Option(
+        False,
+        "--cellpose-only",
+        help="Stop after cellpose phase, save intermediate state for later stitching.",
+    ),
+    stagger_seconds: float = typer.Option(
+        5.0,
+        "--stagger-seconds",
+        help="Seconds to stagger worker starts on the same GPU (0 to disable).",
+    ),
+) -> None:
+    """
+    Run distributed Cellpose segmentation (full pipeline or cellpose-only).
+
+    Expected folder structure:
+    - <workspace>/analysis/deconv/stitch--ROI+CB/<stitched-name> (input image data)
+    - <workspace>/analysis/deconv/config.json (segmentation parameters)
+    - <workspace>/analysis/deconv/stitch--ROI+CB/normalization.json (auto-generated if missing)
+
+    Output files:
+    - <workspace>/analysis/deconv/stitch--ROI+CB/output_segmentation-{sam,unet}.zarr
+    - <workspace>/analysis/deconv/stitch--ROI+CB/segmentation.done (completion marker)
+    - <workspace>/analysis/deconv/stitch--ROI+CB/cellpose_temp/ (temporary files, removed on success)
+
+    Normalization: We pass a `normalize` dict with `lowhigh` shaped (3, 2).
+    If fewer than 3 channels requested, remaining rows are padded with [0, 1].
+    """
+    from rich.logging import RichHandler
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        handlers=[RichHandler(rich_tracebacks=True)],
+        force=True,
+    )
+    logging.getLogger("cellpose").setLevel(logging.WARNING)
+
+    input_paths = _collect_input_paths(Path(workspace), roi, stitched_name, codebook)
+    if not input_paths:
+        logger.info(f"No {stitched_name} inputs found to segment.")
+        return
+
+    for input_path in input_paths:
+        _run_single_input(
+            input_path=input_path,
+            channels=channels,
+            overwrite=overwrite,
+            config_path=config_path,
+            workers_per_gpu=workers_per_gpu,
+            threads_per_worker=threads_per_worker,
+            use_localcuda=use_localcuda,
+            n_workers=n_workers,
+            target_ny=target_ny,
+            target_nx=target_nx,
             cellpose_only=cellpose_only,
             stagger_seconds=stagger_seconds,
         )
-
-        if cellpose_only:
-            logger.info("Cellpose-only mode complete.")
-            logger.info(f"Intermediate results saved to: {temporary_directory}")
-            logger.info("Run 'stitch' command to complete the pipeline.")
-            return
-
-        final_segmentation_zarr, final_bounding_boxes = result
-        (zarr_output_path.parent / "segmentation.done").touch()
-        shutil.rmtree(temporary_directory)
-        logger.info("Run Finished")
-        logger.info(f"Final segmentation saved to: {zarr_output_path}")
-        logger.info(
-            f"Output Zarr shape: {final_segmentation_zarr.shape}, dtype: {final_segmentation_zarr.dtype}"
-        )
-        logger.info(f"Number of segmented objects found: {len(final_bounding_boxes)}")
-
-    except Exception as e:
-        logger.exception("Error during distributed evaluation")
-        raise e
 
 
 @app.command()
