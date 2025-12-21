@@ -22,7 +22,7 @@ from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter
 
 from fishtools.io.codebook import Codebook
-from fishtools.io.workspace import Workspace
+from fishtools.io.workspace import Workspace, WorkspaceOutput
 from fishtools.preprocess.config import SpotThresholdParams
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import (
@@ -175,6 +175,9 @@ def _save_combined_spots_plot(
     if not contexts:
         raise ValueError("No ROIs available to plot.")
 
+    output_root = WorkspaceOutput(output_dir)
+    spotlook_out = output_root.spotlook
+
     n_rois = len(contexts)
     grid = int(math.ceil(math.sqrt(n_rois)))
     n_cols = max(1, min(grid, 12))
@@ -226,9 +229,9 @@ def _save_combined_spots_plot(
     fig.suptitle(f"Spots Overview — {codebook}", color=DARK_PANEL_STYLE["axes.titlecolor"])
     fig.tight_layout(rect=(0, 0, 1, 0.96))
 
-    spots_final_dir = output_dir / "spots_final"
+    spots_final_dir = spotlook_out.spots_final_dir
     spots_final_dir.mkdir(parents=True, exist_ok=True)
-    combined_path = (spots_final_dir / f"spots_all--{codebook}.png").resolve()
+    combined_path = spotlook_out.combined_spots_png(codebook).resolve()
     # Clamp DPI to avoid exceeding Agg backend limits (~65535 px on a side)
     save_dpi = render_dpi
     fig.savefig(combined_path.as_posix(), dpi=save_dpi, bbox_inches="tight")
@@ -588,6 +591,7 @@ def _save_threshold_plot(
     params: SpotThresholdParams,
 ) -> Path:
     """Persist the per-ROI threshold selection plot."""
+    spotlook_out = WorkspaceOutput(output_dir).spotlook
     sns.set_theme()
     fig_thresh, ax1 = plt.subplots(figsize=params.figsize_thresh, dpi=params.dpi)
     ax1.plot(
@@ -617,9 +621,9 @@ def _save_threshold_plot(
 
     ax1.set_title(f"Filter Threshold Selection for ROI: {roi}")
     fig_thresh.tight_layout()
-    thresh_dir = output_dir / "threshold_selection"
+    thresh_dir = spotlook_out.threshold_selection_dir
     save_figure(fig_thresh, thresh_dir, "threshold_selection", roi, codebook)
-    return (thresh_dir / f"threshold_selection--{roi}+{codebook}.png").resolve()
+    return spotlook_out.threshold_selection_png(roi, codebook).resolve()
 
 
 def _save_combined_threshold_plot(
@@ -632,6 +636,7 @@ def _save_combined_threshold_plot(
     if not curves_by_roi:
         raise ValueError("No threshold curves available to plot.")
 
+    spotlook_out = WorkspaceOutput(output_dir).spotlook
     ordered_rois = sorted(curves_by_roi)
     palette = sns.color_palette("husl", len(ordered_rois))
 
@@ -671,9 +676,9 @@ def _save_combined_threshold_plot(
     ax1.add_artist(legend1)
 
     fig.tight_layout()
-    thresh_dir = output_dir / "threshold_selection"
+    thresh_dir = spotlook_out.threshold_selection_dir
     thresh_dir.mkdir(parents=True, exist_ok=True)
-    combined_path = (thresh_dir / f"threshold_selection_all+{codebook}.png").resolve()
+    combined_path = spotlook_out.combined_threshold_png(codebook).resolve()
     fig.savefig(combined_path.as_posix(), dpi=params.dpi, bbox_inches="tight")
     plt.close(fig)
     logger.debug(f"Saved plot: {combined_path}")
@@ -693,7 +698,7 @@ def _prompt_threshold_levels(
     if not ordered_rois:
         return {}
 
-    combined_plot_path = output_dir / "threshold_selection" / f"threshold_selection_all+{codebook}.png"
+    combined_plot_path = WorkspaceOutput(output_dir).spotlook.combined_threshold_png(codebook)
     lines = ["Generated artifacts:"]
     for roi in ordered_rois:
         artifacts = contexts[roi].artifact_paths
@@ -781,6 +786,8 @@ def _generate_final_outputs(
     params: SpotThresholdParams,
 ):
     """Generates all final plots and saves the filtered data for a single ROI."""
+    output_root = WorkspaceOutput(output_dir)
+    spotlook_out = output_root.spotlook
     logger.debug("Generating final plots and saving data...")
     # Final Spots Spatial Plot
     fig_spots, ax = plt.subplots(figsize=params.figsize_spots, dpi=params.dpi)
@@ -803,10 +810,10 @@ def _generate_final_outputs(
     else:
         ax.set_xlabel(x_col)
         ax.set_ylabel(y_col)
-    save_figure(fig_spots, output_dir / "spots_final", "spots_final", roi, codebook, log_level="INFO")
+    save_figure(fig_spots, spotlook_out.spots_final_dir, "spots_final", roi, codebook, log_level="INFO")
 
     # Save blank counts and scree plot together
-    scree_dir = output_dir / "scree_final"
+    scree_dir = spotlook_out.scree_final_dir
     scree_dir.mkdir(parents=True, exist_ok=True)
 
     per_gene_final = count_by_gene(spots_ok)
@@ -838,7 +845,9 @@ def _generate_final_outputs(
     save_figure(fig_scree, scree_dir, "scree_final", roi, codebook, log_level="INFO")
 
     # Save final filtered data
-    output_parquet = output_dir / f"{roi}+{codebook}.parquet"
+    parquets_dir = output_root.parquets
+    parquets_dir.mkdir(parents=True, exist_ok=True)
+    output_parquet = parquets_dir / f"{roi}+{codebook}.parquet"
     spots_ok.drop("point_density", "x_", "y_").write_parquet(output_parquet)
     logger.debug(f"Saved filtered spots for ROI {roi} to {output_parquet}")
 
@@ -885,7 +894,7 @@ def _generate_final_outputs(
     "output_dir",
     type=click.Path(file_okay=False, dir_okay=True, writable=True, resolve_path=True, path_type=Path),
     default=None,
-    help="Directory to save outputs. [default: 'path.parent/output']",
+    help="Directory to save outputs. [default: '<workspace>/analysis/output']",
 )
 @click.option(
     "--config",
@@ -941,8 +950,9 @@ def threshold(
         },
     )
 
+    ws = Workspace(path)
     if output_dir is None:
-        output_dir = path.parent / "output"
+        output_dir = ws.output.root
     output_dir.mkdir(exist_ok=True, parents=True)
     logger.debug(f"Using output directory: {output_dir}")
 
@@ -969,7 +979,8 @@ def threshold(
 
     codebook = Codebook(codebook_path)
 
-    ws = Workspace(path)
+    output_root = WorkspaceOutput(output_dir)
+    spotlook_out = output_root.spotlook
     if includes_wildcard or not explicit_requested:
         rois_to_process = ws.rois
     else:
@@ -999,10 +1010,9 @@ def threshold(
         logger.debug("Attempting to load raw spots parquet")
         spots_raw = _load_spots_data(path, roi, codebook)
         if spots_raw is not None:
-            shutil.copy(
-                ws.decoded_spots_parquet(roi, codebook.name),
-                output_dir / f"{roi}+{codebook.name}.raw.parquet",
-            )
+            raw_parquet_path = ws.threshold_parquet(roi, codebook.name, raw=True, output_dir=output_dir)
+            raw_parquet_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ws.decoded_spots_parquet(roi, codebook.name), raw_parquet_path)
 
         if spots_raw is None or spots_raw.is_empty():
             logger.warning(f"No data loaded for ROI {roi}. Skipping to next.")
@@ -1020,9 +1030,9 @@ def threshold(
         density_results = _calculate_density_map(spots_intermediate, params)
 
         fig_contours, contours, interp_func, surface = density_results
-        contours_dir = output_dir / "contours"
+        contours_dir = spotlook_out.contours_dir
         save_figure(fig_contours, contours_dir, "contours", roi, codebook.name)
-        contour_path = (contours_dir / f"contours--{roi}+{codebook.name}.png").resolve()
+        contour_path = spotlook_out.contours_png(roi, codebook.name).resolve()
 
         fig_blank_panels = _create_spots_contours_figure(
             spots_intermediate,
@@ -1033,9 +1043,9 @@ def threshold(
         )
         spots_contours_path: Path | None = None
         if fig_blank_panels is not None:
-            spots_contours_dir = output_dir / "spots_contours"
+            spots_contours_dir = spotlook_out.spots_contours_dir
             save_figure(fig_blank_panels, spots_contours_dir, "spots_contours", roi, codebook.name)
-            spots_contours_path = (spots_contours_dir / f"spots_contours--{roi}+{codebook.name}.png").resolve()
+            spots_contours_path = spotlook_out.spots_contours_png(roi, codebook.name).resolve()
 
         logger.debug("Computing threshold curve statistics")
         curve = _compute_threshold_curve(spots_intermediate, contours, interp_func)

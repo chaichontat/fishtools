@@ -725,8 +725,8 @@ def register(
                     ax.set_title(roi)
                     fig.tight_layout()
 
-                    # Save under analysis/output and log absolute path
-                    out_dir = ws.output
+                    # Save under analysis/output/stitch_layout and log absolute path
+                    out_dir = ws.stitch_layout
                     out_dir.mkdir(parents=True, exist_ok=True)
                     out_png = (out_dir / f"stitch_layout--{roi}.png").resolve()
                     fig.savefig(out_png.as_posix(), bbox_inches="tight")
@@ -1524,6 +1524,7 @@ def fuse(
         subprocess.run(
             ["preprocess", "stitch", "combine", ws.path, roi,
              *(["--codebook", codebook] if codebook else []),
+             *(["--round-name", round_name] if round_name else []),
              *(["--overwrite"] if overwrite else [])],
              check=True
         )
@@ -2040,10 +2041,11 @@ def slice_tile_from_zarr(
 
 @stitch.command(name="slice")
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
-@click.argument("roi", type=str)
+@click.argument("roi", type=str, default="*")
 @click.option("--round-name", type=str, required=True, help="Round name (e.g., 1_9_17)")
 @click.option("--tile-size", type=int, default=2048, help="Tile size in pixels")
 @click.option("--overwrite", is_flag=True)
+@batch_roi("stitch--*", include_codebook=False, split_codebook=True)
 def slice_mosaic(
     path: Path,
     roi: str,

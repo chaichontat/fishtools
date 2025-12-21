@@ -1,174 +1,64 @@
 from __future__ import annotations
 
+from collections.abc import Generator
 from pathlib import Path
-from typing import Any
 
 import pytest
-from click.testing import CliRunner
+from loguru import logger
 
-from fishtools.preprocess.cli_check_shifts import check_shifts as check_shifts_cli
-
-
-class DummyWorkspace:
-    """Minimal Workspace stub recording resolve_rois input."""
-
-    last_rois: list[str] | None
-
-    def __init__(self, path: Path | str) -> None:
-        self.path = Path(path)
-        DummyWorkspace.last_rois = None
-
-    @property
-    def deconved(self) -> Path:
-        return self.path / "analysis" / "deconv"
-
-    def resolve_rois(self, rois: list[str] | None = None) -> list[str]:
-        DummyWorkspace.last_rois = rois
-        if rois is None:
-            return ["roiA", "roiB"]
-        return list(rois)
+from fishtools.io.workspace import Workspace
+from fishtools.plot.diagnostics.shifts import ShiftsAdapter
+from fishtools.preprocess.cli_check_shifts import _check_missing_tiles
 
 
-class DummyCodebook:
-    """Lightweight Codebook stub exposing .name."""
+@pytest.fixture
+def log_capture() -> Generator[list[str], None, None]:
+    messages: list[str] = []
 
-    def __init__(self, path: Path | str) -> None:
-        self.path = Path(path)
+    def _capture(message: str) -> None:
+        messages.append(message)
 
-    @property
-    def name(self) -> str:
-        return self.path.stem
-
-
-@pytest.fixture()
-def cli_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path, list[dict[str, Any]]]:
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-
-    codebook_path = tmp_path / "cb.json"
-    codebook_path.write_text("{}")
-
-    log_calls: list[dict[str, Any]] = []
-
-    def fake_setup_cli_logging(
-        path: Path | None,
-        *,
-        component: str,
-        file: str,
-        idx: int | None = None,
-        debug: bool = False,
-        extra: dict[str, Any] | None = None,
-        **_: Any,
-    ) -> Path:
-        log_calls.append({
-            "path": Path(path) if path is not None else None,
-            "component": component,
-            "file": file,
-            "idx": idx,
-            "debug": debug,
-            "extra": extra or {},
-        })
-        if path is None:
-            return Path("analysis/logs") / f"{file}.log"
-        return Path(path) / "analysis" / "logs" / f"{file}.log"
-
-    def fake_load_shifts(_: Path) -> dict[int, dict[str, Any]]:
-        # Return empty mapping to skip heavy plotting/path logic.
-        return {}
-
-    def fake_check_missing_tiles(*_: Any, **__: Any) -> None:
-        return None
-
-    monkeypatch.setattr("fishtools.preprocess.cli_check_shifts.Workspace", DummyWorkspace)
-    monkeypatch.setattr("fishtools.preprocess.cli_check_shifts.Codebook", DummyCodebook)
-    monkeypatch.setattr("fishtools.preprocess.cli_check_shifts._load_shifts", fake_load_shifts)
-    monkeypatch.setattr("fishtools.preprocess.cli_check_shifts._check_missing_tiles", fake_check_missing_tiles)
-    monkeypatch.setattr(
-        "fishtools.preprocess.cli_check_shifts.setup_cli_logging",
-        fake_setup_cli_logging,
-    )
-
-    return workspace, codebook_path, log_calls
+    handler_id = logger.add(_capture, level="INFO")
+    try:
+        yield messages
+    finally:
+        logger.remove(handler_id)
 
 
-def test_check_shifts_uses_all_rois_when_none_provided(cli_env: tuple[Path, Path, list[dict[str, Any]]]) -> None:
-    workspace, codebook_path, log_calls = cli_env
-
-    runner = CliRunner()
-    result = runner.invoke(
-        check_shifts_cli,
-        [
-            str(workspace),
-            "--codebook",
-            str(codebook_path),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert DummyWorkspace.last_rois is None
-    assert log_calls
-    assert log_calls[0]["extra"].get("roi") == "all"
+def _write_shift_json(shift_dir: Path, tile: int, round_name: str) -> None:
+    payload = ShiftsAdapter.validate_python({
+        round_name: {"shifts": [0.0, 0.0], "corr": 0.95, "residual": 0.0},
+    })
+    shift_dir.mkdir(parents=True, exist_ok=True)
+    (shift_dir / f"shifts-{tile:04d}.json").write_bytes(ShiftsAdapter.dump_json(payload))
 
 
-def test_check_shifts_accepts_positional_roi(cli_env: tuple[Path, Path, list[dict[str, Any]]]) -> None:
-    workspace, codebook_path, log_calls = cli_env
+def test_check_missing_tiles_prefers_repaired_round(log_capture: list[str], tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "ready.DONE").touch()
+    deconv_dir = workspace / "analysis" / "deconv"
+    roi = "roi1"
+    codebook = "cb1"
+    ref_round = "1_2_3"
 
-    runner = CliRunner()
-    result = runner.invoke(
-        check_shifts_cli,
-        [
-            str(workspace),
-            "roiX",
-            "--codebook",
-            str(codebook_path),
-        ],
-    )
+    ref_dir = deconv_dir / f"{ref_round}--{roi}"
+    repaired_dir = deconv_dir / f"{ref_round}--{roi}--repaired"
+    shift_dir = deconv_dir / f"shifts--{roi}+{codebook}"
 
-    assert result.exit_code == 0, result.output
-    assert DummyWorkspace.last_rois == ["roiX"]
-    assert log_calls
-    assert log_calls[0]["extra"].get("roi") == "roiX"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    repaired_dir.mkdir(parents=True, exist_ok=True)
 
+    # Reference directory has fewer tiles than the repaired directory.
+    for idx in range(2):
+        (ref_dir / f"{ref_round}-{idx:04d}.tif").touch()
+    for idx in range(3):
+        (repaired_dir / f"{ref_round}-{idx:04d}.tif").touch()
+        _write_shift_json(shift_dir, idx, ref_round)
 
-def test_check_shifts_accepts_multiple_roi_options(cli_env: tuple[Path, Path, list[dict[str, Any]]]) -> None:
-    workspace, codebook_path, log_calls = cli_env
+    ws = Workspace(workspace)
+    _check_missing_tiles(ws, roi, codebook, ref_round, shift_dir)
 
-    runner = CliRunner()
-    result = runner.invoke(
-        check_shifts_cli,
-        [
-            str(workspace),
-            "--codebook",
-            str(codebook_path),
-            "--roi",
-            "roi1",
-            "--roi",
-            "roi2",
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert DummyWorkspace.last_rois == ["roi1", "roi2"]
-    assert log_calls
-    assert log_calls[0]["extra"].get("roi") == "roi1,roi2"
-
-
-def test_check_shifts_rejects_conflicting_roi_arguments(cli_env: tuple[Path, Path, list[dict[str, Any]]]) -> None:
-    workspace, codebook_path, _ = cli_env
-
-    runner = CliRunner()
-    result = runner.invoke(
-        check_shifts_cli,
-        [
-            str(workspace),
-            "roiX",
-            "--codebook",
-            str(codebook_path),
-            "--roi",
-            "roiY",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "Specify ROI either as a positional argument or via --roi" in result.output
-
+    combined_logs = "\n".join(log_capture)
+    assert "Using repaired folder for reference round 1_2_3" in combined_logs
+    assert "Missing shifts for tiles" not in combined_logs

@@ -1542,7 +1542,15 @@ def _load_reference_fid_from_previous_run(
 
 @register.command("fix-shifts")
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path, resolve_path=True))
-@click.option("--roi", "-o", type=str, required=True, help="ROI to process")
+@click.argument("idx", required=False, type=int)
+@click.option(
+    "--roi",
+    "-o",
+    "roi_option",
+    type=str,
+    required=False,
+    help="ROI to process. Use '*' for all ROIs.",
+)
 @click.option("--reference", "-r", type=str, default="2_10_18", help="Reference round name")
 @click.option(
     "--rounds",
@@ -1576,7 +1584,8 @@ def _load_reference_fid_from_previous_run(
 @click.option("--debug", is_flag=True)
 def fix_shifts(
     path: Path,
-    roi: str,
+    idx: int | None,
+    roi_option: str | None,
     reference: str,
     rounds: str,
     use_fft: bool,
@@ -1596,11 +1605,13 @@ def fix_shifts(
 
     The output JSON can be used to inform priors for `register batch`.
 
+    If IDX is provided, only that tile is processed.
+
     Example:
 
     \b
         # Detect large shifts
-        preprocess register fix-shifts /ws --roi roi1 \\
+        preprocess register fix-shifts /ws 1 --roi roi1 \\
             --rounds "1_9_17,3_11_19" --reference 2_10_18
 
     \b
@@ -1609,22 +1620,19 @@ def fix_shifts(
     """
     import json as json_module
 
-    setup_cli_logging(
-        path,
-        component="preprocess.register.fix-shifts",
-        file=f"fix-shifts-{roi}",
-        debug=debug,
-        extra={"roi": roi, "reference": reference},
-    )
-    _silence_matplotlib_debug_logs()
-
     ws = Workspace(path)
+    roi_value = roi_option
+    if roi_value is None:
+        raise click.ClickException("ROI is required. Pass it with --roi.")
+    if roi_value == "*":
+        rois = ws.resolve_rois()
+    else:
+        rois = ws.resolve_rois([roi_value])
     rounds_to_fix = [r.strip() for r in rounds.split(",")]
 
     cli_priors: dict[str, tuple[float, float]] | None = None
     if priors is not None:
         priors_value = priors.strip()
-        # First, try simple "dx,dy" format; this requires exactly one target round.
         parts = [p.strip() for p in priors_value.split(",")]
         if len(parts) == 2:
             if len(rounds_to_fix) != 1:
@@ -1634,7 +1642,6 @@ def fix_shifts(
             dx, dy = float(parts[0]), float(parts[1])
             cli_priors = {rounds_to_fix[0]: (dx, dy)}
         else:
-            # Fallback: treat as path to JSON/CSV mapping round→[dx,dy]
             cli_priors = _parse_priors_file(Path(priors_value))
 
     if cli_priors:
@@ -1657,147 +1664,194 @@ def fix_shifts(
     )
     fiducial_cfg = config.registration.fiducial
 
-    logger.info(f"Processing rounds: {rounds_to_fix}")
-    logger.info(f"Reference round: {reference}")
-    logger.info(f"ROI: {roi}")
+    for roi in rois:
+        setup_cli_logging(
+            path,
+            component="preprocess.register.fix-shifts",
+            file=f"fix-shifts-{roi}",
+            debug=debug,
+            extra={"roi": roi, "reference": reference},
+        )
+        _silence_matplotlib_debug_logs()
 
-    # Validate rounds exist
-    ref_dir = path / f"{reference}--{roi}"
-    if not ref_dir.exists():
-        raise ValueError(f"Reference round directory not found: {ref_dir}")
+        logger.info(f"Processing rounds: {rounds_to_fix}")
+        logger.info(f"Reference round: {reference}")
+        logger.info(f"ROI: {roi}")
 
-    for round_name in rounds_to_fix:
-        round_dir = path / f"{round_name}--{roi}"
-        if not round_dir.exists():
-            raise ValueError(f"Round directory not found: {round_dir}")
+        ref_dir = path / f"{reference}--{roi}"
+        if not ref_dir.exists():
+            raise ValueError(f"Reference round directory not found: {ref_dir}")
 
-    # Get list of tile indices from reference
-    ref_tiles = sorted(ref_dir.glob(f"{reference}-*.tif"))
-    if not ref_tiles:
-        raise ValueError(f"No tiles found in reference directory: {ref_dir}")
-
-    idxs = [int(p.stem.split("-")[1]) for p in ref_tiles]
-    logger.info(f"Found {len(idxs)} tiles to process")
-
-    # Results storage: {idx: {round_name: {dx, dy, residual, corr}}}
-    all_results: dict[int, dict[str, dict[str, float]]] = {}
-
-    # Process each tile - same logic as _run() but for specified rounds only
-    for idx in idxs:
-        logger.info(f"Processing tile {idx}")
-
-        # Load fiducial images using the same preprocessing as register run
-        fids: dict[str, np.ndarray] = {}
-        use_raw = fiducial_cfg.use_fft or fiducial_cfg.use_itk
-
-        # Load reference fiducial
-        # Load reference fiducial
-        ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
-        ref_img = Image.from_file(ref_path, n_fids=n_fids)
-        fids[reference] = ref_img.fid_raw.astype(np.float32) if use_raw else ref_img.fid
-
-        # Track raw fiducials for debug overlays (optional)
-        fid_raw_images: dict[str, np.ndarray] | None = None
-        if debug:
-            fid_raw_images = {reference: ref_img.fid_raw.astype(np.float32)}
-
-        # Load target fiducials
         for round_name in rounds_to_fix:
             round_dir = path / f"{round_name}--{roi}"
-            target_path = round_dir / f"{round_name}-{idx:04d}.tif"
-            if not target_path.exists():
-                logger.warning(f"Target tile not found: {target_path}, skipping")
-                continue
-            target_img = Image.from_file(target_path, n_fids=n_fids)
-            fid = target_img.fid_raw.astype(np.float32) if use_raw else target_img.fid
-            fids[round_name] = fid
-            if fid_raw_images is not None:
-                fid_raw_images[round_name] = target_img.fid_raw.astype(np.float32)
+            if not round_dir.exists():
+                raise ValueError(f"Round directory not found: {round_dir}")
 
-        prior_mapping = _apply_priors_to_fids(
-            fids,
-            fid_raw_images,
-            priors=fiducial_cfg.priors,
-            anchor_roi=fiducial_cfg.anchor_roi,
-            idx=idx,
-        )
+        if idx is not None:
+            ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
+            if not ref_path.exists():
+                raise ValueError(f"Reference tile not found: {ref_path}")
+            for round_name in rounds_to_fix:
+                round_path = path / f"{round_name}--{roi}" / f"{round_name}-{idx:04d}.tif"
+                if not round_path.exists():
+                    raise ValueError(f"Round tile not found: {round_path}")
+            idxs = [idx]
+        else:
+            ref_tiles = sorted(ref_dir.glob(f"{reference}-*.tif"))
+            if not ref_tiles:
+                raise ValueError(f"No tiles found in reference directory: {ref_dir}")
+            idxs = [int(p.stem.split("-")[1]) for p in ref_tiles]
+        logger.info(f"Found {len(idxs)} tiles to process")
 
-        shifts, residuals, _ = align_fiducials_with_stats(
-            fids,
-            reference=reference,
-            debug=debug,
-            max_iters=5,
-            threshold_sigma=fiducial_cfg.threshold,
-            fwhm=fiducial_cfg.fwhm,
-            use_fft=fiducial_cfg.use_fft,
-            use_itk=fiducial_cfg.use_itk,
-            use_brightest=fiducial_cfg.detailed.use_brightest,
-            detailed_config=fiducial_cfg.detailed,
-        )
+        all_results: dict[int, dict[str, dict[str, float]]] = {}
 
-        _add_priors_to_shifts(
-            shifts,
-            priors=fiducial_cfg.priors,
-            prior_mapping=prior_mapping,
-            anchor_roi=fiducial_cfg.anchor_roi,
-        )
+        for idx in idxs:
+            logger.info(f"Processing tile {idx}")
 
-        # Store results
-        tile_results: dict[str, dict[str, float]] = {}
-        for round_name in rounds_to_fix:
-            if round_name in shifts:
-                # Add prior back to get total shift
-                dx = float(shifts[round_name][0])
-                dy = float(shifts[round_name][1])
-                magnitude = float(np.hypot(dx, dy))
-                tile_results[round_name] = {
-                    "dx": dx,
-                    "dy": dy,
-                    "magnitude": magnitude,
-                    "residual": float(residuals.get(round_name, 0.0)),
-                }
-                logger.info(f"  {round_name}: dx={dx:.2f}, dy={dy:.2f}, mag={magnitude:.1f}")
+            fids: dict[str, np.ndarray] = {}
+            use_raw = fiducial_cfg.use_fft or fiducial_cfg.use_itk
 
-        all_results[idx] = tile_results
+            ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
+            ref_img = Image.from_file(ref_path, n_fids=n_fids)
+            fids[reference] = ref_img.fid_raw.astype(np.float32) if use_raw else ref_img.fid
 
-    # Write results JSON
-    shifts_dir = ws.shifts(roi)
-    shifts_dir.mkdir(exist_ok=True)
-    output_path = ws.coarse_shifts_json(roi)
+            fid_raw_images: dict[str, np.ndarray] | None = None
+            if debug:
+                fid_raw_images = {reference: ref_img.fid_raw.astype(np.float32)}
 
-    output_data: dict[str, Any] = {
-        "reference": reference,
-        "use_fft": use_fft,
-        "tiles": {f"{idx:04d}": results for idx, results in sorted(all_results.items())},
-    }
-    if cli_priors is not None:
-        output_data["priors"] = {
-            name: {"dx": dx, "dy": dy}
-            for name, (dx, dy) in sorted(cli_priors.items())
-        }
-    output_path.write_text(json_module.dumps(output_data, indent=2))
-    logger.info(f"Wrote coarse shifts to {output_path}")
+            for round_name in rounds_to_fix:
+                round_dir = path / f"{round_name}--{roi}"
+                target_path = round_dir / f"{round_name}-{idx:04d}.tif"
+                if not target_path.exists():
+                    logger.warning(f"Target tile not found: {target_path}, skipping")
+                    continue
+                target_img = Image.from_file(target_path, n_fids=n_fids)
+                fid = target_img.fid_raw.astype(np.float32) if use_raw else target_img.fid
+                fids[round_name] = fid
+                if fid_raw_images is not None:
+                    fid_raw_images[round_name] = target_img.fid_raw.astype(np.float32)
 
-    # Summary
-    for round_name in rounds_to_fix:
-        per_round = [r[round_name] for r in all_results.values() if round_name in r]
-        magnitudes = [rec["magnitude"] for rec in per_round]
-        if magnitudes:
-            dx_vals = [rec["dx"] for rec in per_round]
-            dy_vals = [rec["dy"] for rec in per_round]
-            median_dx = np.median(dx_vals)
-            median_dy = np.median(dy_vals)
-            logger.info(
-                f"{round_name}: median=({median_dx:.1f}, {median_dy:.1f}), "
-                f"mean mag={np.mean(magnitudes):.1f}px, max mag={np.max(magnitudes):.1f}px"
+            prior_mapping = _apply_priors_to_fids(
+                fids,
+                fid_raw_images,
+                priors=fiducial_cfg.priors,
+                anchor_roi=fiducial_cfg.anchor_roi,
+                idx=idx,
             )
-            max_abs_dx = float(np.max(np.abs(dx_vals)))
-            max_abs_dy = float(np.max(np.abs(dy_vals)))
-            if max_abs_dx < 35.0 and max_abs_dy < 35.0:
-                logger.warning(
-                    f"{round_name}: all detected drifts are <35 px in both X and Y; "
-                    "fix-shifts may not be necessary for this round."
+
+            shifts, residuals, _ = align_fiducials_with_stats(
+                fids,
+                reference=reference,
+                debug=debug,
+                max_iters=5,
+                threshold_sigma=fiducial_cfg.threshold,
+                fwhm=fiducial_cfg.fwhm,
+                use_fft=fiducial_cfg.use_fft,
+                use_itk=fiducial_cfg.use_itk,
+                use_brightest=fiducial_cfg.detailed.use_brightest,
+                detailed_config=fiducial_cfg.detailed,
+            )
+
+            _add_priors_to_shifts(
+                shifts,
+                priors=fiducial_cfg.priors,
+                prior_mapping=prior_mapping,
+                anchor_roi=fiducial_cfg.anchor_roi,
+            )
+
+            tile_results: dict[str, dict[str, float]] = {}
+            for round_name in rounds_to_fix:
+                if round_name in shifts:
+                    dx = float(shifts[round_name][0])
+                    dy = float(shifts[round_name][1])
+                    magnitude = float(np.hypot(dx, dy))
+                    tile_results[round_name] = {
+                        "dx": dx,
+                        "dy": dy,
+                        "magnitude": magnitude,
+                        "residual": float(residuals.get(round_name, 0.0)),
+                    }
+                    logger.info(f"  {round_name}: dx={dx:.2f}, dy={dy:.2f}, mag={magnitude:.1f}")
+
+            all_results[idx] = tile_results
+
+        shifts_dir = ws.shifts(roi)
+        shifts_dir.mkdir(exist_ok=True)
+        output_path = ws.coarse_shifts_json(roi)
+
+        existing_tiles: dict[str, Any] = {}
+        existing_priors: dict[str, Any] | None = None
+        output_reference = reference
+        output_use_fft = use_fft
+        if output_path.exists():
+            try:
+                existing_data = json_module.loads(output_path.read_text())
+            except json_module.JSONDecodeError as exc:
+                raise click.ClickException(
+                    f"Existing coarse shifts JSON is invalid: {output_path}"
+                ) from exc
+            if not isinstance(existing_data, dict):
+                raise click.ClickException(
+                    f"Existing coarse shifts JSON must be an object: {output_path}"
                 )
+            if "reference" in existing_data and existing_data["reference"] != reference:
+                logger.warning(
+                    "Existing coarse shifts reference "
+                    f"'{existing_data['reference']}' does not match '{reference}'. "
+                    "Keeping the existing reference to avoid clobbering metadata."
+                )
+                output_reference = existing_data["reference"]
+            if "use_fft" in existing_data and existing_data["use_fft"] != use_fft:
+                logger.warning(
+                    "Existing coarse shifts use_fft "
+                    f"{existing_data['use_fft']} does not match {use_fft}. "
+                    "Keeping the existing use_fft to avoid clobbering metadata."
+                )
+                output_use_fft = existing_data["use_fft"]
+            tiles_value = existing_data.get("tiles")
+            if isinstance(tiles_value, dict):
+                existing_tiles = tiles_value
+            existing_priors_value = existing_data.get("priors")
+            if isinstance(existing_priors_value, dict):
+                existing_priors = existing_priors_value
+
+        updated_tiles = {f"{idx:04d}": results for idx, results in sorted(all_results.items())}
+        merged_tiles = {**existing_tiles, **updated_tiles}
+
+        output_data: dict[str, Any] = {
+            "reference": output_reference,
+            "use_fft": output_use_fft,
+            "tiles": merged_tiles,
+        }
+        if cli_priors is not None:
+            output_data["priors"] = {
+                name: {"dx": dx, "dy": dy}
+                for name, (dx, dy) in sorted(cli_priors.items())
+            }
+        elif existing_priors is not None:
+            output_data["priors"] = existing_priors
+        output_path.write_text(json_module.dumps(output_data, indent=2))
+        logger.info(f"Wrote coarse shifts to {output_path}")
+
+        for round_name in rounds_to_fix:
+            per_round = [r[round_name] for r in all_results.values() if round_name in r]
+            magnitudes = [rec["magnitude"] for rec in per_round]
+            if magnitudes:
+                dx_vals = [rec["dx"] for rec in per_round]
+                dy_vals = [rec["dy"] for rec in per_round]
+                median_dx = np.median(dx_vals)
+                median_dy = np.median(dy_vals)
+                logger.info(
+                    f"{round_name}: median=({median_dx:.1f}, {median_dy:.1f}), "
+                    f"mean mag={np.mean(magnitudes):.1f}px, max mag={np.max(magnitudes):.1f}px"
+                )
+                max_abs_dx = float(np.max(np.abs(dx_vals)))
+                max_abs_dy = float(np.max(np.abs(dy_vals)))
+                if max_abs_dx < 35.0 and max_abs_dy < 35.0:
+                    logger.warning(
+                        f"{round_name}: all detected drifts are <35 px in both X and Y; "
+                        "fix-shifts may not be necessary for this round."
+                    )
 
 
 if __name__ == "__main__":

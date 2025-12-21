@@ -140,6 +140,86 @@ class FiducialPaths:
 # Backward compatibility: codebook utilities are resolved elsewhere
 
 
+@dataclass(frozen=True, slots=True)
+class WorkspaceSpotlookOutput:
+    """Spotlook-specific outputs under an output root."""
+
+    root: Path
+
+    @property
+    def spots_final_dir(self) -> Path:
+        return self.root / "spots_final"
+
+    @property
+    def threshold_selection_dir(self) -> Path:
+        return self.root / "threshold_selection"
+
+    @property
+    def scree_final_dir(self) -> Path:
+        return self.root / "scree_final"
+
+    @property
+    def contours_dir(self) -> Path:
+        return self.root / "contours"
+
+    @property
+    def spots_contours_dir(self) -> Path:
+        return self.root / "spots_contours"
+
+    def combined_spots_png(self, codebook: str) -> Path:
+        return self.spots_final_dir / f"spots_all--{codebook}.png"
+
+    def combined_threshold_png(self, codebook: str) -> Path:
+        return self.threshold_selection_dir / f"threshold_selection_all+{codebook}.png"
+
+    def contours_png(self, roi: str, codebook: str) -> Path:
+        return self.contours_dir / f"contours--{roi}+{codebook}.png"
+
+    def spots_contours_png(self, roi: str, codebook: str) -> Path:
+        return self.spots_contours_dir / f"spots_contours--{roi}+{codebook}.png"
+
+    def threshold_selection_png(self, roi: str, codebook: str) -> Path:
+        return self.threshold_selection_dir / f"threshold_selection--{roi}+{codebook}.png"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceOutput:
+    """Path-like accessor for outputs under ``analysis/output``.
+
+    The object forwards ``Path`` methods while also providing typed sub-accessors
+    (e.g. ``ws.output.spotlook``) to avoid hardcoded path fragments in CLIs.
+    """
+
+    root: Path
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.root, name)
+
+    def __truediv__(self, other: str | Path) -> Path:
+        return self.root / other
+
+    def __fspath__(self) -> str:
+        return self.root.__fspath__()
+
+    def __str__(self) -> str:
+        return str(self.root)
+
+    def __repr__(self) -> str:
+        return f"WorkspaceOutput({self.root})"
+
+    @property
+    def parquets(self) -> Path:
+        return self.root / "parquets"
+
+    @property
+    def stitch_layout(self) -> Path:
+        return self.root / "stitch_layout"
+
+    @property
+    def spotlook(self) -> WorkspaceSpotlookOutput:
+        return WorkspaceSpotlookOutput(self.root)
+
+
 @dataclass
 class Workspace:
     """FISH experiment workspace manager with verified directory structure.
@@ -270,16 +350,34 @@ class Workspace:
         return self.analysis / "logs"
 
     @property
-    def output(self) -> Path:
-        """Return path to top-level analysis output directory.
+    def output(self) -> "WorkspaceOutput":
+        """Return top-level analysis output accessor.
 
         This is the canonical location for ROI-level aggregated artifacts
         (e.g., per-ROI spots parquet files written by the spots pipeline).
 
         Example:
-            >>> ws.output  # PosixPath('/experiment/analysis/output')
+            >>> ws.output.root  # PosixPath('/experiment/analysis/output')
         """
-        return self.analysis / "output"
+        return WorkspaceOutput(self.analysis / "output")
+
+    @property
+    def stitch_layout(self) -> Path:
+        """Return path to stitch layout plot directory."""
+        return self.output / "stitch_layout"
+
+    @property
+    def parquets(self) -> Path:
+        """Return path to parquets output directory."""
+        return self.output / "parquets"
+
+    def threshold_parquet(
+        self, roi: str, codebook: str, *, raw: bool = False, output_dir: Path | None = None
+    ) -> Path:
+        """Return path to threshold-filtered spots parquet."""
+        base = (output_dir / "parquets") if output_dir is not None else self.parquets
+        suffix = ".raw.parquet" if raw else ".parquet"
+        return base / f"{roi}+{codebook}{suffix}"
 
     @property
     def deconv32(self) -> Path:

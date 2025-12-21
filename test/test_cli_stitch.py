@@ -1152,6 +1152,49 @@ def test_slice_mosaic_cli_missing_shifted_tc(self, tmp_path: Path) -> None:
         )
 
 
+def test_slice_mosaic_cli_batches_rois(tmp_path: Path) -> None:
+    """Ensure slice CLI supports roi='*' batching in round-name mode."""
+    import zarr
+
+    runner = CliRunner()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "OK.DONE").write_text("ok")
+    (workspace / "analysis" / "logs").mkdir(parents=True)
+
+    deconv_root = workspace / "analysis" / "deconv"
+    deconv_root.mkdir(parents=True)
+
+    round_name = "1_9_17"
+    rois = ["roi1", "roi2"]
+
+    for roi in rois:
+        stitch_dir = deconv_root / f"stitch--{roi}--shifted-{round_name}"
+        stitch_dir.mkdir(parents=True)
+        zarr_path = stitch_dir / "fused.zarr"
+        arr = zarr.open_array(zarr_path, mode="w", shape=(1, 4, 4, 1), dtype=np.uint16)
+        arr[:] = 123
+
+        original_tc_dir = deconv_root / f"stitch--{roi}"
+        original_tc_dir.mkdir(parents=True)
+        tc = TileConfiguration.from_pos(pd.DataFrame({0: [0.0], 1: [0.0]}))
+        tc.write(original_tc_dir / "TileConfiguration.registered.txt")
+
+        tc.write(stitch_dir / "TileConfiguration.shifted.txt")
+
+    result = runner.invoke(
+        stitch,
+        ["slice", str(deconv_root), "*", "--round-name", round_name, "--tile-size", "4", "--overwrite"],
+    )
+
+    assert result.exit_code == 0
+    for roi in rois:
+        out_dir = deconv_root / f"{round_name}--{roi}--repaired"
+        out_path = out_dir / f"{round_name}-0000.tif"
+        assert out_path.exists()
+
+
 def test_fuse_cli_default_downsample_is_two(tmp_path: Path, monkeypatch: Any) -> None:
     """Ensure `stitch fuse` defaults to downsample=2 when not provided."""
     from fishtools.preprocess import cli_stitch as cli_stitch_module
@@ -1346,6 +1389,93 @@ def test_fuse_cli_coarse_shifts_respects_explicit_downsample(tmp_path: Path, mon
     # Explicit -d 4 should be preserved even in coarse-shift mode
     assert captured["downsample"] == 4
     assert isinstance(result.exception, RuntimeError)
+
+
+def test_fuse_round_name_auto_combine_includes_round_name(tmp_path: Path, monkeypatch: Any) -> None:
+    """Ensure auto-combine passes --round-name when fuse runs in round-name mode."""
+    from fishtools.preprocess import cli_stitch as cli_stitch_module
+
+    roi = "roi1"
+    round_name = "1_9_17"
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "OK.DONE").write_text("ok\n")
+
+    deconv_root = workspace / "analysis" / "deconv"
+    deconv_root.mkdir(parents=True)
+
+    shifts_dir = deconv_root / f"shifts--{roi}"
+    shifts_dir.mkdir(parents=True)
+    coarse_path = shifts_dir / "coarse_shifts.json"
+    coarse_path.write_text(
+        json.dumps(
+            {
+                "reference": "ref",
+                "tiles": {
+                    "1": {
+                        round_name: {
+                            "dx": 0.0,
+                            "dy": 0.0,
+                        }
+                    }
+                },
+            }
+        )
+    )
+
+    tiles_dir = deconv_root / f"{round_name}--{roi}"
+    tiles_dir.mkdir(parents=True)
+    imwrite(tiles_dir / f"{round_name}-0001.tif", np.ones((4, 4), dtype=np.uint16))
+
+    tile_config_dir = workspace / f"stitch--{roi}"
+    tile_config_dir.mkdir(parents=True)
+    tile_config_path = tile_config_dir / "TileConfiguration.registered.txt"
+    TileConfiguration.from_pos(pd.DataFrame({0: [0.0], 1: [0.0]}, index=[1])).write(tile_config_path)
+
+    stitch_dir = deconv_root / f"stitch--{roi}--shifted-{round_name}"
+    channel_dir = stitch_dir / "0" / "0"
+    channel_dir.mkdir(parents=True)
+    (channel_dir / "0.tif").write_bytes(b"stub")
+
+    def fake_run_imagej(path: Path, **_kwargs: Any) -> None:
+        (path / "img_t1_z1_c1").write_bytes(b"fake")
+
+    run_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], *_, **__):  # type: ignore[no-untyped-def]
+        run_calls.append([str(item) for item in args])
+        return MagicMock(returncode=0)
+
+    monkeypatch.setattr(cli_stitch_module, "run_imagej", fake_run_imagej)
+    monkeypatch.setattr(cli_stitch_module.subprocess, "run", fake_run)
+
+    cli_stitch_module.fuse.callback(
+        path=deconv_root,
+        roi=roi,
+        codebook=None,
+        tile_config=tile_config_path,
+        split=1,
+        overwrite=False,
+        downsample=1,
+        is_2d=False,
+        threads=1,
+        channels="all",
+        subsample_z=1,
+        max_proj=False,
+        debug=False,
+        max_from=None,
+        json_config=None,
+        field_zarr=None,
+        coarse_shifts=coarse_path,
+        round_name=round_name,
+        fuse_only=False,
+    )
+
+    assert run_calls
+    combine_call = next(call for call in run_calls if "combine" in call)
+    assert "--round-name" in combine_call
+    assert round_name in combine_call
 
 
 if __name__ == "__main__":

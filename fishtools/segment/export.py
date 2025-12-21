@@ -87,6 +87,23 @@ def _resolve_rois(ws: Workspace, roi: str | None) -> list[str]:
     return rois
 
 
+def _filter_rois_with_segmentation(
+    ws: Workspace,
+    rois: list[str],
+    seg_codebook: str,
+    segmentation_name: str,
+) -> list[str]:
+    """Filter ROIs to only those that have the segmentation output directory."""
+    valid_rois: list[str] = []
+    for roi in rois:
+        seg_path = ws.stitch(roi, seg_codebook) / segmentation_name
+        if seg_path.exists():
+            valid_rois.append(roi)
+        else:
+            logger.warning(f"Skipping ROI={roi}: segmentation not found at {seg_path}")
+    return valid_rois
+
+
 def _resolve_codebooks(codebooks: Iterable[str]) -> list[str]:
     cb_list = list(codebooks)
     if not cb_list:
@@ -365,6 +382,76 @@ def _build_counts_matrix(dfs: dict[tuple[str, str], pl.DataFrame]) -> pl.DataFra
     return counts_by_gene
 
 
+@dataclass(slots=True)
+class _RoiPolygon:
+    name: str
+    polygon_xy: Any
+
+
+def load_roi_polygons(roi_path: Path, *, scale: float = 8.0) -> list[_RoiPolygon]:
+    """Load ImageJ ROI polygons from a `.roi` or `.zip` bundle."""
+
+    import zipfile
+
+    import numpy as np
+    import roifile
+    from matplotlib.path import Path as MplPath
+
+    if scale <= 0:
+        raise ValueError("scale must be positive")
+
+    rois: list[tuple[str, roifile.ImagejRoi]] = []
+    if roi_path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(roi_path) as zf:
+            for name in sorted(zf.namelist()):
+                if not name.lower().endswith(".roi"):
+                    continue
+                roi = roifile.ImagejRoi.frombytes(zf.read(name))
+                roi_name = roi.name or Path(name).stem
+                rois.append((roi_name, roi))
+    else:
+        roi = roifile.ImagejRoi.fromfile(roi_path)
+        roi_name = roi.name or roi_path.stem
+        rois.append((roi_name, roi))
+
+    polygons: list[_RoiPolygon] = []
+    for roi_name, roi in rois:
+        coords_rc = roi.coordinates()
+        if coords_rc.size == 0:
+            continue
+        coords_xy = np.asarray(coords_rc, dtype=np.float32)[:, ::-1] * float(scale)
+        polygons.append(_RoiPolygon(name=str(roi_name), polygon_xy=MplPath(coords_xy)))
+
+    return polygons
+
+
+def annotate_cells_with_roi(
+    adata: "anndata.AnnData",
+    roi_path: Path,
+    *,
+    scale: float = 8.0,
+    column_name: str = "roi",
+) -> None:
+    """Annotate `adata.obs[column_name]` with ROI names for each cell centroid."""
+
+    polygons = load_roi_polygons(roi_path, scale=scale)
+    if "x" not in adata.obs.columns or "y" not in adata.obs.columns:
+        raise ValueError("Expected adata.obs to contain 'x' and 'y' centroid columns.")
+
+    labels: list[str] = []
+    xs = adata.obs["x"].to_numpy()
+    ys = adata.obs["y"].to_numpy()
+    for x, y in zip(xs, ys):
+        assigned = ""
+        for poly in polygons:
+            if poly.polygon_xy.contains_point((float(x), float(y))):
+                assigned = poly.name
+                break
+        labels.append(assigned)
+
+    adata.obs[column_name] = labels
+
+
 def _build_anndata(counts_by_gene: pl.DataFrame, cells: pl.DataFrame) -> "anndata.AnnData":
     counts_pd = counts_by_gene.to_pandas().set_index("roilabel")
     cells_pd = cells.to_pandas().set_index("roilabel")
@@ -420,6 +507,9 @@ def export_cmd(
 
     ws = Workspace(path)
     rois = _resolve_rois(ws, roi)
+    rois = _filter_rois_with_segmentation(ws, rois, seg_codebook, segmentation_name)
+    if not rois:
+        raise ValueError("No ROIs have segmentation output; run segmentation first.")
     cb_list = _resolve_codebooks(codebooks)
 
     ident_frames = _load_ident_shards(ws, rois, cb_list, seg_codebook, segmentation_name)
@@ -439,16 +529,9 @@ def export_cmd(
     cb_token = Workspace.sanitize_codebook_name(primary_cb)
     seg_stem = Path(segmentation_name).stem
 
-    if len(rois) == 1:
-        # Single ROI: put outputs inside the segmentation zarr folder
-        seg_zarr_path = ws.stitch(rois[0], seg_codebook) / segmentation_name
-        cells_path = seg_zarr_path / f"polygons+{cb_token}.parquet"
-        out_h5ad = seg_zarr_path / f"{cb_token}.h5ad"
-    else:
-        # Multiple ROIs: put in output/ with segmentation identifier
-        ws.output.mkdir(parents=True, exist_ok=True)
-        cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
-        out_h5ad = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    ws.output.mkdir(parents=True, exist_ok=True)
+    cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
+    out_h5ad = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
 
     _write_cells_parquet(cells, cells_path)
     adata.write_h5ad(out_h5ad)

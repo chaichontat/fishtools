@@ -45,8 +45,23 @@ def infer_rounds(shifts_by_tile: Mapping[int, Mapping[str, Shift]]) -> list[str]
 
     if not shifts_by_tile:
         return []
-    first = next(iter(shifts_by_tile.values()))
-    return sorted(first.keys())
+    rounds: set[str] = set()
+    for per_tile in shifts_by_tile.values():
+        rounds.update(per_tile.keys())
+    return sorted(rounds)
+
+
+def _round_records(
+    shifts_by_tile: Mapping[int, Mapping[str, Shift]],
+    round_name: str,
+) -> list[tuple[int, Shift]]:
+    records: list[tuple[int, Shift]] = []
+    for tile_id, per_tile in shifts_by_tile.items():
+        shift = per_tile.get(round_name)
+        if shift is None:
+            continue
+        records.append((tile_id, shift))
+    return records
 
 
 def grid_panels(rounds: Iterable[str], ncols: int) -> RoundPanels:
@@ -84,12 +99,9 @@ def make_shifts_scatter_figure(
     fig, axs = _base_figure(panels)
 
     for ax, round_ in zip(axs, panels.rounds, strict=False):
-        pts = np.array([v[round_].shifts for v in shifts_by_tile.values()])
-        corrs = (
-            np.array([v[round_].corr for v in shifts_by_tile.values()])
-            if shifts_by_tile
-            else np.array([])
-        )
+        per_round = _round_records(shifts_by_tile, round_)
+        pts = np.array([shift.shifts for _, shift in per_round]) if per_round else np.array([])
+        corrs = np.array([shift.corr for _, shift in per_round]) if per_round else np.array([])
         lim = max(10.0, 1.25 * float(np.abs(pts).max())) if pts.size else 10.0
 
         if pts.size:
@@ -104,9 +116,9 @@ def make_shifts_scatter_figure(
                     edgecolors="yellow",
                     linewidths=1.0,
                 )
-                for (tile_id, rec), is_low in zip(shifts_by_tile.items(), low, strict=False):
+                for (tile_id, shift), is_low in zip(per_round, low, strict=False):
                     if is_low:
-                        sx, sy = rec[round_].shifts
+                        sx, sy = shift.shifts
                         ax.text(sx, sy, str(tile_id), fontsize=7, color="yellow")
         else:
             ax.scatter([], [], s=5)
@@ -146,8 +158,9 @@ def make_corr_vs_l2_figure(
     fig, axs = _base_figure(panels)
 
     for ax, round_ in zip(axs, panels.rounds, strict=False):
-        corrs = np.array([v[round_].corr for v in shifts_by_tile.values()])
-        pts = np.array([v[round_].shifts for v in shifts_by_tile.values()])
+        per_round = _round_records(shifts_by_tile, round_)
+        corrs = np.array([shift.corr for _, shift in per_round]) if per_round else np.array([])
+        pts = np.array([shift.shifts for _, shift in per_round]) if per_round else np.array([])
         if pts.size:
             median_shift = np.median(pts, axis=0)
             l2 = np.linalg.norm(pts - median_shift, axis=1)
@@ -166,7 +179,7 @@ def make_corr_vs_l2_figure(
                 edgecolors="yellow",
                 linewidths=1.0,
             )
-            for is_low, tile_id, dist, corr in zip(low, shifts_by_tile.keys(), l2, corrs, strict=False):
+            for is_low, (tile_id, _shift), dist, corr in zip(low, per_round, l2, corrs, strict=False):
                 if is_low and corr < corr_threshold:
                     ax.text(float(corr) + 0.01, float(dist) + 0.1, str(tile_id), fontsize=6, color="yellow")
         ax.set_xlabel("Correlation")
@@ -202,7 +215,8 @@ def make_corr_hist_figure(
     fig, axs = _base_figure(panels)
 
     for ax, round_ in zip(axs, panels.rounds, strict=False):
-        corrs = np.array([v[round_].corr for v in shifts_by_tile.values()])
+        per_round = _round_records(shifts_by_tile, round_)
+        corrs = np.array([shift.corr for _, shift in per_round]) if per_round else np.array([])
         ax.hist(corrs, linewidth=0)
         ax.set_title(round_)
         ax.set_xlim(0, 1)

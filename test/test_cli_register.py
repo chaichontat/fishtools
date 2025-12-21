@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -1097,3 +1098,142 @@ def test_run_internal_uses_shifts_from_source_codebook(tmp_path: Path, monkeypat
 
     # The key assertion: run_fiducial should NOT have been called
     assert fiducial_called is False
+
+
+def test_cli_fix_shifts_accepts_star_roi(tmp_path: Path, monkeypatch: Any) -> None:
+    root = tmp_path / "ws"
+    deconv = root / "analysis" / "deconv"
+    deconv.mkdir(parents=True)
+    (root / "workspace.DONE").write_text("")
+
+    reference = "2_10_18"
+    target_round = "1_9_17"
+    rois = ["roiA", "roiB"]
+
+    for roi in rois:
+        for round_name in [reference, target_round]:
+            round_dir = root / f"{round_name}--{roi}"
+            round_dir.mkdir(parents=True)
+            imwrite(round_dir / f"{round_name}-0001.tif", np.zeros((1, 1), dtype=np.uint16))
+
+    class _Image:
+        def __init__(self) -> None:
+            self.fid = np.zeros((8, 8), dtype=np.float32)
+            self.fid_raw = np.zeros((8, 8), dtype=np.float32)
+
+        @classmethod
+        def from_file(cls, _: Path, *, n_fids: int = 2) -> "_Image":
+            return cls()
+
+    def fake_align(fids: dict[str, np.ndarray], *, reference: str, **_: Any):
+        shifts = {name: np.array([0.0, 0.0]) for name in fids}
+        residuals = {name: 0.0 for name in fids}
+        if reference in shifts:
+            shifts[reference] = np.array([0.0, 0.0])
+            residuals[reference] = 0.0
+        return shifts, residuals, {}
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Image", _Image)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.align_fiducials_with_stats", fake_align)
+    monkeypatch.setattr("fishtools.preprocess.cli_register._silence_matplotlib_debug_logs", lambda: None)
+    monkeypatch.setattr(
+        "fishtools.preprocess.cli_register.setup_cli_logging",
+        lambda *_, **__: Path("dummy.log"),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "fix-shifts",
+            str(root),
+            "1",
+            "--roi",
+            "*",
+            "--rounds",
+            target_round,
+            "--reference",
+            reference,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    for roi in rois:
+        output_path = root / "analysis" / "deconv" / f"shifts--{roi}" / "coarse_shifts.json"
+        assert output_path.exists()
+
+
+def test_cli_fix_shifts_merges_existing_tiles(tmp_path: Path, monkeypatch: Any) -> None:
+    root = tmp_path / "ws"
+    deconv = root / "analysis" / "deconv"
+    shifts_dir = deconv / "shifts--roiA"
+    shifts_dir.mkdir(parents=True)
+    (root / "workspace.DONE").write_text("")
+
+    reference = "2_10_18"
+    target_round = "1_9_17"
+    roi = "roiA"
+
+    for round_name in [reference, target_round]:
+        round_dir = root / f"{round_name}--{roi}"
+        round_dir.mkdir(parents=True)
+        imwrite(round_dir / f"{round_name}-0001.tif", np.zeros((1, 1), dtype=np.uint16))
+        imwrite(round_dir / f"{round_name}-0002.tif", np.zeros((1, 1), dtype=np.uint16))
+
+    existing = {
+        "reference": "old_ref",
+        "use_fft": False,
+        "tiles": {
+            "0002": {
+                target_round: {"dx": 1.0, "dy": 2.0, "magnitude": 2.2, "residual": 0.1}
+            }
+        },
+    }
+    (shifts_dir / "coarse_shifts.json").write_text(json.dumps(existing))
+
+    class _Image:
+        def __init__(self) -> None:
+            self.fid = np.zeros((8, 8), dtype=np.float32)
+            self.fid_raw = np.zeros((8, 8), dtype=np.float32)
+
+        @classmethod
+        def from_file(cls, _: Path, *, n_fids: int = 2) -> "_Image":
+            return cls()
+
+    def fake_align(fids: dict[str, np.ndarray], *, reference: str, **_: Any):
+        shifts = {name: np.array([0.0, 0.0]) for name in fids}
+        residuals = {name: 0.0 for name in fids}
+        if reference in shifts:
+            shifts[reference] = np.array([0.0, 0.0])
+            residuals[reference] = 0.0
+        return shifts, residuals, {}
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Image", _Image)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.align_fiducials_with_stats", fake_align)
+    monkeypatch.setattr("fishtools.preprocess.cli_register._silence_matplotlib_debug_logs", lambda: None)
+    monkeypatch.setattr(
+        "fishtools.preprocess.cli_register.setup_cli_logging",
+        lambda *_, **__: Path("dummy.log"),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "fix-shifts",
+            str(root),
+            "1",
+            "--roi",
+            roi,
+            "--rounds",
+            target_round,
+            "--reference",
+            reference,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    output_path = shifts_dir / "coarse_shifts.json"
+    output_data = json.loads(output_path.read_text())
+    assert "0001" in output_data["tiles"]
+    assert output_data["tiles"]["0002"][target_round]["dx"] == 1.0

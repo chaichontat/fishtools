@@ -251,6 +251,48 @@ class TestBatchRoiCodebookIntegration:
         with pytest.raises(ValueError, match="codebook must be a string or Path"):
             mock_func(path=codebook_roi_structure, roi="*", codebook=123)  # type: ignore[arg-type]
 
+    def test_codebook_none_with_round_name_allows_batch(self, temp_workspace: Path) -> None:
+        """Allow wildcard ROI batching when round_name is set and codebook is None."""
+        call_log: list[str] = []
+
+        (temp_workspace / "OK.DONE").write_text("ok\n")
+        deconv_root = temp_workspace / "analysis" / "deconv"
+        deconv_root.mkdir(parents=True, exist_ok=True)
+
+        for roi in ("roi1", "roi2", "cortex"):
+            (deconv_root / f"1_9_17--{roi}").mkdir(parents=True, exist_ok=True)
+
+        @batch_roi(include_codebook=True)
+        def mock_func(path: Path, roi: str, codebook: str | None, round_name: str | None = None) -> None:
+            call_log.append(f"{roi}_{round_name}_{codebook}")
+
+        mock_func(path=temp_workspace, roi="*", codebook=None, round_name="1_9_17")
+
+        expected_rois = {"roi1", "roi2", "cortex"}
+        observed_rois = {entry.split("_", 1)[0] for entry in call_log}
+        assert observed_rois == expected_rois
+
+    def test_round_name_stitch_shifted_discovery(self, temp_workspace: Path) -> None:
+        """Batching with round_name should discover stitch--ROI--shifted-* folders."""
+        call_log: list[str] = []
+
+        (temp_workspace / "OK.DONE").write_text("ok\n")
+        deconv_root = temp_workspace / "analysis" / "deconv"
+        deconv_root.mkdir(parents=True, exist_ok=True)
+
+        for roi in ("roi1", "roi3"):
+            (deconv_root / f"stitch--{roi}--shifted-1_9_17").mkdir(parents=True, exist_ok=True)
+
+        @batch_roi("stitch--*", include_codebook=True)
+        def mock_func(path: Path, roi: str, codebook: str | None, round_name: str | None = None) -> None:
+            call_log.append(f"{roi}_{round_name}_{codebook}")
+
+        mock_func(path=temp_workspace, roi="*", codebook=None, round_name="1_9_17")
+
+        expected_rois = {"roi1", "roi3"}
+        observed_rois = {entry.split("_", 1)[0] for entry in call_log}
+        assert observed_rois == expected_rois
+
 
 class TestBatchRoiEdgeCases:
     """Test edge cases and error conditions."""

@@ -113,6 +113,8 @@ def _patch_deconv_stubs(monkeypatch, channels: int, height: int, width: int) -> 
 def test_cli_prepare_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # Create workspace with one tile and BaSiC profiles
     workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
     round_name = "1_9_17"
     roi = "roiA"
     tile_dir = workspace / f"{round_name}--{roi}"
@@ -128,7 +130,7 @@ def test_cli_prepare_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     _patch_deconv_stubs(monkeypatch, channels=C, height=H, width=W)
 
     # Run CLI via Click runner using positional rounds
-    from fishtools.preprocess.cli_deconv import deconv as multi_deconv
+    from fishtools.preprocess.cli_deconv import deconvnew as multi_deconv
 
     runner = CliRunner()
     result = runner.invoke(

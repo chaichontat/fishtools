@@ -83,7 +83,7 @@ Compute per-tile shifts between the problematic round and a reference round.
 ### Command
 
 ```bash
-preprocess register fix-shifts PATH \
+preprocess register fix-shifts PATH IDX \
     --roi ROI \
     --rounds "ROUND_NAME" \
     --reference REFERENCE_ROUND \
@@ -95,6 +95,7 @@ preprocess register fix-shifts PATH \
 | Argument | Description |
 |----------|-------------|
 | `PATH` | Workspace path |
+| `IDX` | 0-based tile index to process |
 | `--roi ROI` | Target ROI name |
 | `--rounds "ROUND_NAME"` | Round(s) to process (e.g., `"1_9_17"`) |
 | `--reference REFERENCE_ROUND` | Reference round for alignment |
@@ -293,7 +294,7 @@ pipeline.
 
 ```bash
 # 1. Detect shifts for round 1_9_17 relative to reference 2_10_18
-preprocess register fix-shifts /data/workspace/analysis/deconv \
+preprocess register fix-shifts /data/workspace/analysis/deconv 1 \
     --roi roi1 \
     --rounds "1_9_17" \
     --reference 2_10_18
