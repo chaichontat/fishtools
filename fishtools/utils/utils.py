@@ -236,16 +236,24 @@ def batch_roi(
 
             # Create local copy to avoid state mutation bug
             current_look_for = look_for
+            codebook_value = None
+            round_name_value = None
 
             if include_codebook:
                 if "codebook" not in kwargs:
                     raise ValueError(
                         "batch_roi with include_codebook=True requires codebook keyword argument"
                     )
-                if isinstance(kwargs["codebook"], str):
-                    current_look_for = f"{look_for}+{kwargs['codebook']}"
-                elif isinstance(kwargs["codebook"], Path):
-                    current_look_for = f"{look_for}+{kwargs['codebook'].stem}"
+                codebook_value = kwargs["codebook"]
+                round_name_value = kwargs.get("round_name")
+                if codebook_value is None and round_name_value is not None:
+                    # Allow round-name mode to batch across ROIs without a codebook suffix.
+                    # Keep current_look_for unchanged in this case.
+                    pass
+                elif isinstance(codebook_value, str):
+                    current_look_for = f"{look_for}+{codebook_value}"
+                elif isinstance(codebook_value, Path):
+                    current_look_for = f"{look_for}+{codebook_value.stem}"
                 else:
                     raise ValueError("codebook must be a string or Path")
 
@@ -259,16 +267,31 @@ def batch_roi(
 
                 # Filter ROIs based on pattern and codebook requirements
                 if include_codebook:
-                    # Find directories matching the full pattern including codebook
-                    matching_dirs = list(workspace_path.glob(current_look_for))
-                    if split_codebook:
-                        rois = {
-                            p.name.split("--")[1].split("+")[0]
-                            for p in matching_dirs
-                            if "--" in p.name and "+" in p.name.split("--")[1]
-                        }
+                    def _roi_from_name(name: str) -> str | None:
+                        if "--" not in name:
+                            return None
+                        roi_part = name.split("--", 2)[1]
+                        if split_codebook and "+" in roi_part:
+                            roi_part = roi_part.split("+")[0]
+                        if "--" in roi_part:
+                            roi_part = roi_part.split("--")[0]
+                        return roi_part or None
+
+                    if codebook_value is None and round_name_value is not None:
+                        if look_for.startswith("stitch--"):
+                            matching_dirs = list(
+                                workspace.deconved.glob(f"{look_for}--shifted-{round_name_value}")
+                            )
+                            rois = {roi for roi in (_roi_from_name(p.name) for p in matching_dirs) if roi}
+                        elif look_for.startswith("registered--"):
+                            matching_dirs = list(workspace.deconved.glob(f"{round_name_value}--*"))
+                            rois = {roi for roi in (_roi_from_name(p.name) for p in matching_dirs) if roi}
+                        else:
+                            rois = set(workspace.rois)
                     else:
-                        rois = {p.name.split("--")[1] for p in matching_dirs if "--" in p.name}
+                        # Find directories matching the full pattern including codebook
+                        matching_dirs = list(workspace_path.glob(current_look_for))
+                        rois = {roi for roi in (_roi_from_name(p.name) for p in matching_dirs) if roi}
                 else:
                     # Use Workspace.rois for non-codebook patterns
                     if look_for == "registered--*":
