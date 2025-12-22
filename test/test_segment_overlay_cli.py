@@ -31,6 +31,107 @@ def test_segment_overlay_spots_help():
     assert "--segmentation-name" in result.output
 
 
+def test_segment_overlay_all_help():
+    ensure_cellpose_stub()
+    from fishtools.segment import app
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["overlay", "all", "--help"])
+    assert result.exit_code == 0
+    assert "--codebook" in result.output
+    assert "--seg-codebook" in result.output
+    assert "--intensity-codebook" in result.output
+    assert "--segmentation-name" in result.output
+    assert "--intensity-store" in result.output
+    assert "--threads" in result.output
+
+
+def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
+    ensure_cellpose_stub()
+    import importlib
+
+    overlay_all_mod = importlib.import_module("fishtools.segment.overlay_all")
+
+    ws = _make_workspace(tmp_path)
+    (ws / "analysis/deconv/stitch--roi+seg").mkdir(parents=True, exist_ok=True)
+
+    calls: dict[str, dict[str, object]] = {}
+
+    def fake_spots(
+        *,
+        path: Path,
+        roi: str,
+        codebook: str,
+        spots_opt: Path | None,
+        seg_codebook: str | None,
+        segmentation_name: str,
+        overwrite: bool,
+        debug: bool,
+    ) -> None:
+        calls["spots"] = {
+            "path": path,
+            "roi": roi,
+            "codebook": codebook,
+            "spots_opt": spots_opt,
+            "seg_codebook": seg_codebook,
+            "segmentation_name": segmentation_name,
+            "overwrite": overwrite,
+            "debug": debug,
+        }
+
+    def fake_intensity(
+        *,
+        path: Path,
+        roi: str,
+        seg_codebook: str,
+        intensity_codebook: str,
+        segmentation_name: str,
+        intensity_store: str,
+        channel: str | None,
+        threads: int,
+        overwrite: bool,
+    ) -> None:
+        calls["intensity"] = {
+            "path": path,
+            "roi": roi,
+            "seg_codebook": seg_codebook,
+            "intensity_codebook": intensity_codebook,
+            "segmentation_name": segmentation_name,
+            "intensity_store": intensity_store,
+            "channel": channel,
+            "threads": threads,
+            "overwrite": overwrite,
+        }
+
+    def fail_main(*args, **kwargs):
+        raise AssertionError("Command.main should not be called from overlay all.")
+
+    monkeypatch.setattr(overlay_all_mod.overlay_spots, "main", fail_main)
+    monkeypatch.setattr(overlay_all_mod.overlay_intensity, "main", fail_main)
+    monkeypatch.setattr(overlay_all_mod.overlay_spots, "callback", fake_spots)
+    monkeypatch.setattr(overlay_all_mod.overlay_intensity, "callback", fake_intensity)
+
+    overlay_all_mod.overlay_all.callback(
+        path=ws,
+        roi=None,
+        codebook="cb1",
+        seg_codebook=None,
+        intensity_codebook="cb_int",
+        spots_opt=None,
+        segmentation_name="output_segmentation-sam.zarr",
+        intensity_store="fused.zarr",
+        channel=None,
+        threads=2,
+        overwrite=False,
+        debug=False,
+    )
+
+    assert calls["spots"]["roi"] == "roi"
+    assert calls["spots"]["seg_codebook"] is None
+    assert calls["intensity"]["roi"] == "roi"
+    assert calls["intensity"]["seg_codebook"] == "cb1"
+
+
 def test_segment_overlay_executable_direct():
     # Ensure the consolidated command function is importable
     from fishtools.segment.overlay_spots import overlay as segment_overlay

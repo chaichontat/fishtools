@@ -1031,9 +1031,11 @@ def overlay() -> None:
 
 
 # Register overlay subcommands - imports happen here but only when overlay is accessed
-from fishtools.segment.overlay_intensity import overlay_intensity
-from fishtools.segment.overlay_spots import overlay as overlay_spots
+from fishtools.segment.overlay_all import overlay_all  # noqa: E402
+from fishtools.segment.overlay_intensity import overlay_intensity  # noqa: E402
+from fishtools.segment.overlay_spots import overlay as overlay_spots  # noqa: E402
 
+overlay.add_command(overlay_all, "all")
 overlay.add_command(overlay_intensity, "intensity")
 overlay.add_command(overlay_spots, "spots")
 
