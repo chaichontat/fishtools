@@ -831,17 +831,21 @@ class Workspace:
         """Resolve or suggest the ROI-level spots parquet path.
 
         Search order (first existing is returned):
-        1) analysis/output/{roi}+{sanitize(codebook)}.parquet
-        2) analysis/output/{roi}+{codebook}.parquet
-        3) analysis/deconv/{roi}+{sanitize(codebook)}.parquet
-        4) analysis/deconv/{roi}+{codebook}.parquet
+        1) analysis/output/parquets/{roi}+{sanitize(codebook)}.parquet
+        2) analysis/output/parquets/{roi}+{codebook}.parquet
+        3) analysis/output/{roi}+{sanitize(codebook)}.parquet
+        4) analysis/output/{roi}+{codebook}.parquet
+        5) analysis/deconv/{roi}+{sanitize(codebook)}.parquet
+        6) analysis/deconv/{roi}+{codebook}.parquet
 
         When ``must_exist`` is False and no candidates exist, returns the
-        preferred default path under ``analysis/output`` with the sanitized
-        codebook.
+        preferred default path under ``analysis/output/parquets`` with the
+        sanitized codebook.
         """
         cb_s = self.sanitize_codebook_name(codebook)
         candidates = [
+            self.parquets / f"{roi}+{cb_s}.parquet",
+            self.parquets / f"{roi}+{codebook}.parquet",
             self.output / f"{roi}+{cb_s}.parquet",
             self.output / f"{roi}+{codebook}.parquet",
             self.deconved / f"{roi}+{cb_s}.parquet",

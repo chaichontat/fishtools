@@ -162,8 +162,12 @@ def find_spots(
     )
     try:
         df = pl.DataFrame(iraffind(img - median).to_pandas())
-        # Filter out null mag values and sort by magnitude (brightest first - most negative values)
-        df = df.filter(pl.col("mag").is_not_null()).sort("mag").with_row_index("idx")
+        # Filter out null mag values and non-finite centroids, sort by magnitude (brightest first)
+        df = df.filter(
+            pl.col("mag").is_not_null()
+            & pl.col("xcentroid").is_finite()
+            & pl.col("ycentroid").is_finite()
+        ).sort("mag").with_row_index("idx")
     except AttributeError:
         df = pl.DataFrame()
     if len(df) < minimum_spots:
@@ -469,7 +473,13 @@ def _calculate_drift(
         ycentroid=pl.col("ycentroid") + initial_drift[1],
     )
 
-    dist, idxs = ref_kd.query(target_points[cols], workers=2)
+    target_points = target_points.filter(
+        pl.col("xcentroid").is_finite() & pl.col("ycentroid").is_finite()
+    )
+    if target_points.is_empty():
+        raise NotEnoughSpots("No finite target spots available for drift calculation.")
+
+    dist, idxs = ref_kd.query(target_points[cols].to_numpy(), workers=2)
     mapping = pl.concat(
         [pl.DataFrame(dict(fixed_idx=np.array(idxs, dtype=np.uint32), dist=dist)), target_points],
         how="horizontal",
@@ -483,6 +493,8 @@ def _calculate_drift(
         dx=pl.col("xcentroid_fixed") - pl.col("xcentroid"),
         dy=pl.col("ycentroid_fixed") - pl.col("ycentroid"),
     )
+    if joined.is_empty():
+        raise NotEnoughSpots("No valid spot matches found for drift calculation.")
 
     def mode(data: np.ndarray):
         bins = np.arange(min(data), max(data) + bin_size, bin_size)

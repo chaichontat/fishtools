@@ -91,7 +91,10 @@ def overlay_all(
 
     workspace = Workspace(path)
     target_roi = roi or "*"
-    rois = workspace.rois if target_roi == "*" else [target_roi]
+    try:
+        rois = workspace.resolve_rois() if target_roi == "*" else workspace.resolve_rois([target_roi])
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
     if not rois:
         raise click.ClickException(f"No ROIs discovered under workspace {path}.")
 

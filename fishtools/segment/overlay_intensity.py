@@ -242,7 +242,10 @@ def overlay_intensity(
     workspace = Workspace(path)
     target_roi = roi or "*"
     batch_mode = target_roi == "*"
-    rois: Iterable[str] = workspace.rois if batch_mode else [target_roi]
+    try:
+        rois: Iterable[str] = workspace.resolve_rois() if batch_mode else workspace.resolve_rois([target_roi])
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     if not rois:
         raise click.ClickException(f"No ROIs discovered under workspace {path}.")

@@ -53,16 +53,13 @@ def load_segmentation_slice(segmentation_zarr_path: Path, idx: int) -> np.ndarra
         raise
 
 
-def calculate_coordinate_offsets(
-    tile_config_path: Path, downsample_factor: int, idx: int
-) -> tuple[float, float]:
+def calculate_coordinate_offsets(tile_config: TileConfiguration, downsample_factor: int) -> tuple[float, float]:
     """Calculates coordinate offsets from TileConfiguration."""
-    logger.info(f"Slice {idx}: Loading TileConfiguration from {tile_config_path}...")
-    tc = TileConfiguration.from_file(tile_config_path).downsample(downsample_factor)
+    tc = tile_config.downsample(downsample_factor)
     coords = tc.df
     x_offset = coords["x"].min()
     y_offset = coords["y"].min()
-    logger.info(f"Slice {idx}: Calculated offsets: x={x_offset:.2f}, y={y_offset:.2f}")
+    logger.info(f"Calculated offsets: x={x_offset:.2f}, y={y_offset:.2f}")
     return x_offset, y_offset
 
 
@@ -480,7 +477,8 @@ def process_slice(
     idx: int,
     segmentation_zarr_path: Path,
     spots_parquet_path: Path,
-    tile_config_path: Path | None,
+    x_offset: float,
+    y_offset: float,
     output_dir: Path,
     overwrite: bool,
     debug: bool,
@@ -495,10 +493,6 @@ def process_slice(
 
     try:
         img = load_segmentation_slice(segmentation_zarr_path, idx)
-
-        x_offset, y_offset = 0.0, 0.0
-        if tile_config_path:
-            x_offset, y_offset = calculate_coordinate_offsets(tile_config_path, DOWNSAMPLE_FACTOR, idx)
 
         spots_df = load_and_prepare_spots(
             spots_parquet_path,
@@ -595,19 +589,17 @@ def filter_spots_for_imshow(
 
 
 def run_(
-    input_dir: Path,
-    output_dir: Path,
-    segmentation_name: str,
+    segmentation_zarr_path: Path,
     spots: Path,
-    tile_config_path: Path,
     idx: int,
     overwrite: bool,
     debug: bool,
+    x_offset: float,
+    y_offset: float,
     max_proj: bool = False,
     spot_cb_label: str | None = None,
 ) -> None:
     """Process a specific Z-slice and assign detected spots to regions."""
-    segmentation_path = input_dir / segmentation_name
     spots_path = spots
 
     cb_for_chunks = spot_cb_label
@@ -617,7 +609,7 @@ def run_(
         except Exception:
             cb_for_chunks = "spots"
     # Put chunks inside the segmentation zarr folder
-    output_chunk_dir = segmentation_path / f"chunks+{cb_for_chunks}"
+    output_chunk_dir = segmentation_zarr_path / f"chunks+{cb_for_chunks}"
 
     try:
         output_chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -626,27 +618,27 @@ def run_(
         logger.error(f"Failed to create output directory {output_chunk_dir}: {e}")
         sys.exit(1)
 
-    if not segmentation_path.exists():
-        logger.error(f"Segmentation Zarr store not found: {segmentation_path}")
+    if not segmentation_zarr_path.exists():
+        logger.error(f"Segmentation Zarr store not found: {segmentation_zarr_path}")
         sys.exit(1)
     if not spots_path.exists():
         logger.error(f"Spots Parquet file not found: {spots_path}")
         sys.exit(1)
 
     logger.info("--- Configuration ---")
-    logger.info(f"Input directory: {input_dir}")
     logger.info(f"Output directory: {output_chunk_dir}")
-    logger.info(f"Segmentation: {segmentation_path}")
+    logger.info(f"Segmentation: {segmentation_zarr_path}")
     logger.info(f"Spots: {spots_path}")
-    logger.info(f"TileConfig: {tile_config_path if tile_config_path else 'Not used'}")
+    logger.info(f"Offsets: x={x_offset:.2f}, y={y_offset:.2f}")
     logger.info(f"Overwrite: {overwrite}")
 
     try:
         process_slice(
             idx=idx,
-            segmentation_zarr_path=segmentation_path,
+            segmentation_zarr_path=segmentation_zarr_path,
             spots_parquet_path=spots_path,
-            tile_config_path=tile_config_path,
+            x_offset=x_offset,
+            y_offset=y_offset,
             output_dir=output_chunk_dir,
             overwrite=overwrite,
             debug=debug,
@@ -717,7 +709,13 @@ def overlay(
 
     ws = Workspace(path)
     batch_mode = roi == "*"
-    rois = [roi] if not batch_mode else ws.rois
+    try:
+        rois = ws.resolve_rois() if batch_mode else ws.resolve_rois([roi])
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not rois:
+        raise click.ClickException(f"No ROIs discovered under workspace {path}.")
 
     seg_cb = seg_codebook or codebook
     if seg_codebook is None:
@@ -744,9 +742,8 @@ def overlay(
                         logger.warning(msg)
                         continue
                     raise click.ClickException(str(e))
-            input_dir = ws.stitch(current_roi, seg_cb)
-
-            seg_path = input_dir / segmentation_name
+            stitch_root = ws.stitch(current_roi, seg_cb)
+            seg_path = stitch_root / segmentation_name
 
             if not seg_path.exists():
                 msg = f"Skipping ROI '{current_roi}': segmentation not found at {seg_path}."
@@ -762,13 +759,16 @@ def overlay(
                     continue
                 raise click.ClickException(msg)
 
-            tileconfig_path = ws.tileconfig_registered_txt(current_roi)
-            if not tileconfig_path.exists():
-                msg = f"Skipping ROI '{current_roi}': TileConfiguration not found at {tileconfig_path}."
+            try:
+                tileconfig = ws.tileconfig(current_roi)
+            except FileNotFoundError as exc:
+                msg = f"Skipping ROI '{current_roi}': {exc}"
                 if batch_mode:
                     logger.warning(msg)
                     continue
-                raise click.ClickException(msg)
+                raise click.ClickException(msg) from exc
+
+            x_offset, y_offset = calculate_coordinate_offsets(tileconfig, DOWNSAMPLE_FACTOR)
 
             with ProcessPoolExecutor(max_workers=8, mp_context=get_context("spawn")) as executor:
                 futures = []
@@ -785,14 +785,13 @@ def overlay(
                     futures.append(
                         executor.submit(
                             run_,
-                            input_dir,
-                            input_dir,
-                            segmentation_name,
+                            seg_path,
                             spots,
-                            tileconfig_path,
                             i,
                             overwrite,
                             debug,
+                            x_offset,
+                            y_offset,
                             max_proj=z.shape[0] == 1,
                             spot_cb_label=ws.sanitize_codebook_name(codebook),
                         )

@@ -188,6 +188,31 @@ class TestCalculateDrift:
                 err_msg=f"Failed with {missing_frac * 100:.0f}% missing points",
             )
 
+    def test_calculate_drift_ignores_non_finite_points(
+        self, ref_kdtree: cKDTree, reference_points: pl.DataFrame
+    ) -> None:
+        """Test drift calculation ignores NaN/inf target points."""
+        true_shift = (2.0, -3.0)
+        target_points = self.create_shifted_target_points(
+            reference_points, dx=true_shift[0], dy=true_shift[1]
+        )
+
+        # Inject non-finite points that should be ignored.
+        bad_points = pl.DataFrame(
+            {
+                "idx": [100, 101],
+                "xcentroid": [np.nan, np.inf],
+                "ycentroid": [np.inf, np.nan],
+                "mag": [-9.0, -9.0],
+            }
+        )
+        target_points = pl.concat([target_points, bad_points])
+
+        calculated_drift = _calculate_drift(ref_kdtree, reference_points, target_points, precision=2)
+
+        expected_registration_shift = [-true_shift[0], -true_shift[1]]
+        np.testing.assert_allclose(calculated_drift, expected_registration_shift, atol=0.3)
+
     def test_calculate_drift_use_brightest_parameter(
         self, ref_kdtree: cKDTree, reference_points: pl.DataFrame
     ) -> None:

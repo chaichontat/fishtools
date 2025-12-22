@@ -477,6 +477,23 @@ class TestWorkspaceFiducialsAndPositions:
             ws.tile_positions_csv("cortex")
 
 
+class TestWorkspaceSpotsParquet:
+    """Tests for spots parquet resolution."""
+
+    def test_spots_parquet_finds_output_parquets(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
+
+        parquets_dir = workspace_root / "analysis" / "output" / "parquets"
+        parquets_dir.mkdir(parents=True)
+        parquet_path = parquets_dir / "10+cs_base.parquet"
+        parquet_path.write_text("stub", encoding="utf-8")
+
+        ws = Workspace(workspace_root)
+        assert ws.spots_parquet("10", "cs-base", must_exist=True) == parquet_path
+
+
 class TestWorkspaceRegisteredArtifacts:
     """Tests for registered TIFF discovery and validation helpers."""
 
