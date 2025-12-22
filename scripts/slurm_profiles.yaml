@@ -53,6 +53,13 @@ profiles:
     cpus: 44
     mem: 320G
     time: "06:00:00"
+    
+  register-batch-intensity:
+    partition: cpu
+    gpus: 0
+    cpus: 32
+    mem: 128GB
+    time: "06:00:00"
 
   spots-optimize:
     partition: l40s
@@ -95,3 +102,30 @@ profiles:
     cpus: 16
     mem: 64G
     time: "02:00:00"
+
+  overlay:
+    partition: cpu
+    gpus: 0
+    cpus: 32
+    mem: 192G
+
+  dist-seg:
+    partition: h100
+    gpus: 1
+    cpus: 16
+    mem: 192G
+    time: "18:00:00"
+
+  dist-seg-l40s:
+    partition: l40s
+    gpus: 1
+    cpus: 12
+    mem: 96G
+    time: "18:00:00"
+
+  dist-postproc:
+    partition: l40s
+    gpus: 1
+    cpus: 12
+    mem: 96G
+    time: "04:00:00"
