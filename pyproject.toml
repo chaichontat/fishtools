@@ -65,6 +65,7 @@ segment = "fishtools.segment:main"
 qserver = "fishtools.queuing.server:main"
 qclient = "fishtools.queuing.client:main"
 trt-build = "cellpose.contrib.cellposetrt.trt_build:main"
+slurmdash = "fishtools.slurm_dashboard:main"
 
 [tool.uv]
 override-dependencies = ["scikit-image>=0.23.2", "scipy>=1.16.1"]
