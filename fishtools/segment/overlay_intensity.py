@@ -14,10 +14,7 @@ from loguru import logger
 
 from fishtools.io.workspace import Workspace
 
-# Share the exact same region detection primitives used by
-# `segment overlay spots` to keep behavior identical up to the
-# intersection step.
-from fishtools.segment.overlay_spots import extract_polygons_from_mask, load_segmentation_slice
+from fishtools.segment.overlay_spots import load_segmentation_slice
 from fishtools.segment.utils import (
     StitchPaths,
     compute_regionprops_table,
@@ -35,17 +32,7 @@ def _process_slice_shared_detection(
     output_dir: Path,
     overwrite: bool = False,
 ) -> None:
-    """Compute per-label intensity using the same region detection code
-    as `segment overlay spots`.
-
-    Steps shared with spots overlay:
-    - load segmentation slice via `load_segmentation_slice`
-    - detect regions via `extract_polygons_from_mask`
-
-    Divergence (this tool):
-    - intersect regions with an intensity Zarr (per-channel) and compute
-      region properties with intensity measures.
-    """
+    """Compute per-label intensity statistics for a single slice."""
 
     props_path = output_dir / f"intensity_{channel}" / f"intensity-{idx:02d}.parquet"
     if not overwrite and props_path.exists():
@@ -65,28 +52,8 @@ def _process_slice_shared_detection(
             f"and intensity ({intensity_img.shape})."
         )
 
-    # Detect regions using the shared code path. We don't need the polygons
-    # here, but running this ensures region discovery is identical to the
-    # spots overlay pipeline up to this point.
-    polygons_with_meta = extract_polygons_from_mask(seg_mask, idx)
-    labels_from_polygons = {meta["label"] for _, meta in polygons_with_meta}
-
     logger.info(f"Slice {idx} [channel={channel}]: Calculating intensity region properties…")
     df = compute_regionprops_table(seg_mask, intensity_image=intensity_img)
-
-    # Sanity: ensure label sets match to guarantee parity with spots overlay
-    if not labels_from_polygons:
-        logger.warning(f"Slice {idx}: No regions found by shared detector; writing empty output.")
-    else:
-        if "label" in df.columns:
-            labels_from_props = set(df["label"].to_list())  # type: ignore[arg-type]
-            if labels_from_props != labels_from_polygons:
-                missing = labels_from_polygons - labels_from_props
-                extra = labels_from_props - labels_from_polygons
-                raise RuntimeError(
-                    "Region detection parity check failed: label sets differ "
-                    f"(missing={sorted(missing)}, extra={sorted(extra)})."
-                )
 
     write_regionprops_parquet(df, output_dir, channel, idx, overwrite=overwrite)
 

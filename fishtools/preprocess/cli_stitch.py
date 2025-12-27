@@ -42,7 +42,6 @@ import polars as pl
 import rich_click as click
 from click.core import ParameterSource
 from loguru import logger
-from PIL import Image
 from tifffile import TiffFile, TiffFileError, imread
 
 from fishtools import IMWRITE_KWARGS
@@ -64,6 +63,7 @@ from fishtools.utils.tiff import compose_metadata as compose_meta
 from fishtools.utils.tiff import normalize_channel_names as norm_names
 from fishtools.utils.tiff import read_metadata_from_tif
 from fishtools.utils.utils import add_file_context, batch_roi
+from fishtools.utils.thumbnails import load_thumbnail_options, save_thumbnail_png
 from fishtools.utils.zarr_utils import default_zarr_codecs
 from fishtools.utils.zarr_utils import numpy_array_to_zarr as _numpy_array_to_zarr
 
@@ -1541,6 +1541,12 @@ def numpy_array_to_zarr(write_path: Path | str, array: np.ndarray, chunks: tuple
 @click.option("--round-name", type=str, default=None, help="Round name for shifted fusion folder (e.g., 1_9_17)")
 @click.option("--chunk-size", type=int, default=2048)
 @click.option("--overwrite", is_flag=True)
+@click.option(
+    "--options",
+    "thumbnail_options",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
+    help="JSON file to override thumbnail generation options.",
+)
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def combine(
     path: Path,
@@ -1549,6 +1555,7 @@ def combine(
     round_name: str | None = None,
     chunk_size: int = 2048,
     overwrite: bool = True,
+    thumbnail_options: Path | None = None,
 ):
     # Validate: either codebook OR round_name must be provided
     if codebook is None and round_name is None:
@@ -1567,6 +1574,11 @@ def combine(
 
     ws = Workspace(path)
     target_rois = ws.resolve_rois(None if roi == "*" else [roi])
+
+    try:
+        thumb_options = load_thumbnail_options(thumbnail_options)
+    except Exception as exc:
+        raise click.ClickException(f"Invalid --options file: {exc}") from exc
 
     for current_roi in target_rois:
         # Determine stitched directory based on codebook or round_name
@@ -1665,18 +1677,9 @@ def combine(
                 logger.info(f"Writing Z-plane {i + 1}/{zs} to Zarr array")
                 z_array[i, :, :, :] = z_plane_data
 
-                if i % 8 == 0 and thumbnail_data is not None:
-                    # Save as PNG; ensure we have 3 channels for RGB
-                    td = (thumbnail_data[::8, ::8] >> 10).astype(np.uint8)
-                    if td.ndim == 2:
-                        td = np.repeat(td[:, :, None], 3, axis=2)
-                    elif td.shape[2] == 1:
-                        td = np.repeat(td, 3, axis=2)
-                    elif td.shape[2] == 2:
-                        td = np.concatenate([td, np.zeros_like(td[:, :, :1])], axis=2)
-                    thumbnail_img = Image.fromarray(td, mode="RGB")
+                if (i % thumb_options.z_stride) == 0 and thumbnail_data is not None:
                     thumbnail_path = thumbnail_dir / f"thumbnail_z{i:03d}.png"
-                    thumbnail_img.save(thumbnail_path)
+                    save_thumbnail_png(thumbnail_data, thumbnail_path, options=thumb_options)
                     logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
 
                 progress()

@@ -264,6 +264,12 @@ def batch_roi(
                 # Convert path to Path object for type safety
                 workspace_path = Path(str(kwargs["path"]))
                 workspace = Workspace(workspace_path)
+                def _glob_base(pattern: str) -> Path:
+                    if pattern.startswith(
+                        ("registered--", "stitch--", "segment--", "shifts--", "fids--", "opt_")
+                    ):
+                        return workspace.deconved
+                    return workspace.path
 
                 # Filter ROIs based on pattern and codebook requirements
                 if include_codebook:
@@ -290,7 +296,7 @@ def batch_roi(
                             rois = set(workspace.rois)
                     else:
                         # Find directories matching the full pattern including codebook
-                        matching_dirs = list(workspace_path.glob(current_look_for))
+                        matching_dirs = list(_glob_base(current_look_for).glob(current_look_for))
                         rois = {roi for roi in (_roi_from_name(p.name) for p in matching_dirs) if roi}
                 else:
                     # Use Workspace.rois for non-codebook patterns
@@ -299,7 +305,7 @@ def batch_roi(
                         rois = set(workspace.rois)
                     else:
                         # Custom pattern - fall back to glob
-                        matching_dirs = list(workspace_path.glob(current_look_for))
+                        matching_dirs = list(_glob_base(current_look_for).glob(current_look_for))
                         rois = {
                             p.name.split("--")[1].split("+")[0] if split_codebook else p.name.split("--")[1]
                             for p in matching_dirs

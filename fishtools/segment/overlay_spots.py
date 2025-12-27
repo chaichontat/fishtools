@@ -12,26 +12,18 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import polars as pl
 import rich_click as click
 from loguru import logger
-from scipy.ndimage import binary_erosion, binary_fill_holes
-from shapely.geometry import MultiPolygon, Point, Polygon
-from shapely.strtree import STRtree
-from skimage import measure
-from skimage.measure import regionprops
-from skimage.measure._regionprops import RegionProperties
 
 from fishtools.io.workspace import Workspace
+from fishtools.segment.utils import compute_regionprops_table
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.logging import setup_cli_logging
 
 # --- Configuration ---
-CONTOUR_PAD = 1
-MIN_CONTOUR_POINTS = 6
 DOWNSAMPLE_FACTOR = 2
 Z_FILTER_TOLERANCE = 0.5
 
@@ -109,250 +101,69 @@ def load_and_prepare_spots(
     return spots
 
 
-def _extract_polygon_from_region(
-    region: RegionProperties,
-    polygon_index: int,
-    image_shape: tuple[int, int],
-    idx: int,
-) -> tuple[Polygon | MultiPolygon, dict[str, Any]]:
-    """Extracts Shapely polygon(s) and metadata from a single skimage region."""
-
-    region_meta = {
-        "polygon_id": polygon_index,
-        "label": region.label,
-        "area": region.area,
-        "centroid_y": region.centroid[0],
-        "centroid_x": region.centroid[1],
-    }
-    min_row, min_col, max_row, max_col = region.bbox
-    region_image = region.image
-
-    if region.area == 0 or region_image.shape[0] < 2 or region_image.shape[1] < 2:
-        return Polygon(), region_meta
-
-    padded_mask = np.pad(region_image, pad_width=CONTOUR_PAD, mode="constant", constant_values=0)
-    filled_mask = binary_fill_holes(padded_mask)
-    eroded_mask = binary_erosion(filled_mask, iterations=1)
-
-    contours = measure.find_contours(eroded_mask, 0.5)
-
-    region_polygons = []
-    for contour in contours:
-        if len(contour) < MIN_CONTOUR_POINTS:
-            continue
-
-        contour[:, 0] = contour[:, 0] + min_row - CONTOUR_PAD
-        contour[:, 1] = contour[:, 1] + min_col - CONTOUR_PAD
-
-        contour[:, 0] = np.clip(contour[:, 0], 0, image_shape[0] - 1)
-        contour[:, 1] = np.clip(contour[:, 1], 0, image_shape[1] - 1)
-
-        if len(np.unique(contour, axis=0)) >= 3:
-            shapely_contour = contour[:, ::-1]
-            try:
-                poly = Polygon(shapely_contour)
-                if poly.is_valid:
-                    region_polygons.append(poly)
-                else:
-                    buffered_poly = poly.buffer(0)
-                    if buffered_poly.is_valid and isinstance(buffered_poly, Polygon):  # type: ignore
-                        region_polygons.append(buffered_poly)
-            except Exception as e:
-                logger.debug(
-                    f"Slice {idx}, Polygon {polygon_index} (Label {region.label}): Error creating polygon: {e}"
-                )
-
-    if not region_polygons:
-        return Polygon(), region_meta
-    elif len(region_polygons) == 1:
-        return region_polygons[0], region_meta
-    else:
-        try:
-            multi_poly = MultiPolygon(region_polygons)
-            if multi_poly.is_valid:
-                return multi_poly, region_meta
-            else:
-                buffered_multi = multi_poly.buffer(0)
-                if buffered_multi.is_valid and isinstance(buffered_multi, (Polygon, MultiPolygon)):
-                    return buffered_multi, region_meta
-                else:
-                    return Polygon(), region_meta
-        except Exception as e:
-            logger.debug(
-                f"Slice {idx}, Polygon {polygon_index} (Label {region.label}): Error creating MultiPolygon: {e}"
-            )
-            return Polygon(), region_meta
-
-
-def extract_polygons_from_mask(
-    mask: np.ndarray, idx: int
-) -> list[tuple[Polygon | MultiPolygon, dict[str, Any]]]:
-    """Finds regions in a mask and extracts Shapely polygons for each."""
-    logger.info(f"Slice {idx}: Finding regions in the segmentation mask...")
-    props = regionprops(mask)
-    n_regions = len(props)
-    logger.info(f"Slice {idx}: Found {n_regions} regions.")
-
-    if not n_regions:
+def compute_polygon_metadata(seg_mask: np.ndarray, idx: int) -> pl.DataFrame:
+    """Compute per-label region metadata for a single slice."""
+    df = compute_regionprops_table(seg_mask, properties=("label", "area", "centroid"))
+    if df.is_empty():
         logger.warning(f"Slice {idx}: No regions found in the segmentation image.")
-        return []
-
-    polygons_with_meta = []
-    total_region_area = 0
-    processed_regions = 0
-
-    logger.info(f"Slice {idx}: Extracting polygons from {n_regions} regions...")
-    for i, region in enumerate(props):
-        if i > 0 and i % 5000 == 0:
-            logger.info(f"Slice {idx}: Processed {i}/{n_regions} regions for polygon extraction...")
-
-        poly, meta = _extract_polygon_from_region(region, i, mask.shape, idx)
-        polygons_with_meta.append((poly, meta))
-        total_region_area += meta["area"]
-        processed_regions += 1
-
-    if processed_regions > 0:
-        logger.info(
-            f"Slice {idx}: Extracted {len(polygons_with_meta)} polygon entries. Mean region area: {total_region_area / processed_regions:.2f} px²"
-        )
-    else:
-        logger.info(f"Slice {idx}: No valid regions processed for polygon extraction.")
-
-    return polygons_with_meta
-
-
-def extract_polygons_from_roifile(
-    roi_file_path: Path,
-    slice_idx: int,
-    downsample_factor: int,
-) -> list[tuple[Polygon | MultiPolygon, dict[str, Any]]]:
-    """Extract Shapely polygons for a specific Z-slice from an ImageJ ROI file."""
-    from roifile import ImagejRoi, roiread
-
-    logger.info(f"Slice {slice_idx}: Loading ROIs from {roi_file_path}...")
-    try:
-        rois = roiread(roi_file_path)
-    except Exception as e:
-        logger.error(f"Slice {slice_idx}: Failed to read ROI file {roi_file_path}: {e}")
-        return []
-
-    polygons_with_meta: list[tuple[Polygon | MultiPolygon, dict[str, Any]]] = []
-    target_slice = slice_idx + 1  # ImageJ slices are 1-based
-
-    if isinstance(rois, ImagejRoi):
-        rois = [rois]
-
-    for roi in rois:
-        roi_slice = roi.z_position if roi.z_position is not None else roi.position
-        if roi_slice is not None and roi_slice != 0 and roi_slice != target_slice:
-            continue
-
-        logger.debug(f"Slice {slice_idx}: Processing ROI '{roi.name}' for target slice {target_slice}.")
-
-        abs_coords = roi.integer_coordinates + np.array([roi.left, roi.top])
-        adj_coords = abs_coords.astype(np.float64) / downsample_factor
-        shapely_coords = adj_coords[:]
-
-        if len(shapely_coords) < 3:
-            continue
-
-        try:
-            poly = Polygon(shapely_coords)
-            if not poly.is_valid:
-                poly = poly.buffer(0)
-
-            if poly.is_empty or not isinstance(poly, (Polygon, MultiPolygon)):
-                continue
-
-            polygon_index = len(polygons_with_meta)
-            try:
-                label = int(roi.name)
-            except (ValueError, TypeError):
-                label = polygon_index
-
-            meta = {
-                "polygon_id": polygon_index,
-                "label": label,
-                "area": poly.area,
-                "centroid_y": poly.centroid.y,
-                "centroid_x": poly.centroid.x,
+        return pl.DataFrame(
+            schema={
+                "polygon_id": pl.UInt32,
+                "label": pl.UInt32,
+                "area": pl.Float64,
+                "centroid_y": pl.Float64,
+                "centroid_x": pl.Float64,
             }
-            polygons_with_meta.append((poly, meta))
-        except Exception as e:
-            logger.debug(f"Slice {slice_idx}: Could not create polygon for ROI '{roi.name}': {e}")
+        )
 
-    logger.info(f"Slice {slice_idx}: Extracted {len(polygons_with_meta)} polygons from ROI file.")
-    return polygons_with_meta
-
-
-def build_spatial_index(
-    polygons_with_meta: list[tuple[Polygon | MultiPolygon, dict[str, Any]]], idx: int
-) -> tuple[STRtree | None, list[int]]:
-    """Builds an STRtree from the valid polygons."""
-    valid_polygons = [(i, poly) for i, (poly, _) in enumerate(polygons_with_meta) if not poly.is_empty]
-    if not valid_polygons:
-        logger.warning(f"Slice {idx}: No valid polygons for spatial index.")
-        return None, []
-
-    tree_indices = [i for i, _ in valid_polygons]
-    tree = STRtree([poly for _, poly in valid_polygons])
-    logger.info(f"Slice {idx}: Built STRtree with {len(tree_indices)} geometries.")
-    return tree, tree_indices
+    df = df.rename({"centroid-0": "centroid_y", "centroid-1": "centroid_x"})
+    df = df.with_row_index("polygon_id").select(["polygon_id", "label", "area", "centroid_y", "centroid_x"])
+    return df.with_columns(pl.col("polygon_id").cast(pl.UInt32))
 
 
-def assign_spots_to_polygons(
-    spots_df: pl.DataFrame,
-    tree: STRtree | None,
-    tree_indices: list[int],
-    polygons_with_meta: list[tuple[Polygon | MultiPolygon, dict[str, Any]]],
-    idx: int,
-) -> pl.DataFrame:
-    """Assign spots to polygons using STRtree index and point-in-polygon checks."""
-    if tree is None or not tree_indices:
-        logger.warning(f"Slice {idx}: No spatial index; returning empty assignments.")
-        return pl.DataFrame()
+def _round_half_up(values: np.ndarray) -> np.ndarray:
+    return np.floor(values + 0.5).astype(np.int64)
 
+
+def assign_spots_to_labels(spots_df: pl.DataFrame, seg_mask: np.ndarray, idx: int) -> pl.DataFrame:
+    """Assign spots to labels via direct label lookup at rounded pixel coordinates."""
     if spots_df.is_empty():
-        logger.warning(f"Slice {idx}: Empty spots dataframe; returning.")
+        logger.warning(f"Slice {idx}: Empty spots dataframe; returning empty assignments.")
         return pl.DataFrame()
 
-    points: list[Point] = [Point(float(x), float(y)) for x, y in zip(spots_df["x_adj"], spots_df["y_adj"])]
-    query_result = tree.query(points, predicate="intersects")
+    xs = spots_df.get_column("x_adj").to_numpy()
+    ys = spots_df.get_column("y_adj").to_numpy()
+    cols = _round_half_up(xs)
+    rows = _round_half_up(ys)
 
-    if query_result.size == 0:
-        logger.info(f"Slice {idx}: STRtree query returned no candidates.")
+    in_bounds = (
+        (rows >= 0)
+        & (cols >= 0)
+        & (rows < int(seg_mask.shape[0]))
+        & (cols < int(seg_mask.shape[1]))
+    )
+    if not np.any(in_bounds):
         return pl.DataFrame()
 
-    if query_result.ndim == 1:
-        query_result = query_result.reshape(2, 1)
-
-    candidate_pairs = query_result.T
-    logger.info(f"Slice {idx}: Found {candidate_pairs.shape[0]} potential intersections. Refining...")
-
-    assignments_list: list[dict[str, Any]] = []
-    for i, (point_idx, tree_geom_idx) in enumerate(candidate_pairs, start=1):
-        if i % 50000 == 0:
-            logger.info(f"Slice {idx}: Refined {i}/{candidate_pairs.shape[0]} intersections...")
-
-        original_polygon_list_idx = tree_indices[int(tree_geom_idx)]
-        spot = spots_df[int(point_idx)]
-        polygon_meta = polygons_with_meta[int(original_polygon_list_idx)][1]
-        assignments_list.append({
-            "spot_id": spot["spot_id"].item(),
-            "target": spot["target"].item(),
-            "label": polygon_meta["label"],
-        })
-
-    logger.info(f"Slice {idx}: Found {len(assignments_list)} confirmed spot assignments.")
-    if not assignments_list:
+    rows_in = rows[in_bounds]
+    cols_in = cols[in_bounds]
+    labels = np.asarray(seg_mask[rows_in, cols_in], dtype=np.int64)
+    valid = labels > 0
+    if not np.any(valid):
         return pl.DataFrame()
-    else:
-        return pl.from_dicts(assignments_list)
+
+    spot_ids = spots_df.get_column("spot_id").to_numpy()[in_bounds][valid]
+    targets = spots_df.get_column("target").to_numpy()[in_bounds][valid]
+    out_labels = labels[valid]
+    return pl.DataFrame({"spot_id": spot_ids, "target": targets, "label": out_labels}).with_columns(
+        pl.col("spot_id").cast(pl.UInt32),
+        pl.col("label").cast(pl.UInt32),
+    )
 
 
 def save_results(
     assignments_df: pl.DataFrame,
-    polygons_with_meta: list[tuple[Polygon | MultiPolygon, dict[str, Any]]],
+    polygons_df: pl.DataFrame,
     ident_path: Path,
     polygons_path: Path,
     idx: int,
@@ -366,32 +177,10 @@ def save_results(
         raise
 
     logger.info(
-        f"Slice {idx}: Saving polygon metadata ({len(polygons_with_meta)} entries) to {polygons_path}..."
+        f"Slice {idx}: Saving polygon metadata ({len(polygons_df)} entries) to {polygons_path}..."
     )
     try:
-        poly_meta_list = [p[1] for p in polygons_with_meta] if polygons_with_meta else []
-        if not poly_meta_list:
-            df_polygons = pl.DataFrame(
-                schema={
-                    "polygon_id": pl.UInt32,
-                    "label": pl.UInt32,
-                    "area": pl.Float64,
-                    "centroid_y": pl.Float64,
-                    "centroid_x": pl.Float64,
-                }
-            )
-        else:
-            df_polygons = pl.from_dicts(
-                poly_meta_list,
-                schema={
-                    "polygon_id": pl.UInt32,
-                    "label": pl.UInt32,
-                    "area": pl.Float64,
-                    "centroid_y": pl.Float64,
-                    "centroid_x": pl.Float64,
-                },
-            )
-        df_polygons.write_parquet(polygons_path)
+        polygons_df.write_parquet(polygons_path)
     except Exception as e:
         logger.error(f"Slice {idx}: Failed to write polygon metadata parquet: {e}")
         raise
@@ -506,22 +295,17 @@ def process_slice(
 
         if spots_df.is_empty():
             logger.warning(f"Slice {idx}: No spots loaded or filtered. Writing empty outputs.")
-            save_results(spots_df, [], ident_path, polygons_path, idx)
+            save_results(spots_df, compute_polygon_metadata(img, idx), ident_path, polygons_path, idx)
             return
 
-        polygons_with_meta = extract_polygons_from_mask(img, idx)
-
-        if not polygons_with_meta:
-            logger.warning(f"Slice {idx}: No polygons extracted. Writing empty assignments.")
-            assignments_df = pl.DataFrame()
-            save_results(assignments_df, polygons_with_meta, ident_path, polygons_path, idx)
+        polygons_df = compute_polygon_metadata(img, idx)
+        if polygons_df.is_empty():
+            logger.warning(f"Slice {idx}: No regions found. Writing empty assignments.")
+            save_results(pl.DataFrame(), polygons_df, ident_path, polygons_path, idx)
             return
 
-        tree, tree_indices = build_spatial_index(polygons_with_meta, idx)
-
-        assignments_df = assign_spots_to_polygons(spots_df, tree, tree_indices, polygons_with_meta, idx)
-
-        save_results(assignments_df, polygons_with_meta, ident_path, polygons_path, idx)
+        assignments_df = assign_spots_to_labels(spots_df, img, idx)
+        save_results(assignments_df, polygons_df, ident_path, polygons_path, idx)
 
         if debug:
             generate_debug_plot(img, spots_df, segmentation_zarr_path, output_dir, idx)

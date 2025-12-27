@@ -4,7 +4,9 @@ from typing import TYPE_CHECKING, Any
 
 import rich_click as click
 
-from fishtools.utils.pretty_print import TaskCancelledException
+from fishtools.utils.pretty_print import TaskCancelledException, progress_bar
+from fishtools.utils.thumbnails import load_thumbnail_options, save_thumbnail_png
+from fishtools.utils.utils import batch_roi
 
 if TYPE_CHECKING:  # pragma: no cover
     from fishtools.segment.train import TrainConfig as TrainConfig
@@ -48,7 +50,8 @@ def train(
     te_fp8: bool,
     packed: bool,
 ) -> None:
-    from fishtools.segment.train import TrainConfig as TrainConfigCls, run_train
+    from fishtools.segment.train import TrainConfig as TrainConfigCls
+    from fishtools.segment.train import run_train
 
     models_path = path / "models"
     if not models_path.exists():
@@ -295,6 +298,13 @@ def trt_build_cmd(model: Path, batch_size: int, backend: str, opset: int) -> Non
     help="Comma-separated intensity channel list, or 'auto' to discover from intensity_* outputs.",
 )
 @click.option(
+    "--thumbnail-scale",
+    default=8.0,
+    show_default=True,
+    type=float,
+    help="Scale factor to map RoiSet thumbnail coordinates back to segmentation pixels.",
+)
+@click.option(
     "--out-dir",
     type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
     help="Optional output directory; defaults under analysis/deconv/segment_export.",
@@ -312,6 +322,7 @@ def export_command(
     codebooks: tuple[str, ...],
     segmentation_name: str,
     channels: str,
+    thumbnail_scale: float,
     out_dir: Path | None,
     diag: bool,
 ) -> None:
@@ -326,6 +337,7 @@ def export_command(
         codebooks=codebooks,
         segmentation_name=segmentation_name,
         channels=channels,
+        thumbnail_scale=thumbnail_scale,
         out_dir=out_dir,
         diag=diag,
     )
@@ -341,6 +353,18 @@ def _parse_xyz_triple(name: str, val: str) -> tuple[float, float, float]:
     except ValueError as exc:
         raise click.BadParameter(f"{name} must contain numeric values.") from exc
     return (x, y, z)
+
+
+def _parse_zyx_triple(name: str, val: str) -> tuple[float, float, float]:
+    s = val.strip().replace(" ", ",")
+    parts = [p for p in s.split(",") if p]
+    if len(parts) != 3:
+        raise click.BadParameter(f"{name} must be a triple like 'z,y,x' (commas/spaces ok).")
+    try:
+        z, y, x = (float(p) for p in parts)
+    except ValueError as exc:
+        raise click.BadParameter(f"{name} must contain numeric values.") from exc
+    return (z, y, x)
 
 
 def _parse_labels_csv(val: str) -> list[int]:
@@ -384,15 +408,28 @@ def _parse_labels_csv(val: str) -> list[int]:
 )
 @click.option(
     "--spacing",
-    default="1,1,1",
+    default="2,1,1",
     show_default=True,
-    help="Voxel spacing in XYZ order, as 'x,y,z' (commas/spaces ok).",
+    help="Voxel spacing in ZYX order, as 'z,y,x' (commas/spaces ok).",
 )
 @click.option(
     "--origin",
     default="0,0,0",
     show_default=True,
-    help="World-space origin in XYZ order, as 'x,y,z' (commas/spaces ok).",
+    help="World-space origin in ZYX order, as 'z,y,x' (commas/spaces ok).",
+)
+@click.option(
+    "--downsample",
+    type=click.IntRange(1, None),
+    default=1,
+    show_default=True,
+    help="Downsample factor for Y,X (1 = native).",
+)
+@click.option(
+    "--progress-bar/--no-progress-bar",
+    default=True,
+    show_default=True,
+    help="Show a progress bar while loading large Zarr volumes.",
 )
 def export_mesh_command(
     path: Path,
@@ -403,6 +440,8 @@ def export_mesh_command(
     labels: str,
     spacing: str,
     origin: str,
+    downsample: int,
+    progress_bar: bool,
 ) -> None:
     """Export surface meshes for Blender (PLY)."""
 
@@ -416,8 +455,10 @@ def export_mesh_command(
         segmentation_name=segmentation_name,
         output=output,
         labels=label_ids,
-        spacing_xyz=_parse_xyz_triple("--spacing", spacing),
-        origin_xyz=_parse_xyz_triple("--origin", origin),
+        spacing_zyx=_parse_zyx_triple("--spacing", spacing),
+        origin_zyx=_parse_zyx_triple("--origin", origin),
+        downsample=downsample,
+        show_progress_bar=progress_bar,
     )
 
 
@@ -1025,6 +1066,80 @@ def extract_single_command(
         click.echo(f"Completed processing {len(files)} files.")
 
 
+@app.command("thumbnail")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.argument("roi", required=False, default="*")
+@click.option(
+    "--options",
+    "thumbnail_options",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
+    help="JSON file to override thumbnail generation options.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help="Output root for thumbnails (defaults to analysis/output/thumbnails).",
+)
+@click.option("--codebook", "-c", required=True, help="Codebook label for fused.zarr lookup.")
+@batch_roi("stitch--*", include_codebook=True, split_codebook=True)
+def thumbnail_command(
+    path: Path,
+    roi: str,
+    thumbnail_options: Path | None,
+    output_dir: Path | None,
+    codebook: str,
+) -> None:
+    """Generate RGB PNG thumbnails from stitched fused.zarr volumes."""
+    import zarr
+    from loguru import logger
+
+    from fishtools.io.workspace import Workspace
+
+    ws = Workspace(path)
+    try:
+        thumb_options = load_thumbnail_options(thumbnail_options)
+    except Exception as exc:
+        raise click.ClickException(f"Invalid --options file: {exc}") from exc
+
+    output_root = output_dir if output_dir is not None else ws.output / "thumbnails"
+    stitched_dir = ws.stitch(roi, codebook)
+    zarr_path = stitched_dir / "fused.zarr"
+    if not zarr_path.exists():
+        logger.warning(f"Skipping ROI '{roi}': fused.zarr not found at {zarr_path}")
+        return
+
+    try:
+        z_array = zarr.open_array(zarr_path, mode="r")
+    except Exception as exc:
+        logger.warning(f"Skipping ROI '{roi}': failed to open {zarr_path}: {exc}")
+        return
+
+    if z_array.ndim != 4:
+        logger.warning(f"Skipping ROI '{roi}': fused.zarr has shape {z_array.shape}, expected 4D.")
+        return
+
+    zs, _, _, cs = z_array.shape
+    preview_c = min(3, cs)
+    if preview_c <= 0:
+        logger.warning(f"Skipping ROI '{roi}': fused.zarr has no channels.")
+        return
+
+    thumbnail_dir = output_root / f"{roi}+{codebook}"
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
+
+    with progress_bar(zs) as progress:
+        for i in range(zs):
+            if (i % thumb_options.z_stride) == 0:
+                thumbnail_data = z_array[i, :, :, :preview_c]
+                thumbnail_path = thumbnail_dir / f"thumbnail_z{i:03d}.png"
+                save_thumbnail_png(thumbnail_data, thumbnail_path, options=thumb_options)
+                logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
+            progress()
+
+
 @app.group()
 def overlay() -> None:
     """Visualization helpers for segmentation outputs."""
@@ -1049,6 +1164,7 @@ __all__ = [
     "postproc_command",
     "extract_command",
     "extract_single_command",
+    "thumbnail_command",
     "overlay",
 ]
 

@@ -5,6 +5,7 @@ from itertools import product
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
 
+import numpy as np
 import polars as pl
 from loguru import logger
 
@@ -388,6 +389,13 @@ class _RoiPolygon:
     polygon_xy: Any
 
 
+@dataclass(slots=True)
+class _RoiLine:
+    name: str
+    p0_xy: tuple[float, float]
+    p1_xy: tuple[float, float]
+
+
 def load_roi_polygons(roi_path: Path, *, scale: float = 8.0) -> list[_RoiPolygon]:
     """Load ImageJ ROI polygons from a `.roi` or `.zip` bundle."""
 
@@ -424,6 +432,178 @@ def load_roi_polygons(roi_path: Path, *, scale: float = 8.0) -> list[_RoiPolygon
 
     return polygons
 
+
+def _load_roiset_line_and_polygons(
+    roi_path: Path,
+    *,
+    scale: float,
+) -> tuple[_RoiLine | None, list[_RoiPolygon]]:
+    import zipfile
+
+    import numpy as np
+    import roifile
+    from matplotlib.path import Path as MplPath
+
+    if scale <= 0:
+        raise ValueError("scale must be positive")
+
+    rois: list[tuple[str, roifile.ImagejRoi]] = []
+    if roi_path.suffix.lower() == ".zip":
+        with zipfile.ZipFile(roi_path) as zf:
+            for name in sorted(zf.namelist()):
+                if not name.lower().endswith(".roi"):
+                    continue
+                roi = roifile.ImagejRoi.frombytes(zf.read(name))
+                roi_name = roi.name or Path(name).stem
+                rois.append((roi_name, roi))
+    else:
+        roi = roifile.ImagejRoi.fromfile(roi_path)
+        roi_name = roi.name or roi_path.stem
+        rois.append((roi_name, roi))
+
+    line_entries: list[_RoiLine] = []
+    polygons: list[_RoiPolygon] = []
+    for roi_name, roi in rois:
+        if roi.roitype == roifile.ROI_TYPE.LINE:
+            p0 = (float(roi.x1) * scale, float(roi.y1) * scale)
+            p1 = (float(roi.x2) * scale, float(roi.y2) * scale)
+            line_entries.append(_RoiLine(name=str(roi_name), p0_xy=p0, p1_xy=p1))
+            continue
+
+        coords_rc = roi.coordinates()
+        if coords_rc.size == 0:
+            continue
+        coords_xy = np.asarray(coords_rc, dtype=np.float32)[:, ::-1] * float(scale)
+        polygons.append(_RoiPolygon(name=str(roi_name), polygon_xy=MplPath(coords_xy)))
+
+    if len(line_entries) > 1:
+        names = ", ".join([entry.name for entry in line_entries])
+        raise ValueError(f"Expected exactly one line ROI in {roi_path}, found {len(line_entries)}: {names}")
+
+    line = line_entries[0] if line_entries else None
+    return line, polygons
+
+
+def _thumbnail_size(thumbnail_dir: Path) -> tuple[int, int] | None:
+    from PIL import Image
+
+    candidates = sorted(thumbnail_dir.glob("thumbnail_z*.png"))
+    if not candidates:
+        return None
+    with Image.open(candidates[0]) as img:
+        width, height = img.size
+    return width, height
+
+
+def _segmentation_xy_shape(seg_zarr_path: Path) -> tuple[int, int]:
+    import zarr
+
+    arr = zarr.open_array(seg_zarr_path, mode="r")
+    if arr.ndim < 2:
+        raise ValueError(f"Segmentation zarr {seg_zarr_path} has unexpected shape {arr.shape}")
+    height = int(arr.shape[-2])
+    width = int(arr.shape[-1])
+    return width, height
+
+
+def _validate_thumbnail_scale(
+    thumbnail_dir: Path,
+    seg_zarr_path: Path,
+    *,
+    scale: float,
+) -> None:
+    if scale <= 0:
+        raise ValueError("thumbnail scale must be positive")
+
+    size = _thumbnail_size(thumbnail_dir)
+    if size is None:
+        raise ValueError(f"No thumbnail_z*.png files found under {thumbnail_dir}")
+    thumb_w, thumb_h = size
+    seg_w, seg_h = _segmentation_xy_shape(seg_zarr_path)
+    if seg_w <= 0 or seg_h <= 0:
+        raise ValueError(f"Segmentation zarr {seg_zarr_path} has invalid shape ({seg_h}, {seg_w})")
+
+    scale_int = int(round(scale))
+    if not np.isclose(scale, scale_int):
+        raise ValueError(f"thumbnail scale must be an integer downsampling factor, got {scale}")
+
+    def _bounds(thumb_dim: int) -> tuple[int, int]:
+        if thumb_dim <= 0:
+            return (0, 0)
+        lo = (thumb_dim - 1) * scale_int + 1
+        hi = thumb_dim * scale_int
+        return lo, hi
+
+    w_lo, w_hi = _bounds(thumb_w)
+    h_lo, h_hi = _bounds(thumb_h)
+
+    if not (w_lo <= seg_w <= w_hi and h_lo <= seg_h <= h_hi):
+        raise ValueError(
+            "Thumbnail scale mismatch: "
+            f"thumb=({thumb_w},{thumb_h}) scale={scale_int} -> "
+            f"expected_w=[{w_lo},{w_hi}], expected_h=[{h_lo},{h_hi}], seg=({seg_w},{seg_h})"
+        )
+
+
+def _assign_subroi_labels(
+    coords_xy: np.ndarray,
+    polygons: list[_RoiPolygon],
+) -> list[str]:
+    labels = np.full(coords_xy.shape[0], "", dtype=object)
+    for poly in polygons:
+        mask = poly.polygon_xy.contains_points(coords_xy)
+        labels[(labels == "") & mask] = poly.name
+    return labels.tolist()
+
+
+def _apply_roiset_annotations(
+    adata: "anndata.AnnData",
+    *,
+    ws: Workspace,
+    roi: str,
+    seg_codebook: str,
+    segmentation_name: str,
+    scale: float,
+) -> None:
+    import numpy as np
+
+    from fishtools.utils.spatial_transform import rotate_points
+
+    thumbnail_dir = ws.output / "thumbnails" / f"{roi}+{seg_codebook}"
+    roi_path = thumbnail_dir / "RoiSet.zip"
+    if not roi_path.exists():
+        logger.warning(f"Skipping ROI {roi}: RoiSet.zip not found at {roi_path}")
+        return
+
+    line, polygons = _load_roiset_line_and_polygons(roi_path, scale=scale)
+    seg_zarr_path = ws.stitch(roi, seg_codebook) / segmentation_name
+    _validate_thumbnail_scale(thumbnail_dir, seg_zarr_path, scale=scale)
+
+    roi_mask = adata.obs["roi"] == roi
+    if not roi_mask.any():
+        logger.warning(f"Skipping ROI {roi}: no cells found in export.")
+        return
+
+    coords = adata.obs.loc[roi_mask, ["x", "y"]].to_numpy(dtype=np.float64)
+    if polygons:
+        labels = _assign_subroi_labels(coords, polygons)
+        adata.obs.loc[roi_mask, "subroi"] = labels
+    else:
+        adata.obs.loc[roi_mask, "subroi"] = ""
+
+    if line is None:
+        logger.warning(f"Skipping ROI {roi}: no line ROI found in {roi_path}")
+        return
+
+    dx = line.p1_xy[0] - line.p0_xy[0]
+    dy = line.p1_xy[1] - line.p0_xy[1]
+    angle_deg = float(np.rad2deg(np.arctan2(dy, dx)))
+    center = ((line.p0_xy[0] + line.p1_xy[0]) / 2.0, (line.p0_xy[1] + line.p1_xy[1]) / 2.0)
+    rotated = rotate_points(coords, -angle_deg, center=center).astype(np.float32, copy=False)
+
+    adata.obsm["spatial"][roi_mask.to_numpy()] = rotated
+    adata.obs.loc[roi_mask, "x"] = rotated[:, 0]
+    adata.obs.loc[roi_mask, "y"] = rotated[:, 1]
 
 def annotate_cells_with_roi(
     adata: "anndata.AnnData",
@@ -494,8 +674,9 @@ def export_cmd(
     codebooks: Iterable[str],
     segmentation_name: str,
     channels: str,
-    out_dir: Path | None,
-    diag: bool,
+    thumbnail_scale: float = 8.0,
+    out_dir: Path | None = None,
+    diag: bool = False,
 ) -> None:
     """Export per-cell intensities and h5ad ready for Scanpy workflows.
 
@@ -525,6 +706,17 @@ def export_cmd(
     cells = _build_cells_dataframe(polygons_by_roi, intensities, channel_list)
     counts_by_gene = _build_counts_matrix(ident_frames)
     adata = _build_anndata(counts_by_gene, cells)
+
+    adata.obs["subroi"] = ""
+    for roi_name in rois:
+        _apply_roiset_annotations(
+            adata,
+            ws=ws,
+            roi=roi_name,
+            seg_codebook=seg_codebook,
+            segmentation_name=segmentation_name,
+            scale=thumbnail_scale,
+        )
 
     cb_token = Workspace.sanitize_codebook_name(primary_cb)
     seg_stem = Path(segmentation_name).stem
