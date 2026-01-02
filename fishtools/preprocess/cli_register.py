@@ -43,6 +43,18 @@ from fishtools.utils.io import FiducialPaths, Workspace, safe_imwrite
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
 
+# =============================================================================
+# COORDINATE CONVENTIONS
+# =============================================================================
+# Shifts dictionary: [dx, dy] where dx is column displacement (x-axis) and dy is row
+# displacement (y-axis).
+# SciPy: scipy.ndimage.shift expects [row_shift, col_shift] = [dy, dx], so we swap
+# when calling it.
+# Sign: +dx/+dy means the target image is displaced +x/+y relative to the reference;
+# to correct (resample the target into the reference frame) apply the negative shift.
+# ITK: SimpleITK returns translation parameters [tx, ty]; we convert to our [dx, dy]
+# convention (and still swap to [dy, dx] for ndimage.shift).
+
 FORBIDDEN_PREFIXES = ["10x", "registered", "shifts", "fids"]
 
 if TYPE_CHECKING:
@@ -144,8 +156,6 @@ def _run_child_cli(
     *,
     check: bool = True,
 ) -> CompletedProcess[str]:
-    """Wrapper around subprocess execution for easy monkeypatching in tests."""
-
     return run_subprocess_streaming(argv, check=check)
 
 
@@ -159,37 +169,61 @@ def _parse_repaired_option(value: str | None) -> set[str] | None:
     return rounds or None
 
 
+def _load_outlier_tiles_from_shifts_metrics(
+    csv_path: Path,
+    *,
+    only_median_gt: float,
+) -> list[int]:
+    if not csv_path.exists():
+        raise click.ClickException(f"Missing shifts metrics CSV at {csv_path}")
+
+    outliers: set[int] = set()
+    with csv_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        missing = {name for name in ("tile", "L2") if name not in fieldnames}
+        if missing:
+            raise click.ClickException(f"Invalid shifts metrics CSV at {csv_path}: missing columns {sorted(missing)}")
+
+        for row in reader:
+            try:
+                tile = int(str(row.get("tile", "")).strip())
+                l2 = float(str(row.get("L2", "")).strip())
+            except (TypeError, ValueError) as exc:
+                raise click.ClickException(f"Invalid shifts metrics row in {csv_path}: {row}") from exc
+            if l2 > only_median_gt:
+                outliers.add(tile)
+
+    return sorted(outliers)
+
+
+def _write_shifts_json(
+    ws: Workspace,
+    *,
+    roi: str,
+    codebook: str,
+    idx: int,
+    payload: bytes,
+) -> None:
+    deconv_dir = ws.shifts(roi, codebook)
+    deconv_dir.mkdir(exist_ok=True, parents=True)
+    (deconv_dir / f"shifts-{idx:04d}.json").write_bytes(payload)
+
+
 def _copy_codebook_to_workspace(cli_path: Path, codebook_path: Path) -> Path:
-    """Materialize the provided codebook inside the workspace for reproducibility.
-
-    Args:
-        cli_path: Path value provided to the register CLI (typically analysis/deconv).
-        codebook_path: Source codebook file to replicate inside the workspace.
-
-    Returns:
-        Destination path of the codebook inside ``ws.deconved / codebooks``.
-    """
-
     workspace = Workspace(cli_path)
     codebooks_dir = workspace.deconved / "codebooks"
     codebooks_dir.mkdir(parents=True, exist_ok=True)
 
-    source = Path(codebook_path)
+    source = Path(codebook_path).resolve(strict=True)
     destination = codebooks_dir / source.name
-
-    source_resolved = source.resolve(strict=True)
-    destination_resolved = destination.resolve(strict=False)
-    if source_resolved == destination_resolved:
-        logger.debug(f"Codebook already present at workspace destination {destination_resolved}")
-        return destination
-
     try:
-        shutil.copy2(source, destination)
-    except shutil.SameFileError:
-        logger.debug(f"Codebook already present at workspace destination {destination_resolved}")
-    else:
-        logger.debug(f"Copied codebook from {source_resolved} to {destination_resolved}")
+        if destination.resolve(strict=True) == source:
+            return destination
+    except FileNotFoundError:
+        pass
 
+    shutil.copy2(source, destination)
     return destination
 
 
@@ -328,7 +362,8 @@ def _build_register_config(
     use_fft: bool,
     use_itk: bool,
     use_brightest: int,
-    allow_large_drifts: bool,
+    offset_brightest: int,
+    allow_large_shifts: bool,
     n_fids: int,
     anchor_roi: Path | None = None,
     priors: dict[str, tuple[float, float]] | None = None,
@@ -352,7 +387,8 @@ def _build_register_config(
             n_fids=n_fids,
             detailed=FiducialDetailedConfig(
                 use_brightest=max(use_brightest, 0),
-                allow_large_drifts=allow_large_drifts,
+                offset_brightest=max(offset_brightest, 0),
+                allow_large_shifts=allow_large_shifts,
             ),
         ),
         reference=reference,
@@ -526,7 +562,8 @@ class Image:
         else:
             global_deconv_scaling = None
 
-        nofid = img[:-n_fids].reshape(-1, len(powers), 2048, 2048)
+        tile_h, tile_w = img.shape[-2], img.shape[-1]
+        nofid = img[:-n_fids].reshape(-1, len(powers), tile_h, tile_w)
 
         if to_discard_idxs:
             _bits = name.split("_")
@@ -601,12 +638,14 @@ def run_fiducial(
     ws = Workspace(path)
     prior_mapping: dict[str, str] = {}
 
+    shifts_existing_count: int | None = None
     if (
         config.registration.fiducial.anchor_roi is None  # Skip priors when using anchor ROI
         and len(shifts_existing := sorted(ws.shifts(roi, codebook_name).glob("*.json"))) > 10
         and not no_priors
-        and config.registration.fiducial.priors is None
+        and not config.registration.fiducial.priors
     ):
+        shifts_existing_count = len(shifts_existing)
         _priors: dict[str, list[tuple[float, float]]] = defaultdict(list)
         for shift_path in shifts_existing:
             try:
@@ -622,6 +661,8 @@ def run_fiducial(
             name: tuple(np.median(np.array(shifts), axis=0)) for name, shifts in _priors.items()
         }
         logger.debug(config.registration.fiducial.priors)
+    elif config.registration.fiducial.anchor_roi is None and debug:
+        shifts_existing_count = len(sorted(ws.shifts(roi, codebook_name).glob("*.json")))
 
     prior_mapping |= _apply_priors_to_fids(
         fids,
@@ -630,6 +671,27 @@ def run_fiducial(
         anchor_roi=config.registration.fiducial.anchor_roi,
         idx=idx,
     )
+
+    if debug and config.registration.fiducial.anchor_roi is None:
+        if no_priors:
+            logger.debug("Priors: disabled via --no-priors")
+        elif not config.registration.fiducial.priors:
+            count_msg = (
+                f"{shifts_existing_count}" if shifts_existing_count is not None else "unknown"
+            )
+            logger.debug(f"Priors: none (existing shifts files={count_msg}; need >10 to auto-derive)")
+        else:
+            lines: list[str] = []
+            for name, sh in sorted(config.registration.fiducial.priors.items()):
+                mapped = prior_mapping.get(name)
+                if mapped is None:
+                    continue
+                dx, dy = float(sh[0]), float(sh[1])
+                lines.append(f"{name} -> {mapped}: dx={dx:.3f}, dy={dy:.3f}")
+            if lines:
+                logger.debug("Applied priors:\n" + "\n".join(f"  {line}" for line in lines))
+            else:
+                logger.debug("Priors: configured but none applied (no matching fid keys)")
 
     if config.registration.fiducial.overrides is not None:
         for name, sh in config.registration.fiducial.overrides.items():
@@ -743,8 +805,6 @@ def run_fiducial(
         anchor_roi=config.registration.fiducial.anchor_roi,
     )
 
-    (shift_path := ws.shifts(roi, codebook_name)).mkdir(exist_ok=True)
-
     _fid_ref = fids[reference][500:-500:2, 500:-500:2].flatten()
     validated = Shifts.validate_python(
         {
@@ -765,7 +825,7 @@ def run_fiducial(
         }
     )
     jsoned = Shifts.dump_json(validated)
-    (shift_path / f"shifts-{idx:04d}.json").write_bytes(jsoned)
+    _write_shifts_json(ws, roi=roi, codebook=codebook_name, idx=idx, payload=jsoned)
     logger.debug({k: f"{r.corr:03f}" for k, r in validated.items()})
     return shifts
 
@@ -830,6 +890,7 @@ def _run(
     repaired_rounds = set(repaired_rounds or set())
     roi_dirs = []
     used_repaired: set[str] = set()
+    repaired_paths: dict[str, Path] = {}
     for p in Path(path).glob(f"*--{roi}"):
         if not p.is_dir():
             continue
@@ -843,6 +904,7 @@ def _run(
                 roi_dirs.append(repaired_path)
                 logger.info(f"Using repaired folder for round {round_name}: {repaired_path}")
                 used_repaired.add(round_name)
+                repaired_paths[round_name] = repaired_path
             else:
                 raise FileNotFoundError(f"Repaired folder for round {round_name} not found: {repaired_path}")
         else:
@@ -864,6 +926,16 @@ def _run(
         )
 
     reference_bits = set(reference.split("_"))
+    if repaired_paths:
+        for round_name, repaired_path in repaired_paths.items():
+            round_bits = set(round_name.split("_"))
+            if not (round_bits & (codebook_bits | reference_bits)):
+                continue
+            if not any(repaired_path.glob(f"*-{idx:04d}.tif")):
+                raise FileNotFoundError(
+                    f"Repaired folder for round {round_name} lacks index {idx:04d} in {repaired_path}. "
+                    "Remove --repaired for this round or repair/regenerate the missing file."
+                )
     folders = {
         p for p in roi_dirs if set(p.name.split("--")[0].split("_")) & (codebook_bits | reference_bits)
     }
@@ -1077,6 +1149,52 @@ def get_rois(path: Path, roi: str):
     return {r for r in rois if r and r != "*"}
 
 
+def _build_register_run_argv(
+    *,
+    path: Path,
+    idx: int,
+    codebook: Path,
+    fwhm: int,
+    threshold: int,
+    reference: str,
+    roi: str,
+    max_iters: int,
+    overwrite: bool,
+    debug: bool,
+    repaired: str | None,
+    use_fft: bool,
+    use_itk: bool,
+    use_brightest: int,
+    offset_brightest: int,
+    allow_large_shifts: bool,
+    use_shifts_from: str | None,
+) -> list[str]:
+    argv = [
+        "preprocess",
+        "register",
+        "run",
+        str(path),
+        str(idx),
+        f"--codebook={codebook}",
+        f"--fwhm={fwhm}",
+        f"--threshold={threshold}",
+        "--reference",
+        reference,
+        f"--roi={roi}",
+        f"--max-iters={max_iters}",
+        *(["--overwrite"] if overwrite else []),
+        *(["--debug"] if debug else []),
+        *([f"--repaired={repaired}"] if repaired else []),
+        *(["--use-fft"] if use_fft else []),
+        *(["--use-itk"] if use_itk else []),
+        *([f"--use-brightest={use_brightest}"] if use_brightest > 0 else []),
+        *([f"--offset-brightest={offset_brightest}"] if offset_brightest > 0 else []),
+        *(["--allow-large-shifts"] if allow_large_shifts else []),
+        *([f"--use-shifts-from={use_shifts_from}"] if use_shifts_from else []),
+    ]
+    return argv
+
+
 @click.group()
 def register(): ...
 
@@ -1103,14 +1221,16 @@ def register(): ...
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
 @click.option(
-    "--allow-large-drifts",
-    is_flag=True,
-    help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
+    "--offset-brightest",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Skip the first N brightest fiducial spots before applying --use-brightest.",
 )
 @click.option(
-    "--ignore-large-shifts",
+    "--allow-large-shifts",
     is_flag=True,
-    help="Alias for --allow-large-drifts; accept drifts beyond the threshold without failure.",
+    help="Accept shifts larger than the configured threshold instead of raising DriftTooLarge.",
 )
 @click.option(
     "--repaired",
@@ -1146,8 +1266,8 @@ def run(
     use_itk: bool = False,
     anchors: Path | None = None,
     use_brightest: int = 20,
-    allow_large_drifts: bool = False,
-    ignore_large_shifts: bool = False,
+    offset_brightest: int = 0,
+    allow_large_shifts: bool = False,
     repaired: str | None = None,
     max_iters: int = 5,
     use_shifts_from: str | None = None,
@@ -1166,6 +1286,9 @@ def run(
     rois = get_rois(path, roi)
     codebook_name = codebook.stem
     ws = Workspace(path)
+
+    if offset_brightest > 0 and use_brightest <= 0:
+        raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
 
     for roi in rois:
         reg_file = ws.regimg(roi, codebook_name, idx)
@@ -1205,7 +1328,8 @@ def run(
                     use_fft=use_fft,
                     use_itk=use_itk,
                     use_brightest=use_brightest,
-                    allow_large_drifts=allow_large_drifts or ignore_large_shifts,
+                    offset_brightest=offset_brightest,
+                    allow_large_shifts=allow_large_shifts,
                     n_fids=2,
                     anchor_roi=anchors,
                 ),
@@ -1232,6 +1356,15 @@ def run(
 @click.option("--overwrite", is_flag=True)
 @click.option("--debug", is_flag=True)
 @click.option(
+    "--only-median-gt",
+    type=click.FloatRange(min=0, min_open=True),
+    default=None,
+    help=(
+        "Only process tiles whose per-round L2 distance from the median shift exceeds this value, "
+        "as recorded by `preprocess check-shifts` (output/shifts_metrics). Requires --overwrite."
+    ),
+)
+@click.option(
     "--verify",
     is_flag=True,
     help=(
@@ -1250,9 +1383,16 @@ def run(
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
 @click.option(
-    "--allow-large-drifts",
+    "--offset-brightest",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Skip the first N brightest fiducial spots before applying --use-brightest.",
+)
+@click.option(
+    "--allow-large-shifts",
     is_flag=True,
-    help="Accept drifts larger than the configured threshold instead of raising DriftTooLarge.",
+    help="Accept shifts larger than the configured threshold instead of raising DriftTooLarge.",
 )
 @click.option(
     "--repaired",
@@ -1283,11 +1423,13 @@ def batch(
     threads: int,
     overwrite: bool,
     debug: bool,
+    only_median_gt: float | None,
     verify: bool,
     use_fft: bool = False,
     use_itk: bool = False,
     use_brightest: int = 20,
-    allow_large_drifts: bool = False,
+    offset_brightest: int = 0,
+    allow_large_shifts: bool = False,
     repaired: str | None = None,
     max_iters: int = 5,
     use_shifts_from: str | None = None,
@@ -1304,8 +1446,13 @@ def batch(
         extra={"codebook": codebook_name},
     )
     _silence_matplotlib_debug_logs()
-    ws = Workspace(path.parent.parent)
+    ws = Workspace(path)
     logger.info(f"Found {ws.rois}")
+
+    if offset_brightest > 0 and use_brightest <= 0:
+        raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
+    if only_median_gt is not None and not overwrite:
+        raise click.ClickException("--only-median-gt requires --overwrite.")
 
     if ref is None:
         if "2_10_18" in ws.rounds:
@@ -1319,15 +1466,60 @@ def batch(
     # single provided ROI to align with other preprocess CLIs.
     selected_rois = ws.rois if roi in {"*", "all"} else [roi]
     for roi in selected_rois:
-        names = sorted({name for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")})
-        if not len(names):
-            raise ValueError(f"No images found for {ref}--{roi}")
-        idxs = [
-            int(name.stem.split("-")[1])
-            for name in names
-            if overwrite
-            or not ws.regimg(roi, codebook.stem, int(name.stem.split("-")[1])).exists()
-        ]
+        if use_shifts_from:
+            shift_dir = ws.shifts(roi, use_shifts_from)
+            shift_files = sorted(shift_dir.glob("shifts-*.json"))
+            if not shift_files:
+                raise ValueError(f"No shift files found for {roi}+{use_shifts_from} in {shift_dir}")
+            all_idxs = sorted({int(p.stem.split("-")[1]) for p in shift_files})
+        else:
+            names = sorted({name for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")})
+            if not len(names):
+                fid_dir = ws.fids(roi)
+                fid_files = sorted(fid_dir.glob("fids-*.tif")) if fid_dir.exists() else []
+                fid_idxs: list[int] = []
+                for p in fid_files:
+                    try:
+                        fid_idxs.append(int(p.stem.rsplit("-", 1)[-1]))
+                    except ValueError:
+                        continue
+
+                if not fid_idxs:
+                    raise ValueError(f"No images found for {ref}--{roi}")
+
+                logger.warning(
+                    f"No images found for {ref}--{roi}; using fiducials in {fid_dir} to determine indices."
+                )
+                all_idxs = sorted(set(fid_idxs))
+            else:
+                all_idxs = sorted({int(name.stem.split("-")[1]) for name in names})
+
+        if only_median_gt is not None:
+            metrics_output_dir = ws.output.root
+            metrics_output_dir.mkdir(parents=True, exist_ok=True)
+            _run_child_cli(
+                [
+                    "preprocess",
+                    "check-shifts",
+                    str(ws.path),
+                    str(roi),
+                    "--codebook",
+                    str(codebook),
+                    "--output",
+                    str(metrics_output_dir),
+                ],
+                check=True,
+            )
+
+            metrics_csv = metrics_output_dir / "shifts_metrics" / f"shifts_metrics--{roi}+{codebook_name}.csv"
+            outliers = _load_outlier_tiles_from_shifts_metrics(metrics_csv, only_median_gt=only_median_gt)
+            outlier_set = set(outliers)
+            all_idxs = [i for i in all_idxs if i in outlier_set]
+            if not all_idxs and not verify:
+                logger.warning(f"Skipping {ref}--{roi}: no tiles found with L2 > {only_median_gt}.")
+                continue
+
+        idxs = [i for i in all_idxs if overwrite or not ws.regimg(roi, codebook.stem, i).exists()]
 
         if not idxs and not verify:
             logger.warning(f"Skipping {ref}--{roi}, already registered.")
@@ -1337,27 +1529,25 @@ def batch(
             for i in idxs:
                 submit(
                     _run_child_cli,
-                    [
-                        "preprocess",
-                        "register",
-                        "run",
-                        str(path),
-                        str(i),
-                        f"--codebook={codebook}",
-                        f"--fwhm={fwhm}",
-                        f"--threshold={threshold}",
-                        "--reference",
-                        ref,
-                        f"--roi={roi}",
-                        f"--max-iters={max_iters}",
-                        *(["--overwrite"] if overwrite else []),
-                        *( [f"--repaired={repaired}"] if repaired else [] ),
-                        *(["--use-fft"] if use_fft else []),
-                        *(["--use-itk"] if use_itk else []),
-                        *( [f"--use-brightest={use_brightest}"] if use_brightest > 0 else [] ),
-                        *( ["--allow-large-drifts"] if allow_large_drifts else [] ),
-                        *( [f"--use-shifts-from={use_shifts_from}"] if use_shifts_from else [] ),
-                    ],
+                    _build_register_run_argv(
+                        path=path,
+                        idx=i,
+                        codebook=codebook,
+                        fwhm=fwhm,
+                        threshold=threshold,
+                        reference=ref,
+                        roi=roi,
+                        max_iters=max_iters,
+                        overwrite=overwrite,
+                        debug=debug,
+                        repaired=repaired,
+                        use_fft=use_fft,
+                        use_itk=use_itk,
+                        use_brightest=use_brightest,
+                        offset_brightest=offset_brightest,
+                        allow_large_shifts=allow_large_shifts,
+                        use_shifts_from=use_shifts_from,
+                    ),
                     check=True,
                 )
 
@@ -1366,7 +1556,7 @@ def batch(
             codebook_name = codebook.stem
             reg_dir = ws.registered(roi, codebook_name)
             expected_shape: tuple[int, int, int, int] | None = None
-            verify_idxs = sorted({int(name.stem.split("-")[1]) for name in names})
+            verify_idxs = all_idxs
 
             def _read_shape(p: Path) -> tuple[int, int, int, int]:
                 try:
@@ -1415,22 +1605,25 @@ def batch(
             for i in failed:
                 logger.info(f"[{roi}] Re-running index {i:04d} with --overwrite due to verification failure.")
                 _run_child_cli(
-                    [
-                        "preprocess",
-                        "register",
-                        "run",
-                        str(path),
-                        str(i),
-                        f"--codebook={codebook}",
-                        f"--fwhm={fwhm}",
-                        f"--threshold={threshold}",
-                        "--reference",
-                        ref,
-                        f"--roi={roi}",
-                        "--overwrite",
-                        *( [f"--repaired={repaired}"] if repaired else [] ),
-                        *( ["--allow-large-drifts"] if allow_large_drifts else [] ),
-                    ],
+                    _build_register_run_argv(
+                        path=path,
+                        idx=i,
+                        codebook=codebook,
+                        fwhm=fwhm,
+                        threshold=threshold,
+                        reference=ref,
+                        roi=roi,
+                        max_iters=max_iters,
+                        overwrite=True,
+                        debug=debug,
+                        repaired=repaired,
+                        use_fft=use_fft,
+                        use_itk=use_itk,
+                        use_brightest=use_brightest,
+                        offset_brightest=offset_brightest,
+                        allow_large_shifts=allow_large_shifts,
+                        use_shifts_from=use_shifts_from,
+                    ),
                     check=True,
                 )
 
@@ -1444,6 +1637,24 @@ def batch(
                         )
                 except Exception as e:  # noqa: BLE001
                     logger.error(f"[{roi}] Post-rerun read still failing for {p.name}: {e}")
+
+        if only_median_gt is not None:
+            # Refresh diagnostics after potentially re-registering outlier tiles.
+            metrics_output_dir = ws.output.root
+            metrics_output_dir.mkdir(parents=True, exist_ok=True)
+            _run_child_cli(
+                [
+                    "preprocess",
+                    "check-shifts",
+                    str(ws.path),
+                    str(roi),
+                    "--codebook",
+                    str(codebook),
+                    "--output",
+                    str(metrics_output_dir),
+                ],
+                check=True,
+            )
 
 
 register.add_command(batch)
@@ -1489,6 +1700,14 @@ def _load_reference_fid_from_previous_run(
     idx: int,
     prefer_codebook: str | None = None,
 ) -> np.ndarray:
+    """Load a reference fiducial plane when the reference round TIFF is missing.
+
+    Preference order:
+    1) Any previously written registered fiducial stacks (raw fiducials) under
+       ``registered--ROI+codebook/_fids-XXXX.tif``.
+    2) The ROI-scoped fiducial thumbnail under ``fids--ROI/fids-XXXX.tif`` when present.
+    """
+
     codebooks = ws.registered_codebooks(rois=[roi])
     ordered: list[str] = []
     if prefer_codebook is not None:
@@ -1533,6 +1752,13 @@ def _load_reference_fid_from_previous_run(
             logger.info(f"Loaded reference fiducial from previous run: {fids_path}")
             return plane
 
+    fid_path = ws.fid(roi, idx)
+    if fid_path.exists():
+        with TiffFile(fid_path) as tif:
+            plane = np.asarray(tif.asarray()).astype(np.float32)
+        logger.info(f"Loaded reference fiducial from {fid_path} (fids directory fallback)")
+        return plane
+
     searched = ", ".join(ordered) if ordered else "none"
     raise FileNotFoundError(
         f"Reference round directory is missing and no previous-run fiducial was found for "
@@ -1570,10 +1796,17 @@ def _load_reference_fid_from_previous_run(
     help="If >0, use only the N brightest fiducials (matches register run).",
 )
 @click.option(
-    "--allow-large-drifts/--strict-drifts",
+    "--offset-brightest",
+    type=click.IntRange(min=0),
+    default=0,
+    show_default=True,
+    help="Skip the first N brightest fiducial spots before applying --use-brightest.",
+)
+@click.option(
+    "--allow-large-shifts/--strict-shifts",
     default=True,
     show_default=True,
-    help="Enable the same allow_large_drifts toggle used in register run.",
+    help="Enable the same allow_large_shifts toggle used in register run.",
 )
 @click.option(
     "--priors",
@@ -1593,14 +1826,15 @@ def fix_shifts(
     threshold: float,
     fwhm: float,
     use_brightest: int,
-    allow_large_drifts: bool,
+    offset_brightest: int,
+    allow_large_shifts: bool,
     priors: str | None,
     debug: bool,
 ):
     """Detect large drift offsets and write shifts to JSON.
 
     Uses the SAME registration algorithm as the main pipeline (align_fiducials)
-    but with allow_large_drifts=True. Only detects and writes shifts - does NOT
+    but with allow_large_shifts=True. Only detects and writes shifts - does NOT
     apply them to images.
 
     The output JSON can be used to inform priors for `register batch`.
@@ -1647,6 +1881,9 @@ def fix_shifts(
     if cli_priors:
         logger.info(f"Using explicit priors for rounds: {sorted(cli_priors)}")
 
+    if offset_brightest > 0 and use_brightest <= 0:
+        raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
+
     config = Config(
         dataPath=str(DATA),
         exclude=None,
@@ -1657,7 +1894,8 @@ def fix_shifts(
             use_fft=use_fft,
             use_itk=False,
             use_brightest=use_brightest,
-            allow_large_drifts=allow_large_drifts,
+            offset_brightest=offset_brightest,
+            allow_large_shifts=allow_large_shifts,
             n_fids=n_fids,
             priors=cli_priors,
         ),
