@@ -220,9 +220,19 @@ class myGPUCluster:
 
         try:
             if self._client is not None:
-                self._client.close()
+                try:
+                    self._client.close(timeout=30)
+                except TimeoutError as close_exc:
+                    logging.getLogger(__name__).warning(
+                        f"Timed out while closing Dask client (cluster shutdown); ignoring: {close_exc!r}"
+                    )
             if self._cluster is not None:
-                self._cluster.close()
+                try:
+                    self._cluster.close(timeout=30)
+                except TimeoutError as close_exc:
+                    logging.getLogger(__name__).warning(
+                        f"Timed out while closing Dask cluster (cluster shutdown); ignoring: {close_exc!r}"
+                    )
         finally:
             # Clean up transient dask config used for logging control.
             _remove_config_file(DEFAULT_CONFIG_FILENAME)
@@ -303,8 +313,21 @@ class myLocalCluster(distributed.LocalCluster):
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
         if not self.persist_config:
             _remove_config_file(self.config_name)
-        self.client.close()
-        super().__exit__(exc_type, exc_value, traceback)
+        import logging
+
+        try:
+            self.client.close(timeout=30)
+        except TimeoutError as close_exc:
+            logging.getLogger(__name__).warning(
+                f"Timed out while closing Dask client (cluster shutdown); ignoring: {close_exc!r}"
+            )
+
+        try:
+            super().__exit__(exc_type, exc_value, traceback)
+        except TimeoutError as close_exc:
+            logging.getLogger(__name__).warning(
+                f"Timed out while closing Dask LocalCluster (cluster shutdown); ignoring: {close_exc!r}"
+            )
 
 
 # ----------------------- decorator -------------------------------------------#

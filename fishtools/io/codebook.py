@@ -42,5 +42,14 @@ class Codebook:
             .alias("bits")
         )
 
+    def blank_stats(self) -> tuple[int, int]:
+        """Return (n_total_codes, n_blank_codes) from codebook."""
+        import polars as pl
+
+        df = self.to_dataframe()
+        n_total = len(df)
+        n_blanks = df.filter(pl.col("target").str.starts_with("Blank")).height
+        return n_total, n_blanks
+
 
 __all__ = ["Codebook"]

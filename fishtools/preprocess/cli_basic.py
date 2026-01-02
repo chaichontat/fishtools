@@ -107,7 +107,9 @@ def _is_canonical_round(sample_file: Path) -> bool:
         return bool(re.fullmatch(r"\d+_\d+_\d+", round_token))
 
 
-def sample_canonical_unique_tiles(path: Path) -> tuple[list[Path], list[str]]:
+def sample_canonical_unique_tiles(
+    path: Path, *, include_edge_tiles: bool = False
+) -> tuple[list[Path], list[str]]:
     """Return interior tiles from canonical rounds with round-rotating selection.
 
     Canonical rounds are those whose channel names are numeric and exactly 3 long
@@ -145,7 +147,9 @@ def sample_canonical_unique_tiles(path: Path) -> tuple[list[Path], list[str]]:
                 continue
             allowed = _allowed_indices_for_roi(path, roi_dirname, allowed_by_roi)
             idx = _parse_tile_index(f)
-            if allowed is None or idx is None or idx not in allowed:
+            if idx is None:
+                continue
+            if not include_edge_tiles and (allowed is None or idx not in allowed):
                 continue  # enforce interior only when CSV known
             by_roi_index.setdefault(roi_base, {}).setdefault(idx, {})[r] = f
 
@@ -202,8 +206,16 @@ def extract_data_from_tiff(
     if nc is None:
         raise ValueError("nc must be provided.")
 
+    with TiffFile(files[0]) as tif0:
+        first_page = tif0.pages[0].asarray()
+        if first_page.ndim == 3:
+            first_page = first_page[0]
+        if first_page.ndim != 2:
+            raise ValueError(f"Unexpected TIFF page shape {first_page.shape} in {files[0]}.")
+        height, width = first_page.shape
+
     # Initialize output array
-    out = np.zeros((n, len(zs), nc, 2048, 2048), dtype=np.float32)
+    out = np.zeros((n, len(zs), nc, height, width), dtype=np.float32)
 
     # Extract z slices from all files
     for i, file in enumerate(files[:n]):
@@ -222,6 +234,10 @@ def extract_data_from_tiff(
                         img = tif.pages[int(z * nz) * nc + c].asarray()
                         if img.ndim == 3:  # single channel
                             img = img[0]
+                        if img.shape != (height, width):
+                            raise ValueError(
+                                f"Unexpected tile size {img.shape} in {file}; expected {(height, width)}."
+                            )
 
                         if deconv_meta is not None:
                             img = scale_deconv(
@@ -241,7 +257,7 @@ def extract_data_from_tiff(
                         raise Exception(f"Error at {file}, {i}, {k}, {c}.") from e
 
     # Reshape to combine file and z dimensions
-    out = np.reshape(out, (n * len(zs), nc, 2048, 2048))
+    out = np.reshape(out, (n * len(zs), nc, height, width))
     logger.info(f"Loaded {n} files. Output shape: {out.shape}")
 
     return out
@@ -253,6 +269,8 @@ def fit_and_save_basic(
     round_: str,
     channels: list[str],
     plot: bool = True,
+    *,
+    overwrite: bool = False,
 ) -> list[BaSiC]:
     """
     Fit BaSiC models for each channel and save the results.
@@ -270,10 +288,26 @@ def fit_and_save_basic(
     lock = Lock()
 
     def fit_write(idx: int, channel: str) -> BaSiC:
+        out_pkl = output_dir / f"{round_}-{channel}.pkl"
+        out_png = output_dir / f"{round_}-{channel}.png"
+
+        if not overwrite and out_pkl.exists():
+            loaded = pickle.loads(out_pkl.read_bytes())
+            basic = loaded.get("basic") if isinstance(loaded, dict) else loaded
+            if not isinstance(basic, BaSiC):
+                raise TypeError(f"Unexpected BaSiC pickle payload at {out_pkl}: {type(basic)}")
+
+            if not out_png.exists():
+                with lock:
+                    plot_basic(basic)
+                    plt.savefig(out_png)
+                    plt.close()
+            return basic
+
         basic = fit_basic(data, idx)
         logger.info(f"Writing {round_}-{channel}.pkl")
 
-        with open(output_dir / f"{round_}-{channel}.pkl", "wb") as f:
+        with open(out_pkl, "wb") as f:
             pickle.dump(
                 dict(
                     basic=basic,
@@ -286,7 +320,7 @@ def fit_and_save_basic(
 
         with lock:
             plot_basic(basic)
-            plt.savefig(output_dir / f"{round_}-{channel}.png")
+            plt.savefig(out_png)
             plt.close()
 
         return basic
@@ -360,6 +394,8 @@ def run_with_extractor(
     zs: Collection[float] = (0.5,),
     *,
     seed: int | None = None,
+    overwrite: bool = False,
+    include_edge_tiles: bool = False,
 ):
     """
     Generic function to run processing with a specific data extractor.
@@ -385,7 +421,7 @@ def run_with_extractor(
 
     # Get rounds/tiles. When round_ is None → sample canonical rounds with dedup & 2-step margin.
     if not round_:
-        files, extra_rounds = sample_canonical_unique_tiles(path)
+        files, extra_rounds = sample_canonical_unique_tiles(path, include_edge_tiles=include_edge_tiles)
         if extra_rounds:
             logger.info(
                 f"Will run {extra_rounds} separately due to an atypical/non-canonical channel layout."
@@ -432,17 +468,20 @@ def run_with_extractor(
 
     # Apply filter: interior (n>=2) when ROI CSVs are available.
     filtered_files: list[Path] = []
-    for f in files:
-        roi_dirname = f.parent.name
-        allowed = _allowed_indices_for_roi_local(roi_dirname)
-        idx = _parse_tile_index(f)
-        is_interior = allowed is not None and idx is not None and idx in allowed
-        # sz = f.lstat().st_size
-        # Consider only positive sizes for percentile logic to prevent zero-valued files from
-        # collapsing the threshold and letting edge tiles through inadvertently.
-        # is_large = (sz > 0) and (sz >= size_thresh)
-        if is_interior:
-            filtered_files.append(f)
+    if include_edge_tiles:
+        filtered_files = list(files)
+    else:
+        for f in files:
+            roi_dirname = f.parent.name
+            allowed = _allowed_indices_for_roi_local(roi_dirname)
+            idx = _parse_tile_index(f)
+            is_interior = allowed is not None and idx is not None and idx in allowed
+            # sz = f.lstat().st_size
+            # Consider only positive sizes for percentile logic to prevent zero-valued files from
+            # collapsing the threshold and letting edge tiles through inadvertently.
+            # is_large = (sz > 0) and (sz >= size_thresh)
+            if is_interior:
+                filtered_files.append(f)
 
     if not filtered_files:
         roi_labels = sorted(
@@ -571,11 +610,19 @@ def run_with_extractor(
     data = extractor_func(files, zs, deconv_meta, nc=len(channels), max_files=1000 if round_ else 1000)
 
     # Fit and save BaSiC models
-    res = fit_and_save_basic(data, basic_dir, round_ or "all", channels, plot)
+    res = fit_and_save_basic(data, basic_dir, round_ or "all", channels, plot, overwrite=overwrite)
 
     for r in extra_rounds:
         logger.info(f"Running {r}")
-        run_with_extractor(path, r, extractor_func, plot=plot, zs=zs)
+        run_with_extractor(
+            path,
+            r,
+            extractor_func,
+            plot=plot,
+            zs=zs,
+            overwrite=overwrite,
+            include_edge_tiles=include_edge_tiles,
+        )
 
     return res
 
@@ -589,8 +636,21 @@ def basic(): ...
 @click.argument("round_", type=str)
 @click.option("--zs", type=str, default="0.5")
 @click.option("--overwrite", is_flag=True)
+@click.option(
+    "--include-edge-tiles/--no-include-edge-tiles",
+    default=False,
+    help="Include edge tiles in BaSiC sampling (does not require ROI CSVs).",
+)
 @click.option("--seed", type=int, default=None, help="Random seed for sampling (optional)")
-def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5", seed: int | None = None):
+def run(
+    path: Path,
+    round_: str,
+    *,
+    overwrite: bool = False,
+    include_edge_tiles: bool = False,
+    zs: str = "0.5",
+    seed: int | None = None,
+):
     # Workspace-scoped logging to {workspace}/analysis/logs; compatible with progress bars
     setup_cli_logging(
         path,
@@ -598,9 +658,21 @@ def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5", se
         file=f"basic-{round_}",
         extra={"round": round_},
     )
-    if not overwrite and list((path / "basic").glob(f"{round_}*")):
-        logger.info(f"Basic already run for {round_} in {path}. Use --overwrite to re-run.")
-        return
+    basic_dir = path / "basic"
+    if not overwrite:
+        expected_channels: list[str]
+        if round_ == "all":
+            expected_channels = ["560", "650", "750"]
+        else:
+            sample = next(iter(sorted(path.glob(f"{round_}--*/*.tif"))), None)
+            if sample is None:
+                raise click.ClickException(f"No TIFFs found for round '{round_}' under {path}.")
+            expected_channels = get_channels(sample)
+
+        expected_pkls = [basic_dir / f"{round_}-{ch}.pkl" for ch in expected_channels]
+        if expected_pkls and all(p.exists() for p in expected_pkls):
+            logger.info(f"BaSiC already complete for {round_} in {path}. Use --overwrite to re-run.")
+            return
     z_values = tuple(map(float, zs.split(",")))
     extractor = extract_data_from_registered if round_ == "registered" else extract_data_from_tiff
 
@@ -611,6 +683,8 @@ def run(path: Path, round_: str, *, overwrite: bool = False, zs: str = "0.5", se
         plot=False,
         zs=z_values,
         seed=seed,
+        overwrite=overwrite,
+        include_edge_tiles=include_edge_tiles,
     )
 
 

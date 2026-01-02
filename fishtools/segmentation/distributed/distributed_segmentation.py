@@ -334,10 +334,26 @@ def _gpu_probe() -> dict[str, Any]:
     import distributed as _dist
     import torch  # type: ignore
 
-    worker = getattr(_dist.get_worker(), "name", "unknown")
-    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    torch_dev = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
-    return {"worker": worker, "cuda_visible_devices": cuda_visible, "torch_current_device": torch_dev}
+    # Be defensive: during startup/shutdown (or in some LocalCluster thread modes)
+    # `get_worker()` can raise. If we raise here, Dask may fail to serialize the
+    # exception when Rich logging is enabled (ContextVar pickling), which surfaces
+    # as a noisy "contextvars cannot be pickled" error.
+    try:
+        worker = getattr(_dist.get_worker(), "name", "unknown")
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        torch_dev = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+        return {
+            "worker": worker,
+            "cuda_visible_devices": cuda_visible,
+            "torch_current_device": torch_dev,
+        }
+    except Exception as exc:  # pragma: no cover - defensive against early startup failures
+        return {
+            "worker": "unknown",
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "torch_current_device": None,
+            "error": repr(exc),
+        }
 
 
 ######################## File format functions ################################
@@ -796,10 +812,18 @@ def distributed_eval(
 
     # GPU preflight probe to confirm worker pinning
     try:
-        probe = cluster.client.run(_gpu_probe)
-        logger.info(f"GPU probe results: {probe}")
+        cluster.client.wait_for_workers(1, timeout=30)
     except Exception as e:
-        logger.warning(f"GPU probe failed: {e}")
+        logger.warning(f"GPU probe skipped: workers not ready ({e!r})")
+    else:
+        try:
+            probe = cluster.client.run(_gpu_probe)
+            if any("error" in info for info in probe.values()):
+                logger.warning(f"GPU probe returned errors: {probe}")
+            else:
+                logger.info(f"GPU probe results: {probe}")
+        except Exception as e:
+            logger.warning(f"GPU probe failed: {e!r}")
 
     offset = 0
     n = None

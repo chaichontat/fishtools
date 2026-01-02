@@ -252,6 +252,38 @@ class TestCalculateDrift:
                 err_msg=f"Failed with use_brightest={use_brightest}",
             )
 
+    def test_calculate_drift_offset_brightest_skips_first_n(
+        self, ref_kdtree: cKDTree, reference_points: pl.DataFrame
+    ) -> None:
+        """Test offset_brightest pagination over brightest spots."""
+        true_shift = (2.0, 3.0)
+        target_points = self.create_shifted_target_points(reference_points, dx=true_shift[0], dy=true_shift[1])
+
+        # Inject a few "brightest" but invalid points so that use_brightest alone fails.
+        bad_points = pl.DataFrame(
+            {
+                "idx": [100, 101, 102],
+                "xcentroid": [np.nan, np.nan, np.nan],
+                "ycentroid": [np.nan, np.nan, np.nan],
+                "mag": [-100.0, -100.0, -100.0],
+            }
+        )
+        target_with_bad = pl.concat([target_points, bad_points])
+
+        with pytest.raises(NotEnoughSpots):
+            _calculate_drift(ref_kdtree, reference_points, target_with_bad, use_brightest=3, offset_brightest=0)
+
+        calculated_drift = _calculate_drift(
+            ref_kdtree,
+            reference_points,
+            target_with_bad,
+            use_brightest=3,
+            offset_brightest=3,
+            precision=2,
+        )
+        expected_registration_shift = [-true_shift[0], -true_shift[1]]
+        np.testing.assert_allclose(calculated_drift, expected_registration_shift, atol=0.4)
+
     def test_calculate_drift_precision_parameter(
         self, ref_kdtree: cKDTree, reference_points: pl.DataFrame
     ) -> None:

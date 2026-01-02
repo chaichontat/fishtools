@@ -5,7 +5,6 @@ from typing import Any
 
 import numpy as np
 import pytest
-import zarr
 from PIL import Image
 
 from fishtools.preprocess import n4

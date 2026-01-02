@@ -310,9 +310,6 @@ def shifts_from_anchor_roi(
     if not isinstance(rois, list):
         rois = [rois]
 
-    # Find reference channel index
-    ref_channel = ordered_keys.index(reference)
-
     # Group points by channel (c_position is 1-indexed in ImageJ)
     points_by_channel: dict[int, list[tuple[float, float]]] = defaultdict(list)
     for roi in rois:
@@ -339,7 +336,7 @@ def shifts_from_anchor_roi(
 
     shifts: dict[str, np.ndarray] = {reference: np.array([0.0, 0.0])}
 
-    for round_name in rounds:
+    for round_name in ordered_keys:
         if round_name == reference:
             continue
         if round_name not in points_by_round:
@@ -413,6 +410,7 @@ def _calculate_drift(
     *,
     initial_drift: np.ndarray | None = None,
     use_brightest: int = 0,
+    offset_brightest: int = 0,
     # subtract_background: bool = False,
     plot: bool = False,
     precision: int = 2,
@@ -434,6 +432,7 @@ def _calculate_drift(
         target_points: DataFrame of target fiducial spots to be matched against reference
         initial_drift: Prior estimate of drift to improve matching (typically from previous iteration)
         use_brightest: If >0, use only the N brightest spots for more robust matching
+        offset_brightest: Skip the first N brightest spots before applying use_brightest (pagination-style)
         plot: Whether to generate diagnostic histogram plots of drift distributions
         precision: Decimal precision for drift calculation rounding
         warning_spots_threshold: Warn if more spots detected (may indicate noise contamination)
@@ -462,7 +461,9 @@ def _calculate_drift(
 
     if use_brightest:
         # Sort ascending: most negative (brightest) first
-        target_points = target_points.sort("mag")[:use_brightest]
+        if offset_brightest < 0:
+            raise ValueError("offset_brightest must be >= 0")
+        target_points = target_points.sort("mag").slice(offset_brightest, use_brightest)
 
     # points = moving[cols].to_numpy()
     if initial_drift is None:
@@ -477,7 +478,7 @@ def _calculate_drift(
         pl.col("xcentroid").is_finite() & pl.col("ycentroid").is_finite()
     )
     if target_points.is_empty():
-        raise NotEnoughSpots("No finite target spots available for drift calculation.")
+        raise NotEnoughSpots("Empty target points (no finite spots) available for drift calculation.")
 
     dist, idxs = ref_kd.query(target_points[cols].to_numpy(), workers=2)
     mapping = pl.concat(
@@ -729,7 +730,6 @@ def individual_align_fiducial(
 
         # Iteratively reduce threshold_sigma until we get enough fiducials.
         while _attempt < detailed_config.max_drift_attempts:
-            rand = np.random.default_rng(0)
             tried.add((local_σ, local_fwhm))
             try:
                 moving = find_spots(
@@ -754,6 +754,7 @@ def individual_align_fiducial(
                         moving,
                         initial_drift=initial_drift,
                         use_brightest=use_brightest,
+                        offset_brightest=detailed_config.offset_brightest,
                         warning_spots_threshold=detailed_config.warning_spots_threshold,
                         min_spots_for_mode=detailed_config.min_spots_for_mode,
                         max_drift_threshold=detailed_config.max_drift_threshold,
@@ -772,10 +773,10 @@ def individual_align_fiducial(
                     initial_drift = drift
 
                 if np.max(np.abs(drift)) > detailed_config.max_drift_threshold:
-                    if detailed_config.allow_large_drifts:
+                    if detailed_config.allow_large_shifts:
                         logger.warning(
                             f"{bitname}: drift {np.hypot(*drift):.2f} exceeds threshold "
-                            f"{detailed_config.max_drift_threshold}px but allow_large_drifts is enabled; accepting."
+                            f"{detailed_config.max_drift_threshold}px but allow_large_shifts is enabled; accepting."
                         )
                     else:
                         local_σ += detailed_config.threshold_step
@@ -894,8 +895,8 @@ def _align_fiducials_internal(
         detailed_config=detailed_config,
     )
 
-    # ITK max_shift: use larger limit when allow_large_drifts is enabled
-    itk_max_shift = 500.0 if detailed_config.allow_large_drifts else detailed_config.max_drift_threshold
+    # ITK max_shift: use larger limit when allow_large_shifts is enabled
+    itk_max_shift = 500.0 if detailed_config.allow_large_shifts else detailed_config.max_drift_threshold
 
     mode_map: dict[str, str] = {}
     itk_iterations: dict[str, int] = {}

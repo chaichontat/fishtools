@@ -52,6 +52,8 @@ class DeconvolutionOutputMode(str, Enum):
 
 class NumpyEncoder(JSONEncoder):
     def default(self, o: Any) -> Any:
+        if isinstance(o, np.generic):
+            return o.item()
         if isinstance(o, np.ndarray):
             return o.tolist()
         return super().default(o)
@@ -100,6 +102,14 @@ class FiducialDetailedConfig(BaseModel):
             "0 means use all detected spots."
         ),
     )
+    offset_brightest: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Skip the first N brightest fiducial spots before applying use_brightest. "
+            "This behaves like pagination over spots sorted by brightness (mag)."
+        ),
+    )
 
     # Alignment quality thresholds
     bin_size: float = Field(default=0.5, description="Bin size for mode calculation in drift estimation")
@@ -107,11 +117,11 @@ class FiducialDetailedConfig(BaseModel):
         default=99.0, description="Percentile for intensity normalization in plotting"
     )
 
-    allow_large_drifts: bool = Field(
+    allow_large_shifts: bool = Field(
         default=False,
         description=(
-            "If true, accept drifts larger than max_drift_threshold without raising DriftTooLarge. "
-            "Use cautiously; large drifts may indicate mis-registration."
+            "If true, accept shifts larger than max_drift_threshold without raising DriftTooLarge. "
+            "Use cautiously; large shifts may indicate mis-registration."
         ),
     )
 
@@ -360,6 +370,10 @@ class SpotThresholdParams(BaseModel):
         default="linear", description="Spacing of density contour levels"
     )
     contour_levels: int = Field(default=50, gt=1, description="Number of contour levels")
+    use_main_mass_mask: bool = Field(
+        default=True,
+        description="Apply main-mass masking to exclude sparse outlier regions from contour calculation",
+    )
 
     # Reproducibility
     seed: int = Field(default=0, ge=0, description="Random seed")

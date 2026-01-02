@@ -50,6 +50,29 @@ def test_load_projectors_handles_small_psf(tmp_path: Path, monkeypatch) -> None:
     np.testing.assert_allclose(backward.sum(), backward.sum(), rtol=1e-5)
 
 
+def test_projectors_does_not_overwrite_existing_cache(tmp_path: Path, monkeypatch) -> None:
+    psf_dir = tmp_path / "fishtools" / "data"
+    psf_dir.mkdir(parents=True)
+    psf_path = psf_dir / "PSF GL.tif"
+    _write_synthetic_psf(psf_path, (101, 35, 35))
+
+    step = 7
+    cache_path = psf_path.with_name(f"{psf_path.stem}.step{step}.npy")
+    expected = np.arange(2 * 5 * 1 * 7 * 7, dtype=np.float32).reshape(2, 5, 1, 7, 7)
+    np.save(cache_path, expected)
+
+    monkeypatch.setattr("fishtools.preprocess.deconv.core.DATA_DIR", psf_dir)
+    monkeypatch.setattr(
+        "fishtools.preprocess.deconv.core.make_projector",
+        lambda *args, **kwargs: pytest.fail("make_projector should not be called when cache exists"),
+    )
+    projectors.cache_clear()
+
+    forward, backward = projectors(step=step)
+    np.testing.assert_allclose(cp.asnumpy(forward), expected[0])
+    np.testing.assert_allclose(cp.asnumpy(backward), expected[1])
+
+
 @pytest.mark.integration
 def test_fft_deconvolution_matches_spatial_interior() -> None:
     import fishtools.preprocess.deconv.core as core

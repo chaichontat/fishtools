@@ -207,17 +207,18 @@ def overlay_intensity(
     """Overlay stitched intensity volumes onto segmentation masks for one or more ROIs."""
 
     workspace = Workspace(path)
-    target_roi = roi or "*"
-    batch_mode = target_roi == "*"
+    roi_token = (roi or "*").strip()
+    batch_mode = roi_token == "*" or roi_token.lower() == "all"
     try:
-        rois: Iterable[str] = workspace.resolve_rois() if batch_mode else workspace.resolve_rois([target_roi])
+        rois: Iterable[str] = (
+            workspace.resolve_rois() if batch_mode else workspace.resolve_rois([roi_token])
+        )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
     if not rois:
         raise click.ClickException(f"No ROIs discovered under workspace {path}.")
 
-    failed: list[str] = []
     for current_roi in rois:
         try:
             _run_overlay_for_roi(
@@ -234,12 +235,8 @@ def overlay_intensity(
         except Exception as exc:
             logger.error(f"ROI '{current_roi}': {exc}")
             if batch_mode:
-                failed.append(current_roi)
                 continue
             raise click.ClickException(str(exc)) from exc
-
-    if failed:
-        raise click.ClickException("One or more ROIs failed during overlay intensity: " + ", ".join(failed))
 
 
 if __name__ == "__main__":

@@ -20,7 +20,7 @@ def _make_fused(path: Path, data: np.ndarray, names: list[str] | None = None) ->
         shape=data.shape,
         chunks=(1, data.shape[1], data.shape[2], 1),
         dtype=data.dtype,
-        codecs=default_zarr_codecs(),
+        codecs=default_zarr_codecs(data.dtype),
     )
     store[...] = data
     if names is not None:

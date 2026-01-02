@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -9,6 +10,8 @@ import pytest
 from click.testing import CliRunner
 from tifffile import imwrite
 
+import fishtools.preprocess.cli_register as cli_register_module
+from fishtools.io.workspace import Workspace
 from fishtools.preprocess.cli_register import (
     DATA,
     Config,
@@ -18,6 +21,7 @@ from fishtools.preprocess.cli_register import (
     _debug_fid_paths,
     _load_shifts_from_codebook,
     _run,
+    _write_shifts_json,
     _save_debug_overlay,
 )
 from fishtools.preprocess.cli_register import (
@@ -70,7 +74,27 @@ def test_save_debug_overlay_prefixes_roi(tmp_path: Path) -> None:
         "round2": np.ones((6, 6), dtype=np.float32) * 5,
     }
     _save_debug_overlay(tmp_path, "roiZ", 12, "reference", shifted)
-    assert (tmp_path / "roiZ-0012-round2.png").exists()
+    assert (tmp_path / "roiZ-0012-overlay.png").exists()
+
+
+def test_workspace_transformations_paths_use_roi_folder(tmp_path: Path) -> None:
+    root, _deconv = _make_workspace(tmp_path)
+    ws = Workspace(root)
+    with pytest.raises(AttributeError):
+        _ = ws.register_transformations_shift_json("roiA", "cb-1", 7)
+
+
+def test_write_shifts_json_writes_only_to_deconv_shifts(tmp_path: Path) -> None:
+    root, _deconv = _make_workspace(tmp_path)
+    ws = Workspace(root)
+
+    payload = b"{\"ok\": true}\n"
+    _write_shifts_json(ws, roi="roiA", codebook="cb", idx=1, payload=payload)
+
+    deconv_path = ws.shifts("roiA", "cb") / "shifts-0001.json"
+
+    assert deconv_path.read_bytes() == payload
+    assert not (root / "analysis" / "output" / "transformations").exists()
 
 
 def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> None:
@@ -115,6 +139,8 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
         overwrite: bool,
         no_priors: bool,
         repaired_rounds: set[str] | None = None,
+        max_iters: int = 5,
+        use_shifts_from: str | None = None,
     ) -> None:  # type: ignore[no-untyped-def]
         called.update({
             "path": path,
@@ -127,6 +153,8 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
             "overwrite": overwrite,
             "no_priors": no_priors,
             "repaired_rounds": repaired_rounds,
+            "max_iters": max_iters,
+            "use_shifts_from": use_shifts_from,
         })
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
@@ -167,11 +195,12 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
     assert cfg.registration.crop == 40
     assert cfg.registration.downsample == 1
     assert cfg.registration.fiducial.detailed.use_brightest == 20
-    assert cfg.registration.fiducial.detailed.allow_large_drifts is False
+    assert cfg.registration.fiducial.detailed.offset_brightest == 0
+    assert cfg.registration.fiducial.detailed.allow_large_shifts is False
 
-    # Alias flag should toggle the same setting
+    # Non-default offset should be plumbed through to the config
     called.clear()
-    result_alias = runner.invoke(
+    result_offset = runner.invoke(
         register_cli,
         [
             "run",
@@ -183,12 +212,15 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
             "roiA",
             "--reference",
             "4_12_20",
-            "--ignore-large-shifts",
+            "--offset-brightest",
+            "5",
         ],
     )
-    assert result_alias.exit_code == 0, result_alias.output
-    cfg_alias = called["config"]
-    assert cfg_alias.registration.fiducial.detailed.allow_large_drifts is True
+    assert result_offset.exit_code == 0, result_offset.output
+    cfg_offset = called["config"]
+    assert cfg_offset.registration.fiducial.detailed.use_brightest == 20
+    assert cfg_offset.registration.fiducial.detailed.offset_brightest == 5
+
 
 
 def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) -> None:
@@ -217,6 +249,19 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
         def deconved(self) -> Path:
             return self._deconved
 
+        @property
+        def output(self) -> SimpleNamespace:
+            return SimpleNamespace(root=self.path / "analysis" / "output")
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
+
     monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
 
     calls: list[list[str]] = []
@@ -243,7 +288,9 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
             "--overwrite",
             "--threads",
             "1",
-            "--allow-large-drifts",
+            "--allow-large-shifts",
+            "--offset-brightest",
+            "10",
         ],
     )
 
@@ -259,10 +306,11 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
     # Batch should forward default fwhm/threshold into child command
     assert any(a.startswith("--fwhm=") and float(a.split("=", 1)[1]) == 4.0 for a in argv)
     assert any(a.startswith("--threshold=") and float(a.split("=", 1)[1]) == 6.0 for a in argv)
-    assert "--allow-large-drifts" in argv
+    assert "--allow-large-shifts" in argv
+    assert "--offset-brightest=10" in argv
 
 
-def test_cli_register_batch_verify_respects_allow_large_drifts(tmp_path: Path, monkeypatch: Any) -> None:
+def test_cli_register_batch_forwards_debug(tmp_path: Path, monkeypatch: Any) -> None:
     _root, base = _make_workspace(tmp_path)
     (base / "2_10_18--roiA").mkdir(parents=True)
     (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
@@ -284,6 +332,531 @@ def test_cli_register_batch_verify_respects_allow_large_drifts(tmp_path: Path, m
         @property
         def deconved(self) -> Path:
             return self._deconved
+
+        @property
+        def output(self) -> SimpleNamespace:
+            return SimpleNamespace(root=self.path / "analysis" / "output")
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        assert check is True
+        calls.append(argv)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--overwrite",
+            "--threads",
+            "1",
+            "--debug",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    register_calls = [call for call in calls if call[:3] == ["preprocess", "register", "run"]]
+    assert len(register_calls) == 1
+    assert "--debug" in register_calls[0]
+
+
+def test_cli_register_batch_only_median_gt_requires_overwrite(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--threads",
+            "1",
+            "--only-median-gt",
+            "1.0",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--only-median-gt requires --overwrite" in result.output
+
+
+def test_cli_register_batch_only_median_gt_filters_tiles(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    for idx in (1, 2, 3):
+        (base / "2_10_18--roiA" / f"2_10_18-{idx:04d}.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+        @property
+        def output(self) -> SimpleNamespace:
+            return SimpleNamespace(root=self.path / "analysis" / "output")
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        assert check is True
+        calls.append(argv)
+
+        if argv[:2] == ["preprocess", "check-shifts"]:
+            out_dir = Path(argv[argv.index("--output") + 1])
+            roi_value = argv[3]
+            codebook_path = Path(argv[argv.index("--codebook") + 1])
+            csv_path = out_dir / "shifts_metrics" / f"shifts_metrics--{roi_value}+{codebook_path.stem}.csv"
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            csv_path.write_text("tile,L2\n1,0.1\n2,2.1\n3,5.0\n")
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--overwrite",
+            "--threads",
+            "1",
+            "--only-median-gt",
+            "2.0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sum(1 for call in calls if call[:2] == ["preprocess", "check-shifts"]) == 2
+
+    register_calls = [call for call in calls if call[:3] == ["preprocess", "register", "run"]]
+    assert len(register_calls) == 2
+    seen_idxs = sorted(int(call[4]) for call in register_calls)
+    assert seen_idxs == [2, 3]
+
+
+def test_cli_register_batch_falls_back_to_fids_for_idx_discovery(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, base = _make_workspace(tmp_path)
+    # No ref round directory created: fallback must use fids--roiA to determine indices.
+    fid_dir = base / "fids--roiA"
+    fid_dir.mkdir(parents=True, exist_ok=True)
+    imwrite(fid_dir / "fids-0002.tif", np.zeros((4, 4), dtype=np.uint16))
+    imwrite(fid_dir / "fids-0007.tif", np.zeros((4, 4), dtype=np.uint16))
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
+
+        def fids(self, roi: str) -> Path:
+            return self._deconved / f"fids--{roi}"
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        assert check is True
+        calls.append(argv)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--overwrite",
+            "--threads",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    register_calls = [call for call in calls if call[:3] == ["preprocess", "register", "run"]]
+    seen_idxs = sorted(int(call[4]) for call in register_calls)
+    assert seen_idxs == [2, 7]
+
+
+def test_load_reference_fid_falls_back_to_fids_dir(tmp_path: Path) -> None:
+    root, deconv = _make_workspace(tmp_path)
+    ws = cli_register_module.Workspace(root)
+
+    roi = "roiA"
+    idx = 7
+    reference = "2_10_18"
+
+    fid_dir = deconv / f"fids--{roi}"
+    fid_dir.mkdir(parents=True, exist_ok=True)
+    expected = np.arange(16, dtype=np.float32).reshape(4, 4)
+    imwrite(fid_dir / f"fids-{idx:04d}.tif", expected)
+
+    loaded = cli_register_module._load_reference_fid_from_previous_run(
+        ws,
+        roi=roi,
+        reference=reference,
+        idx=idx,
+        prefer_codebook=None,
+    )
+
+    assert np.allclose(loaded, expected)
+
+
+def test_run_fiducial_debug_prints_priors(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+
+    cfg = Config(
+        dataPath=str(DATA),
+        exclude=None,
+        registration=RegisterConfig(
+            chromatic_shifts={
+                "650": str(DATA / "560to650.txt"),
+                "750": str(DATA / "560to750.txt"),
+            },
+            fiducial=Fiducial(
+                use_fft=False,
+                fwhm=4.0,
+                threshold=6.0,
+                priors={"round_b": (1.0, 2.0)},
+                overrides={},
+                n_fids=2,
+            ),
+            reference="round_a",
+            downsample=1,
+            crop=0,
+            slices=slice(None),
+            reduce_bit_depth=0,
+            discards=None,
+        ),
+    )
+
+    def fake_align_with_stats(
+        fids: dict[str, np.ndarray], **_: Any
+    ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
+        shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
+        residuals = {name: 0.1 for name in fids}
+        stats = {name: None for name in fids}
+        return shifts, residuals, stats
+
+    monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+    monkeypatch.setattr(cli_register_module, "shift", lambda arr, *_a, **_k: arr)
+    monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *_a, **_k: None)
+
+    debug_messages: list[str] = []
+
+    def fake_debug(message: object) -> None:
+        debug_messages.append(str(message))
+
+    monkeypatch.setattr(cli_register_module.logger, "debug", fake_debug)
+
+    fids: dict[str, np.ndarray] = {
+        "round_a": np.full((4, 4), 1, dtype=np.float32),
+        "round_b": np.full((4, 4), 2, dtype=np.float32),
+    }
+
+    cli_register_module.run_fiducial(
+        path=deconv,
+        fids=fids,
+        codebook_name="cb",
+        config=cfg,
+        roi="roiA",
+        idx=0,
+        reference="round_a",
+        debug=True,
+        fids_raw={k: v.copy() for k, v in fids.items()},
+    )
+
+    combined = "\n".join(debug_messages)
+    assert "Applied priors:" in combined
+    assert "round_b" in combined
+    assert "dx=1.000" in combined
+    assert "dy=2.000" in combined
+
+
+def test_run_fiducial_debug_logs_when_no_priors(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+
+    cfg = Config(
+        dataPath=str(DATA),
+        exclude=None,
+        registration=RegisterConfig(
+            chromatic_shifts={
+                "650": str(DATA / "560to650.txt"),
+                "750": str(DATA / "560to750.txt"),
+            },
+            fiducial=Fiducial(
+                use_fft=False,
+                fwhm=4.0,
+                threshold=6.0,
+                priors=None,
+                overrides={},
+                n_fids=2,
+            ),
+            reference="round_a",
+            downsample=1,
+            crop=0,
+            slices=slice(None),
+            reduce_bit_depth=0,
+            discards=None,
+        ),
+    )
+
+    def fake_align_with_stats(
+        fids: dict[str, np.ndarray], **_: Any
+    ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
+        shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
+        residuals = {name: 0.1 for name in fids}
+        stats = {name: None for name in fids}
+        return shifts, residuals, stats
+
+    monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+    monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *_a, **_k: None)
+
+    debug_messages: list[str] = []
+
+    def fake_debug(message: object) -> None:
+        debug_messages.append(str(message))
+
+    monkeypatch.setattr(cli_register_module.logger, "debug", fake_debug)
+
+    fids: dict[str, np.ndarray] = {
+        "round_a": np.full((4, 4), 1, dtype=np.float32),
+        "round_b": np.full((4, 4), 2, dtype=np.float32),
+    }
+
+    cli_register_module.run_fiducial(
+        path=deconv,
+        fids=fids,
+        codebook_name="cb",
+        config=cfg,
+        roi="roiA",
+        idx=0,
+        reference="round_a",
+        debug=True,
+        fids_raw={k: v.copy() for k, v in fids.items()},
+    )
+
+    combined = "\n".join(debug_messages)
+    assert "Priors: none" in combined
+
+
+def test_run_fiducial_auto_derives_priors_when_empty(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+    ws = cli_register_module.Workspace(deconv)
+
+    roi = "roiA"
+    codebook_name = "cb"
+
+    shift_dir = ws.shifts(roi, codebook_name)
+    shift_dir.mkdir(parents=True, exist_ok=True)
+    payload = {"round_b": {"shifts": [1.0, 2.0], "corr": 1.0, "residual": 0.1}}
+    for i in range(1, 12):  # >10 shift files triggers auto-priors
+        (shift_dir / f"shifts-{i:04d}.json").write_text(json.dumps(payload))
+
+    cfg = Config(
+        dataPath=str(DATA),
+        exclude=None,
+        registration=RegisterConfig(
+            chromatic_shifts={
+                "650": str(DATA / "560to650.txt"),
+                "750": str(DATA / "560to750.txt"),
+            },
+            fiducial=Fiducial(
+                use_fft=False,
+                fwhm=4.0,
+                threshold=6.0,
+                priors={},  # important: empty dict should still auto-derive
+                overrides={},
+                n_fids=2,
+            ),
+            reference="round_a",
+            downsample=1,
+            crop=0,
+            slices=slice(None),
+            reduce_bit_depth=0,
+            discards=None,
+        ),
+    )
+
+    def fake_align_with_stats(
+        fids: dict[str, np.ndarray], **_: Any
+    ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
+        shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
+        residuals = {name: 0.1 for name in fids}
+        stats = {name: None for name in fids}
+        return shifts, residuals, stats
+
+    monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
+    monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *_a, **_k: None)
+
+    shift_calls: list[list[float]] = []
+
+    def fake_shift(arr: np.ndarray, shift_vec: list[float], **_: Any) -> np.ndarray:
+        shift_calls.append([float(shift_vec[0]), float(shift_vec[1])])
+        return arr
+
+    monkeypatch.setattr(cli_register_module, "shift", fake_shift)
+
+    debug_messages: list[str] = []
+
+    def fake_debug(message: object) -> None:
+        debug_messages.append(str(message))
+
+    monkeypatch.setattr(cli_register_module.logger, "debug", fake_debug)
+
+    fids: dict[str, np.ndarray] = {
+        "round_a": np.full((4, 4), 1, dtype=np.float32),
+        "round_b": np.full((4, 4), 2, dtype=np.float32),
+    }
+
+    cli_register_module.run_fiducial(
+        path=deconv,
+        fids=fids,
+        codebook_name=codebook_name,
+        config=cfg,
+        roi=roi,
+        idx=0,
+        reference="round_a",
+        debug=True,
+        fids_raw={k: v.copy() for k, v in fids.items()},
+    )
+
+    assert cfg.registration.fiducial.priors
+    assert any(call == [2.0, 1.0] for call in shift_calls)  # dy, dx order in scipy.ndimage.shift
+    assert "Applied priors:" in "\n".join(debug_messages)
+
+
+def test_cli_register_batch_verify_respects_allow_large_shifts(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
 
     monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
 
@@ -311,15 +884,15 @@ def test_cli_register_batch_verify_respects_allow_large_drifts(tmp_path: Path, m
             "--threads",
             "1",
             "--verify",
-            "--allow-large-drifts",
+            "--allow-large-shifts",
         ],
     )
 
     assert result.exit_code == 0, result.output
     # Missing outputs trigger verification reruns, so expect two calls with the flag.
     assert len(calls) == 2
-    assert "--allow-large-drifts" in calls[0]
-    assert "--allow-large-drifts" in calls[1]
+    assert "--allow-large-shifts" in calls[0]
+    assert "--allow-large-shifts" in calls[1]
     assert "--overwrite" in calls[1]
 
 
@@ -342,6 +915,8 @@ def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: An
         overwrite: bool,
         no_priors: bool,
         repaired_rounds: set[str] | None = None,
+        max_iters: int = 5,
+        use_shifts_from: str | None = None,
     ) -> None:  # type: ignore[no-untyped-def]
         seen.update({"config": config, "roi": roi, "idx": idx, "reference": reference})
 
@@ -415,8 +990,9 @@ def test_cli_register_run_skips_when_reg_file_exists(tmp_path: Path, monkeypatch
 
 def test_run_internal_returns_early_when_reg_file_exists(tmp_path: Path) -> None:
     """Test that _run returns early when the output reg file already exists."""
+    _root, deconv = _make_workspace(tmp_path)
     codebook_path = _make_codebook(tmp_path)
-    reg_dir = tmp_path / "registered--roiA+cb"
+    reg_dir = deconv / "registered--roiA+cb"
     reg_dir.mkdir(parents=True)
     # Create the output file to trigger early return
     reg_file = reg_dir / "reg-0007.tif"
@@ -448,7 +1024,7 @@ def test_run_internal_returns_early_when_reg_file_exists(tmp_path: Path) -> None
     )
 
     _run(
-        path=tmp_path,
+        path=deconv,
         roi="roiA",
         idx=7,
         codebook=codebook_path,
@@ -586,6 +1162,15 @@ def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: A
         def deconved(self) -> Path:
             return self._deconved
 
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
+
     monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
 
     calls: list[list[str]] = []
@@ -656,6 +1241,15 @@ def test_cli_register_batch_verify_reruns_on_read_failure(tmp_path: Path, monkey
         @property
         def deconved(self) -> Path:
             return self._deconved
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
 
     monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
 
@@ -764,6 +1358,15 @@ def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
         @property
         def deconved(self) -> Path:
             return self._deconved
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
 
     monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
 
@@ -955,26 +1558,10 @@ def test_cli_register_batch_forwards_use_shifts_from(tmp_path: Path, monkeypatch
     _root, base = _make_workspace(tmp_path)
     (base / "2_10_18--roiA").mkdir(parents=True)
     (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+    (base / "shifts--roiA+other_codebook").mkdir(parents=True)
+    (base / "shifts--roiA+other_codebook" / "shifts-0001.json").write_text("{}")
 
     cb = _make_codebook(tmp_path)
-
-    class _WS:
-        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
-            path = Path(path)
-            if path.name == "deconv" and path.parent.name == "analysis":
-                self.path = path.parent.parent
-                self._deconved = path
-            else:
-                self.path = path
-                self._deconved = self.path / "analysis" / "deconv"
-            self.rois = ["roiA"]
-            self.rounds = ["2_10_18"]
-
-        @property
-        def deconved(self) -> Path:
-            return self._deconved
-
-    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
 
     calls: list[list[str]] = []
 
@@ -1006,6 +1593,57 @@ def test_cli_register_batch_forwards_use_shifts_from(tmp_path: Path, monkeypatch
     assert result.exit_code == 0, result.output
     assert len(calls) == 1
     assert "--use-shifts-from=other_codebook" in calls[0]
+
+
+def test_cli_register_batch_use_shifts_from_does_not_require_ref_images(tmp_path: Path, monkeypatch: Any) -> None:
+    """When --use-shifts-from is set, batch should discover indices from shift files, not ref images."""
+    _root, deconv = _make_workspace(tmp_path)
+    roi = "roiA"
+    ref = "2_10_18"
+    source_cb = "source_cb"
+
+    # Ensure ROI exists but do NOT create any ref round images.
+    (deconv / f"1_9_17--{roi}").mkdir(parents=True)
+
+    # Create shift files that batch can use to enumerate indices.
+    shift_dir = deconv / f"shifts--{roi}+{source_cb}"
+    shift_dir.mkdir(parents=True)
+    (shift_dir / "shifts-0001.json").write_text("{}")
+    (shift_dir / "shifts-0002.json").write_text("{}")
+
+    cb = _make_codebook(tmp_path)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True) -> Any:
+        calls.append(argv)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(deconv),
+            "--ref",
+            ref,
+            "--codebook",
+            str(cb),
+            "--threads",
+            "1",
+            f"--use-shifts-from={source_cb}",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 2
+    assert {argv[4] for argv in calls} == {"1", "2"}
 
 
 def test_run_internal_uses_shifts_from_source_codebook(tmp_path: Path, monkeypatch: Any) -> None:

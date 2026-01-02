@@ -5,6 +5,7 @@ from pathlib import Path
 import rich_click as click
 
 from fishtools.io.workspace import Workspace
+from fishtools.segment.utils import StitchPaths, resolve_intensity_store
 from fishtools.segment.overlay_intensity import overlay_intensity
 from fishtools.segment.overlay_spots import overlay as overlay_spots
 
@@ -90,37 +91,71 @@ def overlay_all(
     """Run spots and intensity overlays sequentially for one or more ROIs."""
 
     workspace = Workspace(path)
-    target_roi = roi or "*"
+    roi_token = (roi or "*").strip()
+    batch_mode = roi_token == "*" or roi_token.lower() == "all"
     try:
-        rois = workspace.resolve_rois() if target_roi == "*" else workspace.resolve_rois([target_roi])
+        rois = workspace.resolve_rois() if batch_mode else workspace.resolve_rois([roi_token])
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
     if not rois:
         raise click.ClickException(f"No ROIs discovered under workspace {path}.")
 
     seg_cb = seg_codebook or codebook
+    if seg_codebook is None:
+        click.echo(f"Segmentation codebook not provided; defaulting to --codebook '{codebook}'.", err=True)
+
     for current_roi in rois:
-        overlay_spots.callback(
-            path=path,
-            roi=current_roi,
-            codebook=codebook,
-            spots_opt=spots_opt,
-            seg_codebook=seg_codebook,
-            segmentation_name=segmentation_name,
-            overwrite=overwrite,
-            debug=debug,
-        )
-        overlay_intensity.callback(
-            path=path,
-            roi=current_roi,
-            seg_codebook=seg_cb,
-            intensity_codebook=intensity_codebook,
-            segmentation_name=segmentation_name,
-            intensity_store=intensity_store,
-            channel=channel,
-            threads=threads,
-            overwrite=overwrite,
-        )
+        stitch = StitchPaths.from_workspace(workspace, current_roi, seg_cb)
+        seg_path = stitch.segmentation(segmentation_name)
+        if not seg_path.exists():
+            msg = f"Skipping ROI '{current_roi}': segmentation Zarr not found at {seg_path}"
+            if batch_mode:
+                click.echo(msg, err=True)
+                continue
+            raise click.ClickException(msg)
+
+        try:
+            overlay_spots.callback(
+                path=path,
+                roi=current_roi,
+                codebook=codebook,
+                spots_opt=spots_opt,
+                seg_codebook=seg_codebook,
+                segmentation_name=segmentation_name,
+                overwrite=overwrite,
+                debug=debug,
+            )
+        except Exception as exc:
+            if batch_mode:
+                click.echo(f"Skipping ROI '{current_roi}': overlay spots failed: {exc}", err=True)
+                continue
+            raise
+
+        try:
+            resolve_intensity_store(stitch, intensity_codebook, store_name=intensity_store)
+        except FileNotFoundError as exc:
+            if batch_mode:
+                click.echo(f"Skipping ROI '{current_roi}': {exc}", err=True)
+                continue
+            raise click.ClickException(str(exc)) from exc
+
+        try:
+            overlay_intensity.callback(
+                path=path,
+                roi=current_roi,
+                seg_codebook=seg_cb,
+                intensity_codebook=intensity_codebook,
+                segmentation_name=segmentation_name,
+                intensity_store=intensity_store,
+                channel=channel,
+                threads=threads,
+                overwrite=overwrite,
+            )
+        except Exception as exc:
+            if batch_mode:
+                click.echo(f"Skipping ROI '{current_roi}': overlay intensity failed: {exc}", err=True)
+                continue
+            raise
 
 
 if __name__ == "__main__":

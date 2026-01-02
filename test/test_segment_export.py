@@ -65,6 +65,45 @@ def _write_parquet(path: Path, frame: pl.DataFrame) -> None:
     frame.write_parquet(path)
 
 
+def _write_segmentation_zarr(path: Path, *, shape: tuple[int, int, int]) -> None:
+    import zarr
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    zarr.open_array(path, mode="w", shape=shape, dtype="uint8")
+
+
+def _write_thumbnail(output_dir: Path, *, size: tuple[int, int]) -> None:
+    from PIL import Image
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size).save(output_dir / "thumbnail_z000.png")
+
+
+def _write_roiset_zip(
+    output_dir: Path,
+    *,
+    line: tuple[tuple[float, float], tuple[float, float]],
+    polygons: list[tuple[str, list[tuple[float, float]]]],
+) -> None:
+    from roifile import ImagejRoi, ROI_TYPE, roiwrite
+
+    line_roi = ImagejRoi()
+    line_roi.roitype = ROI_TYPE.LINE
+    line_roi.name = "line"
+    line_roi.x1, line_roi.y1 = line[0]
+    line_roi.x2, line_roi.y2 = line[1]
+    line_roi.left = int(min(line_roi.x1, line_roi.x2))
+    line_roi.right = int(max(line_roi.x1, line_roi.x2))
+    line_roi.top = int(min(line_roi.y1, line_roi.y2))
+    line_roi.bottom = int(max(line_roi.y1, line_roi.y2))
+
+    roi_entries = [line_roi]
+    for name, points in polygons:
+        roi_entries.append(ImagejRoi.frompoints(points, name=name))
+
+    roiwrite(output_dir / "RoiSet.zip", roi_entries, mode="w")
+
+
 def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
@@ -79,6 +118,12 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
     stitch_root = ws.stitch(roi, seg_codebook)
     seg_root = stitch_root / segmentation_name
     chunks_root = seg_root / f"chunks+{codebook}"
+
+    scale = 8.0
+    thumb_size = (10, 8)
+    _write_segmentation_zarr(seg_root, shape=(1, int(thumb_size[1] * scale), int(thumb_size[0] * scale)))
+    thumb_dir = ws.output / "thumbnails" / f"{roi}+{seg_codebook}"
+    _write_thumbnail(thumb_dir, size=thumb_size)
 
     ident_path = chunks_root / "ident_0000.parquet"
     ident_df = pl.DataFrame({
@@ -133,6 +178,173 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
 
     baysor_path = ws.deconved / "baysor" / "spots.csv"
     assert not baysor_path.exists()
+
+
+def test_segment_export_roiset_rotation_and_subroi(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
+    ws.deconved.mkdir(parents=True, exist_ok=True)
+
+    roi = "roi1"
+    seg_codebook = "seg"
+    codebook = "gene"
+    segmentation_name = "output_segmentation.zarr"
+
+    stitch_root = ws.stitch(roi, seg_codebook)
+    seg_root = stitch_root / segmentation_name
+    chunks_root = seg_root / f"chunks+{codebook}"
+
+    scale = 8.0
+    thumb_size = (10, 8)
+    _write_segmentation_zarr(seg_root, shape=(1, int(thumb_size[1] * scale), int(thumb_size[0] * scale)))
+    thumb_dir = ws.output / "thumbnails" / f"{roi}+{seg_codebook}"
+    _write_thumbnail(thumb_dir, size=thumb_size)
+
+    ident_path = chunks_root / "ident_0000.parquet"
+    ident_df = pl.DataFrame({
+        "spot_id": [0, 1, 2, 3],
+        "label": [1, 1, 2, 2],
+        "target": ["GeneA-1", "GeneA-2", "GeneB-1", "GeneC-1"],
+    })
+    _write_parquet(ident_path, ident_df)
+
+    line_p0 = (2.0, 2.0)
+    line_p1 = (8.0, 4.0)
+
+    polygons_path = chunks_root / "polygons_0000.parquet"
+    polygons_df = pl.DataFrame({
+        "label": [1, 2],
+        "area": [5.0, 7.0],
+        "centroid_x": [line_p0[0] * scale, line_p1[0] * scale],
+        "centroid_y": [line_p0[1] * scale, line_p1[1] * scale],
+    })
+    _write_parquet(polygons_path, polygons_df)
+
+    intensity_root = seg_root / "intensity_marker"
+    intensity_path = intensity_root / "intensity-0000.parquet"
+    intensity_df = pl.DataFrame({
+        "label": [1, 2],
+        "mean_intensity": [1.0, 2.0],
+        "max_intensity": [1.5, 2.5],
+        "min_intensity": [0.5, 1.0],
+    })
+    _write_parquet(intensity_path, intensity_df)
+
+    _write_roiset_zip(
+        thumb_dir,
+        line=(line_p0, line_p1),
+        polygons=[("subA", [(1.0, 1.0), (3.0, 1.0), (3.0, 3.0), (1.0, 3.0)])],
+    )
+
+    export_cmd = _export_cmd()
+    export_cmd(
+        path=ws.deconved,
+        roi=roi,
+        seg_codebook=seg_codebook,
+        codebooks=(codebook,),
+        segmentation_name=segmentation_name,
+        channels="marker",
+        out_dir=None,
+        diag=False,
+    )
+
+    cb_token = Workspace.sanitize_codebook_name(codebook)
+    seg_stem = Path(segmentation_name).stem
+    out_h5ad = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    adata = ad.read_h5ad(out_h5ad)
+
+    obs_p0 = adata.obs.loc[f"{roi}|1"]
+    obs_p1 = adata.obs.loc[f"{roi}|2"]
+    assert obs_p0["subroi"] == "subA"
+    assert obs_p1["subroi"] == ""
+    assert abs(float(obs_p0["y"]) - float(obs_p1["y"])) < 1e-3
+
+
+def test_segment_export_roiset_multiple_lines_errors(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
+    ws.deconved.mkdir(parents=True, exist_ok=True)
+
+    roi = "roi1"
+    seg_codebook = "seg"
+    codebook = "gene"
+    segmentation_name = "output_segmentation.zarr"
+
+    stitch_root = ws.stitch(roi, seg_codebook)
+    seg_root = stitch_root / segmentation_name
+    chunks_root = seg_root / f"chunks+{codebook}"
+
+    thumb_size = (10, 8)
+    scale = 8.0
+    _write_segmentation_zarr(seg_root, shape=(1, int(thumb_size[1] * scale), int(thumb_size[0] * scale)))
+    thumb_dir = ws.output / "thumbnails" / f"{roi}+{seg_codebook}"
+    _write_thumbnail(thumb_dir, size=thumb_size)
+
+    ident_path = chunks_root / "ident_0000.parquet"
+    ident_df = pl.DataFrame({
+        "spot_id": [0, 1],
+        "label": [1, 2],
+        "target": ["GeneA-1", "GeneB-1"],
+    })
+    _write_parquet(ident_path, ident_df)
+
+    polygons_path = chunks_root / "polygons_0000.parquet"
+    polygons_df = pl.DataFrame({
+        "label": [1, 2],
+        "area": [5.0, 7.0],
+        "centroid_x": [16.0, 64.0],
+        "centroid_y": [16.0, 32.0],
+    })
+    _write_parquet(polygons_path, polygons_df)
+
+    intensity_root = seg_root / "intensity_marker"
+    intensity_path = intensity_root / "intensity-0000.parquet"
+    intensity_df = pl.DataFrame({
+        "label": [1, 2],
+        "mean_intensity": [1.0, 2.0],
+        "max_intensity": [1.5, 2.5],
+        "min_intensity": [0.5, 1.0],
+    })
+    _write_parquet(intensity_path, intensity_df)
+
+    from roifile import ImagejRoi, ROI_TYPE, roiwrite
+
+    line1 = ImagejRoi()
+    line1.roitype = ROI_TYPE.LINE
+    line1.name = "line1"
+    line1.x1, line1.y1, line1.x2, line1.y2 = (1.0, 1.0, 8.0, 4.0)
+    line1.left = 1
+    line1.right = 8
+    line1.top = 1
+    line1.bottom = 4
+
+    line2 = ImagejRoi()
+    line2.roitype = ROI_TYPE.LINE
+    line2.name = "line2"
+    line2.x1, line2.y1, line2.x2, line2.y2 = (2.0, 2.0, 7.0, 5.0)
+    line2.left = 2
+    line2.right = 7
+    line2.top = 2
+    line2.bottom = 5
+
+    roiwrite(thumb_dir / "RoiSet.zip", [line1, line2], mode="w")
+
+    export_cmd = _export_cmd()
+    with pytest.raises(ValueError, match="Expected exactly one line ROI"):
+        export_cmd(
+            path=ws.deconved,
+            roi=roi,
+            seg_codebook=seg_codebook,
+            codebooks=(codebook,),
+            segmentation_name=segmentation_name,
+            channels="marker",
+            out_dir=None,
+            diag=False,
+        )
 
 
 def test_resolve_rois_defaults_to_workspace_rois(tmp_path: Path) -> None:

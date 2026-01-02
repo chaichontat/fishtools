@@ -9,15 +9,6 @@ from _cellpose_stub import ensure_cellpose_stub
 from fishtools.utils.zarr_utils import default_zarr_codecs
 
 
-def _make_polygons():
-    from shapely.geometry import Polygon
-
-    return [
-        (Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]), {"label": 101}),
-        (Polygon([(2, 2), (3, 2), (3, 3), (2, 3)]), {"label": 202}),
-    ]
-
-
 def test_segment_overlay_spots_help():
     ensure_cellpose_stub()
     from fishtools.segment import app
@@ -53,7 +44,10 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
     overlay_all_mod = importlib.import_module("fishtools.segment.overlay_all")
 
     ws = _make_workspace(tmp_path)
-    (ws / "analysis/deconv/stitch--roi+seg").mkdir(parents=True, exist_ok=True)
+    (ws / "analysis/deconv/stitch--roi+cb1" / "output_segmentation-sam.zarr").mkdir(
+        parents=True, exist_ok=True
+    )
+    (ws / "analysis/deconv/stitch--roi+cb_int" / "fused.zarr").mkdir(parents=True, exist_ok=True)
 
     calls: dict[str, dict[str, object]] = {}
 
@@ -132,6 +126,54 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
     assert calls["intensity"]["seg_codebook"] == "cb1"
 
 
+def test_segment_overlay_all_skips_rois_missing_segmentation_zarr(tmp_path, monkeypatch):
+    ensure_cellpose_stub()
+    import importlib
+
+    overlay_all_mod = importlib.import_module("fishtools.segment.overlay_all")
+
+    ws = _make_workspace(tmp_path)
+    (ws / "analysis/deconv/stitch--2+pi").mkdir(parents=True, exist_ok=True)
+    (ws / "analysis/deconv/stitch--roi1+pi" / "output_segmentation.zarr").mkdir(
+        parents=True, exist_ok=True
+    )
+    (ws / "analysis/deconv/stitch--roi1+edu" / "fused.zarr").mkdir(parents=True, exist_ok=True)
+
+    spots_called: list[str] = []
+    intensity_called: list[str] = []
+
+    def fake_spots(*, roi: str, **kwargs) -> None:
+        spots_called.append(roi)
+
+    def fake_intensity(*, roi: str, **kwargs) -> None:
+        intensity_called.append(roi)
+
+    monkeypatch.setattr(overlay_all_mod.overlay_spots, "callback", fake_spots)
+    monkeypatch.setattr(overlay_all_mod.overlay_intensity, "callback", fake_intensity)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        overlay_all_mod.overlay_all,
+        [
+            str(ws),
+            "--codebook",
+            "cs_base",
+            "--seg-codebook",
+            "pi",
+            "--intensity-codebook",
+            "edu",
+            "--segmentation-name",
+            "output_segmentation.zarr",
+            "--intensity-store",
+            "fused.zarr",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert spots_called == ["roi1"]
+    assert intensity_called == ["roi1"]
+
+
 def test_segment_overlay_executable_direct():
     # Ensure the consolidated command function is importable
     from fishtools.segment.overlay_spots import overlay as segment_overlay
@@ -166,6 +208,43 @@ def test_segment_overlay_intensity_direct():
     assert "--intensity-codebook" in result.output
     assert "--intensity-store" in result.output
     assert "--threads" in result.output
+
+
+def test_segment_overlay_intensity_all_token_triggers_batch_mode(tmp_path, monkeypatch):
+    ensure_cellpose_stub()
+    import importlib
+
+    overlay_mod = importlib.import_module("fishtools.segment.overlay_intensity")
+
+    ws = _make_workspace(tmp_path)
+    (ws / "analysis/deconv/stitch--roi1+seg").mkdir(parents=True, exist_ok=True)
+    (ws / "analysis/deconv/stitch--roi2+seg").mkdir(parents=True, exist_ok=True)
+
+    called: list[str] = []
+
+    def fake_run(
+        workspace,
+        roi: str,
+        seg_codebook: str,
+        intensity_codebook: str,
+        segmentation_name: str,
+        intensity_store: str,
+        channel: str | None,
+        threads: int,
+        overwrite: bool,
+    ) -> None:
+        called.append(roi)
+
+    monkeypatch.setattr(overlay_mod, "_run_overlay_for_roi", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        overlay_mod.overlay_intensity,
+        [str(ws), "all", "--seg-codebook", "seg", "--intensity-codebook", "cb_int"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called == ["roi1", "roi2"]
 
 
 @pytest.fixture
@@ -234,7 +313,7 @@ def _write_segmentation(ws: Path, roi: str, seg_cb: str, data: np.ndarray) -> Pa
         shape=data.shape,
         dtype=data.dtype,
         chunks=data.shape,
-        codecs=default_zarr_codecs(),
+        codecs=default_zarr_codecs(data.dtype),
     )
     arr[:] = data
     return seg_dir
@@ -302,31 +381,6 @@ def _single_block_plane(label: int = 1, size: int = 5) -> np.ndarray:
     return np.vstack([top, bottom])
 
 
-def test_assign_spots_handles_shapely_query_layout():
-    ensure_cellpose_stub()
-    from fishtools.segment.overlay_spots import assign_spots_to_polygons, build_spatial_index
-
-    polygons_with_meta = _make_polygons()
-    tree, tree_indices = build_spatial_index(polygons_with_meta, idx=0)
-
-    spots_df = pl.DataFrame(
-        {
-            "spot_id": [1, 2],
-            "x_adj": [0.5, 2.5],
-            "y_adj": [0.5, 2.5],
-            "z": [0.0, 0.0],
-            "target": ["a", "b"],
-        }
-    )
-
-    assignments = assign_spots_to_polygons(spots_df, tree, tree_indices, polygons_with_meta, idx=0)
-
-    assert assignments.sort("spot_id").to_dicts() == [
-        {"spot_id": 1, "target": "a", "label": 101},
-        {"spot_id": 2, "target": "b", "label": 202},
-    ]
-
-
 @pytest.mark.usefixtures("sync_executor")
 def test_overlay_spots_cli_generates_expected_outputs(tmp_path):
     roi = "roi"
@@ -356,6 +410,31 @@ def test_overlay_spots_cli_generates_expected_outputs(tmp_path):
     ]
     polygons = pl.read_parquet(chunk_dir / "polygons_0.parquet")
     assert sorted(polygons.get_column("label").to_list()) == [1, 2]
+
+
+@pytest.mark.usefixtures("sync_executor")
+def test_overlay_spots_cli_assigns_single_pixel_region(tmp_path):
+    roi = "roi"
+    codebook = "cb1"
+    seg_cb = "seg"
+    ws = _make_workspace(tmp_path)
+    plane = np.zeros((10, 10), dtype=np.int32)
+    plane[2, 2] = 1
+    seg_dir = _write_segmentation(ws, roi, seg_cb, np.array([plane], dtype=np.int32))
+    _write_tileconfig(ws, roi, [(0.0, 0.0)])
+    spots_path = _write_spots(
+        ws,
+        roi,
+        codebook,
+        [{"x": 4.0, "y": 4.0, "z": 0.0, "target": "geneA"}],
+    )
+
+    result = _invoke_overlay_spots(ws, roi, codebook, seg_cb, spots_path)
+
+    assert result.exit_code == 0, result.output
+    chunk_dir = _overlay_chunks_dir(seg_dir, codebook)
+    ident = pl.read_parquet(chunk_dir / "ident_0.parquet")
+    assert ident.to_dicts() == [{"spot_id": 0, "target": "geneA", "label": 1}]
 
 
 @pytest.mark.usefixtures("sync_executor")

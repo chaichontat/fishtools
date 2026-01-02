@@ -1,4 +1,3 @@
-import os
 import pickle
 import queue
 import threading
@@ -176,13 +175,14 @@ def _workspace_with_tile(base: Path, *, round_name: str = "r1", roi: str = "roiA
 
 
 def test_parse_device_spec_auto(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr("cupy.cuda.runtime.getDeviceCount", lambda: 3)
-    assert parse_device_spec("auto") == [0, 1, 2]
+    assert parse_device_spec("auto") == [0]
 
 
 def test_parse_device_spec_subset(monkeypatch):
     monkeypatch.setattr("cupy.cuda.runtime.getDeviceCount", lambda: 4)
-    os.environ["CUDA_VISIBLE_DEVICES"] = "1,2,3"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,2,3")
     assert parse_device_spec("0,2") == [0, 2]
 
 
@@ -203,14 +203,14 @@ def test_run_skip_quantized_forces_float32(tmp_path: Path, monkeypatch: pytest.M
         roi_name="*",
         ref_round=None,
         limit=None,
-        backend="u16",
+        mode="u16",
         histogram_bins=8192,
         overwrite=False,
         delete_origin=False,
         n_fids=2,
         basic_name="all",
         debug=False,
-        devices="auto",
+        devices=[0],
         stop_on_error=True,
         skip_quantized=True,
     )
@@ -236,14 +236,14 @@ def test_run_float32_skips_scaling(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         roi_name="*",
         ref_round=None,
         limit=None,
-        backend="float32",
+        mode="float32",
         histogram_bins=8192,
         overwrite=False,
         delete_origin=False,
         n_fids=2,
         basic_name="all",
         debug=False,
-        devices="auto",
+        devices=[0],
         stop_on_error=True,
         skip_quantized=False,
     )
@@ -252,7 +252,7 @@ def test_run_float32_skips_scaling(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert captured["load_scaling"] is False
 
 
-def test_multi_run_skip_quantized_switches_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_multi_run_skip_quantized_switches_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     workspace = _workspace_with_tile(tmp_path)
 
     captured: dict[str, object] = {}
@@ -268,7 +268,7 @@ def test_multi_run_skip_quantized_switches_backend(tmp_path: Path, monkeypatch: 
         "r1",
         ref=None,
         limit=None,
-        backend="u16",
+        mode="u16",
         histogram_bins=1024,
         skip_quantized=True,
         overwrite=True,

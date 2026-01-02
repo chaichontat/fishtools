@@ -991,7 +991,7 @@ def _write_fused_corrected_zyxc(
         shape=(len(z_sel), y_dim, x_dim, len(channels)),
         chunks=dest_chunks,
         dtype=np.uint16,
-        codecs=default_zarr_codecs(),
+        codecs=default_zarr_codecs(np.uint16),
     )
     logger.info(
         "Opened destination Zarr (partial create) at {path} with shape {shape} (took {dt:.2f}s)",
@@ -1008,7 +1008,7 @@ def _write_fused_corrected_zyxc(
             shape=(len(z_sel), y_dim, x_dim, len(channels)),
             chunks=dest_chunks,
             dtype=np.float32,
-            codecs=default_zarr_codecs(),
+            codecs=default_zarr_codecs(np.float32),
         )
         logger.info(
             "Opened float32 debug Zarr at {path} with shape {shape} (took {dt:.2f}s)",

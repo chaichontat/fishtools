@@ -163,6 +163,29 @@ class TestExtractDataFromTiff:
         # Value for file1, z=0.5 (idx 2), channel 0 was 30. Scaled: 30*2 = 60
         assert np.all(result[0, 0] == 60)
 
+    def test_extract_non_2048_tile_size(self, tmp_path: Path) -> None:
+        round_dir = tmp_path / "Rsmall--P1"
+        round_dir.mkdir()
+        file_path = round_dir / "img1.tif"
+
+        height = 64
+        width = 96
+        nc = 2
+        nz = 5
+
+        data = []
+        for z in range(nz):
+            for c in range(nc):
+                img_data = np.full((height, width), (z + 1) * 10 + c, dtype=np.uint16)
+                data.append(img_data)
+        imwrite(file_path, np.stack(data))
+
+        zs = [0.5]
+        result = extract_data_from_tiff([file_path], zs=zs, nc=nc, max_files=1)
+
+        assert result.shape == (1, nc, height, width)
+        assert np.all(result[0, 0] == 30)
+
 
 class TestExtractDataFromRegistered:
     def test_extract_basic_registered(
@@ -213,10 +236,18 @@ class TestRunWithExtractor:
         mocker: MockerFixture,
     ) -> None:
         round_name = "R1Test"
-        for i in range(100):
-            p = tmp_path / f"{round_name}--pos{i}"
-            p.mkdir()
-            (p / "img.tif").touch()
+        roi = "roiA"
+        # 12x10 grid -> 120 tiles; interior (n=2) -> 48 tiles
+        coords = []
+        for y in range(10):
+            for x in range(12):
+                coords.append((float(x), float(y)))
+        (tmp_path / f"{roi}.csv").write_text("\n".join(f"{y},{x}" for x, y in coords))
+
+        d = tmp_path / f"{round_name}--{roi}"
+        d.mkdir(parents=True, exist_ok=True)
+        for idx in range(12 * 10):
+            (d / f"{round_name}-{idx:04d}.tif").touch()
 
         # Mock the extractor function that will be passed
         mock_actual_extractor_func = mocker.MagicMock(
@@ -240,7 +271,7 @@ class TestRunWithExtractor:
 
         mock_actual_extractor_func.assert_called_once()
         args, kwargs = mock_actual_extractor_func.call_args
-        assert len(args[0]) >= 100  # files list, updated from previous fix
+        assert len(args[0]) == 48  # interior tiles only
         assert args[1] == (0.5,)  # zs
         assert kwargs["nc"] == 2  # from get_channels
 
@@ -249,6 +280,7 @@ class TestRunWithExtractor:
         # data (pos 0), output_dir (pos 1), round_ (pos 2), channels (pos 3)
         assert fit_args[2] == round_name
         assert fit_args[3] == ["chA", "chB"]
+        assert fit_kwargs["overwrite"] is False
 
     def test_run_not_enough_files_error(
         self, tmp_path: Path, mock_get_channels: MagicMock, mocker: MockerFixture
@@ -307,6 +339,42 @@ class TestRunWithExtractor:
                 plot=False,
                 zs=(0.5,),
             )
+
+    def test_include_edge_tiles_allows_no_csv(
+        self,
+        tmp_path: Path,
+        mock_get_channels: MagicMock,
+        mock_basic_module_components: MagicMock,
+        mocker: MockerFixture,
+    ) -> None:
+        round_name = "R2NoCsv"
+        roi = "roiX"
+
+        d = tmp_path / f"{round_name}--{roi}"
+        d.mkdir(parents=True, exist_ok=True)
+
+        # Create 120 tiles (>=100 to satisfy minimum file count) with nonzero size.
+        for idx in range(120):
+            p = d / f"{round_name}-{idx:04d}.tif"
+            p.write_bytes(b"1")
+
+        mock_get_channels.return_value = ["chA", "chB"]
+        mocker.patch("random.sample", side_effect=lambda x, k: list(x)[:k])
+        mocker.patch("numpy.loadtxt", return_value=None)
+        mock_fit = mocker.patch("fishtools.preprocess.cli_basic.fit_and_save_basic", return_value=[])
+
+        run_with_extractor(
+            tmp_path,
+            round_=round_name,
+            extractor_func=lambda files, zs, deconv_meta=None, max_files=800, nc=None: np.zeros(
+                (len(files), 2, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32
+            ),
+            plot=False,
+            zs=(0.5,),
+            include_edge_tiles=True,
+        )
+
+        assert mock_fit.called
 
     def test_sampling_filters_to_interior_tiles_when_csv_present(
         self,
@@ -442,6 +510,77 @@ def test_sample_canonical_unique_tiles_deduplicates_and_filters(
         key = (roi, idx)
         assert key not in seen
         seen.add(key)
+
+
+class TestBasicCliOverwriteGuard:
+    def test_sampling_manifest_does_not_trigger_skip(
+        self, tmp_path: Path, mocker: MockerFixture
+    ) -> None:
+        round_name = "dapi_b2_b4"
+
+        # Minimal round structure so the command can infer channels.
+        d = tmp_path / f"{round_name}--roiA"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{round_name}-0000.tif").touch()
+
+        (tmp_path / "basic").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "basic" / f"{round_name}-sampling.json").write_text("{}")
+
+        mocker.patch("fishtools.preprocess.cli_basic.setup_cli_logging")
+        mocker.patch("fishtools.preprocess.cli_basic.get_channels", return_value=["560", "650"])
+        mock_run = mocker.patch("fishtools.preprocess.cli_basic.run_with_extractor", return_value=None)
+
+        runner = CliRunner()
+        res = runner.invoke(basic, ["run", str(tmp_path), round_name])
+        assert res.exit_code == 0, res.output
+        assert mock_run.called
+
+    def test_complete_pkls_trigger_skip(self, tmp_path: Path, mocker: MockerFixture) -> None:
+        round_name = "dapi_b2_b4"
+
+        d = tmp_path / f"{round_name}--roiA"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{round_name}-0000.tif").touch()
+
+        basic_dir = tmp_path / "basic"
+        basic_dir.mkdir(parents=True, exist_ok=True)
+        (basic_dir / f"{round_name}-560.pkl").touch()
+        (basic_dir / f"{round_name}-650.pkl").touch()
+
+        mocker.patch("fishtools.preprocess.cli_basic.setup_cli_logging")
+        mocker.patch("fishtools.preprocess.cli_basic.get_channels", return_value=["560", "650"])
+        mock_run = mocker.patch("fishtools.preprocess.cli_basic.run_with_extractor", return_value=None)
+
+        runner = CliRunner()
+        res = runner.invoke(basic, ["run", str(tmp_path), round_name])
+        assert res.exit_code == 0, res.output
+        mock_run.assert_not_called()
+
+    def test_cli_include_edge_tiles_does_not_require_csv(self, tmp_path: Path, mocker: MockerFixture) -> None:
+        round_name = "dapi_b2_b4"
+        roi = "roiA"
+
+        d = tmp_path / f"{round_name}--{roi}"
+        d.mkdir(parents=True, exist_ok=True)
+        for idx in range(120):
+            (d / f"{round_name}-{idx:04d}.tif").write_bytes(b"1")
+
+        mocker.patch("fishtools.preprocess.cli_basic.setup_cli_logging")
+        mocker.patch("fishtools.preprocess.cli_basic.get_channels", return_value=["560", "650"])
+        mocker.patch(
+            "fishtools.preprocess.cli_basic.extract_data_from_tiff",
+            return_value=np.zeros((10, 2, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32),
+        )
+        mocker.patch("fishtools.preprocess.cli_basic.fit_and_save_basic", return_value=[])
+        mocker.patch("numpy.loadtxt", return_value=None)
+        mocker.patch("random.sample", side_effect=lambda x, k: list(x)[:k])
+
+        runner = CliRunner()
+        res = runner.invoke(
+            basic,
+            ["run", str(tmp_path), round_name, "--include-edge-tiles", "--seed", "0"],
+        )
+        assert res.exit_code == 0, res.output
 
 
 def test_run_writes_sampling_json(tmp_path: Path, mocker: MockerFixture) -> None:

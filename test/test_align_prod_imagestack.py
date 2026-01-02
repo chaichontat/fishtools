@@ -54,7 +54,7 @@ def _write_field_store(
         shape=(2, c, h // ds if ds > 1 else h, w // ds if ds > 1 else w),
         chunks=(1, 1, max(1, h // (ds * 2)), max(1, w // (ds * 2))),
         dtype=np.float32,
-        codecs=default_zarr_codecs(),
+        codecs=default_zarr_codecs(np.float32),
     )
     za[0] = low
     za[1] = rng

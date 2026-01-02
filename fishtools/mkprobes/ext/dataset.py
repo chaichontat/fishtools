@@ -191,7 +191,7 @@ class Dataset:
 
     def check_kmers(self, seq: str):
         """
-        Checks if any 18-mers from the input sequence are present in the `trna_rna_kmers` set.
+        Checks if any blocklist k-mers from the input sequence are present in the `trna_rna_kmers` set.
 
         This is typically used to filter out sequences that might originate from
         tRNAs or rRNAs, based on a pre-compiled set of common kmers from these RNA types.
@@ -200,14 +200,15 @@ class Dataset:
             seq: The nucleotide sequence to check.
 
         Returns:
-            True if any 18-mer from the sequence is found in `self.trna_rna_kmers`,
+            True if any k-mer from the sequence is found in `self.trna_rna_kmers`,
             False otherwise. Logs a warning if `self.trna_rna_kmers` is not set.
         """
         if not self.trna_rna_kmers:
             logger.warning("No tRNA-RNA kmers found. Skipping.")
             return False
 
-        return any(x in self.trna_rna_kmers for x in kmers(seq, 18))
+        k = len(next(iter(self.trna_rna_kmers)))
+        return any(x in self.trna_rna_kmers for x in kmers(seq, k))
 
     @property
     @cache

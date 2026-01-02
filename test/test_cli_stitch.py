@@ -1115,7 +1115,7 @@ class TestSliceMosaic:
         assert result.exit_code != 0
         assert "fused.zarr not found" in result.output
 
-def test_slice_mosaic_cli_missing_shifted_tc(self, tmp_path: Path) -> None:
+    def test_slice_mosaic_cli_missing_shifted_tc(self, tmp_path: Path) -> None:
         """Test slice CLI error when TileConfiguration.shifted.txt doesn't exist."""
         import zarr
 

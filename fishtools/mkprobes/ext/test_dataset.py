@@ -1,16 +1,12 @@
 import json
-import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import polars as pl
 import pytest
-from polars.testing import assert_frame_equal
 
 from fishtools.mkprobes.ext.dataset import (
     Dataset,
-    DatasetDefinition,
-    ReferenceDataset,
     parse_jellyfish,
 )
 from fishtools.mkprobes.ext.external_data import (
@@ -161,6 +157,11 @@ class TestDataset:
             assert dataset.check_kmers("AGCTAG")
         with patch("fishtools.mkprobes.ext.dataset.kmers", return_value=["TTTT", "AAAA"]):
             assert not dataset.check_kmers("TTTTAA")
+
+    def test_check_kmers_uses_blacklist_k(self, tmp_path: Path, mock_external_data: MagicMock):
+        dataset = Dataset(path=tmp_path, external_data=mock_external_data)
+        dataset.trna_rna_kmers = {"A" * 15}
+        assert dataset.check_kmers("A" * 15)
 
     def test_appris_property_not_implemented(self, tmp_path: Path, mock_external_data: MagicMock):
         dataset = Dataset(path=tmp_path, external_data=mock_external_data)

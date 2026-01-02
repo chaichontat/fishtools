@@ -33,7 +33,7 @@ def _write_field_store_tcyx(path: Path, low: np.ndarray, rng: np.ndarray, channe
         mode="w",
         shape=arr.shape,
         dtype="f4",
-        codecs=default_zarr_codecs(),
+        codecs=default_zarr_codecs(np.float32),
     )
     za[...] = arr
     za.attrs["axes"] = "TCYX"

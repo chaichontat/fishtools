@@ -1767,7 +1767,7 @@ def export_field(
                         shape=arr_shape,
                         chunks=chunks,
                         dtype=np.float32,
-                        codecs=default_zarr_codecs(),
+                        codecs=default_zarr_codecs(np.float32),
                     )
                     za_store.attrs["axes"] = "TCYX"
                     za_store.attrs["t_labels"] = ["low", "range"]
@@ -1866,7 +1866,7 @@ def export_field(
                 shape=arr_shape,
                 chunks=chunks,
                 dtype=np.float32,
-                codecs=default_zarr_codecs(),
+                codecs=default_zarr_codecs(np.float32),
             )
             za_store.attrs["axes"] = "TCYX"
             za_store.attrs["t_labels"] = ["low", "range"]

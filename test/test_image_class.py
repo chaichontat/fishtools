@@ -404,6 +404,44 @@ class TestImageClassIntegration:
         with pytest.raises(FileNotFoundError):
             Image.from_file(Path("nonexistent-1234.tif"))
 
+    def test_from_file_infers_tile_size(self, tmp_path: Path) -> None:
+        ws_root = tmp_path / "ws"
+        (ws_root / "workspace.DONE").parent.mkdir(parents=True, exist_ok=True)
+        (ws_root / "workspace.DONE").write_text("")
+        deconv_dir = ws_root / "analysis" / "deconv" / "round--roi"
+        deconv_dir.mkdir(parents=True)
+
+        test_path = deconv_dir / "A_B_C-0001.tif"
+        test_path.write_bytes(b"")
+
+        tile_h, tile_w = 64, 32
+        img_data = np.random.randint(100, 4000, (4, 3, tile_h, tile_w), dtype=np.uint16)
+        metadata: dict[str, Any] = {
+            "waveform": {
+                "ilm405": {"sequence": [1, 1, 0, 0], "power": 100.0},
+                "ilm488": {"sequence": [0, 1, 0, 0], "power": 150.0},
+                "ilm560": {"sequence": [0, 0, 1, 0], "power": 200.0},
+                "ilm650": {"sequence": [0, 0, 0, 0], "power": 0.0},
+                "ilm750": {"sequence": [0, 0, 0, 0], "power": 0.0},
+            }
+        }
+
+        mock_tif = Mock()
+        mock_tif.asarray.return_value = img_data
+        mock_tif.shaped_metadata = [metadata]
+        mock_tif.imagej_metadata = metadata
+        mock_tif.pages = [Mock() for _ in range(img_data.shape[0])]
+
+        with patch("fishtools.preprocess.cli_register.TiffFile") as mock_tifffile:
+            mock_tifffile.return_value.__enter__.return_value = mock_tif
+            mock_tifffile.return_value.__exit__.return_value = None
+
+            with patch("numpy.loadtxt") as mock_loadtxt:
+                mock_loadtxt.return_value = np.ones((2, 3), dtype=np.float32)
+                image = Image.from_file(test_path, n_fids=1)
+
+        assert image.nofid.shape[-2:] == (tile_h, tile_w)
+
     def test_invalid_filename_format_real_files(self) -> None:
         """Test with invalid filename format using real temporary files"""
         with tempfile.NamedTemporaryFile(suffix="invalid.tif", delete=False) as tmp:

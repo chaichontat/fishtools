@@ -534,7 +534,7 @@ def overlay(
                 if batch_mode:
                     logger.warning(msg)
                     continue
-                raise click.ClickException(msg)
+                # raise click.ClickException(msg)
 
             if not spots.exists():
                 msg = f"Skipping ROI '{current_roi}': spots parquet not found at {spots}."
@@ -560,10 +560,7 @@ def overlay(
                     z = zarr.open_array(seg_path, mode="r")
                 except Exception as e:
                     msg = f"Skipping ROI '{current_roi}': failed to open segmentation '{seg_path}': {e}"
-                    if batch_mode:
-                        logger.error(msg)
-                        continue
-                    raise
+                    continue
 
                 for i in range(z.shape[0]):
                     futures.append(

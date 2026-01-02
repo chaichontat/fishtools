@@ -203,12 +203,26 @@ def _build_field_context(
     # Prefer channel_names attribute when present; fallback to model_meta["channels"].
     field_channels = attrs.get("channel_names") or model_meta.get("channels")
     if isinstance(field_channels, (list, tuple)):
-        c_index_map = {
-            i: (field_channels.index(channel_labels[i]) if channel_labels[i] in field_channels else i)
-            for i in range(len(channel_labels))
-        }
+        c_index_map = {}
+        unmapped = []
+        for i in range(len(channel_labels)):
+            if channel_labels[i] in field_channels:
+                c_index_map[i] = field_channels.index(channel_labels[i])
+            else:
+                c_index_map[i] = i
+                unmapped.append(channel_labels[i])
+        if unmapped:
+            logger.warning(
+                "Field correction: channels %s not found in field store, using identity mapping for these. "
+                "Verify field store channel order matches image.",
+                unmapped,
+            )
     else:
         c_index_map = {i: i for i in range(len(channel_labels))}
+        logger.warning(
+            "Field correction: no channel_names in field store, using identity channel mapping. "
+            "Verify field store channel order matches image."
+        )
 
     low_scale = 65535.0
 

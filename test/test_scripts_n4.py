@@ -35,7 +35,7 @@ def _create_fused_store(path: Path, data: np.ndarray) -> None:
         shape=data.shape,
         chunks=(1, y_dim, x_dim, 1),
         dtype=data.dtype,
-        codecs=default_zarr_codecs(),
+        codecs=default_zarr_codecs(data.dtype),
     )
     store[...] = data
 

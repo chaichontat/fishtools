@@ -22,8 +22,8 @@ import rich_click as click
 from loguru import logger
 
 from fishtools.io.workspace import Workspace
-from fishtools.preprocess.cli_deconv import _setup_cli_logging
 from fishtools.preprocess.cli_deconv import deconvnew as deconv
+from fishtools.utils.logging import setup_cli_logging
 
 # from rich.console import Console
 # from fishtools.preprocess.deconv.core import deconvolve_lucyrichardson_guo, projectors
@@ -220,10 +220,10 @@ def compute_range(
         overwrite: If True, recompute and overwrite existing scaling files.
         max_rna_bit: The maximum integer value considered an RNA bit. Others are treated differently (e.g., protein).
     """
-    _setup_cli_logging(
+    setup_cli_logging(
         path,
         component="preprocess.deconv.compute_range",
-        file_tag="compute_range",
+        file="compute_range",
         extra={
             "perc_min": perc_min,
             "perc_scale": perc_scale,

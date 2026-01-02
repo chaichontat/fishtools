@@ -99,7 +99,14 @@ class Affine:
         # Translate
         translation = self.ats[channel]
         affine.SetTranslation(translation)
-        affine.SetCenter([1023.5 + shiftpx[0], 1023.5 + shiftpx[1], 0])
+        height, width = img.shape[-2], img.shape[-1]
+        affine.SetCenter(
+            [
+                (width - 1) / 2 + float(shiftpx[0]),
+                (height - 1) / 2 + float(shiftpx[1]),
+                0.0,
+            ]
+        )
 
         if debug:
             logger.debug(f"{channel}: affine: {matrix}")

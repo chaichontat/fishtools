@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, Tuple
 
-from fishtools.utils.utils import create_rotation_matrix, make_lazy_getattr
+from fishtools.utils.utils import make_lazy_getattr
 
 # Lazy re-exports to avoid importing heavy deps (anndata, matplotlib, etc.)
 _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
@@ -46,12 +46,15 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "run_spaco": ("fishtools.postprocess.utils_h5ad", "run_spaco"),
     "run_tricycle": ("fishtools.postprocess.utils_h5ad", "run_tricycle"),
     "std_log1p": ("fishtools.postprocess.utils_h5ad", "std_log1p"),
+    # spatial helpers
+    "rotate_rois_in_adata": ("fishtools.utils.spatial_transform", "rotate_rois_in_adata"),
+    "translate_rois_in_adata": ("fishtools.utils.spatial_transform", "translate_rois_in_adata"),
 }
 
 __getattr__, __dir__, __all__ = make_lazy_getattr(
     globals(),
     _LAZY_ATTRS,
-    extras=("jitter", "rotate_rois_in_adata", "translate_rois_in_adata", "add_scale_bar"),
+    extras=("jitter", "add_scale_bar"),
 )
 
 if TYPE_CHECKING:  # pragma: no cover - for editors only
@@ -137,85 +140,6 @@ def jitter(data, amount: float = 0.5, seed: int | None = None):
 
     rand = np.random.default_rng(seed)
     return data + rand.normal(0, amount, size=data.shape[0])
-
-
-def rotate_rois_in_adata(adata, roi_rotation_angles: dict[str, float]):
-    """
-    Rotates spatial coordinates in an AnnData object for specified ROIs around their respective centers.
-
-    Args:
-        adata: The AnnData object with 'roi' in obs and 'spatial' in obsm.
-        roi_rotation_angles: A dictionary where keys are ROI names (matching those in adata.obs['roi'])
-                             and values are the rotation angles in degrees.
-
-    Returns:
-        A new AnnData object with rotated spatial coordinates.
-    """
-    import numpy as np  # local import
-    from loguru import logger  # local import to avoid module-level dep
-
-    spatial_coords = adata.obsm["spatial"].copy()
-
-    for roi_name, angle_degrees in roi_rotation_angles.items():
-        # Find indices for the current ROI
-        roi_indices = np.where(adata.obs["roi"] == roi_name)[0]
-
-        if len(roi_indices) == 0:
-            logger.warning(f"ROI '{roi_name}' not found in adata.obs['roi']. Skipping rotation for this ROI.")
-
-        # Get the spatial coordinates for the current ROI
-        roi_spatial_coords = spatial_coords[roi_indices, :]
-
-        if roi_spatial_coords.shape[1] != 2:
-            raise ValueError(
-                f"Spatial coordinates for ROI '{roi_name}' are not 2D. "
-                f"Expected shape (n_cells, 2), got {roi_spatial_coords.shape}"
-            )
-
-        # Calculate the center of the ROI
-        center_x = np.mean(roi_spatial_coords[:, 0])
-        center_y = np.mean(roi_spatial_coords[:, 1])
-        center = np.array([center_x, center_y])
-
-        # Translate ROI to origin
-        translated_coords = roi_spatial_coords - center
-        rotation_matrix = create_rotation_matrix(-angle_degrees)
-        rotated_coords_at_origin = (rotation_matrix @ translated_coords.T).T
-
-        # Translate ROI back to its original position
-        rotated_coords = rotated_coords_at_origin + center
-
-        spatial_coords[roi_indices, :] = rotated_coords
-
-    adata.obsm["spatial_rot"] = spatial_coords
-    return adata
-
-
-def translate_rois_in_adata(adata: "ad.AnnData", roi_translations: dict[str, tuple[float, float]]):
-    """Translate ROI spatial coordinates in-place by the provided pixel offsets."""
-    import numpy as np  # local import
-    from loguru import logger  # local import
-
-    spatial_coords = adata.obsm.get("spatial_rot", adata.obsm["spatial"]).copy()
-
-    for roi_name, shift in roi_translations.items():
-        if len(shift) != 2:
-            raise ValueError(f"Translation for ROI '{roi_name}' must be a tuple of length 2, got {shift}.")
-
-        dx, dy = shift
-        roi_indices = np.where(adata.obs["roi"] == roi_name)[0]
-
-        if len(roi_indices) == 0:
-            logger.warning(
-                f"ROI '{roi_name}' not found in adata.obs['roi']. Skipping translation for this ROI."
-            )
-            continue
-
-        spatial_coords[roi_indices, 0] += dx
-        spatial_coords[roi_indices, 1] += dy
-
-    adata.obsm["spatial_trans"] = spatial_coords
-    return adata
 
 
 def add_scale_bar(

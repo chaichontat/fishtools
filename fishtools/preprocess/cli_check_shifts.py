@@ -208,7 +208,7 @@ def build_metrics_table(
     "output_dir",
     type=click.Path(file_okay=False, dir_okay=True, writable=True, resolve_path=True, path_type=Path),
     default=None,
-    help="Output directory for PNGs [default: '<workspace_parent>/output']",
+    help="Output directory for PNGs [default: '<workspace>/analysis/output']",
 )
 @click.option("--cols", type=int, default=4, show_default=True, help="Number of columns in the panel grid")
 @click.option(
@@ -278,7 +278,7 @@ def check_shifts(
     )
 
     if output_dir is None:
-        output_dir = path.parent / "output"
+        output_dir = ws.output.root
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.debug(f"Output directory: {output_dir}")
 

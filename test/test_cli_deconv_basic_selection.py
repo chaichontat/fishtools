@@ -81,10 +81,7 @@ def test_cli_deconv_prefers_wavelengths_for_basic_lookup(tmp_path: Path) -> None
         basic_name="all",
         n_fids=2,
         histogram_bins=16,
-        load_scaling=False,
         overwrite=True,
-        debug=False,
-        label=None,
         mode=DeconvolutionOutputMode.F32,
     )
 

@@ -1,5 +1,4 @@
 import numpy as np
-import pytest
 
 from fishtools.preprocess.chromatic import Affine
 
@@ -83,3 +82,22 @@ def test_affine_translation_fractional_shift_com_matches_expected() -> None:
     # CoM should move by (-dx, -dy) due to output→input mapping
     assert np.isclose(cy - y0, -shift[1], atol=1e-3)
     assert np.isclose(cx - x0, -shift[0], atol=1e-3)
+
+
+def test_affine_center_inferred_from_image_shape_non_square() -> None:
+    z, y, x = 1, 10, 6
+    vol = np.zeros((z, y, x), dtype=np.float32)
+    y0, x0 = 2, 1
+    vol[0, y0, x0] = 1000.0
+
+    A = np.eye(3, dtype=np.float64)
+    A[0, 0] = -1.0
+    A[1, 1] = -1.0
+    As = {"650": A}
+    ats = {"650": np.zeros(3, dtype=np.float64)}
+    aff = Affine(ref_img=vol.astype(np.float32, copy=False), As=As, ats=ats, ref="560")
+
+    out = aff(vol, channel="650", shiftpx=np.array([0.0, 0.0], dtype=np.float64))
+
+    yy, xx = np.unravel_index(np.argmax(out[0]), out[0].shape)
+    assert (yy, xx) == (y - 1 - y0, x - 1 - x0)

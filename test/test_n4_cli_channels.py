@@ -24,7 +24,7 @@ def _make_fused(workspace: Path, roi: str, codebook: str, shape=(1, 8, 8, 3), na
         shape=shape,
         chunks=(1, shape[1], shape[2], 1),
         dtype=np.uint16,
-        codecs=default_zarr_codecs(),
+        codecs=default_zarr_codecs(np.uint16),
     )
     store[...] = 100
     if names is not None:
