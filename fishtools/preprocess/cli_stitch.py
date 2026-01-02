@@ -1,40 +1,11 @@
-"""
-FISH Image Stitching Pipeline
-
-This module provides tools for stitching multi-tile FISH images into seamless mosaics.
-The workflow includes:
-
-1. Tile registration using ImageJ Grid/Collection stitching
-2. Channel extraction and preprocessing
-3. Multi-threaded image fusion
-4. Zarr array creation for large datasets
-
-Key Functions:
-- create_tile_config: Generate ImageJ-compatible tile configuration files
-- run_imagej: Execute ImageJ stitching operations via subprocess
-- extract_channel: Extract and preprocess individual channels from multi-channel images
-- extract: Process images for segmentation with proper formatting
-- walk_fused: Navigate fused image directory structures
-
-CLI Commands:
-- register-simple: Basic tile registration workflow
-- register: Advanced registration with fiducial markers
-- fuse: Multi-threaded image fusion with compression
-- combine: Combine fused tiles into Zarr arrays for analysis
-- run: Complete end-to-end stitching pipeline
-
-Uses ImageJ Grid/Collection stitching for accurate tile alignment and supports
-large-scale datasets through efficient memory management and parallelization.
-"""
-
 import json
 import shutil
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Callable
 from itertools import chain
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -52,61 +23,28 @@ from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.downsample import downsample_xy, gpu_downsample_xy
 from fishtools.preprocess.illumination import parse_tile_index_from_path, resolve_roi_for_field, tile_origin
 from fishtools.preprocess.imagej import run_imagej as _run_imagej
-from fishtools.preprocess.imageops import clip_range_for_dtype as clip_range_for_dtype_lib
-from fishtools.preprocess.imageops import crop_xy as crop_xy_lib
+from fishtools.preprocess.imageops import clip_range_for_dtype, crop_xy
 from fishtools.preprocess.stitching import walk_fused as _walk_fused
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.preprocess.tileconfig import copy_registered as _copy_registered
 from fishtools.utils.logging import CONSOLE_SKIP_EXTRA, get_shared_console, setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
-from fishtools.utils.tiff import compose_metadata as compose_meta
-from fishtools.utils.tiff import normalize_channel_names as norm_names
-from fishtools.utils.tiff import read_metadata_from_tif
+from fishtools.utils.tiff import compose_metadata, normalize_channel_names, read_metadata_from_tif
 from fishtools.utils.utils import add_file_context, batch_roi
 from fishtools.utils.thumbnails import load_thumbnail_options, save_thumbnail_png
 from fishtools.utils.zarr_utils import default_zarr_codecs
 from fishtools.utils.zarr_utils import numpy_array_to_zarr as _numpy_array_to_zarr
 
-# Expose subprocess for tests that monkeypatch cli_stitch.subprocess.run
-_subprocess_run_for_tests = subprocess.run
-
-"""Lazy N4 workflow import (CuPy/SimpleITK heavy).
-
-We keep a module-level symbol for tests to monkeypatch while deferring
-the actual import until the 'n4' command is invoked.
-"""
-run_cli_workflow = None  # type: ignore[assignment]
+run_cli_workflow: Callable[..., Any] | None = None
 
 
-def _get_run_cli_workflow():
+def _get_run_cli_workflow() -> Callable[..., Any]:
     global run_cli_workflow  # noqa: PLW0603 - intended shared cache
-    if run_cli_workflow is None:  # type: ignore[comparison-overlap]
-        from fishtools.preprocess.n4 import run_cli_workflow as _run
+    if run_cli_workflow is None:
+        from fishtools.preprocess.n4 import run_cli_workflow as _run_cli_workflow
 
-        run_cli_workflow = _run  # type: ignore[assignment]
-    return run_cli_workflow  # type: ignore[return-value]
-
-
-def _clip_range_for_dtype(dtype: np.dtype) -> tuple[float, float] | None:  # shim
-    return clip_range_for_dtype_lib(dtype)
-
-
-def _crop_xy(array: np.ndarray, trim: int) -> np.ndarray:  # shim
-    return crop_xy_lib(array, trim)
-
-
-def _read_tiff_metadata(tif: TiffFile) -> dict[str, Any]:
-    return read_metadata_from_tif(tif)
-
-
-def _normalize_channel_names(count: int, metadata: dict[str, Any]) -> list[str]:
-    return norm_names(count, metadata)
-
-
-def _compose_metadata(
-    axes: str, channel_names: Sequence[str] | None, *, extra: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    return compose_meta(axes, channel_names, extra=extra)
+        run_cli_workflow = _run_cli_workflow
+    return run_cli_workflow
 
 
 def _label_for_max_from(path: Path | None) -> str | None:
@@ -115,7 +53,7 @@ def _label_for_max_from(path: Path | None) -> str | None:
     label = f"max_from:{path.stem}"
     try:
         with TiffFile(path) as tif:
-            metadata = _read_tiff_metadata(tif)
+            metadata = read_metadata_from_tif(tif)
         raw_keys = metadata.get("key")
         if isinstance(raw_keys, str):
             keys = [raw_keys]
@@ -130,97 +68,9 @@ def _label_for_max_from(path: Path | None) -> str | None:
     return label
 
 
-def _resolve_codebook_path(ws: Workspace, codebook: str) -> Path:
-    """Locate the JSON file backing a codebook stem inside a workspace."""
-
-    candidates = [
-        ws.path / "codebooks" / f"{codebook}.json",
-        ws.deconved / "codebooks" / f"{codebook}.json",
-        ws.path / f"{codebook}.json",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    search_list = ", ".join(str(p) for p in candidates)
-    raise ValueError(
-        f"Codebook JSON for '{codebook}' not found. Looked under: {search_list}. "
-        "Ensure the codebook JSON is present in the workspace."
-    )
-
-
-def _load_codebook_channels(ws: Workspace, codebook: str) -> set[str]:
-    """Parse the set of channel identifiers used by a codebook."""
-
-    path = _resolve_codebook_path(ws, codebook)
-    try:
-        payload = json.loads(path.read_text())
-    except json.JSONDecodeError as exc:  # pragma: no cover - invalid user file
-        raise ValueError(f"Failed to parse codebook JSON at {path}: {exc}") from exc
-
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected codebook JSON at {path} to be an object mapping targets to channels.")
-
-    channels: set[str] = set()
-    for value in payload.values():
-        if isinstance(value, (list, tuple, set)):
-            for item in value:
-                if item is None:
-                    raise ValueError(f"Codebook {path} contains null channel entries.")
-                channels.add(str(item))
-        else:
-            if value is None:
-                raise ValueError(f"Codebook {path} contains null channel entries.")
-            channels.add(str(value))
-
-    if not channels:
-        raise ValueError(f"Codebook '{codebook}' did not define any channels.")
-
-    return channels
-
-
-def _collect_registered_channels(
-    img_paths: Sequence[Path],
-    expected: set[str],
-) -> tuple[list[Path], set[str], list[tuple[Path, list[str]]]]:
-    """Filter registered tiles that satisfy the required channel coverage.
-
-    Returns the valid tiles, the union of channels observed across them, and tiles that
-    were skipped with their missing channels.
-    """
-
-    discovered: set[str] = set()
-    valid_paths: list[Path] = []
-    skipped: list[tuple[Path, list[str]]] = []
-
-    for img_path in img_paths:
-        with TiffFile(img_path) as tif:
-            metadata = _read_tiff_metadata(tif)
-        raw_keys = metadata.get("key")
-        if raw_keys is None:
-            channels: set[str] = set()
-        elif isinstance(raw_keys, str):
-            channels = {raw_keys}
-        elif isinstance(raw_keys, Iterable):
-            channels = {str(key) for key in raw_keys}
-        else:
-            channels = {str(raw_keys)}
-
-        if expected:
-            missing = sorted(expected - channels)
-            if missing:
-                skipped.append((img_path, missing))
-                continue
-
-        discovered.update(channels)
-        valid_paths.append(img_path)
-
-    return valid_paths, discovered, skipped
-
-
 def create_tile_config(
     path: Path, df: pd.DataFrame, *, name: str = "TileConfiguration.txt", pixel: int = 1024
 ) -> None:
-    """Shim: delegate to TileConfiguration.from_pos(...).write(...)."""
     TileConfiguration.from_pos(df).write(path / name)
 
 
@@ -262,25 +112,7 @@ def extract_channel(
     reduce_bit_depth: int = 0,
     sc: StitchingConfig | None = None,
 ) -> None:
-    """
-    Extract and preprocess a single channel from multi-channel TIFF image.
-
-    Supports channel extraction, maximum projection, trimming, downsampling,
-    and bit depth reduction with compressed output.
-
-    Args:
-        path: Input TIFF file path
-        out: Output TIFF file path
-        idx: Channel index to extract (required unless max_proj=True)
-        trim: Pixels to trim from each edge
-        max_proj: Compute maximum projection over Z and C dimensions
-        downsample: Downsampling factor for spatial dimensions
-        reduce_bit_depth: Number of bits to reduce (right shift)
-
-    Raises:
-        ValueError: If trim is negative or bit depth reduction on non-uint16
-        TiffFileError: If input file is corrupted or unreadable
-    """
+    """Extract one channel (or max-proj) and write as a YX TIFF."""
     from fishtools.utils.pretty_print import TaskCancelledException, get_cancel_event
 
     cancel = get_cancel_event()
@@ -290,22 +122,22 @@ def extract_channel(
             if trim < 0:
                 raise ValueError("Trim must be positive")
 
-            metadata_in = _read_tiff_metadata(tif)
+            metadata_in = read_metadata_from_tif(tif)
             channel_names: list[str] = []
 
             if max_proj:
                 full = tif.asarray()
                 if full.ndim >= 4:
-                    channel_names = _normalize_channel_names(full.shape[1], metadata_in)
+                    channel_names = normalize_channel_names(full.shape[1], metadata_in)
                     img = full.max(axis=(0, 1))
                 elif full.ndim == 3:
-                    channel_names = _normalize_channel_names(full.shape[0], metadata_in)
+                    channel_names = normalize_channel_names(full.shape[0], metadata_in)
                     img = full.max(axis=(0, 1))
                 else:
                     img = full.squeeze()
             elif len(tif.pages) == 1 and tif.pages[0].asarray().ndim == 3:
                 arr = tif.pages[0].asarray()
-                channel_names = _normalize_channel_names(arr.shape[0], metadata_in)
+                channel_names = normalize_channel_names(arr.shape[0], metadata_in)
                 if idx is None:
                     raise ValueError("Channel index is required when extracting without max projection.")
                 img = arr[idx]
@@ -314,7 +146,7 @@ def extract_channel(
                 if idx is None:
                     raise ValueError("Channel index is required when extracting without max projection.")
                 channel_count = len(tif.pages)
-                channel_names_all = _normalize_channel_names(channel_count, metadata_in)
+                channel_names_all = normalize_channel_names(channel_count, metadata_in)
                 img = tif.pages[idx].asarray()
                 channel_names = (
                     [channel_names_all[idx]]
@@ -332,9 +164,9 @@ def extract_channel(
     try:
         if cancel.is_set():
             raise TaskCancelledException("Cancelled before processing")
-        img = _crop_xy(img, trim)
+        img = crop_xy(img, trim)
         if downsample > 1:
-            clip_range = _clip_range_for_dtype(img.dtype)
+            clip_range = clip_range_for_dtype(img.dtype)
             try:
                 img = downsample_xy(
                     img,
@@ -344,11 +176,7 @@ def extract_channel(
                     output_dtype=img.dtype,
                 )
             finally:
-                # Release GPU allocator caches after downsampling
-                try:
-                    gpu_release_all()
-                except Exception:
-                    logger.opt(exception=True).debug("GPU cleanup failed after downsample; continuing.")
+                gpu_release_all()
 
         if reduce_bit_depth:
             if img.dtype != np.uint16:
@@ -358,7 +186,7 @@ def extract_channel(
         level = sc.compression_levels.get("low") if sc else 0.7
         if cancel.is_set():
             raise TaskCancelledException("Cancelled before write")
-        metadata_out = _compose_metadata(
+        metadata_out = compose_metadata(
             "YX",
             channel_names,
             extra={
@@ -370,7 +198,6 @@ def extract_channel(
                 }
             },
         )
-        # Remove None values to keep metadata clean
         metadata_out = {k: v for k, v in metadata_out.items() if v is not None}
         try:
             safe_imwrite(
@@ -412,20 +239,13 @@ def stitch():
     help="Optional project config to populate stitching defaults.",
 )
 def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int, json_config: Path | None):
-    # Workspace-scoped logging; logs to {workspace}/analysis/logs while
-    # cooperating with Rich progress bars via the shared Console
     setup_cli_logging(
         path,
         component="preprocess.stitch.register-simple",
         file="stitch-register-simple",
         extra={"downsample": downsample, "fuse": fuse},
     )
-    sc: StitchingConfig | None = None
-    if json_config:
-        try:
-            sc = load_config(json_config).stitching
-        except Exception as e:
-            logger.warning(f"Failed to load config {json_config}: {e}")
+    sc = load_config(json_config).stitching if json_config else None
     if downsample > 1:
         logger.info(f"Downsampling tile config by {downsample}x to {path / 'TileConfiguration.txt'}")
     TileConfiguration.from_file(tileconfig).downsample(downsample).write(path / "TileConfiguration.txt")
@@ -440,7 +260,6 @@ def register_simple(path: Path, tileconfig: Path, fuse: bool, downsample: int, j
 
 
 @stitch.command()
-# "Path to registered images folder. Expects CYX images. Will reshape to CYX if not. Assumes ${name}-${idx}.tif",
 @click.argument(
     "path",
     type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
@@ -501,12 +320,7 @@ def register(
         file=f"stitch-register-{roi}",
         extra={"roi": roi, "codebook": codebook, "debug": debug},
     )
-    sc: StitchingConfig | None = None
-    if json_config:
-        try:
-            sc = load_config(json_config).stitching
-        except Exception as e:
-            logger.warning(f"Failed to load config {json_config}: {e}")
+    sc = load_config(json_config).stitching if json_config else None
     ws = Workspace(path)
     out_path = ws.tileconfig_dir(roi)
     tileconfig_registered = ws.tileconfig_registered_txt(roi)
@@ -543,51 +357,12 @@ def register(
     imgs = sorted(f for f in registered_dir.glob("*.tif") if not f.name.endswith(".hp.tif"))
     if not imgs:
         raise ValueError(f"No registered TIFF files found under {registered_dir}.")
-    # codebook_channels = _load_codebook_channels(ws, codebook)
-    # imgs, registered_channels, skipped_tiles = _collect_registered_channels(imgs, expected=codebook_channels)
-
-    # if skipped_tiles:
-    #     for skipped_path, missing in skipped_tiles:
-    #         missing_labels = ", ".join(missing)
-    #         logger.warning(
-    #             f"Skipping registered tile {skipped_path.name} for ROI '{roi}' (codebook '{codebook}') "
-    #             f"because it is missing channel(s): {missing_labels}."
-    #         )
-
-    if not imgs:
-        logger.warning(
-            f"All registered tiles for ROI '{roi}' with codebook '{codebook}' are missing required channels; "
-            "skipping this ROI."
-        )
-        return
-
-    # if not registered_channels:
-    #     logger.warning(
-    #         f"Registered tiles for ROI '{roi}' with codebook '{codebook}' have no channel metadata; skipping."
-    #     )
-    #     return
-
-    # missing_channels = sorted(codebook_channels - registered_channels)
-    # if missing_channels:
-    #     observed = ", ".join(sorted(registered_channels)) or "none"
-    #     missing = ", ".join(missing_channels)
-    #     logger.warning(
-    #         f"Registered tiles for ROI '{roi}' with codebook '{codebook}' still missing channel(s): {missing}. "
-    #         f"Observed channels: {observed}. Skipping ROI."
-    #     )
-    #     return
-
-    # logger.debug(
-    #     f"Validated codebook channels for roi={roi}, codebook={codebook}: {sorted(registered_channels)}"
-    # )
 
     out_path.mkdir(exist_ok=True)
 
     if overwrite:
-        [p.unlink() for p in out_path.glob("*.tif")]
-
-    # No need to track pre-existing numeric TIFFs; all extracted per-tile TIFFs are
-    # intermediates and will be removed after ImageJ registration completes.
+        for p in out_path.glob("*.tif"):
+            p.unlink()
 
     def get_idx(img_path: Path) -> int:
         return int(img_path.stem.split("-")[1])
@@ -661,7 +436,6 @@ def register(
 
         tileconfig.write(out_path / "TileConfiguration.txt")
         logger.info(f"Created TileConfiguration at {out_path}.")
-        logger.info("Running first.")
     run_imagej(
         out_path,
         compute_overlap=True,
@@ -673,70 +447,61 @@ def register(
         sc=sc,
     )
 
-    # Post-check: verify registered tile configuration and emit a layout plot
+    for p in out_path.glob("*.tif"):
+        if p.stem.isdigit():
+            p.unlink()
+
+    tc_reg_path = tileconfig_registered
+    if not tc_reg_path.exists():
+        logger.warning(f"Registered TileConfiguration not found at {tc_reg_path.resolve()}")
+        return
+
     try:
-        tc_reg_path = tileconfig_registered
-        if not tc_reg_path.exists():
-            logger.warning(
-                f"Registered TileConfiguration not found at {tc_reg_path.resolve()}; ImageJ may have failed to write it."
-            )
-        else:
-            try:
-                tc = TileConfiguration.from_file(tc_reg_path)
-            except Exception as exc:  # pragma: no cover - user file error
-                logger.warning(f"Failed to parse {tc_reg_path.resolve()}: {exc}")
-            else:
-                # Identify any tiles at exactly (0, 0), which indicates non-registered tiles
-                df = tc.df
-                zero_mask = (df["x"] == 0.0) & (df["y"] == 0.0)
-                bad = df.filter(zero_mask).sort("index")
-                if len(bad) > 1:
-                    extras = bad.slice(1)
-                    extra_count = len(extras)
-                    bad_dict = extras.select(["index", "filename"]).to_dict(as_series=False)
-                    indices = bad_dict.get("index", [])
-                    files = bad_dict.get("filename", [])
-                    paired = ", ".join(f"{i}:{f}" for i, f in zip(indices, files))
-                    logger.warning(
-                        f"Detected {extra_count} additional tile(s) registered at (0,0): {paired}. "
-                        "These tiles were likely not registered; inspect your input or rerun registration."
-                    )
+        tc = TileConfiguration.from_file(tc_reg_path)
+    except Exception as exc:  # pragma: no cover - user file error
+        logger.warning(f"Failed to parse {tc_reg_path.resolve()}: {exc}")
+        return
 
-                # Save a per-ROI arrangement plot to the workspace outputs directory
-                try:
-                    import matplotlib.pyplot as plt
+    df = tc.df
+    zero_mask = (df["x"] == 0.0) & (df["y"] == 0.0)
+    bad = df.filter(zero_mask).sort("index")
+    if len(bad) > 1:
+        extras = bad.slice(1).select(["index", "filename"]).to_dict(as_series=False)
+        indices = extras.get("index", [])
+        files = extras.get("filename", [])
+        paired = ", ".join(f"{i}:{f}" for i, f in zip(indices, files))
+        logger.warning(
+            f"Detected {len(indices)} additional tile(s) registered at (0,0): {paired}. "
+            "These tiles were likely not registered; inspect inputs or rerun registration."
+        )
 
-                    from fishtools.utils.plot import micron_tick_formatter, place_labels_avoid_overlap
+    try:
+        import matplotlib.pyplot as plt
 
-                    fig, ax = plt.subplots(figsize=(6, 5), dpi=200)
-                    # Plot points without labels then add labels with avoidance
-                    tc.plot(ax, show_labels=False)
-                    df_lab = tc.df
-                    xs = df_lab["x"].to_numpy()
-                    ys = df_lab["y"].to_numpy()
-                    labels = [str(int(i)) for i in df_lab["index"].to_numpy()]
-                    place_labels_avoid_overlap(ax, xs, ys, labels, fontsize=6, use_arrows=True)
-                    # Convert axes to micrometers using default pixel size
-                    fmt = micron_tick_formatter(0.108)
-                    ax.xaxis.set_major_formatter(fmt)
-                    ax.yaxis.set_major_formatter(fmt)
-                    ax.set_xlabel("X (µm)")
-                    ax.set_ylabel("Y (µm)")
-                    ax.set_title(roi)
-                    fig.tight_layout()
+        from fishtools.utils.plot import micron_tick_formatter, place_labels_avoid_overlap
 
-                    # Save under analysis/output/stitch_layout and log absolute path
-                    out_dir = ws.stitch_layout
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    out_png = (out_dir / f"stitch_layout--{roi}.png").resolve()
-                    fig.savefig(out_png.as_posix(), bbox_inches="tight")
-                    plt.close(fig)
-                    logger.info(f"Saved stitch layout plot: {out_png}")
-                except Exception as exc:  # pragma: no cover - plotting environment issues
-                    logger.warning(f"Failed to generate stitch layout plot: {exc}")
-    except Exception:
-        # Keep CLI resilient; log full context for diagnostics
-        logger.opt(exception=True).warning("Post-registration checks encountered an error; continuing.")
+        fig, ax = plt.subplots(figsize=(6, 5), dpi=200)
+        tc.plot(ax, show_labels=False)
+        xs = df["x"].to_numpy()
+        ys = df["y"].to_numpy()
+        labels = [str(int(i)) for i in df["index"].to_numpy()]
+        place_labels_avoid_overlap(ax, xs, ys, labels, fontsize=6, use_arrows=True)
+        fmt = micron_tick_formatter(0.108)
+        ax.xaxis.set_major_formatter(fmt)
+        ax.yaxis.set_major_formatter(fmt)
+        ax.set_xlabel("X (µm)")
+        ax.set_ylabel("Y (µm)")
+        ax.set_title(roi)
+        fig.tight_layout()
+
+        out_dir = ws.stitch_layout
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_png = (out_dir / f"stitch_layout--{roi}.png").resolve()
+        fig.savefig(out_png, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Saved stitch layout plot: {out_png}")
+    except Exception as exc:  # pragma: no cover - plotting environment issues
+        logger.warning(f"Failed to generate stitch layout plot: {exc}")
 
 
 
@@ -756,40 +521,19 @@ def extract(
     workspace_root: Path | None = None,
     roi_for_ws: str | None = None,
     debug: bool = False,
+    field_corr: Path | None = None,
     field_zarr: Path | None = None,
+    field_patch_downsample: int = 2,
+    field_neighbors: int = 0,
+    field_smoothing: float | None = None,
     n_channels_reshape: int | None = None,
     n_fids: int = 0,
     include_fiducials: bool = False,
 ) -> None:
-    """
-    Extract and format images for downstream segmentation analysis.
-
-    Processes multi-dimensional images by extracting specific channels,
-    downsampling, and organizing into directory structure suitable for
-    segmentation workflows. Supports both 2D and 3D processing modes.
-
-    Args:
-        path: Input image file path
-        out_path: Output directory for processed images
-        trim: Pixels to trim from each edge
-        downsample: Spatial downsampling factor
-        reduce_bit_depth: Number of bits to reduce (right shift)
-        subsample_z: Z-dimension subsampling factor
-        max_proj: Compute maximum Z-projection
-        is_2d: Process as 2D image (max project if 4D input)
-        channels: List of channel indices to extract
-        max_from: Additional file to merge for max projection
-        n_channels_reshape: If set, reshape [ZC]YX to ZCYX with this many channels
-        n_fids: Number of fiducial frames to remove from end before reshape
-        include_fiducials: If True, also extract fiducial frames to fid_XX folders
-
-    Raises:
-        ValueError: If is_2d=False but max_proj required for 4D input
-        FileNotFoundError: If input files not found
-    """
+    """Extract tiles into per-(z, channel) folders for ImageJ fusion."""
     try:
         with TiffFile(path) as tif:
-            metadata_in = _read_tiff_metadata(tif)
+            metadata_in = read_metadata_from_tif(tif)
             img = tif.asarray()
     except FileNotFoundError as exc:
         add_file_context(exc, path)
@@ -815,7 +559,7 @@ def extract(
         # Reshape from [ZC]YX to ZCYX - frames are interleaved as Z0C0, Z0C1, Z0C2, Z1C0, Z1C1, Z1C2, ...
         img = img.reshape(n_z, n_channels_reshape, h, w)
 
-    Path(out_path).mkdir(exist_ok=True)
+    out_path.mkdir(exist_ok=True)
     # Determine channel labels directly from metadata 'key' when present;
     # otherwise fall back to numeric labels sized from shape or requested channels
     maybe_keys = metadata_in.get("key")
@@ -846,14 +590,9 @@ def extract(
 
     try:
         if is_2d:
-            logger.info(
-                f"Extract2D: start tile={path.name} channels={channels} subsample_z={subsample_z} field_zarr={bool(field_zarr)}"
-            )
             if len(img.shape) == 4:
                 if not max_proj:
-                    raise ValueError(
-                        "Please set is_3d to True if you want to segment 3D images or max_proj to True for max projection."
-                    )
+                    raise ValueError("4D input with --is-2d requires --max-proj.")
                 img = img.max(axis=0)
 
             if img.ndim == 2:
@@ -864,7 +603,43 @@ def extract(
             if channels is not None:
                 img = img[channels]
 
-            # Apply field correction after downsample for 2D path using single TCYX store
+            clip_range = clip_range_for_dtype(img.dtype)
+            img = crop_xy(img, trim)
+            if downsample > 1:
+                try:
+                    img = downsample_xy(
+                        img,
+                        crop=0,
+                        factor=downsample,
+                        clip_range=clip_range,
+                        output_dtype=img.dtype,
+                    )
+                finally:
+                    gpu_release_all()
+
+            if field_corr is not None:
+                if workspace_root is None:
+                    raise ValueError("workspace_root is required when applying --field-corr")
+                roi_name = resolve_roi_for_field(out_path, roi_for_ws)
+                tile_index = parse_tile_index_from_path(path)
+                from fishtools.preprocess.illumination_apply import apply_field_corr_to_tile_zcyx
+
+                corrected = apply_field_corr_to_tile_zcyx(
+                    img[np.newaxis, ...],
+                    model=field_corr,
+                    workspace=workspace_root,
+                    roi=roi_name,
+                    tile_index=tile_index,
+                    downsample=downsample,
+                    patch_downsample=field_patch_downsample,
+                    channels_to_apply=tuple(range(img.shape[0])),
+                    neighbors_override=None if field_neighbors == 0 else field_neighbors,
+                    smoothing_override=field_smoothing,
+                    pretrim=int(trim),
+                    coords_in_downsampled_space=True,
+                )
+                img = corrected[0]
+
             if field_zarr is not None:
                 if workspace_root is None:
                     raise ValueError("workspace_root is required when applying field Zarr stores")
@@ -882,25 +657,6 @@ def extract(
                     trim=int(trim),
                 )
 
-            clip_range = _clip_range_for_dtype(img.dtype)
-            img = _crop_xy(img, trim)
-            if downsample > 1:
-                try:
-                    img = downsample_xy(
-                        img,
-                        crop=0,
-                        factor=downsample,
-                        clip_range=clip_range,
-                        output_dtype=img.dtype,
-                    )
-                finally:
-                    try:
-                        gpu_release_all()
-                    except Exception:
-                        logger.opt(exception=True).debug(
-                            "GPU cleanup failed after 2D downsample; continuing."
-                        )
-
             if reduce_bit_depth:
                 img >>= reduce_bit_depth
 
@@ -910,7 +666,7 @@ def extract(
                 )
                 (out_path / f"{i:02d}").mkdir(exist_ok=True)
                 target = out_path / f"{i:02d}" / (path.stem.split("-")[1] + ".tif")
-                metadata_out = _compose_metadata(
+                metadata_out = compose_metadata(
                     "YX",
                     [channel_name],
                     extra={
@@ -951,8 +707,8 @@ def extract(
         if channels is not None:
             img = img[:, channels]
 
-        clip_range = _clip_range_for_dtype(img.dtype)
-        img = _crop_xy(img, trim)
+        clip_range = clip_range_for_dtype(img.dtype)
+        img = crop_xy(img, trim)
         if downsample > 1:
             try:
                 img = downsample_xy(
@@ -963,12 +719,30 @@ def extract(
                     output_dtype=img.dtype,
                 )
             finally:
-                try:
-                    gpu_release_all()
-                except Exception:
-                    logger.opt(exception=True).debug("GPU cleanup failed after 3D downsample; continuing.")
+                gpu_release_all()
 
-        # Apply field correction after downsample for 3D path using single TCYX store
+        if field_corr is not None:
+            if workspace_root is None:
+                raise ValueError("workspace_root is required when applying --field-corr")
+            roi_name = resolve_roi_for_field(out_path, roi_for_ws)
+            tile_index = parse_tile_index_from_path(path)
+            from fishtools.preprocess.illumination_apply import apply_field_corr_to_tile_zcyx
+
+            img = apply_field_corr_to_tile_zcyx(
+                img,
+                model=field_corr,
+                workspace=workspace_root,
+                roi=roi_name,
+                tile_index=tile_index,
+                downsample=downsample,
+                patch_downsample=field_patch_downsample,
+                channels_to_apply=tuple(range(img.shape[1])),
+                neighbors_override=None if field_neighbors == 0 else field_neighbors,
+                smoothing_override=field_smoothing,
+                pretrim=int(trim),
+                coords_in_downsampled_space=True,
+            )
+
         if field_zarr is not None:
             if workspace_root is None:
                 raise ValueError("workspace_root is required when applying field Zarr stores")
@@ -997,7 +771,7 @@ def extract(
                 p = out_path / f"{i:02d}" / f"{j:02d}"
                 p.mkdir(exist_ok=True, parents=True)
                 target = p / (path.stem.split("-")[1] + ".tif")
-                metadata_out = _compose_metadata(
+                metadata_out = compose_metadata(
                     "YX",
                     [channel_name],
                     extra={
@@ -1030,8 +804,8 @@ def extract(
         if fiducials is not None:
             # Apply same processing as main image: trim, downsample
             fid_img = fiducials
-            clip_range = _clip_range_for_dtype(fid_img.dtype)
-            fid_img = _crop_xy(fid_img, trim)
+            clip_range = clip_range_for_dtype(fid_img.dtype)
+            fid_img = crop_xy(fid_img, trim)
             if downsample > 1:
                 try:
                     fid_img = gpu_downsample_xy(
@@ -1042,17 +816,14 @@ def extract(
                         output_dtype=fid_img.dtype,
                     )
                 finally:
-                    try:
-                        gpu_release_all()
-                    except Exception:
-                        pass
+                    gpu_release_all()
 
             # Save fiducials as 1 channel with n_fids Z slices: fid/00/, fid/01/
             for fid_z in range(fid_img.shape[0]):
                 fid_folder = out_path / "fid" / f"{fid_z:02d}"
                 fid_folder.mkdir(exist_ok=True, parents=True)
                 target = fid_folder / (path.stem.split("-")[1] + ".tif")
-                metadata_out = _compose_metadata(
+                metadata_out = compose_metadata(
                     "YX",
                     ["fiducial"],
                     extra={"processing": {"fiducial_z": fid_z}},
@@ -1073,7 +844,6 @@ def extract(
     except Exception as exc:
         add_file_context(exc, path)
         raise
-    return
 
 
 def walk_fused(path: Path) -> dict[int, list[Path]]:  # shim
@@ -1165,38 +935,21 @@ def fuse(
     round_name: str | None = None,
     fuse_only: bool = False,
 ):
-    # Validate: either codebook OR round_name must be provided
     if codebook is None and round_name is None:
         raise ValueError("Either --codebook or --round-name must be provided.")
 
     ws = Workspace(path)
 
-    # Load coarse shifts if round_name mode
-    shifts_data: dict | None = None
     shift_lookup: dict[int, tuple[float, float]] = {}
     coarse_round_name: str | None = None
 
     if round_name is not None:
-        # In coarse-shifted fusion, default to downsample=1 unless the user
-        # explicitly provided --downsample/-d. This keeps shifts aligned to
-        # the pixel grid used when coarse_shifts.json was computed.
-        try:
-            ctx = click.get_current_context(silent=True)
-        except RuntimeError:
-            ctx = None
+        ctx = click.get_current_context(silent=True)
         if ctx is not None:
-            try:
-                source = ctx.get_parameter_source("downsample")
-            except Exception:
-                source = None
+            source = ctx.get_parameter_source("downsample")
             if source is None or source is ParameterSource.DEFAULT:
-                if downsample != 1:
-                    logger.info(
-                        "Coarse-shifted fusion without explicit --downsample; "
-                        "overriding default to downsample=1 for alignment."
-                    )
                 downsample = 1
-        # Auto-detect coarse_shifts path if not provided
+
         if coarse_shifts is None:
             coarse_shifts = ws.coarse_shifts_json(roi)
             if not coarse_shifts.exists():
@@ -1205,36 +958,28 @@ def fuse(
                     f"Run 'preprocess register fix-shifts' first or provide --coarse-shifts."
                 )
             logger.info(f"Auto-detected coarse shifts: {coarse_shifts}")
-        import json as json_module
-        shifts_data = json_module.loads(coarse_shifts.read_text())
-        tiles_shifts = shifts_data.get("tiles", {})
+        tiles_shifts = json.loads(coarse_shifts.read_text()).get("tiles", {})
 
-        # Validate round_name exists in coarse_shifts
         available_rounds: set[str] = set()
         for tile_shifts in tiles_shifts.values():
             available_rounds.update(tile_shifts.keys())
 
         if round_name not in available_rounds:
-            raise ValueError(f"Round '{round_name}' not in coarse_shifts. Available: {available_rounds}")
+            available = ", ".join(sorted(available_rounds))
+            raise ValueError(f"Round '{round_name}' not in coarse_shifts. Available: {available}")
         coarse_round_name = round_name
 
-        # Build shift lookup for the selected round
         for tile_idx_str, round_shifts in tiles_shifts.items():
             if coarse_round_name in round_shifts:
                 shift_data = round_shifts[coarse_round_name]
                 shift_lookup[int(tile_idx_str)] = (shift_data["dx"], shift_data["dy"])
 
-        # Output folder and source path for coarse-shifted fusion
         stitch_dir = ws.stitch_shifted(roi, coarse_round_name)
         path_img = ws.deconv_round_dir(coarse_round_name, roi)
-        logger.info(f"Coarse-shifted fusion: reading from {path_img}, output to {stitch_dir}")
 
-        # For deconvolved images: calculate n_channels from round name (e.g., "1_9_17" -> 3 channels)
         n_channels_reshape = len(coarse_round_name.split("_"))
-        n_fids_reshape = 2  # Default fiducial count; could be made configurable
-        logger.info(f"Deconvolved image reshape: {n_channels_reshape} channels, {n_fids_reshape} fiducials")
+        n_fids_reshape = 2
     else:
-        # Standard registered fusion
         assert codebook is not None  # validated above
         stitch_dir = ws.stitch(roi, codebook)
         path_img = ws.registered(roi, codebook)
@@ -1250,14 +995,7 @@ def fuse(
         extra={"roi": roi, "codebook": codebook, "round": coarse_round_name, "threads": threads},
     )
 
-    sc: StitchingConfig | None = None
-    if json_config:
-        try:
-            sc = load_config(json_config).stitching
-        except Exception as e:
-            logger.warning(f"Failed to load config {json_config}: {e}")
-    if "--" in path.as_posix():
-        raise ValueError("Please be in the workspace folder.")
+    sc = load_config(json_config).stitching if json_config else None
 
     existing_fused = [
         candidate
@@ -1315,7 +1053,6 @@ def fuse(
     if shift_lookup:
         logger.info(f"Applying coarse shifts for round '{coarse_round_name}' to {len(shift_lookup)} tiles")
 
-        # Validate: warn if TileConfiguration has tiles not in shift_lookup
         tc_indices = set(int(r["index"]) for r in tileconfig.df.iter_rows(named=True))
         missing = tc_indices - set(shift_lookup.keys())
         if missing:
@@ -1323,24 +1060,20 @@ def fuse(
                 f"Tiles in TileConfiguration but not in coarse_shifts (using 0,0): {sorted(missing)}"
             )
 
-
-        def apply_shift(row: dict) -> dict:
+        adjusted_rows: list[dict[str, Any]] = []
+        for row in tileconfig.df.iter_rows(named=True):
             tile_idx = int(row["index"])
             dx, dy = shift_lookup.get(tile_idx, (0.0, 0.0))
             row["x"] = row["x"] + dx / downsample
             row["y"] = row["y"] + dy / downsample
-            return row
-
-        adjusted_rows = [apply_shift(row) for row in tileconfig.df.iter_rows(named=True)]
+            adjusted_rows.append(row)
         tileconfig = TileConfiguration(pl.DataFrame(adjusted_rows, schema=tileconfig.df.schema))
 
-        # Log summary
         applied = [(dx, dy) for dx, dy in shift_lookup.values()]
         if applied:
             dxs, dys = zip(*applied)
             logger.info(f"  dx: [{min(dxs):.1f}, {max(dxs):.1f}], dy: [{min(dys):.1f}, {max(dys):.1f}]")
 
-        # Save shifted TileConfiguration for slice step
         stitch_dir.mkdir(parents=True, exist_ok=True)
         shifted_tc_path = stitch_dir / "TileConfiguration.shifted.txt"
         tileconfig.write(shifted_tc_path)
@@ -1351,7 +1084,7 @@ def fuse(
     # Read metadata first to properly determine channel count
     try:
         with TiffFile(files[0]) as tif_first:
-            metadata_first = _read_tiff_metadata(tif_first)
+            metadata_first = read_metadata_from_tif(tif_first)
             first_image_shape = tif_first.asarray().shape
             first_image_ndim = len(first_image_shape)
     except Exception as exc:
@@ -1390,14 +1123,14 @@ def fuse(
 
     # Build channel names from metadata
     if isinstance(key_raw, str):
-        channel_names_all = _normalize_channel_names(1, metadata_first)
+        channel_names_all = normalize_channel_names(1, metadata_first)
     elif isinstance(key_raw, (list, tuple)):
-        channel_names_all = _normalize_channel_names(len(key_raw), metadata_first)
+        channel_names_all = normalize_channel_names(len(key_raw), metadata_first)
     elif isinstance(key_raw, np.ndarray):
-        channel_names_all = _normalize_channel_names(len(key_raw), metadata_first)
+        channel_names_all = normalize_channel_names(len(key_raw), metadata_first)
     else:
         count_guess = (max(channel_indices) + 1) if channel_indices else n_channels
-        channel_names_all = _normalize_channel_names(count_guess, metadata_first)
+        channel_names_all = normalize_channel_names(count_guess, metadata_first)
 
     if channel_indices:
         channel_labels_selected = [
@@ -1421,11 +1154,8 @@ def fuse(
         logger.warning(f"Not all images are present in {path_img}. Missing: {needed - imgs}. Dropping.")
 
     # When using pre-exported fields, enforce ds=1 for alignment
-    if (field_zarr) and int(downsample) != 1:
+    if field_zarr and int(downsample) != 1:
         raise ValueError("When providing field Zarr stores, please set --downsample 1 for alignment.")
-
-    # Sanity: both LOW and RANGE must be supplied together
-    # Only TCYX format is supported now
 
     if skip_extract:
         logger.info(f"Reusing previously extracted tiles at {path}. Use --overwrite to regenerate.")
@@ -1452,7 +1182,7 @@ def fuse(
                     include_fiducials=n_channels_reshape is not None,  # Always include in round-name mode
                 )
 
-    def run_folder(folder: Path, capture_output: bool = False, stream_to_console: bool = False):
+    def run_folder(folder: Path, capture_output: bool = False, stream_to_console: bool = False) -> None:
         def log_progress(message: str) -> None:
             if capture_output:
                 logger.info(message)
@@ -1462,25 +1192,18 @@ def fuse(
 
         for i in range(split):
             tileconfig[i * n : (i + 1) * n].write(folder / f"TileConfiguration{i + 1}.registered.txt")
-            try:
-                start = perf_counter()
-                log_progress(
-                    f"Starting ImageJ fuse run for {folder} using TileConfiguration{i + 1}.registered.txt "
-                    f"(split_index={i + 1}, capture_output={capture_output})"
-                )
-                run_imagej(
-                    folder,
-                    name=f"TileConfiguration{i + 1}",
-                    capture_output=capture_output,
-                    stream_to_console=stream_to_console,
-                    sc=sc,
-                )
-            except Exception as e:
-                logger.critical(f"Error running ImageJ for {folder}: {e}")
-                raise e
-            Path(folder / "img_t1_z1_c1").rename(folder / f"fused_{folder.name}-{i + 1}.tif")
+            start = perf_counter()
+            log_progress(f"Starting ImageJ fuse for {folder} ({i + 1}/{split})")
+            run_imagej(
+                folder,
+                name=f"TileConfiguration{i + 1}",
+                capture_output=capture_output,
+                stream_to_console=stream_to_console,
+                sc=sc,
+            )
+            (folder / "img_t1_z1_c1").rename(folder / f"fused_{folder.name}-{i + 1}.tif")
             duration = perf_counter() - start
-            log_progress(f"Completed ImageJ fuse run for {folder} chunk {i + 1}/{split} in {duration:.2f}s")
+            log_progress(f"Completed ImageJ fuse for {folder} ({i + 1}/{split}) in {duration:.2f}s")
 
     # Get all folders without subfolders
     folders = list(chain.from_iterable(walk_fused(path).values()))
@@ -1494,21 +1217,20 @@ def fuse(
             folders.extend(fid_subfolders)
 
     logger.info(f"Calling ImageJ on {len(folders)} folders.")
-    to_runs = []
+    to_runs: list[Path] = []
     for folder in folders:
         if not folder.is_dir():
-            raise Exception("Invalid folder")
-        # Allow digit folders (channels/Z) - parent can be digit (main) or "fid" (fiducials)
+            raise ValueError(f"Invalid folder: {folder}")
         if not folder.name.isdigit():
             raise ValueError(f"Invalid folder name {folder.name}. Expected digit.")
 
         existings = list(folder.glob("fused*"))
         if existings and not overwrite:
-            logger.warning(f"{existings} already exists. Skipping this folder.")
+            logger.warning(f"Skipping {folder}: fused outputs already exist")
             continue
         to_runs.append(folder)
 
-    if len(to_runs):
+    if to_runs:
         with progress_bar_threadpool(len(to_runs), threads=threads, stop_on_exception=True) as submit:
             for folder in to_runs:
                 submit(run_folder, folder, capture_output=not debug, stream_to_console=debug)
@@ -1521,13 +1243,14 @@ def fuse(
 
     if not fuse_only:
         logger.info("Automatically running combine step...")
-        subprocess.run(
-            ["preprocess", "stitch", "combine", ws.path, roi,
-             *(["--codebook", codebook] if codebook else []),
-             *(["--round-name", round_name] if round_name else []),
-             *(["--overwrite"] if overwrite else [])],
-             check=True
-        )
+        cmd = ["preprocess", "stitch", "combine", str(ws.path), roi]
+        if codebook:
+            cmd.extend(["--codebook", codebook])
+        if round_name:
+            cmd.extend(["--round-name", round_name])
+        if overwrite:
+            cmd.append("--overwrite")
+        subprocess.run(cmd, check=True)
 
 
 def numpy_array_to_zarr(write_path: Path | str, array: np.ndarray, chunks: tuple[int, ...]):  # shim
@@ -1554,10 +1277,9 @@ def combine(
     codebook: str | None = None,
     round_name: str | None = None,
     chunk_size: int = 2048,
-    overwrite: bool = True,
+    overwrite: bool = False,
     thumbnail_options: Path | None = None,
 ):
-    # Validate: either codebook OR round_name must be provided
     if codebook is None and round_name is None:
         raise ValueError("Either --codebook or --round-name must be provided.")
 
@@ -1570,8 +1292,6 @@ def combine(
     )
     import zarr
 
-    from fishtools.io.workspace import Workspace
-
     ws = Workspace(path)
     target_rois = ws.resolve_rois(None if roi == "*" else [roi])
 
@@ -1581,13 +1301,11 @@ def combine(
         raise click.ClickException(f"Invalid --options file: {exc}") from exc
 
     for current_roi in target_rois:
-        # Determine stitched directory based on codebook or round_name
         if round_name is not None:
             stitched_dir = ws.stitch_shifted(current_roi, round_name)
         else:
             assert codebook is not None
             stitched_dir = ws.stitch(current_roi, codebook)
-        # Group folders by Z index (parent directory name)
         try:
             folders_by_z = walk_fused(stitched_dir)
         except ValueError:
@@ -1595,7 +1313,6 @@ def combine(
                 f"No valid stitched folders found under {stitched_dir}. Skipping ROI '{current_roi}'."
             )
             continue
-        # Sort folders within each Z index by C index (folder name)
         for z_idx in folders_by_z:
             folders_by_z[z_idx].sort(key=lambda f: int(f.name))
 
@@ -1604,10 +1321,10 @@ def combine(
             continue
 
         zs = max(folders_by_z.keys()) + 1
-        cs = max(int(f.name) for f in folders_by_z[0]) + 1  # Assume C count is same for all Z
+        first_z = min(folders_by_z.keys())
+        cs = max(int(f.name) for f in folders_by_z[first_z]) + 1  # Assume C count is same for all Z
 
-        # Check for fused images in the first Z plane to get dimensions
-        first_z_folders = folders_by_z[0]
+        first_z_folders = folders_by_z[first_z]
         missing = [
             folder for folder in first_z_folders if not (folder / f"fused_{folder.name}-1.tif").exists()
         ]
@@ -1617,7 +1334,6 @@ def combine(
             )
             continue
 
-        # Get shape from the first image of the first Z plane
         first_folder = first_z_folders[0]
         first_img = imread(first_folder / f"fused_{first_folder.name}-1.tif")
         img_shape = first_img.shape
@@ -1625,19 +1341,19 @@ def combine(
         final_shape = (zs, img_shape[0], img_shape[1], cs)
         logger.info(f"Final Zarr shape: {final_shape}, dtype: {dtype}")
 
-        # Initialize the Zarr array
         zarr_path = stitched_dir / "fused.zarr"
         logger.info(f"Writing to {zarr_path.resolve()}")
-        # Define chunks: chunk along Z=1, use user chunk_size for Y/X, full chunk for C
         zarr_chunks = (1, chunk_size, chunk_size, cs)
         zarr.config.set({"array.target_shard_size_bytes": "10MB"})
-        z_array = zarr.open_array(
+        codecs = default_zarr_codecs(dtype)
+        z_array = zarr.create_array(
             zarr_path,
-            mode="w",
             shape=final_shape,
             chunks=zarr_chunks,
             dtype=dtype,
-            codecs=default_zarr_codecs(),
+            serializer=codecs[0],
+            compressors=tuple(codecs[1:]),
+            overwrite=overwrite,
         )
 
         # Create thumbnail directory
@@ -1653,16 +1369,7 @@ def combine(
                 for folder in z_plane_folders:
                     j = int(folder.name)
                     img_path = folder / f"fused_{folder.name}-1.tif"
-                    try:
-                        img = imread(img_path)
-                    except FileNotFoundError:
-                        logger.warning(f"File not found while combining ROI '{current_roi}': {img_path}")
-                        raise
-                    except Exception as e:
-                        logger.warning(
-                            f"Error reading image while combining ROI '{current_roi}': {img_path}: {e}"
-                        )
-                        raise
+                    img = imread(img_path)
 
                     z_plane_data[:, :, j] = img[:, :]
 
@@ -1684,34 +1391,40 @@ def combine(
 
                 progress()
 
-        # Add metadata (channel names)
-        try:
-            first_reg_file = next(ws.registered(current_roi, codebook).glob("*.tif"))
-            with TiffFile(first_reg_file) as tif:
-                # Attempt to get channel names, handle potential errors
-                names = tif.shaped_metadata[0].get("key") if tif.shaped_metadata else None
-
-            if names:
-                if cs == len(names) + 1:
-                    names = names + ["spots"]
-                z_array.attrs["key"] = names
-                logger.info(f"Added channel names: {names}")
+        if codebook is not None:
+            try:
+                first_reg_file = next(ws.registered(current_roi, codebook).glob("*.tif"))
+            except StopIteration:
+                logger.warning(
+                    f"No registered TIF file found in {ws.registered(current_roi, codebook)} to read channel names."
+                )
             else:
-                logger.warning("Could not find channel names ('key') in TIF metadata.")
-        except StopIteration:
-            logger.warning(
-                f"No registered TIF file found in {ws.registered(current_roi, codebook)} to read channel names."
-            )
-        except Exception as e:
-            logger.warning(f"Error reading metadata from TIF file: {e}")
+                try:
+                    with TiffFile(first_reg_file) as tif:
+                        names = tif.shaped_metadata[0].get("key") if tif.shaped_metadata else None
+                except Exception as exc:
+                    logger.warning(f"Error reading metadata from {first_reg_file}: {exc}")
+                else:
+                    if names:
+                        if isinstance(names, np.ndarray):
+                            names = names.tolist()
+                        elif isinstance(names, tuple):
+                            names = list(names)
+                        elif not isinstance(names, list):
+                            names = [str(names)]
+
+                        if cs == len(names) + 1:
+                            names.append("spots")
+                        z_array.attrs["key"] = names
+                        logger.info(f"Added channel names: {names}")
+                    else:
+                        logger.warning("Could not find channel names ('key') in TIF metadata.")
 
         logger.info("Deleting source folders.")
-        all_folders = [f for z_folders in folders_by_z.values() for f in z_folders]
-        for folder in all_folders:
-            try:
-                shutil.rmtree(folder.parent)  # Remove the Z-level parent folder
-            except FileNotFoundError:
-                ...
+        parents = sorted({folder.parent for z_folders in folders_by_z.values() for folder in z_folders})
+        for parent in parents:
+            if parent.exists():
+                shutil.rmtree(parent)
         logger.info("Done.")
 
 
@@ -1910,8 +1623,6 @@ def final_stitch(
     sc: StitchingConfig | None = None,
 ):
     logger.info(f"Combining splits of {n} for {path}.")
-    import polars as pl
-
     tcs = [TileConfiguration.from_file(f"{path}/TileConfiguration{i + 1}.registered.txt") for i in range(n)]
 
     bmin = pl.concat([tc.df.min() for tc in tcs])
@@ -1934,7 +1645,7 @@ def final_stitch(
     out = out.max(axis=0)
     default_label = f"channel_{path.name}" if path.name.isdigit() else path.name
     label = channel_name or default_label
-    metadata_out = _compose_metadata(
+    metadata_out = compose_metadata(
         "YX",
         [label] if label else None,
         extra={
@@ -2152,5 +1863,3 @@ def slice_mosaic(
 
 if __name__ == "__main__":
     stitch()
-
-# %%
