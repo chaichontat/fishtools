@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import functools
-import os
+import tempfile
+from os import environ, fsync
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,11 @@ from cupyx.scipy.ndimage import convolve as cconvolve
 from loguru import logger
 from tifffile import imread
 
-DATA_DIR = Path(os.environ["DATA_PATH"]).expanduser().resolve() if "DATA_PATH" in os.environ else (Path(__file__).resolve().parent.parent.parent.parent / "data")
+DATA_DIR = (
+    Path(environ["DATA_PATH"]).expanduser().resolve()
+    if "DATA_PATH" in environ
+    else (Path(__file__).resolve().parent.parent.parent.parent / "data")
+)
 PSF_FILENAME = "PSF GL.tif"
 
 
@@ -27,8 +33,17 @@ I_MAX = np.float32(2**16 - 1)
 
 @functools.cache
 def projectors(step: int = 6):
-    make_projector(Path(DATA_DIR / PSF_FILENAME), step=step, max_z=7)
-    return tuple([x.astype(cp.float32) for x in cp.load((DATA_DIR / PSF_FILENAME).with_suffix(".npy"))])
+    psf_path = Path(DATA_DIR / PSF_FILENAME)
+    cache_path = psf_path.with_name(f"{psf_path.stem}.step{step}.npy")
+
+    if not cache_path.exists():
+        lock_path = cache_path.with_suffix(f"{cache_path.suffix}.lock")
+        with open(lock_path, "w") as lock_fp:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+            if not cache_path.exists():
+                make_projector(psf_path, step=step, max_z=7, output=cache_path)
+
+    return tuple([x.astype(cp.float32) for x in cp.load(cache_path)])
 
 
 def center_index(center: int, nz: int, step: int):
@@ -91,6 +106,7 @@ def make_projector(
     max_z: int = 7,
     size: int = 31,
     center: int = 50,
+    output: Path | None = None,
 ):
     gen = imread(path := Path(path))
     assert gen.shape[1] == gen.shape[2]
@@ -106,11 +122,38 @@ def make_projector(
     logger.debug(f"PSF shape: {psf.shape}")
     print(path)
     p = [
-        x.get()[:, np.newaxis, ...]
+        cp.asnumpy(x)[:, np.newaxis, ...]
         for x in _calculate_projectors_3d(cp.array(psf), σ_G=1.7, a=0.02, b=0.02, n=10)
     ]
-    with open(path.with_suffix(".npy"), "wb") as f:
-        np.save(f, p)
+
+    out_path = (Path(output) if output is not None else path.with_name(f"{path.stem}.step{step}.npy")).resolve()
+    if out_path.exists():
+        return p
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=out_path.parent,
+        prefix=f".{out_path.name}.",
+        suffix=".partial",
+        delete=False,
+    ) as tmp_fp:
+        np.save(tmp_fp, p)
+        tmp_fp.flush()
+        fsync(tmp_fp.fileno())
+        tmp_path = Path(tmp_fp.name)
+
+    try:
+        try:
+            out_path.hardlink_to(tmp_path)
+        except FileExistsError:
+            return p
+        except OSError:
+            if out_path.exists():
+                return p
+            tmp_path.replace(out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return p
 
 

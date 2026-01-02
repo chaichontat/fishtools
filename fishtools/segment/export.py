@@ -175,7 +175,10 @@ def _load_ident_shards(
         if not df_roi.is_empty():
             dfs[(roi, codebook)] = df_roi
     if not dfs:
-        raise ValueError(f"No ident files found for ROIs {list(rois)} with seg_codebook '{seg_codebook}'.")
+        raise ValueError(
+            f"No ident files found for ROIs {list(rois)} with seg_codebook '{seg_codebook}'. "
+            "Run `segment overlay intensity` or `segment overlay all` first."
+        )
     return dfs
 
 

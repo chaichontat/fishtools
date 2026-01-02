@@ -80,22 +80,39 @@ def sample_histograms(
 
 def _quantile_from_hist(counts: np.ndarray, edges: np.ndarray, q: float) -> float:
     """
-    Linear CDF interpolation within bins. `counts` length = len(edges)-1.
-    Returns approximate quantile value in the same units as edges.
+    Piecewise-linear CDF interpolation for histogram quantile estimation.
+
+    Uses an edge-based CDF definition:
+      - CDF(edges[0]) = 0
+      - CDF(edges[i]) = cumsum(counts[0:i]) / total  for i in 1..n-1
+      - CDF(edges[n]) = 1.0
+
+    This allows interpolation across the full range [edges[0], edges[-1]],
+    with q=0 returning edges[0] and q=1 returning edges[-1].
     """
     counts = counts.astype(np.float64, copy=False)
     total = counts.sum()
     if total <= 0:
         return float(edges[0])
-    cdf = np.cumsum(counts) / total
-    mids = 0.5 * (edges[:-1] + edges[1:])
 
-    idx = int(np.searchsorted(cdf, q, side="left"))
-    if idx <= 0:
-        return float(mids[0])
-    if idx >= mids.size:
-        return float(mids[-1])
-    x0, x1 = mids[idx - 1], mids[idx]
-    y0, y1 = cdf[idx - 1], cdf[idx]
+    # Boundary cases
+    if q <= 0.0:
+        return float(edges[0])
+    if q >= 1.0:
+        return float(edges[-1])
+
+    # Build CDF at edges: CDF[0]=0, CDF[i]=cumsum(counts[0:i])/total, CDF[n]=1
+    cumsum = np.cumsum(counts)
+    cdf_at_edges = np.concatenate([[0.0], cumsum / total])  # len = n+1
+
+    # Find which bin q falls into
+    idx = int(np.searchsorted(cdf_at_edges, q, side="left"))
+
+    # Clamp idx to valid range [1, len(edges)-1]
+    idx = max(1, min(idx, len(edges) - 1))
+
+    # Interpolate within bin [idx-1, idx]
+    x0, x1 = edges[idx - 1], edges[idx]
+    y0, y1 = cdf_at_edges[idx - 1], cdf_at_edges[idx]
     t = 0.0 if y1 <= y0 else (q - y0) / (y1 - y0)
     return float(x0 + t * (x1 - x0))
