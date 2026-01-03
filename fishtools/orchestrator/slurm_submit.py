@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import NamedTuple
 
 import click
 import yaml
@@ -363,7 +364,7 @@ def submit_array(
     dry_run: bool = False,
     dependency: str | None = None,
 ) -> str | None:
-    """Submit a SLURM job array.
+    """Submit a SLURM job array and return the job ID.
 
     Args:
         commands: List of shell commands, one per array task
@@ -373,6 +374,28 @@ def submit_array(
 
     Returns:
         Job ID string if submitted, None if dry_run or no commands
+    """
+    result = submit_array_result(commands, config, dry_run=dry_run, dependency=dependency)
+    return result.job_id if result is not None else None
+
+
+class SubmitResult(NamedTuple):
+    job_id: str
+    stdout: str
+    stderr: str
+    script: str
+
+
+def submit_array_result(
+    commands: list[str],
+    config: SlurmConfig | None = None,
+    *,
+    dry_run: bool = False,
+    dependency: str | None = None,
+) -> SubmitResult | None:
+    """Submit a SLURM job array and return job_id plus sbatch stdout/stderr.
+
+    Useful for orchestrators that want to persist submission diagnostics.
     """
     if not commands:
         return None
@@ -412,10 +435,13 @@ def submit_array(
                 print(result.stderr)
             raise subprocess.CalledProcessError(result.returncode, sbatch_args, result.stdout, result.stderr)
 
-        output = result.stdout.strip()
-        print(output)
-        # Extract job ID from "Submitted batch job 12345"
-        return output.split()[-1] if output else None
+        stdout = result.stdout.strip()
+        stderr = (result.stderr or "").strip()
+        print(stdout)
+        job_id = stdout.split()[-1] if stdout else ""
+        if not job_id:
+            raise RuntimeError(f"Failed to parse sbatch job ID from output: {stdout!r}")
+        return SubmitResult(job_id=job_id, stdout=stdout, stderr=stderr, script=script_content)
     finally:
         Path(script_path).unlink()
 
