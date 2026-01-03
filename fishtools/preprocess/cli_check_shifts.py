@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -46,6 +47,73 @@ def _load_shifts(path: Path) -> dict[int, dict[str, Shift]]:
             result[tile] = ShiftsAdapter.validate_json(f.read_text())
         except (OSError, UnicodeDecodeError, ValidationError, ValueError) as exc:
             raise click.ClickException(f"Failed parsing shifts JSON at {f}: {exc}") from exc
+    return result
+
+
+def _load_coarse_shifts(ws: Workspace, roi: str) -> dict[int, dict[str, Shift]]:
+    """Load coarse shifts from fix-shifts output and convert to Shift format.
+
+    The coarse_shifts.json format:
+    {
+        "reference": "...",
+        "use_fft": true/false,
+        "tiles": {
+            "0001": {
+                "round_name": {"dx": ..., "dy": ..., "magnitude": ..., "residual": ...}
+            }
+        }
+    }
+
+    Returns a dict[tile_id, dict[round_name, Shift]] compatible with plotting functions.
+    """
+    coarse_path = ws.coarse_shifts_json(roi)
+    if not coarse_path.exists():
+        return {}
+
+    try:
+        data = json.loads(coarse_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(f"Failed to load coarse shifts from {coarse_path}: {exc}")
+        return {}
+
+    if not isinstance(data, dict) or "tiles" not in data:
+        return {}
+
+    tiles_data = data.get("tiles", {})
+    if not isinstance(tiles_data, dict):
+        return {}
+
+    result: dict[int, dict[str, Shift]] = {}
+    for tile_str, rounds_data in tiles_data.items():
+        try:
+            tile_id = int(tile_str)
+        except ValueError:
+            continue
+
+        if not isinstance(rounds_data, dict):
+            continue
+
+        tile_shifts: dict[str, Shift] = {}
+        for round_name, shift_data in rounds_data.items():
+            if not isinstance(shift_data, dict):
+                continue
+
+            dx = shift_data.get("dx", 0.0)
+            dy = shift_data.get("dy", 0.0)
+            residual = shift_data.get("residual", 0.0)
+            # Coarse shifts don't have correlation; use residual-based proxy
+            # Low residual = good alignment = high correlation proxy
+            corr = max(0.0, 1.0 - residual) if residual > 0 else 1.0
+
+            tile_shifts[round_name] = Shift(
+                shifts=(float(dx), float(dy)),
+                corr=corr,
+                residual=float(residual),
+            )
+
+        if tile_shifts:
+            result[tile_id] = tile_shifts
+
     return result
 
 
@@ -224,6 +292,12 @@ def build_metrics_table(
     default=None,
     help="Optional round name to check missing tiles against (e.g., '2_10_18')",
 )
+@click.option(
+    "--round-name",
+    type=str,
+    default=None,
+    help="Plot coarse shifts for a repaired round (from `register fix-shifts`).",
+)
 def check_shifts(
     path: Path,
     roi: str | None,
@@ -233,13 +307,17 @@ def check_shifts(
     cols: int,
     corr_threshold: float,
     ref_round: str | None,
+    round_name: str | None,
 ) -> None:
     """Inspect registration shifts across tiles and rounds; save diagnostic PNGs.
 
-    Generates three figures per ROI:
+    Generates figures per ROI/codebook (or per ROI/round when using --round-name):
     - shifts_scatter: X/Y shift scatter per round colored by correlation
     - shifts_corr_vs_l2: correlation vs L2 distance from per-round mean shift
-    - shifts_corr_hist: correlation histograms
+    - shifts_corr_hist: correlation histograms (codebook mode only)
+    - shifts_layout: spatial layout of shifts per tile
+
+    Use --round-name to plot coarse shifts for repaired rounds (from `register fix-shifts`).
     """
 
     if roi is not None and rois:
@@ -257,6 +335,72 @@ def check_shifts(
     ws = Workspace(path)
     roi_list = ws.resolve_rois(selected_rois)
 
+    if output_dir is None:
+        output_dir = path.parent / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    roi_label = ",".join(selected_rois) if selected_rois else "all"
+
+    # Plot coarse shifts for repaired round (from fix-shifts)
+    if round_name is not None:
+        setup_cli_logging(
+            path,
+            component="preprocess.check_shifts",
+            file=f"check-shifts-{round_name}",
+            extra={"round_name": round_name, "roi": roi_label},
+        )
+        logger.debug(f"Output directory: {output_dir}")
+
+        for roi in roi_list:
+            coarse_shifts = _load_coarse_shifts(ws, roi)
+            if not coarse_shifts:
+                logger.warning(f"No coarse shifts found for ROI '{roi}'")
+                continue
+
+            # Filter to only the requested round
+            filtered: dict[int, dict[str, Shift]] = {}
+            for tile_id, rounds_data in coarse_shifts.items():
+                if round_name in rounds_data:
+                    filtered[tile_id] = {round_name: rounds_data[round_name]}
+
+            if not filtered:
+                available = infer_rounds(coarse_shifts)
+                logger.warning(f"Round '{round_name}' not in coarse shifts for ROI '{roi}'. Available: {available}")
+                continue
+
+            logger.info(f"Plotting coarse shifts for ROI '{roi}' / round '{round_name}'")
+
+            fig1 = make_shifts_scatter_figure(filtered, ncols=cols, corr_threshold=corr_threshold)
+            save_figure(fig1, output_dir / "shifts_scatter", "shifts_scatter", roi, round_name, log_level="INFO")
+
+            fig2 = make_corr_vs_l2_figure(filtered, ncols=cols, corr_threshold=corr_threshold)
+            save_figure(fig2, output_dir / "shifts_corr_vs_l2", "shifts_corr_vs_l2", roi, round_name, log_level="INFO")
+
+            # Build layout if TileConfiguration is available
+            try:
+                tc = ws.tileconfig(roi)
+                tile_size_px = _infer_tile_size_px(ws, roi, "", default=1968.0)
+                centers = {
+                    int(idx): (float(x) + 0.5 * tile_size_px, float(y) + 0.5 * tile_size_px)
+                    for idx, x, y in tc.df.select(["index", "x", "y"]).iter_rows()
+                }
+                records = build_shift_layout_table(centers, filtered, roi=roi)
+                try:
+                    fig_layout = make_shifts_layout_figure(
+                        records,
+                        tile_size_px=tile_size_px,
+                        pixel_size_um=0.108,
+                        label_skip=2,
+                        corr_threshold=corr_threshold,
+                    )
+                    save_figure(fig_layout, output_dir / "shifts_layout", "shifts_layout", roi, round_name, log_level="INFO")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Failed to render shifts_layout for ROI {roi}: {e}")
+            except FileNotFoundError:
+                logger.debug(f"TileConfiguration not found for ROI {roi}; skipping shifts layout plot.")
+        return
+
+    # Plot registration shifts per codebook
     if codebook_path is not None:
         codebook_names = [Codebook(codebook_path).name]
     else:
@@ -267,7 +411,6 @@ def check_shifts(
             )
         logger.info(f"Auto-discovered codebooks: {codebook_names}")
 
-    roi_label = ",".join(selected_rois) if selected_rois else "all"
     codebook_label = codebook_path.stem if codebook_path else ",".join(codebook_names)
 
     setup_cli_logging(
@@ -280,6 +423,7 @@ def check_shifts(
     if output_dir is None:
         output_dir = ws.output.root
     output_dir.mkdir(parents=True, exist_ok=True)
+
     logger.debug(f"Output directory: {output_dir}")
 
     for codebook_name in codebook_names:

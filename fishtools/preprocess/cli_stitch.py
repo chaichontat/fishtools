@@ -920,7 +920,7 @@ def fuse(
     tile_config: Path | None = None,
     split: int = 1,
     overwrite: bool = False,
-    downsample: int = 1,
+    downsample: int = 2,
     is_2d: bool = False,
     threads: int = 8,
     channels: str = "all",
@@ -1009,6 +1009,8 @@ def fuse(
             "Re-run with --overwrite to regenerate."
         )
         return
+    stitch_dir.mkdir(parents=True, exist_ok=True)
+    import json as json_module
     path = stitch_dir
     files = sorted(path_img.glob("*.tif"))
     if not len(files):
@@ -1046,6 +1048,30 @@ def fuse(
     if tile_config is None:
         tile_config = ws.tileconfig_registered_txt(roi)
         logger.info(f"Getting tile configuration from {tile_config.resolve()}")
+
+    fuse_args = {
+        "roi": roi,
+        "codebook": codebook,
+        "round_name": coarse_round_name,
+        "tile_config": str(tile_config) if tile_config else None,
+        "split": split,
+        "overwrite": overwrite,
+        "downsample": downsample,
+        "is_2d": is_2d,
+        "threads": threads,
+        "channels": channels,
+        "subsample_z": subsample_z,
+        "max_proj": max_proj,
+        "debug": debug,
+        "max_from": max_from,
+        "json_config": str(json_config) if json_config else None,
+        "field_zarr": str(field_zarr) if field_zarr else None,
+        "coarse_shifts": str(coarse_shifts) if coarse_shifts else None,
+        "fuse_only": fuse_only,
+    }
+    if sc is not None:
+        fuse_args["stitching_config"] = sc.model_dump()
+    (stitch_dir / "fuse_args.json").write_text(json_module.dumps(fuse_args, indent=2))
 
     tileconfig = TileConfiguration.from_file(tile_config).downsample(downsample)
 
@@ -1290,6 +1316,7 @@ def combine(
         file=f"stitch-combine-{roi}+{log_label}",
         extra={"roi": roi, "codebook": codebook, "round_name": round_name, "chunk_size": chunk_size},
     )
+    import json as json_module
     import zarr
 
     ws = Workspace(path)
@@ -1355,6 +1382,10 @@ def combine(
             compressors=tuple(codecs[1:]),
             overwrite=overwrite,
         )
+        fuse_args_path = stitched_dir / "fuse_args.json"
+        if fuse_args_path.exists():
+            fuse_args = json_module.loads(fuse_args_path.read_text())
+            z_array.attrs["fuse_args"] = fuse_args
 
         # Create thumbnail directory
         thumbnail_dir = stitched_dir / "thumbnails"

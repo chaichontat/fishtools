@@ -1201,13 +1201,16 @@ def _write_fused_corrected_zyxc(
 
     if float_dest is not None and float_dest_path is not None:
         try:
-            float_attrs = {
-                "axes": "ZYXC",
-                "key": [str(n) for n in names],
-                "roi": roi,
-                "codebook": codebook,
-                "n4": n4_params,
-            }
+            float_attrs: dict[str, Any] = dict(src_attrs)
+            float_attrs.update(
+                {
+                    "axes": "ZYXC",
+                    "key": [str(n) for n in names],
+                    "roi": roi,
+                    "codebook": codebook,
+                    "n4": n4_params,
+                }
+            )
             _zarr_attrs_write(float_dest.attrs, float_attrs)
         except Exception:
             logger.exception("Failed to write metadata for float32 corrected store")

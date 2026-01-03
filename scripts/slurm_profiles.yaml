@@ -1,4 +1,11 @@
-# Default profile (inherited by all others)
+# | Partition | Nodes | CPU | Memory Per Core | GPUs | Time Limit | Features                                      |
+# |-----------|-------|-----|-----------------|------|------------|-----------------------------------------------|
+# | CPU       | 80    | 108 | 4,000           | N/A  | 72:00:00   | Intel Xeon Platinum 8480+ 56 Core             |
+# | l40s      | 8     | 124 | 6,000           | 8    | 72:00:00   | Nvidia L40S 48GB GPUs, AMD EPYC 9534 64 Core  |
+# | a100      | 15    | 92  | 10,000          | 8    | 72:00:00   | Nvidia A100 80GB GPUs, AMD EPYC 7443 24 Core  |
+# | h100      | 16    | 120 | 12,000          | 4    | 72:00:00   | Nvidia H100 80GB GPUs, AMD EPYC 9534 64 Core  |
+# | NVL       | 16    | 124 | 12,000          | 4    | 72:00:00   | Nvidia H100-NVL 96GB GPUs, AMD EPYC 9534 64 Core |
+
 default:
   partition: cpu
   gpus: 0
@@ -53,7 +60,7 @@ profiles:
     cpus: 44
     mem: 320G
     time: "06:00:00"
-    
+
   register-batch-intensity:
     partition: cpu
     gpus: 0
@@ -107,7 +114,13 @@ profiles:
     partition: cpu
     gpus: 0
     cpus: 32
-    mem: 192G
+    mem: 256G
+
+  export:
+    partition: cpu
+    gpus: 0
+    cpus: 8
+    mem: 128G
 
   dist-seg:
     partition: h100
@@ -120,7 +133,7 @@ profiles:
     partition: l40s
     gpus: 1
     cpus: 12
-    mem: 96G
+    mem: 72G
     time: "18:00:00"
 
   dist-postproc:

@@ -5,9 +5,12 @@ for parallel processing. Intended to be called from bigrun.py or similar
 orchestration scripts.
 """
 
+import math
+import re
 import shlex
 import subprocess
 import tempfile
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import click
@@ -110,6 +113,21 @@ def append_extra_args(command: str, extra_args: tuple[str, ...]) -> str:
     return f"{command} {shlex.join(extra_args)}"
 
 
+def parse_depends_on(depends_on: str | None) -> str | None:
+    """Parse comma-separated SLURM job IDs into an afterok dependency."""
+    if not depends_on:
+        return None
+    job_ids = [job_id.strip() for job_id in depends_on.split(",") if job_id.strip()]
+    if not job_ids:
+        return None
+    invalid = [job_id for job_id in job_ids if not job_id.isdigit()]
+    if invalid:
+        raise click.ClickException(
+            f"Invalid --depends-on entries (must be numeric job IDs): {', '.join(invalid)}"
+        )
+    return f"afterok:{':'.join(job_ids)}"
+
+
 def split_rounds_and_extra(
     rounds: tuple[str, ...],
     extra_args: tuple[str, ...],
@@ -123,6 +141,18 @@ def split_rounds_and_extra(
     return list(rounds), ()
 
 
+def split_roi_and_extra(
+    roi_and_extra: tuple[str, ...],
+    extra_args: tuple[str, ...],
+) -> tuple[str | None, tuple[str, ...]]:
+    rois, merged_extra = split_rounds_and_extra(roi_and_extra, extra_args)
+    if not rois:
+        return None, merged_extra
+    if len(rois) != 1:
+        raise click.ClickException(f"Expected at most one ROI, got: {', '.join(rois)}")
+    return rois[0], merged_extra
+
+
 def submit_single_task(
     command: str,
     config: SlurmConfig,
@@ -131,6 +161,7 @@ def submit_single_task(
     confirm: bool,
     task_label: str,
     submit_prompt: str,
+    dependency: str | None = None,
 ) -> None:
     """Print a single-task summary and submit it."""
     print(f"Task: {task_label}")
@@ -144,7 +175,7 @@ def submit_single_task(
     if not confirm_or_abort(submit_prompt, confirm):
         return
 
-    job_id = submit_array([command], config, dry_run=dry_run)
+    job_id = submit_array([command], config, dry_run=dry_run, dependency=dependency)
     if job_id:
         print(f"Submitted job {job_id}")
 
@@ -159,6 +190,7 @@ def submit_labeled_tasks(
     header: str,
     empty_message: str = "No ROIs found",
     submit_prompt: str | None = None,
+    dependency: str | None = None,
 ) -> None:
     """Print a labeled task list and submit as a job array."""
     if not commands:
@@ -179,9 +211,107 @@ def submit_labeled_tasks(
     if not confirm_or_abort(submit_prompt, confirm):
         return
 
-    job_id = submit_array(commands, config, dry_run=dry_run)
+    job_id = submit_array(commands, config, dry_run=dry_run, dependency=dependency)
     if job_id:
         print(f"Submitted job {job_id}")
+
+
+def submit_one(
+    ws: Workspace,
+    *,
+    profile_name: str,
+    job_type: str,
+    command: str,
+    ctx_args: tuple[str, ...],
+    dry_run: bool,
+    yes: bool,
+    depends_on: str | None,
+    task_label: str,
+    submit_prompt: str,
+    config_transform: Callable[[SlurmConfig], None] | None = None,
+) -> None:
+    config = load_profiles().get(profile_name)
+    job_name = make_job_name(ws.path, job_type)
+    config.job_name = job_name
+    if config_transform is not None:
+        config_transform(config)
+
+    if not warn_if_running(ws, job_name, confirm=not yes):
+        return
+
+    submit_single_task(
+        append_extra_args(command, ctx_args),
+        config,
+        dry_run=dry_run,
+        confirm=not yes,
+        task_label=task_label,
+        submit_prompt=submit_prompt,
+        dependency=parse_depends_on(depends_on),
+    )
+
+
+def submit_per_roi(
+    ws: Workspace,
+    *,
+    profile_name: str,
+    job_type: str,
+    label_prefix: str,
+    header: str,
+    build_cmd_for_roi: Callable[[str], str],
+    ctx_args: tuple[str, ...],
+    dry_run: bool,
+    yes: bool,
+    depends_on: str | None,
+    config_transform: Callable[[SlurmConfig], None] | None = None,
+    rois: Iterable[str] | None = None,
+) -> None:
+    config = load_profiles().get(profile_name)
+    job_name = make_job_name(ws.path, job_type)
+    config.job_name = job_name
+    if config_transform is not None:
+        config_transform(config)
+
+    if not warn_if_running(ws, job_name, confirm=not yes):
+        return
+
+    try:
+        resolved_rois = ws.resolve_rois(rois)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    commands: list[str] = []
+    labels: list[str] = []
+    for roi in resolved_rois:
+        labels.append(f"{label_prefix}:{roi}")
+        commands.append(append_extra_args(build_cmd_for_roi(roi), ctx_args))
+
+    submit_labeled_tasks(
+        commands,
+        labels,
+        config,
+        dry_run=dry_run,
+        confirm=not yes,
+        header=f"{header} ({len(resolved_rois)} ROIs)",
+        dependency=parse_depends_on(depends_on),
+    )
+
+
+_MEM_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>[KMGTPkmgpt]?)$")
+
+
+def _scale_mem(mem: str, factor: float) -> str:
+    match = _MEM_RE.match(mem.strip())
+    if match is None:
+        raise click.ClickException(f"Unsupported mem format: {mem!r} (expected e.g. '64G')")
+
+    value = float(match.group("value"))
+    unit = match.group("unit")
+
+    scaled = value * factor
+    scaled_int = int(math.ceil(scaled)) if factor >= 1 else int(math.floor(scaled))
+    if scaled_int < 1:
+        scaled_int = 1
+    return f"{scaled_int}{unit}"
 
 
 def generate_batch_script(
@@ -298,6 +428,7 @@ def submit_deconv(
     include_nonbit: bool = False,
     rounds: list[str] | None = None,
     extra_args: tuple[str, ...] = (),
+    dependency: str | None = None,
 ) -> list[str]:
     """Submit deconvolution jobs for pending tasks.
 
@@ -428,15 +559,15 @@ def submit_deconv(
     # Submit phase 1
     if phase1_commands:
         config.job_name = f"{job_name}_p1"
-        job_id = submit_array(phase1_commands, config, dry_run=dry_run)
+        job_id = submit_array(phase1_commands, config, dry_run=dry_run, dependency=dependency)
         if job_id:
             job_ids.append(job_id)
 
     # Submit phase 2 with dependency on phase 1
     if phase2_commands:
         config.job_name = f"{job_name}_p2"
-        dependency = f"afterok:{job_ids[0]}" if job_ids else None
-        job_id = submit_array(phase2_commands, config, dry_run=dry_run, dependency=dependency)
+        phase2_dependency = f"afterok:{job_ids[0]}" if job_ids else dependency
+        job_id = submit_array(phase2_commands, config, dry_run=dry_run, dependency=phase2_dependency)
         if job_id:
             job_ids.append(job_id)
 
@@ -453,6 +584,11 @@ def cli():
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.argument("rounds", nargs=-1)
 @click.option("--include-nonbit", is_flag=True, help="Include non-bit rounds (prepare/precompute + run_u16)")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.option("--partition", default=None, help="SLURM partition (overrides profile)")
@@ -466,6 +602,7 @@ def deconv(
     path: Path,
     rounds: tuple[str, ...],
     include_nonbit: bool,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
     partition: str | None,
@@ -505,17 +642,24 @@ def deconv(
         include_nonbit=include_nonbit,
         rounds=resolved_rounds if resolved_rounds else None,
         extra_args=extra_args,
+        dependency=parse_depends_on(depends_on),
     )
 
 
 @cli.command("basic", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
 def basic(
     ctx: click.Context,
     path: Path,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -524,19 +668,15 @@ def basic(
     Runs `preprocess basic run` on all ROIs.
     """
     ws = Workspace(path)
-    config = load_profiles().get("basic")
-    job_name = make_job_name(ws.path, "basic")
-    config.job_name = job_name
-
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
-
-    command = append_extra_args(f"preprocess basic run {ws.path} all", tuple(ctx.args))
-    submit_single_task(
-        command,
-        config,
+    submit_one(
+        ws,
+        profile_name="basic",
+        job_type="basic",
+        command=f"preprocess basic run {ws.path} all",
+        ctx_args=tuple(ctx.args),
         dry_run=dry_run,
-        confirm=not yes,
+        yes=yes,
+        depends_on=depends_on,
         task_label=f"basic preprocessing for {ws.path.name}",
         submit_prompt="Submit job? [y/N] ",
     )
@@ -544,12 +684,18 @@ def basic(
 
 @cli.command("compute-range", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
 def compute_range(
     ctx: click.Context,
     path: Path,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -558,19 +704,15 @@ def compute_range(
     Runs `preprocess deconv compute-range` on the deconvolved directory.
     """
     ws = Workspace(path)
-    config = load_profiles().get("compute-range")
-    job_name = make_job_name(ws.path, "compute-range")
-    config.job_name = job_name
-
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
-
-    command = append_extra_args(f"preprocess deconv compute-range {ws.deconved}", tuple(ctx.args))
-    submit_single_task(
-        command,
-        config,
+    submit_one(
+        ws,
+        profile_name="compute-range",
+        job_type="compute-range",
+        command=f"preprocess deconv compute-range {ws.deconved}",
+        ctx_args=tuple(ctx.args),
         dry_run=dry_run,
-        confirm=not yes,
+        yes=yes,
+        depends_on=depends_on,
         task_label=f"compute-range for {ws.path.name}",
         submit_prompt="Submit job? [y/N] ",
     )
@@ -579,11 +721,17 @@ def compute_range(
 @cli.command("register", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.argument("codebook", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("roi_and_extra", nargs=-1)
 @click.option("--threads", default=None, type=int, help="Number of threads (defaults to cpus from profile)")
 @click.option(
     "--intensity",
     is_flag=True,
     help="Use register-batch-intensity profile instead of register-batch.",
+)
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
 )
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
@@ -592,8 +740,10 @@ def register(
     ctx: click.Context,
     path: Path,
     codebook: Path,
+    roi_and_extra: tuple[str, ...],
     threads: int | None,
     intensity: bool,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -603,32 +753,29 @@ def register(
     """
     ws = Workspace(path)
     profile_name = "register-batch-intensity" if intensity else "register-batch"
-    config = load_profiles().get(profile_name)
-    job_name = make_job_name(ws.path, profile_name)
-    config.job_name = job_name
 
     # Default to 18 threads (less than cpus to leave headroom)
     if threads is None:
         threads = 24
 
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
 
-    # Build commands for each ROI
-    commands = []
-    labels = []
-    for roi in ws.rois:
-        labels.append(f"register:{roi}")
-        base_cmd = f"preprocess register batch {ws.deconved} {roi} --codebook={codebook} --threads={threads}"
-        commands.append(append_extra_args(base_cmd, tuple(ctx.args)))
-
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    submit_per_roi(
+        ws,
+        profile_name=profile_name,
+        job_type=profile_name,
+        label_prefix="register",
+        header=f"Tasks: {profile_name} for {ws.path.name}",
+        build_cmd_for_roi=(
+            lambda roi: (
+                f"preprocess register batch {ws.deconved} {roi} --codebook={codebook} --threads={threads}"
+            )
+        ),
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: {profile_name} for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        rois=[roi] if roi is not None else None,
     )
 
 
@@ -638,6 +785,11 @@ def register(
 @click.option("--rounds", default=10, type=int, help="Number of optimization rounds")
 @click.option("--threads", default=None, type=int, help="Number of threads (defaults to cpus from profile)")
 @click.option("--config", "json_config", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Optional project config JSON")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
@@ -648,6 +800,7 @@ def spots_optimize(
     rounds: int,
     threads: int | None,
     json_config: Path | None,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -656,16 +809,10 @@ def spots_optimize(
     Runs `preprocess spots optimize` on all ROIs.
     """
     ws = Workspace(path)
-    config = load_profiles().get("spots-optimize")
-    job_name = make_job_name(ws.path, "spots-optimize")
-    config.job_name = job_name
 
     # Default threads to profile cpus
     if threads is None:
         threads = 24
-
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
 
     cmd = (
         f"preprocess spots optimize {ws.deconved} '*' --codebook={codebook} --rounds={rounds} "
@@ -673,13 +820,16 @@ def spots_optimize(
     )
     if json_config:
         cmd += f" --config={json_config}"
-    cmd = append_extra_args(cmd, tuple(ctx.args))
 
-    submit_single_task(
-        cmd,
-        config,
+    submit_one(
+        ws,
+        profile_name="spots-optimize",
+        job_type="spots-optimize",
+        command=cmd,
+        ctx_args=tuple(ctx.args),
         dry_run=dry_run,
-        confirm=not yes,
+        yes=yes,
+        depends_on=depends_on,
         task_label=f"spots-optimize for {ws.path.name}",
         submit_prompt="Submit job? [y/N] ",
     )
@@ -688,9 +838,15 @@ def spots_optimize(
 @cli.command("spots-batch", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.argument("codebook", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("roi_and_extra", nargs=-1)
 @click.option("--threads", default=None, type=int, help="Number of threads (defaults to cpus from profile)")
 @click.option("--split", is_flag=True, default=True, help="Split into quadrants")
 @click.option("--config", "json_config", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Optional project config JSON")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
@@ -698,9 +854,11 @@ def spots_batch(
     ctx: click.Context,
     path: Path,
     codebook: Path,
+    roi_and_extra: tuple[str, ...],
     threads: int | None,
     split: bool,
     json_config: Path | None,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -709,57 +867,67 @@ def spots_batch(
     Runs `preprocess spots batch` on each ROI in the deconvolved directory.
     """
     ws = Workspace(path)
-    config = load_profiles().get("spots-batch")
-    job_name = make_job_name(ws.path, "spots-batch")
-    config.job_name = job_name
 
     # Default threads to profile cpus
     if threads is None:
         threads = 24
 
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
 
-    # Build commands for each ROI
-    commands = []
-    labels = []
-    for roi in ws.rois:
-        labels.append(f"spots-batch:{roi}")
-        cmd = f"preprocess spots batch {ws.deconved} {roi} --codebook={codebook} --threads={threads}"
+    def build_cmd_for_roi(roi_name: str) -> str:
+        cmd = f"preprocess spots batch {ws.deconved} {roi_name} --codebook={codebook} --threads={threads}"
         if split:
             cmd += " --split"
         if json_config:
             cmd += f" --config={json_config}"
-        commands.append(append_extra_args(cmd, tuple(ctx.args)))
+        return cmd
 
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    submit_per_roi(
+        ws,
+        profile_name="spots-batch",
+        job_type="spots-batch",
+        label_prefix="spots-batch",
+        header=f"Tasks: spots-batch for {ws.path.name}",
+        build_cmd_for_roi=build_cmd_for_roi,
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: spots-batch for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        rois=[roi] if roi is not None else None,
     )
 
 
 @cli.command("stitch-register", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("roi_and_extra", nargs=-1)
 @click.option("--codebook", default=None, help="Codebook name (auto-detected if only one)")
-@click.option("--fid", is_flag=True, help="Use fiducial channel for registration")
-@click.option("--max-proj", is_flag=True, help="Use max projection for registration")
+@click.option("--fid/--no-fid", default=False, show_default=True, help="Use fiducial channel for registration")
+@click.option(
+    "--max-proj/--no-max-proj",
+    default=True,
+    show_default=True,
+    help="Use max projection for registration",
+)
 @click.option("--overwrite", is_flag=True, help="Overwrite existing TileConfiguration.registered.txt")
 @click.option("--config", "json_config", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Optional project config JSON")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
 def stitch_register(
     ctx: click.Context,
     path: Path,
+    roi_and_extra: tuple[str, ...],
     codebook: str | None,
     fid: bool,
     max_proj: bool,
     overwrite: bool,
     json_config: Path | None,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -768,49 +936,60 @@ def stitch_register(
     Runs `preprocess stitch register` on each ROI in the deconvolved directory.
     """
     ws = Workspace(path)
-    config = load_profiles().get("stitch-register")
-    job_name = make_job_name(ws.path, "stitch-register")
-    config.job_name = job_name
 
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
 
-    # Build commands for each ROI
-    commands = []
-    labels = []
-    for roi in ws.rois:
-        labels.append(f"stitch-register:{roi}")
-        cmd = f"preprocess stitch register {ws.deconved} {roi} --idx=0 --max-proj --debug"
+    def build_cmd_for_roi(roi: str) -> str:
+        cmd = f"preprocess stitch register {ws.deconved} {roi} --debug"
+        if max_proj:
+            cmd += " --max-proj"
+        else:
+            cmd += " --idx=0"
+        if fid:
+            cmd += " --fid"
         if codebook:
             cmd += f" --codebook={codebook}"
         if overwrite:
             cmd += " --overwrite"
         if json_config:
             cmd += f" --config={json_config}"
-        commands.append(append_extra_args(cmd, tuple(ctx.args)))
+        return cmd
 
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    submit_per_roi(
+        ws,
+        profile_name="stitch-register",
+        job_type="stitch-register",
+        label_prefix="stitch-register",
+        header=f"Tasks: stitch-register for {ws.path.name}",
+        build_cmd_for_roi=build_cmd_for_roi,
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: stitch-register for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        rois=[roi] if roi is not None else None,
     )
 
 
 @cli.command("stitch-fuse", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("roi_and_extra", nargs=-1)
 @click.option("--codebook", default="pi", help="Codebook name (default: pi)")
 @click.option("--config", "json_config", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Optional project config JSON")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
 def stitch_fuse(
     ctx: click.Context,
     path: Path,
+    roi_and_extra: tuple[str, ...],
     codebook: str,
     json_config: Path | None,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -819,45 +998,50 @@ def stitch_fuse(
     Runs `preprocess stitch fuse` on each ROI in the deconvolved directory.
     """
     ws = Workspace(path)
-    config = load_profiles().get("stitch-fuse")
-    job_name = make_job_name(ws.path, "stitch-fuse")
-    config.job_name = job_name
 
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
 
-    # Build commands for each ROI
-    commands = []
-    labels = []
-    for roi in ws.rois:
-        labels.append(f"stitch-fuse:{roi}")
-        cmd = f"preprocess stitch fuse {ws.deconved} {roi} --codebook={codebook}"
+    def build_cmd_for_roi(roi: str) -> str:
+        cmd = f"preprocess stitch fuse {ws.deconved} {roi} --codebook={codebook} --downsample=2"
         if json_config:
             cmd += f" --config={json_config}"
-        commands.append(append_extra_args(cmd, tuple(ctx.args)))
+        return cmd
 
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    submit_per_roi(
+        ws,
+        profile_name="stitch-fuse",
+        job_type="stitch-fuse",
+        label_prefix="stitch-fuse",
+        header=f"Tasks: stitch-fuse for {ws.path.name}",
+        build_cmd_for_roi=build_cmd_for_roi,
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: stitch-fuse for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        rois=[roi] if roi is not None else None,
     )
 
 
 @cli.command("n4", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("roi_and_extra", nargs=-1)
 @click.option("--codebook", default="pi", help="Codebook name (default: pi)")
 @click.option("--z-index", default=5, type=int, help="Z index for n4 correction (default: 5)")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
 def n4(
     ctx: click.Context,
     path: Path,
+    roi_and_extra: tuple[str, ...],
     codebook: str,
     z_index: int,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -866,37 +1050,38 @@ def n4(
     Runs `preprocess stitch n4` on each ROI in the deconvolved directory.
     """
     ws = Workspace(path)
-    config = load_profiles().get("n4")
-    job_name = make_job_name(ws.path, "n4")
-    config.job_name = job_name
 
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
 
-    # Build commands for each ROI
-    commands = []
-    labels = []
-    for roi in ws.rois:
-        labels.append(f"n4:{roi}")
-        base_cmd = f"preprocess stitch n4 {ws.deconved} {roi} --codebook={codebook} --z-index={z_index}"
-        commands.append(append_extra_args(base_cmd, tuple(ctx.args)))
-
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    submit_per_roi(
+        ws,
+        profile_name="n4",
+        job_type="n4",
+        label_prefix="n4",
+        header=f"Tasks: n4 for {ws.path.name}",
+        build_cmd_for_roi=(
+            lambda roi: f"preprocess stitch n4 {ws.deconved} {roi} --codebook={codebook} --z-index={z_index}"
+        ),
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: n4 for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        rois=[roi] if roi is not None else None,
     )
 
 
 @cli.command("spots-stitch", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.argument("codebook", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("roi_and_extra", nargs=-1)
 @click.option("--threads", default=None, type=int, help="Number of threads (defaults to cpus from profile)")
 @click.option("--no-filter", is_flag=True, help="Disable filtering")
 @click.option("--overwrite", is_flag=True, help="Overwrite existing outputs")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
@@ -904,9 +1089,11 @@ def spots_stitch(
     ctx: click.Context,
     path: Path,
     codebook: Path,
+    roi_and_extra: tuple[str, ...],
     threads: int | None,
     no_filter: bool,
     overwrite: bool,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -915,47 +1102,52 @@ def spots_stitch(
     Runs `preprocess spots stitch` on each ROI in the deconvolved directory.
     """
     ws = Workspace(path)
-    config = load_profiles().get("spots-stitch")
-    job_name = make_job_name(ws.path, "spots-stitch")
-    config.job_name = job_name
 
     # Default threads to profile cpus
     if threads is None:
         threads = 8
 
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
 
-    # Build commands for each ROI
-    commands = []
-    labels = []
-    for roi in ws.rois:
-        labels.append(f"spots-stitch:{roi}")
-        cmd = f"preprocess spots stitch {ws.deconved} {roi} --codebook={codebook} --threads={threads}"
+    def build_cmd_for_roi(roi_name: str) -> str:
+        cmd = f"preprocess spots stitch {ws.deconved} {roi_name} --codebook={codebook} --threads={threads}"
         if no_filter:
             cmd += " --no-filter"
         if overwrite:
             cmd += " --overwrite"
-        commands.append(append_extra_args(cmd, tuple(ctx.args)))
+        return cmd
 
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    submit_per_roi(
+        ws,
+        profile_name="spots-stitch",
+        job_type="spots-stitch",
+        label_prefix="spots-stitch",
+        header=f"Tasks: spots-stitch for {ws.path.name}",
+        build_cmd_for_roi=build_cmd_for_roi,
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: spots-stitch for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        rois=[roi] if roi is not None else None,
     )
 
 
 @cli.command("overlay", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("roi_and_extra", nargs=-1)
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
 def overlay(
     ctx: click.Context,
     path: Path,
+    roi_and_extra: tuple[str, ...],
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ) -> None:
@@ -964,36 +1156,79 @@ def overlay(
     Runs `segment overlay all . <ROI> --threads=32` from the workspace root.
     """
     ws = Workspace(path)
-    config = load_profiles().get("overlay")
-    job_name = make_job_name(ws.path, "overlay")
-    config.job_name = job_name
-
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
-
-    commands = []
-    labels = []
     workspace_root = shlex.quote(str(ws.path))
-    for roi in ws.rois:
-        labels.append(f"overlay:{roi}")
-        cmd = f"cd {workspace_root} && segment overlay all . {shlex.quote(roi)} --threads=32"
-        commands.append(append_extra_args(cmd, tuple(ctx.args)))
 
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
+
+    def build_cmd_for_roi(roi: str) -> str:
+        return f"cd {workspace_root} && segment overlay all . {shlex.quote(roi)} --threads=16"
+
+    submit_per_roi(
+        ws,
+        profile_name="overlay",
+        job_type="overlay",
+        label_prefix="overlay",
+        header=f"Tasks: overlay for {ws.path.name}",
+        build_cmd_for_roi=build_cmd_for_roi,
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: overlay for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        rois=[roi] if roi is not None else None,
+    )
+
+
+@cli.command("export", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
+@click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
+@click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
+@click.pass_context
+def segment_export(
+    ctx: click.Context,
+    path: Path,
+    depends_on: str | None,
+    dry_run: bool,
+    yes: bool,
+) -> None:
+    """Submit segment export job for a workspace."""
+    ws = Workspace(path)
+    submit_one(
+        ws,
+        profile_name="export",
+        job_type="export",
+        command=f"segment export {shlex.quote(str(ws.path))}",
+        ctx_args=tuple(ctx.args),
+        dry_run=dry_run,
+        yes=yes,
+        depends_on=depends_on,
+        task_label=f"segment export for {ws.path.name}",
+        submit_prompt="Submit job? [y/N] ",
     )
 
 
 @cli.command("dist-seg", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.argument("codebook", type=str)
+@click.argument("roi_and_extra", nargs=-1)
 @click.option("--l40s", "use_l40s", is_flag=True, help="Use l40s profile (lower resources)")
+@click.option(
+    "--n-gpu",
+    "n_gpu",
+    default=None,
+    type=int,
+    help="Override GPUs per task; scales cpus/mem linearly from the profile baseline.",
+)
 @click.option("--overwrite", is_flag=True, help="Overwrite existing segmentation outputs")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
@@ -1001,8 +1236,11 @@ def dist_seg(
     ctx: click.Context,
     path: Path,
     codebook: str,
+    roi_and_extra: tuple[str, ...],
     use_l40s: bool,
+    n_gpu: int | None,
     overwrite: bool,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -1016,46 +1254,72 @@ def dist_seg(
         / "distributed_segmentation.py"
     )
     profile_name = "dist-seg-l40s" if use_l40s else "dist-seg"
-    config = load_profiles().get(profile_name)
-    job_name = make_job_name(ws.path, "dist-seg")
-    config.job_name = job_name
-
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
-
-    commands = []
-    labels = []
     workers_per_gpu = 4 if use_l40s else 8
-    for roi in ws.rois:
-        labels.append(f"dist-seg:{roi}")
+
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
+
+    if n_gpu is not None and n_gpu < 1:
+        raise click.ClickException("--n-gpu must be >= 1")
+
+    def config_transform(config: SlurmConfig) -> None:
+        if n_gpu is None:
+            return
+
+        base_gpus = config.gpus
+        if base_gpus < 1:
+            raise click.ClickException(f"Invalid profile gpus={base_gpus} for {profile_name!r}; expected >= 1")
+
+        factor = n_gpu / base_gpus
+        config.gpus = n_gpu
+        config.cpus = max(
+            1,
+            int(math.ceil(config.cpus * factor)) if factor >= 1 else int(math.floor(config.cpus * factor)),
+        )
+        config.mem = _scale_mem(config.mem, factor)
+
+    def build_cmd_for_roi(roi: str) -> str:
         cmd = (
             f"python {script_path} "
             f"run {ws.path} {roi} --workers-per-gpu={workers_per_gpu} --codebook={codebook} -c ~/config.json"
         )
         if overwrite:
             cmd += " --overwrite"
-        commands.append(append_extra_args(cmd, tuple(ctx.args)))
+        return cmd
 
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    submit_per_roi(
+        ws,
+        profile_name=profile_name,
+        job_type="dist-seg",
+        label_prefix="dist-seg",
+        header=f"Tasks: dist-seg for {ws.path.name}",
+        build_cmd_for_roi=build_cmd_for_roi,
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: dist-seg for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        config_transform=config_transform,
+        rois=[roi] if roi is not None else None,
     )
 
 
 @cli.command("dist-postproc", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.argument("path", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("roi_and_extra", nargs=-1)
 @click.option("--overwrite", is_flag=True, help="Overwrite existing postproc outputs")
+@click.option(
+    "--depends-on",
+    default=None,
+    help="Comma-separated SLURM job IDs to depend on.",
+)
 @click.option("--dry-run", is_flag=True, help="Print tasks without submitting")
 @click.option("-y", "--yes", is_flag=True, help="Skip confirmation prompt")
 @click.pass_context
 def dist_postproc(
     ctx: click.Context,
     path: Path,
+    roi_and_extra: tuple[str, ...],
     overwrite: bool,
+    depends_on: str | None,
     dry_run: bool,
     yes: bool,
 ):
@@ -1068,29 +1332,27 @@ def dist_postproc(
         / "distributed"
         / "distributed_postproc.py"
     )
-    config = load_profiles().get("dist-postproc")
-    job_name = make_job_name(ws.path, "dist-postproc")
-    config.job_name = job_name
 
-    if not warn_if_running(ws, job_name, confirm=not yes):
-        return
+    roi, extra_args = split_roi_and_extra(roi_and_extra, tuple(ctx.args))
 
-    commands = []
-    labels = []
-    for roi in ws.rois:
-        labels.append(f"dist-postproc:{roi}")
+    def build_cmd_for_roi(roi: str) -> str:
         cmd = f"python {script_path} {ws.path} {roi} --workers-per-gpu=10"
         if overwrite:
             cmd += " --overwrite"
-        commands.append(append_extra_args(cmd, tuple(ctx.args)))
+        return cmd
 
-    submit_labeled_tasks(
-        commands,
-        labels,
-        config,
+    submit_per_roi(
+        ws,
+        profile_name="dist-postproc",
+        job_type="dist-postproc",
+        label_prefix="dist-postproc",
+        header=f"Tasks: dist-postproc for {ws.path.name}",
+        build_cmd_for_roi=build_cmd_for_roi,
+        ctx_args=extra_args,
         dry_run=dry_run,
-        confirm=not yes,
-        header=f"Tasks: dist-postproc for {ws.path.name} ({len(commands)} ROIs)",
+        yes=yes,
+        depends_on=depends_on,
+        rois=[roi] if roi is not None else None,
     )
 
 

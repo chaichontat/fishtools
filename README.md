@@ -87,6 +87,16 @@ fishtools decompress path/to/directory
 6. Save as a new file with today's date.
 7. In the email, upload and redownload, verify that it's the same file.
 
+## SLURM Dashboard
+
+`slurmdash` launches a two‑pane terminal UI to monitor your SLURM jobs and tail their stdout/stderr.
+
+```sh
+slurmdash
+```
+
+Key bindings: `↑/↓` select job, `r` toggle running filter (turn off to load 7‑day history), `n` toggle other filter, `o/e/b` stdout/stderr/both, `PgUp/PgDn` scroll logs, `Enter` toggle follow, `q` quit.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).

@@ -7,17 +7,17 @@
 - Read this, then skim `ARCHITECTURE.md` at the repository root before coding.
 - If there is a mismatch between your memory of what the code was and the actual code, re-read the code; a quality hook (e.g., pre-commit formatting) or a human update has made the repo authoritative.
 
-- ALWAYS RUN YOUR TESTS IF YOU CREATE ONE (use `conda run -n seq pytest …`).
-- DO NOT run the whole `pytest -q` unless ordered to do so. Prefer focused invocations such as `conda run -n seq pytest test/test_cli_register.py -k smoke`.
-- VERY IMPORTANT: USE THE `seq` CONDA ENVIRONMENT TO RUN ALL PYTHON COMMANDS INCLUDING PYTEST. Use `conda run -n seq …`; if the environment is missing, create it with `conda env create -n seq -f environment.yml` and retry.
+- ALWAYS RUN YOUR TESTS IF YOU CREATE ONE (use `conda run -n cp4 pytest …`).
+- DO NOT run the whole `pytest -q` unless ordered to do so. Prefer focused invocations such as `conda run -n cp4 pytest test/test_cli_register.py -k smoke`.
+- VERY IMPORTANT: USE THE `seq` CONDA ENVIRONMENT TO RUN ALL PYTHON COMMANDS INCLUDING PYTEST. Use `conda run -n cp4 …`; if the environment is missing, create it with `conda env create -n cp4 -f environment.yml` and retry.
 - Sandbox note: the CLI runs under a seccomp profile; `conda run` can hang if GPU plugins try to register semaphores. When that happens, set `CONDA_NO_PLUGINS=true` or ping the user to loosen sandbox restrictions before proceeding.
 - You do not need to verify `git` status after your edits. There can be changes that _I_ made that I want you to keep, but you may still inspect `git status` to confirm what you touched.
-- Perform `python -m compileall` before returning the results to the user. Run `conda run -n seq python -m compileall fishtools test` unless told otherwise.
+- Perform `python -m compileall` before returning the results to the user. Run `conda run -n cp4 python -m compileall fishtools test` unless told otherwise.
 
 - DO NOT create conditional imports or assume that some packages are not going to be available. ALL packages are available, do not try to create a fallback unless explicitly told to do so. It adds bloat and complexity.
 - DO NOT preemptively handle exceptions, swallowing Exceptions are never acceptable. If you are not sure what to do, ask the user.
 
-- After modifications, run `conda run -n seq ruff check --output-format=concise {MODIFIED FILES}` unless told otherwise to check for errors before returning to the user.
+- After modifications, run `conda run -n cp4 ruff check --output-format=concise {MODIFIED FILES}` unless told otherwise to check for errors before returning to the user.
 
 - **DO NOT EVER use %-style formatting for logging. Use f-strings.**
 
@@ -31,7 +31,7 @@ logger.info(f"CombSpots grid: rois={n_rois}, dpi={params.dpi}")
 ## Quick Start
 
 - Alt (mamba): `mamba env create -n fishtools -f environment.yml && conda activate fishtools && pip install -e '.[dev]'` (useful for local development before mirroring the commands inside the `seq` environment).
-- Sanity check: `conda run -n seq pytest -q test/`
+- Sanity check: `conda run -n cp4 pytest -q test/`
 - Explore CLIs: `fishtools --help` (main entrypoint), `preprocess --help` (image prep), `postprocess --help` (analysis assembly), `segment --help` (Cellpose wrapper), `mkprobes --help` (probe design).
 
 ## Project Layout
@@ -129,9 +129,9 @@ When in doubt, check or extend `Workspace` instead of scattering path logic.
 
 ## Testing Practices (strict; see TESTING_STRAT.md)
 
-- Tests must pass — no exceptions. Favor TDD: analyze behavior, write focused tests, then implement. Example: `conda run -n seq pytest test/test_preprocess_config_json.py::test_round_defaults`.
+- Tests must pass — no exceptions. Favor TDD: analyze behavior, write focused tests, then implement. Example: `conda run -n cp4 pytest test/test_preprocess_config_json.py::test_round_defaults`.
 - Prefer synthetic arrays; validate shapes/dtypes; use `np.allclose` for floats and `np.isfinite` checks.
-- Add CLI tests for new subcommands; keep coverage stable or rising. Example: `conda run -n seq pytest -vv -k register` using the Click/Typer fixtures in `test/conftest.py`.
+- Add CLI tests for new subcommands; keep coverage stable or rising. Example: `conda run -n cp4 pytest -vv -k register` using the Click/Typer fixtures in `test/conftest.py`.
 - Mock external FS/heavy IO only; do not mock core algorithms.
 - **Refactor-resistant assertions:** verify observable outcomes/state, not internal steps; duplicate literals in tests instead of reusing production constants when asserting.
 - **Test value factors:** balance regression protection, speed, maintainability, and refactor-resistance—if any drops to ~0, rewrite the test.
@@ -144,7 +144,7 @@ When in doubt, check or extend `Workspace` instead of scattering path logic.
 
 ## Style, Typing & Tooling
 
-- Formatting: Black (110) + isort (profile=black). Lint: Ruff. Security: Bandit. Spelling: Codespell. Typical commands: `conda run -n seq ruff check`, `conda run -n seq bandit -r fishtools`, `conda run -n seq codespell`.
+- Formatting: Black (110) + isort (profile=black). Lint: Ruff. Security: Bandit. Spelling: Codespell. Typical commands: `conda run -n cp4 ruff check`, `conda run -n cp4 bandit -r fishtools`, `conda run -n cp4 codespell`.
 - Typing is mandatory: annotate every function (params + return). **Use Python 3.12 built-ins (`list`, `dict`, `tuple`, `type[...]`) instead of importing `List`/`Dict`; pull `NDArray[...]` from `numpy.typing` when needed.**
 
 ## Common Flows
