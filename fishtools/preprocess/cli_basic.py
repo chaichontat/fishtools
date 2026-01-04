@@ -35,6 +35,9 @@ class DataExtractor(Protocol):
         deconv_meta: np.ndarray | None = None,
         max_files: int = 800,
         nc: int | None = None,
+        *,
+        random_flip: bool = False,
+        rng: np.random.Generator | None = None,
     ) -> np.ndarray: ...
 
 
@@ -186,6 +189,9 @@ def extract_data_from_tiff(
     deconv_meta: np.ndarray | None = None,
     max_files: int = 500,
     nc: int | None = None,
+    *,
+    random_flip: bool = False,
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """
     Extract data from TIFF files with multiple channels per file.
@@ -222,6 +228,14 @@ def extract_data_from_tiff(
         if i % 100 / nc == 0:
             logger.info(f"Loaded {i}/{n}")
 
+        flip_y = False
+        flip_x = False
+        if random_flip:
+            if rng is None:
+                rng = np.random.default_rng()
+            flip_y = bool(rng.random() < 0.5)
+            flip_x = bool(rng.random() < 0.5)
+
         with TiffFile(file) as tif:
             if file.parent.name not in n_zs:
                 n_zs[file.parent.name] = len(tif.pages) // nc
@@ -247,6 +261,11 @@ def extract_data_from_tiff(
                                 global_deconv_scaling=deconv_meta,
                                 metadata=meta,
                             )
+
+                        if flip_y:
+                            img = img[::-1, :]
+                        if flip_x:
+                            img = img[:, ::-1]
 
                         out[i, k, c] = img
 
@@ -346,6 +365,9 @@ def extract_data_from_registered(
     max_files: int = 800,
     nc: int | None = None,
     max_proj: bool = True,
+    *,
+    random_flip: bool = False,
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """
     Extract data from TIFF files with all channels in one file.
@@ -375,8 +397,20 @@ def extract_data_from_registered(
         if i % 20 == 0:
             logger.info("Loaded {}/{}", i, n)
 
+        flip_y = False
+        flip_x = False
+        if random_flip:
+            if rng is None:
+                rng = np.random.default_rng()
+            flip_y = bool(rng.random() < 0.5)
+            flip_x = bool(rng.random() < 0.5)
+
         with TiffFile(file) as tif:
             img = tif.asarray().max(axis=0)
+            if flip_y:
+                img = img[:, ::-1, :]
+            if flip_x:
+                img = img[:, :, ::-1]
             out[i] = img
 
     # Reshape to combine file and z dimensions
@@ -394,6 +428,7 @@ def run_with_extractor(
     zs: Collection[float] = (0.5,),
     *,
     seed: int | None = None,
+    random_flip: bool = False,
     overwrite: bool = False,
     include_edge_tiles: bool = False,
 ):
@@ -534,6 +569,7 @@ def run_with_extractor(
         sampling_json = {
             "round": round_ or "all",
             "seed": seed,
+            "random_flip": bool(random_flip),
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "channels": channels,
             "n_candidates": int(len(filtered_files)),
@@ -607,7 +643,16 @@ def run_with_extractor(
         logger.warning(f"Sampling plot generation failed: {e}")
 
     # Extract data using the provided extractor function
-    data = extractor_func(files, zs, deconv_meta, nc=len(channels), max_files=1000 if round_ else 1000)
+    flip_rng = np.random.default_rng(seed) if random_flip else None
+    data = extractor_func(
+        files,
+        zs,
+        deconv_meta,
+        nc=len(channels),
+        max_files=1000 if round_ else 1000,
+        random_flip=random_flip,
+        rng=flip_rng,
+    )
 
     # Fit and save BaSiC models
     res = fit_and_save_basic(data, basic_dir, round_ or "all", channels, plot, overwrite=overwrite)
@@ -620,6 +665,8 @@ def run_with_extractor(
             extractor_func,
             plot=plot,
             zs=zs,
+            seed=seed,
+            random_flip=random_flip,
             overwrite=overwrite,
             include_edge_tiles=include_edge_tiles,
         )
@@ -636,6 +683,7 @@ def basic(): ...
 @click.argument("round_", type=str)
 @click.option("--zs", type=str, default="0.5")
 @click.option("--overwrite", is_flag=True)
+@click.option("--random-flip", is_flag=True, help="Randomly flip tiles vertically and/or horizontally.")
 @click.option(
     "--include-edge-tiles/--no-include-edge-tiles",
     default=False,
@@ -647,6 +695,7 @@ def run(
     round_: str,
     *,
     overwrite: bool = False,
+    random_flip: bool = False,
     include_edge_tiles: bool = False,
     zs: str = "0.5",
     seed: int | None = None,
@@ -683,6 +732,7 @@ def run(
         plot=False,
         zs=z_values,
         seed=seed,
+        random_flip=random_flip,
         overwrite=overwrite,
         include_edge_tiles=include_edge_tiles,
     )
@@ -694,7 +744,15 @@ def run(
 @click.option("--threads", "-t", type=int, default=1)
 @click.option("--zs", type=str, default="0.5")
 @click.option("--seed", type=int, default=None, help="Random seed for sampling (optional)")
-def batch(path: Path, overwrite: bool = False, threads: int = 1, zs: str = "0.5", seed: int | None = None):
+@click.option("--random-flip", is_flag=True, help="Randomly flip tiles vertically and/or horizontally.")
+def batch(
+    path: Path,
+    overwrite: bool = False,
+    threads: int = 1,
+    zs: str = "0.5",
+    seed: int | None = None,
+    random_flip: bool = False,
+):
     setup_cli_logging(
         path,
         component="preprocess.basic.batch",
@@ -704,7 +762,7 @@ def batch(path: Path, overwrite: bool = False, threads: int = 1, zs: str = "0.5"
     rounds = sorted({p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name})
     with ThreadPoolExecutor(threads) as exc:
         futs = [
-            exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs, seed=seed)
+            exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs, seed=seed, random_flip=random_flip)
             for r in rounds  # type: ignore
         ]
         for fut in as_completed(futs):

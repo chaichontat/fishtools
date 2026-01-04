@@ -45,6 +45,7 @@ from fishtools.preprocess.cli_deconv import (  # noqa: E402
 )
 from fishtools.preprocess.deconv.backend import (  # noqa: E402
     Float32HistBackend,
+    LegacyPerTileU16Backend,
     OutputArtifacts,
     U16PrenormBackend,
 )
@@ -250,6 +251,87 @@ def test_run_float32_skips_scaling(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert captured["mode"] is DeconvolutionOutputMode.F32
     assert captured["load_scaling"] is False
+
+
+def test_run_legacy_percentiles_passed_through(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = _workspace_with_tile(tmp_path)
+
+    captured: dict[str, object] = {}
+
+    def _fake_plan_execute(**kwargs):
+        captured.update(
+            mode=kwargs["mode"],
+            min_perc=kwargs["min_perc"],
+            max_perc=kwargs["max_perc"],
+        )
+        return []
+
+    monkeypatch.setattr("fishtools.preprocess.cli_deconv._plan_and_execute", _fake_plan_execute)
+
+    run.callback(
+        workspace,
+        "r1",
+        roi_name="*",
+        ref_round=None,
+        limit=None,
+        mode="legacy",
+        histogram_bins=8192,
+        overwrite=False,
+        delete_origin=False,
+        n_fids=2,
+        min_perc=1.0,
+        max_perc=99.0,
+        basic_name="all",
+        debug=False,
+        devices=[0],
+        stop_on_error=True,
+        skip_quantized=False,
+    )
+
+    assert captured["mode"] is DeconvolutionOutputMode.LEGACY
+    assert captured["min_perc"] == 1.0
+    assert captured["max_perc"] == 99.0
+
+
+def test_legacy_backend_respects_percentiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_quantize(
+        res: object,  # noqa: ARG001 - stub
+        hw: tuple[int, int],  # noqa: ARG001 - stub
+        *,
+        percentile_low: float,
+        percentile_high: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        captured.update(low=percentile_low, high=percentile_high)
+        return (
+            np.zeros((1, 1, 1), dtype=np.uint16),
+            np.array([1.0], dtype=np.float32),
+            np.array([2.0], dtype=np.float32),
+        )
+
+    monkeypatch.setattr("fishtools.preprocess.deconv.backend.legacy_per_tile_quantize", _fake_quantize)
+
+    config = ProcessorConfig(
+        round_name="rLegacy",
+        basic_paths=(),
+        output_dir=tmp_path / "analysis" / "deconv",
+        n_fids=0,
+        step=1,
+        mode=DeconvolutionOutputMode.LEGACY,
+        histogram_bins=1,
+        m_glob=None,
+        s_glob=None,
+        debug=False,
+        legacy_percentile_low=3.0,
+        legacy_percentile_high=97.0,
+    )
+
+    backend = LegacyPerTileU16Backend(config)
+    backend.postprocess(object(), Path("dummy.tif"), (1, 1))
+
+    assert captured["low"] == 3.0
+    assert captured["high"] == 97.0
 
 
 def test_multi_run_skip_quantized_switches_mode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

@@ -5,10 +5,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+import line_profiler
 import numpy as np
 import numpy.typing as npt
 from loguru import logger
-import line_profiler as line_profiler
 
 __all__ = ["scale_deconv", "safe_delete_origin_dirs"]
 
@@ -50,13 +50,13 @@ def scale_deconv(
     scaled = scale_factor * img.astype(np.float32) + offset
 
     if debug:
-        logger.debug("Deconvolution scaling=%s offset=%s", scale_factor, offset)
+        logger.debug(f"Deconvolution scaling={scale_factor} offset={offset}")
 
     if name and scaled.max() > 65535:
-        logger.debug("Scaled image %s has max > 65535.", name)
+        logger.debug(f"Scaled image {name} has max > 65535.")
 
     if np.all(scaled < 0):
-        logger.warning("Scaled image %s has all negative values.", name or "<unnamed>")
+        logger.warning(f"Scaled image {name or '<unnamed>'} has all negative values.")
 
     clipped = np.clip(scaled, 0, 65534).astype(np.float32, copy=False)
     return clipped
@@ -77,25 +77,20 @@ def safe_delete_origin_dirs(files: Iterable[Path], out: Path) -> None:
     for src_dir, src_files in grouped.items():
         dst_dir = out / src_dir.name
         if not dst_dir.exists():
-            logger.warning(
-                "Skip delete for %s: destination %s does not exist.", src_dir, dst_dir
-            )
+            logger.warning(f"Skip delete for {src_dir}: destination {dst_dir} does not exist.")
             continue
 
         missing = [src for src in src_files if not (dst_dir / src.name).exists()]
         if missing:
             sample = missing[0].name
             logger.warning(
-                "Skip delete for %s: %d inputs missing outputs (e.g., %s).",
-                src_dir,
-                len(missing),
-                sample,
+                f"Skip delete for {src_dir}: {len(missing)} inputs missing outputs (e.g., {sample})."
             )
             continue
 
         if "analysis" in src_dir.parts:
-            logger.error("Refusing to delete source in analysis tree: %s", src_dir)
+            logger.error(f"Refusing to delete source in analysis tree: {src_dir}")
             continue
 
-        logger.info("Deleting origin folder %s", src_dir)
+        logger.info(f"Deleting origin folder {src_dir}")
         shutil.rmtree(src_dir)

@@ -186,6 +186,29 @@ class TestExtractDataFromTiff:
         assert result.shape == (1, nc, height, width)
         assert np.all(result[0, 0] == 30)
 
+    def test_random_flip_is_deterministic(self, tmp_path: Path) -> None:
+        round_dir = tmp_path / "Rflip--P1"
+        round_dir.mkdir()
+        file_path = round_dir / "img1.tif"
+
+        img = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.uint16)
+        imwrite(file_path, np.stack([img]))
+
+        rng = np.random.default_rng(0)
+        result = extract_data_from_tiff([file_path], zs=[0.5], nc=1, max_files=1, random_flip=True, rng=rng)
+        assert result.shape == (1, 1, img.shape[0], img.shape[1])
+
+        rng_expected = np.random.default_rng(0)
+        flip_y = bool(rng_expected.random() < 0.5)
+        flip_x = bool(rng_expected.random() < 0.5)
+        expected = img
+        if flip_y:
+            expected = expected[::-1, :]
+        if flip_x:
+            expected = expected[:, ::-1]
+
+        np.testing.assert_array_equal(result[0, 0], expected)
+
 
 class TestExtractDataFromRegistered:
     def test_extract_basic_registered(
@@ -534,6 +557,25 @@ class TestBasicCliOverwriteGuard:
         res = runner.invoke(basic, ["run", str(tmp_path), round_name])
         assert res.exit_code == 0, res.output
         assert mock_run.called
+
+    def test_random_flip_option_is_forwarded(self, tmp_path: Path, mocker: MockerFixture) -> None:
+        round_name = "dapi_b2_b4"
+
+        d = tmp_path / f"{round_name}--roiA"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{round_name}-0000.tif").touch()
+
+        mocker.patch("fishtools.preprocess.cli_basic.setup_cli_logging")
+        mocker.patch("fishtools.preprocess.cli_basic.get_channels", return_value=["560", "650"])
+        mock_run = mocker.patch("fishtools.preprocess.cli_basic.run_with_extractor", return_value=None)
+
+        runner = CliRunner()
+        res = runner.invoke(basic, ["run", str(tmp_path), round_name, "--random-flip"])
+        assert res.exit_code == 0, res.output
+
+        assert mock_run.called
+        _, kwargs = mock_run.call_args
+        assert kwargs["random_flip"] is True
 
     def test_complete_pkls_trigger_skip(self, tmp_path: Path, mocker: MockerFixture) -> None:
         round_name = "dapi_b2_b4"
