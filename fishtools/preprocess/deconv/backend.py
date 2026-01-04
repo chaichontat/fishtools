@@ -47,6 +47,8 @@ class ProcessorConfig:
     m_glob: np.ndarray | None
     s_glob: np.ndarray | None
     debug: bool
+    legacy_percentile_low: float = LEGACY_PERCENTILES[0]
+    legacy_percentile_high: float = LEGACY_PERCENTILES[1]
 
 
 # ------------------- Output backends -------------------
@@ -341,7 +343,12 @@ class LegacyPerTileU16Backend:
         hw: tuple[int, int],
     ) -> tuple[OutputArtifacts, dict[str, Any], dict[str, float]]:
         t0 = time.perf_counter()
-        towrite_u16, mins, scales = legacy_per_tile_quantize(res, hw)
+        towrite_u16, mins, scales = legacy_per_tile_quantize(
+            res,
+            hw,
+            percentile_low=self.config.legacy_percentile_low,
+            percentile_high=self.config.legacy_percentile_high,
+        )
         quant_time = time.perf_counter() - t0
         meta_patch = {
             "deconv_min": [float(val) for val in mins],
@@ -642,5 +649,7 @@ def make_processor_factory(
         m_glob=None if config.m_glob is None else np.asarray(config.m_glob, dtype=np.float32),
         s_glob=None if config.s_glob is None else np.asarray(config.s_glob, dtype=np.float32),
         debug=config.debug,
+        legacy_percentile_low=config.legacy_percentile_low,
+        legacy_percentile_high=config.legacy_percentile_high,
     )
     return _ProcessorFactory(safe_config, backend_factory)

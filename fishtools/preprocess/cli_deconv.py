@@ -16,6 +16,7 @@ from fishtools.preprocess.config import DeconvolutionConfig, DeconvolutionOutput
 from fishtools.preprocess.deconv.backend import (
     DeconvolutionTileProcessor,  # noqa: F401 - re-exported for tests/consumers
     Float32HistBackend,
+    LEGACY_PERCENTILES,
     LegacyPerTileU16Backend,
     OutputBackend,
     ProcessorConfig,
@@ -410,6 +411,8 @@ def _prepare_round_plan(
     debug: bool = False,
     label: str | None = None,
     out_dir: Path | None = None,
+    min_perc: float = LEGACY_PERCENTILES[0],
+    max_perc: float = LEGACY_PERCENTILES[1],
 ) -> _RoundProcessingPlan | None:
     file_list = list(files)
     if not file_list:
@@ -473,6 +476,8 @@ def _prepare_round_plan(
         m_glob=m_glob,
         s_glob=s_glob,
         debug=debug,
+        legacy_percentile_low=min_perc,
+        legacy_percentile_high=max_perc,
     )
     logger.info(processor_cfg)
 
@@ -645,6 +650,8 @@ def _plan_and_execute(
     stop_on_error: bool,
     mode: DeconvolutionOutputMode,
     delete_origin: bool,
+    min_perc: float = LEGACY_PERCENTILES[0],
+    max_perc: float = LEGACY_PERCENTILES[1],
     progress: ProgressReporter | ProgressCallback | None = None,
 ) -> list[WorkerMessage]:
     workspace = Workspace(path)
@@ -720,6 +727,8 @@ def _plan_and_execute(
             debug=debug,
             label=round_token,
             mode=mode,
+            min_perc=min_perc,
+            max_perc=max_perc,
         )
 
         if plan is not None:
@@ -796,6 +805,8 @@ def multi_run(
     debug: bool,
     devices: Sequence[int],
     stop_on_error: bool,
+    min_perc: float = LEGACY_PERCENTILES[0],
+    max_perc: float = LEGACY_PERCENTILES[1],
     configure_logging: bool = False,
     process_label: str = "0",
 ) -> list[WorkerMessage]:
@@ -805,6 +816,8 @@ def multi_run(
         _configure_logging(debug, process_label=process_label)
 
     selected_mode = _normalize_mode(mode)
+    if min_perc >= max_perc:
+        raise click.ClickException("--min-perc must be < --max-perc.")
 
     if skip_quantized and selected_mode is DeconvolutionOutputMode.U16:
         logger.info("multi_run: skip_quantized requested; switching mode to float32 outputs.")
@@ -835,6 +848,8 @@ def multi_run(
         stop_on_error=stop_on_error,
         mode=selected_mode,
         delete_origin=False,
+        min_perc=min_perc,
+        max_perc=max_perc,
     )
 
     return failures
@@ -1019,6 +1034,20 @@ def prepare(
 @click.option("--delete-origin/--no-delete-origin", default=True, show_default=True)
 @click.option("--n-fids", type=int, default=2, show_default=True)
 @click.option(
+    "--min-perc",
+    type=click.FloatRange(min=0.0, max=100.0),
+    default=LEGACY_PERCENTILES[0],
+    show_default=True,
+    help="Lower percentile used by legacy per-tile quantization (mode=legacy).",
+)
+@click.option(
+    "--max-perc",
+    type=click.FloatRange(min=0.0, max=100.0),
+    default=LEGACY_PERCENTILES[1],
+    show_default=True,
+    help="Upper percentile used by legacy per-tile quantization (mode=legacy).",
+)
+@click.option(
     "--basic-name",
     type=str,
     default=None,
@@ -1052,6 +1081,8 @@ def run(
     overwrite: bool,
     delete_origin: bool,
     n_fids: int,
+    min_perc: float = LEGACY_PERCENTILES[0],
+    max_perc: float = LEGACY_PERCENTILES[1],
     basic_name: str | None,
     debug: bool,
     devices: list[int],
@@ -1101,6 +1132,8 @@ def run(
         raise click.ClickException(f"ROI '{roi_name}' not found in {path}.")
 
     selected_mode = _normalize_mode(mode)
+    if min_perc >= max_perc:
+        raise click.ClickException("--min-perc must be < --max-perc.")
 
     if skip_quantized:
         if selected_mode is DeconvolutionOutputMode.U16:
@@ -1135,6 +1168,8 @@ def run(
         stop_on_error=stop_on_error,
         mode=selected_mode,
         delete_origin=delete_origin,
+        min_perc=min_perc,
+        max_perc=max_perc,
     )
 
 
@@ -1154,6 +1189,20 @@ def run(
 @click.option("--overwrite", is_flag=True)
 @click.option("--delete-origin/--no-delete-origin", default=True, show_default=True)
 @click.option("--n-fids", type=int, default=2, show_default=True)
+@click.option(
+    "--min-perc",
+    type=click.FloatRange(min=0.0, max=100.0),
+    default=LEGACY_PERCENTILES[0],
+    show_default=True,
+    help="Lower percentile used by legacy per-tile quantization (mode=legacy).",
+)
+@click.option(
+    "--max-perc",
+    type=click.FloatRange(min=0.0, max=100.0),
+    default=LEGACY_PERCENTILES[1],
+    show_default=True,
+    help="Upper percentile used by legacy per-tile quantization (mode=legacy).",
+)
 @click.option(
     "--basic-name",
     type=str,
@@ -1188,6 +1237,8 @@ def batch(
     overwrite: bool,
     delete_origin: bool,
     n_fids: int,
+    min_perc: float = LEGACY_PERCENTILES[0],
+    max_perc: float = LEGACY_PERCENTILES[1],
     basic_name: str | None,
     debug: bool,
     devices: list[int],
@@ -1206,6 +1257,8 @@ def batch(
         overwrite=overwrite,
         delete_origin=delete_origin,
         n_fids=n_fids,
+        min_perc=min_perc,
+        max_perc=max_perc,
         basic_name=basic_name,
         debug=debug,
         devices=devices,
