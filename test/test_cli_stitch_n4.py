@@ -74,7 +74,7 @@ def _downscale_local_mean(image: np.ndarray, factors: tuple[int, ...], **_: obje
 setattr(cucim_transform, "downscale_local_mean", _downscale_local_mean)
 
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = [pytest.mark.timeout(30), pytest.mark.gpu]
 
 
 def test_stitch_n4_subcommand_invokes_runner(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from fishtools.segment.postproc3d import (
     compute_metadata_and_adjacency,
@@ -555,10 +556,9 @@ def test_gaussian_smooth_not_in_place():
     assert result is not masks
 
 
+@pytest.mark.gpu
 def test_gaussian_smooth_cupy_matches_cpu():
     """CuPy-accelerated smoothing should match CPU result on a small volume."""
-    import pytest
-
     cupy = pytest.importorskip("cupy")
     try:
         # Skip if CUDA is not actually usable in this environment

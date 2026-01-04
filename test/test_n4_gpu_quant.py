@@ -10,6 +10,7 @@ from fishtools.preprocess import n4
 pytestmark = pytest.mark.timeout(30)
 
 
+@pytest.mark.gpu
 def test_apply_correction_field_with_mocked_cupy_numpy_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     image = np.array([[4.0, 8.0], [12.0, 16.0]], dtype=np.float32)
     field = np.array([[2.0, 2.0], [3.0, 4.0]], dtype=np.float32)

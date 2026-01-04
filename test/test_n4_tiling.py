@@ -42,7 +42,7 @@ if HAS_CUPY:
     )
 
 
-pytestmark = pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")
+pytestmark = [pytest.mark.gpu, pytest.mark.skipif(not HAS_CUPY, reason="CuPy not available")]
 
 # Marker for tests that require real cucim (not stub)
 requires_cucim = pytest.mark.skipif(
@@ -185,8 +185,6 @@ class TestTiledEquivalence:
         field = (np.ones((H, W), dtype=np.float32) + np.random.rand(H, W) * 0.2).astype(np.float32)
         mask = plane > 200
 
-        field_gpu = cp.asarray(field)
-
         result_full = _correct_plane_gpu(
             plane,
             field_cpu=field,
@@ -221,8 +219,6 @@ class TestMaskBoundaries:
         mask = np.zeros((H, W), dtype=bool)
         mask[:, :512] = True  # Left half only
 
-        field_gpu = cp.asarray(field)
-
         result_full = _correct_plane_gpu(
             plane,
             field_cpu=field,
@@ -252,8 +248,6 @@ class TestMaskBoundaries:
         # Mask transition exactly at y=512
         mask = np.zeros((H, W), dtype=bool)
         mask[:512, :] = True  # Top half only
-
-        field_gpu = cp.asarray(field)
 
         result_full = _correct_plane_gpu(
             plane,
@@ -285,8 +279,6 @@ class TestEdgeContinuity:
         plane = np.tile(np.linspace(100, 1100, W, dtype=np.float32), (H, 1))
         field = np.ones((H, W), dtype=np.float32)
         mask = np.ones((H, W), dtype=bool)
-
-        field_gpu = cp.asarray(field)
 
         result_full = _correct_plane_gpu(
             plane,
@@ -335,8 +327,6 @@ class TestTileSizeVariations:
         field = (np.ones((H, W), dtype=np.float32) + np.random.rand(H, W) * 0.2).astype(np.float32)
         mask = plane > 200
 
-        field_gpu = cp.asarray(field)
-
         result_full = _correct_plane_gpu(
             plane,
             field_cpu=field,
@@ -365,8 +355,6 @@ class TestNoMask:
 
         plane = (np.random.rand(H, W).astype(np.float32) * 1000 + 100).astype(np.float32)
         field = (np.ones((H, W), dtype=np.float32) + np.random.rand(H, W) * 0.2).astype(np.float32)
-
-        field_gpu = cp.asarray(field)
 
         result_full = _correct_plane_gpu(
             plane,

@@ -88,6 +88,7 @@ def test_compute_correction_field_method_threshold_empty_mask() -> None:
         )
 
 
+@pytest.mark.gpu
 def test_unsharp_mask_helper_executes_with_mocks(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_cp = _fake_cp()
     monkeypatch.setattr(n4, "cp", fake_cp)
@@ -109,6 +110,7 @@ def test_unsharp_mask_helper_executes_with_mocks(monkeypatch: pytest.MonkeyPatch
     assert np.allclose(result[mask == 0], 1.0)
 
 
+@pytest.mark.gpu
 def test_unsharp_mask_preprocesses_n4_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace = tmp_path / "ws"
     fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
@@ -160,6 +162,7 @@ def test_unsharp_mask_preprocesses_n4_input(tmp_path: Path, monkeypatch: pytest.
     np.testing.assert_allclose(observed["input"], expected)
 
 
+@pytest.mark.gpu
 def test_unsharp_mask_applies_during_correction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace = tmp_path / "ws"
     fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
@@ -268,6 +271,7 @@ def test_compute_fields_from_workspace_records_threshold_metadata(
     assert threshold_meta == {"kind": "method", "function": "threshold_otsu"}
 
 
+@pytest.mark.gpu
 def test_compute_fields_from_workspace_corrects_zarr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace = tmp_path / "ws"
     fused_dir = workspace / "analysis/deconv/stitch--roi+cb"
@@ -377,6 +381,7 @@ def test_normalize_field_sets_background_to_one() -> None:
     assert abs(med - 1.0) < 1e-3
 
 
+@pytest.mark.gpu
 def test_quantization_dynamic_guard_spans_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Synthetic plane with broad dynamic range and a few bright spikes
     workspace = tmp_path / "ws"
@@ -429,6 +434,7 @@ def test_quantization_dynamic_guard_spans_range(tmp_path: Path, monkeypatch: pyt
     assert u16.max() >= 60000
 
 
+@pytest.mark.gpu
 def test_quantization_with_unsharp_spans_range(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     workspace = tmp_path / "ws"
     fused_dir = workspace / "analysis/deconv/stitch--roi+cb"

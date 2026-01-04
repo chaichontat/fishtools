@@ -9,6 +9,7 @@ import fishtools.preprocess.cli_register as cli_register_module
 from fishtools.preprocess.config import Config, Fiducial, RegisterConfig
 
 
+@pytest.mark.gpu
 def test_cli_register_calls_gpu_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # Arrange: workspace structure
     deconv_path = tmp_path / "analysis" / "deconv"

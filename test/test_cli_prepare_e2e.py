@@ -110,6 +110,7 @@ def _patch_deconv_stubs(monkeypatch, channels: int, height: int, width: int) -> 
     )
 
 
+@pytest.mark.gpu
 def test_cli_prepare_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # Create workspace with one tile and BaSiC profiles
     workspace = tmp_path / "workspace"
