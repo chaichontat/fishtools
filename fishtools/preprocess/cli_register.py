@@ -74,12 +74,15 @@ def _silence_matplotlib_debug_logs() -> None:
     logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
 
 
-def _load_chromatic_affines() -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+def _load_chromatic_affines(ws: Workspace | None = None) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     As: dict[str, np.ndarray] = {}
     ats: dict[str, np.ndarray] = {}
 
     for λ in ["650", "750"]:
-        a_ = np.loadtxt(DATA / f"560to{λ}.txt")
+        filename = f"560to{λ}.txt"
+        candidate = (ws.chromatic / filename) if ws is not None else None
+        path = candidate if candidate is not None and candidate.exists() else (DATA / filename)
+        a_ = np.loadtxt(path)
         A = np.zeros((3, 3), dtype=np.float64)
         A[:2, :2] = a_[:4].reshape(2, 2)
         t = np.zeros(3, dtype=np.float64)
@@ -225,6 +228,25 @@ def _copy_codebook_to_workspace(cli_path: Path, codebook_path: Path) -> Path:
 
     shutil.copy2(source, destination)
     return destination
+
+
+def _copy_chromatic_corrections_to_workspace(cli_path: Path) -> None:
+    workspace = Workspace(cli_path)
+    chromatic_dir = workspace.chromatic
+    chromatic_dir.mkdir(parents=True, exist_ok=True)
+
+    for filename in ("560to650.txt", "560to750.txt"):
+        source = (DATA / filename).resolve(strict=True)
+        destination = chromatic_dir / filename
+
+        if destination.exists():
+            try:
+                if destination.read_bytes() == source.read_bytes():
+                    continue
+            except OSError:
+                pass
+
+        shutil.copy2(source, destination)
 
 
 def sort_key(x: tuple[str, np.ndarray]) -> int | str:
@@ -406,6 +428,8 @@ def _save_debug_overlay(
     idx: int,
     reference_name: str,
     shifted: dict[str, np.ndarray],
+    *,
+    codebook_name: str,
 ) -> None:
     """Save red-green overlay figure: reference round (green) vs shifted rounds (red)."""
     import matplotlib.pyplot as plt
@@ -450,32 +474,16 @@ def _save_debug_overlay(
 
     fig.suptitle(f"{roi}-{idx:04d} (green=ref:{reference_name})", fontsize=12, color="white")
     fig.tight_layout()
-    fig.savefig(debug_dir / f"{roi}-{idx:04d}-overlay.png", facecolor="black")
+    fig.savefig(debug_dir / f"{roi}+{codebook_name}-{idx:04d}-overlay.png", facecolor="black")
     plt.close(fig)
 
 
-def _debug_fid_paths(path: Path, roi: str, idx: int) -> tuple[Path, str, str]:
+def _debug_fid_paths(path: Path, roi: str, idx: int, codebook_name: str) -> tuple[Path, str, str]:
     paths = FiducialPaths(path, roi)
     debug_dir = paths.debug_dir
-    fids_name = f"{roi}-{idx:04d}.tif"
-    shifted_name = f"{roi}-shifted-{idx:04d}.tif"
+    fids_name = f"{roi}+{codebook_name}-{idx:04d}.tif"
+    shifted_name = f"{roi}+{codebook_name}-shifted-{idx:04d}.tif"
     return debug_dir, fids_name, shifted_name
-
-
-def _spot_registration_failures(
-    stats: dict[str, FiducialAlignmentStats | None],
-    *,
-    fiducial_cfg: Fiducial,
-) -> list[str]:
-    """Return rounds that fell back to FFT after spot registration failed."""
-
-    if fiducial_cfg.use_itk or fiducial_cfg.use_fft:
-        return []
-
-    failures = [
-        name for name, stat in stats.items() if stat is not None and stat.mode == "fft"
-    ]
-    return failures
 
 
 @dataclass
@@ -745,7 +753,6 @@ def run_fiducial(
         shifts = {k: anchor_shifts.get(k, np.array([0.0, 0.0])) for k in fids}
         residuals = {k: 0.0 for k in fids}
         stats: dict[str, FiducialAlignmentStats | None] = {k: None for k in fids}
-        failed_spot_rounds: list[str] = []
     else:
         shifts, residuals, stats = align_fiducials_with_stats(
             fids,
@@ -762,17 +769,13 @@ def run_fiducial(
 
         assert shifts  # type: ignore
         assert residuals  # type: ignore
-        failed_spot_rounds = _spot_registration_failures(
-            stats,
-            fiducial_cfg=config.registration.fiducial,
-        )
 
     shifted = {k: shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()}
 
-    should_write_debug = debug or bool(failed_spot_rounds)
+    should_write_debug = debug
 
     if should_write_debug:
-        debug_dir, fids_name, shifted_name = _debug_fid_paths(path, roi, idx)
+        debug_dir, fids_name, shifted_name = _debug_fid_paths(path, roi, idx, codebook_name)
         debug_dir.mkdir(exist_ok=True, parents=True)
         # Ensure deterministic channel ordering for debug TIFFs so that the
         # plane index matches the sorted fiducial keys used in QC tooling.
@@ -790,12 +793,7 @@ def run_fiducial(
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX", "key": ordered_keys},
         )
-        _save_debug_overlay(debug_dir, roi, idx, reference, shifted)
-        if failed_spot_rounds and not debug:
-            failed = ", ".join(sorted(failed_spot_rounds))
-            logger.warning(
-                f"Spot-based registration failed for {failed}; debug fiducials saved to {debug_dir}."
-            )
+        _save_debug_overlay(debug_dir, roi, idx, reference, shifted, codebook_name=codebook_name)
 
     # Add priors to final shifts (skip when using anchor ROIs - anchor points are absolute)
     _add_priors_to_shifts(
@@ -1036,7 +1034,7 @@ def _run(
     transformed: dict[str, np.ndarray] = {}
     ref = None
 
-    As, ats = _load_chromatic_affines()
+    As, ats = _load_chromatic_affines(ws)
     affine = Affine(As=As, ats=ats)
     bits_in_output = sorted(codebook_bits & set(bits))
     for i, bit in enumerate(bits_in_output):
@@ -1284,8 +1282,10 @@ def run(
         fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
     """
     rois = get_rois(path, roi)
+    codebook = _copy_codebook_to_workspace(path, codebook)
     codebook_name = codebook.stem
     ws = Workspace(path)
+    _copy_chromatic_corrections_to_workspace(path)
 
     if offset_brightest > 0 and use_brightest <= 0:
         raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
@@ -1447,6 +1447,7 @@ def batch(
     )
     _silence_matplotlib_debug_logs()
     ws = Workspace(path)
+    _copy_chromatic_corrections_to_workspace(path)
     logger.info(f"Found {ws.rois}")
 
     if offset_brightest > 0 and use_brightest <= 0:

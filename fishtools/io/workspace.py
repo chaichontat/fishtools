@@ -671,6 +671,16 @@ class Workspace:
         """
         return self.path / "analysis" / "deconv"
 
+    @property
+    def chromatic(self) -> Path:
+        """Return path to chromatic correction resources directory.
+
+        Stores per-workspace chromatic correction profiles such as ``560to650.txt`` and
+        ``560to750.txt`` used by registration.
+        """
+
+        return self.deconved / "chromatic"
+
     def deconv_round_dir(self, round_name: str, roi: str) -> Path:
         """Return path to a deconvolved round/ROI directory under analysis/deconv."""
 
