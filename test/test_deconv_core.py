@@ -20,6 +20,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - handled at runtime in tests
     cp = None
 
+pytestmark = pytest.mark.gpu
+
 
 def _write_synthetic_psf(path: Path, shape: tuple[int, int, int]) -> None:
     z, y, x = shape

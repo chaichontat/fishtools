@@ -129,3 +129,10 @@ def test_deconv_normalize_quantize(tmp_path: Path) -> None:
 
     output_path = workspace / "analysis" / "deconv" / f"{round_name}--{roi}" / float32_path.name
     assert output_path.exists()
+    sidecar = output_path.with_suffix(".deconv.json")
+    assert sidecar.exists()
+    meta = json.loads(sidecar.read_text())
+    assert meta["deconv_round"] == round_name
+    assert meta["deconv_mode"] == "u16"
+    assert meta["deconv_n_fids"] == n_fids
+    assert meta["deconv_quantize_scaling_path"].endswith(f"analysis/deconv_scaling/{round_name}.txt")

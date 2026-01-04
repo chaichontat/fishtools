@@ -74,9 +74,12 @@ def _silence_matplotlib_debug_logs() -> None:
     logging.getLogger("matplotlib.font_manager").setLevel(logging.WARNING)
 
 
-def _load_chromatic_affines(ws: Workspace | None = None) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+def _load_chromatic_affines(
+    ws: Workspace | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, dict[str, Any]]]:
     As: dict[str, np.ndarray] = {}
     ats: dict[str, np.ndarray] = {}
+    meta: dict[str, dict[str, Any]] = {}
 
     for λ in ["650", "750"]:
         filename = f"560to{λ}.txt"
@@ -93,8 +96,14 @@ def _load_chromatic_affines(ws: Workspace | None = None) -> tuple[dict[str, np.n
         t[2] = 0
         As[λ] = A
         ats[λ] = t
+        meta[λ] = {
+            "source": str(path),
+            "A": [[float(x) for x in row] for row in A[:2, :2]],
+            "t": [float(x) for x in t[:2]],
+        }
 
-    return As, ats
+    meta["ref"] = {"channel": "560"}
+    return As, ats, meta
 
 
 def spillover_correction(spillee: np.ndarray, spiller: np.ndarray, corr: float):
@@ -198,6 +207,34 @@ def _load_outlier_tiles_from_shifts_metrics(
                 outliers.add(tile)
 
     return sorted(outliers)
+
+
+def _load_low_corr_tiles_from_shifts_metrics(
+    csv_path: Path,
+    *,
+    only_corr_lt: float,
+) -> list[int]:
+    if not csv_path.exists():
+        raise click.ClickException(f"Missing shifts metrics CSV at {csv_path}")
+
+    selected: set[int] = set()
+    with csv_path.open(newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        missing = {name for name in ("tile", "correlation") if name not in fieldnames}
+        if missing:
+            raise click.ClickException(f"Invalid shifts metrics CSV at {csv_path}: missing columns {sorted(missing)}")
+
+        for row in reader:
+            try:
+                tile = int(str(row.get("tile", "")).strip())
+                corr = float(str(row.get("correlation", "")).strip())
+            except (TypeError, ValueError) as exc:
+                raise click.ClickException(f"Invalid shifts metrics row in {csv_path}: {row}") from exc
+            if corr < only_corr_lt:
+                selected.add(tile)
+
+    return sorted(selected)
 
 
 def _write_shifts_json(
@@ -430,7 +467,7 @@ def _save_debug_overlay(
     shifted: dict[str, np.ndarray],
     *,
     codebook_name: str,
-) -> None:
+) -> Path | None:
     """Save red-green overlay figure: reference round (green) vs shifted rounds (red)."""
     import matplotlib.pyplot as plt
 
@@ -443,39 +480,38 @@ def _save_debug_overlay(
 
     ref_norm = (norm_pct(ref) * 255).astype(np.uint8)
 
-    # Get non-reference rounds
-    other_names = sorted(k for k in shifted.keys() if k != reference_name)
-    n_panels = len(other_names)
-    if n_panels == 0:
-        return
+    other_names = [k for k in sorted(shifted) if k != reference_name]
+    if not other_names:
+        return None
 
-    # Calculate grid layout
+    n_panels = len(other_names)
     ncols = min(4, n_panels)
     nrows = (n_panels + ncols - 1) // ncols
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), dpi=200, facecolor="black")
-    if n_panels == 1:
-        axes = np.array([axes])
-    axes = axes.flatten()
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(5 * ncols, 5 * nrows), dpi=200, facecolor="black", squeeze=False
+    )
+    axes = axes.ravel()
+    blue = np.zeros_like(ref_norm)
 
     for ax, name in zip(axes, other_names):
         img_norm = (norm_pct(shifted[name]) * 255).astype(np.uint8)
-        # RGB: R=current round, G=reference round, B=0
-        rgb = np.stack([img_norm, ref_norm, np.zeros_like(ref_norm)], axis=-1)
+        rgb = np.stack([img_norm, ref_norm, blue], axis=-1)
         ax.imshow(rgb)
         ax.set_title(name, fontsize=10, color="white")
         ax.set_facecolor("black")
         ax.axis("off")
 
-    # Hide unused axes
     for ax in axes[n_panels:]:
         ax.set_facecolor("black")
         ax.axis("off")
 
     fig.suptitle(f"{roi}-{idx:04d} (green=ref:{reference_name})", fontsize=12, color="white")
     fig.tight_layout()
-    fig.savefig(debug_dir / f"{roi}+{codebook_name}-{idx:04d}-overlay.png", facecolor="black")
+    overlay_path = debug_dir / f"{roi}+{codebook_name}-{idx:04d}-overlay.png"
+    fig.savefig(overlay_path, facecolor="black")
     plt.close(fig)
+    return overlay_path
 
 
 def _debug_fid_paths(path: Path, roi: str, idx: int, codebook_name: str) -> tuple[Path, str, str]:
@@ -772,28 +808,41 @@ def run_fiducial(
 
     shifted = {k: shift(fid, [shifts[k][1], shifts[k][0]]) for k, fid in fids.items()}
 
-    should_write_debug = debug
-
-    if should_write_debug:
+    if debug:
         debug_dir, fids_name, shifted_name = _debug_fid_paths(path, roi, idx, codebook_name)
         debug_dir.mkdir(exist_ok=True, parents=True)
-        # Ensure deterministic channel ordering for debug TIFFs so that the
-        # plane index matches the sorted fiducial keys used in QC tooling.
+        tifs_dir = debug_dir / "tifs"
+        tifs_dir.mkdir(exist_ok=True, parents=True)
+
+        use_raw = config.registration.fiducial.use_fft or config.registration.fiducial.use_itk
+        debug_fids = (
+            {k: Image.loG_fids(fids_raw[k]) for k in ordered_keys}
+            if use_raw
+            else {k: fids[k] for k in ordered_keys}
+        )
+        debug_shifted = {
+            k: shift(debug_fids[k], [shifts[k][1], shifts[k][0]]) for k in ordered_keys
+        }
+        # Keep channel order stable for QC tooling.
         safe_imwrite(
-            debug_dir / fids_name,
-            np.stack([fids_raw[k] for k in ordered_keys]),
+            tifs_dir / fids_name,
+            np.stack([debug_fids[k] for k in ordered_keys]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX", "key": ordered_keys},
         )
         safe_imwrite(
-            debug_dir / shifted_name,
-            np.stack([shifted[k] for k in ordered_keys]),
+            tifs_dir / shifted_name,
+            np.stack([debug_shifted[k] for k in ordered_keys]),
             compression=22610,
             compressionargs={"level": 0.65},
             metadata={"axes": "CYX", "key": ordered_keys},
         )
-        _save_debug_overlay(debug_dir, roi, idx, reference, shifted, codebook_name=codebook_name)
+        overlay_path = _save_debug_overlay(
+            debug_dir, roi, idx, reference, debug_shifted, codebook_name=codebook_name
+        )
+        if overlay_path is not None:
+            logger.info(f"fids_debug overlay image: {overlay_path.resolve()}")
 
     # Add priors to final shifts (skip when using anchor ROIs - anchor points are absolute)
     _add_priors_to_shifts(
@@ -1034,7 +1083,7 @@ def _run(
     transformed: dict[str, np.ndarray] = {}
     ref = None
 
-    As, ats = _load_chromatic_affines(ws)
+    As, ats, chromatic_meta = _load_chromatic_affines(ws)
     affine = Affine(As=As, ats=ats)
     bits_in_output = sorted(codebook_bits & set(bits))
     for i, bit in enumerate(bits_in_output):
@@ -1123,6 +1172,7 @@ def _run(
             "axes": "ZCYX",
             "shifts": json.dumps(shifts, cls=NumpyEncoder),
             "config": json.dumps(config.model_dump(), cls=NumpyEncoder),
+            "chromatic": json.dumps(chromatic_meta),
         },
     )
 
@@ -1349,7 +1399,7 @@ def run(
     help="Path to the codebook file",
     type=click.Path(exists=True, file_okay=True, path_type=Path),
 )
-@click.option("--ref", default=None, help="Reference identifier")
+@click.option("--reference", "--ref", default=None, help="Reference identifier")
 @click.option("--fwhm", type=float, default=4, help="FWHM value")
 @click.option("--threshold", type=float, default=6, help="Threshold value")
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
@@ -1361,6 +1411,15 @@ def run(
     default=None,
     help=(
         "Only process tiles whose per-round L2 distance from the median shift exceeds this value, "
+        "as recorded by `preprocess check-shifts` (output/shifts_metrics). Requires --overwrite."
+    ),
+)
+@click.option(
+    "--only-corr-lt",
+    type=click.FloatRange(min=-1.0, max=1.0),
+    default=None,
+    help=(
+        "Only process tiles whose per-round correlation is below this value, "
         "as recorded by `preprocess check-shifts` (output/shifts_metrics). Requires --overwrite."
     ),
 )
@@ -1416,7 +1475,7 @@ def run(
 def batch(
     path: Path,
     roi: str,
-    ref: str | None,
+    reference: str | None,
     codebook: Path,
     fwhm: int,
     threshold: int,
@@ -1424,6 +1483,7 @@ def batch(
     overwrite: bool,
     debug: bool,
     only_median_gt: float | None,
+    only_corr_lt: float | None,
     verify: bool,
     use_fft: bool = False,
     use_itk: bool = False,
@@ -1454,12 +1514,14 @@ def batch(
         raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
     if only_median_gt is not None and not overwrite:
         raise click.ClickException("--only-median-gt requires --overwrite.")
+    if only_corr_lt is not None and not overwrite:
+        raise click.ClickException("--only-corr-lt requires --overwrite.")
 
-    if ref is None:
+    if reference is None:
         if "2_10_18" in ws.rounds:
-            ref = "2_10_18"
+            reference = "2_10_18"
         elif "7_15_23" in ws.rounds:
-            ref = "7_15_23"
+            reference = "7_15_23"
         else:
             raise ValueError("No reference specified and no default found.")
 
@@ -1474,7 +1536,8 @@ def batch(
                 raise ValueError(f"No shift files found for {roi}+{use_shifts_from} in {shift_dir}")
             all_idxs = sorted({int(p.stem.split("-")[1]) for p in shift_files})
         else:
-            names = sorted({name for name in path.rglob(f"{ref}--{roi}/{ref}*.tif")})
+            assert reference is not None
+            names = sorted({name for name in path.rglob(f"{reference}--{roi}/{reference}*.tif")})
             if not len(names):
                 fid_dir = ws.fids(roi)
                 fid_files = sorted(fid_dir.glob("fids-*.tif")) if fid_dir.exists() else []
@@ -1486,16 +1549,17 @@ def batch(
                         continue
 
                 if not fid_idxs:
-                    raise ValueError(f"No images found for {ref}--{roi}")
+                    raise ValueError(f"No images found for {reference}--{roi}")
 
                 logger.warning(
-                    f"No images found for {ref}--{roi}; using fiducials in {fid_dir} to determine indices."
+                    f"No images found for {reference}--{roi}; using fiducials in {fid_dir} to determine indices."
                 )
                 all_idxs = sorted(set(fid_idxs))
             else:
                 all_idxs = sorted({int(name.stem.split("-")[1]) for name in names})
 
-        if only_median_gt is not None:
+        wants_metrics_filter = only_median_gt is not None or only_corr_lt is not None
+        if wants_metrics_filter:
             metrics_output_dir = ws.output.root
             metrics_output_dir.mkdir(parents=True, exist_ok=True)
             _run_child_cli(
@@ -1513,17 +1577,31 @@ def batch(
             )
 
             metrics_csv = metrics_output_dir / "shifts_metrics" / f"shifts_metrics--{roi}+{codebook_name}.csv"
-            outliers = _load_outlier_tiles_from_shifts_metrics(metrics_csv, only_median_gt=only_median_gt)
-            outlier_set = set(outliers)
-            all_idxs = [i for i in all_idxs if i in outlier_set]
+            selected: set[int] = set()
+            if only_median_gt is not None:
+                selected.update(
+                    _load_outlier_tiles_from_shifts_metrics(metrics_csv, only_median_gt=only_median_gt)
+                )
+            if only_corr_lt is not None:
+                selected.update(_load_low_corr_tiles_from_shifts_metrics(metrics_csv, only_corr_lt=only_corr_lt))
+
+            all_idxs = [i for i in all_idxs if i in selected]
             if not all_idxs and not verify:
-                logger.warning(f"Skipping {ref}--{roi}: no tiles found with L2 > {only_median_gt}.")
+                parts: list[str] = []
+                if only_median_gt is not None:
+                    parts.append(f"L2 > {only_median_gt}")
+                if only_corr_lt is not None:
+                    parts.append(f"corr < {only_corr_lt}")
+                filters = " or ".join(parts) if parts else "the requested filter"
+                logger.warning(
+                    f"Skipping {reference}--{roi}: no tiles found with {filters}."
+                )
                 continue
 
         idxs = [i for i in all_idxs if overwrite or not ws.regimg(roi, codebook.stem, i).exists()]
 
         if not idxs and not verify:
-            logger.warning(f"Skipping {ref}--{roi}, already registered.")
+            logger.warning(f"Skipping {reference}--{roi}, already registered.")
             continue
 
         with progress_bar_threadpool(len(idxs), threads=threads, debug=debug) as submit:
@@ -1536,7 +1614,7 @@ def batch(
                         codebook=codebook,
                         fwhm=fwhm,
                         threshold=threshold,
-                        reference=ref,
+                        reference=reference,
                         roi=roi,
                         max_iters=max_iters,
                         overwrite=overwrite,
@@ -1612,7 +1690,7 @@ def batch(
                         codebook=codebook,
                         fwhm=fwhm,
                         threshold=threshold,
-                        reference=ref,
+                        reference=reference,
                         roi=roi,
                         max_iters=max_iters,
                         overwrite=True,
@@ -1639,7 +1717,7 @@ def batch(
                 except Exception as e:  # noqa: BLE001
                     logger.error(f"[{roi}] Post-rerun read still failing for {p.name}: {e}")
 
-        if only_median_gt is not None:
+        if wants_metrics_filter:
             # Refresh diagnostics after potentially re-registering outlier tiles.
             metrics_output_dir = ws.output.root
             metrics_output_dir.mkdir(parents=True, exist_ok=True)

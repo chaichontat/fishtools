@@ -107,7 +107,8 @@ class FiducialPaths:
     - Fiducial thumbnails per ROI/tile index:
       ``<deconved>/fids--{roi}/fids-{idx:04d}.tif``
     - Debug stacks and overlays (when registration runs with --debug):
-      ``<analysis>/output/fids_debug/{roi}/``.
+      ``<analysis>/output/fids_debug/{roi}/`` (PNG overlays) and
+      ``<analysis>/output/fids_debug/{roi}/tifs/`` (multi-channel TIFF stacks).
     """
 
     deconved_root: Path

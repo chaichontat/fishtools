@@ -613,6 +613,11 @@ def quantize(
                 "deconv_min": [float(x) for x in np.ravel(m_glob)],
                 "deconv_scale": [float(x) for x in np.ravel(s_glob)],
                 "prenormalized": True,
+                "deconv_round": round_name,
+                "deconv_mode": "u16",
+                "deconv_n_fids": int(n_fids),
+                "deconv_quantize_scaling_path": str(scaling_path),
+                "deconv_quantize_overwrite": bool(overwrite),
             })
 
             tifffile.imwrite(
@@ -622,6 +627,7 @@ def quantize(
                 compressionargs={"level": 0.75},
                 metadata=metadata_dict,
             )
+            output_path.with_suffix(".deconv.json").write_text(json.dumps(metadata_dict, indent=2))
 
             processed += 1
             logger.info(f"Quantized {output_path.relative_to(workspace)} (roi={roi_name})")

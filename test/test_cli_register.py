@@ -241,6 +241,103 @@ def test_cli_register_copies_chromatic_corrections_to_workspace(tmp_path: Path, 
         assert copied.read_bytes() == (DATA / filename).read_bytes()
 
 
+def test_register_writes_chromatic_values_to_metadata(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+    roi = "roiA"
+    idx = 0
+    round_name = "1_2"
+
+    round_dir = deconv / f"{round_name}--{roi}"
+    round_dir.mkdir(parents=True, exist_ok=True)
+
+    h = w = 32
+    payload = np.zeros((2, h, w), dtype=np.uint16)
+    fid0 = np.random.default_rng(0).integers(0, 1000, size=(h, w), dtype=np.uint16)
+    fid1 = np.random.default_rng(1).integers(0, 1000, size=(h, w), dtype=np.uint16)
+    stack = np.concatenate([payload, fid0[None, ...], fid1[None, ...]], axis=0)
+
+    waveform = {
+        "ilm405": {"sequence": [0], "power": 0.0},
+        "ilm488": {"sequence": [0], "power": 0.0},
+        "ilm560": {"sequence": [1], "power": 0.0},
+        "ilm650": {"sequence": [1], "power": 0.0},
+        "ilm750": {"sequence": [0], "power": 0.0},
+        "params": {"powers": ["ilm560", "ilm650"]},
+    }
+    imwrite(
+        round_dir / f"{round_name}-{idx:04d}.tif",
+        stack,
+        metadata={"waveform": json.dumps(waveform), "prenormalized": True},
+    )
+
+    cb = tmp_path / "cb.json"
+    cb.write_text(json.dumps({"geneX": ["2"]}))
+
+    ws = Workspace(deconv)
+    shifts_path = ws.shift_json(roi, "src", idx)
+    shifts_path.parent.mkdir(parents=True, exist_ok=True)
+    shifts_path.write_text(
+        json.dumps({round_name: {"shifts": [0.0, 0.0], "corr": 1.0, "residual": 0.0}})
+    )
+
+    chromatic_meta = {
+        "650": {"source": "dummy-650", "A": [[1.0, 0.0], [0.0, 1.0]], "t": [2.0, 3.0]},
+        "750": {"source": "dummy-750", "A": [[1.0, 0.0], [0.0, 1.0]], "t": [4.0, 5.0]},
+        "ref": {"channel": "560"},
+    }
+
+    A = np.eye(3, dtype=np.float64)
+    t = np.zeros(3, dtype=np.float64)
+
+    monkeypatch.setattr(
+        cli_register_module,
+        "_load_chromatic_affines",
+        lambda _ws=None: ({"650": A, "750": A}, {"650": t, "750": t}, chromatic_meta),
+    )
+
+    class _DummyAffine:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.ref_image = None
+
+        def __call__(
+            self,
+            img: np.ndarray,
+            *,
+            channel: str,
+            shiftpx: np.ndarray,
+            debug: bool = False,
+        ) -> np.ndarray:
+            return img
+
+    monkeypatch.setattr(cli_register_module, "Affine", _DummyAffine)
+
+    captured: dict[str, Any] = {}
+
+    def fake_safe_imwrite(*args: Any, **kwargs: Any) -> None:
+        captured["metadata"] = kwargs.get("metadata")
+
+    monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+
+    cfg = Config()
+    cfg = cfg.model_copy(update={"registration": cfg.registration.model_copy(update={"crop": 0})})
+
+    _run(
+        deconv,
+        roi,
+        idx,
+        codebook=cb,
+        reference=round_name,
+        config=cfg,
+        overwrite=True,
+        debug=False,
+        use_shifts_from="src",
+    )
+
+    metadata = captured["metadata"]
+    assert metadata is not None
+    assert json.loads(metadata["chromatic"]) == chromatic_meta
+
+
 
 def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) -> None:
     # Arrange workspace structure expected by batch
@@ -267,6 +364,10 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
         @property
         def deconved(self) -> Path:
             return self._deconved
+
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
 
         @property
         def output(self) -> SimpleNamespace:
@@ -353,6 +454,10 @@ def test_cli_register_batch_forwards_debug(tmp_path: Path, monkeypatch: Any) -> 
             return self._deconved
 
         @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
+
+        @property
         def output(self) -> SimpleNamespace:
             return SimpleNamespace(root=self.path / "analysis" / "output")
 
@@ -418,6 +523,10 @@ def test_cli_register_batch_only_median_gt_requires_overwrite(tmp_path: Path, mo
         def deconved(self) -> Path:
             return self._deconved
 
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
+
     monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
 
     runner = CliRunner()
@@ -462,6 +571,10 @@ def test_cli_register_batch_only_median_gt_filters_tiles(tmp_path: Path, monkeyp
         @property
         def deconved(self) -> Path:
             return self._deconved
+
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
 
         @property
         def output(self) -> SimpleNamespace:
@@ -524,6 +637,143 @@ def test_cli_register_batch_only_median_gt_filters_tiles(tmp_path: Path, monkeyp
     assert seen_idxs == [2, 3]
 
 
+def test_cli_register_batch_only_corr_lt_requires_overwrite(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--threads",
+            "1",
+            "--only-corr-lt",
+            "0.5",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--only-corr-lt requires --overwrite" in result.output
+
+
+def test_cli_register_batch_only_corr_lt_filters_tiles(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    for idx in (1, 2, 3):
+        (base / "2_10_18--roiA" / f"2_10_18-{idx:04d}.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
+
+        @property
+        def output(self) -> SimpleNamespace:
+            return SimpleNamespace(root=self.path / "analysis" / "output")
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        assert check is True
+        calls.append(argv)
+
+        if argv[:2] == ["preprocess", "check-shifts"]:
+            out_dir = Path(argv[argv.index("--output") + 1])
+            roi_value = argv[3]
+            codebook_path = Path(argv[argv.index("--codebook") + 1])
+            csv_path = out_dir / "shifts_metrics" / f"shifts_metrics--{roi_value}+{codebook_path.stem}.csv"
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            csv_path.write_text("tile,correlation\n1,0.95\n2,0.05\n3,0.20\n")
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--codebook",
+            str(cb),
+            "--overwrite",
+            "--threads",
+            "1",
+            "--only-corr-lt",
+            "0.3",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sum(1 for call in calls if call[:2] == ["preprocess", "check-shifts"]) == 2
+
+    register_calls = [call for call in calls if call[:3] == ["preprocess", "register", "run"]]
+    assert len(register_calls) == 2
+    seen_idxs = sorted(int(call[4]) for call in register_calls)
+    assert seen_idxs == [2, 3]
+
+
 def test_cli_register_batch_falls_back_to_fids_for_idx_discovery(tmp_path: Path, monkeypatch: Any) -> None:
     _root, base = _make_workspace(tmp_path)
     # No ref round directory created: fallback must use fids--roiA to determine indices.
@@ -549,6 +799,10 @@ def test_cli_register_batch_falls_back_to_fids_for_idx_discovery(tmp_path: Path,
         @property
         def deconved(self) -> Path:
             return self._deconved
+
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -868,6 +1122,10 @@ def test_cli_register_batch_verify_respects_allow_large_shifts(tmp_path: Path, m
         def deconved(self) -> Path:
             return self._deconved
 
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
+
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
 
@@ -1181,6 +1439,10 @@ def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: A
         def deconved(self) -> Path:
             return self._deconved
 
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
+
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
 
@@ -1260,6 +1522,10 @@ def test_cli_register_batch_verify_reruns_on_read_failure(tmp_path: Path, monkey
         @property
         def deconved(self) -> Path:
             return self._deconved
+
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -1377,6 +1643,10 @@ def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
         @property
         def deconved(self) -> Path:
             return self._deconved
+
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -1650,7 +1920,7 @@ def test_cli_register_batch_use_shifts_from_does_not_require_ref_images(tmp_path
         [
             "batch",
             str(deconv),
-            "--ref",
+            "--reference",
             ref,
             "--codebook",
             str(cb),

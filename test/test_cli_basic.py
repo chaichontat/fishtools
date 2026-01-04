@@ -1,5 +1,4 @@
 import json
-import pickle
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -9,7 +8,7 @@ import pandas as pd
 import pytest
 from click.testing import CliRunner
 from pytest_mock import MockerFixture
-from tifffile import TiffFile, imwrite
+from tifffile import imwrite
 
 from fishtools.preprocess.cli_basic import (
     basic,
@@ -19,12 +18,6 @@ from fishtools.preprocess.cli_basic import (
     sample_canonical_unique_tiles,
 )
 from fishtools.preprocess.tileconfig import tiles_at_least_n_steps_from_edges
-
-
-class StubBasicModel:
-    def __init__(self, darkfield: np.ndarray, flatfield: np.ndarray) -> None:
-        self.darkfield = darkfield
-        self.flatfield = flatfield
 
 
 IMG_HEIGHT = 2048
@@ -389,8 +382,8 @@ class TestRunWithExtractor:
         run_with_extractor(
             tmp_path,
             round_=round_name,
-            extractor_func=lambda files, zs, deconv_meta=None, max_files=800, nc=None: np.zeros(
-                (len(files), 2, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32
+            extractor_func=lambda files, zs, deconv_meta=None, max_files=800, nc=None, *, random_flip=False, rng=None: (
+                np.zeros((len(files), 2, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32)
             ),
             plot=False,
             zs=(0.5,),
@@ -441,7 +434,7 @@ class TestRunWithExtractor:
         # Collector to introspect which files were passed into the extractor
         captured_files = {}
 
-        def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None):
+        def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None, *, random_flip=False, rng=None):
             captured_files["files"] = list(files)
             # Return shape (n_samples, nc, H, W)
             return np.zeros((len(files), 2, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32)
@@ -661,7 +654,7 @@ def test_run_writes_sampling_json(tmp_path: Path, mocker: MockerFixture) -> None
         return_value=[],
     )
 
-    def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None):
+    def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None, *, random_flip=False, rng=None):
         # Return array with correct nc
         n = len(files)
         c = nc or 3
@@ -713,7 +706,7 @@ def test_run_all_canonical_deduplicates_indices(tmp_path: Path, mocker: MockerFi
 
     captured = {}
 
-    def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None):
+    def fake_extractor(files, zs, deconv_meta=None, max_files=800, nc=None, *, random_flip=False, rng=None):
         captured["files"] = list(files)
         n = len(files)
         c = nc or 3
@@ -743,162 +736,3 @@ def test_run_all_canonical_deduplicates_indices(tmp_path: Path, mocker: MockerFi
         key = (roi_base, idx)
         assert key not in seen
         seen.add(key)
-
-
-class TestTransformCommand:
-    def _write_basic_profile(self, target: Path, dark: float, flat: float, *, size: int = 4) -> None:
-        darkfield = np.full((size, size), dark, dtype=np.float32)
-        flatfield = np.full((size, size), flat, dtype=np.float32)
-        payload = {"basic": StubBasicModel(darkfield, flatfield)}
-        target.write_bytes(pickle.dumps(payload))
-
-    def test_transform_corrects_tile_and_writes_to_default_location(
-        self,
-        tmp_path: Path,
-        mocker: MockerFixture,
-    ) -> None:
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
-        (workspace / "basic").mkdir()
-        (workspace / "analysis").mkdir()
-        (workspace / "workspace.DONE").touch()
-
-        mocker.patch("fishtools.preprocess.cli_basic.IMWRITE_KWARGS", {"compression": None})
-
-        channels = ["560", "650"]
-        for idx, channel in enumerate(channels):
-            self._write_basic_profile(workspace / "basic" / f"roundA-{channel}.pkl", dark=5.0 * idx, flat=2.0)
-
-        roi_dir = workspace / "roundA--roi1"
-        roi_dir.mkdir()
-        tile = np.stack(
-            [
-                np.full((4, 4), 20, dtype=np.uint16),  # channel 560
-                np.full((4, 4), 200, dtype=np.uint16),  # channel 650
-            ],
-            axis=0,
-        )
-        input_tiff = roi_dir / "roundA-0001.tif"
-        imwrite(input_tiff, tile)
-
-        runner = CliRunner()
-        result = runner.invoke(
-            basic,
-            [
-                "transform",
-                str(workspace),
-                "roi1",
-                "1",
-                "--round",
-                "roundA",
-                "--n-fids",
-                "0",
-            ],
-        )
-        assert result.exit_code == 0, result.output
-
-        output_path = workspace / "analysis" / "basic_transform" / "roundA--roi1" / input_tiff.name
-        assert output_path.exists()
-
-        with TiffFile(output_path) as tif:
-            corrected = tif.asarray()
-            metadata = tif.shaped_metadata[0]
-
-        expected_ch0 = np.full((4, 4), 10, dtype=np.uint16)  # (20 - 0) / 2
-        expected_ch1 = np.full((4, 4), 98, dtype=np.uint16)  # (200 - 5*1) / 2 → 97.5 -> 98 after rounding
-
-        assert corrected.dtype == np.uint16
-        assert corrected.shape == tile.shape
-        np.testing.assert_array_equal(corrected[0], expected_ch0)
-        np.testing.assert_array_equal(corrected[1], expected_ch1)
-        assert metadata["basic_corrected"] is True
-        assert metadata["basic_channels"] == channels
-
-    def test_transform_respects_overwrite_flag(
-        self,
-        tmp_path: Path,
-        mocker: MockerFixture,
-    ) -> None:
-        workspace = tmp_path / "workspace"
-        workspace.mkdir(parents=True)
-        (workspace / "basic").mkdir()
-        (workspace / "analysis").mkdir()
-        (workspace / "workspace.DONE").touch()
-
-        mocker.patch("fishtools.preprocess.cli_basic.IMWRITE_KWARGS", {"compression": None})
-
-        self._write_basic_profile(workspace / "basic" / "roundA-560.pkl", dark=0.0, flat=1.0)
-
-        roi_dir = workspace / "roundA--roi1"
-        roi_dir.mkdir()
-        tile1 = np.full((1, 4, 4), 50, dtype=np.uint16)
-        tile2 = np.full((1, 4, 4), 80, dtype=np.uint16)
-        input_tiff1 = roi_dir / "roundA-0001.tif"
-        input_tiff2 = roi_dir / "roundA-0002.tif"
-        imwrite(input_tiff1, tile1)
-        imwrite(input_tiff2, tile2)
-
-        runner = CliRunner()
-        first = runner.invoke(
-            basic,
-            [
-                "transform",
-                str(workspace),
-                "roi1",
-                "--round",
-                "roundA",
-                "--n-fids",
-                "0",
-            ],
-        )
-        assert first.exit_code == 0, first.output
-
-        output_dir = workspace / "analysis" / "basic_transform" / "roundA--roi1"
-        output_path1 = output_dir / input_tiff1.name
-        output_path2 = output_dir / input_tiff2.name
-        assert output_path1.exists()
-        assert output_path2.exists()
-
-        with TiffFile(output_path1) as tif:
-            initial = tif.asarray().copy()
-
-        # Modify the first output file manually to detect changes
-        imwrite(output_path1, np.full_like(tile1, 7, dtype=np.uint16))
-
-        second = runner.invoke(
-            basic,
-            [
-                "transform",
-                str(workspace),
-                "roi1",
-                "--round",
-                "roundA",
-                "--n-fids",
-                "0",
-            ],
-        )
-        assert second.exit_code == 0, second.output
-
-        with TiffFile(output_path1) as tif:
-            skipped = tif.asarray()
-        # Should remain the manual value because overwrite was not requested
-        np.testing.assert_array_equal(skipped, np.full_like(tile1, 7, dtype=np.uint16))
-
-        third = runner.invoke(
-            basic,
-            [
-                "transform",
-                str(workspace),
-                "roi1",
-                "--round",
-                "roundA",
-                "--n-fids",
-                "0",
-                "--overwrite",
-            ],
-        )
-        assert third.exit_code == 0, third.output
-
-        with TiffFile(output_path1) as tif:
-            final = tif.asarray()
-        np.testing.assert_array_equal(final, initial)

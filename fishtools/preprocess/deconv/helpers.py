@@ -5,7 +5,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
-import line_profiler
 import numpy as np
 import numpy.typing as npt
 from loguru import logger
@@ -13,7 +12,6 @@ from loguru import logger
 __all__ = ["scale_deconv", "safe_delete_origin_dirs"]
 
 
-@line_profiler.profile
 def scale_deconv(
     img: npt.NDArray[np.float32],
     idx: int,

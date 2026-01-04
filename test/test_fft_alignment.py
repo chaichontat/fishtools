@@ -83,6 +83,64 @@ class TestPhaseShiftCoordinates:
         assert captured["ref_std"] == pytest.approx(1.0, rel=1e-3)
         assert captured["img_std"] == pytest.approx(1.0, rel=1e-3)
 
+    def test_align_fiducials_fft_uses_log_preprocessing(self) -> None:
+        """align_fiducials(use_fft=True) should run phase correlation on LoG-filtered images."""
+        from fishtools.preprocess.fiducial import align_fiducials
+
+        from scipy import ndimage
+        from skimage.registration import phase_cross_correlation
+
+        def normalize(img: np.ndarray) -> np.ndarray:
+            arr = np.asarray(img, dtype=np.float32)
+            centered = arr - float(np.median(arr))
+            scale = float(np.std(centered))
+            if not np.isfinite(scale) or scale < 1e-6:
+                max_abs = float(np.max(np.abs(centered)))
+                scale = max_abs if max_abs > 0 else 1.0
+            return centered / scale
+
+        rng = np.random.default_rng(0)
+        ref = rng.normal(0, 1.0, (128, 128)).astype(np.float32)
+        y, x = np.mgrid[: ref.shape[0], : ref.shape[1]]
+        ref = ref + (x / ref.shape[1]) * 10.0 + (y / ref.shape[0]) * 5.0
+
+        # Use wrap so the Fourier-domain assumption matches the synthetic transform.
+        moving = ndimage.shift(ref, shift=(4.0, -3.0), order=1, mode="wrap")
+
+        fwhm = 4.0
+        shifts, _ = align_fiducials(
+            {"reference": ref, "moving": moving},
+            reference="reference",
+            use_fft=True,
+            fwhm=fwhm,
+            threads=1,
+            debug=True,
+        )
+
+        detected = shifts["moving"]  # [dx, dy]
+
+        sigma = max(0.5, fwhm / 2.355)
+
+        def log_for_fft(img: np.ndarray) -> np.ndarray:
+            filtered = -ndimage.gaussian_laplace(img.astype(np.float32), sigma=sigma)
+            filtered -= float(filtered.min())
+            p1, p99999 = np.percentile(filtered, [1, 99.99])
+            if not np.isfinite(p1) or not np.isfinite(p99999) or p99999 - p1 <= 0:
+                return np.zeros_like(filtered, dtype=np.float32)
+            filtered = (filtered - float(p1)) / float(p99999 - p1)
+            return np.clip(filtered, 0.0, 1.0).astype(np.float32)
+
+        ref_log = log_for_fft(ref)
+        moving_log = log_for_fft(moving)
+        shift_dy_dx, _, _ = phase_cross_correlation(
+            normalize(ref_log),
+            normalize(moving_log),
+            upsample_factor=100,
+        )
+        expected = shift_dy_dx[::-1]  # [dx, dy]
+
+        np.testing.assert_allclose(detected, expected, atol=0.2)
+
     def test_phase_shift_vs_spot_based_coordinate_order(self) -> None:
         """Compare coordinate ordering between FFT and spot-based alignment.
 
@@ -160,6 +218,82 @@ class TestPhaseShiftCoordinates:
 @pytest.mark.unit
 class TestFFTAlignment:
     """Test FFT-based alignment in align_fiducials."""
+
+    def test_align_fiducials_fft_clamps_shift_to_50px(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """FFT-based alignment should clamp extreme shifts to +/- 50 px per axis."""
+        from loguru import logger
+
+        from fishtools.preprocess import fiducial as fiducial_module
+        from fishtools.preprocess.fiducial import align_fiducials
+
+        monkeypatch.setattr(fiducial_module, "phase_shift", lambda *_args, **_kwargs: np.array([60.0, -100.0]))
+
+        messages: list[str] = []
+
+        def sink(message: str) -> None:
+            messages.append(message)
+
+        sink_id = logger.add(sink, level="WARNING", format="{message}")
+        try:
+            fids = {
+                "reference": np.zeros((64, 64), dtype=np.float32),
+                "round1": np.ones((64, 64), dtype=np.float32),
+            }
+
+            shifts, _ = align_fiducials(
+                fids,
+                reference="reference",
+                use_fft=True,
+                threads=1,
+                debug=True,
+            )
+        finally:
+            logger.remove(sink_id)
+
+        # phase_shift returns [dy, dx]; align_fiducials exposes [dx, dy]
+        np.testing.assert_allclose(shifts["round1"], [-50.0, 50.0], atol=0.0)
+        assert any("Clamped FFT shift" in msg and "round1" in msg for msg in messages), messages
+
+    def test_align_fiducials_warns_on_exact_zero_shift_for_nonreference(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-reference rounds with exactly [0,0] shift should raise a warning."""
+        from loguru import logger
+
+        from fishtools.preprocess import fiducial as fiducial_module
+        from fishtools.preprocess.fiducial import align_fiducials
+
+        messages: list[str] = []
+
+        def sink(message: str) -> None:
+            messages.append(message)
+
+        sink_id = logger.add(sink, level="WARNING", format="{message}")
+        try:
+            monkeypatch.setattr(
+                fiducial_module,
+                "phase_cross_correlation",
+                lambda *_args, **_kwargs: (np.array([0.0, 0.0]), None, None),
+            )
+
+            fids = {
+                "reference": np.zeros((64, 64), dtype=np.float32),
+                "round1": np.ones((64, 64), dtype=np.float32),
+            }
+
+            shifts, _ = align_fiducials(
+                fids,
+                reference="reference",
+                use_fft=True,
+                threads=1,
+                debug=True,
+            )
+            np.testing.assert_allclose(shifts["round1"], [0.0, 0.0], atol=0.0)
+
+        finally:
+            logger.remove(sink_id)
+
+        assert any("exactly [0, 0]" in msg and "round1" in msg for msg in messages), messages
 
     def test_align_fiducials_fft_returns_nonzero_shifts(self) -> None:
         """Test that align_fiducials with use_fft=True returns non-zero shifts for shifted images.
@@ -281,7 +415,6 @@ class TestFFTAlignment:
         non_ref_shifts = {k: v for k, v in shifts.items() if k != "reference"}
 
         # All shifts should be different from each other
-        shift_values = list(non_ref_shifts.values())
         for i, (name_i, shift_i) in enumerate(non_ref_shifts.items()):
             for name_j, shift_j in list(non_ref_shifts.items())[i + 1 :]:
                 assert not np.allclose(shift_i, shift_j, atol=0.5), (

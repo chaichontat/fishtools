@@ -76,6 +76,8 @@ from fishtools.preprocess.spots.illum_field_correction import (
     slice_field_ds_for_tile as _slice_field_ds_for_tile,
 )
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
+from fishtools.preprocess.stitching import spot_split_cut_px
+from fishtools.preprocess.simple_spots import simple, simple_batch
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import plot_all_genes
 from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
@@ -960,9 +962,22 @@ def _sanitize_codebook_name(codebook: str) -> str:
     return codebook.replace("-", "_").replace(" ", "_")
 
 
-def _resolve_spots_parquet(base: Path, roi: str, codebook: str) -> Path:
+def _resolve_spots_parquet(base: Path, roi: str, codebook: str, *, use_raw_decoded: bool = False) -> Path:
     ws = Workspace(base)
-    return ws.spots_parquet(roi, codebook, must_exist=True)
+    if use_raw_decoded:
+        decoded = ws.decoded_spots_parquet(roi, codebook)
+        if not decoded.exists():
+            raise FileNotFoundError(
+                f"Raw decoded spots parquet not found for ROI '{roi}', codebook '{codebook}': {decoded}"
+            )
+        return decoded
+    try:
+        return ws.spots_parquet(roi, codebook, must_exist=True)
+    except FileNotFoundError as e:
+        decoded = ws.decoded_spots_parquet(roi, codebook)
+        hint = f"Hint: if you want to plot raw decoded spots, rerun with --use-raw-decoded (expects {decoded})."
+        logger.warning(f"{e}. {hint}")
+        raise FileNotFoundError(f"{e}. {hint}") from e
 
 
 def _render_one_roi_plot(
@@ -971,6 +986,7 @@ def _render_one_roi_plot(
     codebook: str,
     outdir: Path,
     *,
+    use_raw_decoded: bool = False,
     dark: bool = False,
     only_blank: bool = False,
     overwrite: bool = False,
@@ -989,7 +1005,7 @@ def _render_one_roi_plot(
     cb_s = _sanitize_codebook_name(codebook)
     base_name = f"plotall--{roi}+{cb_s}{'--blank' if only_blank else ''}{'--dark' if dark else ''}"
 
-    spots_path = _resolve_spots_parquet(base, roi, codebook)
+    spots_path = _resolve_spots_parquet(base, roi, codebook, use_raw_decoded=use_raw_decoded)
     spots_df = pl.read_parquet(spots_path)
     genes = spots_df.get_column("target").unique().to_list()  # type: ignore[attr-defined]
     genes = sorted(g for g in genes if isinstance(g, str))
@@ -997,16 +1013,24 @@ def _render_one_roi_plot(
         genes = [g for g in genes if g.startswith("Blank")]
 
     outputs: list[Path] = []
+    skipped = 0
 
     if (max_per_plot is None) or (len(genes) <= max_per_plot):
         out_png = outdir / f"{base_name}.png"
-        if not out_png.exists() or overwrite:
+        if out_png.exists() and not overwrite:
+            logger.info(
+                f"[spots.plotall] SKIPPED existing plot (overwrite=False); pass --overwrite to regenerate: {out_png}"
+            )
+            skipped += 1
+        else:
             size0 = figure_sizes[0] if figure_sizes else None
             fig, _ = plot_all_genes(spots_df, dark=dark, only_blank=only_blank, figsize=size0, cmap=cmap)
             fig.tight_layout()
             fig.savefig(out_png.as_posix(), dpi=200, bbox_inches="tight")
             plt.close(fig)
         outputs.append(out_png)
+        if skipped:
+            logger.info(f"[spots.plotall] skipped_existing={skipped} (overwrite=False) | roi={roi} | codebook={cb_s}")
         return outputs
 
     # Multi-part rendering
@@ -1015,7 +1039,12 @@ def _render_one_roi_plot(
         g_chunk = genes[idx * max_per_plot : (idx + 1) * max_per_plot]  # type: ignore[operator]
         df_chunk = spots_df.filter(pl.col("target").is_in(g_chunk))
         out_png = outdir / f"{base_name}.{idx + 1}.png"
-        if not out_png.exists() or overwrite:
+        if out_png.exists() and not overwrite:
+            logger.info(
+                f"[spots.plotall] SKIPPED existing plot (overwrite=False); pass --overwrite to regenerate: {out_png}"
+            )
+            skipped += 1
+        else:
             size_i = (
                 figure_sizes[idx]
                 if (figure_sizes and idx < len(figure_sizes))
@@ -1027,6 +1056,8 @@ def _render_one_roi_plot(
             plt.close(fig)
         outputs.append(out_png)
 
+    if skipped:
+        logger.info(f"[spots.plotall] skipped_existing={skipped} (overwrite=False) | roi={roi} | codebook={cb_s}")
     return outputs
 
 
@@ -1074,6 +1105,11 @@ def _render_one_roi_plot(
     default=None,
     help="Colormap name for hexbin plots (e.g., 'magma', 'viridis').",
 )
+@click.option(
+    "--use-raw-decoded",
+    is_flag=True,
+    help="Read spots from analysis/deconv/registered--{roi}+{codebook}/decoded-{codebook}/spots.parquet.",
+)
 def plot_all_genes_cli(
     path: Path,
     roi: str,
@@ -1086,6 +1122,7 @@ def plot_all_genes_cli(
     max_per_plot_opt: str | None = None,
     figure_size_opt: str | None = None,
     cmap: str | None = None,
+    use_raw_decoded: bool = False,
 ):
     """Plot per-gene spot distributions for one or many ROIs.
 
@@ -1104,6 +1141,7 @@ def plot_all_genes_cli(
             "codebook": cb_stem,
             "threads": threads,
             "overwrite": overwrite,
+            "use_raw_decoded": use_raw_decoded,
         },
     )
     ws = Workspace(path)
@@ -1197,6 +1235,7 @@ def plot_all_genes_cli(
                         r,
                         cb,
                         outdir,
+                        use_raw_decoded=use_raw_decoded,
                         dark=dark,
                         only_blank=only_blank,
                         overwrite=overwrite,
@@ -1236,6 +1275,7 @@ def plot_all_genes_cli(
                         r,
                         cb,
                         outdir,
+                        use_raw_decoded=use_raw_decoded,
                         dark=dark,
                         only_blank=only_blank,
                         overwrite=overwrite,
@@ -1855,8 +1895,8 @@ def run(
     # blurred = gaussian(path, sigma=8)
     # blurred = levels(blurred)  # clip negative values to 0.
     # filtered = image - blurred
-    cut = 1024
-    # 1998 - 1024 = 974
+    tile_size = int(raw.shape[-1])
+    cut = spot_split_cut_px(tile_size)
     split = int(split) if split is not None else None
     if split is None:
         split_slice = np.s_[:, :]
@@ -2384,6 +2424,8 @@ def batch(
 spots.add_command(optimize)
 spots.add_command(stitch)
 spots.add_command(threshold)
+spots.add_command(simple_batch)
+spots.add_command(simple)
 
 if __name__ == "__main__":
     spots()

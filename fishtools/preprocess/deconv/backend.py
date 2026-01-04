@@ -51,6 +51,44 @@ class ProcessorConfig:
     legacy_percentile_high: float = LEGACY_PERCENTILES[1]
 
 
+def _sanitize_for_json(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(v) for v in value]
+    return str(value)
+
+
+def _write_deconv_sidecar(tile_path: Path, metadata: dict[str, Any]) -> None:
+    sidecar = tile_path.with_suffix(".deconv.json")
+    sidecar.write_text(json.dumps(_sanitize_for_json(metadata), indent=2))
+
+
+def _deconv_params_metadata(config: ProcessorConfig) -> dict[str, Any]:
+    return {
+        "deconv_round": config.round_name,
+        "deconv_mode": config.mode.value,
+        "deconv_step": int(config.step),
+        "deconv_histogram_bins": int(config.histogram_bins),
+        "deconv_n_fids": int(config.n_fids),
+        "deconv_basic_paths": [str(p) for p in config.basic_paths],
+        "deconv_legacy_percentile_low": float(config.legacy_percentile_low),
+        "deconv_legacy_percentile_high": float(config.legacy_percentile_high),
+        "deconv_algorithm": "lucyrichardson_guo",
+        "deconv_iters": 1,
+    }
+
+
 # ------------------- Output backends -------------------
 
 
@@ -157,7 +195,7 @@ class Float32HistBackend:
     def expected_targets(self, out_dir: Path, src: Path) -> Sequence[Path]:
         root = out_dir.parent / "deconv32"
         base = root / src.parent.name / src.name
-        return [base, base.with_suffix(".histogram.csv")]
+        return [base, base.with_suffix(".histogram.csv"), base.with_suffix(".deconv.json")]
 
     def setup(self, processor: "DeconvolutionTileProcessor") -> None:
         self._out32 = processor.config.output_dir.parent / "deconv32"
@@ -233,6 +271,7 @@ class Float32HistBackend:
             compression="zlib",
             compressionargs={"level": 6},
         )
+        _write_deconv_sidecar(sub32 / path.name, metadata)
 
         hist_path = (sub32 / path.name).with_suffix(".histogram.csv")
         with open(hist_path, "w", newline="") as fh:
@@ -264,7 +303,8 @@ class U16PrenormBackend:
 
     # --- idempotency contract for CLI ---
     def expected_targets(self, out_dir: Path, src: Path) -> Sequence[Path]:
-        return [out_dir / src.parent.name / src.name]
+        base = out_dir / src.parent.name / src.name
+        return [base, base.with_suffix(".deconv.json")]
 
     def setup(self, processor: "DeconvolutionTileProcessor") -> None:  # pragma: no cover - trivial
         return None
@@ -319,6 +359,7 @@ class U16PrenormBackend:
             compressionargs={"level": 0.75},
             metadata=metadata_out,
         )
+        _write_deconv_sidecar(out_dir_roi / path.name, metadata_out)
         return time.perf_counter() - t0
 
 
@@ -330,7 +371,8 @@ class LegacyPerTileU16Backend:
         self._out_dir: Path | None = None
 
     def expected_targets(self, out_dir: Path, src: Path) -> Sequence[Path]:
-        return [out_dir / src.parent.name / src.name]
+        base = out_dir / src.parent.name / src.name
+        return [base, base.with_suffix(".deconv.json")]
 
     def setup(self, processor: "DeconvolutionTileProcessor") -> None:
         self._out_dir = processor.config.output_dir
@@ -386,8 +428,7 @@ class LegacyPerTileU16Backend:
             metadata=metadata_out,
         )
 
-        sidecar = (roi_dir / path.name).with_suffix(".deconv.json")
-        sidecar.write_text(json.dumps(metadata_out, indent=2))
+        _write_deconv_sidecar(roi_dir / path.name, metadata_out)
 
         return time.perf_counter() - t0
 
@@ -594,6 +635,7 @@ class DeconvolutionTileProcessor:
         del res, x
 
         metadata_out = metadata_in | meta_patch
+        metadata_out |= _deconv_params_metadata(self.config)
         return artifacts, metadata_out, timings
 
     def write_tile(

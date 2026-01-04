@@ -13,6 +13,7 @@ from loguru import logger
 from photutils.background import Background2D, MedianBackground
 from photutils.detection import DAOStarFinder
 from pydantic import BaseModel, TypeAdapter
+from scipy import ndimage
 from scipy.spatial import cKDTree
 from skimage import exposure, filters
 from skimage.registration import phase_cross_correlation
@@ -184,6 +185,24 @@ def _normalize_for_fft(img: np.ndarray) -> np.ndarray:
         max_abs = float(np.max(np.abs(centered)))
         scale = max_abs if max_abs > 0 else 1.0
     return centered / scale
+
+
+def _log_for_fft(img: np.ndarray, *, sigma: float = 3.0) -> np.ndarray:
+    """Apply a LoG filter to suppress low-frequency structure before phase correlation."""
+    arr = np.asarray(img, dtype=np.float32)
+    if arr.ndim == 3:
+        arr = arr.max(axis=0)
+    if arr.ndim != 2:
+        raise ValueError(f"FFT alignment expects 2D (or ZYX) fiducials; got shape={arr.shape}.")
+
+    # Negative so blob-like structures become positive peaks.
+    filtered = -ndimage.gaussian_laplace(arr, sigma=sigma)
+    filtered -= float(filtered.min())
+    p1, p99999 = np.percentile(filtered, [1, 99.99])
+    if not np.isfinite(p1) or not np.isfinite(p99999) or p99999 - p1 <= 0:
+        return np.zeros_like(filtered, dtype=np.float32)
+    filtered = (filtered - float(p1)) / float(p99999 - p1)
+    return np.clip(filtered, 0.0, 1.0).astype(np.float32)
 
 
 def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2) -> np.ndarray:
@@ -882,18 +901,21 @@ def _align_fiducials_internal(
         raise ValueError(f"Could not find reference {reference} in {keys}")
 
     del reference
-    # returns drift, residual
-    corr = individual_align_fiducial(
-        fids[ref],
-        subtract_background=subtract_background,
-        debug=debug,
-        name=ref,
-        threshold_sigma=threshold_sigma,
-        threshold_residual=threshold_residual,
-        fwhm=fwhm,
-        use_brightest=use_brightest,
-        detailed_config=detailed_config,
-    )
+
+    corr = None
+    if not use_fft and not use_itk:
+        # returns drift, residual
+        corr = individual_align_fiducial(
+            fids[ref],
+            subtract_background=subtract_background,
+            debug=debug,
+            name=ref,
+            threshold_sigma=threshold_sigma,
+            threshold_residual=threshold_residual,
+            fwhm=fwhm,
+            use_brightest=use_brightest,
+            detailed_config=detailed_config,
+        )
 
     # ITK max_shift: use larger limit when allow_large_shifts is enabled
     itk_max_shift = 500.0 if detailed_config.allow_large_shifts else detailed_config.max_drift_threshold
@@ -901,11 +923,34 @@ def _align_fiducials_internal(
     mode_map: dict[str, str] = {}
     itk_iterations: dict[str, int] = {}
 
+    # FFT phase correlation is sensitive to low-frequency structure (illumination, DAPI morphology).
+    # Run it on LoG-filtered images using a sigma derived from the fiducial FWHM so the filter
+    # scale tracks the expected feature size.
+    fft_ref: np.ndarray | None = None
+    fft_sigma = max(0.5, float(fwhm) / 2.355)
+    if use_fft:
+        fft_ref = _log_for_fft(fids[ref], sigma=fft_sigma)
+
     def _itk_wrapper(img: np.ndarray, bitname: str) -> tuple[np.ndarray, float]:
         """Pure ITK-based registration wrapper for thread pool."""
         shift_vec, n_iters = itk_shift(fids[ref], img, max_shift=itk_max_shift)
         itk_iterations[bitname] = n_iters
         # itk_shift returns [dy, dx], swap to [dx, dy] for consistency.
+        return shift_vec[::-1], 0.0
+
+    def _fft_wrapper(img: np.ndarray, bitname: str) -> tuple[np.ndarray, float]:
+        """FFT-based registration on LoG-filtered images."""
+        if fft_ref is None:
+            raise RuntimeError("FFT alignment requested but reference FFT image not initialized.")
+        shift_vec = phase_shift(fft_ref, _log_for_fft(img, sigma=fft_sigma))
+        clipped = np.clip(shift_vec, -50.0, 50.0)
+        if np.any(np.abs(shift_vec) > 50.0):
+            logger.warning(
+                f"Clamped FFT shift for '{bitname}' from [dy, dx]={shift_vec.tolist()} "
+                f"to {clipped.tolist()} (limit=50 px)."
+            )
+        shift_vec = clipped
+        # phase_shift returns [dy, dx], swap to [dx, dy] for consistency.
         return shift_vec[::-1], 0.0
 
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
@@ -915,14 +960,14 @@ def _align_fiducials_internal(
                 continue
             if use_fft:
                 mode_map[k] = "fft"
-                # phase_shift returns [dy, dx] (row, col) from phase_cross_correlation.
-                # Swap to [dx, dy] to match spot-based convention used elsewhere.
-                futs[k] = exc.submit(lambda x: (phase_shift(fids[ref], x)[::-1], 0.0), img)
+                futs[k] = exc.submit(_fft_wrapper, img, k)
             elif use_itk:
                 mode_map[k] = "itk"
                 futs[k] = exc.submit(_itk_wrapper, img, k)
             else:
                 mode_map[k] = "spots"
+                if corr is None:
+                    raise RuntimeError("Spot-based alignment requested but reference spot matcher not initialized.")
                 futs[k] = exc.submit(corr, img, bitname=k, limit=max_iters)
 
             if debug:
@@ -938,7 +983,11 @@ def _align_fiducials_internal(
     )
     residual_dict: dict[str, np.ndarray[float, Any]] = {k: v.result()[1] for k, v in futs.items()} | {ref: 0.0}
 
-    raw_stats = getattr(corr, "stats", {}) if isinstance(getattr(corr, "stats", None), dict) else {}
+    raw_stats = (
+        getattr(corr, "stats", {})
+        if corr is not None and isinstance(getattr(corr, "stats", None), dict)
+        else {}
+    )
     stats_dict: dict[str, FiducialAlignmentStats | None] = {}
     for name in fids.keys():
         base_stat = raw_stats.get(name) if isinstance(raw_stats, dict) else None
@@ -972,6 +1021,18 @@ def _align_fiducials_internal(
             stat.mode = "spots"
 
         stats_dict[name] = stat
+
+    for name, shift_vec in drift_dict.items():
+        if name == ref:
+            continue
+        if overrides is not None and name in overrides:
+            continue
+        if np.all(np.asarray(shift_vec) == 0):
+            mode = mode_map.get(name, "unknown")
+            logger.warning(
+                f"Computed shift is exactly [0, 0] for non-reference round '{name}' "
+                f"(reference='{ref}', mode='{mode}')."
+            )
 
     return drift_dict, residual_dict, stats_dict
 

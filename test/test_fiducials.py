@@ -431,6 +431,55 @@ class TestAlignFiducials:
         for name in ["shift_A", "shift_B", "shift_C"]:
             assert residuals[name] == 0.0
 
+    def test_align_fiducials_fft_skips_reference_spot_detection(
+        self,
+        fiducial_image_set: dict[str, NDArray[np.uint16]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FFT mode should not run DAOStarFinder/spot detection on the reference fiducial."""
+        import fishtools.preprocess.fiducial as fiducial_mod
+
+        def _boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("individual_align_fiducial should not be called when use_fft=True")
+
+        monkeypatch.setattr(fiducial_mod, "individual_align_fiducial", _boom)
+
+        shifts, residuals = align_fiducials(
+            fiducial_image_set, reference="reference", use_fft=True, threads=1, debug=True
+        )
+
+        assert set(shifts.keys()) == set(fiducial_image_set.keys())
+        assert residuals["shift_A"] == 0.0
+        assert residuals["shift_B"] == 0.0
+        assert residuals["shift_C"] == 0.0
+
+    def test_align_fiducials_itk_skips_reference_spot_detection(
+        self,
+        fiducial_image_set: dict[str, NDArray[np.uint16]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ITK mode should not run DAOStarFinder/spot detection on the reference fiducial."""
+        import fishtools.preprocess.fiducial as fiducial_mod
+
+        def _boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("individual_align_fiducial should not be called when use_itk=True")
+
+        def _fake_itk_shift(_ref: NDArray[np.uint16], _img: NDArray[np.uint16], *, max_shift: float) -> tuple[np.ndarray, int]:
+            assert max_shift >= 0
+            return np.zeros(2, dtype=float), 3  # [dy, dx], n_iters
+
+        monkeypatch.setattr(fiducial_mod, "individual_align_fiducial", _boom)
+        monkeypatch.setattr(fiducial_mod, "itk_shift", _fake_itk_shift)
+
+        shifts, residuals = align_fiducials(
+            fiducial_image_set, reference="reference", use_itk=True, threads=1, debug=True
+        )
+
+        assert set(shifts.keys()) == set(fiducial_image_set.keys())
+        assert residuals["shift_A"] == 0.0
+        assert residuals["shift_B"] == 0.0
+        assert residuals["shift_C"] == 0.0
+
     def test_align_fiducials_missing_reference(
         self, fiducial_image_set: dict[str, NDArray[np.uint16]]
     ) -> None:
