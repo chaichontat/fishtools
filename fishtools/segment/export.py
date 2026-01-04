@@ -112,12 +112,6 @@ def _resolve_codebooks(codebooks: Iterable[str]) -> list[str]:
     return cb_list
 
 
-def _prepare_output_dir(default_path: Path, override: Path | None) -> Path:
-    out_dir = override or default_path
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
-
-
 def _resolve_channels(
     ws: Workspace,
     rois: Iterable[str],
@@ -678,15 +672,12 @@ def export_cmd(
     segmentation_name: str,
     channels: str,
     thumbnail_scale: float = 8.0,
-    out_dir: Path | None = None,
     diag: bool = False,
 ) -> None:
     """Export per-cell intensities and h5ad ready for Scanpy workflows.
 
-    - Writes aggregated per-cell centroids and intensities to
-      <out_dir>/cells.parquet (default: <deconv>/segment_export)
-    - Emits an AnnData file under <workspace>/analysis/output capturing
-      gene counts, QC metrics, and spatial coordinates.
+    - Writes aggregated per-cell centroids and intensities to the workspace output directory.
+    - Emits an AnnData file under <workspace>/analysis/output capturing gene counts, QC metrics, and spatial coordinates.
     """
 
     ws = Workspace(path)

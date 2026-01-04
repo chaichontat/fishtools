@@ -6,8 +6,6 @@ import rich_click as click
 
 from fishtools.io.workspace import Workspace
 from fishtools.segment.utils import StitchPaths, resolve_intensity_store
-from fishtools.segment.overlay_intensity import overlay_intensity
-from fishtools.segment.overlay_spots import overlay as overlay_spots
 
 
 @click.command()
@@ -72,6 +70,13 @@ from fishtools.segment.overlay_spots import overlay as overlay_spots
     show_default=True,
     help="Number of parallel worker processes to use per ROI.",
 )
+@click.option(
+    "--export",
+    "export_opt",
+    is_flag=True,
+    default=False,
+    help="Run `segment export` (as a subprocess) after overlays complete.",
+)
 @click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing output files.")
 @click.option("--debug", is_flag=True, default=False, help="Enable debug logging and generate debug plots.")
 def overlay_all(
@@ -85,10 +90,14 @@ def overlay_all(
     intensity_store: str,
     channel: str | None,
     threads: int,
+    export_opt: bool,
     overwrite: bool,
     debug: bool,
 ) -> None:
     """Run spots and intensity overlays sequentially for one or more ROIs."""
+
+    from fishtools.segment.overlay_intensity import overlay_intensity
+    from fishtools.segment.overlay_spots import overlay as overlay_spots
 
     workspace = Workspace(path)
     roi_token = (roi or "*").strip()
@@ -104,6 +113,7 @@ def overlay_all(
     if seg_codebook is None:
         click.echo(f"Segmentation codebook not provided; defaulting to --codebook '{codebook}'.", err=True)
 
+    did_overlay_any = False
     for current_roi in rois:
         stitch = StitchPaths.from_workspace(workspace, current_roi, seg_cb)
         seg_path = stitch.segmentation(segmentation_name)
@@ -151,11 +161,30 @@ def overlay_all(
                 threads=threads,
                 overwrite=overwrite,
             )
+            did_overlay_any = True
         except Exception as exc:
             if batch_mode:
                 click.echo(f"Skipping ROI '{current_roi}': overlay intensity failed: {exc}", err=True)
                 continue
             raise
+
+    if export_opt and did_overlay_any:
+        export_channels = channel if channel is not None else "auto"
+        try:
+            from fishtools.segment.export import export_cmd as segment_export_cmd
+
+            segment_export_cmd(
+                path=path,
+                roi=None if batch_mode else roi_token,
+                seg_codebook=seg_cb,
+                codebooks=(codebook,),
+                segmentation_name=segmentation_name,
+                channels=export_channels,
+            )
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+    elif export_opt and not did_overlay_any:
+        click.echo("No overlays completed successfully; skipping export.", err=True)
 
 
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ Usage
 -----
 CLI:
     python -m fishtools.segmentation.distributed.distributed_postproc \\
-        /path/to/segmentation.zarr \\
+        run /path/to/segmentation.zarr \\
         --blocksize 512 --sigma \"1,2,2\" --v-min 8000
 
 Programmatic:
@@ -101,7 +101,7 @@ from typing import Any
 import cupy as cp
 import dask.array
 import numpy as np
-import typer
+import click
 import zarr
 from loguru import logger
 from numpy.typing import NDArray
@@ -144,7 +144,7 @@ def _parse_sigma_option(val: str) -> float | tuple[float, float, float]:
     if len(parts) == 3:
         z, y, x = (float(p) for p in parts)
         return (z, y, x)
-    raise typer.BadParameter("sigma must be a number or a 'z,y,x' triple")
+    raise click.BadParameter("sigma must be a number or a 'z,y,x' triple")
 
 
 def process_postproc_block(
@@ -621,9 +621,6 @@ def distributed_postproc(
     )
 
 
-# CLI
-app = typer.Typer(pretty_exceptions_show_locals=False)
-
 _DEFAULT_SEGMENTATION_NAME = "output_segmentation-sam.zarr"
 
 
@@ -638,23 +635,45 @@ def _iter_segmentation_paths_for_roi(ws: Workspace, roi: str) -> list[Path]:
     return seg_paths
 
 
-@app.command()
-def main(
-    workspace_or_input_zarr: Path = typer.Argument(
-        ...,
-        help=(
-            "Workspace root (preferred) or a direct path to a segmentation zarr "
-            f"(legacy mode; e.g. {_DEFAULT_SEGMENTATION_NAME})."
-        ),
-    ),
-    roi: str = typer.Argument("*", help="ROI name (default: '*')."),
-    output_path: Path = typer.Option(None, help="Output path (default: input_postproc.zarr)"),
-    blocksize: int = typer.Option(1024, help="XY block size for tiled processing"),
-    sigma: str = typer.Option("1,2,2", help="Gaussian smoothing sigma; scalar or 'z,y,x' triple"),
-    v_min: int = typer.Option(500, help="Minimum volume threshold for small cell donation"),
-    margin: int = typer.Option(50, help="Margin parameter (overlap = 2*margin for overlap removal)"),
-    workers_per_gpu: int = typer.Option(4, help="Workers per GPU"),
-    overwrite: bool = typer.Option(False, help="Overwrite existing output"),
+@click.group()
+def cli() -> None:
+    """Distributed 3D post-processing for segmentation masks."""
+
+
+@cli.command("run")
+@click.argument(
+    "workspace_or_input_zarr",
+    type=click.Path(exists=True, file_okay=True, dir_okay=True, path_type=Path),
+)
+@click.argument("roi", required=False, default="*", type=str)
+@click.option(
+    "--output-path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Output path (only valid when processing a single input zarr).",
+)
+@click.option("--blocksize", default=1024, show_default=True, type=int, help="XY block size for tiled processing.")
+@click.option(
+    "--sigma",
+    default="1,2,2",
+    show_default=True,
+    type=str,
+    help="Gaussian smoothing sigma; scalar or 'z,y,x' triple.",
+)
+@click.option("--v-min", default=500, show_default=True, type=int, help="Minimum volume threshold for small cell donation.")
+@click.option("--margin", default=50, show_default=True, type=int, help="Margin parameter (overlap = 2*margin for overlap removal).")
+@click.option("--workers-per-gpu", default=4, show_default=True, type=int, help="Workers per GPU.")
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing output.")
+def run(
+    workspace_or_input_zarr: Path,
+    roi: str,
+    output_path: Path | None,
+    blocksize: int,
+    sigma: str,
+    v_min: int,
+    margin: int,
+    workers_per_gpu: int,
+    overwrite: bool,
 ) -> None:
     """
     Post-process 3D segmentation masks with Gaussian smoothing and small cell donation.
@@ -681,7 +700,7 @@ def main(
         return
 
     if output_path is not None and len(input_paths) > 1:
-        raise typer.BadParameter("--output-path can only be used when processing a single input zarr.")
+        raise click.BadParameter("--output-path can only be used when processing a single input zarr.")
 
     for input_path in input_paths:
         input_zarr = zarr.open(input_path, mode="r")
@@ -718,4 +737,4 @@ def main(
 
 if __name__ == "__main__":
     cp.cuda.set_allocator(None)
-    app()
+    cli()

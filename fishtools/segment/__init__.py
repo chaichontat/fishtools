@@ -1,9 +1,11 @@
-import logging
+from importlib import import_module
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import rich_click as click
 
+from fishtools.segment.cli import app, main
 from fishtools.utils.pretty_print import TaskCancelledException, progress_bar
 from fishtools.utils.thumbnails import load_thumbnail_options, save_thumbnail_png
 from fishtools.utils.utils import batch_roi
@@ -17,17 +19,6 @@ def _strip_line_comments(text: str) -> str:
     lines = text.splitlines()
     kept = [line for line in lines if not line.lstrip().startswith("//")]
     return "\n".join(kept) + ("\n" if text.endswith("\n") else "")
-
-
-class SegmentCLI(click.Group):
-    """Click group that surfaces exceptions (standalone_mode=False by default)."""
-
-    def main(self, *args: Any, **kwargs: Any) -> Any:
-        kwargs.setdefault("standalone_mode", False)
-        return super().main(*args, **kwargs)
-
-
-app = SegmentCLI(help="Segmentation tooling CLI.")
 
 
 @app.command("train")
@@ -84,20 +75,6 @@ def train(
     updated = run_train(name, path, train_config).model_dump_json(indent=2)
     output_path = models_path / f"{name}.trained.json"
     output_path.write_text(updated)
-
-
-@app.command("distill")
-@click.argument(
-    "path",
-    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
-)
-@click.argument("outdir")
-def distill_command(path: Path, outdir: str) -> None:
-    from fishtools.segment.distill import run_distill
-
-    warnings = run_distill(path, outdir)
-    for message in warnings:
-        click.echo(message)
 
 
 @app.command("run")
@@ -287,7 +264,7 @@ def trt_build_cmd(model: Path, batch_size: int, backend: str, opset: int) -> Non
 )
 @click.option(
     "--segmentation-name",
-    default="output_segmentation.zarr",
+    default="output_segmentation-sam_postproc_s1-2-2_v500.zarr",
     show_default=True,
     help="Segmentation zarr name (contains chunks and intensity outputs).",
 )
@@ -305,14 +282,9 @@ def trt_build_cmd(model: Path, batch_size: int, backend: str, opset: int) -> Non
     help="Scale factor to map RoiSet thumbnail coordinates back to segmentation pixels.",
 )
 @click.option(
-    "--out-dir",
-    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
-    help="Optional output directory; defaults under analysis/deconv/segment_export.",
-)
-@click.option(
-    "--diag/--no-diag",
+    "--debug",
     default=False,
-    show_default=True,
+    is_flag=True,
     help="Emit matching diagnostics for polygons/intensity shards per ROI.",
 )
 def export_command(
@@ -323,8 +295,7 @@ def export_command(
     segmentation_name: str,
     channels: str,
     thumbnail_scale: float,
-    out_dir: Path | None,
-    diag: bool,
+    debug: bool,
 ) -> None:
     """Export Baysor-ready spots plus aggregated per-cell intensities."""
 
@@ -338,8 +309,7 @@ def export_command(
         segmentation_name=segmentation_name,
         channels=channels,
         thumbnail_scale=thumbnail_scale,
-        out_dir=out_dir,
-        diag=diag,
+        diag=debug,
     )
 
 
@@ -519,18 +489,8 @@ def _postproc_single(
         if backend.lower() == "cupy":
             try:
                 import cupy
-
-                _ = cupy.cuda.runtime.getDevice()
-                masks = gaussian_smooth_labels_cupy(
-                    masks,
-                    sigma=sigma_val,
-                    in_place=False,
-                    bg_scale=bg_scale,
-                    max_expansion=max_expansion,
-                )
-                click.echo("  Using CuPy-accelerated backend")
-            except Exception:
-                click.echo("  CuPy not available, falling back to CPU")
+            except ImportError:
+                click.echo("  CuPy not installed, falling back to CPU")
                 masks = gaussian_smooth_labels(
                     masks,
                     sigma=sigma_val,
@@ -538,6 +498,27 @@ def _postproc_single(
                     bg_scale=bg_scale,
                     max_expansion=max_expansion,
                 )
+            else:
+                try:
+                    _ = cupy.cuda.runtime.getDevice()
+                except cupy.cuda.runtime.CUDARuntimeError:
+                    click.echo("  CUDA unavailable, falling back to CPU")
+                    masks = gaussian_smooth_labels(
+                        masks,
+                        sigma=sigma_val,
+                        in_place=False,
+                        bg_scale=bg_scale,
+                        max_expansion=max_expansion,
+                    )
+                else:
+                    masks = gaussian_smooth_labels_cupy(
+                        masks,
+                        sigma=sigma_val,
+                        in_place=False,
+                        bg_scale=bg_scale,
+                        max_expansion=max_expansion,
+                    )
+                    click.echo("  Using CuPy-accelerated backend")
         else:
             masks = gaussian_smooth_labels(
                 masks,
@@ -749,6 +730,240 @@ def postproc_command(
 
         click.echo(f"\n{'=' * 60}")
         click.echo(f"Completed processing {len(files)} files.")
+
+
+@app.command("batch")
+@click.argument(
+    "workspace",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.argument("roi", required=False, default="*", type=str)
+@click.option(
+    "--codebook",
+    required=True,
+    type=str,
+    help="Codebook label used to locate stitch--ROI+<codebook> folders.",
+)
+@click.option("--channels", default=None, type=str, help="Comma-separated list of channel names to use.")
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing segmentation.")
+@click.option(
+    "--stitched-name",
+    default="fused_n4.zarr",
+    show_default=True,
+    help="Stitched zarr filename inside stitch--ROI+CB.",
+)
+@click.option(
+    "--config",
+    "-c",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Explicit path to config.json. Defaults to <path>/../config.json when omitted.",
+)
+@click.option(
+    "--workers-per-gpu",
+    default=4,
+    show_default=True,
+    type=int,
+    help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster).",
+)
+@click.option(
+    "--threads-per-worker",
+    default=1,
+    show_default=True,
+    type=int,
+    help="Threads per worker (GPU-bound work typically uses 1).",
+)
+@click.option(
+    "--use-localcuda/--no-use-localcuda",
+    default=False,
+    show_default=True,
+    help="If true and workers_per_gpu<=1, use dask-cuda LocalCUDACluster.",
+)
+@click.option("--n-workers", default=None, type=int, help="For LocalCUDACluster: number of workers (defaults to #GPUs).")
+@click.option(
+    "--target-ny",
+    default=None,
+    type=int,
+    help="Desired internal Cellpose ny tiles (SAM backend only).",
+)
+@click.option(
+    "--target-nx",
+    default=None,
+    type=int,
+    help="Desired internal Cellpose nx tiles (SAM backend only).",
+)
+@click.option(
+    "--cellpose-only/--no-cellpose-only",
+    default=False,
+    show_default=True,
+    help="Stop after cellpose phase, save intermediate state for later stitching.",
+)
+@click.option(
+    "--stagger-seconds",
+    default=5.0,
+    show_default=True,
+    type=float,
+    help="Seconds to stagger worker starts on the same GPU (0 to disable).",
+)
+@click.option(
+    "--roi-retries",
+    default=2,
+    show_default=True,
+    type=int,
+    help="Number of retries per ROI when segmentation fails (0 disables retries).",
+)
+@click.option(
+    "--roi-retry-delay-s",
+    default=0.0,
+    show_default=True,
+    type=float,
+    help="Delay (seconds) between ROI retries.",
+)
+def batch_command(
+    workspace: Path,
+    roi: str,
+    codebook: str,
+    channels: str | None,
+    overwrite: bool,
+    stitched_name: str,
+    config_path: Path | None,
+    workers_per_gpu: int,
+    threads_per_worker: int,
+    use_localcuda: bool,
+    n_workers: int | None,
+    target_ny: int | None,
+    target_nx: int | None,
+    cellpose_only: bool,
+    stagger_seconds: float,
+    roi_retries: int,
+    roi_retry_delay_s: float,
+) -> None:
+    """Run distributed Cellpose segmentation over stitched Zarr volumes."""
+    from fishtools.segmentation.distributed import distributed_segmentation as ds
+
+    callback = ds.run.callback
+    if callback is None:  # pragma: no cover
+        raise click.ClickException("distributed_segmentation.run callback missing.")
+
+    callback(
+        workspace=workspace,
+        roi=roi,
+        codebook=codebook,
+        channels=channels,
+        overwrite=overwrite,
+        stitched_name=stitched_name,
+        config_path=config_path,
+        workers_per_gpu=workers_per_gpu,
+        threads_per_worker=threads_per_worker,
+        use_localcuda=use_localcuda,
+        n_workers=n_workers,
+        target_ny=target_ny,
+        target_nx=target_nx,
+        cellpose_only=cellpose_only,
+        stagger_seconds=stagger_seconds,
+        roi_retries=roi_retries,
+        roi_retry_delay_s=roi_retry_delay_s,
+    )
+
+
+@app.command("postproc-batch")
+@click.argument(
+    "workspace",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.argument("rois", nargs=-1, type=str)
+@click.option(
+    "--output-path",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Output path (only valid when processing a single input zarr).",
+)
+@click.option("--blocksize", default=1024, show_default=True, type=int, help="XY block size for tiled processing.")
+@click.option(
+    "--sigma",
+    default="1,2,2",
+    show_default=True,
+    help="Gaussian smoothing sigma; scalar or 'z,y,x' triple.",
+)
+@click.option("--v-min", default=500, show_default=True, type=int, help="Minimum volume threshold for small cell donation.")
+@click.option("--margin", default=50, show_default=True, type=int, help="Margin parameter (overlap = 2*margin for overlap removal).")
+@click.option("--workers-per-gpu", default=4, show_default=True, type=int, help="Workers per GPU.")
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing output.")
+def postproc_batch_command(
+    workspace: Path,
+    rois: tuple[str, ...],
+    output_path: Path | None,
+    blocksize: int,
+    sigma: str,
+    v_min: int,
+    margin: int,
+    workers_per_gpu: int,
+    overwrite: bool,
+) -> None:
+    """Distributed post-processing for stitched segmentation Zarrs in a workspace.
+
+    Post-processes `output_segmentation-sam.zarr` under `analysis/deconv/stitch--ROI+*`
+    using the distributed 3D post-processing pipeline.
+    """
+    import zarr
+
+    from fishtools.io.workspace import Workspace
+    from fishtools.segmentation.distributed import distributed_postproc as dpp
+
+    ws = Workspace(workspace)
+    if (not rois) or any(roi in {"*", "all"} for roi in rois):
+        resolved_rois = ws.rois
+    else:
+        resolved_rois = ws.resolve_rois(list(rois))
+
+    input_paths: list[Path] = []
+    for roi in resolved_rois:
+        seg_paths = dpp._iter_segmentation_paths_for_roi(ws, roi)
+        if not seg_paths:
+            click.echo(f"[{roi}] No {dpp._DEFAULT_SEGMENTATION_NAME} found; skipping.")
+            continue
+        input_paths.extend(seg_paths)
+
+    if not input_paths:
+        click.echo("No segmentation zarrs found to post-process.")
+        return
+
+    if output_path is not None and len(input_paths) > 1:
+        raise click.ClickException("--output-path can only be used when processing a single input zarr.")
+
+    try:
+        sigma_val = dpp._parse_sigma_option(sigma)
+    except (ValueError, click.ClickException) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    cluster_kwargs = {
+        "workers_per_gpu": workers_per_gpu,
+        "threads_per_worker": 1,
+    }
+
+    for input_path in input_paths:
+        input_zarr = zarr.open(input_path, mode="r")
+
+        resolved_output_path = output_path
+        if resolved_output_path is None:
+            sigma_str = sigma.replace(",", "-").replace(" ", "")
+            resolved_output_path = input_path.parent / f"{input_path.stem}_postproc_s{sigma_str}_v{v_min}.zarr"
+
+        if resolved_output_path.exists() and not overwrite:
+            click.echo(f"Output already exists: {resolved_output_path}. Skipping (use --overwrite to force).")
+            continue
+
+        dpp.distributed_postproc(
+            input_zarr=input_zarr,
+            write_path=resolved_output_path,
+            blocksize=(input_zarr.shape[0], blocksize, blocksize),
+            margin=margin,
+            sigma=sigma_val,
+            V_min=v_min,
+            input_path=input_path,
+            cluster_kwargs=cluster_kwargs,
+        )
 
 
 @app.command("extract")
@@ -1073,6 +1288,23 @@ def extract_single_command(
 )
 @click.argument("roi", required=False, default="*")
 @click.option(
+    "--z-stride",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Generate thumbnail every N Z-planes (overrides --options).",
+)
+@click.option(
+    "--z-range",
+    default=None,
+    help="Z range as start:end (e.g., 0:50). Empty start/end is allowed (e.g., :50, 10:).",
+)
+@click.option(
+    "--downsample",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Spatial downsampling factor (overrides --options).",
+)
+@click.option(
     "--options",
     "thumbnail_options",
     type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
@@ -1084,13 +1316,25 @@ def extract_single_command(
     help="Output root for thumbnails (defaults to analysis/output/thumbnails).",
 )
 @click.option("--codebook", "-c", required=True, help="Codebook label for fused.zarr lookup.")
+@click.option(
+    "--include-n4",
+    is_flag=True,
+    default=False,
+    help="Also generate thumbnails from fused_n4.zarr when present.",
+)
+@click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing thumbnails.")
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def thumbnail_command(
     path: Path,
     roi: str,
+    z_stride: int | None,
+    z_range: str | None,
+    downsample: int | None,
     thumbnail_options: Path | None,
     output_dir: Path | None,
     codebook: str,
+    include_n4: bool,
+    overwrite: bool,
 ) -> None:
     """Generate RGB PNG thumbnails from stitched fused.zarr volumes."""
     import zarr
@@ -1104,61 +1348,124 @@ def thumbnail_command(
     except Exception as exc:
         raise click.ClickException(f"Invalid --options file: {exc}") from exc
 
+    from dataclasses import replace
+
+    if z_stride is not None:
+        thumb_options = replace(thumb_options, z_stride=z_stride)
+    if downsample is not None:
+        thumb_options = replace(thumb_options, xy_downsample=downsample)
+
+    z_start: int | None = None
+    z_end: int | None = None
+    if z_range is not None:
+        parts = z_range.split(":", maxsplit=1)
+        if len(parts) != 2:
+            raise click.ClickException("Invalid --z-range format. Use start:end (e.g., 0:50).")
+        start_raw, end_raw = (p.strip() for p in parts)
+        try:
+            z_start = int(start_raw) if start_raw else None
+            z_end = int(end_raw) if end_raw else None
+        except ValueError as exc:
+            raise click.ClickException("--z-range must contain integer start/end values.") from exc
+
     output_root = output_dir if output_dir is not None else ws.output / "thumbnails"
     stitched_dir = ws.stitch(roi, codebook)
-    zarr_path = stitched_dir / "fused.zarr"
-    if not zarr_path.exists():
-        logger.warning(f"Skipping ROI '{roi}': fused.zarr not found at {zarr_path}")
-        return
-
-    try:
-        z_array = zarr.open_array(zarr_path, mode="r")
-    except Exception as exc:
-        logger.warning(f"Skipping ROI '{roi}': failed to open {zarr_path}: {exc}")
-        return
-
-    if z_array.ndim != 4:
-        logger.warning(f"Skipping ROI '{roi}': fused.zarr has shape {z_array.shape}, expected 4D.")
-        return
-
-    zs, _, _, cs = z_array.shape
-    preview_c = min(3, cs)
-    if preview_c <= 0:
-        logger.warning(f"Skipping ROI '{roi}': fused.zarr has no channels.")
-        return
-
     thumbnail_dir = output_root / f"{roi}+{codebook}"
-    thumbnail_dir.mkdir(parents=True, exist_ok=True)
 
-    with progress_bar(zs) as progress:
-        for i in range(zs):
-            if (i % thumb_options.z_stride) == 0:
+    def _process_zarr(*, zarr_path: Path, prefix: str) -> None:
+        if not zarr_path.exists():
+            logger.warning(f"Skipping ROI '{roi}': {zarr_path.name} not found at {zarr_path}")
+            return
+
+        try:
+            z_array = zarr.open_array(zarr_path, mode="r")
+        except Exception as exc:
+            logger.warning(f"Skipping ROI '{roi}': failed to open {zarr_path}: {exc}")
+            return
+
+        if z_array.ndim != 4:
+            logger.warning(f"Skipping ROI '{roi}': {zarr_path.name} has shape {z_array.shape}, expected 4D.")
+            return
+
+        zs, _, _, cs = z_array.shape
+        preview_c = min(3, cs)
+        if preview_c <= 0:
+            logger.warning(f"Skipping ROI '{roi}': {zarr_path.name} has no channels.")
+            return
+
+        start = z_start if z_start is not None else 0
+        end = z_end if z_end is not None else zs
+        start = max(0, start)
+        end = min(zs, end)
+        if start >= end:
+            logger.warning(f"Skipping ROI '{roi}': no Z-planes to process in range [{start}, {end}).")
+            return
+
+        z_indices = list(range(start, end, thumb_options.z_stride))
+        if not z_indices:
+            logger.warning(f"Skipping ROI '{roi}': no Z-planes to process in range [{start}, {end}).")
+            return
+
+        thumbnail_dir.mkdir(parents=True, exist_ok=True)
+        with progress_bar(len(z_indices)) as progress:
+            for i in z_indices:
+                thumbnail_path = thumbnail_dir / f"{prefix}_z{i:03d}.png"
+                if thumbnail_path.exists() and not overwrite:
+                    progress()
+                    continue
                 thumbnail_data = z_array[i, :, :, :preview_c]
-                thumbnail_path = thumbnail_dir / f"thumbnail_z{i:03d}.png"
                 save_thumbnail_png(thumbnail_data, thumbnail_path, options=thumb_options)
                 logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
-            progress()
+                progress()
+
+    _process_zarr(zarr_path=stitched_dir / "fused.zarr", prefix="thumbnail")
+    if include_n4:
+        _process_zarr(zarr_path=stitched_dir / "fused_n4.zarr", prefix="thumbnail_n4")
 
 
-@app.group()
+LAZY_OVERLAY_COMMANDS: dict[str, SimpleNamespace] = {
+    "all": SimpleNamespace(module="fishtools.segment.overlay_all", attr="overlay_all"),
+    "intensity": SimpleNamespace(module="fishtools.segment.overlay_intensity", attr="overlay_intensity"),
+    "spots": SimpleNamespace(module="fishtools.segment.overlay_spots", attr="overlay"),
+}
+
+
+class LazyGroup(click.Group):
+    """Lazy-loading Click group that defers CLI imports until invocation."""
+
+    def __init__(self, *args: Any, lazy_commands: dict[str, SimpleNamespace] | None = None, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._lazy_commands = lazy_commands or {}
+
+    def list_commands(self, ctx: click.Context) -> list[str]:
+        eager = super().list_commands(ctx)
+        lazy = sorted(self._lazy_commands)
+        ordered = list(dict.fromkeys([*eager, *lazy]))
+        return ordered
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        command = super().get_command(ctx, cmd_name)
+        if command is not None:
+            return command
+
+        spec = self._lazy_commands.get(cmd_name)
+        if spec is None:
+            return None
+
+        module = import_module(spec.module)
+        return getattr(module, spec.attr)
+
+
+@app.group(cls=LazyGroup, lazy_commands=LAZY_OVERLAY_COMMANDS)
 def overlay() -> None:
     """Visualization helpers for segmentation outputs."""
-
-
-# Register overlay subcommands - imports happen here but only when overlay is accessed
-from fishtools.segment.overlay_all import overlay_all  # noqa: E402
-from fishtools.segment.overlay_intensity import overlay_intensity  # noqa: E402
-from fishtools.segment.overlay_spots import overlay as overlay_spots  # noqa: E402
-
-overlay.add_command(overlay_all, "all")
-overlay.add_command(overlay_intensity, "intensity")
-overlay.add_command(overlay_spots, "spots")
 
 
 __all__ = [
     "app",
     "train",
     "run_command",
+    "batch_command",
     "trt_build_cmd",
     "export_command",
     "postproc_command",
@@ -1167,11 +1474,6 @@ __all__ = [
     "thumbnail_command",
     "overlay",
 ]
-
-
-def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    app()
 
 
 if __name__ == "__main__":

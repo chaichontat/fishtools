@@ -19,8 +19,8 @@ import rich_click as click
 from loguru import logger
 
 from fishtools.io.workspace import Workspace
-from fishtools.segment.utils import compute_regionprops_table
 from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.segment.utils import compute_regionprops_table
 from fishtools.utils.logging import setup_cli_logging
 
 # --- Configuration ---
@@ -471,7 +471,7 @@ def initialize() -> None:
 @click.option(
     "--segmentation-name",
     type=str,
-    default="output_segmentation-sam.zarr",
+    default="output_segmentation-sam_postproc_s1-2-2_v500.zarr",
     show_default=True,
     help="Relative path to the segmentation Zarr store within the input directory.",
 )
@@ -534,7 +534,7 @@ def overlay(
                 if batch_mode:
                     logger.warning(msg)
                     continue
-                # raise click.ClickException(msg)
+                raise click.ClickException(msg)
 
             if not spots.exists():
                 msg = f"Skipping ROI '{current_roi}': spots parquet not found at {spots}."
@@ -542,6 +542,36 @@ def overlay(
                     logger.warning(msg)
                     continue
                 raise click.ClickException(msg)
+
+            spot_cb_label = ws.sanitize_codebook_name(codebook)
+            output_chunk_dir = seg_path / f"chunks+{spot_cb_label}"
+
+            try:
+                z = zarr.open_array(seg_path, mode="r")
+            except Exception as exc:
+                msg = f"Skipping ROI '{current_roi}': failed to open segmentation '{seg_path}': {exc}"
+                if batch_mode:
+                    logger.warning(msg)
+                    continue
+                raise click.ClickException(msg) from exc
+
+            pending_slices: list[int] = []
+            if overwrite:
+                pending_slices = list(range(z.shape[0]))
+            else:
+                for idx in range(z.shape[0]):
+                    ident_path = output_chunk_dir / f"ident_{idx}.parquet"
+                    polygons_path = output_chunk_dir / f"polygons_{idx}.parquet"
+                    if ident_path.exists() and polygons_path.exists():
+                        continue
+                    pending_slices.append(idx)
+
+            if not pending_slices:
+                logger.info(
+                    f"ROI '{current_roi}': overlay spots already complete under {output_chunk_dir} "
+                    "(use --overwrite to recompute)."
+                )
+                continue
 
             try:
                 tileconfig = ws.tileconfig(current_roi)
@@ -556,13 +586,7 @@ def overlay(
 
             with ProcessPoolExecutor(max_workers=8, mp_context=get_context("spawn")) as executor:
                 futures = []
-                try:
-                    z = zarr.open_array(seg_path, mode="r")
-                except Exception as e:
-                    msg = f"Skipping ROI '{current_roi}': failed to open segmentation '{seg_path}': {e}"
-                    continue
-
-                for i in range(z.shape[0]):
+                for i in pending_slices:
                     futures.append(
                         executor.submit(
                             run_,
@@ -574,7 +598,7 @@ def overlay(
                             x_offset,
                             y_offset,
                             max_proj=z.shape[0] == 1,
-                            spot_cb_label=ws.sanitize_codebook_name(codebook),
+                            spot_cb_label=spot_cb_label,
                         )
                     )
                 for future in as_completed(futures):

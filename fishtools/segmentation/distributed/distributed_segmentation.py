@@ -20,7 +20,7 @@ import distributed
 import imagecodecs
 import numpy as np
 import tifffile
-import typer
+import click
 import zarr
 from numpy.typing import NDArray
 
@@ -1114,8 +1114,6 @@ def stitch_segmentation(
     return final_seg_zarr, merged_boxes
 
 
-app = typer.Typer(pretty_exceptions_show_locals=False)
-
 _DEFAULT_FUSED_NAME = "fused_n4.zarr"
 
 
@@ -1361,61 +1359,145 @@ def _run_single_input(
     logger.info(f"Number of segmented objects found: {len(final_bounding_boxes)}")
 
 
-@app.command()
+def _run_inputs_with_roi_retries(
+    *,
+    input_paths: list[Path],
+    run_one: Callable[[Path], None],
+    roi_retries: int,
+    roi_retry_delay_s: float,
+) -> None:
+    if roi_retries < 0:
+        raise ValueError("roi_retries must be >= 0")
+    if roi_retry_delay_s < 0:
+        raise ValueError("roi_retry_delay_s must be >= 0")
+
+    for input_path in input_paths:
+        attempt = 0
+        while True:
+            try:
+                run_one(input_path)
+                break
+            except Exception as exc:
+                if attempt >= roi_retries:
+                    raise
+
+                attempt += 1
+                logger.warning(
+                    f"[{input_path.parent.name}] Segmentation failed (attempt {attempt}/{roi_retries + 1}): {exc!r}"
+                )
+                if roi_retry_delay_s > 0:
+                    logger.info(f"[{input_path.parent.name}] Retrying in {roi_retry_delay_s:.1f}s...")
+                    time.sleep(roi_retry_delay_s)
+
+
+@click.group()
+def cli() -> None:
+    """Distributed Cellpose segmentation utilities."""
+
+
+@cli.command("run")
+@click.argument("workspace", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("roi", required=False, default="*", type=str)
+@click.option(
+    "--codebook",
+    required=True,
+    type=str,
+    help="Codebook label used to locate stitch--ROI+<codebook> folders.",
+)
+@click.option("--channels", default=None, type=str, help="Comma-separated list of channel names to use.")
+@click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite existing segmentation.")
+@click.option(
+    "--stitched-name",
+    default=_DEFAULT_FUSED_NAME,
+    show_default=True,
+    help="Stitched zarr filename inside stitch--ROI+CB.",
+)
+@click.option(
+    "--config",
+    "-c",
+    "config_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Explicit path to config.json. Defaults to <path>/../config.json when omitted.",
+)
+@click.option(
+    "--workers-per-gpu",
+    default=4,
+    show_default=True,
+    type=int,
+    help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster).",
+)
+@click.option(
+    "--threads-per-worker",
+    default=1,
+    show_default=True,
+    type=int,
+    help="Threads per worker (GPU-bound work typically uses 1).",
+)
+@click.option(
+    "--use-localcuda/--no-use-localcuda",
+    default=False,
+    show_default=True,
+    help="If true and workers_per_gpu<=1, use dask-cuda LocalCUDACluster.",
+)
+@click.option("--n-workers", default=None, type=int, help="For LocalCUDACluster: number of workers (defaults to #GPUs).")
+@click.option(
+    "--target-ny",
+    default=None,
+    type=int,
+    help="Desired internal Cellpose ny tiles (SAM backend only).",
+)
+@click.option(
+    "--target-nx",
+    default=None,
+    type=int,
+    help="Desired internal Cellpose nx tiles (SAM backend only).",
+)
+@click.option(
+    "--cellpose-only/--no-cellpose-only",
+    default=False,
+    show_default=True,
+    help="Stop after cellpose phase, save intermediate state for later stitching.",
+)
+@click.option(
+    "--stagger-seconds",
+    default=5.0,
+    show_default=True,
+    type=float,
+    help="Seconds to stagger worker starts on the same GPU (0 to disable).",
+)
+@click.option(
+    "--roi-retries",
+    default=2,
+    show_default=True,
+    type=int,
+    help="Number of retries per ROI when segmentation fails (0 disables retries).",
+)
+@click.option(
+    "--roi-retry-delay-s",
+    default=0.0,
+    show_default=True,
+    type=float,
+    help="Delay (seconds) between ROI retries.",
+)
 def run(
-    workspace: Path = typer.Argument(
-        ...,
-        help=(
-            "Workspace root containing analysis/deconv/stitch--ROI+CB folders with stitched zarr."
-        ),
-    ),
-    roi: str = typer.Argument("*", help="ROI name (default: '*')."),
-    codebook: str = typer.Option(
-        ...,
-        "--codebook",
-        help="Codebook label used to locate stitch--ROI+<codebook> folders.",
-    ),
-    channels: str | None = typer.Option(None, help="Comma-separated list of channel names to use."),
-    overwrite: bool = typer.Option(False, help="Overwrite existing segmentation."),
-    stitched_name: str = typer.Option(
-        _DEFAULT_FUSED_NAME,
-        "--stitched-name",
-        help="Stitched zarr filename inside stitch--ROI+CB (default: fused_n4.zarr).",
-    ),
-    config_path: Path | None = typer.Option(
-        None,
-        "--config",
-        "-c",
-        help="Explicit path to config.json. Defaults to <path>/../config.json when omitted.",
-    ),
-    workers_per_gpu: int = typer.Option(
-        4, help="Number of workers to spawn per GPU (>=2 enables multi-worker SpecCluster)"
-    ),
-    threads_per_worker: int = typer.Option(1, help="Threads per worker (GPU-bound work typically uses 1)"),
-    use_localcuda: bool = typer.Option(
-        False, help="If true and workers_per_gpu<=1, use dask-cuda LocalCUDACluster"
-    ),
-    n_workers: int | None = typer.Option(
-        None, help="For LocalCUDACluster: number of workers (defaults to #GPUs)"
-    ),
-    target_ny: int | None = typer.Option(
-        None,
-        help="Desired internal Cellpose ny tiles (SAM backend only; overrides default 4).",
-    ),
-    target_nx: int | None = typer.Option(
-        None,
-        help="Desired internal Cellpose nx tiles (SAM backend only; overrides default 6).",
-    ),
-    cellpose_only: bool = typer.Option(
-        False,
-        "--cellpose-only",
-        help="Stop after cellpose phase, save intermediate state for later stitching.",
-    ),
-    stagger_seconds: float = typer.Option(
-        5.0,
-        "--stagger-seconds",
-        help="Seconds to stagger worker starts on the same GPU (0 to disable).",
-    ),
+    workspace: Path,
+    roi: str,
+    codebook: str,
+    channels: str | None,
+    overwrite: bool,
+    stitched_name: str,
+    config_path: Path | None,
+    workers_per_gpu: int,
+    threads_per_worker: int,
+    use_localcuda: bool,
+    n_workers: int | None,
+    target_ny: int | None,
+    target_nx: int | None,
+    cellpose_only: bool,
+    stagger_seconds: float,
+    roi_retries: int,
+    roi_retry_delay_s: float,
 ) -> None:
     """
     Run distributed Cellpose segmentation (full pipeline or cellpose-only).
@@ -1443,14 +1525,14 @@ def run(
     )
     logging.getLogger("cellpose").setLevel(logging.WARNING)
 
-    input_paths = _collect_input_paths(Path(workspace), roi, stitched_name, codebook)
+    input_paths = _collect_input_paths(workspace, roi, stitched_name, codebook)
     if not input_paths:
         logger.info(f"No {stitched_name} inputs found to segment.")
         return
 
-    for input_path in input_paths:
+    def _run_one(path: Path) -> None:
         _run_single_input(
-            input_path=input_path,
+            input_path=path,
             channels=channels,
             overwrite=overwrite,
             config_path=config_path,
@@ -1464,13 +1546,19 @@ def run(
             stagger_seconds=stagger_seconds,
         )
 
+    _run_inputs_with_roi_retries(
+        input_paths=input_paths,
+        run_one=_run_one,
+        roi_retries=roi_retries,
+        roi_retry_delay_s=roi_retry_delay_s,
+    )
 
-@app.command()
-def stitch(
-    temp_dir: Path = typer.Argument(..., help="Path to cellpose_temp directory with intermediate results."),
-    output_path: Path = typer.Argument(..., help="Path for output zarr file."),
-    cleanup: bool = typer.Option(True, help="Remove temp directory after successful stitching."),
-) -> None:
+
+@cli.command("stitch")
+@click.argument("temp_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.argument("output_path", type=click.Path(path_type=Path))
+@click.option("--cleanup/--no-cleanup", default=True, show_default=True, help="Remove temp directory after successful stitching.")
+def stitch(temp_dir: Path, output_path: Path, cleanup: bool) -> None:
     """
     Stitch pre-computed cellpose results into final segmentation.
 
@@ -1506,4 +1594,4 @@ def stitch(
 
 
 if __name__ == "__main__":
-    app()
+    cli()

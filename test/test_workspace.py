@@ -257,6 +257,13 @@ class TestWorkspaceImageAccess:
         expected_path = workspace_path / "analysis" / "deconv"
         assert ws.deconved == expected_path
 
+    def test_chromatic_property(self):
+        """Test chromatic property returns correct path."""
+        workspace_path = self.create_mock_workspace_with_deconv()
+        ws = Workspace(workspace_path)
+
+        assert ws.chromatic == workspace_path / "analysis" / "deconv" / "chromatic"
+
     def test_img_path_construction(self):
         """Test img method constructs correct paths."""
         workspace_path = self.create_mock_workspace_with_deconv()

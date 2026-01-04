@@ -35,6 +35,7 @@ def test_segment_overlay_all_help():
     assert "--segmentation-name" in result.output
     assert "--intensity-store" in result.output
     assert "--threads" in result.output
+    assert "--export" in result.output
 
 
 def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
@@ -42,6 +43,8 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
     import importlib
 
     overlay_all_mod = importlib.import_module("fishtools.segment.overlay_all")
+    overlay_intensity_mod = importlib.import_module("fishtools.segment.overlay_intensity")
+    overlay_spots_mod = importlib.import_module("fishtools.segment.overlay_spots")
 
     ws = _make_workspace(tmp_path)
     (ws / "analysis/deconv/stitch--roi+cb1" / "output_segmentation-sam.zarr").mkdir(
@@ -100,10 +103,10 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
     def fail_main(*args, **kwargs):
         raise AssertionError("Command.main should not be called from overlay all.")
 
-    monkeypatch.setattr(overlay_all_mod.overlay_spots, "main", fail_main)
-    monkeypatch.setattr(overlay_all_mod.overlay_intensity, "main", fail_main)
-    monkeypatch.setattr(overlay_all_mod.overlay_spots, "callback", fake_spots)
-    monkeypatch.setattr(overlay_all_mod.overlay_intensity, "callback", fake_intensity)
+    monkeypatch.setattr(overlay_spots_mod.overlay, "main", fail_main)
+    monkeypatch.setattr(overlay_intensity_mod.overlay_intensity, "main", fail_main)
+    monkeypatch.setattr(overlay_spots_mod.overlay, "callback", fake_spots)
+    monkeypatch.setattr(overlay_intensity_mod.overlay_intensity, "callback", fake_intensity)
 
     overlay_all_mod.overlay_all.callback(
         path=ws,
@@ -116,6 +119,7 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
         intensity_store="fused.zarr",
         channel=None,
         threads=2,
+        export_opt=False,
         overwrite=False,
         debug=False,
     )
@@ -126,11 +130,91 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
     assert calls["intensity"]["seg_codebook"] == "cb1"
 
 
+def test_segment_overlay_all_export_runs_segment_export_direct(tmp_path, monkeypatch):
+    ensure_cellpose_stub()
+    import importlib
+
+    overlay_all_mod = importlib.import_module("fishtools.segment.overlay_all")
+    overlay_intensity_mod = importlib.import_module("fishtools.segment.overlay_intensity")
+    overlay_spots_mod = importlib.import_module("fishtools.segment.overlay_spots")
+    export_mod = importlib.import_module("fishtools.segment.export")
+
+    ws = _make_workspace(tmp_path)
+    (ws / "analysis/deconv/stitch--roi+cb1" / "output_segmentation-sam.zarr").mkdir(
+        parents=True, exist_ok=True
+    )
+    (ws / "analysis/deconv/stitch--roi+cb_int" / "fused.zarr").mkdir(parents=True, exist_ok=True)
+
+    def fake_spots(**_kwargs) -> None:
+        return None
+
+    def fake_intensity(**_kwargs) -> None:
+        return None
+
+    export_calls: dict[str, object] = {}
+
+    def fake_export_cmd(
+        *,
+        path: Path,
+        roi: str | None,
+        seg_codebook: str,
+        codebooks: tuple[str, ...],
+        segmentation_name: str,
+        channels: str,
+        thumbnail_scale: float = 8.0,
+        diag: bool = False,
+    ) -> None:
+        export_calls.update(
+            {
+                "path": path,
+                "roi": roi,
+                "seg_codebook": seg_codebook,
+                "codebooks": codebooks,
+                "segmentation_name": segmentation_name,
+                "channels": channels,
+                "thumbnail_scale": thumbnail_scale,
+                "diag": diag,
+            }
+        )
+
+    monkeypatch.setattr(overlay_spots_mod.overlay, "callback", fake_spots)
+    monkeypatch.setattr(overlay_intensity_mod.overlay_intensity, "callback", fake_intensity)
+    monkeypatch.setattr(export_mod, "export_cmd", fake_export_cmd)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        overlay_all_mod.overlay_all,
+        [
+            str(ws),
+            "--codebook",
+            "cb1",
+            "--seg-codebook",
+            "cb1",
+            "--intensity-codebook",
+            "cb_int",
+            "--export",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert export_calls == {
+        "path": ws,
+        "roi": None,
+        "seg_codebook": "cb1",
+        "codebooks": ("cb1",),
+        "segmentation_name": "output_segmentation-sam.zarr",
+        "channels": "auto",
+        "thumbnail_scale": 8.0,
+        "diag": False,
+    }
+
+
 def test_segment_overlay_all_skips_rois_missing_segmentation_zarr(tmp_path, monkeypatch):
     ensure_cellpose_stub()
     import importlib
 
     overlay_all_mod = importlib.import_module("fishtools.segment.overlay_all")
+    overlay_intensity_mod = importlib.import_module("fishtools.segment.overlay_intensity")
+    overlay_spots_mod = importlib.import_module("fishtools.segment.overlay_spots")
 
     ws = _make_workspace(tmp_path)
     (ws / "analysis/deconv/stitch--2+pi").mkdir(parents=True, exist_ok=True)
@@ -148,8 +232,8 @@ def test_segment_overlay_all_skips_rois_missing_segmentation_zarr(tmp_path, monk
     def fake_intensity(*, roi: str, **kwargs) -> None:
         intensity_called.append(roi)
 
-    monkeypatch.setattr(overlay_all_mod.overlay_spots, "callback", fake_spots)
-    monkeypatch.setattr(overlay_all_mod.overlay_intensity, "callback", fake_intensity)
+    monkeypatch.setattr(overlay_spots_mod.overlay, "callback", fake_spots)
+    monkeypatch.setattr(overlay_intensity_mod.overlay_intensity, "callback", fake_intensity)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -332,6 +416,24 @@ def _overlay_chunks_dir(seg_dir: Path, codebook: str, seg_name: str = "output_se
     return seg_dir / seg_name / f"chunks+{_sanitize_codebook(codebook)}"
 
 
+def _write_intensity_store(ws: Path, roi: str, cb: str, data: np.ndarray, *, key: list[str]) -> Path:
+    import zarr
+
+    out_dir = ws / "analysis/deconv" / f"stitch--{roi}+{cb}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    arr = zarr.open_array(
+        str(out_dir / "fused.zarr"),
+        mode="w",
+        shape=data.shape,
+        dtype=data.dtype,
+        chunks=data.shape,
+        codecs=default_zarr_codecs(data.dtype),
+    )
+    arr[:] = data
+    arr.attrs["key"] = key
+    return out_dir / "fused.zarr"
+
+
 def _invoke_overlay_spots(
     ws: Path,
     roi: str,
@@ -358,6 +460,37 @@ def _invoke_overlay_spots(
         "--spots",
         str(spots_path),
         "--overwrite",
+    ]
+    if extra_args:
+        args.extend(extra_args)
+    return runner.invoke(app, args)
+
+
+def _invoke_overlay_spots_no_overwrite(
+    ws: Path,
+    roi: str,
+    codebook: str,
+    seg_cb: str,
+    spots_path: Path,
+    extra_args: list[str] | None = None,
+):
+    ensure_cellpose_stub()
+    from fishtools.segment import app
+
+    runner = CliRunner()
+    args = [
+        "overlay",
+        "spots",
+        str(ws),
+        roi,
+        "--codebook",
+        codebook,
+        "--seg-codebook",
+        seg_cb,
+        "--segmentation-name",
+        "output_segmentation.zarr",
+        "--spots",
+        str(spots_path),
     ]
     if extra_args:
         args.extend(extra_args)
@@ -542,3 +675,117 @@ def test_overlay_spots_cli_errors_on_missing_segmentation(tmp_path):
     assert result.exit_code != 0
     assert result.exception is not None
     assert "segmentation not found" in str(result.exception).lower()
+
+
+@pytest.mark.usefixtures("sync_executor")
+def test_overlay_spots_cli_skips_when_outputs_exist_and_no_overwrite(tmp_path, monkeypatch):
+    ensure_cellpose_stub()
+    import importlib
+
+    overlay_mod = importlib.import_module("fishtools.segment.overlay_spots")
+
+    roi = "roi"
+    codebook = "cb1"
+    seg_cb = "seg"
+    ws = _make_workspace(tmp_path)
+    seg_dir = _write_segmentation(ws, roi, seg_cb, np.array([_single_block_plane()], dtype=np.int32))
+    _write_tileconfig(ws, roi, [(0.0, 0.0)])
+    spots_path = _write_spots(ws, roi, codebook, [{"x": 1.0, "y": 1.0, "z": 0.0, "target": "geneA"}])
+
+    chunk_dir = _overlay_chunks_dir(seg_dir, codebook)
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"spot_id": [0], "target": ["geneA"], "label": [1]}).write_parquet(
+        chunk_dir / "ident_0.parquet"
+    )
+    pl.DataFrame({"label": [1], "area": [1]}).write_parquet(chunk_dir / "polygons_0.parquet")
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("run_ should not be called when outputs already exist and --overwrite is not set.")
+
+    monkeypatch.setattr(overlay_mod, "run_", fail_run)
+
+    result = _invoke_overlay_spots_no_overwrite(ws, roi, codebook, seg_cb, spots_path)
+    assert result.exit_code == 0, result.output
+
+
+@pytest.fixture
+def sync_executor_intensity(monkeypatch):
+    from concurrent.futures import Future
+    import importlib
+
+    ensure_cellpose_stub()
+    overlay_mod = importlib.import_module("fishtools.segment.overlay_intensity")
+
+    class _ImmediateExecutor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            future = Future()
+            try:
+                result = fn(*args, **kwargs)
+            except Exception as exc:  # pragma: no cover - surface exact exception upstream
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+            return future
+
+    monkeypatch.setattr(overlay_mod, "ProcessPoolExecutor", _ImmediateExecutor)
+    return None
+
+
+@pytest.mark.usefixtures("sync_executor_intensity")
+def test_overlay_intensity_cli_skips_when_outputs_exist_and_no_overwrite(tmp_path, monkeypatch):
+    ensure_cellpose_stub()
+    import importlib
+
+    overlay_mod = importlib.import_module("fishtools.segment.overlay_intensity")
+    from fishtools.segment import app
+
+    roi = "roi"
+    seg_cb = "seg"
+    intensity_cb = "cb_int"
+    ws = _make_workspace(tmp_path)
+
+    seg_dir = _write_segmentation(ws, roi, seg_cb, np.array([_single_block_plane()], dtype=np.int32))
+    _write_intensity_store(ws, roi, intensity_cb, np.zeros((1, 10, 10), dtype=np.uint16), key=["ch0"])
+
+    seg_zarr = seg_dir / "output_segmentation.zarr"
+    out_dir = seg_zarr / "intensity_ch0"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame({"label": [1], "mean_intensity": [1.0]}).write_parquet(out_dir / "intensity-00.parquet")
+
+    def fail_process(*_args, **_kwargs):
+        raise AssertionError(
+            "_process_slice_shared_detection should not run when outputs already exist and --overwrite is not set."
+        )
+
+    monkeypatch.setattr(overlay_mod, "_process_slice_shared_detection", fail_process)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "overlay",
+            "intensity",
+            str(ws),
+            roi,
+            "--seg-codebook",
+            seg_cb,
+            "--intensity-codebook",
+            intensity_cb,
+            "--segmentation-name",
+            "output_segmentation.zarr",
+            "--intensity-store",
+            "fused.zarr",
+            "--threads",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output

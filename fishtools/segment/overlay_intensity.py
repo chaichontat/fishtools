@@ -13,7 +13,6 @@ import zarr
 from loguru import logger
 
 from fishtools.io.workspace import Workspace
-
 from fishtools.segment.overlay_spots import load_segmentation_slice
 from fishtools.segment.utils import (
     StitchPaths,
@@ -111,22 +110,40 @@ def _run_overlay_for_roi(
     # Put intensity outputs inside the segmentation zarr folder
     output_dir = segmentation_zarr_path
 
+    pending: list[tuple[str, int]] = []
+    if overwrite:
+        pending = [(ch, idx) for ch in channels for idx in range(num_slices)]
+    else:
+        for ch in channels:
+            channel_dir = output_dir / f"intensity_{ch}"
+            for idx in range(num_slices):
+                props_path = channel_dir / f"intensity-{idx:02d}.parquet"
+                if props_path.exists():
+                    continue
+                pending.append((ch, idx))
+
+    if not pending:
+        logger.info(
+            f"ROI '{roi}': intensity overlay already complete under {output_dir} "
+            "(use --overwrite to recompute)."
+        )
+        return
+
     processed_count = 0
     failed_count = 0
     with ProcessPoolExecutor(max_workers=threads, mp_context=get_context("spawn")) as executor:
         futures: dict = {}
-        for ch in channels:
-            for idx in range(num_slices):
-                fut = executor.submit(
-                    _process_slice_shared_detection,
-                    idx,
-                    segmentation_zarr_path,
-                    intensity_zarr_path,
-                    ch,
-                    output_dir,
-                    overwrite,
-                )
-                futures[fut] = (ch, idx)
+        for ch, idx in pending:
+            fut = executor.submit(
+                _process_slice_shared_detection,
+                idx,
+                segmentation_zarr_path,
+                intensity_zarr_path,
+                ch,
+                output_dir,
+                overwrite,
+            )
+            futures[fut] = (ch, idx)
 
         for future in as_completed(futures):
             ch, idx = futures[future]
@@ -169,7 +186,7 @@ def _run_overlay_for_roi(
 @click.option(
     "--segmentation-name",
     type=str,
-    default="output_segmentation-sam.zarr",
+    default="output_segmentation-sam_postproc_s1-2-2_v500.zarr",
     show_default=True,
     help="Relative path to the segmentation Zarr within the stitched ROI directory.",
 )

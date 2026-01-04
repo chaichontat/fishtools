@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import zarr
-from typer.testing import CliRunner
+from click.testing import CliRunner
 
 from fishtools.segmentation.distributed import distributed_postproc as dp
 
@@ -36,7 +36,7 @@ def test_cli_workspace_all_rois_runs_only_existing(tmp_path: Path, monkeypatch: 
     monkeypatch.setattr(dp, "distributed_postproc", _fake_postproc)
 
     runner = CliRunner()
-    res = runner.invoke(dp.app, [str(ws)])
+    res = runner.invoke(dp.cli, ["run", str(ws)])
     assert res.exit_code == 0, res.output
     assert called == [ws / "analysis/deconv/stitch--roi1+cb1/output_segmentation-sam.zarr"]
 
@@ -56,7 +56,7 @@ def test_cli_workspace_single_roi_runs_all_codebooks(tmp_path: Path, monkeypatch
     monkeypatch.setattr(dp, "distributed_postproc", _fake_postproc)
 
     runner = CliRunner()
-    res = runner.invoke(dp.app, [str(ws), "roi1"])
+    res = runner.invoke(dp.cli, ["run", str(ws), "roi1"])
     assert res.exit_code == 0, res.output
     assert sorted(called) == sorted(
         [
@@ -77,6 +77,12 @@ def test_cli_legacy_direct_zarr_path(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(dp, "distributed_postproc", _fake_postproc)
 
     runner = CliRunner()
-    res = runner.invoke(dp.app, [str(seg_path)])
+    res = runner.invoke(dp.cli, ["run", str(seg_path)])
     assert res.exit_code == 0, res.output
     assert called == [seg_path]
+
+
+def test_distributed_postproc_click_help() -> None:
+    runner = CliRunner()
+    res = runner.invoke(dp.cli, ["--help"])
+    assert res.exit_code == 0, res.output
