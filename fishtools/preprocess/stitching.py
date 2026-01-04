@@ -9,6 +9,32 @@ Cells: TypeAlias = list[Polygon]
 Crosses: TypeAlias = list[list[int]]
 Coords: TypeAlias = tuple[float, float]
 
+DEFAULT_SPOT_SPLIT_OVERLAP_PX = 50
+
+
+def spot_split_cut_px(tile_size_px: int, *, overlap_px: int = DEFAULT_SPOT_SPLIT_OVERLAP_PX) -> int:
+    """Compute the per-quadrant crop size for spot decoding.
+
+    The spots pipeline processes each registered tile in 4 corner crops. This
+    helper returns the crop "cut" such that the two crops along an axis overlap
+    by ~``overlap_px`` pixels:
+
+        overlap = 2 * cut - tile_size
+
+    Special case: historically, 1960px tiles used ``cut=1024``; keep that
+    behavior to avoid changing existing results.
+    """
+    if tile_size_px < 1:
+        raise ValueError(f"tile_size_px must be >= 1, got {tile_size_px}")
+    if overlap_px < 0:
+        raise ValueError(f"overlap_px must be >= 0, got {overlap_px}")
+
+    if tile_size_px == 1960:
+        return 1024
+
+    cut = (tile_size_px + overlap_px + 1) // 2
+    return min(tile_size_px, int(cut))
+
 
 def calculate_intersections(cells: Cells) -> Crosses:
     idx = index.Index()

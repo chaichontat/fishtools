@@ -23,7 +23,7 @@ import polars as pl
 import rich_click as click
 from loguru import logger
 from rtree import index
-from tifffile import imread
+from tifffile import TiffFile
 
 from fishtools.analysis.spots import load_spots, load_spots_simple
 from fishtools.io.workspace import Workspace
@@ -33,6 +33,7 @@ from fishtools.preprocess.stitching import (
     filter_spots_by_area,
     generate_cells,
     get_exclusive_area,
+    spot_split_cut_px,
 )
 from fishtools.utils.logging import resolve_workspace_root, setup_cli_logging
 
@@ -82,7 +83,7 @@ def load_splits(
     *,
     filter_: bool = True,
     size: int,
-    cut: int = 1024,
+    cut: int,
     simple: bool = False,
 ):
     """
@@ -147,6 +148,7 @@ def process(
     cells: Cells,
     crosses: Crosses,
     size: int,
+    cut: int,
     *,
     filter_: bool = True,
     simple: bool = False,
@@ -158,7 +160,7 @@ def process(
     downstream stitching and visualization.
     """
     try:
-        df = load_splits(path_pickle, curr, coords, size=size, filter_=filter_, simple=simple)
+        df = load_splits(path_pickle, curr, coords, size=size, cut=cut, filter_=filter_, simple=simple)
     except Exception as e:
         logger.error(f"{path_pickle.name}: {e}")
         return None
@@ -237,20 +239,16 @@ def stitch(
             f"Checked ROIs: {joined}"
         )
 
-    # Get size
-    first_tile: Path | None = None
-    for _roi_name, reg_dir in registered_dirs:
-        first_tile = next(reg_dir.glob("reg-*.tif"), None)
-        if first_tile is not None:
-            break
-    if first_tile is None:
-        raise ValueError(f"No registered tiles found under {ws.path} for codebook={cb}")
-    img = imread(first_tile)
-    size = img.shape[-1]
-    logger.info(f"Size: {size}")
-    del img
-
     for roi_name, reg_dir in registered_dirs:
+        first_tile = next(reg_dir.glob("reg-*.tif"), None)
+        if first_tile is None:
+            logger.error(f"Skipping {roi_name}: no registered tiles found under {reg_dir}")
+            continue
+        with TiffFile(first_tile) as tif:
+            size = int(tif.series[0].shape[-1])
+        cut = spot_split_cut_px(size)
+        logger.info(f"{roi_name}: tile_size={size}px, split_cut={cut}px, overlap={2 * cut - size}px")
+
         path_cb = ws.decoded_dir(roi_name, cb)
         try:
             coords = load_coords(ws.path, roi_name)
@@ -277,7 +275,7 @@ def stitch(
         coords = coords.filter(pl.col("index").is_in({int(f.stem.rsplit("-", 2)[1]) for f in files}))
 
         # Precompute intersections
-        cells = generate_cells(coords, files, split=not simple and not no_split, size=size)
+        cells = generate_cells(coords, files, split=not simple and not no_split, size=size, cut=cut)
         assert len(files) == len(cells)
         logger.debug(f"Generated {len(cells)} cells.")
         if not len(cells):
@@ -289,6 +287,7 @@ def stitch(
         # Get the indices of the cells that cross each other
         crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 
+        # DO NOT TOUCH THIS EXECUTOR. If there's a sandbox issue, inform the user, don't try to work around it.
         with ProcessPoolExecutor(max_workers=threads, mp_context=get_context("spawn")) as exc:
             futs = []
             for i, file in enumerate(files):
@@ -299,6 +298,7 @@ def stitch(
                             file,
                             i,
                             size=size,
+                            cut=cut,
                             coords=coords,
                             cells=cells,
                             crosses=crosses,

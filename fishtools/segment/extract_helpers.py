@@ -128,6 +128,11 @@ def _write_tiff(
     *,
     upscale: float,
 ) -> None:
+    tiff_kwargs = dict(TIFF_KWARGS)
+    if "C" in axes:
+        ch_axis = axes.index("C")
+        if data.shape[ch_axis] <= 1:
+            tiff_kwargs.pop("planarconfig", None)
     imwrite(
         path,
         data,
@@ -137,7 +142,7 @@ def _write_tiff(
             "channels_arg": channels_arg,
             "upscale": upscale,
         },
-        **TIFF_KWARGS,  # type: ignore[arg-type]
+        **tiff_kwargs,  # type: ignore[arg-type]
     )
 
 

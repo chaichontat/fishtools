@@ -10,6 +10,8 @@ def _make_workspace(tmp_path: Path, rois: list[str]) -> None:
     # Create minimal directories so Workspace discovers ROIs
     for roi in rois:
         (tmp_path / f"R1--{roi}").mkdir(parents=True, exist_ok=True)
+    # Workspace root marker (required by Workspace path resolution)
+    (tmp_path / "workspace.DONE").touch()
     # Ensure output location exists
     (tmp_path / "analysis" / "output").mkdir(parents=True, exist_ok=True)
 
@@ -21,6 +23,25 @@ def _write_parquet(tmp_path: Path, roi: str, codebook_sanitized: str) -> Path:
         "target": ["GeneA", "GeneB", "Blank-1"],
     })
     out = tmp_path / "analysis" / "output" / f"{roi}+{codebook_sanitized}.parquet"
+    spots.write_parquet(out)
+    return out
+
+
+def _write_raw_decoded_parquet(tmp_path: Path, roi: str, codebook: str) -> Path:
+    spots = pl.DataFrame({
+        "x": [10.0, 20.0, 30.0],
+        "y": [5.0, 15.0, 25.0],
+        "target": ["GeneA", "GeneB", "Blank-1"],
+    })
+    out = (
+        tmp_path
+        / "analysis"
+        / "deconv"
+        / f"registered--{roi}+{codebook}"
+        / f"decoded-{codebook}"
+        / "spots.parquet"
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
     spots.write_parquet(out)
     return out
 
@@ -45,6 +66,50 @@ def test_spots_plotall_single_roi(tmp_path: Path) -> None:
     assert res.exit_code == 0, res.output
     out_png = tmp_path / "analysis" / "output" / "plots" / "plotall--roiA+cs_base.png"
     assert out_png.exists()
+
+
+def test_spots_plotall_use_raw_decoded(tmp_path: Path) -> None:
+    _make_workspace(tmp_path, ["roiA"])  # ROI discovery
+    _write_raw_decoded_parquet(tmp_path, "roiA", "cs-base")
+
+    runner = CliRunner()
+    res = runner.invoke(
+        spots_cli,
+        [
+            "plotall",
+            str(tmp_path),
+            "roiA",
+            "--codebook",
+            "cs-base",
+            "--threads",
+            "1",
+            "--use-raw-decoded",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    out_png = tmp_path / "analysis" / "output" / "plots" / "plotall--roiA+cs_base.png"
+    assert out_png.exists()
+
+
+def test_spots_plotall_missing_default_parquet_hints_raw_decoded(tmp_path: Path) -> None:
+    _make_workspace(tmp_path, ["roiA"])  # ROI discovery
+    _write_raw_decoded_parquet(tmp_path, "roiA", "cs-base")
+
+    runner = CliRunner()
+    res = runner.invoke(
+        spots_cli,
+        [
+            "plotall",
+            str(tmp_path),
+            "roiA",
+            "--codebook",
+            "cs-base",
+            "--threads",
+            "1",
+        ],
+    )
+    assert res.exit_code != 0
+    assert "--use-raw-decoded" in res.output
 
 
 def test_spots_plotall_all_rois(tmp_path: Path) -> None:
@@ -131,3 +196,28 @@ def test_spots_plotall_max_per_plot(tmp_path: Path) -> None:
     out1 = tmp_path / "analysis" / "output" / "plots" / "plotall--roiA+cs_base.1.png"
     out2 = tmp_path / "analysis" / "output" / "plots" / "plotall--roiA+cs_base.2.png"
     assert out1.exists() and out2.exists()
+
+
+def test_spots_plotall_logs_skipped_when_not_overwriting(tmp_path: Path) -> None:
+    _make_workspace(tmp_path, ["roiA"])  # ROI discovery
+    _write_parquet(tmp_path, "roiA", "cs_base")
+
+    out_png = tmp_path / "analysis" / "output" / "plots" / "plotall--roiA+cs_base.png"
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    out_png.write_bytes(b"dummy")
+
+    runner = CliRunner()
+    res = runner.invoke(
+        spots_cli,
+        [
+            "plotall",
+            str(tmp_path),
+            "roiA",
+            "--codebook",
+            "cs-base",
+            "--threads",
+            "1",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert "SKIPPED existing plot" in res.output

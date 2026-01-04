@@ -367,6 +367,7 @@ def _execute_extraction(
     crop: int,
     dz: int,
     n: int,
+    z_crops_per_file: int = 1,
     anisotropy: int,
     threads: int,
     upscale: float,
@@ -430,6 +431,7 @@ def _execute_extraction(
         explicit_mask_path=explicit_mask_path,
         enrich_boundaries=enrich_boundaries,
         roi_points=roi_points,
+        z_crops_per_file=z_crops_per_file,
     )
 
 
@@ -708,6 +710,7 @@ def _execute_tiff_extraction(
     explicit_mask_path: Path | None,
     enrich_boundaries: Path | None,
     roi_points: Path | None = None,
+    z_crops_per_file: int = 1,
 ) -> None:
     if roi_points is not None:
         logger.warning(f"[{label}] --roi-points is only supported for Zarr inputs; ignoring for TIFF extraction")
@@ -726,7 +729,7 @@ def _execute_tiff_extraction(
                     out_dir=out_dir,
                     channels=config.channels,
                     dz=config.dz,
-                    n=config.n,
+                    n_crops=z_crops_per_file,
                     upscale=config.upscale,
                     max_from_path=max_from_path,
                     mask_path=mask_path,
@@ -998,6 +1001,7 @@ def run_workspace_extract(
     out: Path | None,
     dz: int,
     n: int | None,
+    z_crops_per_file: int,
     anisotropy: int,
     channels: str | None,
     crop: int,
@@ -1039,6 +1043,7 @@ def run_workspace_extract(
             out=roi_out,
             dz=dz,
             n=n,
+            z_crops_per_file=z_crops_per_file,
             anisotropy=anisotropy,
             channels=channels,
             crop=crop,
@@ -1064,6 +1069,7 @@ def run_single_file_extract(
     out: Path,
     dz: int,
     n: int,
+    z_crops_per_file: int,
     anisotropy: int,
     channels: str | None,
     crop: int,
@@ -1089,6 +1095,7 @@ def run_single_file_extract(
         crop=crop,
         dz=dz,
         n=n,
+        z_crops_per_file=z_crops_per_file,
         anisotropy=anisotropy,
         threads=threads,
         upscale=upscale,
@@ -1110,6 +1117,7 @@ def _extract_single_roi(
     out: Path | None,
     dz: int,
     n: int,
+    z_crops_per_file: int,
     anisotropy: int,
     channels: str | None,
     crop: int,
@@ -1181,6 +1189,7 @@ def _extract_single_roi(
         crop=crop,
         dz=dz,
         n=n,
+        z_crops_per_file=z_crops_per_file,
         anisotropy=anisotropy,
         threads=threads,
         upscale=upscale,
@@ -1218,7 +1227,7 @@ def _extract_z_slices(
     out_dir: Path,
     channels: str | None,
     dz: int,
-    n: int,
+    n_crops: int,
     upscale: float,
     max_from_path: Path | None,
     mask_path: Path | None,
@@ -1256,7 +1265,7 @@ def _extract_z_slices(
     max_y = max(0, y_len - crop_size)
     max_x = max(0, x_len - crop_size)
 
-    n_crops = max(1, n)
+    n_crops = max(1, n_crops)
     rng = np.random.default_rng(seed)
 
     if enrich_mask_vol is not None and (max_y > 0 or max_x > 0):

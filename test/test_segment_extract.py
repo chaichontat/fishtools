@@ -144,10 +144,44 @@ def test_extract_z_slices_writes_outputs(tmp_path: Path, monkeypatch: pytest.Mon
         out_dir=out_dir,
         channels=None,
         dz=1,
-        n=1,
+        n_crops=1,
         upscale=1.0,
         max_from_path=None,
         mask_path=mask_path,
+        enrich_boundaries=None,
+        seed=0,
+        progress=None,
+    )
+
+    outputs = list(out_dir.glob("*.tif"))
+    assert any(p.name.endswith("_z00.tif") for p in outputs)
+    assert any(p.name.endswith("_z01.tif") for p in outputs)
+
+
+def test_extract_z_slices_supports_single_channel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import fishtools.segment.extract_core as extract_core_mod
+    from fishtools.segment.extract_core import _extract_z_slices
+
+    # Avoid GPU requirement in unsharp_all during tests.
+    monkeypatch.setattr(extract_core_mod, "unsharp_all", lambda img, **_: np.asarray(img))
+
+    reg_path = tmp_path / "reg-00.tif"
+    reg_data = np.zeros((2, 1, 6, 6), dtype=np.uint16)
+    tifffile.imwrite(reg_path, reg_data)
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    _extract_z_slices(
+        file=reg_path,
+        roi="roi_a",
+        out_dir=out_dir,
+        channels=None,
+        dz=1,
+        n_crops=1,
+        upscale=1.0,
+        max_from_path=None,
+        mask_path=None,
         enrich_boundaries=None,
         seed=0,
         progress=None,
@@ -263,6 +297,8 @@ def test_extract_cli_delegates_across_rois(tmp_path: Path, monkeypatch: pytest.M
     assert len(roi_b_call["prefetched_inputs"]) == available_counts["roi_b"]
     assert roi_a_call["use_zarr"] is False
     assert roi_b_call["use_zarr"] is False
+    assert roi_a_call["z_crops_per_file"] == 1
+    assert roi_b_call["z_crops_per_file"] == 1
 
 
 def test_extract_cli_single_roi_argument(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -785,7 +821,7 @@ def test_mask_slice_matches_image_dimensions_in_z_mode(
             out_dir=out_dir,
             channels=None,
             dz=1,
-            n=1,
+            n_crops=1,
             upscale=1.5,
             max_from_path=None,
             mask_path=mask_path,

@@ -989,6 +989,12 @@ def postproc_batch_command(
     help="Number of images to sample per ROI. Default: 50 for z, 20 for ortho.",
 )
 @click.option(
+    "--n-crops",
+    default=None,
+    type=click.IntRange(1, None),
+    help="Number of crops per image (z mode). Default: 1.",
+)
+@click.option(
     "--anisotropy",
     default=None,
     type=click.IntRange(1, None),
@@ -1051,6 +1057,7 @@ def extract_command(
     out: Path | None,
     dz: int,
     n: int | None,
+    n_crops: int | None,
     anisotropy: int | None,
     channels: str | None,
     crop: int,
@@ -1070,6 +1077,7 @@ def extract_command(
 
     # Apply mode-specific default for n
     n_value = n if n is not None else (20 if mode.lower() == "ortho" else 50)
+    z_crops_value = n_crops if n_crops is not None else (1 if mode.lower() == "z" else 1)
     # Apply zarr-specific default for anisotropy (only relevant for ortho mode)
     if mode.lower() == "ortho":
         anisotropy_value = anisotropy if anisotropy is not None else (2 if zarr else 4)
@@ -1093,6 +1101,7 @@ def extract_command(
         out=out,
         dz=dz,
         n=n_value,
+        z_crops_per_file=z_crops_value,
         anisotropy=anisotropy_value,
         channels=channels,
         crop=crop,
