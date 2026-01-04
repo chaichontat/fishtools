@@ -908,20 +908,6 @@ def _align_fiducials_internal(
         # itk_shift returns [dy, dx], swap to [dx, dy] for consistency.
         return shift_vec[::-1], 0.0
 
-    def spot_with_fft_fallback(img: np.ndarray, bitname: str, limit: int) -> tuple[np.ndarray, float]:
-        """Try spot-based registration, fall back to FFT if it fails."""
-        try:
-            return corr(img, bitname=bitname, limit=limit)
-        except (NotEnoughSpots, TooManySpots, ResidualTooLarge, DriftTooLarge) as e:
-            logger.warning(
-                f"{bitname}: Spot-based registration failed ({e.__class__.__name__}), falling back to FFT"
-            )
-            # phase_shift returns [dy, dx], swap to [dx, dy] to match spot-based convention
-            shift_vec = phase_shift(fids[ref], img)[::-1]
-            mode_map[bitname] = "fft"
-            # residual=-1 indicates fallback
-            return shift_vec, -1.0
-
     with ThreadPoolExecutor(threads if not debug else 1) as exc:
         futs: dict[str, Future] = {}
         for k, img in fids.items():
@@ -936,9 +922,8 @@ def _align_fiducials_internal(
                 mode_map[k] = "itk"
                 futs[k] = exc.submit(_itk_wrapper, img, k)
             else:
-                # Spot-based with FFT fallback
                 mode_map[k] = "spots"
-                futs[k] = exc.submit(spot_with_fft_fallback, img, bitname=k, limit=max_iters)
+                futs[k] = exc.submit(corr, img, bitname=k, limit=max_iters)
 
             if debug:
                 futs[k].result()
@@ -971,7 +956,7 @@ def _align_fiducials_internal(
                 final_fwhm=None,
                 n_spots=0,
                 mode="fft",
-                algorithm=None,
+                algorithm="phase_correlation",
             )
         elif mode == "itk":
             stat = FiducialAlignmentStats(

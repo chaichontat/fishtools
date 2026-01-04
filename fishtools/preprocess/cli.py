@@ -47,37 +47,6 @@ class LazyGroup(click.Group):
         return getattr(module, spec.attr)
 
 
-# Wrapper to integrate Typer app with Click
-@click.command("registerv1", context_settings={"ignore_unknown_options": True})
-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
-@click.pass_context
-def registerv1(ctx, args):
-    """🔬 FISH Image Registration and Preprocessing Pipeline (Typer-based)
-
-    Enhanced CLI with rich formatting, parameter validation, and comprehensive help.
-
-    Examples:
-    - Register single image: registerv1 /path/workspace roi 42 --codebook codebook.json
-    - Register all files in ROI: registerv1 /path/workspace roi --codebook codebook.json
-    - Register all files: registerv1 /path/workspace --codebook codebook.json
-    """
-    import subprocess
-    import sys
-
-    if not args:
-        # Show help if no arguments provided
-        args = ["--help"]
-
-    # Call the Typer CLI as a subprocess
-    cmd = [sys.executable, "-m", "fishtools.preprocess.cli_register_migrated"] + list(args)
-
-    try:
-        result = subprocess.run(cmd, check=False)
-        ctx.exit(result.returncode)
-    except KeyboardInterrupt:
-        ctx.exit(1)
-
-
 # log = setup_logging()
 click.rich_click.SHOW_ARGUMENTS = True
 click.rich_click.GROUP_ARGUMENTS_OPTIONS = True
@@ -101,8 +70,6 @@ def main():
     """
     ...
 
-
-main.add_command(registerv1)
 
 if __name__ == "__main__":
     main()

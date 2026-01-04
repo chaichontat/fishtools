@@ -657,6 +657,11 @@ def status(path: Path, codebook: str | None, roi_filter: str | None, verbose: bo
     # Rich table output
     console.print(f"\n[bold]Workspace:[/bold] {ws.path}\n")
 
+    has_spots_codebook = any(
+        cb != "(none)" and is_spots_codebook(ws, cb, rois)
+        for cb in codebooks
+    )
+
     for cb in codebooks:
         if cb == "(none)":
             # Show raw/deconv only table
@@ -683,3 +688,8 @@ def status(path: Path, codebook: str | None, roi_filter: str | None, verbose: bo
         console.print()
 
     console.print("[dim]Legend: [green]✓[/green] Complete | [yellow]⧖[/yellow] Partial | - Not started | [red]![/red] Stale (upstream newer)[/dim]\n")
+    if has_spots_codebook:
+        console.print(
+            "[dim]Spots column is `stitch/threshold`; run `preprocess spots stitch` for the first value and "
+            "`preprocess spots threshold` for the second.[/dim]\n"
+        )

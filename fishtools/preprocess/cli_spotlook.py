@@ -451,12 +451,10 @@ def _load_spots_data(path: Path, roi: str, codebook: Codebook, *, output_dir: Pa
     if not decoded_path.exists():
         if raw_copy_path.exists():
             spots_path = raw_copy_path
-            logger.warning(f"Decoded spots parquet missing for ROI {roi}; using output copy: {raw_copy_path}")
+            logger.info(f"Using output copy for ROI {roi}: {raw_copy_path}")
         elif legacy_raw_copy_path.exists():
             spots_path = legacy_raw_copy_path
-            logger.warning(
-                f"Decoded spots parquet missing for ROI {roi}; using legacy output copy: {legacy_raw_copy_path}"
-            )
+            logger.info(f"Using legacy output copy for ROI {roi}: {legacy_raw_copy_path}")
         else:
             logger.warning(f"Spots file not found for ROI {roi}, skipping: {decoded_path}")
             return None

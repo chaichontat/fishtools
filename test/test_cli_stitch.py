@@ -2,7 +2,6 @@ import json
 import time
 from collections.abc import Generator
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, Mock, patch
 
@@ -11,7 +10,6 @@ import pandas as pd
 import pytest
 from click.testing import CliRunner
 from pydantic import BaseModel
-from scipy import ndimage
 from tifffile import TiffFile, TiffFileError, imwrite
 
 from fishtools.preprocess import downsample as downsample_module
@@ -516,30 +514,9 @@ class TestImageExtraction:
 
         imwrite(input_file, test_data)
 
-        fake_cuda = SimpleNamespace(runtime=SimpleNamespace(getDeviceCount=lambda: 1))
-        fake_cp = SimpleNamespace(
-            float32=np.float32,
-            uint16=np.uint16,
-            cuda=fake_cuda,
-            asarray=lambda arr, dtype=None: np.asarray(arr, dtype=dtype),
-            asnumpy=lambda arr: np.asarray(arr),
-            clip=lambda arr, a_min, a_max: np.clip(arr, a_min, a_max),
-            empty=lambda shape, dtype=np.float32: np.empty(shape, dtype=dtype),
-        )
-
-        monkeypatch.setattr(downsample_module, "cp", fake_cp)
-        monkeypatch.setattr(
-            downsample_module,
-            "cp_zoom",
-            lambda arr, zoom, output, order, mode, grid_mode: ndimage.zoom(
-                arr,
-                zoom,
-                output=output,
-                order=order,
-                mode=mode,
-                grid_mode=grid_mode,
-            ),
-        )
+        # Force CPU downsampling so this test is deterministic and does not depend on CUDA/CuPy.
+        monkeypatch.setattr(downsample_module, "_cuda_available", False)
+        monkeypatch.setattr(downsample_module, "_check_cuda_available", lambda: False)
 
         # Extract with trim=10 and downsample=2, specify idx=0 for single-page TIFF
         extract_channel(input_file, output_file, idx=0, trim=10, downsample=2)

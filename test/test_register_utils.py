@@ -530,6 +530,7 @@ class TestRunFiducial:
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
@@ -564,6 +565,7 @@ class TestRunFiducial:
         cli_register_module.run_fiducial(
             path=deconv_path,
             fids=fids,
+            fids_raw=fids,
             codebook_name="cb",
             config=config,
             roi="roi",
@@ -591,46 +593,27 @@ class TestRunFiducial:
     def test_run_fiducial_writes_debug_on_spot_failure(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """When spot registration falls back to ITK, debug stacks are saved automatically."""
+        """Spot-based registration failures should error (no FFT fallback)."""
         config = self._make_config(priors=None)
 
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         reference = "round_a"
         failing_round = "round_b"
 
-        fallback_stat = cli_register_module.FiducialAlignmentStats(
-            iterations=0,
-            final_threshold=None,
-            final_fwhm=None,
-            n_spots=0,
-            mode="itk",
-            algorithm="OnePlusOneEvo",
-        )
-
         def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
         ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
-            shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
-            residuals = {name: 0.05 for name in fids}
-            stats = {reference: None, failing_round: fallback_stat}
-            return shifts, residuals, stats
+            from fishtools.preprocess.fiducial import NotEnoughSpots
+
+            raise NotEnoughSpots("Not enough spots")
 
         monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
-        monkeypatch.setattr(cli_register_module, "shift", lambda arr, *_args, **_kwargs: arr)
-        monkeypatch.setattr(cli_register_module, "_save_debug_overlay", lambda *args, **kwargs: None)
 
-        recorded_paths: list[Path] = []
-
-        def _under_debug_dir(path: Path) -> bool:
-            return path.parent.parent.name == "fids_debug"
-
-        def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
-            recorded_paths.append(Path(path))
-
-        monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *_a, **_k: None)
 
         fids = {
             reference: np.ones((4, 4), dtype=np.float32),
@@ -640,41 +623,44 @@ class TestRunFiducial:
         roi = "roi_dbg"
         idx = 2
 
-        cli_register_module.run_fiducial(
-            path=deconv_path,
-            fids=fids,
-            codebook_name="cb",
-            config=config,
-            roi=roi,
-            idx=idx,
-            reference=reference,
-            debug=False,
-        )
+        from fishtools.preprocess.fiducial import NotEnoughSpots
 
-        debug_writes = [path for path in recorded_paths if _under_debug_dir(path)]
-        expected_files = {f"{roi}-{idx:04d}.tif", f"{roi}-shifted-{idx:04d}.tif"}
-        assert {path.name for path in debug_writes} == expected_files
+        with pytest.raises(NotEnoughSpots, match="Not enough spots"):
+            cli_register_module.run_fiducial(
+                path=deconv_path,
+                fids=fids,
+                fids_raw=fids,
+                codebook_name="cb",
+                config=config,
+                roi=roi,
+                idx=idx,
+                reference=reference,
+                debug=False,
+            )
 
-    def test_run_fiducial_respects_forced_itk_without_extra_debug(
+        debug_dir, _, _ = cli_register_module._debug_fid_paths(deconv_path, roi, idx, "cb")
+        assert not debug_dir.exists()
+
+    def test_run_fiducial_does_not_write_debug_without_debug_flag(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """If the user explicitly requests ITK, auto-debug should not trigger."""
-        config = self._make_config(priors=None, use_itk=True)
+        """Debug artifacts are only written when debug=True (no auto-debug based on stats)."""
+        config = self._make_config(priors=None)
 
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         reference = "round_a"
         target = "round_b"
-
-        itk_stat = cli_register_module.FiducialAlignmentStats(
-            iterations=5,
+        debug_like_stat = cli_register_module.FiducialAlignmentStats(
+            iterations=0,
             final_threshold=None,
             final_fwhm=None,
             n_spots=0,
-            mode="itk",
-            algorithm="OnePlusOneEvo",
+            mode="fft",
+            algorithm="phase_correlation",
         )
 
         def fake_align_with_stats(
@@ -682,22 +668,11 @@ class TestRunFiducial:
         ) -> tuple[dict[str, np.ndarray], dict[str, float], dict[str, Any]]:
             shifts = {name: np.array([0.0, 0.0], dtype=np.float32) for name in fids}
             residuals = {name: 0.05 for name in fids}
-            stats = {reference: None, target: itk_stat}
+            stats = {reference: None, target: debug_like_stat}
             return shifts, residuals, stats
 
         monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", fake_align_with_stats)
-        monkeypatch.setattr(cli_register_module, "shift", lambda arr, *_args, **_kwargs: arr)
-        monkeypatch.setattr(cli_register_module, "_save_debug_overlay", lambda *args, **kwargs: None)
-
-        recorded_paths: list[Path] = []
-
-        def _under_debug_dir(path: Path) -> bool:
-            return path.parent.parent.name == "fids_debug"
-
-        def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
-            recorded_paths.append(Path(path))
-
-        monkeypatch.setattr(cli_register_module, "safe_imwrite", fake_safe_imwrite)
+        monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *_a, **_k: None)
 
         fids = {
             reference: np.ones((4, 4), dtype=np.float32),
@@ -707,6 +682,7 @@ class TestRunFiducial:
         cli_register_module.run_fiducial(
             path=deconv_path,
             fids=fids,
+            fids_raw=fids,
             codebook_name="cb",
             config=config,
             roi="roi_force_itk",
@@ -715,8 +691,8 @@ class TestRunFiducial:
             debug=False,
         )
 
-        debug_writes = [path for path in recorded_paths if _under_debug_dir(path)]
-        assert not debug_writes
+        debug_dir, _, _ = cli_register_module._debug_fid_paths(deconv_path, "roi_force_itk", 1, "cb")
+        assert not debug_dir.exists()
 
     def test_run_fiducial_writes__fids_with_sorted_keys(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -727,6 +703,7 @@ class TestRunFiducial:
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
@@ -760,6 +737,7 @@ class TestRunFiducial:
         cli_register_module.run_fiducial(
             path=deconv_path,
             fids=fids,
+            fids_raw=fids,
             codebook_name="cb",
             config=config,
             roi="roi",
@@ -794,6 +772,7 @@ class TestRunFiducial:
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
@@ -827,6 +806,7 @@ class TestRunFiducial:
         cli_register_module.run_fiducial(
             path=deconv_path,
             fids=fids,
+            fids_raw=fids,
             codebook_name="cb",
             config=config,
             roi="roi",
@@ -856,6 +836,7 @@ class TestRunFiducial:
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         def fake_safe_imwrite(path: Path, data: np.ndarray, **kwargs: Any) -> None:
             # No-op to avoid filesystem dependencies; metadata not needed here.
@@ -891,6 +872,7 @@ class TestRunFiducial:
         cli_register_module.run_fiducial(
             path=deconv_path,
             fids=fids,
+            fids_raw=fids,
             codebook_name=codebook_name,
             config=config,
             roi=roi,
@@ -920,6 +902,7 @@ class TestRunFiducial:
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         (deconv_path / "fidA--roi").mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
         tifffile.imwrite(
             deconv_path / "fidA--roi" / "fidA-0000.tif",
             np.zeros((3, 3, 3), dtype=np.uint16),
@@ -941,6 +924,7 @@ class TestRunFiducial:
         result = cli_register_module.run_fiducial(
             path=deconv_path,
             fids=fids,
+            fids_raw=fids,
             codebook_name="cb",
             config=config,
             roi="roi",
@@ -960,6 +944,7 @@ class TestRunFiducial:
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
@@ -1009,6 +994,7 @@ class TestRunFiducial:
         cli_register_module.run_fiducial(
             path=deconv_path,
             fids=fids,
+            fids_raw=fids,
             codebook_name=codebook_name,
             config=config,
             roi=roi,
@@ -1030,6 +1016,7 @@ class TestRunFiducial:
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
@@ -1065,6 +1052,7 @@ class TestRunFiducial:
             cli_register_module.run_fiducial(
                 path=deconv_path,
                 fids=fids,
+                fids_raw=fids,
                 codebook_name=codebook_name,
                 config=config,
                 roi=roi,
@@ -1132,6 +1120,7 @@ class TestRunFiducial:
         deconv_path = workspace / "analysis" / "deconv"
         shifts_dir = deconv_path / f"shifts--{roi}+{codebook_name}"
         shifts_dir.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
         (shifts_dir / "shifts-0000.json").write_text(
             json.dumps({"fidC-0002": {"shifts": [0.0, 0.0], "residual": 0.0, "corr": 1.0}})
         )
@@ -1171,6 +1160,7 @@ class TestRunFiducial:
         workspace = tmp_path / "ws"
         deconv_path = workspace / "analysis" / "deconv"
         deconv_path.mkdir(parents=True)
+        (workspace / "workspace.DONE").write_text("")
 
         def fake_align_with_stats(
             fids: dict[str, np.ndarray], **_: Any
@@ -1269,6 +1259,7 @@ def test_run_prefers_repaired_round_directories(
     workspace = tmp_path / "ws"
     deconv_path = workspace / "analysis" / "deconv"
     deconv_path.mkdir(parents=True)
+    (workspace / "workspace.DONE").write_text("")
 
     roi = "roiA"
     round_name = "r1"

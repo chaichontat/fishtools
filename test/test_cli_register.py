@@ -46,10 +46,10 @@ def _make_workspace(tmp_path: Path) -> tuple[Path, Path]:
 
 def test_debug_fid_paths_include_roi(tmp_path: Path) -> None:
     base = tmp_path / "ws" / "analysis" / "deconv"
-    debug_dir, raw, shifted = _debug_fid_paths(base, "roiA", 7)
+    debug_dir, raw, shifted = _debug_fid_paths(base, "roiA", 7, "cb")
     assert debug_dir == base.parent / "output" / "fids_debug" / "roiA"
-    assert raw == "roiA-0007.tif"
-    assert shifted == "roiA-shifted-0007.tif"
+    assert raw == "roiA+cb-0007.tif"
+    assert shifted == "roiA+cb-shifted-0007.tif"
 
 
 def test_debug_fid_paths_with_relative_path(tmp_path: Path, monkeypatch: Any) -> None:
@@ -59,7 +59,7 @@ def test_debug_fid_paths_with_relative_path(tmp_path: Path, monkeypatch: Any) ->
     monkeypatch.chdir(base)
 
     # Use "." as the path (simulating running from deconv directory)
-    debug_dir, raw, shifted = _debug_fid_paths(Path("."), "roiA", 7)
+    debug_dir, raw, shifted = _debug_fid_paths(Path("."), "roiA", 7, "cb")
 
     # Should resolve to absolute path under output/fids_debug
     expected = base.parent / "output" / "fids_debug" / "roiA"
@@ -73,8 +73,8 @@ def test_save_debug_overlay_prefixes_roi(tmp_path: Path) -> None:
         "reference": np.ones((6, 6), dtype=np.float32),
         "round2": np.ones((6, 6), dtype=np.float32) * 5,
     }
-    _save_debug_overlay(tmp_path, "roiZ", 12, "reference", shifted)
-    assert (tmp_path / "roiZ-0012-overlay.png").exists()
+    _save_debug_overlay(tmp_path, "roiZ", 12, "reference", shifted, codebook_name="cb")
+    assert (tmp_path / "roiZ+cb-0012-overlay.png").exists()
 
 
 def test_workspace_transformations_paths_use_roi_folder(tmp_path: Path) -> None:
@@ -187,6 +187,8 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
     assert called["idx"] == 42
     assert called["reference"] == "4_12_20"
     assert called["overwrite"] is True
+    assert called["codebook"].parent == deconv / "codebooks"
+    assert called["codebook"].read_bytes() == cb.read_bytes()
     # Defaults: fwhm=4.0 (from click default), threshold=5.0
     cfg = called["config"]
     assert pytest.approx(cfg.registration.fiducial.fwhm, rel=0, abs=1e-6) == 4.0
@@ -198,9 +200,25 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
     assert cfg.registration.fiducial.detailed.offset_brightest == 0
     assert cfg.registration.fiducial.detailed.allow_large_shifts is False
 
-    # Non-default offset should be plumbed through to the config
-    called.clear()
-    result_offset = runner.invoke(
+
+def test_cli_register_copies_chromatic_corrections_to_workspace(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+    cb = _make_codebook(tmp_path)
+
+    def fake_setup_workspace_logging(*_: Any, **__: Any) -> Path:
+        return deconv / "analysis" / "logs" / "noop.log"
+
+    def fake__run(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+    monkeypatch.setattr(
+        "fishtools.preprocess.cli_register.setup_cli_logging",
+        fake_setup_workspace_logging,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
         register_cli,
         [
             "run",
@@ -212,14 +230,15 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
             "roiA",
             "--reference",
             "4_12_20",
-            "--offset-brightest",
-            "5",
+            "--overwrite",
         ],
     )
-    assert result_offset.exit_code == 0, result_offset.output
-    cfg_offset = called["config"]
-    assert cfg_offset.registration.fiducial.detailed.use_brightest == 20
-    assert cfg_offset.registration.fiducial.detailed.offset_brightest == 5
+    assert result.exit_code == 0, result.output
+
+    for filename in ("560to650.txt", "560to750.txt"):
+        copied = deconv / "chromatic" / filename
+        assert copied.exists()
+        assert copied.read_bytes() == (DATA / filename).read_bytes()
 
 
 
