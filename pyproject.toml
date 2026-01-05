@@ -26,6 +26,7 @@ dependencies = [
     "hyperactive<=5",
     "pyfastx>=2.1.0",
     "rich-click>=1.8.9",
+    "pyvista>=0.46.0",
     "tifffile",
     "tqdm>=4.65.0",
     "matplotlib",
@@ -64,8 +65,10 @@ preprocess = "fishtools.preprocess.cli:main"
 segment = "fishtools.segment:main"
 qserver = "fishtools.queuing.server:main"
 qclient = "fishtools.queuing.client:main"
+bigrun3 = "fishtools.orchestrator.bigrun3:cli"
 trt-build = "cellpose.contrib.cellposetrt.trt_build:main"
 slurmdash = "fishtools.slurm_dashboard:main"
+slurm_submit = "fishtools.orchestrator.slurm_submit:cli"
 
 [tool.uv]
 override-dependencies = ["scikit-image>=0.23.2", "scipy>=1.16.1"]
@@ -115,6 +118,7 @@ markers = [
     "unit: fast, deterministic unit tests",
     "integration: integration tests using library APIs",
     "perf: performance or timing-sensitive tests",
+    "gpu: tests that exercise GPU/CUDA/CuPy code paths",
 ]
 
 [tool.bandit]
