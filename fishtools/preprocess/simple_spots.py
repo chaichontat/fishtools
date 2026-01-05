@@ -5,7 +5,7 @@ import re
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import numpy as np
 import rich_click as click
@@ -43,31 +43,38 @@ class BlobDetectorParams(BaseModel):
 DEFAULT_BLOB_DETECTOR_JSON = BlobDetectorParams().model_dump_json()
 
 
+class NoSpotsFoundError(RuntimeError):
+    def __init__(self, path: Path, *, split: int) -> None:
+        super().__init__(f"No spots found for {path.name} split={split}")
+        self.path = path
+        self.split = split
+
+
 def _parse_duration(duration_str: str) -> timedelta:
-    match = re.fullmatch(r"(\d+)([mhd])", duration_str)
-    if not match:
+    m = re.fullmatch(r"(\d+)([mhd])", duration_str)
+    if m is None:
         raise ValueError(f"Invalid duration format: {duration_str}. Use 'Nm', 'Nh', or 'Nd'.")
-    value, unit = match.groups()
-    n = int(value)
-    if unit == "m":
-        return timedelta(minutes=n)
-    if unit == "h":
-        return timedelta(hours=n)
-    if unit == "d":
-        return timedelta(days=n)
-    raise ValueError(f"Invalid duration format: {duration_str}. Use 'Nm', 'Nh', or 'Nd'.")
+    n, unit = int(m.group(1)), m.group(2)
+    match unit:
+        case "m":
+            return timedelta(minutes=n)
+        case "h":
+            return timedelta(hours=n)
+        case "d":
+            return timedelta(days=n)
+    raise AssertionError(f"Unexpected duration unit: {unit!r}")
 
 
 def _split_slices(*, split: int, cut: int) -> tuple[slice, slice]:
-    if split == 0:
-        return (slice(None, cut), slice(None, cut))
-    if split == 1:
-        return (slice(None, cut), slice(-cut, None))
-    if split == 2:
-        return (slice(-cut, None), slice(None, cut))
-    if split == 3:
-        return (slice(-cut, None), slice(-cut, None))
-    raise ValueError(f"Unknown split={split}, expected 0-3.")
+    splits: list[tuple[slice, slice]] = [
+        (slice(None, cut), slice(None, cut)),
+        (slice(None, cut), slice(-cut, None)),
+        (slice(-cut, None), slice(None, cut)),
+        (slice(-cut, None), slice(-cut, None)),
+    ]
+    if split < 0 or split >= len(splits):
+        raise ValueError(f"Unknown split={split}, expected 0-3.")
+    return splits[split]
 
 
 def _channel_names(raw: np.ndarray, tif: TiffFile, *, path_tif: Path) -> list[str]:
@@ -156,18 +163,20 @@ def _simple_lookup_decode(spots: SpotFindingResults, *, codebook: Codebook) -> D
 
 
 def _morph_from_decoded(
-    decoded: Any,
+    decoded: DecodedIntensityTable,
     *,
     area_radius_scale: float = 2.5,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, object]]:
     spot_ids = np.asarray(decoded.coords["spot_id"].values, dtype=int)
     xs = np.asarray(decoded.coords["x"].values, dtype=float)
     ys = np.asarray(decoded.coords["y"].values, dtype=float)
-    zs = np.asarray(decoded.coords.get("z").values if "z" in decoded.coords else np.zeros_like(xs), dtype=float)
-    radii = np.asarray(decoded.coords.get("radius").values if "radius" in decoded.coords else np.ones_like(xs))
+    zs = (
+        np.asarray(decoded.coords["z"].values, dtype=float) if "z" in decoded.coords else np.zeros_like(xs, dtype=float)
+    )
+    radii = np.asarray(decoded.coords["radius"].values) if "radius" in decoded.coords else np.ones_like(xs)
 
     n = int(decoded.sizes.get("features", len(xs)))
-    morph: list[dict[str, Any]] = [{} for _ in range(n)]
+    morph: list[dict[str, object]] = [{} for _ in range(n)]
     for spot_id, x, y, z, radius in zip(spot_ids, xs, ys, zs, radii, strict=True):
         area = float(np.pi * float(area_radius_scale * radius) ** 2)
         morph[int(spot_id)] = {"area": area, "centroid": (float(z), float(y), float(x))}
@@ -225,7 +234,7 @@ def _run_single_split(
 
     n_features = int(decoded.sizes.get("features", 0))
     if n_features == 0:
-        raise ValueError(f"No spots found for {path_tif.name} split={split}")
+        raise NoSpotsFoundError(path_tif, split=split)
 
     decoded = decoded.assign_coords(
         distance=("features", np.zeros(n_features, dtype=np.float32)),
@@ -233,7 +242,7 @@ def _run_single_split(
     )
 
     morph = _morph_from_decoded(decoded, area_radius_scale=area_radius_scale)
-    meta = {
+    meta: dict[str, object] = {
         "fishtools_commit": git_hash(),
         "config": {
             "blob_detector": json.loads(blob_detector_json),
@@ -334,7 +343,6 @@ def simple_batch(
         logger.warning("No registered tiles found to process.")
         return
 
-    # Always split (0-3), per user requirement
     split_list = [0, 1, 2, 3]
 
     tiles_to_process: list[Path] = []
@@ -354,14 +362,6 @@ def simple_batch(
     )
 
     script = Path(__file__).resolve()
-
-    def _run_one(cmd: list[str], worker_idx: int | None = None) -> None:
-        run_subprocess_streaming(
-            cmd,
-            thread_index=worker_idx,
-            check=True,
-            emit_to_console=True,
-        )
 
     with progress_bar_threadpool(
         len(tiles_to_process) * len(split_list),
@@ -389,7 +389,7 @@ def simple_batch(
                     str(area_radius_scale),
                     *([] if not overwrite else ["--overwrite"]),
                 ]
-                submit(_run_one, cmd, slot + 1)
+                submit(run_subprocess_streaming, cmd, thread_index=slot + 1, check=True, emit_to_console=True)
                 idx += 1
 
 
@@ -459,51 +459,35 @@ def simple(
 
     split_list = [split] if split is not None else [0, 1, 2, 3]
 
-    if split is not None:
+    def run_split(s: int) -> None:
         try:
             out, n_spots = _run_single_split(
                 path,
-                split=split,
+                split=s,
                 codebook_label=codebook_path.stem,
                 blob_detector_json=blob_detector_json,
                 overwrite=overwrite,
                 tophat_radius=tophat_radius,
                 area_radius_scale=area_radius_scale,
             )
-            if n_spots < 0:
-                logger.info(f"{path.name} split={split}: skipped (already decoded)")
-            else:
-                logger.info(f"{path.name} split={split}: discovered_spots={n_spots}")
-                logger.debug(f"Wrote {out}")
-        except ValueError as exc:
-            if str(exc).startswith("No spots found for"):
-                logger.info(f"{path.name} split={split}: discovered_spots=0")
-                return
-            raise
+        except NoSpotsFoundError:
+            logger.info(f"{path.name} split={s}: discovered_spots=0")
+            return
+
+        if n_spots < 0:
+            logger.info(f"{path.name} split={s}: skipped (already decoded)")
+        else:
+            logger.info(f"{path.name} split={s}: discovered_spots={n_spots}")
+            logger.debug(f"Wrote {out}")
+
+    if split is not None:
+        run_split(split)
         return
 
     with progress_bar(len(split_list)) as advance:
         for s in split_list:
             try:
-                out, n_spots = _run_single_split(
-                    path,
-                    split=s,
-                    codebook_label=codebook_path.stem,
-                    blob_detector_json=blob_detector_json,
-                    overwrite=overwrite,
-                    tophat_radius=tophat_radius,
-                    area_radius_scale=area_radius_scale,
-                )
-                if n_spots < 0:
-                    logger.info(f"{path.name} split={s}: skipped (already decoded)")
-                else:
-                    logger.info(f"{path.name} split={s}: discovered_spots={n_spots}")
-                    logger.debug(f"Wrote {out}")
-            except ValueError as exc:
-                if str(exc).startswith("No spots found for"):
-                    logger.info(f"{path.name} split={s}: discovered_spots=0")
-                    continue
-                raise
+                run_split(s)
             finally:
                 advance()
 

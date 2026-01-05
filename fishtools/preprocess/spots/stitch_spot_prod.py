@@ -288,6 +288,7 @@ def stitch(
         crosses = [sorted(idx.intersection(poly.bounds)) for poly in cells]
 
         # DO NOT TOUCH THIS EXECUTOR. If there's a sandbox issue, inform the user, don't try to work around it.
+        # DO NOT CREATE A "FALLBACK" WHEN THREADS <= 1.
         with ProcessPoolExecutor(max_workers=threads, mp_context=get_context("spawn")) as exc:
             futs = []
             for i, file in enumerate(files):

@@ -15,8 +15,6 @@ from typing import Any, Literal, Mapping, Optional, Sequence, cast
 
 import cupy as cp
 import matplotlib
-
-# disable memory pool for predictable memory usage
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
@@ -24,7 +22,7 @@ import rich_click as click
 import starfish
 import xarray as xr
 from loguru import logger
-from numpy.typing import NDArray  # noqa: F401
+from numpy.typing import NDArray
 from pydantic import BaseModel, TypeAdapter, field_validator
 from rich.progress import (
     BarColumn,
@@ -52,6 +50,7 @@ from starfish.util.plot import imshow_plane, intensity_histogram
 from tifffile import TiffFile
 
 matplotlib.use("Agg", force=True)
+# Disable CuPy memory pool for predictable memory usage.
 if hasattr(cp, "cuda") and hasattr(cp.cuda, "set_allocator"):
     cp.cuda.set_allocator(None)
 else:  # CPU-only environments expose a stub without allocator control
@@ -144,7 +143,7 @@ def _build_field_context(
         stem = tile_path.stem
         try:
             return int(stem.split("-")[1])
-        except Exception:
+        except (IndexError, ValueError):
             return int(re.sub(r"\D+", "", stem))
 
     tile_index = _tile_index_from_path(path)
@@ -170,12 +169,9 @@ def _build_field_context(
     try:
         store_path = _discover_field_store(ws, roi, codebook)
     except FileNotFoundError as exc:
-        raise click.ClickException(str(exc))
+        raise click.ClickException(str(exc)) from exc
 
-    try:
-        import zarr  # local import
-    except Exception as exc:  # pragma: no cover
-        raise click.ClickException(f"zarr is required for --field-correct: {exc}")
+    import zarr  # local import
 
     za = zarr.open_array(str(store_path), mode="r")
     attrs = getattr(za, "attrs", {})
@@ -215,9 +211,8 @@ def _build_field_context(
                 unmapped.append(channel_labels[i])
         if unmapped:
             logger.warning(
-                "Field correction: channels %s not found in field store, using identity mapping for these. "
-                "Verify field store channel order matches image.",
-                unmapped,
+                f"Field correction: channels {unmapped} not found in field store; using identity mapping. "
+                "Verify field store channel order matches image."
             )
     else:
         c_index_map = {i: i for i in range(len(channel_labels))}
@@ -250,7 +245,7 @@ def _build_field_context(
 
 def make_fetcher(
     path: Path,
-    raw: np.ndarray,
+    raw: np.ndarray | slice | tuple | list[int] = np.s_[:],
     sl: slice | tuple | list[int] = np.s_[:],
     *,
     field_correct: bool = False,
@@ -283,6 +278,10 @@ def make_fetcher(
       with the filename ``field--{roi}+{codebook}.zarr`` produced by
       ``preprocess correct-illum export-field --what both``.
     """
+    if not isinstance(raw, np.ndarray):
+        sl = raw
+        with TiffFile(path) as tif:
+            raw = tif.asarray()
 
     # Resolve XY slice offsets from sl relative to the native tile
     def _norm_slice(s: slice, dim: int) -> tuple[int, int]:
@@ -334,31 +333,17 @@ def make_fetcher(
         logger.info("Applying field correction on all channels")
         raw = raw[sl]
 
-        # Align field channel order to the selected image channels automatically
-        try:
-            # Derive selected channel positions from `sl`; default = all
-            if isinstance(sl, tuple) and len(sl) >= 2:
-                ch_sel = sl[1]
-                if isinstance(ch_sel, (list, tuple, np.ndarray)):
-                    sel_positions = [int(i) for i in ch_sel]
-                elif isinstance(ch_sel, slice):
-                    sel_positions = list(range(raw.shape[1]))
-                else:
-                    sel_positions = list(range(raw.shape[1]))
-            else:
-                sel_positions = list(range(raw.shape[1]))
+        sel_positions = list(range(raw.shape[1]))
+        if isinstance(sl, tuple) and len(sl) >= 2:
+            ch_sel = sl[1]
+            if isinstance(ch_sel, (list, tuple, np.ndarray)):
+                sel_positions = [int(i) for i in ch_sel]
 
-            # Remap field planes into the selected image order (subset/reorder)
-            low_ds, rng_ds = remap_field_channels(
-                low_ds,
-                rng_ds,
-                sel_positions,
-                field_ctx.c_index_map,
-            )
-        except click.ClickException:
-            raise
-        except Exception as exc:  # pragma: no cover — defensive guard around inspection logic
-            raise click.ClickException(f"Failed to verify field channel ordering: {exc}")
+        low_ds, rng_ds = remap_field_channels(low_ds, rng_ds, sel_positions, field_ctx.c_index_map)
+
+        sl_field = sl if isinstance(sl, tuple) else (sl,)
+        if len(sl_field) < 4:
+            sl_field = (*sl_field, *(slice(None),) * (4 - len(sl_field)))
 
         img = correct_channel_with_field(
             raw,
@@ -367,7 +352,7 @@ def make_fetcher(
             int(field_ctx.ds),
             use_gpu=False,
             normalize=True,
-            sl=sl,
+            sl=sl_field,
         )
         logger.info("Field correction applied.")
         # return np.clip(corrected_stack, 0.0, 1.0).astype(np.float32, copy=False)
@@ -379,22 +364,11 @@ def make_fetcher(
 
     del raw
 
-    # print(type(img), img.shape, img.dtype)
-
     class DemoFetchedTile(FetchedTile):
-        def __init__(
-            self,
-            img: np.ndarray,
-            z: int,
-            chs: int,
-            *,
-            field_ctx: Optional[FieldContext] = None,
-        ):
+        def __init__(self, img: np.ndarray, z: int, chs: int):
             self.img = img
             self.z = z
             self.c = chs
-            self._field_ctx = field_ctx
-            self._corrected_stack: np.ndarray | None = None
 
         @property
         def shape(self) -> Mapping[Axes, int]:
@@ -415,19 +389,11 @@ def make_fetcher(
             return self.img[self.z, self.c]
 
     class DemoTileFetcher(TileFetcher):
-        def __init__(self, field_ctx: Optional[FieldContext] = None):
-            self._field_ctx = field_ctx
-
         def get_tile(self, fov_id: int, round_label: int, ch_label: int, zplane_label: int) -> FetchedTile:
-            return DemoFetchedTile(
-                img,
-                zplane_label,
-                ch_label,
-                field_ctx=self._field_ctx,
-            )
+            return DemoFetchedTile(img, zplane_label, ch_label)
 
     return ImageStack.from_tilefetcher(
-        DemoTileFetcher(field_ctx),
+        DemoTileFetcher(),
         {
             Axes.X: img.shape[3],
             Axes.Y: img.shape[2],
@@ -464,9 +430,9 @@ def plot_intensity_histograms(stack: starfish.ImageStack, r: int):
 
 def scale(
     img: ImageStack,
-    scale: np.ndarray[np.float32, Any],
-    mins: np.ndarray[np.float32, Any] | None = None,
-):
+    scale: NDArray[np.float32],
+    mins: NDArray[np.float32] | None = None,
+) -> None:
     if mins is not None:
         ElementWiseAddition(
             xr.DataArray(
@@ -489,7 +455,7 @@ def load_codebook(
     exclude: set[str] | None = None,
     simple: bool = False,
 ):
-    cb_json: dict[str, list[int]] = json.loads(path.read_text())
+    cb_json = json.loads(path.read_text())
     for k in exclude or set():
         try:
             cb_json.pop(k)
@@ -510,6 +476,13 @@ def load_codebook(
         raise ValueError("No genes in codebook are imaged. Please check your codebook and bit mapping.")
 
     used_bits = sorted(set(chain.from_iterable(cb_json.values())))
+    if used_bits and any(isinstance(bit, str) for bit in used_bits):
+        example = next(bit for bit in used_bits if isinstance(bit, str))
+        raise click.ClickException(
+            f"Codebook {path} contains string bit IDs (example: {example!r}). "
+            "This `preprocess spots` path expects integer bit IDs. If you want to decode single bits, "
+            "use `preprocess spots simple-batch` instead."
+        )
     names = np.array(list(cb_json.keys()))
 
     # mapping from bit name to index
@@ -799,15 +772,44 @@ def find_threshold(
     path_out = path / (f"opt_{codebook.stem}" + (f"+{roi}" if roi != "*" else ""))
     jsonfile = path_out / "percentiles.json"
 
-    ws = Workspace(path)
-    mapping, _missing = ws.registered_file_map(codebook.stem, rois=None if roi == "*" else [roi])
-    paths = sorted(p for registered_files in mapping.values() for p in registered_files)
-    if field_correct:
+    ws: Workspace | None
+    try:
+        ws = Workspace(path)
+    except ValueError:
+        ws = None
+
+    if ws is not None:
+        mapping, _missing = ws.registered_file_map(codebook.stem, rois=None if roi == "*" else [roi])
+        paths = sorted(p for registered_files in mapping.values() for p in registered_files)
+        rois_for_highpass = ws.rois if roi == "*" else [roi]
+        if field_correct:
+            rois_needed = set(rois_for_highpass) if roi == "*" else {roi}
+            _ensure_field_stores(ws, sorted(rois_needed), codebook.stem)
+    else:
+        if field_correct:
+            raise click.ClickException("--field-correct requires a valid workspace root.")
+
         if roi == "*":
-            rois_needed = set(ws.rois)
+            rois_for_highpass = []
+            for d in path.iterdir():
+                if not d.is_dir():
+                    continue
+                m = re.match(r"^registered--(.+)\+(.*)$", d.name)
+                if m is None:
+                    continue
+                roi_name, codebook_name = m.groups()
+                if codebook_name == codebook.stem:
+                    rois_for_highpass.append(roi_name)
+            rois_for_highpass = sorted(set(rois_for_highpass))
         else:
-            rois_needed = {roi}
-        _ensure_field_stores(ws, sorted(rois_needed), codebook.stem)
+            rois_for_highpass = [roi]
+
+        paths = []
+        for current_roi in rois_for_highpass:
+            reg_dir = path / f"registered--{current_roi}+{codebook.stem}"
+            if reg_dir.is_dir():
+                paths.extend(reg_dir.glob("*.tif"))
+        paths = sorted(paths)
 
     rand = np.random.default_rng(0)
     if len(paths) > 50:
@@ -845,10 +847,12 @@ def find_threshold(
         )
 
     highpasses: list[Path] = []
-    for current_roi in (ws.rois if roi == "*" else [roi]):
-        highpasses.extend(
-            (ws.registered(current_roi, codebook.stem) / SUBFOLDER).glob(f"*_{codebook.stem}.hp.tif")
-        )
+    for current_roi in rois_for_highpass:
+        if ws is not None:
+            base = ws.registered(current_roi, codebook.stem)
+        else:
+            base = path / f"registered--{current_roi}+{codebook.stem}"
+        highpasses.extend((base / SUBFOLDER).glob(f"*_{codebook.stem}.hp.tif"))
     logger.info(f"Found {len(highpasses)} images to get percentiles from.")
 
     norms = {}
@@ -942,9 +946,8 @@ def find_threshold(
 
     if skipped_mismatched:
         logger.warning(
-            "Skipped %d highpass file(s) with channel mismatches: %s",
-            len(skipped_mismatched),
-            ", ".join(skipped_mismatched),
+            f"Skipped {len(skipped_mismatched)} highpass file(s) with channel mismatches: "
+            f"{', '.join(skipped_mismatched)}"
         )
 
     path_out.mkdir(exist_ok=True)
@@ -1680,15 +1683,7 @@ GAUSS_SIGMA = (2, 2, 2)
 
 
 def get_blank_channel_info(key: str) -> tuple[int, int]:
-    """
-    Maps an image channel key to its corresponding wavelength and blank channel index.
-
-    Args:
-        key: The channel key (string representation of an integer).
-
-    Returns:
-        A tuple containing (wavelength_nm, blank_channel_index).
-    """
+    """Return (wavelength_nm, blank_channel_index) for a channel key."""
     key_int = int(key)
     if key_int in KEYS_560NM:
         return 560, 0
@@ -1706,18 +1701,8 @@ def generate_subtraction_matrix(blanks: xr.DataArray, coefs: pl.DataFrame, keys:
         missing_key = params_df.filter(pl.col("slope").is_null())["output_key"][0]
         raise ValueError(f"No parameters found for channel key '{missing_key}'.")
 
-    # Extract slopes and intercepts as NumPy arrays
     slopes = params_df["slope"].to_numpy()
     intercepts = params_df["intercept"].to_numpy()
-
-    # G# Get the corresponding source blank index for each output key
-
-    # --- 2. Vectorized Selection ---
-
-    # Select all necessary source blank channels at once using the list of indices.
-    # If blanks.dims is (r,c,z,y,x) and len(keys) is N,
-    # this creates a DataArray with dims (r, c, z, y, x) and shape (1, N, z, y, x).
-    # The new 'c' dimension corresponds to our N output channels.
     source_indices = [get_blank_channel_info(key)[1] for key in keys]
     selected_blanks = blanks.isel(c=source_indices)
     # print(selected_blanks.max({Axes.X, Axes.Y, Axes.ZPLANE}))
@@ -1730,8 +1715,6 @@ def generate_subtraction_matrix(blanks: xr.DataArray, coefs: pl.DataFrame, keys:
     scaled_channels = (selected_blanks * slope_da) + intercept_da / 65535
     # print(scaled_channels.max({Axes.X, Axes.Y, Axes.ZPLANE}))
     floored_channels = xr.where(scaled_channels < 0, 0, scaled_channels)
-
-    # Ensure the dimension order is what we expect (though it should be already)
     return -floored_channels.transpose(
         str(Axes.ROUND), str(Axes.CH), str(Axes.ZPLANE), str(Axes.Y), str(Axes.X)
     )
@@ -1917,7 +1900,6 @@ def run(
             [bit_mapping[k] for k in used_bits if k in bit_mapping],
         ]
     ) + tuple(split_slice)
-    max_proj = False
     stack = make_fetcher(
         path,
         raw,
@@ -1940,19 +1922,22 @@ def run(
     _roi, _codebook = match.groups()
     ws_registered = Workspace(path.parent.parent)
 
-    _slc_blank = tuple(np.s_[::subsample_z, :]) + tuple(split_slice)
-    _stack_blank = (
-        make_fetcher(
-            ws_registered.registered(_roi, blank) / path.name,
-            _slc_blank,
-            max_proj=max_proj,
+    if blank is not None:
+        blank_path = ws_registered.registered(_roi, blank) / path.name
+        with TiffFile(blank_path) as tif:
+            raw_blank = tif.asarray()
+        slc_blank = tuple(np.s_[::subsample_z, :]) + tuple(split_slice)
+        _stack_blank = make_fetcher(
+            blank_path,
+            raw_blank,
+            slc_blank,
             field_correct=field_correct,
             workspace_root=workspace_hint if not path.is_dir() else path,
         )
-        if blank is not None
-        else None
-    )
-    del _roi, _codebook, _slc_blank
+        del raw_blank, blank_path, slc_blank
+    else:
+        _stack_blank = None
+    del _roi, _codebook
 
     # In all modes, data below 0 is set to 0.
     # We probably wouldn't need SATURATED_BY_IMAGE here since this is a subtraction operation.
@@ -2151,7 +2136,7 @@ def run(
                 percent_blanks=0,
             )
         else:
-            """Concatenate with previous rounds. Will overwrite rounds beyond the current one."""
+            # Concatenate with previous rounds; overwrite rounds beyond the current one.
             append_json(
                 path_json,
                 round_num,
@@ -2188,13 +2173,11 @@ def parse_duration(duration_str: str) -> timedelta:
     value = int(value)
     if unit == "m":
         return timedelta(minutes=value)
-    elif unit == "h":
+    if unit == "h":
         return timedelta(hours=value)
-    elif unit == "d":
+    if unit == "d":
         return timedelta(days=value)
-    else:
-        # This should not happen due to regex matching
-        raise ValueError(f"Unknown time unit: {unit}")
+    raise ValueError(f"Unknown time unit: {unit}")
 
 
 @spots.command()
@@ -2280,7 +2263,7 @@ def batch(
     roi_filter = None if roi == "*" else [roi]
     file_map, _ = workspace.registered_file_map(codebook_path.stem, rois=roi_filter)
     all_paths = {p for paths in file_map.values() for p in paths}
-    paths_in_scope = all_paths  # Start with all paths
+    paths_in_scope = all_paths
 
     if delete_corrupted:
         logger.info("Checking all files for corruption.")
@@ -2295,13 +2278,12 @@ def batch(
                 all_paths.discard(p)
                 continue
 
-    # Filter by modification time if --since is provided
     if since:
         try:
             duration = parse_duration(since)
         except ValueError as e:
             logger.error(f"Error parsing --since value: {e}")
-            return  # Or raise click.BadParameter
+            return
 
         current_time = time.time()
         cutoff_time = current_time - duration.total_seconds()
@@ -2309,17 +2291,14 @@ def batch(
         logger.info(
             f"Found {len(recent_paths)} files modified since {since} (out of {len(all_paths)} total)."
         )
-        paths_in_scope = recent_paths  # Update paths_in_scope to only include recent ones
+        paths_in_scope = recent_paths
     else:
         logger.info(f"Found {len(paths_in_scope)} files matching pattern (no --since filter).")
 
     already_done = set()
-    # Check which of the files *in scope* are already done
     for p in paths_in_scope:
-        # Check if 4 corresponding pkl files exist for this tif file if split is True
         num_expected_pkl = 4 if split else 1
         glob_pattern = f"decoded-{codebook_path.stem}/{p.stem}{'-*' if split else ''}.pkl"
-        # Use parent.parent because the decoded files are one level up
         if len(list(p.parent.glob(glob_pattern))) == num_expected_pkl:
             already_done.add(p)
 
@@ -2349,20 +2328,16 @@ def batch(
             logger.info(f"Deleted {len(stale_pkls)} stale pkl files and {deleted_parquets} parquet files.")
 
     if overwrite:
-        # Overwrite only applies to files within the scope (all or recent)
         paths_to_process = sorted(list(paths_in_scope))
         logger.info(f"Processing {len(paths_to_process)} files in scope (overwrite enabled).")
-        # Log how many of these were already done but will be overwritten
         overwritten_count = len(already_done)
         if overwritten_count > 0:
             logger.info(f"Overwriting {overwritten_count} already processed files within the scope.")
     elif overwrite_stale:
-        # Process new files + stale files
         paths_to_process = sorted(list((paths_in_scope - already_done) | stale))
         new_count = len(paths_in_scope - already_done)
         logger.info(f"Processing {len(paths_to_process)} files ({len(stale)} stale + {new_count} new).")
     else:
-        # Process only files in scope that are not already done
         paths_to_process = sorted(list(paths_in_scope - already_done))
         skipped_count = len(paths_in_scope) - len(paths_to_process)
         if skipped_count > 0:
