@@ -1172,13 +1172,21 @@ def _extract_single_roi(
             mask_path = default_mask
             logger.info(f"[{roi}] Using default mask: {mask_path}")
 
-    enrich_mask_path = _resolve_enrich_mask(
-        ws,
-        roi,
-        codebook,
-        enrich_boundaries,
-        enable_enrich_boundaries,
-    )
+    enrich_mask_path: Path | None = None
+    if enable_enrich_boundaries:
+        if enrich_boundaries is not None:
+            enrich_mask_path = enrich_boundaries
+        else:
+            # Boundary enrichment is only meaningful when extracting from the fused Zarr volume.
+            is_fused_zarr = len(files) == 1 and _is_zarr_path(files[0])
+            if is_fused_zarr:
+                enrich_mask_path = _resolve_enrich_mask(
+                    ws,
+                    roi,
+                    codebook,
+                    enrich_boundaries=None,
+                    enable=True,
+                )
 
     _execute_extraction(
         label=roi,
