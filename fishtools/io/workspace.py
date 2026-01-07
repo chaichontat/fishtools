@@ -217,6 +217,11 @@ class WorkspaceOutput:
         return self.root / "stitch_layout"
 
     @property
+    def ccf_transforms(self) -> Path:
+        """Return path to CCF transform artifacts under ``analysis/output``."""
+        return self.root / "ccf-transforms"
+
+    @property
     def spotlook(self) -> WorkspaceSpotlookOutput:
         return WorkspaceSpotlookOutput(self.root)
 
@@ -372,6 +377,19 @@ class Workspace:
         """Return path to parquets output directory."""
         return self.output / "parquets"
 
+    def ccf_transforms(self, roi: str | None = None) -> Path:
+        """Return the per-workspace (or per-ROI) CCF transform output directory.
+
+        Layout:
+        - All CCF transforms live under ``analysis/output/ccf-transforms``.
+        - Per-ROI artifacts should be written under ``analysis/output/ccf-transforms/{roi}/``.
+        """
+
+        base = self.output.ccf_transforms
+        if roi is None:
+            return base
+        return base / roi
+
     def threshold_parquet(
         self, roi: str, codebook: str, *, raw: bool = False, output_dir: Path | None = None
     ) -> Path:
@@ -454,6 +472,24 @@ class Workspace:
                     # Discard everything after second '--' (e.g., 'roi1--shifted-1_9_17' → 'roi1')
                     if "--" in roi_name:
                         roi_name = roi_name.split("--")[0]
+                    rois_set.add(roi_name)
+
+        if rois_set:
+            return sorted(rois_set)
+
+        # Fallback: workspaces may contain only aggregated artifacts under analysis/output.
+        for path in [self.parquets, self.output.root]:
+            if not path.exists():
+                continue
+            for p in path.iterdir():
+                if not p.is_file():
+                    continue
+                if ".parquet" not in p.suffixes:
+                    continue
+                if p.name.count("+") != 1:
+                    continue
+                roi_name = p.name.split("+", 1)[0]
+                if roi_name:
                     rois_set.add(roi_name)
 
         return sorted(rois_set)
@@ -643,6 +679,28 @@ class Workspace:
                 if not suffix:
                     continue
                 discovered.add(suffix)
+
+        if discovered:
+            return sorted(discovered)
+
+        # Fallback: workspaces may contain only aggregated spots artifacts under analysis/output.
+        roi_set = set(resolved_rois)
+        for base in [self.parquets, self.output.root]:
+            if not base.exists():
+                continue
+            for entry in base.iterdir():
+                if not entry.is_file():
+                    continue
+                if entry.suffix != ".parquet":
+                    continue
+                stem = entry.name[: -len(".parquet")]
+                if stem.endswith(".raw"):
+                    stem = stem[: -len(".raw")]
+                if "+" not in stem:
+                    continue
+                roi, codebook = stem.split("+", 1)
+                if roi in roi_set and codebook:
+                    discovered.add(codebook)
 
         return sorted(discovered)
 
