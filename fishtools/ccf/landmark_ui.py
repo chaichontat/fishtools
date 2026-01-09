@@ -134,10 +134,16 @@ def pick_atlas_slice_idx(
 class RotationDegPicker:
     fig: Figure
     slider: Slider
+    flip_button: Button
+    flip_state: dict[str, bool]
 
     @property
     def deg(self) -> int:
         return int(round(float(self.slider.val)))
+
+    @property
+    def flip_x(self) -> bool:
+        return bool(self.flip_state.get("flip_x", False))
 
     def close(self) -> None:
         plt.close(self.fig)
@@ -147,6 +153,7 @@ def pick_rotation_deg(
     *,
     moving_image_yx: np.ndarray,
     initial_deg: int = 0,
+    initial_flip_x: bool = False,
     step_deg: int = 2,
     vmin_deg: int = -180,
     vmax_deg: int = 180,
@@ -164,7 +171,7 @@ def pick_rotation_deg(
     ax.set_title("Sample (MOVING)")
     ax.axis("off")
 
-    ax_slider = plt.axes([0.15, 0.08, 0.6, 0.04])
+    ax_slider = plt.axes([0.15, 0.08, 0.5, 0.04])
     slider = Slider(
         ax=ax_slider,
         label="Rotation (°)",
@@ -174,19 +181,33 @@ def pick_rotation_deg(
         valstep=float(step_deg),
     )
 
+    flip_state: dict[str, bool] = {"flip_x": bool(initial_flip_x)}
+
+    ax_flip = plt.axes([0.68, 0.08, 0.27, 0.04])
+    flip_button = Button(ax_flip, "Flip X: OFF" if not flip_state["flip_x"] else "Flip X: ON")
+
     def _update(*args: object) -> None:
         deg = int(round(float(slider.val)))
-        rotated = ndimage_rotate(moving_image_yx, deg, reshape=False, order=1)
+        moving = moving_image_yx[:, ::-1] if flip_state["flip_x"] else moving_image_yx
+        rotated = ndimage_rotate(moving, deg, reshape=False, order=1)
         im_moving.set_data(rotated)
-        ax.set_title(f"Sample (MOVING) — rot {deg}°")
+        flip_tag = " +flipX" if flip_state["flip_x"] else ""
+        ax.set_title(f"Sample (MOVING) — rot {deg}°{flip_tag}")
         fig.canvas.draw_idle()
 
     slider.on_changed(_update)
 
+    def _toggle_flip(*args: object) -> None:
+        flip_state["flip_x"] = not flip_state["flip_x"]
+        flip_button.label.set_text("Flip X: ON" if flip_state["flip_x"] else "Flip X: OFF")
+        _update()
+
+    flip_button.on_clicked(_toggle_flip)
+
     _update()
 
     plt.show()
-    return RotationDegPicker(fig=fig, slider=slider)
+    return RotationDegPicker(fig=fig, slider=slider, flip_button=flip_button, flip_state=flip_state)
 
 
 @dataclass(frozen=True, slots=True)

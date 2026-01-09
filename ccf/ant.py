@@ -102,35 +102,51 @@ from fishtools.io.workspace import Workspace
 # Prereq: run `register_partial_section.py` at least through p1 so
 # `OUTDIR/p1_landmarks.json` exists (for `prior_rotation_deg` + crop bboxes).
 #
-# Edit the same config block below in both notebooks.
+# You should only need to set WORKSPACE / ROI / STITCH_CODEBOOK.
+# Everything else is loaded from `p1_landmarks.json` written by
+# `register_partial_section.py`.
 
 # %%
-# === EDIT THESE (mirrors register_partial_section.py) ===
+# === EDIT THESE ===
 
 # Workspace configuration
 WORKSPACE = Path("/home/chaichontat/fishtools2/working/20250929_JaxA3_Coro4")
 ROI = "3"
 STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.zarr
 
-# Atlas configuration
-ATLAS_NAME = "kim_dev_mouse_e15-5_lsfm_20um"
-ATLAS_SLICE_IDX = 600 - 382  # Coronal slice index
-
-# Sample configuration (resolved via Workspace)
+# Sample configuration (path resolved via Workspace; z/channel/voxel inferred from p1_landmarks.json)
 ws = Workspace(WORKSPACE)
 SAMPLE_ZARR = ws.stitch(ROI, STITCH_CODEBOOK) / "fused.zarr"
-SAMPLE_Z_IDX = 5
-SAMPLE_CHANNEL = "pi"
-
-# Voxel sizes (µm)
-SAMPLE_VOXEL_XY = 0.2
-ATLAS_VOXEL = 20.0
 
 # Output directory (analysis/output/ccf-transforms/{ROI}/)
 OUTDIR = ws.ccf_transforms(ROI)
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 OUT = LandmarkRegistrationOutputs(OUTDIR)
+
+# Read Phase 1 outputs (contract from register_partial_section.py)
+print("Loading p1 landmarks...")
+if not OUT.p1_landmarks_json.exists():
+    raise FileNotFoundError(
+        f"Missing {OUT.p1_landmarks_json}. Run register_partial_section.py through p1 first."
+    )
+p1 = OUT.read_p1_landmarks()
+
+# Atlas configuration (inferred)
+ATLAS_NAME = p1.atlas_name or "kim_dev_mouse_e15-5_lsfm_20um"
+if p1.atlas_slice_idx is None:
+    raise ValueError(
+        f"p1_landmarks.json at {OUT.p1_landmarks_json} is missing atlas_slice_idx. "
+        "Re-run register_partial_section.py and pick an atlas slice."
+    )
+ATLAS_SLICE_IDX = int(p1.atlas_slice_idx)
+ATLAS_PLANE = p1.atlas_plane or ("sagittal" if "Sag" in Path(WORKSPACE).name else "coronal")
+ATLAS_VOXEL = float(p1.atlas_voxel_um) if p1.atlas_voxel_um is not None else 20.0
+
+# Sample configuration (inferred)
+SAMPLE_Z_IDX = int(p1.sample_z_idx) if p1.sample_z_idx is not None else 5
+SAMPLE_CHANNEL = p1.sample_channel or STITCH_CODEBOOK
+SAMPLE_VOXEL_XY = float(p1.sample_voxel_xy_um) if p1.sample_voxel_xy_um is not None else 0.216
 
 # Common spacing for ANTs refinement (DevCCF used 20 µm for mapping compute/size reasons).
 TARGET_SPACING_UM = 10.0
@@ -151,17 +167,14 @@ RANDOM_SEED = 1
 # ## 2) Bring in your images
 
 # %%
-print("Loading p1 landmarks...")
-if not OUT.p1_landmarks_json.exists():
-    raise FileNotFoundError(
-        f"Missing {OUT.p1_landmarks_json}. Run register_partial_section.py through p1 first."
-    )
-p1 = OUT.read_p1_landmarks()
 PRIOR_ROTATION_DEG = p1.prior_rotation_deg
+PRIOR_FLIP_X = p1.prior_flip_x
 atlas_crop_bbox = p1.atlas_crop_bbox
 sample_rotated_crop_bbox = p1.sample_rotated_crop_bbox
+atlas_plane = p1.atlas_plane or ATLAS_PLANE
 
 print(f"  prior_rotation_deg={PRIOR_ROTATION_DEG}")
+print(f"  prior_flip_x={PRIOR_FLIP_X}")
 print(f"  atlas_crop_bbox={atlas_crop_bbox}")
 print(f"  sample_rotated_crop_bbox={sample_rotated_crop_bbox}")
 
@@ -169,8 +182,11 @@ print("Loading atlas...")
 atlas = BrainGlobeAtlas(ATLAS_NAME)
 print(f"  Atlas shape: {atlas.reference.shape}, resolution: {atlas.resolution} µm")
 
-atlas_slice_full = atlas.reference[ATLAS_SLICE_IDX, :, :]
-atlas_annotation_full = atlas.annotation[ATLAS_SLICE_IDX, :, :]
+atlas_reference_slices = atlas.reference if atlas_plane == "coronal" else atlas.reference.transpose(2, 1, 0)
+atlas_annotation_slices = atlas.annotation if atlas_plane == "coronal" else atlas.annotation.transpose(2, 1, 0)
+
+atlas_slice_full = atlas_reference_slices[ATLAS_SLICE_IDX, :, :]
+atlas_annotation_full = atlas_annotation_slices[ATLAS_SLICE_IDX, :, :]
 atlas_brain_mask = atlas_annotation_full > 0
 
 atlas_slice_full_masked = atlas_slice_full.copy().astype(np.float32)
@@ -190,11 +206,12 @@ else:
     print(f"  WARNING: channel {SAMPLE_CHANNEL!r} not found in attrs.key={keys}; using ch_idx=0")
 
 sample_slice_full_raw = np.asarray(arr[SAMPLE_Z_IDX, :, :, ch_idx])
+sample_slice_full_raw_pose = sample_slice_full_raw[:, ::-1] if PRIOR_FLIP_X else sample_slice_full_raw
 if PRIOR_ROTATION_DEG != 0:
-    sample_slice_full = ndimage_rotate(sample_slice_full_raw, PRIOR_ROTATION_DEG, reshape=True, order=1)
-    print(f"  Rotated sample by {PRIOR_ROTATION_DEG}°: {sample_slice_full_raw.shape} -> {sample_slice_full.shape}")
+    sample_slice_full = ndimage_rotate(sample_slice_full_raw_pose, PRIOR_ROTATION_DEG, reshape=True, order=1)
+    print(f"  Rotated sample by {PRIOR_ROTATION_DEG}°: {sample_slice_full_raw_pose.shape} -> {sample_slice_full.shape}")
 else:
-    sample_slice_full = sample_slice_full_raw
+    sample_slice_full = sample_slice_full_raw_pose
 
 sr0, sr1, sc0, sc1 = sample_rotated_crop_bbox
 sample_slice_rotated = sample_slice_full[sr0:sr1, sc0:sc1]
@@ -320,26 +337,20 @@ moving_mask_in_fixed = ants.apply_transforms(
     interpolator="nearestNeighbor",
 )
 overlap = fixed_mask_ants * moving_mask_in_fixed
-# One more erosion on overlap (often helps with partial tissue)
-# Convert overlap->sitk for erosion, then back
-overlap_sitk = sitk.ReadImage(str(OUTDIR / "fixed_mask_eroded.nii.gz"))  # spacing/origin
-overlap_sitk = sitk.Cast(overlap_sitk > 0, sitk.sitkUInt8)
-# Replace with true overlap content
+# One more erosion on overlap (often helps with partial tissue).
 overlap_arr = (ants_numpy_yx(overlap) > 0).astype(np.uint8)
-overlap_ref_arr = sitk.GetArrayFromImage(overlap_sitk)
+overlap_ref_arr = sitk.GetArrayFromImage(fixed_mask_eroded)
 if overlap_arr.shape != overlap_ref_arr.shape:
-    if overlap_arr.T.shape == overlap_ref_arr.shape:
-        overlap_arr = overlap_arr.T
-    else:
+    if overlap_arr.T.shape != overlap_ref_arr.shape:
         raise ValueError(
             f"Unexpected overlap array shape {overlap_arr.shape} vs reference {overlap_ref_arr.shape}."
         )
-overlap_sitk2 = sitk.GetImageFromArray(overlap_arr)
-overlap_sitk2.CopyInformation(overlap_sitk)
-
-overlap_sitk2 = erode_by_um(overlap_sitk2, EDGE_GUARD_UM)
+    overlap_arr = overlap_arr.T
+overlap_sitk = sitk.GetImageFromArray(overlap_arr)
+overlap_sitk.CopyInformation(fixed_mask_eroded)
+overlap_sitk = erode_by_um(overlap_sitk, EDGE_GUARD_UM)
 overlap_mask_nifti = OUTDIR / "overlap_mask_eroded.nii.gz"
-sitk.WriteImage(overlap_sitk2, str(overlap_mask_nifti))
+sitk.WriteImage(overlap_sitk, str(overlap_mask_nifti))
 overlap_mask_ants = ants.image_read(str(overlap_mask_nifti))
 
 print("Overlap frac (fixed grid):", float((overlap_mask_ants.numpy() > 0).mean()))
@@ -396,10 +407,7 @@ def qc_plot(fixed_img: ants.ANTsImage, moving_warped: ants.ANTsImage, title: str
     f = normalize_robust(f)
     m = normalize_robust(m)
 
-    overlay = np.zeros((f.shape[0], f.shape[1], 3), dtype=np.float32)
-    overlay[..., 0] = f
-    overlay[..., 1] = m
-    overlay[..., 2] = f
+    overlay = np.stack([f, m, f], axis=-1)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     axes[0].imshow(f, cmap="gray")

@@ -38,15 +38,17 @@ if ip is not None:
 # === EDIT THESE ===
 
 # Workspace configuration
-WORKSPACE = Path("/working/20250929_JaxA3_Coro4")
-ROI = "3"
+WORKSPACE = Path("/working/20251224_JaxA4_Sag1")
+ws = Workspace(WORKSPACE)
+ROI = ws.rois[7]
+
 STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.zarr
 
 # Atlas configuration
 ATLAS_NAME = "kim_dev_mouse_e15-5_lsfm_20um"
+ATLAS_PLANE = "sagittal" if "Sag" in WORKSPACE.name else "coronal"
 
 # Sample configuration (resolved via Workspace)
-ws = Workspace(WORKSPACE)
 SAMPLE_ZARR = ws.stitch(ROI, STITCH_CODEBOOK) / "fused.zarr"
 SAMPLE_Z_IDX = 5
 SAMPLE_CHANNEL = "pi"
@@ -70,6 +72,8 @@ PREVIEW_DOWNSAMPLE = 8
 
 # %%
 atlas = BrainGlobeAtlas(ATLAS_NAME)
+atlas_reference_slices = atlas.reference if ATLAS_PLANE == "coronal" else atlas.reference.transpose(2, 1, 0)
+atlas_annotation_slices = atlas.annotation if ATLAS_PLANE == "coronal" else atlas.annotation.transpose(2, 1, 0)
 
 arr = zarr.open(str(SAMPLE_ZARR), mode="r")
 keys = list(arr.attrs.get("key", []))
@@ -113,26 +117,31 @@ sample_preview = sample_slice[::ROTATION_PREVIEW_DOWNSAMPLE, ::ROTATION_PREVIEW_
 
 existing_p1 = OUT.try_read_p1_landmarks()
 initial_rotation_deg = existing_p1.prior_rotation_deg if existing_p1 is not None else 0
+initial_flip_x = existing_p1.prior_flip_x if existing_p1 is not None else False
 
 rotation_picker = pick_rotation_deg(
     moving_image_yx=sample_preview,
     initial_deg=initial_rotation_deg,
+    initial_flip_x=initial_flip_x,
 )
 
 # %%
 PRIOR_ROTATION_DEG = rotation_picker.deg
-print(f"Selected rotation: {PRIOR_ROTATION_DEG}°")
+PRIOR_FLIP_X = rotation_picker.flip_x
+print(f"Selected rotation: {PRIOR_ROTATION_DEG}° (flip_x={PRIOR_FLIP_X})")
 
 # Rotate the FULL sample (raw), then crop for landmark selection.
+sample_slice_full_raw_pose = sample_slice_full_raw[:, ::-1] if PRIOR_FLIP_X else sample_slice_full_raw
 if PRIOR_ROTATION_DEG != 0:
-    sample_slice_full = ndimage_rotate(sample_slice_full_raw, PRIOR_ROTATION_DEG, reshape=True, order=1)
+    sample_slice_full = ndimage_rotate(sample_slice_full_raw_pose, PRIOR_ROTATION_DEG, reshape=True, order=1)
 else:
-    sample_slice_full = sample_slice_full_raw
+    sample_slice_full = sample_slice_full_raw_pose
 
 sample_crop_bbox_rot: tuple[int, int, int, int]
 if (
     existing_p1 is not None
     and existing_p1.prior_rotation_deg == PRIOR_ROTATION_DEG
+    and existing_p1.prior_flip_x == PRIOR_FLIP_X
     and existing_p1.sample_rotated_full_shape_yx == tuple(int(x) for x in sample_slice_full.shape)
 ):
     sample_crop_bbox_rot = existing_p1.sample_rotated_crop_bbox
@@ -150,19 +159,25 @@ ATLAS_Z_PREVIEW_DOWNSAMPLE = PREVIEW_DOWNSAMPLE * 2
 atlas_z_sample_preview = sample_slice_rotated[::ATLAS_Z_PREVIEW_DOWNSAMPLE, ::ATLAS_Z_PREVIEW_DOWNSAMPLE]
 
 atlas_slice_picker = pick_atlas_slice_idx(
-    atlas_reference_zyx=atlas.reference,
+    atlas_reference_zyx=atlas_reference_slices,
     moving_image_yx=atlas_z_sample_preview,
     initial_idx=(existing_p1.atlas_slice_idx if existing_p1 is not None and existing_p1.atlas_slice_idx is not None else 0),
-    z_min_idx=0,
+    z_min_idx=120,
     z_max_idx=320,
 )
 
+
+# %% [markdown]
+# ### Interactive Landmark Selection
+#
+# Click paired landmarks (atlas first, then sample). The UI enforces pairing and saves
+# `p1_landmarks.json` as you go.
 # %%
 atlas_slice_idx = atlas_slice_picker.idx
 print(f"Selected atlas_slice_idx={atlas_slice_idx}")
 
-atlas_slice_full = atlas.reference[atlas_slice_idx, :, :]
-atlas_annotation_full = atlas.annotation[atlas_slice_idx, :, :]
+atlas_slice_full = atlas_reference_slices[atlas_slice_idx, :, :]
+atlas_annotation_full = atlas_annotation_slices[atlas_slice_idx, :, :]
 
 atlas_brain_mask = atlas_annotation_full > 0
 
@@ -173,13 +188,7 @@ atlas_slice, atlas_crop_bbox = crop_to_content(atlas_slice_masked, atlas_brain_m
 
 ATLAS_CROP_OFFSET = (atlas_crop_bbox[2], atlas_crop_bbox[0])  # (x_offset, y_offset)
 
-# %% [markdown]
-# ### Interactive Landmark Selection
-#
-# Click paired landmarks (atlas first, then sample). The UI enforces pairing and saves
-# `p1_landmarks.json` as you go.
 
-# %%
 def _save_p1_landmarks(
     *,
     fixed_points_cropped_xy: list[tuple[float, float]],
@@ -188,7 +197,14 @@ def _save_p1_landmarks(
     OUT.write_p1_landmarks(
         P1Landmarks(
             prior_rotation_deg=PRIOR_ROTATION_DEG,
+            prior_flip_x=PRIOR_FLIP_X,
             atlas_slice_idx=atlas_slice_idx,
+            atlas_plane=ATLAS_PLANE,
+            atlas_name=ATLAS_NAME,
+            atlas_voxel_um=ATLAS_VOXEL,
+            sample_channel=SAMPLE_CHANNEL,
+            sample_z_idx=SAMPLE_Z_IDX,
+            sample_voxel_xy_um=SAMPLE_VOXEL_XY,
             fixed_points_cropped_xy=fixed_points_cropped_xy,
             moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
             atlas_crop_bbox=atlas_crop_bbox,
@@ -204,19 +220,10 @@ sample_preview_rotated = sample_slice_rotated[::PREVIEW_DOWNSAMPLE, ::PREVIEW_DO
 
 initial_fixed: list[tuple[float, float]] = []
 initial_moving: list[tuple[float, float]] = []
-if (
-    existing_p1 is not None
-    and existing_p1.prior_rotation_deg == PRIOR_ROTATION_DEG
-    and existing_p1.atlas_crop_bbox == atlas_crop_bbox
-    and existing_p1.sample_rotated_crop_bbox == sample_crop_bbox_rot
-    and existing_p1.preview_downsample == PREVIEW_DOWNSAMPLE
-):
+if existing_p1 is not None:
     initial_fixed = existing_p1.fixed_points_cropped_xy
     initial_moving = existing_p1.moving_points_fullres_xy_in_rotated_crop
-    print(
-        f"Loaded existing landmarks from {OUT.p1_landmarks_json}: "
-        f"pairs={len(initial_fixed)} (rotation={existing_p1.prior_rotation_deg}°)"
-    )
+    print(f"Loaded existing landmarks: slice_idx={existing_p1.atlas_slice_idx} pairs={len(initial_fixed)}")
 
 
 def _on_landmarks_change(
@@ -243,6 +250,11 @@ landmark_picker = pick_paired_landmarks(
 
 # %%
 fixed_points, moving_points_fullres = landmark_picker.get_points()
+if len(fixed_points) != len(moving_points_fullres):
+    raise ValueError(
+        f"Landmark UI returned mismatched pair counts: fixed={len(fixed_points)} vs moving={len(moving_points_fullres)}"
+    )
+
 _save_p1_landmarks(
     fixed_points_cropped_xy=fixed_points,
     moving_points_fullres_xy_in_rotated_crop=moving_points_fullres,
