@@ -348,6 +348,53 @@ def test_extract_cli_single_roi_argument(tmp_path: Path, monkeypatch: pytest.Mon
     assert calls[-1]["file_quota"] is None
 
 
+def test_extract_cli_no_enrich_boundaries_disables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    workspace = tmp_path / "ws"
+    (workspace / "analysis" / "deconv").mkdir(parents=True)
+    (workspace / "analysis" / "deconv" / "registered--roi_a+cb1").mkdir()
+    (workspace / "workspace.DONE").write_text("")
+
+    def _fake_discover_inputs(
+        ws: Any,  # noqa: ANN401
+        current_roi: str,
+        codebook: str,
+        *,
+        require_zarr: bool = False,
+    ) -> list[Path]:
+        assert codebook == "cb1"
+        assert current_roi == "roi_a"
+        assert require_zarr is False
+        return [Path("/fake/roi_a-00.tif"), Path("/fake/roi_a-01.tif")]
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_extract_single_roi(**kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr("fishtools.segment.extract_core._discover_registered_inputs", _fake_discover_inputs)
+    monkeypatch.setattr("fishtools.segment.extract_core._extract_single_roi", _fake_extract_single_roi)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        segment_app,
+        [
+            "extract",
+            "z",
+            str(workspace),
+            "roi_a",
+            "--codebook",
+            "cb1",
+            "--no-enrich-boundaries",
+            "--n",
+            "2",
+        ],
+        prog_name="segment",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls and calls[-1]["enable_enrich_boundaries"] is False
+
+
 def test_extract_single_cli_delegates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     reg_file = tmp_path / "reg-00.tif"
     reg_file.write_bytes(b"")
@@ -381,6 +428,58 @@ def test_extract_single_cli_delegates(tmp_path: Path, monkeypatch: pytest.Monkey
     assert captured["n"] == 1
     assert captured["out_dir"] == reg_file.parent / "segment_extract"
     assert captured["max_from_path"] is None
+
+
+def test_extract_single_roi_skips_auto_enrich_for_tiffs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fishtools.io.workspace import Workspace
+    from fishtools.segment.extract_core import _extract_single_roi
+
+    workspace = tmp_path / "ws"
+    (workspace / "analysis" / "deconv").mkdir(parents=True)
+    (workspace / "analysis" / "deconv" / "registered--roi_a+cb1").mkdir()
+    stitch_dir = workspace / "analysis" / "deconv" / "stitch--roi_a+cb1"
+    stitch_dir.mkdir(parents=True, exist_ok=True)
+    (stitch_dir / "output_segmentation-sam.zarr").mkdir()
+    (workspace / "workspace.DONE").write_text("")
+
+    ws = Workspace(workspace)
+
+    captured: dict[str, Any] = {}
+
+    def _fake_execute(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("fishtools.segment.extract_core._execute_extraction", _fake_execute)
+
+    _extract_single_roi(
+        ws=ws,
+        roi="roi_a",
+        codebook="cb1",
+        mode="z",
+        out=None,
+        dz=1,
+        n=2,
+        z_crops_per_file=1,
+        anisotropy=4,
+        channels=None,
+        crop=0,
+        threads=1,
+        upscale=1.0,
+        seed=0,
+        every=1,
+        max_from=None,
+        use_zarr=False,
+        prefetched_inputs=[Path("/fake/reg-00.tif")],
+        file_quota=None,
+        explicit_mask_path=None,
+        enrich_boundaries=None,
+        enable_enrich_boundaries=True,
+        roi_points=None,
+    )
+
+    assert captured["enrich_boundaries"] is None
 
 
 def test_extract_single_cli_with_max_from(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

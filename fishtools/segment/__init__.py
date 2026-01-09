@@ -263,10 +263,16 @@ def trt_build_cmd(model: Path, batch_size: int, backend: str, opset: int) -> Non
     help="Decoded spots codebook labels to include in the export (repeatable).",
 )
 @click.option(
+    "--base-segmentation-name",
+    default="output_segmentation-sam.zarr",
+    show_default=True,
+    help="Base (pre-postproc) segmentation zarr name to export.",
+)
+@click.option(
     "--segmentation-name",
     default="output_segmentation-sam_postproc_s1-2-2_v500.zarr",
     show_default=True,
-    help="Segmentation zarr name (contains chunks and intensity outputs).",
+    help="Post-processed segmentation zarr name (contains chunks and intensity outputs).",
 )
 @click.option(
     "--channels",
@@ -292,6 +298,7 @@ def export_command(
     roi: str | None,
     seg_codebook: str,
     codebooks: tuple[str, ...],
+    base_segmentation_name: str,
     segmentation_name: str,
     channels: str,
     thumbnail_scale: float,
@@ -299,18 +306,51 @@ def export_command(
 ) -> None:
     """Export Baysor-ready spots plus aggregated per-cell intensities."""
 
+    from fishtools.io.workspace import Workspace
     from fishtools.segment.export import export_cmd as segment_export_cmd
 
-    segment_export_cmd(
-        path=path,
-        roi=roi,
-        seg_codebook=seg_codebook,
-        codebooks=codebooks,
-        segmentation_name=segmentation_name,
-        channels=channels,
-        thumbnail_scale=thumbnail_scale,
-        diag=debug,
-    )
+    ws = Workspace(path)
+    import shlex
+    import subprocess
+
+    roi_for_thumbnails = roi if roi is not None else "*"
+    thumb_cmd = ["segment", "thumbnail", str(ws.path)]
+    if roi is not None:
+        thumb_cmd.append(roi)
+    thumb_cmd.extend(["--codebook", seg_codebook])
+    try:
+        subprocess.run(thumb_cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        cmd_str = " ".join(shlex.quote(part) for part in thumb_cmd)
+        raise click.ClickException(
+            f"Thumbnail generation failed (exit code {exc.returncode}). Command: {cmd_str}"
+        ) from exc
+
+    rois_to_check = [roi] if roi else ws.rois
+    existing_segmentation_names: list[str] = []
+    for candidate in (base_segmentation_name, segmentation_name):
+        if candidate in existing_segmentation_names:
+            continue
+        if any((ws.stitch(r, seg_codebook) / candidate).exists() for r in rois_to_check):
+            existing_segmentation_names.append(candidate)
+
+    if not existing_segmentation_names:
+        raise click.ClickException(
+            f"No segmentation outputs found for roi={roi_for_thumbnails!r}, seg_codebook={seg_codebook!r}. "
+            f"Checked: {base_segmentation_name!r}, {segmentation_name!r}"
+        )
+
+    for seg_name in existing_segmentation_names:
+        segment_export_cmd(
+            path=path,
+            roi=roi,
+            seg_codebook=seg_codebook,
+            codebooks=codebooks,
+            segmentation_name=seg_name,
+            channels=channels,
+            thumbnail_scale=thumbnail_scale,
+            diag=debug,
+        )
 
 
 def _parse_xyz_triple(name: str, val: str) -> tuple[float, float, float]:
@@ -1068,7 +1108,7 @@ def extract_command(
     max_from: str | None,
     zarr: bool,
     masks: Path | None,
-    enrich_boundaries: Path | str | None,
+    enrich_boundaries: Path | None,
     no_enrich_boundaries: bool,
     overwrite: bool,
     roi_points: Path | None,
@@ -1084,8 +1124,7 @@ def extract_command(
     else:
         anisotropy_value = anisotropy if anisotropy is not None else 4
 
-    # Resolve enrich_boundaries: None means disabled, "AUTO" means use default, Path means explicit
-    enrich_value: Path | str | None = None if no_enrich_boundaries else enrich_boundaries
+    enable_enrich_boundaries = not no_enrich_boundaries
 
     # If a custom output directory is provided and already populated, require --overwrite
     if out is not None and out.exists() and any(out.iterdir()) and not overwrite:
@@ -1112,7 +1151,8 @@ def extract_command(
         max_from=max_from,
         use_zarr=zarr,
         masks=masks,
-        enrich_boundaries=enrich_value,
+        enrich_boundaries=enrich_boundaries,
+        enable_enrich_boundaries=enable_enrich_boundaries,
         roi_points=roi_points,
     )
 
@@ -1432,6 +1472,155 @@ def thumbnail_command(
         _process_zarr(zarr_path=stitched_dir / "fused_n4.zarr", prefix="thumbnail_n4")
 
 
+def _parse_rgb_triplet(val: str) -> tuple[int, int, int]:
+    raw = val.strip().replace(" ", ",")
+    parts = [p for p in raw.split(",") if p]
+    if len(parts) != 3:
+        raise click.BadParameter("--boundary-color must be an RGB triplet like '255,255,255'.")
+    try:
+        r, g, b = (int(p) for p in parts)
+    except ValueError as exc:
+        raise click.BadParameter("--boundary-color must contain integer values.") from exc
+    for x in (r, g, b):
+        if x < 0 or x > 255:
+            raise click.BadParameter("--boundary-color values must be in [0, 255].")
+    return (r, g, b)
+
+
+@app.command("plot")
+@click.argument(
+    "path",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+)
+@click.argument("roi", required=False, default="*")
+@click.option("--codebook", "-c", required=True, help="Codebook label for stitched fused_n4.zarr lookup.")
+@click.option(
+    "--seg-codebook",
+    type=str,
+    default=None,
+    help="Segmentation codebook (defaults to --codebook).",
+)
+@click.option(
+    "--segmentation-name",
+    default="output_segmentation-sam_postproc_s1-2-2_v500.zarr",
+    show_default=True,
+    help="Segmentation zarr name (Z,Y,X integer labels) inside stitch--ROI+<seg_codebook>.",
+)
+@click.option(
+    "--image-store",
+    default="fused.zarr",
+    show_default=True,
+    help="Image zarr name inside stitch--ROI+<codebook> (usually fused.zarr).",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(file_okay=False, dir_okay=True, path_type=Path),
+    help=(
+        "Output root for PNGs (defaults to analysis/output/plots). "
+        "Outputs are written under <output-dir>/<roi>+<seg_codebook>/ (like `segment thumbnail`)."
+    ),
+)
+@click.option("--channel", type=click.IntRange(min=0), default=0, show_default=True, help="Channel index.")
+@click.option(
+    "--subsample",
+    type=click.IntRange(min=1),
+    default=2,
+    show_default=True,
+    help="Subsample factor for Y,X (output size is Y//subsample, X//subsample).",
+)
+@click.option(
+    "--z-step",
+    type=click.IntRange(min=1),
+    default=8,
+    show_default=True,
+    help="Export every Nth z-slice.",
+)
+@click.option(
+    "--z-range",
+    default=None,
+    help="Z range as start:end (e.g., 0:50). Empty start/end is allowed (e.g., :50, 10:).",
+)
+@click.option("--cmap", "cmap_name", default="magma", show_default=True, help="Matplotlib colormap name.")
+@click.option("--p-low", type=float, default=1.0, show_default=True, help="Lower percentile for normalization.")
+@click.option("--p-high", type=float, default=99.99, show_default=True, help="Upper percentile for normalization.")
+@click.option(
+    "--boundary-color",
+    default="255,255,255",
+    show_default=True,
+    help="Boundary RGB triplet like '255,255,255'.",
+)
+@click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing PNGs.")
+@batch_roi("stitch--*", include_codebook=True, split_codebook=True)
+def plot_command(
+    path: Path,
+    roi: str,
+    codebook: str,
+    seg_codebook: str | None,
+    segmentation_name: str,
+    image_store: str,
+    output_dir: Path | None,
+    channel: int,
+    subsample: int,
+    z_step: int,
+    z_range: str | None,
+    cmap_name: str,
+    p_low: float,
+    p_high: float,
+    boundary_color: str,
+    overwrite: bool,
+) -> None:
+    """Export per-Z PNGs with and without segmentation boundaries."""
+    from fishtools.io.workspace import Workspace
+    from fishtools.segment.plot import export_zslices_with_boundaries
+
+    ws = Workspace(path)
+    seg_cb = seg_codebook or codebook
+
+    z_start: int = 0
+    z_end: int | None = None
+    if z_range is not None:
+        parts = z_range.split(":", maxsplit=1)
+        if len(parts) != 2:
+            raise click.ClickException("Invalid --z-range format. Use start:end (e.g., 0:50).")
+        start_raw, end_raw = (p.strip() for p in parts)
+        try:
+            z_start = int(start_raw) if start_raw else 0
+            z_end = int(end_raw) if end_raw else None
+        except ValueError as exc:
+            raise click.ClickException("--z-range must contain integer start/end values.") from exc
+
+    stitched_dir = ws.stitch(roi, codebook)
+    image_path = stitched_dir / image_store
+    if not image_path.exists():
+        raise click.ClickException(f"ROI '{roi}': image zarr not found at {image_path}")
+
+    seg_dir = ws.stitch(roi, seg_cb)
+    mask_path = seg_dir / segmentation_name
+    if not mask_path.exists():
+        raise click.ClickException(f"ROI '{roi}': segmentation zarr not found at {mask_path}")
+
+    rgb = _parse_rgb_triplet(boundary_color)
+
+    out_root = (ws.output / "plots") if output_dir is None else output_dir
+    out = out_root / f"{roi}+{seg_cb}"
+
+    export_zslices_with_boundaries(
+        image_path=image_path,
+        mask_path=mask_path,
+        output_dir=out,
+        channel=channel,
+        subsample=subsample,
+        boundary_color=rgb,
+        z_step=z_step,
+        z_start=z_start,
+        z_end=z_end,
+        cmap_name=cmap_name,
+        p_low=p_low,
+        p_high=p_high,
+        overwrite=overwrite,
+    )
+
+
 LAZY_OVERLAY_COMMANDS: dict[str, SimpleNamespace] = {
     "all": SimpleNamespace(module="fishtools.segment.overlay_all", attr="overlay_all"),
     "intensity": SimpleNamespace(module="fishtools.segment.overlay_intensity", attr="overlay_intensity"),
@@ -1481,6 +1670,7 @@ __all__ = [
     "extract_command",
     "extract_single_command",
     "thumbnail_command",
+    "plot_command",
     "overlay",
 ]
 

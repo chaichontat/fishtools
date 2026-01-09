@@ -627,7 +627,6 @@ def quantize(
                 compressionargs={"level": 0.75},
                 metadata=metadata_dict,
             )
-            output_path.with_suffix(".deconv.json").write_text(json.dumps(metadata_dict, indent=2))
 
             processed += 1
             logger.info(f"Quantized {output_path.relative_to(workspace)} (roi={roi_name})")

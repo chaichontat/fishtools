@@ -23,10 +23,12 @@ def test_p1_landmarks_parsing_and_rotation_loading(tmp_path: Path) -> None:
 
     payload = {
         "prior_rotation_deg": 70,
+        "prior_flip_x": True,
         "fixed_points_cropped_xy": [[1, 2], [3.5, 4.5], [10, 11]],
         "moving_points_fullres_xy_in_rotated_crop": [[5, 6], [7, 8], [9, 10]],
         "atlas_crop_bbox": [1, 2, 3, 4],
         "sample_rotated_crop_bbox": [5, 6, 7, 8],
+        "atlas_plane": "coronal",
         "preview_downsample": 8,
         "atlas_full_shape_yx": [100, 200],
         "sample_rotated_full_shape_yx": [300, 400],
@@ -35,6 +37,8 @@ def test_p1_landmarks_parsing_and_rotation_loading(tmp_path: Path) -> None:
 
     lm = P1Landmarks.from_json(out.p1_landmarks_json)
     assert lm.prior_rotation_deg == 70
+    assert lm.prior_flip_x is True
+    assert lm.atlas_plane == "coronal"
     assert lm.atlas_crop_bbox == (1, 2, 3, 4)
     assert lm.sample_rotated_crop_bbox == (5, 6, 7, 8)
     assert lm.preview_downsample == 8
@@ -64,10 +68,12 @@ def test_outputs_write_and_read_p1_landmarks(tmp_path: Path) -> None:
 
     lm = P1Landmarks(
         prior_rotation_deg=12,
+        prior_flip_x=True,
         fixed_points_cropped_xy=[(1.0, 2.0), (3.0, 4.0), (5.0, 6.0)],
         moving_points_fullres_xy_in_rotated_crop=[(7.0, 8.0), (9.0, 10.0), (11.0, 12.0)],
         atlas_crop_bbox=(1, 2, 3, 4),
         sample_rotated_crop_bbox=(5, 6, 7, 8),
+        atlas_plane="sagittal",
         preview_downsample=8,
         atlas_full_shape_yx=(100, 200),
         sample_rotated_full_shape_yx=(300, 400),

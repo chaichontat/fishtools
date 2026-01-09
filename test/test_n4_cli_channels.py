@@ -16,6 +16,8 @@ pytestmark = pytest.mark.timeout(30)
 
 
 def _make_fused(workspace: Path, roi: str, codebook: str, shape=(1, 8, 8, 3), names=None) -> Path:
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").write_text("ok\n", encoding="utf-8")
     stitch_dir = workspace / f"analysis/deconv/stitch--{roi}+{codebook}"
     stitch_dir.mkdir(parents=True, exist_ok=True)
     store = zarr.open_array(

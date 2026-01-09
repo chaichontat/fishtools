@@ -126,29 +126,30 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
     _write_thumbnail(thumb_dir, size=thumb_size)
 
     ident_path = chunks_root / "ident_0000.parquet"
+    n_cells = 12
     ident_df = pl.DataFrame({
-        "spot_id": [0, 1, 2, 3],
-        "label": [1, 1, 2, 2],
-        "target": ["GeneA-1", "GeneA-2", "GeneB-1", "GeneC-1"],
+        "spot_id": list(range(n_cells)),
+        "label": list(range(1, n_cells + 1)),
+        "target": ["GeneB-1"] * n_cells,
     })
     _write_parquet(ident_path, ident_df)
 
     polygons_path = chunks_root / "polygons_0000.parquet"
     polygons_df = pl.DataFrame({
-        "label": [1, 2],
-        "area": [5.0, 7.0],
-        "centroid_x": [10.0, 20.0],
-        "centroid_y": [15.0, 25.0],
+        "label": list(range(1, n_cells + 1)),
+        "area": [5.0] * n_cells,
+        "centroid_x": [10.0 + idx for idx in range(n_cells)],
+        "centroid_y": [15.0 + idx for idx in range(n_cells)],
     })
     _write_parquet(polygons_path, polygons_df)
 
     intensity_root = seg_root / "intensity_marker"
     intensity_path = intensity_root / "intensity-0000.parquet"
     intensity_df = pl.DataFrame({
-        "label": [1, 2],
-        "mean_intensity": [1.0, 2.0],
-        "max_intensity": [1.5, 2.5],
-        "min_intensity": [0.5, 1.0],
+        "label": list(range(1, n_cells + 1)),
+        "mean_intensity": [1.0] * n_cells,
+        "max_intensity": [1.5] * n_cells,
+        "min_intensity": [0.5] * n_cells,
     })
     _write_parquet(intensity_path, intensity_df)
 
@@ -160,24 +161,105 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
         codebooks=(codebook,),
         segmentation_name=segmentation_name,
         channels="marker",
-        out_dir=None,
         diag=False,
     )
 
-    cells_path = seg_root / "polygons+gene.parquet"
+    cb_token = Workspace.sanitize_codebook_name(codebook)
+    seg_stem = Path(segmentation_name).stem
+    cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
     assert cells_path.exists()
     cells_df = pl.read_parquet(cells_path)
     assert set(["x", "y", "roi", "area", "marker_mean"]).issubset(set(cells_df.columns))
+    assert cells_df.schema["area"] == pl.Float32
+    assert cells_df.schema["x"] == pl.Float32
+    assert cells_df.schema["y"] == pl.Float32
+    assert cells_df.schema["marker_mean"] == pl.Float32
+    assert cells_df.schema["marker_max"] == pl.Float32
+    assert cells_df.schema["marker_min"] == pl.Float32
 
-    h5ad_path = seg_root / "gene.h5ad"
+    h5ad_path = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
     assert h5ad_path.exists()
     adata = ad.read_h5ad(h5ad_path)
-    assert adata.n_obs == 2
+    assert adata.n_obs == n_cells
     assert {"marker_mean"}.issubset(set(adata.obs.columns))
-    assert {"GeneA-1", "GeneA-2", "GeneB", "GeneC"}.issubset(set(adata.var_names))
+    assert adata.n_vars == 1
+    assert {"GeneB"}.issubset(set(adata.var_names))
+
+    assert "fishtools" in adata.uns
+    assert "segment_export" in adata.uns["fishtools"]
+    assert "qc_filtering" in adata.uns["fishtools"]
+    meta = adata.uns["fishtools"]["segment_export"]
+    assert meta["workspace_path"] == str(ws.path)
+    assert meta["args"]["seg_codebook"] == seg_codebook
+    assert meta["resolved"]["rois"] == [roi]
+    assert meta["outputs"]["h5ad_path"] == str(h5ad_path)
+    assert codebook in set(meta["artifacts_by_roi"][roi]["available_chunks"])
+    assert "marker" in set(meta["artifacts_by_roi"][roi]["available_intensity_channels"])
+    assert adata.uns["fishtools"]["qc_filtering"]["filter_cells"]["max_counts"] == 1200
 
     baysor_path = ws.deconved / "baysor" / "spots.csv"
     assert not baysor_path.exists()
+
+
+def test_segment_export_keeps_cells_without_spots(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
+    ws.deconved.mkdir(parents=True, exist_ok=True)
+
+    roi = "roi1"
+    seg_codebook = "seg"
+    codebook = "gene"
+    segmentation_name = "output_segmentation.zarr"
+    stitch_root = ws.stitch(roi, seg_codebook)
+    seg_root = stitch_root / segmentation_name
+    chunks_root = seg_root / f"chunks+{codebook}"
+
+    scale = 8.0
+    thumb_size = (10, 8)
+    _write_segmentation_zarr(seg_root, shape=(1, int(thumb_size[1] * scale), int(thumb_size[0] * scale)))
+    thumb_dir = ws.output / "thumbnails" / f"{roi}+{seg_codebook}"
+    _write_thumbnail(thumb_dir, size=thumb_size)
+
+    n_cells = 12
+    n_spotted = 10
+
+    ident_path = chunks_root / "ident_0000.parquet"
+    ident_df = pl.DataFrame({
+        "spot_id": list(range(n_spotted)),
+        "label": list(range(1, n_spotted + 1)),
+        "target": ["GeneB-1"] * n_spotted,
+    })
+    _write_parquet(ident_path, ident_df)
+
+    polygons_path = chunks_root / "polygons_0000.parquet"
+    polygons_df = pl.DataFrame({
+        "label": list(range(1, n_cells + 1)),
+        "area": [5.0] * n_cells,
+        "centroid_x": [10.0 + idx for idx in range(n_cells)],
+        "centroid_y": [15.0 + idx for idx in range(n_cells)],
+    })
+    _write_parquet(polygons_path, polygons_df)
+
+    export_cmd = _export_cmd()
+    export_cmd(
+        path=ws.deconved,
+        roi=roi,
+        seg_codebook=seg_codebook,
+        codebooks=(codebook,),
+        segmentation_name=segmentation_name,
+        channels="auto",
+        diag=False,
+    )
+
+    cb_token = Workspace.sanitize_codebook_name(codebook)
+    seg_stem = Path(segmentation_name).stem
+    h5ad_path = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    adata = ad.read_h5ad(h5ad_path)
+    assert adata.n_obs == n_cells
+    assert f"{roi}|{n_cells}" in set(adata.obs_names)
+    assert adata[adata.obs_names == f"{roi}|{n_cells}", :].X.sum() == 0
 
 
 def test_segment_export_roiset_rotation_and_subroi(tmp_path: Path) -> None:
@@ -203,10 +285,11 @@ def test_segment_export_roiset_rotation_and_subroi(tmp_path: Path) -> None:
     _write_thumbnail(thumb_dir, size=thumb_size)
 
     ident_path = chunks_root / "ident_0000.parquet"
+    n_cells = 12
     ident_df = pl.DataFrame({
-        "spot_id": [0, 1, 2, 3],
-        "label": [1, 1, 2, 2],
-        "target": ["GeneA-1", "GeneA-2", "GeneB-1", "GeneC-1"],
+        "spot_id": list(range(n_cells)),
+        "label": list(range(1, n_cells + 1)),
+        "target": ["GeneB-1"] * n_cells,
     })
     _write_parquet(ident_path, ident_df)
 
@@ -214,21 +297,23 @@ def test_segment_export_roiset_rotation_and_subroi(tmp_path: Path) -> None:
     line_p1 = (8.0, 4.0)
 
     polygons_path = chunks_root / "polygons_0000.parquet"
+    centroid_x = [line_p0[0] * scale, line_p1[0] * scale] + [100.0] * (n_cells - 2)
+    centroid_y = [line_p0[1] * scale, line_p1[1] * scale] + [100.0] * (n_cells - 2)
     polygons_df = pl.DataFrame({
-        "label": [1, 2],
-        "area": [5.0, 7.0],
-        "centroid_x": [line_p0[0] * scale, line_p1[0] * scale],
-        "centroid_y": [line_p0[1] * scale, line_p1[1] * scale],
+        "label": list(range(1, n_cells + 1)),
+        "area": [5.0] * n_cells,
+        "centroid_x": centroid_x,
+        "centroid_y": centroid_y,
     })
     _write_parquet(polygons_path, polygons_df)
 
     intensity_root = seg_root / "intensity_marker"
     intensity_path = intensity_root / "intensity-0000.parquet"
     intensity_df = pl.DataFrame({
-        "label": [1, 2],
-        "mean_intensity": [1.0, 2.0],
-        "max_intensity": [1.5, 2.5],
-        "min_intensity": [0.5, 1.0],
+        "label": list(range(1, n_cells + 1)),
+        "mean_intensity": [1.0] * n_cells,
+        "max_intensity": [1.5] * n_cells,
+        "min_intensity": [0.5] * n_cells,
     })
     _write_parquet(intensity_path, intensity_df)
 
@@ -246,7 +331,6 @@ def test_segment_export_roiset_rotation_and_subroi(tmp_path: Path) -> None:
         codebooks=(codebook,),
         segmentation_name=segmentation_name,
         channels="marker",
-        out_dir=None,
         diag=False,
     )
 
@@ -285,29 +369,30 @@ def test_segment_export_roiset_multiple_lines_errors(tmp_path: Path) -> None:
     _write_thumbnail(thumb_dir, size=thumb_size)
 
     ident_path = chunks_root / "ident_0000.parquet"
+    n_cells = 12
     ident_df = pl.DataFrame({
-        "spot_id": [0, 1],
-        "label": [1, 2],
-        "target": ["GeneA-1", "GeneB-1"],
+        "spot_id": list(range(n_cells)),
+        "label": list(range(1, n_cells + 1)),
+        "target": ["GeneB-1"] * n_cells,
     })
     _write_parquet(ident_path, ident_df)
 
     polygons_path = chunks_root / "polygons_0000.parquet"
     polygons_df = pl.DataFrame({
-        "label": [1, 2],
-        "area": [5.0, 7.0],
-        "centroid_x": [16.0, 64.0],
-        "centroid_y": [16.0, 32.0],
+        "label": list(range(1, n_cells + 1)),
+        "area": [5.0] * n_cells,
+        "centroid_x": [16.0] * n_cells,
+        "centroid_y": [16.0] * n_cells,
     })
     _write_parquet(polygons_path, polygons_df)
 
     intensity_root = seg_root / "intensity_marker"
     intensity_path = intensity_root / "intensity-0000.parquet"
     intensity_df = pl.DataFrame({
-        "label": [1, 2],
-        "mean_intensity": [1.0, 2.0],
-        "max_intensity": [1.5, 2.5],
-        "min_intensity": [0.5, 1.0],
+        "label": list(range(1, n_cells + 1)),
+        "mean_intensity": [1.0] * n_cells,
+        "max_intensity": [1.5] * n_cells,
+        "min_intensity": [0.5] * n_cells,
     })
     _write_parquet(intensity_path, intensity_df)
 
@@ -342,9 +427,175 @@ def test_segment_export_roiset_multiple_lines_errors(tmp_path: Path) -> None:
             codebooks=(codebook,),
             segmentation_name=segmentation_name,
             channels="marker",
-            out_dir=None,
             diag=False,
         )
+
+
+def test_segment_export_runs_without_intensity_data(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
+    ws.deconved.mkdir(parents=True, exist_ok=True)
+
+    roi = "roi1"
+    seg_codebook = "seg"
+    codebook = "gene"
+    segmentation_name = "output_segmentation.zarr"
+
+    stitch_root = ws.stitch(roi, seg_codebook)
+    seg_root = stitch_root / segmentation_name
+    chunks_root = seg_root / f"chunks+{codebook}"
+
+    scale = 8.0
+    thumb_size = (10, 8)
+    _write_segmentation_zarr(seg_root, shape=(1, int(thumb_size[1] * scale), int(thumb_size[0] * scale)))
+    thumb_dir = ws.output / "thumbnails" / f"{roi}+{seg_codebook}"
+    _write_thumbnail(thumb_dir, size=thumb_size)
+
+    n_cells = 12
+    ident_path = chunks_root / "ident_0000.parquet"
+    ident_df = pl.DataFrame({
+        "spot_id": list(range(n_cells)),
+        "label": list(range(1, n_cells + 1)),
+        "target": ["GeneB-1"] * n_cells,
+    })
+    _write_parquet(ident_path, ident_df)
+
+    polygons_path = chunks_root / "polygons_0000.parquet"
+    polygons_df = pl.DataFrame({
+        "label": list(range(1, n_cells + 1)),
+        "area": [5.0] * n_cells,
+        "centroid_x": [10.0 + idx for idx in range(n_cells)],
+        "centroid_y": [15.0 + idx for idx in range(n_cells)],
+    })
+    _write_parquet(polygons_path, polygons_df)
+
+    export_cmd = _export_cmd()
+    export_cmd(
+        path=ws.deconved,
+        roi=roi,
+        seg_codebook=seg_codebook,
+        codebooks=(codebook,),
+        segmentation_name=segmentation_name,
+        channels="auto",
+        diag=False,
+    )
+
+    cb_token = Workspace.sanitize_codebook_name(codebook)
+    seg_stem = Path(segmentation_name).stem
+    cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
+    assert cells_path.exists()
+    cells_df = pl.read_parquet(cells_path)
+    assert set(["x", "y", "roi", "area"]).issubset(set(cells_df.columns))
+    assert "marker_mean" not in cells_df.columns
+
+    h5ad_path = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    assert h5ad_path.exists()
+    adata = ad.read_h5ad(h5ad_path)
+    assert adata.n_obs == n_cells
+    assert "marker_mean" not in adata.obs.columns
+    assert adata.n_vars == 1
+    assert {"GeneB"}.issubset(set(adata.var_names))
+
+
+def test_segment_export_missing_ident_error_lists_available_chunks(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
+    ws.deconved.mkdir(parents=True, exist_ok=True)
+
+    roi = "1"
+    seg_codebook = "pi"
+    segmentation_name = "output_segmentation.zarr"
+
+    seg_root = ws.stitch(roi, seg_codebook) / segmentation_name
+    seg_root.mkdir(parents=True, exist_ok=True)
+    (seg_root / "chunks+cs_base").mkdir(parents=True, exist_ok=True)
+
+    export_cmd = _export_cmd()
+    with pytest.raises(ValueError) as excinfo:
+        export_cmd(
+            path=ws.deconved,
+            roi=roi,
+            seg_codebook=seg_codebook,
+            codebooks=("pi",),
+            segmentation_name=segmentation_name,
+            channels="auto",
+            diag=False,
+        )
+
+    message = str(excinfo.value)
+    assert "ident_*.parquet" in message
+    assert "cs_base" in message
+    assert "overlay spots" in message
+
+
+def test_segment_export_multi_codebook_writes_distinct_h5ad_name(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "workspace.DONE").touch()
+    ws = Workspace(workspace)
+    ws.deconved.mkdir(parents=True, exist_ok=True)
+
+    roi = "roi1"
+    seg_codebook = "seg"
+    segmentation_name = "output_segmentation.zarr"
+    seg_root = ws.stitch(roi, seg_codebook) / segmentation_name
+
+    primary_codebook = "gene"
+    secondary_codebook = "gene2"
+    chunks_primary = seg_root / f"chunks+{primary_codebook}"
+    chunks_secondary = seg_root / f"chunks+{secondary_codebook}"
+
+    n_cells = 12
+    _write_parquet(
+        chunks_primary / "ident_0000.parquet",
+        pl.DataFrame({
+            "spot_id": list(range(n_cells)),
+            "label": list(range(1, n_cells + 1)),
+            "target": ["GeneB-1"] * n_cells,
+        }),
+    )
+    _write_parquet(
+        chunks_secondary / "ident_0000.parquet",
+        pl.DataFrame({
+            "spot_id": list(range(n_cells, 2 * n_cells)),
+            "label": list(range(1, n_cells + 1)),
+            "target": ["GeneC-1"] * n_cells,
+        }),
+    )
+    _write_parquet(
+        chunks_primary / "polygons_0000.parquet",
+        pl.DataFrame({
+            "label": list(range(1, n_cells + 1)),
+            "area": [5.0] * n_cells,
+            "centroid_x": [10.0 + idx for idx in range(n_cells)],
+            "centroid_y": [15.0 + idx for idx in range(n_cells)],
+        }),
+    )
+
+    export_cmd = _export_cmd()
+    export_cmd(
+        path=ws.deconved,
+        roi=roi,
+        seg_codebook=seg_codebook,
+        codebooks=(primary_codebook, secondary_codebook),
+        segmentation_name=segmentation_name,
+        channels="auto",
+        diag=False,
+    )
+
+    seg_stem = Path(segmentation_name).stem
+    cells_path = ws.output / f"polygons+{primary_codebook}+{seg_stem}.parquet"
+    assert cells_path.exists()
+
+    out_h5ad = ws.output / f"all+{primary_codebook}__{secondary_codebook}+{seg_stem}.h5ad"
+    assert out_h5ad.exists()
+    adata = ad.read_h5ad(out_h5ad)
+    assert adata.n_obs == n_cells
+    assert {"GeneB", "GeneC"}.issubset(set(adata.var_names))
 
 
 def test_resolve_rois_defaults_to_workspace_rois(tmp_path: Path) -> None:

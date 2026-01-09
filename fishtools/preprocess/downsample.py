@@ -11,32 +11,37 @@ from loguru import logger
 
 ClipRange = tuple[float, float] | None
 
-# Lazy-loaded modules
-_cp = None
-_cucim_downscale = None
+# Public, monkeypatchable GPU backends (tests rely on these names)
+cp = None
+downscale_local_mean = None
 _skimage_downscale = None
 _cuda_available: bool | None = None
 
 
 def _check_cuda_available() -> bool:
     """Check if CUDA is available for GPU operations."""
-    global _cuda_available, _cp, _cucim_downscale
-    if _cuda_available is not None:
+    global _cuda_available, cp, downscale_local_mean
+    # Cache only the positive result. A previous "no CUDA" check should not
+    # permanently poison the module (tests monkeypatch `cp` at runtime).
+    if _cuda_available is True:
+        return True
+
+    if cp is None:
+        try:
+            import cupy as imported_cupy  # pragma: no cover - exercised by integration runs
+        except ImportError:
+            _cuda_available = False
+            return _cuda_available
+        cp = imported_cupy
+
+    cuda = getattr(cp, "cuda", None)
+    runtime = getattr(cuda, "runtime", None)
+    get_device_count = getattr(runtime, "getDeviceCount", None)
+    if not callable(get_device_count) or int(get_device_count()) < 1:
+        _cuda_available = False
         return _cuda_available
 
-    try:
-        import cupy as cp
-        _cp = cp
-        runtime = cp.cuda.runtime
-        count = runtime.getDeviceCount()
-        if count < 1:
-            _cuda_available = False
-        else:
-            from cucim.skimage.transform import downscale_local_mean
-            _cucim_downscale = downscale_local_mean
-            _cuda_available = True
-    except Exception:
-        _cuda_available = False
+    _cuda_available = True
 
     return _cuda_available
 
@@ -98,12 +103,14 @@ def _gpu_downsample_xy(
     output_dtype: np.dtype | type[np.generic] | None = None,
 ) -> np.ndarray:
     """GPU-based crop and downsample using CuPy/cuCIM."""
+    global downscale_local_mean
     if factor < 1:
         raise ValueError("Downsample factor must be >= 1.")
     if crop < 0:
         raise ValueError("Crop must be non-negative.")
 
-    cp = _cp
+    if cp is None:
+        raise RuntimeError("CUDA is not available. Set up a CUDA-capable GPU or use downsample_xy().")
     gpu_volume = cp.asarray(volume, dtype=cp.float32)
 
     if crop > 0:
@@ -116,6 +123,10 @@ def _gpu_downsample_xy(
         gpu_volume = gpu_volume[tuple(crop_slices)]
 
     if factor > 1:
+        if downscale_local_mean is None:
+            from cucim.skimage.transform import downscale_local_mean as cucim_downscale  # pragma: no cover
+
+            downscale_local_mean = cucim_downscale
         if gpu_volume.shape[-2] % factor != 0 or gpu_volume.shape[-1] % factor != 0:
             raise ValueError("Downsample factor must evenly divide the cropped spatial dimensions.")
 
@@ -123,7 +134,7 @@ def _gpu_downsample_xy(
         zoom_factors[-2] = factor
         zoom_factors[-1] = factor
 
-        gpu_volume = _cucim_downscale(gpu_volume, tuple(map(int, zoom_factors)))
+        gpu_volume = downscale_local_mean(gpu_volume, tuple(map(int, zoom_factors)))
 
     if clip_range is not None:
         gpu_volume = cp.clip(gpu_volume, clip_range[0], clip_range[1])
@@ -164,14 +175,9 @@ def gpu_downsample_xy(
     clip_range: ClipRange = None,
     output_dtype: np.dtype | type[np.generic] | None = None,
 ) -> np.ndarray:
-    """Crop and downsample with GPU if available, CPU fallback.
-
-    .. deprecated::
-        Use :func:`downsample_xy` instead.
-    """
-    return downsample_xy(
-        volume, crop=crop, factor=factor, clip_range=clip_range, output_dtype=output_dtype
-    )
+    """Crop and downsample using the GPU, failing fast if CUDA is unavailable."""
+    ensure_cuda_available()
+    return _gpu_downsample_xy(volume, crop=crop, factor=factor, clip_range=clip_range, output_dtype=output_dtype)
 
 
 def ensure_cuda_available() -> None:
@@ -186,4 +192,4 @@ def ensure_cuda_available() -> None:
         )
 
 
-__all__ = ["downsample_xy", "gpu_downsample_xy", "ensure_cuda_available"]
+__all__ = ["cp", "downscale_local_mean", "downsample_xy", "gpu_downsample_xy", "ensure_cuda_available"]

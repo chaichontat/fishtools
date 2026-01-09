@@ -232,6 +232,37 @@ class TestWorkspaceStructureDiscovery:
         rois = ws.rois
         assert set(rois) == {"cortex", "hippocampus"}
 
+    def test_rois_discovery_from_output_only_parquets(self, tmp_path: Path) -> None:
+        """Test ROI discovery works when only analysis/output artifacts exist."""
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
+
+        parquets_dir = workspace_root / "analysis" / "output" / "parquets"
+        parquets_dir.mkdir(parents=True)
+        (parquets_dir / "cortex+cb1.parquet").write_text("stub", encoding="utf-8")
+        (parquets_dir / "hippocampus+cb2.raw.parquet").write_text("stub", encoding="utf-8")
+
+        ws = Workspace(workspace_root)
+        assert ws.rois == ["cortex", "hippocampus"]
+
+    def test_rois_discovery_ignores_multi_plus_artifacts(self, tmp_path: Path) -> None:
+        """Ignore output artifacts that are not ROI-level spots (e.g. segmentation polygons)."""
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
+
+        out_dir = workspace_root / "analysis" / "output"
+        out_dir.mkdir(parents=True)
+        parquets_dir = out_dir / "parquets"
+        parquets_dir.mkdir(parents=True)
+
+        (parquets_dir / "brain+mousecommon.parquet").write_text("stub", encoding="utf-8")
+        (out_dir / "polygons+mousecommon+output_segmentation-sam_v1.parquet").write_text("stub", encoding="utf-8")
+
+        ws = Workspace(workspace_root)
+        assert ws.rois == ["brain"]
+
 
 class TestWorkspaceImageAccess:
     """Test image access methods."""
@@ -501,6 +532,17 @@ class TestWorkspaceSpotsParquet:
         assert ws.spots_parquet("10", "cs-base", must_exist=True) == parquet_path
 
 
+class TestWorkspaceCcfTransforms:
+    def test_ccf_transforms_returns_roi_scoped_output_dir(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
+
+        ws = Workspace(workspace_root)
+        assert ws.ccf_transforms() == workspace_root / "analysis" / "output" / "ccf-transforms"
+        assert ws.ccf_transforms("cortex") == workspace_root / "analysis" / "output" / "ccf-transforms" / "cortex"
+
+
 class TestWorkspaceRegisteredArtifacts:
     """Tests for registered TIFF discovery and validation helpers."""
 
@@ -544,6 +586,19 @@ class TestWorkspaceRegisteredArtifacts:
         ws = Workspace(workspace_root)
 
         assert ws.registered_codebooks() == ["cb1", "cb2", "cb3"]
+
+    def test_registered_codebooks_discovers_from_output_only(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        _write_done_sentinel(workspace_root)
+
+        parquets_dir = workspace_root / "analysis" / "output" / "parquets"
+        parquets_dir.mkdir(parents=True)
+        (parquets_dir / "cortex+cb1.parquet").write_text("stub", encoding="utf-8")
+        (parquets_dir / "hippocampus+cb2.raw.parquet").write_text("stub", encoding="utf-8")
+
+        ws = Workspace(workspace_root)
+        assert ws.registered_codebooks() == ["cb1", "cb2"]
 
     def test_registered_codebooks_filters_by_rois(self, tmp_path: Path) -> None:
         workspace_root = tmp_path / "ws"

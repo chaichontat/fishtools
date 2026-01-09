@@ -7,6 +7,7 @@ import numpy as np
 import tifffile
 from click.testing import CliRunner
 
+from fishtools.io.workspace import get_metadata
 from fishtools.preprocess.cli import main as preprocess
 
 
@@ -129,9 +130,8 @@ def test_deconv_normalize_quantize(tmp_path: Path) -> None:
 
     output_path = workspace / "analysis" / "deconv" / f"{round_name}--{roi}" / float32_path.name
     assert output_path.exists()
-    sidecar = output_path.with_suffix(".deconv.json")
-    assert sidecar.exists()
-    meta = json.loads(sidecar.read_text())
+    assert not output_path.with_suffix(".deconv.json").exists()
+    meta = get_metadata(output_path)
     assert meta["deconv_round"] == round_name
     assert meta["deconv_mode"] == "u16"
     assert meta["deconv_n_fids"] == n_fids

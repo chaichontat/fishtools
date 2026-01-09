@@ -7,20 +7,22 @@ from typing import Any
 import numpy as np
 import tifffile
 
-from fishtools.preprocess.image_loader import DEFAULT_CHANNELS, ImageComponents, load_image_components
+from fishtools.preprocess.cli_register import Image
 
 
 def _build_waveform(powers: dict[str, float]) -> dict[str, Any]:
     waveform: dict[str, Any] = {}
-    for channel in DEFAULT_CHANNELS:
+    for channel in Image.CHANNELS:
         power = powers.get(channel[3:], 0.0)
         waveform[channel] = {"sequence": [1 if power else 0], "power": power}
     return waveform
 
 
 def test_load_image_components_basic(monkeypatch, tmp_path: Path) -> None:
-    workspace = tmp_path / "ws" / "analysis" / "deconv" / "round--roi"
-    workspace.mkdir(parents=True)
+    ws_root = tmp_path / "ws"
+    (ws_root / "analysis" / "deconv" / "round--roi").mkdir(parents=True)
+    (ws_root / "ws.DONE").touch()
+    workspace = ws_root / "analysis" / "deconv" / "round--roi"
     tiff_path = workspace / "geneA_geneB-0000.tif"
 
     img = np.arange(3 * 4 * 4, dtype=np.uint16).reshape(3, 4, 4)
@@ -47,26 +49,27 @@ def test_load_image_components_basic(monkeypatch, tmp_path: Path) -> None:
         def imagej_metadata(self) -> dict[str, Any]:
             return metadata
 
-    monkeypatch.setattr("fishtools.preprocess.image_loader.TiffFile", DummyTiff)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.TiffFile", DummyTiff)
 
-    scaling_dir = workspace.parent / "deconv_scaling"
+    scaling_dir = ws_root / "analysis" / "deconv_scaling"
     scaling_dir.mkdir(parents=True)
     np.savetxt(scaling_dir / "geneA_geneB.txt", np.ones((2, 2)))
 
-    components = load_image_components(tiff_path, image_size=4)
+    components = Image.from_file(tiff_path)
 
-    assert isinstance(components, ImageComponents)
     assert components.name == "geneA_geneB"
     assert components.idx == 0
     assert components.nofid.shape == (1, 2, 4, 4)
     assert list(components.bits) == ["geneA", "geneB"]
     assert components.powers == {"560": 2.0, "650": 3.0}
-    assert components.basic_loader() is None
+    assert components.basic() is None
 
 
 def test_load_image_components_discards(monkeypatch, tmp_path: Path) -> None:
-    workspace = tmp_path / "ws" / "analysis" / "deconv" / "round--roi"
-    workspace.mkdir(parents=True)
+    ws_root = tmp_path / "ws"
+    (ws_root / "analysis" / "deconv" / "round--roi").mkdir(parents=True)
+    (ws_root / "ws.DONE").touch()
+    workspace = ws_root / "analysis" / "deconv" / "round--roi"
     tiff_path = workspace / "geneA_geneB-0000.tif"
 
     img = np.arange(3 * 4 * 4, dtype=np.uint16).reshape(3, 4, 4)
@@ -93,16 +96,15 @@ def test_load_image_components_discards(monkeypatch, tmp_path: Path) -> None:
         def imagej_metadata(self) -> dict[str, Any]:
             return metadata
 
-    monkeypatch.setattr("fishtools.preprocess.image_loader.TiffFile", DummyTiff)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.TiffFile", DummyTiff)
 
-    scaling_dir = workspace.parent / "deconv_scaling"
+    scaling_dir = ws_root / "analysis" / "deconv_scaling"
     scaling_dir.mkdir(parents=True)
     np.savetxt(scaling_dir / "geneA_geneB.txt", np.ones((2, 2)))
 
-    components = load_image_components(
+    components = Image.from_file(
         tiff_path,
         discards={"geneA": ["geneA_geneB"]},
-        image_size=4,
     )
 
     assert components.nofid.shape == (1, 1, 4, 4)
@@ -120,7 +122,7 @@ def _build_prenorm_waveform(z_planes: int, n_fids: int) -> dict[str, Any]:
             }
         }
     }
-    for channel in DEFAULT_CHANNELS:
+    for channel in Image.CHANNELS:
         if channel == "ilm560" or channel == "ilm650" or channel == "ilm750":
             count = z_planes
             power = waveform["params"]["powers"][channel]
@@ -150,8 +152,10 @@ def _write_prenorm_tile(
 
 
 def test_load_image_components_prenormalized_uses_metadata_scaling(tmp_path: Path) -> None:
-    workspace = tmp_path / "ws" / "analysis" / "deconv" / "round--roi"
-    workspace.mkdir(parents=True)
+    ws_root = tmp_path / "ws"
+    (ws_root / "analysis" / "deconv" / "round--roi").mkdir(parents=True)
+    (ws_root / "ws.DONE").touch()
+    workspace = ws_root / "analysis" / "deconv" / "round--roi"
     tiff_path = workspace / "560_650_750-0000.tif"
 
     z_planes = 2
@@ -173,17 +177,20 @@ def test_load_image_components_prenormalized_uses_metadata_scaling(tmp_path: Pat
         metadata=metadata,
     )
 
-    components = load_image_components(tiff_path, n_fids=n_fids, image_size=image_size)
+    components = Image.from_file(tiff_path, n_fids=n_fids)
 
     assert components.metadata["prenormalized"] is True
     assert components.nofid.shape == (z_planes, 3, image_size, image_size)
-    expected = np.array([[0.1, 0.2, 0.3], [1.1, 1.2, 1.3]], dtype=np.float32)
-    np.testing.assert_allclose(components.global_deconv_scaling, expected)
+    assert components.global_deconv_scaling is None
+    assert components.metadata["deconv_min"] == [0.1, 0.2, 0.3]
+    assert components.metadata["deconv_scale"] == [1.1, 1.2, 1.3]
 
 
 def test_load_image_components_prenormalized_missing_metadata_defaults(tmp_path: Path) -> None:
-    workspace = tmp_path / "ws" / "analysis" / "deconv" / "round--roi"
-    workspace.mkdir(parents=True)
+    ws_root = tmp_path / "ws"
+    (ws_root / "analysis" / "deconv" / "round--roi").mkdir(parents=True)
+    (ws_root / "ws.DONE").touch()
+    workspace = ws_root / "analysis" / "deconv" / "round--roi"
     tiff_path = workspace / "560_650_750-0001.tif"
 
     z_planes = 2
@@ -203,13 +210,7 @@ def test_load_image_components_prenormalized_missing_metadata_defaults(tmp_path:
         metadata=metadata,
     )
 
-    components = load_image_components(tiff_path, n_fids=n_fids, image_size=image_size)
+    components = Image.from_file(tiff_path, n_fids=n_fids)
 
     assert components.metadata["prenormalized"] is True
-    np.testing.assert_allclose(
-        components.global_deconv_scaling,
-        np.array([
-            np.zeros(3, dtype=np.float32),
-            np.ones(3, dtype=np.float32),
-        ]),
-    )
+    assert components.global_deconv_scaling is None

@@ -110,15 +110,20 @@ def compute_polygon_metadata(seg_mask: np.ndarray, idx: int) -> pl.DataFrame:
             schema={
                 "polygon_id": pl.UInt32,
                 "label": pl.UInt32,
-                "area": pl.Float64,
-                "centroid_y": pl.Float64,
-                "centroid_x": pl.Float64,
+                "area": pl.Float32,
+                "centroid_y": pl.Float32,
+                "centroid_x": pl.Float32,
             }
         )
 
     df = df.rename({"centroid-0": "centroid_y", "centroid-1": "centroid_x"})
     df = df.with_row_index("polygon_id").select(["polygon_id", "label", "area", "centroid_y", "centroid_x"])
-    return df.with_columns(pl.col("polygon_id").cast(pl.UInt32))
+    return df.with_columns(
+        pl.col("polygon_id").cast(pl.UInt32),
+        pl.col("area").cast(pl.Float32),
+        pl.col("centroid_x").cast(pl.Float32),
+        pl.col("centroid_y").cast(pl.Float32),
+    )
 
 
 def _round_half_up(values: np.ndarray) -> np.ndarray:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 import matplotlib as mpl
@@ -19,8 +20,53 @@ from fishtools.plot.diagnostics.stitch import (
 )
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.logging import setup_cli_logging
+from fishtools.utils.plot import scatter_spots
 
 sns.set_theme()
+
+
+if TYPE_CHECKING:
+    import polars as pl
+
+
+def _overlay_spots(ax: plt.Axes, spots: "pl.DataFrame", *, max_points: int = 200_000) -> None:
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    scatter_spots(ax, spots, x_col="plot_x", y_col="plot_y", max_points=max_points)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+
+
+def _load_spots_final(ws: Workspace, rois: list[str], codebook: str) -> dict[str, "pl.DataFrame"]:
+    import polars as pl
+
+    spots_by_roi: dict[str, pl.DataFrame] = {}
+    for roi in rois:
+        parquet_path = ws.spots_parquet(roi, codebook, must_exist=False)
+        if not parquet_path.exists():
+            logger.warning(f"Spots parquet not found for ROI {roi}: {parquet_path}")
+            continue
+
+        schema = pl.scan_parquet(parquet_path).collect_schema()
+        if "y" in schema and "x" in schema:
+            x_col = "y"
+            y_col = "x"
+        elif "y_" in schema and "x_" in schema:
+            x_col = "y_"
+            y_col = "x_"
+        else:
+            raise click.ClickException(
+                f"Spots parquet {parquet_path} for ROI '{roi}' is missing required coordinates (x/y or x_/y_)."
+            )
+
+        df = pl.read_parquet(parquet_path, columns=[x_col, y_col]).select(
+            plot_x=pl.col(x_col),
+            plot_y=pl.col(y_col),
+        )
+        spots_by_roi[roi] = df
+        logger.debug(f"ROI='{roi}': loaded spots_final parquet {parquet_path} (n={df.height:,})")
+
+    return spots_by_roi
 
 
 @click.command("check-stitch")
@@ -77,6 +123,13 @@ sns.set_theme()
     show_default=True,
     help="Tile edge length in pixels. Coords are top-left; labels at centroid.",
 )
+@click.option(
+    "--spots",
+    "spots_codebook",
+    default=None,
+    metavar="CODEBOOK",
+    help="Overlay spots_final from analysis/output/parquets (ROI+CODEBOOK parquet) on the tile layout.",
+)
 def check_stitch(
     path: Path,
     rois: list[str] | None,
@@ -86,6 +139,7 @@ def check_stitch(
     per_roi: bool,
     label_skip: int,
     tile_size_px: int,
+    spots_codebook: str | None,
 ) -> None:
     """Visualize TileConfiguration layouts per ROI.
 
@@ -96,7 +150,7 @@ def check_stitch(
     setup_cli_logging(path, component="preprocess.check_stitch", file="check-stitch", extra={})
     logger.info(
         f"check-stitch: path={path}, rois={rois or 'ALL'}, cols={cols}, pixel_size_um={pixel_size_um}, "
-        f"per_roi={per_roi}, label_skip={label_skip}, tile_size_px={tile_size_px}"
+        f"per_roi={per_roi}, label_skip={label_skip}, tile_size_px={tile_size_px}, spots={spots_codebook}"
     )
 
     ws = Workspace(path)
@@ -133,15 +187,28 @@ def check_stitch(
     if all(tc is None for tc in tileconfigs.values()):
         raise click.ClickException("No TileConfiguration files found for requested ROIs.")
 
+    spots_by_roi = None
+    if spots_codebook is not None:
+        spots_by_roi = _load_spots_final(ws, roi_list, spots_codebook)
+        if not spots_by_roi:
+            logger.warning(f"No spots_final parquets loaded for codebook {spots_codebook}.")
+            spots_by_roi = None
+
     stitch_output_dir = output_dir / "stitch_layout"
     stitch_output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, _ = make_combined_stitch_layout(
+    fig, axes_by_roi = make_combined_stitch_layout(
         roi_list,
         tileconfigs,
         ncols=cols,
         options=options,
     )
+    if spots_by_roi is not None:
+        for roi, ax in axes_by_roi.items():
+            spots = spots_by_roi.get(roi)
+            if spots is None:
+                continue
+            _overlay_spots(ax, spots)
     combined = (stitch_output_dir / "stitch_layout_all.png").resolve()
     fig.savefig(combined.as_posix(), bbox_inches="tight")
     plt.close(fig)
@@ -153,6 +220,8 @@ def check_stitch(
             if tc is None:
                 continue
             fig_roi = make_roi_stitch_layout(tc, roi, options=options)
+            if spots_by_roi is not None and roi in spots_by_roi and fig_roi.axes:
+                _overlay_spots(fig_roi.axes[0], spots_by_roi[roi])
             out = (stitch_output_dir / f"stitch_layout--{roi}.png").resolve()
             fig_roi.savefig(out.as_posix(), bbox_inches="tight")
             plt.close(fig_roi)

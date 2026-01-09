@@ -20,7 +20,8 @@ class _Call:
 @pytest.fixture()
 def workspace(tmp_path: Path) -> Path:
     # Minimal structure required by optimize(): at least one registered folder
-    (tmp_path / "registered--roiA").mkdir(parents=True)
+    (tmp_path / "analysis/deconv/registered--roiA+cb").mkdir(parents=True)
+    (tmp_path / "workspace.DONE").write_text("ok\n", encoding="utf-8")
     return tmp_path
 
 

@@ -58,6 +58,43 @@ def test_pick_rotation_deg_returns_latest_slider_value(monkeypatch: pytest.Monke
     assert picker.deg == 10
 
 
+def test_pick_rotation_deg_flip_x_toggle_updates_picker_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fishtools.ccf.landmark_ui as ui
+
+    captured: dict[str, object] = {}
+    original_slider = ui.Slider
+    original_button = ui.Button
+
+    class CapturingSlider(original_slider):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            captured["slider"] = self
+
+    class CapturingButton(original_button):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            captured["button"] = self
+
+        def on_clicked(self, func):  # type: ignore[no-untyped-def]
+            captured["button_callback"] = func
+            return super().on_clicked(func)
+
+    def _show() -> None:
+        cb = captured.get("button_callback")
+        assert callable(cb)
+        cb(None)
+        fig = ui.plt.gcf()
+        ui.plt.close(fig)
+
+    monkeypatch.setattr(ui, "Slider", CapturingSlider)
+    monkeypatch.setattr(ui, "Button", CapturingButton)
+    monkeypatch.setattr(ui.plt, "show", _show)
+
+    moving = np.zeros((20, 20), dtype=np.float32)
+    picker = ui.pick_rotation_deg(moving_image_yx=moving, initial_deg=0, initial_flip_x=False)
+    assert picker.flip_x is True
+
+
 def test_pick_paired_landmarks_undo_button_click_removes_last_pair(monkeypatch: pytest.MonkeyPatch) -> None:
     import matplotlib.backend_bases
 

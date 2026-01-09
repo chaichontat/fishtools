@@ -76,6 +76,21 @@ def test_spots_simple_batch_writes_pickles_and_stitches(tmp_path: Path) -> None:
     for split in range(4):
         assert (decoded_dir / f"reg-0000-{split}.pkl").exists()
 
+    import pickle
+
+    _decoded, _morph, meta = pickle.loads((decoded_dir / "reg-0000-0.pkl").read_bytes())
+    assert meta["config"]["blob_detector"] == {
+        "min_sigma": 0.5,
+        "max_sigma": 1.5,
+        "num_sigma": 3,
+        "threshold": 0.1,
+        "overlap": 0.5,
+        "measurement_type": "mean",
+        "is_volume": True,
+        "detector_method": "blob_log",
+        "exclude_border": False,
+    }
+
     res = runner.invoke(
         spots_cli,
         [
@@ -135,3 +150,65 @@ def test_spots_simple_runs_one_tile(tmp_path: Path) -> None:
     decoded_dir = reg_dir / f"decoded-{codebook}"
     assert (decoded_dir / "reg-0000-0.pkl").exists()
     assert (decoded_dir / "reg-0000-3.pkl").exists()
+
+    import pickle
+
+    _decoded, _morph, meta = pickle.loads((decoded_dir / "reg-0000-0.pkl").read_bytes())
+    assert meta["config"]["blob_detector"] == {
+        "min_sigma": 0.5,
+        "max_sigma": 1.5,
+        "num_sigma": 3,
+        "threshold": 0.1,
+        "overlap": 0.5,
+        "measurement_type": "mean",
+        "is_volume": True,
+        "detector_method": "blob_log",
+        "exclude_border": False,
+    }
+
+
+def test_spots_simple_writes_empty_pickles_when_no_spots(tmp_path: Path) -> None:
+    deconv_dir = _make_workspace(tmp_path)
+    roi = "roiA"
+    codebook = "cb"
+
+    reg_dir = deconv_dir / f"registered--{roi}+{codebook}"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+
+    size = 1100
+    tile = np.zeros((1, 2, size, size), dtype=np.uint16)
+    path_tile = reg_dir / "reg-0000.tif"
+    safe_imwrite(
+        path_tile,
+        tile,
+        metadata={"axes": "ZCYX", "key": ["GeneA", "GeneB"]},
+    )
+
+    codebook_path = tmp_path / f"{codebook}.json"
+    codebook_path.write_text("{}")
+
+    runner = CliRunner()
+    res = runner.invoke(
+        spots_cli,
+        [
+            "simple",
+            str(path_tile),
+            "--codebook",
+            str(codebook_path),
+            "--tophat-radius",
+            "0",
+            "--blob-detector",
+            '{"min_sigma":0.5,"max_sigma":1.5,"num_sigma":3,"threshold":0.99,"measurement_type":"mean","is_volume":true}',
+        ],
+    )
+    assert res.exit_code == 0, res.output
+
+    decoded_dir = reg_dir / f"decoded-{codebook}"
+    for split in range(4):
+        assert (decoded_dir / f"reg-0000-{split}.pkl").exists()
+
+    from fishtools.analysis.spots import load_spots
+
+    df = load_spots(decoded_dir / "reg-0000-0.pkl", 0, tile_coords=(0.0, 0.0))
+    assert df.is_empty()
+    assert {"x", "y", "x_local", "y_local", "target", "tile"}.issubset(set(df.columns))

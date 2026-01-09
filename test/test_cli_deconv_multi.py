@@ -11,6 +11,8 @@ import pytest
 import tifffile
 import cupy as cp
 
+from fishtools.io.workspace import get_metadata
+
 pytestmark = pytest.mark.gpu
 
 
@@ -376,7 +378,6 @@ def test_filter_pending_files_uint16(tmp_path: Path):
     file_done.parent.mkdir(parents=True)
     file_done.touch()
     (existing_dir / file_done.name).touch()
-    (existing_dir / file_done.name).with_suffix(".deconv.json").touch()
 
     file_pending = tmp_path / "r1--roiB" / "r1-0002.tif"
     file_pending.parent.mkdir(parents=True)
@@ -418,7 +419,6 @@ def test_filter_pending_files_float32(tmp_path: Path):
     hist_dir.mkdir(parents=True, exist_ok=True)
     (hist_dir / file_done.name).touch()
     (hist_dir / file_done.name).with_suffix(".histogram.csv").touch()
-    (hist_dir / file_done.name).with_suffix(".deconv.json").touch()
 
     file_pending = tmp_path / "r2--roiA" / "r2-0002.tif"
     file_pending.touch()
@@ -498,6 +498,7 @@ def test_deconvolution_processor_dynamic_geometry(tmp_path: Path, monkeypatch):
         output_dir=output_dir,
         n_fids=0,
         step=6,
+        iters=3,
         mode=DeconvolutionOutputMode.F32,
         histogram_bins=16,
         m_glob=None,
@@ -514,16 +515,15 @@ def test_deconvolution_processor_dynamic_geometry(tmp_path: Path, monkeypatch):
 
     float32_path = output_dir.parent / "deconv32" / tile_dir.name / tile_path.name
     assert float32_path.exists()
-    sidecar = float32_path.with_suffix(".deconv.json")
-    assert sidecar.exists()
-    meta = json.loads(sidecar.read_text())
+    assert not float32_path.with_suffix(".deconv.json").exists()
+    meta = get_metadata(float32_path)
     assert meta["deconv_round"] == round_name
     assert meta["deconv_mode"] == "float32"
     assert meta["deconv_step"] == 6
     assert meta["deconv_histogram_bins"] == 16
     assert meta["deconv_n_fids"] == 0
     assert meta["deconv_algorithm"] == "lucyrichardson_guo"
-    assert meta["deconv_iters"] == 1
+    assert meta["deconv_iters"] == 3
     with tifffile.TiffFile(float32_path) as tif:
         arr = tif.asarray()
     assert arr.shape == (channels * 2, height, width)
@@ -733,6 +733,12 @@ def test_multi_run_end_to_end(minimal_workspace: tuple[Path, str, str], monkeypa
     f32_path = workspace / "analysis" / "deconv32" / f"{round_name}--{roi}" / f"{round_name}-0000.tif"
     assert u16_path.exists() or f32_path.exists()
     if u16_path.exists():
-        assert u16_path.with_suffix(".deconv.json").exists()
+        assert not u16_path.with_suffix(".deconv.json").exists()
+        meta = get_metadata(u16_path)
+        assert meta["deconv_mode"] == "u16"
+        assert "deconv_min" in meta
+        assert "deconv_scale" in meta
     if f32_path.exists():
-        assert f32_path.with_suffix(".deconv.json").exists()
+        assert not f32_path.with_suffix(".deconv.json").exists()
+        meta = get_metadata(f32_path)
+        assert meta["deconv_mode"] == "float32"

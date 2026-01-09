@@ -13,6 +13,8 @@ from fishtools.preprocess import n4
 def test_cli_field_only_writes_field_quick(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Arrange: workspace layout and a placeholder fused.zarr directory so path checks pass
     ws = tmp_path / "ws"
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "workspace.DONE").write_text("ok\n", encoding="utf-8")
     stitch_dir = ws / "analysis/deconv/stitch--roi+cb"
     stitch_dir.mkdir(parents=True)
     (stitch_dir / "fused.zarr").mkdir()
@@ -56,4 +58,3 @@ def test_cli_field_only_writes_field_quick(tmp_path: Path, monkeypatch: pytest.M
         assert field.shape[0] == 1 and field.shape[1:] == (12, 10)
     else:
         assert field.shape == (12, 10)
-
