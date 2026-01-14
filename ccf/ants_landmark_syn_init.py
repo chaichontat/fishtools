@@ -57,7 +57,9 @@ SYN_TYPE_OF_TRANSFORM = "SyNOnly"  # diffeomorphic non-rigid
 SYN_METRIC = "mattes"  # MI
 SYN_SAMPLING = 64
 SYN_REG_ITERATIONS = (300, 200, 100, 50)
-EDGE_GUARD_UM = 100.0  # erode masks to avoid edge-driven warps
+# Mask erosion guards (in µm). Fixed can stay conservative; moving should be looser for partial tissue.
+FIXED_EDGE_GUARD_UM = 100.0
+MOVING_EDGE_GUARD_UM = 20.0
 SYN_GRAD_STEP = 0.5
 SYN_FLOW_SIGMA = 1.0
 SYN_TOTAL_SIGMA = 0.0
@@ -377,8 +379,8 @@ if USE_N4:
 fixed_reg_sitk = normalize_sitk_intensity(fixed_reg_sitk)
 moving_reg_intensity_sitk = normalize_sitk_intensity(moving_reg_intensity_sitk)
 
-fixed_mask_sitk = erode_by_um(fixed_mask_sitk, EDGE_GUARD_UM)
-moving_mask_reg_sitk = erode_by_um(moving_mask_reg_sitk, EDGE_GUARD_UM)
+fixed_mask_sitk = erode_by_um(fixed_mask_sitk, FIXED_EDGE_GUARD_UM)
+moving_mask_reg_sitk = erode_by_um(moving_mask_reg_sitk, MOVING_EDGE_GUARD_UM)
 
 if USE_FEATURE_IMAGES:
     fixed_feat_sitk = gradmag_feature(fixed_reg_sitk, FEATURE_SIGMA_UM)
