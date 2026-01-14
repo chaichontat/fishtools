@@ -5,8 +5,8 @@
 # registration (diffeomorphic non-rigid warp) driven by Mattes mutual information.
 #
 # High level:
-# 1) Fit a landmark-driven linear transform (moving→fixed) using
-#    `ants.fit_transform_to_paired_points(...)` (swap fixed/moving points).
+# 1) Fit a landmark-driven linear transform (fixed→moving) using
+#    `ants.fit_transform_to_paired_points(...)`.
 # 2) Run diffeomorphic registration (SyN) initialized by that similarity, using MI.
 #
 # Outputs are written under:
