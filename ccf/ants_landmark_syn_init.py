@@ -56,13 +56,14 @@ STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.
 SYN_TYPE_OF_TRANSFORM = "SyNOnly"  # diffeomorphic non-rigid
 SYN_METRIC = "mattes"  # MI
 SYN_SAMPLING = 64
-SYN_REG_ITERATIONS = (300, 200, 100, 50)
+SYN_REG_ITERATIONS = (200, 100, 50, 20)
 # Mask erosion guards (in µm). Fixed can stay conservative; moving should be looser for partial tissue.
 FIXED_EDGE_GUARD_UM = 100.0
 MOVING_EDGE_GUARD_UM = 20.0
-SYN_GRAD_STEP = 0.5
-SYN_FLOW_SIGMA = 1.0
-SYN_TOTAL_SIGMA = 0.0
+# Regularize SyN to avoid over-warping on partial tissue / cross-modality mismatch.
+SYN_GRAD_STEP = 0.25
+SYN_FLOW_SIGMA = 3.0
+SYN_TOTAL_SIGMA = 1.0
 
 # Moving mask construction.
 # Otsu can be overly conservative on low-signal edges; for partial slices we prefer
