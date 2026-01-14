@@ -61,7 +61,9 @@ SYN_GRAD_STEP = 0.5
 SYN_FLOW_SIGMA = 1.0
 SYN_TOTAL_SIGMA = 0.0
 
-# Landmark-driven linear initialization (moving→fixed for image warping/registration).
+# Landmark-driven linear initialization.
+# NOTE: For ANTs image resampling (`ants.apply_transforms`) and `ants.registration(initial_transform=...)`,
+# the transform should map **fixed→moving** (the resampler internally pulls from the moving image).
 # "affine" often helps when the ROI is a partial/warped view relative to atlas space.
 LANDMARK_LINEAR_TRANSFORM_TYPE = "affine"  # "similarity" | "affine"
 
@@ -109,7 +111,7 @@ SAMPLE_ZARR = ws.stitch(ROI, STITCH_CODEBOOK) / "fused.zarr"
 SAMPLE_Z_IDX = int(p1.sample_z_idx) if p1.sample_z_idx is not None else 5
 SAMPLE_CHANNEL = p1.sample_channel or STITCH_CODEBOOK
 
-LINEAR_INIT_MAT_PATH = OUTDIR / f"init_{LANDMARK_LINEAR_TRANSFORM_TYPE}_moving2fixed_from_p1.mat"
+LINEAR_INIT_MAT_PATH = OUTDIR / f"init_{LANDMARK_LINEAR_TRANSFORM_TYPE}_fixed2moving_from_p1.mat"
 FIXED_NIFTI = OUTDIR / "fixed_atlas_crop.nii.gz"
 MOVING_NIFTI = OUTDIR / "moving_sample_crop.nii.gz"
 FIXED_MASK_NIFTI = OUTDIR / "fixed_mask_crop.nii.gz"
@@ -133,8 +135,12 @@ SYN_PREFIX = OUTDIR / "final_syn_mi_"
 WARPED_BEFORE_NIFTI = OUTDIR / "moving_warped_init.nii.gz"
 WARPED_AFTER_NIFTI = OUTDIR / "moving_warped_similarity_plus_syn.nii.gz"
 QC_PNG = OUTDIR / "similarity_plus_syn_qc.png"
+QC_MASKED_PNG = OUTDIR / "similarity_plus_syn_qc_masked.png"
 QC_ZOOM_PNG = OUTDIR / "similarity_plus_syn_qc_zoom.png"
+QC_ZOOM_MASKED_PNG = OUTDIR / "similarity_plus_syn_qc_zoom_masked.png"
 SUMMARY_JSON = OUTDIR / "similarity_plus_syn_summary.json"
+MOVING_MASK_WARPED_FINAL_NIFTI = OUTDIR / "moving_mask_warped_final.nii.gz"
+OVERLAP_MASK_FINAL_NIFTI = OUTDIR / "overlap_mask_final.nii.gz"
 
 # %% [markdown]
 # ## Helpers
@@ -147,9 +153,19 @@ def ants_numpy_yx(img: ants.ANTsImage) -> np.ndarray:
     return arr_xy.T
 
 
-def qc_overlay_png(*, fixed_img: ants.ANTsImage, moving_warped: ants.ANTsImage, out_png: Path, title: str) -> None:
+def qc_overlay_png(
+    *,
+    fixed_img: ants.ANTsImage,
+    moving_warped: ants.ANTsImage,
+    out_png: Path,
+    title: str,
+    moving_mask_fixed: ants.ANTsImage | None = None,
+) -> None:
     f = normalize_robust(ants_numpy_yx(fixed_img).astype(np.float32))
     m = normalize_robust(ants_numpy_yx(moving_warped).astype(np.float32))
+    if moving_mask_fixed is not None:
+        mask = ants_numpy_yx(moving_mask_fixed) > 0
+        m = m * mask.astype(np.float32)
     overlay = np.stack([f, m, f], axis=-1)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -172,13 +188,13 @@ def landmark_error_after_registration(
     *,
     moving_pts_mm: np.ndarray,
     fixed_pts_mm: np.ndarray,
-    invtransforms: list[str] | str,
+    fwdtransforms: list[str] | str,
 ) -> dict[str, float]:
-    inv_list = [invtransforms] if isinstance(invtransforms, str) else list(invtransforms)
+    fwd_list = [fwdtransforms] if isinstance(fwdtransforms, str) else list(fwdtransforms)
     df = pd.DataFrame(moving_pts_mm, columns=["x", "y"])
     df["z"] = 0.0
     df["t"] = 0.0
-    df_out = ants.apply_transforms_to_points(dim=2, points=df, transformlist=inv_list)
+    df_out = ants.apply_transforms_to_points(dim=2, points=df, transformlist=fwd_list)
     pred_fixed = df_out[["x", "y"]].to_numpy(dtype=np.float64)
     err = np.linalg.norm(pred_fixed - fixed_pts_mm, axis=1)
     return {
@@ -239,7 +255,7 @@ def normalize_sitk_intensity(img: sitk.Image) -> sitk.Image:
 
 
 # %% [markdown]
-# ## Phase 0: Load landmarks + fit linear init (moving→fixed)
+# ## Phase 0: Load landmarks + fit linear init (fixed→moving)
 
 # %%
 fixed_points_cropped_xy = p1.fixed_points_cropped_xy
@@ -270,15 +286,15 @@ if LANDMARK_LINEAR_TRANSFORM_TYPE not in {"similarity", "affine"}:
     )
 
 linear_init_tx = ants.fit_transform_to_paired_points(
-    moving_points=fixed_pts_mm,
-    fixed_points=moving_pts_mm,
+    moving_points=moving_pts_mm,
+    fixed_points=fixed_pts_mm,
     transform_type=LANDMARK_LINEAR_TRANSFORM_TYPE,
 )
 ants.write_transform(linear_init_tx, str(LINEAR_INIT_MAT_PATH))
 print(f"Wrote: {LINEAR_INIT_MAT_PATH}")
 
-pred_fixed = np.vstack([np.asarray(linear_init_tx.apply_to_point(tuple(p))) for p in moving_pts_mm])
-errs_lin_mm = np.linalg.norm(pred_fixed - fixed_pts_mm, axis=1)
+pred_moving = np.vstack([np.asarray(linear_init_tx.apply_to_point(tuple(p))) for p in fixed_pts_mm])
+errs_lin_mm = np.linalg.norm(pred_moving - moving_pts_mm, axis=1)
 rmse_lin_mm = float(np.sqrt(np.mean(errs_lin_mm**2)))
 max_lin_mm = float(errs_lin_mm.max())
 print(
@@ -502,13 +518,26 @@ warped_after = ants.apply_transforms(
 )
 ants.image_write(warped_after, str(WARPED_AFTER_NIFTI))
 
+moving_mask_final_in_fixed = ants.apply_transforms(
+    fixed=fixed_mask_ants,
+    moving=moving_mask_reg_ants,
+    transformlist=tx["fwdtransforms"],
+    interpolator="nearestNeighbor",
+)
+ants.image_write(moving_mask_final_in_fixed, str(MOVING_MASK_WARPED_FINAL_NIFTI))
+overlap_mask_final = fixed_mask_ants * moving_mask_final_in_fixed
+ants.image_write(overlap_mask_final, str(OVERLAP_MASK_FINAL_NIFTI))
+print(f"Wrote: {MOVING_MASK_WARPED_FINAL_NIFTI}")
+print(f"Wrote: {OVERLAP_MASK_FINAL_NIFTI}")
+print("Overlap frac after (fixed grid):", float((overlap_mask_final.numpy() > 0).mean()))
+
 mi_after = float(ants.image_mutual_information(fixed_ants, warped_after))
 print(f"MI after (init + SyN): {mi_after:.6f}")
 
 lm_err = landmark_error_after_registration(
     moving_pts_mm=moving_pts_mm,
     fixed_pts_mm=fixed_pts_mm,
-    invtransforms=tx["invtransforms"],
+    fwdtransforms=tx["fwdtransforms"],
 )
 print(f"Post-SyN landmark RMSE: {lm_err['rmse_mm'] * 1e3:.2f} µm (max {lm_err['max_mm'] * 1e3:.2f} µm)")
 
@@ -518,15 +547,30 @@ qc_overlay_png(
     out_png=QC_PNG,
     title=f"SyN(MI) | MI {mi_before:.3f}→{mi_after:.3f} | lm_rmse={lm_err['rmse_mm']*1e3:.1f} µm",
 )
+qc_overlay_png(
+    fixed_img=fixed_ants,
+    moving_warped=warped_after,
+    moving_mask_fixed=moving_mask_final_in_fixed,
+    out_png=QC_MASKED_PNG,
+    title=f"SyN(MI) (masked) | MI {mi_before:.3f}→{mi_after:.3f} | lm_rmse={lm_err['rmse_mm']*1e3:.1f} µm",
+)
 
 if fixed_crop_lower is not None and fixed_crop_upper is not None:
     fixed_zoom = ants.crop_indices(fixed_ants, fixed_crop_lower, fixed_crop_upper)
     moving_zoom = ants.crop_indices(warped_after, fixed_crop_lower, fixed_crop_upper)
+    mask_zoom = ants.crop_indices(moving_mask_final_in_fixed, fixed_crop_lower, fixed_crop_upper)
     qc_overlay_png(
         fixed_img=fixed_zoom,
         moving_warped=moving_zoom,
         out_png=QC_ZOOM_PNG,
         title=f"SyN(MI) zoom | MI {mi_before:.3f}→{mi_after:.3f} | lm_rmse={lm_err['rmse_mm']*1e3:.1f} µm",
+    )
+    qc_overlay_png(
+        fixed_img=fixed_zoom,
+        moving_warped=moving_zoom,
+        moving_mask_fixed=mask_zoom,
+        out_png=QC_ZOOM_MASKED_PNG,
+        title=f"SyN(MI) zoom (masked) | MI {mi_before:.3f}→{mi_after:.3f} | lm_rmse={lm_err['rmse_mm']*1e3:.1f} µm",
     )
 
 summary = {
@@ -573,16 +617,24 @@ summary = {
         "moving_landmark_heatmap_nifti": str(MOVING_LM_NIFTI) if USE_LANDMARK_HEATMAP_METRIC else None,
         "warped_before_nifti": str(WARPED_BEFORE_NIFTI),
         "warped_after_nifti": str(WARPED_AFTER_NIFTI),
+        "moving_mask_warped_final_nifti": str(MOVING_MASK_WARPED_FINAL_NIFTI),
+        "overlap_mask_final_nifti": str(OVERLAP_MASK_FINAL_NIFTI),
         "qc_png": str(QC_PNG),
+        "qc_masked_png": str(QC_MASKED_PNG),
         "qc_zoom_png": str(QC_ZOOM_PNG) if fixed_crop_lower is not None and fixed_crop_upper is not None else None,
+        "qc_zoom_masked_png": str(QC_ZOOM_MASKED_PNG) if fixed_crop_lower is not None and fixed_crop_upper is not None else None,
     },
 }
 SUMMARY_JSON.write_text(json.dumps(summary, indent=2))
 print(f"Wrote: {WARPED_BEFORE_NIFTI}")
 print(f"Wrote: {WARPED_AFTER_NIFTI}")
+print(f"Wrote: {MOVING_MASK_WARPED_FINAL_NIFTI}")
+print(f"Wrote: {OVERLAP_MASK_FINAL_NIFTI}")
 print(f"Wrote: {QC_PNG}")
+print(f"Wrote: {QC_MASKED_PNG}")
 if fixed_crop_lower is not None and fixed_crop_upper is not None:
     print(f"Wrote: {QC_ZOOM_PNG}")
+    print(f"Wrote: {QC_ZOOM_MASKED_PNG}")
 print(f"Wrote: {SUMMARY_JSON}")
 
 
