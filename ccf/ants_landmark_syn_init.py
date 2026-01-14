@@ -188,13 +188,15 @@ def landmark_error_after_registration(
     *,
     moving_pts_mm: np.ndarray,
     fixed_pts_mm: np.ndarray,
-    fwdtransforms: list[str] | str,
+    invtransforms: list[str] | str,
 ) -> dict[str, float]:
-    fwd_list = [fwdtransforms] if isinstance(fwdtransforms, str) else list(fwdtransforms)
+    inv_list = [invtransforms] if isinstance(invtransforms, str) else list(invtransforms)
     df = pd.DataFrame(moving_pts_mm, columns=["x", "y"])
     df["z"] = 0.0
     df["t"] = 0.0
-    df_out = ants.apply_transforms_to_points(dim=2, points=df, transformlist=fwd_list)
+    # Note: ANTs "forward transforms" are fixed→moving (point mapping), used for resampling moving into fixed.
+    # To map moving-space points into fixed space, use inverse transforms.
+    df_out = ants.apply_transforms_to_points(dim=2, points=df, transformlist=inv_list)
     pred_fixed = df_out[["x", "y"]].to_numpy(dtype=np.float64)
     err = np.linalg.norm(pred_fixed - fixed_pts_mm, axis=1)
     return {
@@ -405,6 +407,8 @@ print("Overlap frac (fixed grid):", float((overlap_mask_ants.numpy() > 0).mean()
 
 # Optionally crop the fixed registration target down to the overlap region to avoid
 # optimizer getting "stuck" because most of the fixed frame has no corresponding tissue.
+fixed_crop_lower = None
+fixed_crop_upper = None
 if CROP_FIXED_TO_OVERLAP:
     overlap_arr = overlap_mask_ants.numpy() > 0
     if np.any(overlap_arr):
@@ -414,25 +418,21 @@ if CROP_FIXED_TO_OVERLAP:
         pad = int(CROP_PAD_VOX)
         lo = [max(0, int(lo_x - pad)), max(0, int(lo_y - pad))]
         hi = [min(fixed_reg_ants.shape[0] - 1, int(hi_x + pad)), min(fixed_reg_ants.shape[1] - 1, int(hi_y + pad))]
-        upper = [hi[0] + 1, hi[1] + 1]
         fixed_crop_lower = lo
-        fixed_crop_upper = upper
-        fixed_reg_syn = ants.crop_indices(fixed_reg_ants, fixed_crop_lower, fixed_crop_upper)
-        fixed_mask_syn = ants.crop_indices(overlap_mask_ants, fixed_crop_lower, fixed_crop_upper)
-        ants.image_write(fixed_reg_syn, str(FIXED_REG_CROP_NIFTI))
-        ants.image_write(fixed_mask_syn, str(FIXED_MASK_CROP_NIFTI))
+        fixed_crop_upper = [hi[0] + 1, hi[1] + 1]
+
+        fixed_reg_crop = ants.crop_indices(fixed_reg_ants, fixed_crop_lower, fixed_crop_upper)
+        fixed_mask_crop = ants.crop_indices(overlap_mask_ants, fixed_crop_lower, fixed_crop_upper)
+        ants.image_write(fixed_reg_crop, str(FIXED_REG_CROP_NIFTI))
+        ants.image_write(fixed_mask_crop, str(FIXED_MASK_CROP_NIFTI))
         print(f"Wrote: {FIXED_REG_CROP_NIFTI}")
         print(f"Wrote: {FIXED_MASK_CROP_NIFTI}")
-    else:
-        fixed_crop_lower = None
-        fixed_crop_upper = None
-        fixed_reg_syn = fixed_reg_ants
-        fixed_mask_syn = overlap_mask_ants
-else:
-    fixed_crop_lower = None
-    fixed_crop_upper = None
-    fixed_reg_syn = fixed_reg_ants
-    fixed_mask_syn = overlap_mask_ants
+
+# IMPORTANT: do NOT run registration in the cropped fixed domain.
+# Cropping changes the fixed image origin, which makes the resulting transform misaligned
+# when later applied on the full fixed crop. Use a fixed-space overlap mask instead.
+fixed_reg_syn = fixed_reg_ants
+fixed_mask_syn = overlap_mask_ants
 
 # %% [markdown]
 # ## Phase 2: MI-based diffeomorphic refinement (SyN)
@@ -474,10 +474,7 @@ extras: list[tuple[str, ants.ANTsImage, ants.ANTsImage, float, int]] = []
 if USE_FEATURE_IMAGES:
     assert fixed_feat_ants is not None
     assert moving_feat_ants is not None
-    fixed_feat_reg = fixed_feat_ants
-    if fixed_crop_lower is not None and fixed_crop_upper is not None:
-        fixed_feat_reg = ants.crop_indices(fixed_feat_reg, fixed_crop_lower, fixed_crop_upper)
-    extras.append(("MeanSquares", fixed_feat_reg, moving_feat_ants, float(FEATURE_WEIGHT), 0))
+    extras.append(("MeanSquares", fixed_feat_ants, moving_feat_ants, float(FEATURE_WEIGHT), 0))
 
 if USE_MASK_DISTANCE_METRIC:
     fixed_dt_sitk = signed_distance(fixed_mask_sitk)
@@ -486,13 +483,11 @@ if USE_MASK_DISTANCE_METRIC:
     sitk.WriteImage(moving_dt_sitk, str(MOVING_DT_NIFTI))
     fixed_dt_ants = ants.image_read(str(FIXED_DT_NIFTI))
     moving_dt_ants = ants.image_read(str(MOVING_DT_NIFTI))
-    if fixed_crop_lower is not None and fixed_crop_upper is not None:
-        fixed_dt_ants = ants.crop_indices(fixed_dt_ants, fixed_crop_lower, fixed_crop_upper)
     extras.append(("MeanSquares", fixed_dt_ants, moving_dt_ants, float(MASK_DISTANCE_WEIGHT), 0))
 
 if USE_LANDMARK_HEATMAP_METRIC:
     fixed_lm = landmark_heatmap_from_points_mm(
-        domain_img=fixed_reg_syn,
+        domain_img=fixed_reg_ants,
         points_mm=fixed_pts_mm,
         sigma_um=LANDMARK_HEATMAP_SIGMA_UM,
     )
@@ -537,7 +532,7 @@ print(f"MI after (init + SyN): {mi_after:.6f}")
 lm_err = landmark_error_after_registration(
     moving_pts_mm=moving_pts_mm,
     fixed_pts_mm=fixed_pts_mm,
-    fwdtransforms=tx["fwdtransforms"],
+    invtransforms=tx["invtransforms"],
 )
 print(f"Post-SyN landmark RMSE: {lm_err['rmse_mm'] * 1e3:.2f} µm (max {lm_err['max_mm'] * 1e3:.2f} µm)")
 
