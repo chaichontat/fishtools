@@ -115,9 +115,9 @@ CROP_FIXED_TO_OVERLAP = True
 CROP_PAD_VOX = 24
 
 # Dilate the fixed mask into the background so MI penalizes moving tissue spilling into fixed "void".
-FIXED_METRIC_MASK_DILATE_UM = 100.0
+FIXED_METRIC_MASK_DILATE_UM = 75.0
 # Dilate the moving mask into the background so MI penalizes fixed tissue "void" mismatch too.
-MOVING_METRIC_MASK_DILATE_UM = 100.0
+MOVING_METRIC_MASK_DILATE_UM = 75.0
 
 # Landmark injection (as an extra image metric via Gaussian heatmaps)
 USE_LANDMARK_HEATMAP_METRIC = True
@@ -200,6 +200,15 @@ QC_MASKED_PNG = OUTDIR / "similarity_plus_syn_qc_masked.png"
 QC_ZOOM_PNG = OUTDIR / "similarity_plus_syn_qc_zoom.png"
 QC_ZOOM_MASKED_PNG = OUTDIR / "similarity_plus_syn_qc_zoom_masked.png"
 QC_MOVING_BBOX_PNG = OUTDIR / "moving_before_after_bbox.png"
+DEFORMATION_FIELD_PNG = OUTDIR / "final_syn_mi_deformation_field.png"
+# Deformation field plotting controls.
+# Constraint: do not downsample the moving crop more than 16x relative to fused.zarr.
+DEFORMATION_BG_MAX_DIM = 4096
+DEFORMATION_FIELD_MAX_DIM = 1024
+DEFORMATION_MAX_DOWNSAMPLE = 16.0
+DEFORMATION_QUIVER_STEP = 12
+DEFORMATION_SAVE_DPI = 300
+DEFORMATION_MAX_FIG_IN = 18.0
 SUMMARY_JSON = OUTDIR / "similarity_plus_syn_summary.json"
 MOVING_MASK_WARPED_FINAL_NIFTI = OUTDIR / "moving_mask_warped_final.nii.gz"
 MOVING_MASK_METRIC_WARPED_FINAL_NIFTI = OUTDIR / "moving_mask_metric_warped_final.nii.gz"
@@ -362,6 +371,41 @@ def _pearson_corr(a: np.ndarray, b: np.ndarray) -> float:
     if denom == 0.0:
         return float("nan")
     return float(np.sum(a0 * b0) / denom)
+
+
+def _as_transform_list(transforms: list[str] | str) -> list[str]:
+    if isinstance(transforms, str):
+        return [transforms]
+    return list(transforms)
+
+
+def _resample_for_plot(
+    img: ants.ANTsImage, *, max_dim: int, max_downsample: float, interp_type: int
+) -> ants.ANTsImage:
+    max_dim = int(max_dim)
+    max_downsample = float(max_downsample)
+    interp_type = int(interp_type)
+    if max_dim <= 0:
+        raise ValueError(f"max_dim must be > 0, got {max_dim}.")
+    if max_downsample < 1:
+        raise ValueError(f"max_downsample must be >= 1, got {max_downsample}.")
+    if interp_type not in (0, 1):
+        raise ValueError(f"interp_type must be 0(nearest) or 1(linear), got {interp_type}.")
+
+    in_max_dim = max(int(img.shape[0]), int(img.shape[1]))
+    if in_max_dim <= 0:
+        raise ValueError(f"Invalid image shape: {img.shape}.")
+
+    desired_factor = in_max_dim / float(max_dim)
+    scale = min(max_downsample, max(1.0, desired_factor))
+    if scale == 1.0:
+        return img
+
+    out_shape = (
+        max(32, int(round(img.shape[0] / scale))),
+        max(32, int(round(img.shape[1] / scale))),
+    )
+    return ants.resample_image(img, out_shape, use_voxels=True, interp_type=interp_type)
 
 
 # %% [markdown]
@@ -833,6 +877,137 @@ if extras:
 
 tx = ants.registration(**kwargs)
 
+# --- Deformation field plot (SyN residual vs init), shown in MOVING domain ---
+# User request: use the moving image as background and plot the inverse-direction field.
+# For visualization, use the native-res moving crop (no more than 16x downsample vs fused.zarr).
+moving_plot = moving_ants
+moving_bg_ds = _resample_for_plot(
+    moving_plot,
+    max_dim=DEFORMATION_BG_MAX_DIM,
+    max_downsample=DEFORMATION_MAX_DOWNSAMPLE,
+    interp_type=1,
+)
+moving_field_ds = _resample_for_plot(
+    moving_plot,
+    max_dim=DEFORMATION_FIELD_MAX_DIM,
+    max_downsample=DEFORMATION_MAX_DOWNSAMPLE,
+    interp_type=1,
+)
+
+size_x, size_y = moving_field_ds.shape
+origin_x_mm, origin_y_mm = moving_field_ds.origin
+spacing_x_mm, spacing_y_mm = moving_field_ds.spacing
+xs_mm = origin_x_mm + np.arange(size_x, dtype=np.float64) * float(spacing_x_mm)
+ys_mm = origin_y_mm + np.arange(size_y, dtype=np.float64) * float(spacing_y_mm)
+grid_x_mm, grid_y_mm = np.meshgrid(xs_mm, ys_mm, indexing="xy")
+df_grid = pd.DataFrame({"x": grid_x_mm.ravel(), "y": grid_y_mm.ravel(), "z": 0.0, "t": 0.0})
+
+# Inverse mapping: moving → fixed.
+inv_list = _as_transform_list(tx["invtransforms"])
+df_final_inv = ants.apply_transforms_to_points(dim=2, points=df_grid, transformlist=inv_list)
+
+# Baseline inverse mapping corresponding to the init (linear, or optional affine-refine if enabled).
+if USE_AFFINE_REFINE and tx_affine_refine is not None and affine_refine_applied:
+    init_inv_list = _as_transform_list(tx_affine_refine["invtransforms"])
+    df_init_inv = ants.apply_transforms_to_points(dim=2, points=df_grid, transformlist=init_inv_list)
+else:
+    init_list = _as_transform_list(initial_transform_for_syn)
+    whichtoinvert: list[bool] = []
+    for path in init_list:
+        suffix = Path(path).suffix.lower()
+        if suffix == ".mat":
+            whichtoinvert.append(True)
+        else:
+            raise ValueError(
+                f"Cannot invert init transform {path!r} (suffix {suffix!r}). "
+                "Expected a matrix transform ('.mat') or enable affine refine."
+            )
+    df_init_inv = ants.apply_transforms_to_points(
+        dim=2,
+        points=df_grid,
+        transformlist=init_list,
+        whichtoinvert=whichtoinvert,
+    )
+
+dx_mm = (df_final_inv["x"].to_numpy(dtype=np.float64) - df_init_inv["x"].to_numpy(dtype=np.float64)).reshape(
+    (size_y, size_x)
+)
+dy_mm = (df_final_inv["y"].to_numpy(dtype=np.float64) - df_init_inv["y"].to_numpy(dtype=np.float64)).reshape(
+    (size_y, size_x)
+)
+mag_um = np.sqrt(dx_mm**2 + dy_mm**2) / UM_TO_MM
+
+# Resample displacement components + magnitude to the background grid for display.
+dx_img = ants.from_numpy(
+    dx_mm.T.astype(np.float32, copy=False),
+    origin=moving_field_ds.origin,
+    spacing=moving_field_ds.spacing,
+    direction=moving_field_ds.direction,
+)
+dy_img = ants.from_numpy(
+    dy_mm.T.astype(np.float32, copy=False),
+    origin=moving_field_ds.origin,
+    spacing=moving_field_ds.spacing,
+    direction=moving_field_ds.direction,
+)
+mag_img = ants.from_numpy(
+    mag_um.T.astype(np.float32, copy=False),
+    origin=moving_field_ds.origin,
+    spacing=moving_field_ds.spacing,
+    direction=moving_field_ds.direction,
+)
+dx_bg = ants.resample_image_to_target(dx_img, moving_bg_ds, interp_type=1)
+dy_bg = ants.resample_image_to_target(dy_img, moving_bg_ds, interp_type=1)
+mag_bg = ants.resample_image_to_target(mag_img, moving_bg_ds, interp_type=1)
+
+dx_bg_mm = np.asarray(dx_bg.numpy(), dtype=np.float32).T
+dy_bg_mm = np.asarray(dy_bg.numpy(), dtype=np.float32).T
+mag_bg_um = np.asarray(mag_bg.numpy(), dtype=np.float32).T
+
+bg_spacing_x_mm, bg_spacing_y_mm = moving_bg_ds.spacing
+dx_bg_px = dx_bg_mm / float(bg_spacing_x_mm)
+dy_bg_px = dy_bg_mm / float(bg_spacing_y_mm)
+
+scale_ratio = float(moving_bg_ds.shape[0]) / float(moving_field_ds.shape[0])
+step_bg = max(1, int(round(float(DEFORMATION_QUIVER_STEP) * scale_ratio)))
+yy, xx = np.mgrid[0 : mag_bg_um.shape[0] : step_bg, 0 : mag_bg_um.shape[1] : step_bg]
+u = dx_bg_px[::step_bg, ::step_bg]
+v = dy_bg_px[::step_bg, ::step_bg]
+max_disp_px = float(np.sqrt(u**2 + v**2).max())
+desired_max_len = step_bg * 0.8
+quiver_scale = max_disp_px / desired_max_len if max_disp_px > 0 else 1.0
+
+fig_w_in = min(float(DEFORMATION_MAX_FIG_IN), max(10.0, float(moving_bg_ds.shape[0]) / float(DEFORMATION_SAVE_DPI)))
+fig_h_in = fig_w_in * (float(moving_bg_ds.shape[1]) / float(moving_bg_ds.shape[0]))
+fig, ax = plt.subplots(figsize=(fig_w_in, fig_h_in))
+bg = normalize_robust(ants_numpy_yx(moving_bg_ds).astype(np.float32))
+if bg.shape != mag_bg_um.shape:
+    raise ValueError(f"Unexpected bg shape {bg.shape} vs mag {mag_bg_um.shape}.")
+ax.imshow(bg, cmap="gray", interpolation="bilinear")
+im = ax.imshow(mag_bg_um, cmap="magma", alpha=0.35, interpolation="bilinear")
+fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="|displacement| (µm)")
+mask_u = bg[::step_bg, ::step_bg] > 0.03
+u_plot = np.ma.masked_where(~mask_u, u)
+v_plot = np.ma.masked_where(~mask_u, v)
+ax.quiver(
+    xx,
+    yy,
+    u_plot,
+    v_plot,
+    color="cyan",
+    angles="xy",
+    scale_units="xy",
+    scale=quiver_scale,
+    width=0.0022,
+    alpha=0.75,
+)
+ax.set_title("SyN inverse displacement field (residual vs init, moving domain)")
+ax.axis("off")
+plt.tight_layout()
+plt.savefig(DEFORMATION_FIELD_PNG, dpi=int(DEFORMATION_SAVE_DPI))
+plt.close(fig)
+print(f"Wrote: {DEFORMATION_FIELD_PNG}")
+
 warped_after = ants.apply_transforms(
     fixed=fixed_ants,
     moving=moving_ants,
@@ -1038,6 +1213,7 @@ summary = {
     "mask_distance_use_overlap": MASK_DISTANCE_USE_OVERLAP if USE_MASK_DISTANCE_METRIC else None,
     "fixed_metric_mask_dilate_um": FIXED_METRIC_MASK_DILATE_UM,
     "moving_metric_mask_dilate_um": MOVING_METRIC_MASK_DILATE_UM,
+    "deformation_field_png": str(DEFORMATION_FIELD_PNG),
     "use_landmark_heatmap_metric": USE_LANDMARK_HEATMAP_METRIC,
     "landmark_heatmap_sigma_um": LANDMARK_HEATMAP_SIGMA_UM if USE_LANDMARK_HEATMAP_METRIC else None,
     "landmark_heatmap_weight": LANDMARK_HEATMAP_WEIGHT if USE_LANDMARK_HEATMAP_METRIC else None,
@@ -1066,6 +1242,7 @@ summary = {
         "fixed_metric_mask_nifti": str(FIXED_METRIC_MASK_NIFTI),
         "moving_metric_mask_nifti": str(MOVING_METRIC_MASK_NIFTI),
         "overlap_mask_nifti": str(OVERLAP_MASK_NIFTI),
+        "deformation_field_png": str(DEFORMATION_FIELD_PNG),
         "fixed_reg_nifti": str(FIXED_REG_NIFTI),
         "moving_reg_nifti": str(MOVING_REG_NIFTI),
         "fixed_reg_raw_nifti": str(FIXED_REG_RAW_NIFTI),
