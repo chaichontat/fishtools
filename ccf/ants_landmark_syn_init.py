@@ -32,6 +32,7 @@ from fishtools.ccf.sitk_utils import (
     UM_TO_MM,
     erode_by_um,
     gradmag_feature,
+    largest_cc,
     make_moving_mask_sitk,
     normalize_robust,
     resample_sitk_to_spacing,
@@ -60,6 +61,11 @@ EDGE_GUARD_UM = 100.0  # erode masks to avoid edge-driven warps
 SYN_GRAD_STEP = 0.5
 SYN_FLOW_SIGMA = 1.0
 SYN_TOTAL_SIGMA = 0.0
+
+# Moving mask construction.
+# Otsu can be overly conservative on low-signal edges; for partial slices we prefer
+# using the full nonzero support (after robust normalization) as the mask domain.
+MOVING_MASK_NONZERO = True
 
 # Landmark-driven linear initialization.
 # NOTE: For ANTs image resampling (`ants.apply_transforms`) and `ants.registration(initial_transform=...)`,
@@ -256,6 +262,13 @@ def normalize_sitk_intensity(img: sitk.Image) -> sitk.Image:
     return out
 
 
+def moving_mask_from_nonzero(img: sitk.Image) -> sitk.Image:
+    mask = sitk.Cast(img > 0, sitk.sitkUInt8)
+    mask = sitk.BinaryMorphologicalClosing(mask, [3, 3])
+    mask = sitk.BinaryFillhole(mask)
+    return largest_cc(mask)
+
+
 # %% [markdown]
 # ## Phase 0: Load landmarks + fit linear init (fixed→moving)
 
@@ -338,7 +351,9 @@ fixed_sitk = sitk_from_numpy_2d(normalize_robust(fixed_np), spacing_um=ATLAS_VOX
 moving_sitk = sitk_from_numpy_2d(normalize_robust(moving_np), spacing_um=SAMPLE_VOXEL_XY_UM)
 fixed_mask_sitk = sitk_from_numpy_2d(fixed_mask_np.astype(np.float32), spacing_um=ATLAS_VOXEL_UM) > 0
 moving_reg_sitk = resample_sitk_to_spacing(moving_sitk, target_spacing_um=ATLAS_VOXEL_UM, interp=sitk.sitkLinear)
-moving_mask_reg_seed_sitk = make_moving_mask_sitk(moving_reg_sitk)
+moving_mask_reg_seed_sitk = (
+    moving_mask_from_nonzero(moving_reg_sitk) if MOVING_MASK_NONZERO else make_moving_mask_sitk(moving_reg_sitk)
+)
 moving_mask_reg_sitk = moving_mask_reg_seed_sitk
 
 fixed_reg_sitk = fixed_sitk
@@ -353,7 +368,11 @@ if USE_N4:
     moving_reg_intensity_sitk = n4_correct_sitk(
         img=moving_reg_intensity_sitk, mask=moving_mask_reg_seed_sitk, max_iters=N4_MAX_ITERATIONS
     )
-    moving_mask_reg_sitk = make_moving_mask_sitk(moving_reg_intensity_sitk)
+    moving_mask_reg_sitk = (
+        moving_mask_from_nonzero(moving_reg_intensity_sitk)
+        if MOVING_MASK_NONZERO
+        else make_moving_mask_sitk(moving_reg_intensity_sitk)
+    )
 
 fixed_reg_sitk = normalize_sitk_intensity(fixed_reg_sitk)
 moving_reg_intensity_sitk = normalize_sitk_intensity(moving_reg_intensity_sitk)
