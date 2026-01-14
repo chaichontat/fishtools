@@ -25,8 +25,8 @@ import pandas as pd
 import SimpleITK as sitk
 import zarr
 from brainglobe_atlasapi import BrainGlobeAtlas
-from scipy.ndimage import rotate as ndimage_rotate
 from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import rotate as ndimage_rotate
 
 from fishtools.ccf.landmark import LandmarkRegistrationOutputs
 from fishtools.ccf.sitk_utils import (
@@ -57,7 +57,7 @@ STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.
 # hard-code CC as the deformable metric.
 SYN_TYPE_OF_TRANSFORM = "SyNOnly"  # diffeomorphic non-rigid
 SYN_METRIC = "mattes"  # MI
-SYN_SAMPLING = 32
+SYN_SAMPLING = 48
 SYN_REG_ITERATIONS = (300, 150, 70, 30)
 # Mask erosion guards (in µm). Fixed can stay conservative; moving should be looser for partial tissue.
 FIXED_EDGE_GUARD_UM = 0.0
@@ -65,8 +65,8 @@ FIXED_EDGE_GUARD_UM = 0.0
 MOVING_EDGE_GUARD_UM = 0.0
 # Regularize SyN to avoid over-warping on partial tissue / cross-modality mismatch.
 SYN_GRAD_STEP = 0.15
-SYN_FLOW_SIGMA = 3
-SYN_TOTAL_SIGMA = 1
+SYN_FLOW_SIGMA = 4
+SYN_TOTAL_SIGMA = 1.5
 
 # Optional moving-image pre-smoothing before normalization/feature construction (helps noisy partial tissue).
 MOVING_PRESMOOTH_SIGMA_UM = 30.0
