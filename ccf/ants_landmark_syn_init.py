@@ -31,6 +31,7 @@ from scipy.ndimage import distance_transform_edt
 from fishtools.ccf.landmark import LandmarkRegistrationOutputs
 from fishtools.ccf.sitk_utils import (
     UM_TO_MM,
+    dilate_by_um,
     erode_by_um,
     gradmag_feature,
     largest_cc,
@@ -64,7 +65,7 @@ FIXED_EDGE_GUARD_UM = 0.0
 MOVING_EDGE_GUARD_UM = 0.0
 # Regularize SyN to avoid over-warping on partial tissue / cross-modality mismatch.
 SYN_GRAD_STEP = 0.15
-SYN_FLOW_SIGMA = 2.5
+SYN_FLOW_SIGMA = 3
 SYN_TOTAL_SIGMA = 1
 
 # Optional moving-image pre-smoothing before normalization/feature construction (helps noisy partial tissue).
@@ -112,6 +113,11 @@ MASK_DISTANCE_USE_OVERLAP = False
 # Crop the fixed image to where the warped moving mask lands (helps partial-overlap registration).
 CROP_FIXED_TO_OVERLAP = True
 CROP_PAD_VOX = 24
+
+# Dilate the fixed mask into the background so MI penalizes moving tissue spilling into fixed "void".
+FIXED_METRIC_MASK_DILATE_UM = 100.0
+# Dilate the moving mask into the background so MI penalizes fixed tissue "void" mismatch too.
+MOVING_METRIC_MASK_DILATE_UM = 100.0
 
 # Landmark injection (as an extra image metric via Gaussian heatmaps)
 USE_LANDMARK_HEATMAP_METRIC = True
@@ -166,8 +172,10 @@ FIXED_NIFTI = OUTDIR / "fixed_atlas_crop.nii.gz"
 MOVING_NIFTI = OUTDIR / "moving_sample_crop.nii.gz"
 FIXED_MASK_NIFTI = OUTDIR / "fixed_mask_crop.nii.gz"
 FIXED_MASK_ORIG_NIFTI = OUTDIR / "fixed_mask_crop_orig.nii.gz"
+FIXED_METRIC_MASK_NIFTI = OUTDIR / "fixed_mask_metric_dilated.nii.gz"
 MOVING_MASK_NIFTI = OUTDIR / "moving_mask_crop.nii.gz"
 MOVING_MASK_REG_FULL_NIFTI = OUTDIR / "moving_mask_reg_full.nii.gz"
+MOVING_METRIC_MASK_NIFTI = OUTDIR / "moving_mask_metric_dilated.nii.gz"
 OVERLAP_MASK_NIFTI = OUTDIR / "overlap_mask_eroded.nii.gz"
 MOVING_REG_RAW_NIFTI = OUTDIR / "moving_sample_crop_reg_raw.nii.gz"
 FIXED_REG_RAW_NIFTI = OUTDIR / "fixed_reg_raw.nii.gz"
@@ -538,6 +546,11 @@ save_debug_thumbnail(overlay, OUTDIR / "debug_moving_mask_overlay.png", "Mask ov
 fixed_mask_sitk = erode_by_um(fixed_mask_sitk, FIXED_EDGE_GUARD_UM)
 moving_mask_reg_full_sitk = moving_mask_reg_sitk
 moving_mask_reg_sitk = erode_by_um(moving_mask_reg_full_sitk, MOVING_EDGE_GUARD_UM)
+moving_metric_mask_sitk = (
+    dilate_by_um(moving_mask_reg_full_sitk, MOVING_METRIC_MASK_DILATE_UM)
+    if MOVING_METRIC_MASK_DILATE_UM > 0
+    else moving_mask_reg_full_sitk
+)
 
 if USE_FEATURE_IMAGES:
     fixed_feat_sitk = gradmag_feature(fixed_reg_sitk, FEATURE_SIGMA_UM)
@@ -566,7 +579,28 @@ sitk.WriteImage(fixed_sitk, str(FIXED_NIFTI))
 sitk.WriteImage(moving_sitk, str(MOVING_NIFTI))
 sitk.WriteImage(sitk.Cast(fixed_mask_orig_sitk, sitk.sitkUInt8), str(FIXED_MASK_ORIG_NIFTI))
 sitk.WriteImage(sitk.Cast(fixed_mask_sitk, sitk.sitkUInt8), str(FIXED_MASK_NIFTI))
+fixed_metric_mask_sitk = (
+    dilate_by_um(fixed_mask_orig_sitk, FIXED_METRIC_MASK_DILATE_UM)
+    if FIXED_METRIC_MASK_DILATE_UM > 0
+    else fixed_mask_orig_sitk
+)
+sitk.WriteImage(sitk.Cast(fixed_metric_mask_sitk, sitk.sitkUInt8), str(FIXED_METRIC_MASK_NIFTI))
+save_debug_thumbnail(
+    sitk.GetArrayFromImage(fixed_metric_mask_sitk).astype(np.float32),
+    OUTDIR / "debug_fixed_metric_mask.png",
+    f"Fixed metric mask (dilate_um={FIXED_METRIC_MASK_DILATE_UM:g})",
+    vmin=0.0,
+    vmax=1.0,
+)
 sitk.WriteImage(sitk.Cast(moving_mask_reg_full_sitk, sitk.sitkUInt8), str(MOVING_MASK_REG_FULL_NIFTI))
+sitk.WriteImage(sitk.Cast(moving_metric_mask_sitk, sitk.sitkUInt8), str(MOVING_METRIC_MASK_NIFTI))
+save_debug_thumbnail(
+    sitk.GetArrayFromImage(moving_metric_mask_sitk).astype(np.float32),
+    OUTDIR / "debug_moving_metric_mask.png",
+    f"Moving metric mask (dilate_um={MOVING_METRIC_MASK_DILATE_UM:g})",
+    vmin=0.0,
+    vmax=1.0,
+)
 sitk.WriteImage(sitk.Cast(moving_mask_reg_sitk, sitk.sitkUInt8), str(MOVING_MASK_REG_NIFTI))
 
 if USE_FEATURE_IMAGES:
@@ -579,8 +613,10 @@ fixed_ants = ants.image_read(str(FIXED_NIFTI))
 moving_ants = ants.image_read(str(MOVING_NIFTI))
 fixed_mask_ants = ants.image_read(str(FIXED_MASK_NIFTI))
 fixed_mask_orig_ants = ants.image_read(str(FIXED_MASK_ORIG_NIFTI))
+fixed_metric_mask_ants = ants.image_read(str(FIXED_METRIC_MASK_NIFTI))
 moving_mask_reg_ants = ants.image_read(str(MOVING_MASK_REG_NIFTI))
 moving_mask_reg_full_ants = ants.image_read(str(MOVING_MASK_REG_FULL_NIFTI))
+moving_metric_mask_ants = ants.image_read(str(MOVING_METRIC_MASK_NIFTI))
 fixed_reg_ants = ants.image_read(str(FIXED_REG_NIFTI))
 moving_reg_ants = ants.image_read(str(MOVING_REG_NIFTI))
 fixed_feat_ants = ants.image_read(str(FIXED_FEAT_NIFTI)) if USE_FEATURE_IMAGES else None
@@ -594,7 +630,7 @@ initial_transform_for_syn: list[str] = [str(LINEAR_INIT_MAT_PATH)]
 # and let ANTs compute the overlap dynamically as the transform updates.
 moving_mask_in_fixed = ants.apply_transforms(
     fixed=fixed_mask_orig_ants,
-    moving=moving_mask_reg_full_ants,
+    moving=moving_metric_mask_ants if MOVING_METRIC_MASK_DILATE_UM > 0 else moving_mask_reg_full_ants,
     transformlist=initial_transform_for_syn,
     interpolator="nearestNeighbor",
 )
@@ -688,7 +724,7 @@ if CROP_FIXED_TO_OVERLAP:
 # (Cropping is fine in principle if physical coordinates are preserved, but keeping a single
 # fixed reference simplifies transform application/QC on the full atlas crop.)
 fixed_reg_syn = fixed_reg_ants
-fixed_mask_syn = fixed_mask_orig_ants
+fixed_mask_syn = fixed_metric_mask_ants
 
 # %% [markdown]
 # ## Phase 2: MI-based diffeomorphic refinement (SyN)
@@ -717,7 +753,7 @@ kwargs: dict[str, object] = dict(
     syn_sampling=SYN_SAMPLING,
     reg_iterations=SYN_REG_ITERATIONS,
     mask=fixed_mask_syn,
-    moving_mask=moving_mask_reg_full_ants,
+    moving_mask=moving_metric_mask_ants,
     mask_all_stages=True,
     random_seed=0,
     write_composite_transform=True,
@@ -1000,6 +1036,8 @@ summary = {
     "use_mask_distance_metric": USE_MASK_DISTANCE_METRIC,
     "mask_distance_weight": MASK_DISTANCE_WEIGHT if USE_MASK_DISTANCE_METRIC else None,
     "mask_distance_use_overlap": MASK_DISTANCE_USE_OVERLAP if USE_MASK_DISTANCE_METRIC else None,
+    "fixed_metric_mask_dilate_um": FIXED_METRIC_MASK_DILATE_UM,
+    "moving_metric_mask_dilate_um": MOVING_METRIC_MASK_DILATE_UM,
     "use_landmark_heatmap_metric": USE_LANDMARK_HEATMAP_METRIC,
     "landmark_heatmap_sigma_um": LANDMARK_HEATMAP_SIGMA_UM if USE_LANDMARK_HEATMAP_METRIC else None,
     "landmark_heatmap_weight": LANDMARK_HEATMAP_WEIGHT if USE_LANDMARK_HEATMAP_METRIC else None,
@@ -1025,6 +1063,8 @@ summary = {
         "fixed_nifti": str(FIXED_NIFTI),
         "moving_nifti": str(MOVING_NIFTI),
         "fixed_mask_orig_nifti": str(FIXED_MASK_ORIG_NIFTI),
+        "fixed_metric_mask_nifti": str(FIXED_METRIC_MASK_NIFTI),
+        "moving_metric_mask_nifti": str(MOVING_METRIC_MASK_NIFTI),
         "overlap_mask_nifti": str(OVERLAP_MASK_NIFTI),
         "fixed_reg_nifti": str(FIXED_REG_NIFTI),
         "moving_reg_nifti": str(MOVING_REG_NIFTI),
