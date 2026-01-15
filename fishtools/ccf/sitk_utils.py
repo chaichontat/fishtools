@@ -83,6 +83,16 @@ def erode_by_um(mask: sitk.Image, guard_um: float) -> sitk.Image:
     return sitk.BinaryErode(sitk.Cast(mask, sitk.sitkUInt8), [rad_px, rad_px])
 
 
+def dilate_by_um(mask: sitk.Image, guard_um: float) -> sitk.Image:
+    sp = float(mask.GetSpacing()[0])  # mm
+    guard_mm = float(guard_um) * UM_TO_MM
+    rad_px = int(np.round(guard_mm / sp))
+    rad_px = max(0, rad_px)
+    if rad_px == 0:
+        return sitk.Cast(mask, sitk.sitkUInt8)
+    return sitk.BinaryDilate(sitk.Cast(mask, sitk.sitkUInt8), [rad_px, rad_px])
+
+
 def gradmag_feature(img: sitk.Image, sigma_um: float) -> sitk.Image:
     sigma_mm = float(sigma_um) * UM_TO_MM
     g = sitk.GradientMagnitudeRecursiveGaussian(sitk.Cast(img, sitk.sitkFloat32), sigma=sigma_mm)
