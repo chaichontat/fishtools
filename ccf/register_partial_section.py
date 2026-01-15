@@ -10,9 +10,10 @@
 #
 # Run cells sequentially. Each phase saves outputs for inspection.
 
-# %%
+ # %%
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -21,10 +22,18 @@ import SimpleITK as sitk
 import zarr
 from brainglobe_atlasapi import BrainGlobeAtlas
 from IPython import get_ipython
+from matplotlib.colors import ListedColormap
+from matplotlib.widgets import Button, Slider
+from scipy.ndimage import gaussian_filter, sobel
 from scipy.ndimage import rotate as ndimage_rotate
 
 from fishtools.ccf.landmark import LandmarkRegistrationOutputs, P1Landmarks
-from fishtools.ccf.landmark_ui import pick_atlas_slice_idx, pick_paired_landmarks, pick_rotation_deg
+from fishtools.ccf.landmark_ui import (
+    pick_atlas_slice_idx,
+    pick_paired_landmarks,
+    pick_paired_landmarks_overlay,
+    pick_rotation_deg,
+)
 from fishtools.ccf.sitk_utils import compute_similarity2d_from_landmarks, pixels_to_physical_um
 from fishtools.io.workspace import Workspace
 from fishtools.preprocess.config import NumpyEncoder
@@ -38,9 +47,9 @@ if ip is not None:
 # === EDIT THESE ===
 
 # Workspace configuration
-WORKSPACE = Path("/working/20251224_JaxA4_Sag1")
+WORKSPACE = Path("/working/20251228_JaxA4_Sag4")
 ws = Workspace(WORKSPACE)
-ROI = ws.rois[7]
+ROI = ws.rois[1]
 
 STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.zarr
 
@@ -65,7 +74,7 @@ OUT = LandmarkRegistrationOutputs(OUTDIR)
 P1_TFM_PATH = OUT.p1_similarity_tfm
 
 # Preview downsample factor for interactive elements (sample only)
-PREVIEW_DOWNSAMPLE = 8
+PREVIEW_DOWNSAMPLE = 16
 
 # %% [markdown]
 # ## Phase 0: Load Data
@@ -170,8 +179,13 @@ atlas_slice_picker = pick_atlas_slice_idx(
 # %% [markdown]
 # ### Interactive Landmark Selection
 #
-# Click paired landmarks (atlas first, then sample). The UI enforces pairing and saves
-# `p1_landmarks.json` as you go.
+# Click paired landmarks (atlas first, then sample). Use "Save landmarks" to persist
+# `p1_landmarks.json` without running the next cell (status will confirm saves).
+#
+# Edit helpers:
+# - Ctrl+click near an existing marker to delete that pair (removes both atlas+sample points)
+# - "Undo last pair" removes the most recent pair (or cancels an unfinished atlas click)
+# - "Clear all" removes all points
 # %%
 atlas_slice_idx = atlas_slice_picker.idx
 print(f"Selected atlas_slice_idx={atlas_slice_idx}")
@@ -248,6 +262,11 @@ landmark_picker = pick_paired_landmarks(
     moving_title=f"MOVING (sample, {PREVIEW_DOWNSAMPLE}x ds, rot {PRIOR_ROTATION_DEG}°)",
 )
 
+# %% [markdown]
+# ## Phase 1: Landmark-based Similarity2D
+#
+# Solves: rotation, scale, translation from user-provided landmarks.
+
 # %%
 fixed_points, moving_points_fullres = landmark_picker.get_points()
 if len(fixed_points) != len(moving_points_fullres):
@@ -262,12 +281,6 @@ _save_p1_landmarks(
 
 print(f"Landmark pairs: {len(fixed_points)}")
 
-# %% [markdown]
-# ## Phase 1: Landmark-based Similarity2D
-#
-# Solves: rotation, scale, translation from user-provided landmarks.
-
-# %%
 # Convert cropped pixel landmarks to physical coordinates in full-image space.
 
 fixed_points_full = [(x + ATLAS_CROP_OFFSET[0], y + ATLAS_CROP_OFFSET[1]) for x, y in fixed_points]
@@ -341,16 +354,46 @@ axes[0].set_title("Atlas cropped (FIXED)")
 axes[0].axis("off")
 
 axes[1].imshow(sample_warped_arr_preview, cmap="gray")
-axes[1].set_title("Sample warped to atlas space")
+axes[1].set_title("Sample warped to atlas space (raw)")
 axes[1].axis("off")
 
 # Overlay: atlas in magenta, sample in green
 overlay = np.zeros((*atlas_slice.shape, 3), dtype=np.float32)
-atlas_norm = atlas_slice / (atlas_slice.max() + 1e-8)
-sample_norm = sample_warped_arr_preview / (sample_warped_arr_preview.max() + 1e-8)
-overlay[..., 0] = atlas_norm  # R
-overlay[..., 1] = sample_norm  # G
-overlay[..., 2] = atlas_norm  # B (magenta = R+B)
+ATLAS_LO_PERCENTILE = 1.0
+ATLAS_HI_PERCENTILE = 99.8
+ATLAS_GAMMA = 0.85
+atlas_vals = atlas_slice[atlas_slice > 0] if np.any(atlas_slice > 0) else atlas_slice
+atlas_lo, atlas_hi = (float(v) for v in np.percentile(atlas_vals, [ATLAS_LO_PERCENTILE, ATLAS_HI_PERCENTILE]))
+atlas_norm = (atlas_slice - atlas_lo) / (atlas_hi - atlas_lo + 1e-8)
+atlas_norm = np.clip(atlas_norm, 0.0, 1.0) ** ATLAS_GAMMA
+SAMPLE_LO_PERCENTILE = 1.0
+SAMPLE_HI_PERCENTILE = 99.5
+SAMPLE_GAMMA = 0.7
+sample_lo, sample_hi = (float(v) for v in np.percentile(sample_warped_arr_preview, [SAMPLE_LO_PERCENTILE, SAMPLE_HI_PERCENTILE]))
+sample_norm = (sample_warped_arr_preview - sample_lo) / (sample_hi - sample_lo + 1e-8)
+sample_norm = np.clip(sample_norm, 0.0, 1.0) ** SAMPLE_GAMMA
+
+# Edge-enhance the atlas (fixed) image for easier visual alignment.
+MOVING_ALPHA = 1.0
+SAMPLE_GAIN = 0.75
+ATLAS_ALPHA = 0.8
+EDGE_SIGMA = 0.25
+EDGE_THRESH = 0.25
+EDGE_GAMMA = 2.5
+
+atlas_blur = gaussian_filter(atlas_norm.astype(np.float32), sigma=EDGE_SIGMA)
+gx = sobel(atlas_blur, axis=1)
+gy = sobel(atlas_blur, axis=0)
+edges = np.hypot(gx, gy)
+edges_p99 = float(np.percentile(edges, 99))
+edges_norm = edges / (edges_p99 + 1e-8)
+edges_norm = np.clip(edges_norm, 0.0, 1.0)
+edges_norm = np.clip((edges_norm - EDGE_THRESH) / (1.0 - EDGE_THRESH + 1e-8), 0.0, 1.0)
+edges_norm = edges_norm**EDGE_GAMMA
+atlas_edge_enhanced = np.clip(0.8 * atlas_norm + 1.2 * edges_norm, 0.0, 1.0)
+overlay[..., 0] = ATLAS_ALPHA * atlas_edge_enhanced  # R
+overlay[..., 1] = MOVING_ALPHA * SAMPLE_GAIN * sample_norm  # G
+overlay[..., 2] = ATLAS_ALPHA * atlas_edge_enhanced  # B (magenta = R+B)
 
 axes[2].imshow(overlay)
 axes[2].set_title("Overlay (magenta=atlas, green=sample)")
@@ -374,5 +417,226 @@ print("Phase 1 complete.")
 # transform = sitk.ReadTransform("transform_final.tfm")
 # warped = sitk.Resample(moving, fixed, transform, sitk.sitkLinear)
 # ```
+
+# %% [markdown]
+# ### Overlay editor (optional)
+#
+# Edit landmark pairs on the final overlay:
+# - Click order: atlas point (magenta structures) → sample point (green structures)
+# - Ctrl+click near an existing marker deletes that pair
+# - Use "Save landmarks" to write `p1_landmarks.json` (and re-save `p1_overlay_landmarks.png`)
+# %%
+overlay_with_landmarks = overlay.copy()
+inverse_similarity = transform_similarity.GetInverse()
+moving_pts_in_fixed_phys = [inverse_similarity.TransformPoint(mp) for mp in moving_pts_phys]
+moving_pts_in_fixed_full_px = [(x / ATLAS_VOXEL, y / ATLAS_VOXEL) for x, y in moving_pts_in_fixed_phys]
+moving_pts_in_fixed_cropped_px = [
+    (x - ATLAS_CROP_OFFSET[0], y - ATLAS_CROP_OFFSET[1]) for x, y in moving_pts_in_fixed_full_px
+]
+
+out_path = OUT.root / "p1_overlay_landmarks.png"
+
+
+def _save_overlay_landmarks(
+    fixed_points_cropped_xy: list[tuple[float, float]],
+    moving_points_in_fixed_cropped_xy: list[tuple[float, float]],
+) -> None:
+    moving_points_fullres_xy_in_rotated_crop: list[tuple[float, float]] = []
+    roundtrip_errors_px: list[float] = []
+    for x_cropped, y_cropped in moving_points_in_fixed_cropped_xy:
+        fixed_full_px = (float(x_cropped) + ATLAS_CROP_OFFSET[0], float(y_cropped) + ATLAS_CROP_OFFSET[1])
+        fixed_phys = (fixed_full_px[0] * ATLAS_VOXEL, fixed_full_px[1] * ATLAS_VOXEL)
+        moving_phys = transform_similarity.TransformPoint(fixed_phys)
+        moving_full_px = (moving_phys[0] / SAMPLE_VOXEL_XY, moving_phys[1] / SAMPLE_VOXEL_XY)
+        moving_points_fullres_xy_in_rotated_crop.append(
+            (moving_full_px[0] - SAMPLE_CROP_OFFSET[0], moving_full_px[1] - SAMPLE_CROP_OFFSET[1])
+        )
+
+        # Sanity check: fixed -> moving -> fixed should recover the clicked location (in fixed/cropped pixels).
+        fixed_phys_roundtrip = inverse_similarity.TransformPoint(moving_phys)
+        fixed_full_px_roundtrip = (fixed_phys_roundtrip[0] / ATLAS_VOXEL, fixed_phys_roundtrip[1] / ATLAS_VOXEL)
+        fixed_cropped_px_roundtrip = (
+            fixed_full_px_roundtrip[0] - ATLAS_CROP_OFFSET[0],
+            fixed_full_px_roundtrip[1] - ATLAS_CROP_OFFSET[1],
+        )
+        roundtrip_errors_px.append(
+            float(
+                np.hypot(
+                    fixed_cropped_px_roundtrip[0] - float(x_cropped),
+                    fixed_cropped_px_roundtrip[1] - float(y_cropped),
+                )
+            )
+        )
+
+    _save_p1_landmarks(
+        fixed_points_cropped_xy=fixed_points_cropped_xy,
+        moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
+    )
+    overlay_picker.fig.savefig(out_path, dpi=150)
+    print(f"Saved: {OUT.p1_landmarks_json}")
+    print(f"Saved: {out_path}")
+    if roundtrip_errors_px:
+        print(f"Overlay back-transform roundtrip error: max={max(roundtrip_errors_px):.3g} px")
+
+
+overlay_picker = pick_paired_landmarks_overlay(
+    overlay_image_yx_rgb=overlay_with_landmarks,
+    initial_fixed_points_cropped_xy=list(fixed_points),
+    initial_moving_points_in_fixed_cropped_xy=list(moving_pts_in_fixed_cropped_px),
+    min_pairs=3,
+    on_save=_save_overlay_landmarks,
+    title="Overlay + landmarks (magenta=atlas, green=sample)",
+    fixed_label="atlas point",
+    moving_label="sample point",
+)
+
+# %%
+
+# %% [markdown]
+# ## Interactive thresholding (optional)
+#
+# Use this to pick a manual intensity threshold on a *downsampled* view of the rotated+copped sample.
+# Pixels above the threshold are highlighted in red. Click "Save threshold" to write:
+# - `p1_threshold.json`
+# - `p1_threshold_preview.png`
+#
+# If `p1_threshold.json` already exists, it will be loaded and used as the initial value.
+
+# %%
+if "sample_preview_rotated" not in globals():
+    raise RuntimeError("Missing sample_preview_rotated; run the earlier cells through Phase 1 first.")
+
+P1_THRESHOLD_JSON = OUT.root / "p1_threshold.json"
+P1_THRESHOLD_PREVIEW_PNG = OUT.root / "p1_threshold_preview.png"
+
+threshold_img = sample_preview_rotated.astype(np.float32, copy=False)
+threshold_vals = threshold_img[np.isfinite(threshold_img)]
+if threshold_vals.size == 0:
+    raise ValueError("sample_preview_rotated contains no finite values.")
+
+
+def _otsu_threshold(values: np.ndarray, *, nbins: int = 256) -> float:
+    v = values[np.isfinite(values)].astype(np.float64, copy=False)
+    if v.size == 0:
+        return 0.0
+
+    vmin, vmax = (float(x) for x in np.percentile(v, [0.5, 99.5]))
+    if vmax <= vmin:
+        return vmin
+
+    hist, bin_edges = np.histogram(v, bins=int(nbins), range=(vmin, vmax))
+    hist = hist.astype(np.float64, copy=False)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    weight1 = np.cumsum(hist)
+    weight2 = np.cumsum(hist[::-1])[::-1]
+    mean1 = np.cumsum(hist * bin_centers) / np.maximum(weight1, 1e-12)
+    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / np.maximum(weight2[::-1], 1e-12))[::-1]
+
+    between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    if between.size == 0:
+        return float(np.median(v))
+    idx = int(np.argmax(between))
+    return float(bin_centers[idx])
+
+
+existing_threshold: float | None = None
+if P1_THRESHOLD_JSON.exists():
+    payload = json.loads(P1_THRESHOLD_JSON.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "threshold" in payload:
+        existing_threshold = float(payload["threshold"])
+        print(f"Loaded existing threshold: {existing_threshold:g} ({P1_THRESHOLD_JSON})")
+
+thr_init = existing_threshold if existing_threshold is not None else _otsu_threshold(threshold_vals)
+thr_min, thr_max = (float(x) for x in np.percentile(threshold_vals, [0.5, 99.5]))
+if thr_max <= thr_min:
+    thr_max = thr_min + 1.0
+thr_step = max((thr_max - thr_min) / 200.0, 1e-6)
+
+fig, ax = plt.subplots(figsize=(7, 7), constrained_layout=False)
+fig.subplots_adjust(bottom=0.16)
+disp_lo, disp_hi = (float(x) for x in np.percentile(threshold_vals, [0.5, 99.5]))
+ax.imshow(threshold_img, cmap="gray", vmin=disp_lo, vmax=disp_hi)
+
+overlay_cmap = ListedColormap([(1.0, 0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.35)])
+mask_init = (threshold_img >= float(np.clip(thr_init, thr_min, thr_max))).astype(np.uint8)
+overlay_artist = ax.imshow(mask_init, cmap=overlay_cmap, vmin=0, vmax=1, interpolation="nearest")
+ax.set_title(f"sample_preview_rotated (downsample={PREVIEW_DOWNSAMPLE}x)")
+ax.axis("off")
+
+hud = ax.text(
+    0.01,
+    0.99,
+    "",
+    transform=ax.transAxes,
+    ha="left",
+    va="top",
+    color="white",
+    fontsize=10,
+    bbox={"facecolor": "black", "alpha": 0.5, "pad": 3},
+)
+
+slider_ax = fig.add_axes([0.14, 0.06, 0.62, 0.03])
+slider = Slider(
+    ax=slider_ax,
+    label="threshold",
+    valmin=thr_min,
+    valmax=thr_max,
+    valinit=float(np.clip(thr_init, thr_min, thr_max)),
+    valfmt="%.3g",
+    valstep=thr_step,
+)
+
+button_ax = fig.add_axes([0.80, 0.045, 0.16, 0.06])
+save_btn = Button(button_ax, "Save", color="0.85", hovercolor="0.95")
+
+DEBOUNCE_MS = 75
+
+
+def _update_overlay(threshold: float) -> None:
+    mask = (threshold_img >= float(threshold)).astype(np.uint8)
+    overlay_artist.set_data(mask)
+    frac = float(mask.mean())
+    hud.set_text(f"thr={float(threshold):.3g}  above={frac:.1%}")
+    fig.canvas.draw_idle()
+
+
+def _on_save_clicked(_: object) -> None:
+    threshold = float(slider.val)
+    payload = {
+        "threshold": threshold,
+        "image": "sample_preview_rotated",
+        "preview_downsample": int(PREVIEW_DOWNSAMPLE),
+        "prior_rotation_deg": int(PRIOR_ROTATION_DEG),
+        "prior_flip_x": bool(PRIOR_FLIP_X),
+    }
+    P1_THRESHOLD_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    fig.savefig(P1_THRESHOLD_PREVIEW_PNG, dpi=150)
+    print(f"Saved: {P1_THRESHOLD_JSON}")
+    print(f"Saved: {P1_THRESHOLD_PREVIEW_PNG}")
+
+
+pending_threshold: dict[str, float] = {"value": float(slider.val)}
+debounce_timer = fig.canvas.new_timer(interval=DEBOUNCE_MS)
+
+
+def _debounce_flush() -> None:
+    debounce_timer.stop()
+    _update_overlay(float(pending_threshold["value"]))
+
+
+debounce_timer.add_callback(_debounce_flush)
+
+
+def _on_slider_change(val: float) -> None:
+    pending_threshold["value"] = float(val)
+    debounce_timer.stop()
+    debounce_timer.start()
+
+
+slider.on_changed(_on_slider_change)
+save_btn.on_clicked(_on_save_clicked)
+
+_update_overlay(float(slider.val))
 
 # %%
