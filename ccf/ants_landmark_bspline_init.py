@@ -39,11 +39,22 @@ WORKSPACE = Path("/working/20251228_JaxA4_Sag4")
 ROI = "3"
 STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.zarr
 
+OVERWRITE = True
+
+# Nonlinear refinement model:
+# - False: B-spline (local, grid-controlled)
+# - True:  TPS (global, bending-energy-minimizing)
+USE_TPS = True
+RESIDUAL_MODEL_TAG = "tps" if USE_TPS else "bspline"
+RESIDUAL_MODEL_LABEL = "TPS" if USE_TPS else "B-spline"
+
 # B-spline fitting knobs (start gentle; increase mesh for more flexibility)
 BSPLINE_FITTING_LEVELS = 5
 BSPLINE_MESH_SIZE = (1, 1)
 BSPLINE_SPLINE_ORDER = 3
-BSPLINE_ENFORCE_STATIONARY_BOUNDARY = True
+BSPLINE_ANCHOR_BOUNDARY = True
+BSPLINE_ANCHOR_POINTS_PER_EDGE = 9
+BSPLINE_ANCHOR_WEIGHT = 50.0
 
 ws = Workspace(WORKSPACE)
 OUTDIR = ws.ccf_transforms(ROI)
@@ -68,14 +79,15 @@ SAMPLE_CHANNEL = p1.sample_channel or STITCH_CODEBOOK
 DOMAIN_NIFTI = OUTDIR / "fixed_domain_crop.nii.gz"
 SIMILARITY_MAT_PATH = OUTDIR / "init_similarity_fixed2moving_from_p1.mat"
 RESIDUAL_BSPLINE_WARP_PATH = OUTDIR / "init_residual_bspline_movingdomain_warp.nii.gz"
+RESIDUAL_TPS_WARP_PATH = OUTDIR / "init_residual_tps_movingdomain_warp.nii.gz"
 FIXED_NIFTI = OUTDIR / "fixed_atlas_crop.nii.gz"
 MOVING_NIFTI = OUTDIR / "moving_sample_crop.nii.gz"
-WARPED_NIFTI = OUTDIR / "moving_warped_similarity_plus_residual_bspline.nii.gz"
-QC_PNG = OUTDIR / "similarity_plus_residual_bspline_qc.png"
-BEFORE_AFTER_DIFF_PNG = OUTDIR / "similarity_plus_residual_bspline_before_after_diff.png"
-DEFORMATION_FIELD_PNG = OUTDIR / "init_residual_bspline_deformation_field.png"
-DEFORMATION_OVERLAY_UNWARPED_PNG = OUTDIR / "init_residual_bspline_deformation_on_sample_unwarped.png"
-DEFORMATION_OVERLAY_WARPED_PNG = OUTDIR / "init_residual_bspline_deformation_on_sample_warped.png"
+WARPED_NIFTI = OUTDIR / f"moving_warped_similarity_plus_residual_{RESIDUAL_MODEL_TAG}.nii.gz"
+QC_PNG = OUTDIR / f"similarity_plus_residual_{RESIDUAL_MODEL_TAG}_qc.png"
+BEFORE_AFTER_DIFF_PNG = OUTDIR / f"similarity_plus_residual_{RESIDUAL_MODEL_TAG}_before_after_diff.png"
+DEFORMATION_FIELD_PNG = OUTDIR / f"init_residual_{RESIDUAL_MODEL_TAG}_deformation_field.png"
+DEFORMATION_OVERLAY_UNWARPED_PNG = OUTDIR / f"init_residual_{RESIDUAL_MODEL_TAG}_deformation_on_sample_unwarped.png"
+DEFORMATION_OVERLAY_WARPED_PNG = OUTDIR / f"init_residual_{RESIDUAL_MODEL_TAG}_deformation_on_sample_warped.png"
 DEFORMATION_MAX_DIM = 512
 DEFORMATION_QUIVER_STEP = 12
 WARPED_VIS_SPACING_UM = 2.0
@@ -154,6 +166,33 @@ def ants_numpy_yx(img: ants.ANTsImage) -> np.ndarray:
     return arr_xy.T
 
 
+def boundary_anchor_points_mm(img: ants.ANTsImage, *, points_per_edge: int) -> np.ndarray:
+    points_per_edge = int(points_per_edge)
+    if points_per_edge < 2:
+        raise ValueError(f"points_per_edge must be >= 2, got {points_per_edge}.")
+
+    size_x, size_y = img.shape
+    origin_x_mm, origin_y_mm = img.origin
+    spacing_x_mm, spacing_y_mm = img.spacing
+
+    xs_mm = origin_x_mm + np.linspace(0.0, float(size_x - 1), points_per_edge, dtype=np.float64) * float(spacing_x_mm)
+    ys_mm = origin_y_mm + np.linspace(0.0, float(size_y - 1), points_per_edge, dtype=np.float64) * float(spacing_y_mm)
+
+    x0 = float(origin_x_mm)
+    x1 = float(origin_x_mm) + float(size_x - 1) * float(spacing_x_mm)
+    y0 = float(origin_y_mm)
+    y1 = float(origin_y_mm) + float(size_y - 1) * float(spacing_y_mm)
+
+    top = np.column_stack([xs_mm, np.full_like(xs_mm, y0)])
+    bottom = np.column_stack([xs_mm, np.full_like(xs_mm, y1)])
+    left = np.column_stack([np.full_like(ys_mm, x0), ys_mm])
+    right = np.column_stack([np.full_like(ys_mm, x1), ys_mm])
+
+    pts = np.vstack([top, bottom, left, right]).astype(np.float64, copy=False)
+    pts = np.unique(pts, axis=0)
+    return pts
+
+
 atlas = BrainGlobeAtlas(ATLAS_NAME)
 atlas_reference_slices = atlas.reference if ATLAS_PLANE == "coronal" else atlas.reference.transpose(2, 1, 0)
 atlas_annotation_slices = atlas.annotation if ATLAS_PLANE == "coronal" else atlas.annotation.transpose(2, 1, 0)
@@ -188,25 +227,60 @@ sitk.WriteImage(moving_sitk, str(MOVING_NIFTI))
 fixed_ants = ants.image_read(str(FIXED_NIFTI))
 moving_ants = ants.image_read(str(MOVING_NIFTI))
 
-if RESIDUAL_BSPLINE_WARP_PATH.exists():
-    residual_bspline_field = ants.image_read(str(RESIDUAL_BSPLINE_WARP_PATH))
-    print(f"Loaded: {RESIDUAL_BSPLINE_WARP_PATH}")
+anchor_points_mm = None
+residual_warp_path = RESIDUAL_TPS_WARP_PATH if USE_TPS else RESIDUAL_BSPLINE_WARP_PATH
+
+if residual_warp_path.exists() and not OVERWRITE:
+    residual_field = ants.image_read(str(residual_warp_path))
+    print(f"Loaded: {residual_warp_path}")
 else:
     residual_mm = (moving_pts_mm - pred_moving).astype(np.float64)
-    residual_bspline_field = ants.fit_bspline_object_to_scattered_data(
-        scattered_data=residual_mm,
-        parametric_data=pred_moving,
-        parametric_domain_origin=moving_ants.origin,
-        parametric_domain_spacing=moving_ants.spacing,
-        parametric_domain_size=moving_ants.shape,
-        number_of_fitting_levels=BSPLINE_FITTING_LEVELS,
-        mesh_size=BSPLINE_MESH_SIZE,
-        spline_order=BSPLINE_SPLINE_ORDER,
-    )
-    ants.image_write(residual_bspline_field, str(RESIDUAL_BSPLINE_WARP_PATH))
-    print(f"Wrote: {RESIDUAL_BSPLINE_WARP_PATH}")
+    residual_fit_points_mm = pred_moving
+    residual_fit_weights = None
+    if BSPLINE_ANCHOR_BOUNDARY:
+        anchor_points_mm = boundary_anchor_points_mm(moving_ants, points_per_edge=BSPLINE_ANCHOR_POINTS_PER_EDGE)
+        residual_fit_points_mm = np.vstack([residual_fit_points_mm, anchor_points_mm])
+        residual_mm = np.vstack([residual_mm, np.zeros((anchor_points_mm.shape[0], 2), dtype=np.float64)])
+        if not USE_TPS:
+            residual_fit_weights = np.concatenate(
+                [
+                    np.ones((pred_moving.shape[0],), dtype=np.float64),
+                    np.full((anchor_points_mm.shape[0],), float(BSPLINE_ANCHOR_WEIGHT), dtype=np.float64),
+                ]
+            )
 
-residual_tx = ants.transform_from_displacement_field(residual_bspline_field)
+    if USE_TPS:
+        residual_field = ants.fit_thin_plate_spline_displacement_field(
+            displacement_origins=residual_fit_points_mm,
+            displacements=residual_mm,
+            origin=moving_ants.origin,
+            spacing=moving_ants.spacing,
+            size=moving_ants.shape,
+            direction=moving_ants.direction,
+        )
+    else:
+        residual_field = ants.fit_bspline_object_to_scattered_data(
+            scattered_data=residual_mm,
+            parametric_data=residual_fit_points_mm,
+            parametric_domain_origin=moving_ants.origin,
+            parametric_domain_spacing=moving_ants.spacing,
+            parametric_domain_size=moving_ants.shape,
+            data_weights=residual_fit_weights,
+            number_of_fitting_levels=BSPLINE_FITTING_LEVELS,
+            mesh_size=BSPLINE_MESH_SIZE,
+            spline_order=BSPLINE_SPLINE_ORDER,
+        )
+
+    ants.image_write(residual_field, str(residual_warp_path))
+    print(f"Wrote: {residual_warp_path}")
+
+residual_tx = ants.transform_from_displacement_field(residual_field)
+if BSPLINE_ANCHOR_BOUNDARY and anchor_points_mm is not None:
+    pred_anchor = np.vstack([np.asarray(residual_tx.apply_to_point(tuple(p))) for p in anchor_points_mm])
+    anchor_disp_um = np.linalg.norm(pred_anchor - anchor_points_mm, axis=1) / UM_TO_MM
+    print(
+        f"Anchor displacement: mean={float(np.mean(anchor_disp_um)):.2f} µm, max={float(np.max(anchor_disp_um)):.2f} µm"
+    )
 pred_refined = np.vstack([np.asarray(residual_tx.apply_to_point(tuple(p))) for p in pred_moving])
 errs_refined_mm = np.linalg.norm(pred_refined - moving_pts_mm, axis=1)
 rmse_refined_mm = float(np.sqrt(np.mean(errs_refined_mm**2)))
@@ -216,7 +290,7 @@ print(f"Refined landmark RMSE: {rmse_refined_mm * 1e3:.2f} µm (max {max_refined
 warped = ants.apply_transforms(
     fixed=fixed_ants,
     moving=moving_ants,
-    transformlist=[str(RESIDUAL_BSPLINE_WARP_PATH), str(SIMILARITY_MAT_PATH)],
+    transformlist=[str(residual_warp_path), str(SIMILARITY_MAT_PATH)],
     interpolator="linear",
 )
 ants.image_write(warped, str(WARPED_NIFTI))
@@ -293,17 +367,17 @@ plt.show()
 print(f"Wrote: {BEFORE_AFTER_DIFF_PNG}")
 
 # %% [markdown]
-# ## Phase 3: Plot deformation field (residual B-spline)
+# ## Phase 3: Plot deformation field (residual warp)
 
 # %%
-plot_xy = residual_bspline_field.shape
+plot_xy = residual_field.shape
 max_dim = max(plot_xy)
 if max_dim <= 0:
-    raise ValueError(f"Invalid residual_bspline_field.shape={plot_xy}.")
+    raise ValueError(f"Invalid residual_field.shape={plot_xy}.")
 
 scale = max_dim / float(DEFORMATION_MAX_DIM)
 plot_xy_ds = (max(32, int(round(plot_xy[0] / scale))), max(32, int(round(plot_xy[1] / scale))))
-residual_ds = ants.resample_image(residual_bspline_field, plot_xy_ds, use_voxels=True, interp_type=0)
+residual_ds = ants.resample_image(residual_field, plot_xy_ds, use_voxels=True, interp_type=0)
 
 disp_xyc = np.asarray(residual_ds.numpy())
 if disp_xyc.ndim != 3 or disp_xyc.shape[2] != 2:
@@ -341,7 +415,7 @@ ax.quiver(
     width=0.0022,
     alpha=0.75,
 )
-ax.set_title("Residual B-spline displacement field (moving domain, downsampled)")
+ax.set_title(f"Residual {RESIDUAL_MODEL_LABEL} displacement field (moving domain, downsampled)")
 ax.axis("off")
 plt.tight_layout()
 plt.savefig(DEFORMATION_FIELD_PNG, dpi=200)
@@ -402,7 +476,7 @@ ax.quiver(
     width=0.004,
     alpha=0.9,
 )
-ax.set_title("Residual deformation over moving sample (moving→fixed)")
+ax.set_title(f"Residual {RESIDUAL_MODEL_LABEL} deformation over moving sample (moving→fixed)")
 ax.axis("off")
 ax.legend(loc="lower right", frameon=True)
 
@@ -447,7 +521,7 @@ df_pred["t"] = 0.0
 grid_refined_moving = ants.apply_transforms_to_points(
     dim=2,
     points=df_pred,
-    transformlist=[str(RESIDUAL_BSPLINE_WARP_PATH)],
+    transformlist=[str(residual_warp_path)],
 )
 
 dx_fixed_mm = (grid_refined_moving["x"] - grid_pred_moving["x"]).to_numpy(dtype=np.float64).reshape((size_y, size_x))
@@ -470,7 +544,7 @@ fixed_vis = ants.resample_image(fixed_ants, (vis_size_x, vis_size_y), use_voxels
 warped_vis = ants.apply_transforms(
     fixed=fixed_vis,
     moving=moving_ants,
-    transformlist=[str(RESIDUAL_BSPLINE_WARP_PATH), str(SIMILARITY_MAT_PATH)],
+    transformlist=[str(residual_warp_path), str(SIMILARITY_MAT_PATH)],
     interpolator="linear",
 )
 after_vis_n = normalize_robust(ants_numpy_yx(warped_vis).astype(np.float32))
@@ -568,7 +642,7 @@ ax.quiver(
     width=0.004,
     alpha=0.9,
 )
-ax.set_title("Residual deformation over warped sample (moving→fixed)")
+ax.set_title(f"Residual {RESIDUAL_MODEL_LABEL} deformation over warped sample (moving→fixed)")
 ax.axis("off")
 ax.legend(loc="lower right", frameon=True)
 
