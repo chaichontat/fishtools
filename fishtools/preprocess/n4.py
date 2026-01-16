@@ -23,6 +23,7 @@ import shutil
 import threading
 from concurrent.futures import as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable, Iterable, Sequence
@@ -31,6 +32,7 @@ import cupy as cp
 import numpy as np
 import SimpleITK as sitk
 import tifffile
+import rich_click as click
 import zarr
 from cucim.skimage import filters as cucim_filters
 from cupy import ndarray as cupy_ndarray
@@ -604,7 +606,8 @@ def _correct_plane_cpu_for_quant(
 def _correct_plane_gpu(
     plane: np.ndarray,
     *,
-    field_gpu: cupy_ndarray,
+    field_gpu: cupy_ndarray | None = None,
+    field_cpu: np.ndarray | None = None,
     use_unsharp_mask: bool,
     mask_cpu: np.ndarray | None = None,
     tile_size: int | None = None,
@@ -630,6 +633,7 @@ def _correct_plane_gpu(
             return correct_plane_gpu_tiled(
                 plane,
                 field_gpu=field_gpu,
+                field_cpu=field_cpu,
                 use_unsharp_mask=use_unsharp_mask,
                 mask_cpu=mask_cpu,
                 tile_size=tile_size,
@@ -637,6 +641,10 @@ def _correct_plane_gpu(
             )
 
     with _GPU_SEMAPHORE:
+        if field_gpu is None:
+            if field_cpu is None:
+                raise ValueError("_correct_plane_gpu requires field_gpu or field_cpu.")
+            field_gpu = cp.asarray(np.asarray(field_cpu, dtype=np.float32), dtype=cp.float32)
         logger.debug(
             "Correcting plane on GPU (full-frame) -- unsharp_mask=%s (tiles disabled)", use_unsharp_mask
         )
@@ -659,6 +667,114 @@ def _correct_plane_gpu(
         corrected = cp.asnumpy(img_gpu).astype(np.float32, copy=False)
         del img_gpu
     return corrected
+
+
+@lru_cache(maxsize=1)
+def _cupy_available() -> bool:
+    cuda = getattr(cp, "cuda", None)
+    runtime = getattr(cuda, "runtime", None)
+    get_device_count = getattr(runtime, "getDeviceCount", None)
+    if not callable(get_device_count):
+        return False
+    return int(get_device_count()) > 0
+
+
+def apply_correction_field(image: np.ndarray, field: np.ndarray) -> np.ndarray:
+    """Divide an image plane by its correction field, preferring GPU when available."""
+    img = _ensure_float32(image)
+    fld = _ensure_float32(field)
+    if img.shape != fld.shape:
+        raise ValueError(f"Image shape {img.shape} does not match field shape {fld.shape}")
+
+    if _cupy_available():
+        img_gpu = cp.asarray(img, dtype=cp.float32)
+        field_gpu = cp.asarray(fld, dtype=cp.float32)
+        img_gpu /= field_gpu
+        out = cp.asnumpy(img_gpu).astype(np.float32, copy=False)
+        del img_gpu, field_gpu
+        np.nan_to_num(out, copy=False)
+        return out
+
+    out = img / fld
+    np.nan_to_num(out, copy=False)
+    return out.astype(np.float32, copy=False)
+
+
+def _compute_quantization_params(plane_supplier: Callable[[], Iterable[np.ndarray]]) -> QuantizationParams:
+    """Compute quantization parameters from a deterministic subsample across planes."""
+    sample_parts: list[np.ndarray] = []
+    population_count = 0
+    rng = np.random.default_rng(0)
+
+    for plane in plane_supplier():
+        arr = _ensure_float32(plane).ravel()
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            continue
+        population_count += int(finite.size)
+        if finite.size <= QUANT_MAX_SAMPLES:
+            sample_parts.append(finite)
+            continue
+        idx = rng.choice(finite.size, size=QUANT_MAX_SAMPLES, replace=False)
+        sample_parts.append(finite[idx])
+
+    if population_count == 0 or not sample_parts:
+        return QuantizationParams(
+            lower=0.0,
+            upper=QUANT_MIN_RANGE,
+            observed_min=0.0,
+            observed_max=0.0,
+            lower_percentile=QUANT_LOWER_PERCENTILE,
+            upper_percentile=QUANT_FALLBACK_UPPER_PERCENTILE,
+            sample_count=0,
+        )
+
+    sample = np.concatenate(sample_parts, axis=0)
+    if sample.size > QUANT_MAX_SAMPLES:
+        idx = rng.choice(sample.size, size=QUANT_MAX_SAMPLES, replace=False)
+        sample = sample[idx]
+
+    lower = float(np.percentile(sample, QUANT_LOWER_PERCENTILE))
+    upper_pct = QUANT_UPPER_PERCENTILE
+    if population_count < QUANT_MIN_TOTAL_SAMPLES_FOR_HIGH_PERCENTILE:
+        upper_pct = QUANT_FALLBACK_UPPER_PERCENTILE
+    upper = float(np.percentile(sample, upper_pct))
+
+    if not np.isfinite(lower):
+        lower = 0.0
+    if not np.isfinite(upper):
+        upper = lower + QUANT_MIN_RANGE
+    if upper - lower < QUANT_MIN_RANGE:
+        center = (upper + lower) * 0.5
+        lower = center - QUANT_MIN_RANGE * 0.5
+        upper = center + QUANT_MIN_RANGE * 0.5
+
+    observed_min = float(np.min(sample)) if sample.size else lower
+    observed_max = float(np.max(sample)) if sample.size else upper
+
+    return QuantizationParams(
+        lower=lower,
+        upper=upper,
+        observed_min=observed_min,
+        observed_max=observed_max,
+        lower_percentile=QUANT_LOWER_PERCENTILE,
+        upper_percentile=upper_pct,
+        sample_count=population_count,
+    )
+
+
+def _quantize_to_uint16(data: np.ndarray, params: QuantizationParams) -> np.ndarray:
+    """Quantize float32 data into uint16 with a 1-count headroom below saturation."""
+    arr = _ensure_float32(data)
+    width = max(params.upper - params.lower, QUANT_MIN_RANGE)
+    max_u16 = int(np.iinfo(np.uint16).max)
+    scale = float(max_u16 - 1) / float(width)
+    out = (arr - float(params.lower)) * scale
+    np.nan_to_num(out, copy=False)
+    out = np.clip(out, 0.0, float(max_u16 - 1))
+    # Preserve a saturation bucket for values above the selected upper percentile.
+    out = np.where(arr > float(params.upper), float(max_u16), out)
+    return (out + 0.5).astype(np.uint16)
 
 
 def _compute_channel_quant_from_single_plane(
@@ -1797,11 +1913,102 @@ def run_cli_workflow(
     return compute_fields_from_workspace(config)
 
 
+@click.command(context_settings={"allow_interspersed_args": True}, no_args_is_help=True)
+@click.argument("workspace", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str)
+@click.option("--codebook", type=str, required=True)
+@click.option("--channels", type=str, default=None)
+@click.option("--shrink", type=int, default=4, show_default=True)
+@click.option("--spline-lowres-px", type=float, default=128.0, show_default=True)
+@click.option("--z-index", type=int, required=True, help="Z index (0-based) used to compute the correction field.")
+@click.option("--threshold", type=str, default=None)
+@click.option("--field-output", type=click.Path(exists=False, dir_okay=False, file_okay=True, path_type=Path))
+@click.option(
+    "--corrected-output",
+    type=click.Path(exists=False, dir_okay=True, file_okay=True, path_type=Path),
+)
+@click.option("--field-only", is_flag=True, help="Only compute the correction field; do not apply it.")
+@click.option("--overwrite", is_flag=True)
+@click.option("--single-plane", is_flag=True, help="Only correct the specified Z plane (debugging aid).")
+@click.option("--debug", is_flag=True, help="Write float32 debug outputs alongside quantized corrections.")
+@click.option("--unsharp", is_flag=True, help="Pre-filter the N4 source plane with unsharp masking (GPU/CuPy).")
+@click.option(
+    "--threads",
+    type=int,
+    default=None,
+    help="Override number of CPU threads used for SimpleITK field estimation (defaults to ~half cores).",
+)
+@click.option("--tile-size", type=int, default=None, help="Optional explicit GPU tile size (pixels).")
+@click.option(
+    "--tile-threshold",
+    type=int,
+    default=None,
+    help="Auto-tiling threshold in pixels (max dimension). Set <=0 to disable auto-tiling.",
+)
+def app(
+    workspace: Path,
+    roi: str,
+    *,
+    codebook: str,
+    channels: str | None,
+    shrink: int,
+    spline_lowres_px: float,
+    z_index: int,
+    threshold: str | None,
+    field_output: Path | None,
+    corrected_output: Path | None,
+    field_only: bool,
+    overwrite: bool,
+    single_plane: bool,
+    debug: bool,
+    unsharp: bool,
+    threads: int | None,
+    tile_size: int | None,
+    tile_threshold: int | None,
+) -> None:
+    try:
+        run_cli_workflow(
+            workspace=workspace,
+            roi=roi,
+            codebook=codebook,
+            channels=channels,
+            shrink=shrink,
+            spline_lowres_px=spline_lowres_px,
+            z_index=z_index,
+            threshold=threshold,
+            field_output=field_output,
+            corrected_output=corrected_output,
+            apply_correction=not field_only,
+            overwrite=overwrite,
+            single_plane=single_plane,
+            debug=debug,
+            use_unsharp_mask=unsharp,
+            threads=threads,
+            tile_size=tile_size,
+            tile_threshold=tile_threshold,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 __all__ = [
     "N4RuntimeConfig",
     "N4Result",
     "DEFAULT_ITERATIONS",
+    "app",
+    "apply_correction_field",
     "compute_correction_field",
     "compute_fields_from_workspace",
     "run_cli_workflow",
+    "_compute_quantization_params",
+    "_cupy_available",
+    "_quantize_to_uint16",
 ]
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()
