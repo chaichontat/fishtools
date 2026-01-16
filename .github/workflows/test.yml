@@ -23,4 +23,4 @@ jobs:
         run: pip install .[dev]
 
       - name: Test
-        run: pytest
+        run: pytest -m "not gpu"
