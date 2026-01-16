@@ -527,7 +527,8 @@ def individual_align_fiducial(
 
     _attempt = 0
     thr = threshold_sigma
-    last_exc_type: type[Exception] | None = None
+    last_exc_type: type[NotEnoughSpots] | type[TooManySpots] | None = None
+    last_exc: NotEnoughSpots | TooManySpots | None = None
     last_n_spots: int | None = None
     last_thr: float = float(thr)
 
@@ -540,15 +541,19 @@ def individual_align_fiducial(
                     f"Reference spots out of range (too many): n={n_spots} max={detailed_config.max_spots} "
                     f"(threshold_sigma={thr}, fwhm={fwhm}); increasing threshold."
                 )
-                last_exc_type = TooManySpots
-                last_n_spots = n_spots
-                last_thr = float(thr)
-                raise TooManySpots(
+                exc = TooManySpots(
                     f"Too many spots ({n_spots} > {detailed_config.max_spots}) found on the reference image."
                 )
+                last_exc_type = TooManySpots
+                last_exc = exc
+                last_n_spots = n_spots
+                last_thr = float(thr)
+                raise exc
             last_exc_type = None
-        except NotEnoughSpots:
+            last_exc = None
+        except NotEnoughSpots as e:
             last_exc_type = NotEnoughSpots
+            last_exc = e
             last_n_spots = None
             last_thr = float(thr)
             logger.debug(
@@ -557,8 +562,9 @@ def individual_align_fiducial(
             thr -= detailed_config.threshold_step
             _attempt += 1
             continue
-        except TooManySpots:
+        except TooManySpots as e:
             last_exc_type = TooManySpots
+            last_exc = e
             last_thr = float(thr)
             thr += detailed_config.threshold_step
             _attempt += 1
@@ -569,16 +575,23 @@ def individual_align_fiducial(
     else:
         if last_exc_type is TooManySpots:
             n_spots = -1 if last_n_spots is None else last_n_spots
-            raise TooManySpots(
+            exc = TooManySpots(
                 f"Reference spots out of range after {detailed_config.max_attempts} attempts: "
                 f"too many spots (n={n_spots}, max={detailed_config.max_spots}). "
                 f"Last params: threshold_sigma={last_thr}, fwhm={fwhm}."
             )
-        raise NotEnoughSpots(
+            if debug:
+                raise exc from last_exc
+            raise exc from None
+
+        exc = NotEnoughSpots(
             f"Reference spots out of range after {detailed_config.max_attempts} attempts: "
             f"not enough spots (min={detailed_config.min_spots}). "
             f"Last params: threshold_sigma={last_thr}, fwhm={fwhm}."
         )
+        if debug:
+            raise exc from last_exc
+        raise exc from None
 
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
     kd = cKDTree(fixed[["xcentroid", "ycentroid"]])
