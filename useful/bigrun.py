@@ -27,6 +27,10 @@ def setwd(path: Path | str):
         os.chdir(old)
 
 
+def serialize_kwargs(kwargs: dict[str, Any] | None) -> str:
+    return "".join(f" --{k}={v}" for k, v in (kwargs or {}).items() if v is not None
+                   )
+
 @task(name="cli", retries=1, tags=["script"], task_run_name="{args}")
 def execute_script(args: str, *, cwd: Path | None = None, overwrite: bool = False, **kwargs: Any) -> str:
     """Execute a shell command with real-time colored output using a pseudo-terminal.
@@ -105,9 +109,9 @@ def deconv():
 
 
 @flow(name="Register")
-def register(ws: Workspace, codebook: Path, threads: int):
+def register(ws: Workspace, codebook: Path, threads: int, **kwargs: Any):
     execute_script("preprocess deconv compute-range . --overwrite")
-    execute_script(f"preprocess register batch . --codebook={codebook} --threads={threads}")
+    execute_script(f"preprocess register batch . --codebook={codebook} --threads={threads} --chromatic=../../chromatic" + serialize_kwargs(kwargs))
 
 
 @flow(name="Spots optimize: {ws.path.name}")
@@ -116,7 +120,7 @@ def optimize(
     codebook: Path,
     threads: int,
     *,
-    rounds: int = 8,
+    rounds: int = 10,
     blank: str | None = None,
     json_config: Path | None = None,
 ):
@@ -155,7 +159,7 @@ def main_workflow(
     with setwd(ws.deconved):
         register(ws, codebook, threads)
         stitch_register(ws, ws.rois, threads, json_config=json_config)
-        optimize(ws, codebook, threads, blank=blank, rounds=8, json_config=json_config)
+        optimize(ws, codebook, threads, blank=blank, rounds=10, json_config=json_config)
         call_spots(ws, codebook, threads, blank=blank, json_config=json_config)
 
 
@@ -170,7 +174,7 @@ def cli(): ...
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Path to the codebook file",
 )
-@click.option("--threads", type=int, default=8, help="Number of threads to use")
+@click.option("--threads", type=int, default=12, help="Number of threads to use")
 @click.option("--blank", type=str, default=None, help="Blank image to subtract")
 @click.option(
     "--config",
@@ -193,7 +197,6 @@ def stitch_register(
             cmd += f" --config={json_config}"
         execute_script(cmd, overwrite=overwrite)
 
-
 @flow
 def stitch_fuse(
     ws: Workspace,
@@ -202,57 +205,48 @@ def stitch_fuse(
     threads: int,
     overwrite: bool = False,
     json_config: Path | None = None,
+    **kwargs: Any,
 ):
-    logger = get_run_logger()
-    for roi in rois:
-        path = ws.stitch(roi, codebook)
-        done = (
-            path.exists()
-            and (path / "fused.zarr").exists()
-            and not any(p.name.isdigit() for p in path.iterdir())  # Intermediate fuses
-        )
-
-        if done:
-            logger.info(f"{roi} already fused.")
-
-        if overwrite or not done:
-            cmd = f"preprocess stitch fuse . {roi} --codebook={codebook}"
-            if json_config:
-                cmd += f" --config={json_config}"
-            execute_script(cmd, overwrite=overwrite)
-            execute_script(f"preprocess stitch combine . {roi} --codebook={codebook}", overwrite=overwrite)
-
-        if not (path / "fused.zarr").exists():
-            raise ValueError(f"No fused image found at {path / 'fused.zarr'}")
+    cmd = f"preprocess stitch fuse . --codebook={codebook} --threads={threads}" + "".join(f" --{k}={v}" for k, v in (kwargs or {}).items() if v is not None)
+    if json_config:
+        cmd += f" --config={json_config}"
+    execute_script(cmd, overwrite=overwrite)
 
 
 @flow
 def segment_workflow(
     ws: Workspace,
+    codebook: str,
     seg_codebook: str,
     channels: str,
+    fuse:bool=False,
     overwrite: bool = False,
+    intensity_codebook: str | None =None
 ):
-    logger = get_run_logger()
-    for roi in ws.rois:
-        if (
-            (ws.stitch(roi, codebook=seg_codebook) / "segmentation.done").exists()
-            and (ws.stitch(roi, codebook=seg_codebook) / "segmentation_output.zarr").exists()
-            and not overwrite
-        ):
-            logger.info(f"{roi} already segmented.")
-            continue
-        execute_script(
-            f"python /working/fishtools/segmentation/distributed/distributed_segmentation.py {ws.stitch(roi, codebook=seg_codebook)} --channels={channels}",
-            overwrite=overwrite,
-        )
+    # logger = get_run_logger()
+    if fuse:
+        stitch_fuse(ws, ws.rois, seg_codebook, threads=15, overwrite=overwrite)
 
-    for roi in ws.rois:
-        for codebook in ["mousecommon", "zachDE"]:
-            execute_script(
-                f"segment overlay spots {ws.path} {roi} --{codebook=} --seg-codebook={seg_codebook}",
-                overwrite=overwrite,
-            )
+    if intensity_codebook:
+        register(ws, Path(intensity_codebook), threads=15)
+
+
+    execute_script(f"preprocess stitch n4 . --codebook={seg_codebook} --z-index=5", overwrite=overwrite)
+    execute_script(
+            f"segment batch {ws.path} --codebook={seg_codebook} --channels={channels}",
+            overwrite=overwrite
+        )
+    execute_script(
+        f"segment postproc-batch {ws.path} --workers-per-gpu=4", overwrite=overwrite
+    )
+    execute_script(
+        f"segment overlay spots {ws.path} --{codebook=} --seg-codebook={seg_codebook}",
+        overwrite=overwrite,
+    )
+    if intensity_codebook:
+        execute_script(f"segment overlay intensity . --seg-codebook={seg_codebook} --intensity-codebook={intensity_codebook}", overwrite=overwrite)
+
+    execute_script(f"segment export . --codebook={codebook} --seg-codebook={seg_codebook}", overwrite=overwrite)
 
 
 @cli.command()
