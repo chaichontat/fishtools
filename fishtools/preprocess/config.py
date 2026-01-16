@@ -190,7 +190,7 @@ class RegisterConfig(BaseModel):
     )
     reference: str = Field(default="2_10_18", description="Reference round to align others to.")
     # Moved from HardwareConfig - threads used specifically for registration
-    threads: int = Field(default=15, description="Number of threads for registration operations")
+    threads: int = Field(default=10, description="Number of threads for registration operations")
     gpu_affine: bool = Field(
         default=False,
         description=("Enable GPU-based shift/affine in registration (opt-in). Falls back to CPU on error."),

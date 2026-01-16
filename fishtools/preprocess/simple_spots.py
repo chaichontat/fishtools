@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import time
 from datetime import timedelta
@@ -29,10 +28,10 @@ _REGISTERED_DIR = re.compile(r"^registered--(.+)\+(.+)$")
 
 
 class BlobDetectorParams(BaseModel):
-    min_sigma: float = 0.8
-    max_sigma: float = 3.0
-    num_sigma: int = 8
-    threshold: float = 0.015
+    min_sigma: float = 1.0
+    max_sigma: float = 2.0
+    num_sigma: int = 4
+    threshold: float = 0.05
     overlap: float = 0.5
     measurement_type: Literal["mean", "max", "median", "min"] = "mean"
     is_volume: bool = True
@@ -228,13 +227,12 @@ def _run_single_split(
         Filter.WhiteTophat(int(tophat_radius), is_volume=False).run(stack, in_place=True)
 
     blob = BlobDetectorParams.model_validate_json(blob_detector_json)
-    spots = FindSpots.BlobDetector(**blob.model_dump()).run(image_stack=stack)
+    blob_detector_config = blob.model_dump()
+    spots = FindSpots.BlobDetector(**blob_detector_config).run(image_stack=stack)
 
     decoded = _simple_lookup_decode(spots, codebook=_identity_codebook(channel_names))
 
     n_features = int(decoded.sizes.get("features", 0))
-    if n_features == 0:
-        raise NoSpotsFoundError(path_tif, split=split)
 
     decoded = decoded.assign_coords(
         distance=("features", np.zeros(n_features, dtype=np.float32)),
@@ -245,7 +243,7 @@ def _run_single_split(
     meta: dict[str, object] = {
         "fishtools_commit": git_hash(),
         "config": {
-            "blob_detector": json.loads(blob_detector_json),
+            "blob_detector": blob_detector_config,
             "tophat_radius": int(tophat_radius),
             "area_radius_scale": float(area_radius_scale),
         },
@@ -460,19 +458,15 @@ def simple(
     split_list = [split] if split is not None else [0, 1, 2, 3]
 
     def run_split(s: int) -> None:
-        try:
-            out, n_spots = _run_single_split(
-                path,
-                split=s,
-                codebook_label=codebook_path.stem,
-                blob_detector_json=blob_detector_json,
-                overwrite=overwrite,
-                tophat_radius=tophat_radius,
-                area_radius_scale=area_radius_scale,
-            )
-        except NoSpotsFoundError:
-            logger.info(f"{path.name} split={s}: discovered_spots=0")
-            return
+        out, n_spots = _run_single_split(
+            path,
+            split=s,
+            codebook_label=codebook_path.stem,
+            blob_detector_json=blob_detector_json,
+            overwrite=overwrite,
+            tophat_radius=tophat_radius,
+            area_radius_scale=area_radius_scale,
+        )
 
         if n_spots < 0:
             logger.info(f"{path.name} split={s}: skipped (already decoded)")
