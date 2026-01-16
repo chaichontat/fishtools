@@ -3,6 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    import polars as pl
 
 
 @dataclass
@@ -17,7 +22,7 @@ class Codebook:
     def name(self) -> str:
         return self.path.stem
 
-    def to_dataframe(self, bits_as_list: bool = False):
+    def to_dataframe(self, bits_as_list: bool = False) -> "pl.DataFrame":
         """
         Return a Polars DataFrame view of this codebook.
 
@@ -36,10 +41,9 @@ class Codebook:
         if not bits_as_list:
             return df.rename({"column_0": "bit0", "column_1": "bit1", "column_2": "bit2"})
 
-        return df.with_columns(
-            concat_list=pl.concat_list("column_0", "column_1", "column_2")
-            .cast(pl.List(pl.UInt8))
-            .alias("bits")
+        return df.select(
+            pl.col("target"),
+            pl.concat_list("column_0", "column_1", "column_2").cast(pl.List(pl.UInt8)).alias("bits"),
         )
 
     def blank_stats(self) -> tuple[int, int]:

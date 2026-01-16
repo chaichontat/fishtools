@@ -101,20 +101,6 @@ def load_spots(
         except KeyError:
             logger.warning(f"No passes_thresholds in {path}")
 
-    df = pl.DataFrame(y)
-    n_dims = len(df[0, "centroid"])
-
-    if n_dims == 3:
-        df = df.with_columns(pl.col("centroid").list.to_struct(fields=["z", "y_local", "x_local"])).unnest(
-            "centroid"
-        )
-    else:
-        df = (
-            df.with_columns(pl.col("centroid").list.to_struct(fields=["y_local", "x_local"]))
-            .unnest("centroid")
-            .with_columns(z=pl.lit(0.0))
-        )
-
     SCHEMA = pl.Schema([
         ("idx_local", pl.UInt32),
         ("area", pl.Float32),
@@ -129,6 +115,28 @@ def load_spots(
         ("tile", pl.Utf8),
         ("passes_thresholds", pl.Boolean),
     ])
+
+    if isinstance(y, np.ndarray):
+        is_empty = y.size == 0
+    else:
+        is_empty = len(y) == 0
+
+    if is_empty:
+        return pl.DataFrame(schema=SCHEMA)
+
+    df = pl.DataFrame(y)
+    n_dims = len(df[0, "centroid"])
+
+    if n_dims == 3:
+        df = df.with_columns(pl.col("centroid").list.to_struct(fields=["z", "y_local", "x_local"])).unnest(
+            "centroid"
+        )
+    else:
+        df = (
+            df.with_columns(pl.col("centroid").list.to_struct(fields=["y_local", "x_local"]))
+            .unnest("centroid")
+            .with_columns(z=pl.lit(0.0))
+        )
 
     df = df.with_columns(
         y=pl.col("y_local") + (tile_coords[1] if tile_coords is not None else 0),
@@ -171,8 +179,20 @@ def load_spots_simple(
         Path(path).unlink()
         raise Exception(f"Error reading {path}: {e}.") from e
 
+    df = pl.DataFrame(d.to_features_dataframe())
+    if df.is_empty():
+        return pl.DataFrame(schema=pl.Schema([
+            ("idx_local", pl.UInt32),
+            ("y_local", pl.Float32),
+            ("x_local", pl.Float32),
+            ("y", pl.Float32),
+            ("x", pl.Float32),
+            ("tile", pl.Utf8),
+            ("passes_thresholds", pl.Boolean),
+        ]))
+
     return (
-        pl.DataFrame(d.to_features_dataframe())
+        df
         .rename(dict(y="y_local", x="x_local"))
         .with_columns(
             y=pl.col("y_local") + (tile_coords[1] if tile_coords is not None else 0),
