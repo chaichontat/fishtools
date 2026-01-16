@@ -176,3 +176,6 @@ squid/
 *.h5
 .vscode/
 logs/
+ccf/out/
+.tmp/
+_out/
