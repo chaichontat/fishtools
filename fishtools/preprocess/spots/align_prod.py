@@ -38,9 +38,7 @@ from starfish.core.intensity_table.decoded_intensity_table import DecodedIntensi
 from starfish.core.intensity_table.intensity_table_coordinates import (
     transfer_physical_coords_to_intensity_table,
 )
-from starfish.core.spots.DetectPixels.combine_adjacent_features import (
-    CombineAdjacentFeatures,
-)
+from starfish.core.spots.DetectPixels.combine_adjacent_features import CombineAdjacentFeatures
 from starfish.core.types import Axes, Coordinates, CoordinateValue
 from starfish.experiment.builder import FetchedTile, TileFetcher
 from starfish.image import Filter
@@ -60,11 +58,9 @@ from fishtools.gpu.memory import release_all as _gpu_release_all
 from fishtools.io.workspace import CorruptedTiffError, Workspace, safe_imwrite
 from fishtools.preprocess.addition import ElementWiseAddition
 from fishtools.preprocess.cli_spotlook import threshold
-from fishtools.preprocess.config import (
-    OPTIMIZE_DECODE,
-    SpotDecodeConfig,
-)
+from fishtools.preprocess.config import OPTIMIZE_DECODE, SpotDecodeConfig
 from fishtools.preprocess.config_loader import load_config
+from fishtools.preprocess.simple_spots import simple, simple_batch
 from fishtools.preprocess.spots.align_batchoptimize import optimize
 from fishtools.preprocess.spots.illum_field_correction import (
     FieldContext,
@@ -76,7 +72,6 @@ from fishtools.preprocess.spots.illum_field_correction import (
 )
 from fishtools.preprocess.spots.stitch_spot_prod import stitch
 from fishtools.preprocess.stitching import spot_split_cut_px
-from fishtools.preprocess.simple_spots import simple, simple_batch
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import plot_all_genes
 from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
@@ -1679,7 +1674,53 @@ def spot_decoding(
 KEYS_560NM = set(range(1, 9)) | {25, 28, 31, 34}
 KEYS_650NM = set(range(9, 17)) | {26, 29, 32, 35}
 KEYS_750NM = set(range(17, 25)) | {27, 30, 33, 36}
-GAUSS_SIGMA = (2, 2, 2)
+OPTIMIZE_CROP_PX = 984
+
+
+def _run_spatial_slices(
+    tile_shape_yx: tuple[int, int],
+    *,
+    split: int | None,
+    optimize_crop: bool,
+) -> tuple[slice, slice]:
+    y, x = (int(tile_shape_yx[0]), int(tile_shape_yx[1]))
+    if optimize_crop:
+        # Keep optimize runtime constant across tile sizes.
+        # Crop is a fixed-size window whose bottom-right corner is as close as possible
+        # to the image center (i.e., "toward top-left from center"), while staying in-bounds.
+        if y <= OPTIMIZE_CROP_PX:
+            y_slice = slice(0, y)
+        else:
+            cy = y // 2
+            y0 = max(0, min(cy - OPTIMIZE_CROP_PX, y - OPTIMIZE_CROP_PX))
+            y_slice = slice(y0, y0 + OPTIMIZE_CROP_PX)
+
+        if x <= OPTIMIZE_CROP_PX:
+            x_slice = slice(0, x)
+        else:
+            cx = x // 2
+            x0 = max(0, min(cx - OPTIMIZE_CROP_PX, x - OPTIMIZE_CROP_PX))
+            x_slice = slice(x0, x0 + OPTIMIZE_CROP_PX)
+
+        return y_slice, x_slice
+
+    # Non-optimize decoding keeps the legacy quadrant split behavior (including for early ~1968px tiles)
+    # so downstream stitching and historical results remain comparable.
+    tile_size = x
+    cut = spot_split_cut_px(tile_size)
+    split = int(split) if split is not None else None
+
+    if split is None:
+        return slice(None), slice(None)
+    if split == 0:
+        return slice(0, cut), slice(0, cut)  # top-left
+    if split == 1:
+        return slice(0, cut), slice(-cut, None)  # top-right
+    if split == 2:
+        return slice(-cut, None), slice(0, cut)  # bottom-left
+    if split == 3:
+        return slice(-cut, None), slice(-cut, None)  # bottom-right
+    raise ValueError(f"split must be 0..3, got {split}")
 
 
 def get_blank_channel_info(key: str) -> tuple[int, int]:
@@ -1878,28 +1919,18 @@ def run(
     # blurred = gaussian(path, sigma=8)
     # blurred = levels(blurred)  # clip negative values to 0.
     # filtered = image - blurred
-    tile_size = int(raw.shape[-1])
-    cut = spot_split_cut_px(tile_size)
-    split = int(split) if split is not None else None
-    if split is None:
-        split_slice = np.s_[:, :]
-    elif split == 0:
-        split_slice = np.s_[:cut, :cut]  # top-left
-    elif split == 1:
-        split_slice = np.s_[:cut, -cut:]  # top-right
-    elif split == 2:
-        split_slice = np.s_[-cut:, :cut]  # bottom-left
-    elif split == 3:
-        split_slice = np.s_[-cut:, -cut:]  # bottom-right
-    else:
-        raise ValueError(f"Unknown split {split}")
+    split_slice = _run_spatial_slices(
+        raw.shape[-2:],
+        split=split,
+        optimize_crop=(calc_deviations or highpass_only),
+    )
 
     slc = tuple(
         np.s_[
             ::subsample_z,
             [bit_mapping[k] for k in used_bits if k in bit_mapping],
         ]
-    ) + tuple(split_slice)
+    ) + split_slice
     stack = make_fetcher(
         path,
         raw,
@@ -1926,7 +1957,7 @@ def run(
         blank_path = ws_registered.registered(_roi, blank) / path.name
         with TiffFile(blank_path) as tif:
             raw_blank = tif.asarray()
-        slc_blank = tuple(np.s_[::subsample_z, :]) + tuple(split_slice)
+        slc_blank = tuple(np.s_[::subsample_z, :]) + split_slice
         _stack_blank = make_fetcher(
             blank_path,
             raw_blank,
@@ -2394,6 +2425,146 @@ def batch(
             stagger=stagger,
             stagger_jitter=stagger_jitter,
         )
+
+
+@spots.command()
+@click.argument("parquet", type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path))
+@click.option("--out", type=click.Path(dir_okay=True, file_okay=False, path_type=Path), default=None)
+@click.option("--peak-perc", type=float, default=99.5, help="Percentile threshold on max-proj ||vec||")
+@click.option("--peak-min-distance", type=int, default=2, help="min_distance for peak_local_max")
+@click.option("--match-radius", type=float, default=2.0, help="Peak↔call match radius (px)")
+@click.option("--near-radius", type=float, default=5.0, help="Near radius for 'near_call_outside_radius' (px)")
+@click.option("--cb-dist-thresh", type=float, default=0.35, help="Heuristic 'bad code' distance threshold")
+@click.option("--dominant-frac", type=float, default=0.92, help="Heuristic max_channel_frac for single-channel peaks")
+@click.option("--edge-margin", type=int, default=8, help="Heuristic edge distance threshold (px)")
+@click.option("--k-per-cause", type=int, default=4, help="How many examples to render per cause bucket")
+@click.option("--blank-k", type=int, default=12, help="How many blank-peak examples to render")
+@click.option("--blank-call-k", type=int, default=12, help="How many blank-call examples to render")
+@click.option("--multichannel-call-k", type=int, default=12, help="How many multichannel call examples to render")
+@click.option("--confident-call-k", type=int, default=12, help="How many high-confidence call examples to render")
+@click.option("--multipeak-call-k", type=int, default=12, help="How many >3-peak call examples to render")
+@click.option("--min-peaks", type=int, default=4, help="Minimum number of peaks (active channels) for multipeak calls")
+@click.option("--confident-distance-q", type=float, default=0.10, help="Quantile for low distance cutoff")
+@click.option("--confident-norm-q", type=float, default=0.90, help="Quantile for high norm cutoff")
+@click.option(
+    "--variant",
+    type=click.Choice(
+        [
+            "missed",
+            "blank-peaks",
+            "blank-calls",
+            "multichannel-calls",
+            "confident-calls",
+            "multipeak-calls",
+            "both",
+        ]
+    ),
+    default="missed",
+    show_default=True,
+    help="Which peak panels to render (default focuses on missed peaks).",
+)
+@click.option(
+    "--include-bad-calls",
+    is_flag=True,
+    help="Also render a few suspicious calls (far from peaks, high decode distance, fails_thresholds).",
+)
+@click.option("--active-window", type=int, default=3, help="Patch radius (px) for channel-activity metrics")
+@click.option("--active-frac", type=float, default=0.30, help="Channel considered active if >= active_frac*max")
+@click.option("--active-topk", type=int, default=6, help="Store/report top-K channels by patch max")
+@click.option(
+    "--write-profiles/--no-write-profiles",
+    default=True,
+    show_default=True,
+    help="Write per-example channel profile plots (bar + z heatmap).",
+)
+@click.option("--panel-margin", type=int, default=12, help="Half-size of blank-style panel crop")
+@click.option("--vmax-percentile", type=float, default=99.999, help="Per-channel vmax percentile for panels")
+def investigate(
+    parquet: Path,
+    out: Path | None,
+    peak_perc: float,
+    peak_min_distance: int,
+    match_radius: float,
+    near_radius: float,
+    cb_dist_thresh: float,
+    dominant_frac: float,
+    edge_margin: int,
+    k_per_cause: int,
+    blank_k: int,
+    blank_call_k: int,
+    multichannel_call_k: int,
+    confident_call_k: int,
+    multipeak_call_k: int,
+    min_peaks: int,
+    confident_distance_q: float,
+    confident_norm_q: float,
+    variant: str,
+    include_bad_calls: bool,
+    active_window: int,
+    active_frac: float,
+    active_topk: int,
+    write_profiles: bool,
+    panel_margin: int,
+    vmax_percentile: float,
+) -> None:
+    from fishtools.preprocess.spots.investigate import main as investigate_main
+
+    argv = [parquet.as_posix()]
+    if out is not None:
+        argv.extend(["--out", out.as_posix()])
+    argv.extend(
+        [
+            "--peak-perc",
+            str(peak_perc),
+            "--peak-min-distance",
+            str(peak_min_distance),
+            "--match-radius",
+            str(match_radius),
+            "--near-radius",
+            str(near_radius),
+            "--cb-dist-thresh",
+            str(cb_dist_thresh),
+            "--dominant-frac",
+            str(dominant_frac),
+            "--edge-margin",
+            str(edge_margin),
+            "--k-per-cause",
+            str(k_per_cause),
+            "--blank-k",
+            str(blank_k),
+            "--blank-call-k",
+            str(blank_call_k),
+            "--multichannel-call-k",
+            str(multichannel_call_k),
+            "--confident-call-k",
+            str(confident_call_k),
+            "--multipeak-call-k",
+            str(multipeak_call_k),
+            "--min-peaks",
+            str(min_peaks),
+            "--confident-distance-q",
+            str(confident_distance_q),
+            "--confident-norm-q",
+            str(confident_norm_q),
+            "--variant",
+            str(variant),
+            "--active-window",
+            str(active_window),
+            "--active-frac",
+            str(active_frac),
+            "--active-topk",
+            str(active_topk),
+            "--panel-margin",
+            str(panel_margin),
+            "--vmax-percentile",
+            str(vmax_percentile),
+        ]
+    )
+    if include_bad_calls:
+        argv.append("--include-bad-calls")
+    argv.append("--write-profiles" if write_profiles else "--no-write-profiles")
+
+    raise SystemExit(investigate_main(argv))
 
 
 spots.add_command(optimize)
