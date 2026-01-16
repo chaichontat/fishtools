@@ -135,12 +135,12 @@ class Fiducial(BaseModel):
         description="Use SimpleITK gradient descent for alignment. More robust for low-contrast images.",
     )
     fwhm: float = Field(
-        default=4.5,
+        default=4.0,
         gt=0.1,  # Must be positive
         description="Full width at half maximum for fiducial spot detection. The higher this is, the more spots will be detected.",
     )
     threshold: float = Field(
-        default=4.0,
+        default=6.0,
         gt=0.0,  # Must be positive
         description="Threshold for fiducial spot detection in standard deviation above the median.",
     )

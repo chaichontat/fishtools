@@ -47,27 +47,10 @@ def imread_page(path: Path | str, page: int):
 def butterworth(
     image: np.ndarray, cutoff: float = 0.05, squared_butterworth: bool = True, order: int = 3, npad: int = 0
 ) -> np.ndarray:
-    """Apply Butterworth high-pass filter to enhance fiducial spot detection.
+    """High-pass Butterworth filter (clipped to non-negative).
 
-    High-pass filtering removes low-frequency background variations while preserving
-    high-frequency features like fiducial spots. This preprocessing step improves
-    the contrast of fiducial markers against cellular background.
-
-    Args:
-        image: Input microscopy image to be filtered
-        cutoff: Cutoff frequency ratio (0-1). Lower values remove more background
-        squared_butterworth: Whether to use squared Butterworth response for sharper cutoff
-        order: Filter order - higher values create sharper frequency transitions
-        npad: Number of pixels to pad edges (0 = automatic padding)
-
-    Returns:
-        Filtered image with enhanced spot contrast, clipped to non-negative values
-
-    Scientific Context:
-        Fiducial spots appear as bright, localized features that need to be distinguished
-        from cellular autofluorescence and imaging artifacts. High-pass filtering
-        effectively removes slowly varying background while preserving the sharp
-        intensity gradients characteristic of diffraction-limited spots.
+    Scientific context:
+        Useful for suppressing slowly varying background while preserving spot-like structure.
     """
     res: np.ndarray = filters.butterworth(
         image,
@@ -81,24 +64,10 @@ def butterworth(
 
 
 def clahe(img: np.ndarray, clip_limit: float = 0.01, bins: int = 200) -> np.ndarray:
-    """Apply Contrast Limited Adaptive Histogram Equalization (CLAHE) to improve local contrast.
+    """Contrast-limited adaptive histogram equalization.
 
-    CLAHE enhances local contrast by applying histogram equalization within small regions
-    of the image while preventing over-amplification of noise through clipping.
-    This is particularly useful for images with varying illumination conditions.
-
-    Args:
-        img: Input microscopy image
-        clip_limit: Clipping limit for contrast enhancement (0-1). Higher values allow more contrast
-        bins: Number of histogram bins for equalization (unused in current implementation)
-
-    Returns:
-        Contrast-enhanced image with improved local feature visibility
-
-    Scientific Context:
-        Microscopy images often suffer from uneven illumination due to optical limitations.
-        CLAHE improves the visibility of fiducial spots in regions with poor contrast
-        without over-amplifying noise in already well-contrasted areas.
+    Scientific context:
+        Helps with uneven illumination without over-amplifying noise.
     """
     return exposure.equalize_adapthist(img, clip_limit=clip_limit, nbins=bins)
 
@@ -109,41 +78,11 @@ def find_spots(
     fwhm: float,
     minimum_spots: int = 6,
 ) -> pl.DataFrame:
-    """Detect fiducial spots using Laplacian of Gaussian filtering and peak detection.
+    """Detect fiducial spots with DAOStarFinder (sorted by mag).
 
-    This function identifies sub-pixel accurate spot locations by applying a Laplacian
-    of Gaussian (LoG) filter followed by local maxima detection. The LoG filter is
-    particularly effective for detecting blob-like features with known approximate size.
-
-    Args:
-        img: Input microscopy image containing fiducial spots
-        threshold_sigma: Detection threshold in standard deviations above median.
-                        Higher values detect only brighter spots, lower values may include noise
-        fwhm: Full Width at Half Maximum of expected spots in pixels. Should match the
-              point spread function of the imaging system (~2-4 pixels for typical setups)
-        minimum_spots: Minimum number of spots required for successful detection.
-                      Raises NotEnoughSpots if fewer spots are found
-
-    Returns:
-        DataFrame with detected spots sorted by brightness (mag column), containing:
-        - xcentroid, ycentroid: Sub-pixel spot coordinates
-        - mag: Spot intensity/magnitude
-        - Additional photometry measurements
-
-    Raises:
-        NotEnoughSpots: If fewer than minimum_spots are detected
-        TooManySpots: If an excessive number of spots suggests noise contamination
-
-    Scientific Context:
-        Fiducial spots are fluorescent beads embedded in tissue that serve as reference
-        points for image registration. Accurate sub-pixel localization is critical for
-        achieving nanometer-scale registration precision required in super-resolution
-        microscopy and spatial transcriptomics applications.
-
-        The LoG filter approximates the appearance of diffraction-limited spots and
-        provides scale-invariant detection when the FWHM parameter matches the actual
-        spot size. The sigma parameter controls detection sensitivity - too low includes
-        noise, too high misses dim legitimate spots.
+    Scientific context:
+        `threshold_sigma` is interpreted as standard deviations above the (sigma-clipped) median.
+        `fwhm` should roughly match the PSF spot size in pixels.
     """
     img = img.squeeze()
     if img.ndim != 2:
@@ -153,17 +92,13 @@ def find_spots(
     if np.sum(img) == 0:
         raise NotEnoughSpots("Reference image has zero sum - no signal available.")
 
-    # min_ = img.min()
-    # normalized = clahe((img - min_) / (img.max() - min_))
-
     _mean, median, std = sigma_clipped_stats(img, sigma=threshold_sigma + 5)
-    # You don't want need to subtract the mean here, the median is subtracted in the call three lines below.
+    # Median is subtracted inside the DAOStarFinder call below.
     iraffind = DAOStarFinder(
         threshold=threshold_sigma * std, fwhm=fwhm, exclude_border=True, roundhi=0.5, roundlo=-0.5
     )
     try:
         df = pl.DataFrame(iraffind(img - median).to_pandas())
-        # Filter out null mag values and non-finite centroids, sort by magnitude (brightest first)
         df = df.filter(
             pl.col("mag").is_not_null()
             & pl.col("xcentroid").is_finite()
@@ -206,25 +141,11 @@ def _log_for_fft(img: np.ndarray, *, sigma: float = 3.0) -> np.ndarray:
 
 
 def phase_shift(ref: np.ndarray, img: np.ndarray, precision: int = 2) -> np.ndarray:
-    """Calculate sub-pixel image translation using phase cross-correlation.
+    """Phase-correlation shift [dy, dx] (sub-pixel).
 
-    Args:
-        ref: Reference image (typically fiducial channel from reference round)
-        img: Target image to be aligned to reference
-        precision: Decimal precision for sub-pixel accuracy. precision=2 gives 0.01 pixel accuracy
-
-    Returns:
-        Translation vector [dy, dx] in pixels to align img to ref
-
-    Scientific Context:
-        Phase cross-correlation is robust to intensity variations and noise, making it
-        ideal for registering fiducial images across imaging rounds. Unlike feature-based
-        methods, it works directly on pixel intensities and can detect translations
-        even when individual fiducial spots are not clearly visible.
-
-        The upsample_factor parameter determines sub-pixel precision: 100 (10²) gives
-        centipixel accuracy, sufficient for most microscopy applications requiring
-        nanometer-scale registration precision.
+    Scientific context:
+        Robust to global intensity scaling and can work when spot finding is unreliable.
+        `precision` controls the upsample factor used for sub-pixel refinement.
     """
     ref_norm = _normalize_for_fft(ref)
     img_norm = _normalize_for_fft(img)
@@ -235,22 +156,11 @@ def itk_shift(
     ref: np.ndarray,
     img: np.ndarray,
     max_shift: float = 20.0,
-) -> np.ndarray:
-    """Calculate image translation using SimpleITK 1+1 evolutionary optimizer (2D translation).
+) -> tuple[np.ndarray, int]:
+    """SimpleITK translation-only registration (returns shift + iterations).
 
-    Uses a correlation metric and the OnePlusOne evolutionary strategy over a small
-    multi-resolution pyramid. The optimization is centered on the initial transform
-    (zero shift). The final shift is clipped to ``[-max_shift, max_shift]`` per axis
-    to guard against implausibly large drifts.
-
-    Args:
-        ref: Reference image.
-        img: Target image to be aligned to reference.
-        max_shift: Maximum absolute translation (in pixels, assuming unit spacing)
-            allowed along each axis. Results exceeding this are clipped.
-
-    Returns:
-        Translation vector [dy, dx] in pixels to align img to ref.
+    Scientific context:
+        This is a slower but more forgiving fallback for low-contrast fiducials.
     """
     import SimpleITK as sitk
 
@@ -283,7 +193,6 @@ def itk_shift(
     final_transform = registration.Execute(fixed_sitk, moving_sitk)
     params = final_transform.GetParameters()
 
-    # Debug: log optimizer diagnostics and final shift
     stop_reason = registration.GetOptimizerStopConditionDescription()
     n_iters = int(registration.GetOptimizerIteration())
     logger.debug(f"ITK optimizer stop: {stop_reason}")
@@ -307,19 +216,10 @@ def itk_shift(
 def shifts_from_anchor_roi(
     roi_path: Path, reference: str, ordered_keys: list[str]
 ) -> dict[str, np.ndarray]:
-    """Calculate shifts from ImageJ ROI anchor points using channel position.
+    """Shifts from ImageJ point ROIs (c_position maps to round).
 
-    Points are matched to rounds by their channel position (c_position) in the ROI.
-    Channel indices correspond to the sorted round names in the fids TIFF.
-    Points are matched by nearest-neighbor - user doesn't need to mark in same order.
-
-    Args:
-        roi_path: Path to ImageJ RoiSet.zip or .roi file
-        reference: Name of the reference round
-        ordered_keys: Sorted list of round names (channel order in fids TIFF)
-
-    Returns:
-        Dict mapping round name to [dx, dy] shift in pixels
+    Scientific context:
+        Manual anchor points are expected to be sparse; nearest-neighbor matching makes point order irrelevant.
     """
     from collections import defaultdict
 
@@ -387,32 +287,13 @@ def shifts_from_anchor_roi(
 def background(
     img: np.ndarray, box_size: tuple[int, int] | None = None, sigma_clip: float = 2.0
 ) -> np.ndarray:
-    """Estimate spatially varying background using 2D background fitting.
+    """Median background estimate via Background2D.
 
-    This function creates a smooth background model by dividing the image into boxes,
-    calculating the median background level in each box while rejecting outliers
-    (bright spots), then interpolating between boxes to create a full-frame background map.
-
-    Args:
-        img: Input microscopy image for background estimation
-        box_size: Size of background estimation boxes (y, x) in pixels.
-                 Larger boxes = smoother background, smaller boxes = more local adaptation
-                 If None, automatically determines size based on image dimensions
-        sigma_clip: Standard deviation threshold for outlier rejection.
-                   Higher values include more pixels in background estimation
-
-    Returns:
-        2D background image matching input dimensions
-
-    Scientific Context:
-        The median estimator is robust to the presence of bright fiducial spots, which
-        are treated as outliers and excluded from background calculation. Sigma clipping
-        further improves robustness by rejecting pixels that deviate significantly from
-        the local median, ensuring the background model represents true background signal.
+    Scientific context:
+        The median estimator and sigma clipping suppress bright fiducials so the background
+        is dominated by tissue/autofluorescence.
     """
     if box_size is None:
-        # Auto-determine box size based on image dimensions
-        # Use boxes that are ~10% of the image size, but at least 10x10
         box_size = (max(10, img.shape[0] // 10), max(10, img.shape[1] // 10))
 
     sigma_clip_obj = SigmaClip(sigma=sigma_clip)
@@ -438,35 +319,10 @@ def _calculate_drift(
     max_drift_threshold: float = 40.0,
     bin_size: float = 0.5,
 ) -> np.ndarray:
-    """Calculate drift between reference and target fiducial spots using nearest neighbor matching.
+    """Robust translation from matched fiducial spots.
 
-    This function matches detected fiducial spots between reference and target images
-    to estimate the global translation drift. It uses k-d tree nearest neighbor search
-    for efficient matching, followed by robust drift estimation using mode calculation
-    to reject outliers from incorrect matches.
-
-    Args:
-        ref_kd: K-d tree built from reference spot coordinates for fast neighbor search
-        ref_points: DataFrame of reference fiducial spots with xcentroid, ycentroid columns
-        target_points: DataFrame of target fiducial spots to be matched against reference
-        initial_drift: Prior estimate of drift to improve matching (typically from previous iteration)
-        use_brightest: If >0, use only the N brightest spots for more robust matching
-        offset_brightest: Skip the first N brightest spots before applying use_brightest (pagination-style)
-        plot: Whether to generate diagnostic histogram plots of drift distributions
-        precision: Decimal precision for drift calculation rounding
-        warning_spots_threshold: Warn if more spots detected (may indicate noise contamination)
-        min_spots_for_mode: Minimum matched spots required for mode-based drift estimation
-        max_drift_threshold: Maximum allowed drift magnitude before flagging as suspicious
-        bin_size: Bin size for histogram-based mode calculation
-
-    Returns:
-        Drift vector [dy, dx] in pixels, rounded to specified precision
-
-    Raises:
-        ValueError: If no drift is found or reference image was passed as target
-
-    Note:
-        Coordinate ordering follows scipy convention (z, y, x) to match image array indexing.
+    Scientific context:
+        Uses nearest-neighbor matching and a mode estimate to reduce the impact of mismatches/outliers.
     """
 
     if len(target_points) > warning_spots_threshold:
@@ -484,7 +340,6 @@ def _calculate_drift(
             raise ValueError("offset_brightest must be >= 0")
         target_points = target_points.sort("mag").slice(offset_brightest, use_brightest)
 
-    # points = moving[cols].to_numpy()
     if initial_drift is None:
         initial_drift = np.zeros(2)
 
@@ -659,25 +514,7 @@ def individual_align_fiducial(
     fwhm: float = 4,
     detailed_config: FiducialDetailedConfig | None = None,
 ):
-    """Create function to align target images to reference fiducials.
-
-    Detects fiducial spots in reference image and returns function that calculates
-    drift for target images by matching their fiducials to reference spots.
-
-    Args:
-        ref: Reference image containing fiducial spots
-        subtract_background: Apply background subtraction before detection
-        debug: Enable debug logging and single-threaded execution
-        name: Image name for logging
-        threshold_sigma: Detection threshold in standard deviations
-        threshold_residual: Maximum residual drift for convergence
-        use_brightest: Use only N brightest spots (0 = use all)
-        fwhm: Expected spot FWHM in pixels
-        processing_config: Configuration for detection parameters
-
-    Returns:
-        Function that takes target image and returns (drift, residual) tuple
-    """
+    """Build a fiducial aligner closure for a reference frame."""
     if detailed_config is None:
         detailed_config = FiducialDetailedConfig()
 
@@ -690,15 +527,30 @@ def individual_align_fiducial(
 
     _attempt = 0
     thr = threshold_sigma
+    last_exc_type: type[Exception] | None = None
+    last_n_spots: int | None = None
+    last_thr: float = float(thr)
 
     while _attempt < detailed_config.max_attempts:
         try:
             fixed = find_spots(ref, threshold_sigma=thr, fwhm=fwhm, minimum_spots=detailed_config.min_spots)
-            if len(fixed) > detailed_config.max_spots:
-                raise TooManySpots(
-                    f"Too many spots ({len(fixed)} > {detailed_config.max_spots}) found on the reference image. Please increase threshold_sigma or reduce FWHM."
+            n_spots = int(len(fixed))
+            if n_spots > detailed_config.max_spots:
+                logger.warning(
+                    f"Reference spots out of range (too many): n={n_spots} max={detailed_config.max_spots} "
+                    f"(threshold_sigma={thr}, fwhm={fwhm}); increasing threshold."
                 )
+                last_exc_type = TooManySpots
+                last_n_spots = n_spots
+                last_thr = float(thr)
+                raise TooManySpots(
+                    f"Too many spots ({n_spots} > {detailed_config.max_spots}) found on the reference image."
+                )
+            last_exc_type = None
         except NotEnoughSpots:
+            last_exc_type = NotEnoughSpots
+            last_n_spots = None
+            last_thr = float(thr)
             logger.debug(
                 "Not enough spots found on reference image. Trying to find spots with lower threshold."
             )
@@ -706,9 +558,8 @@ def individual_align_fiducial(
             _attempt += 1
             continue
         except TooManySpots:
-            logger.warning(
-                "Too many spots found on reference image. Trying to find spots with lower threshold."
-            )
+            last_exc_type = TooManySpots
+            last_thr = float(thr)
             thr += detailed_config.threshold_step
             _attempt += 1
         else:
@@ -716,8 +567,17 @@ def individual_align_fiducial(
             fixed = fixed[: max(np.argmax(np.diff(fixed["mag"])), 10, len(fixed) // 4)]
             break
     else:
+        if last_exc_type is TooManySpots:
+            n_spots = -1 if last_n_spots is None else last_n_spots
+            raise TooManySpots(
+                f"Reference spots out of range after {detailed_config.max_attempts} attempts: "
+                f"too many spots (n={n_spots}, max={detailed_config.max_spots}). "
+                f"Last params: threshold_sigma={last_thr}, fwhm={fwhm}."
+            )
         raise NotEnoughSpots(
-            f"Could not find spots on reference after {detailed_config.max_attempts} attempts."
+            f"Reference spots out of range after {detailed_config.max_attempts} attempts: "
+            f"not enough spots (min={detailed_config.min_spots}). "
+            f"Last params: threshold_sigma={last_thr}, fwhm={fwhm}."
         )
 
     logger.debug(f"{name}: {len(fixed)} peaks found on reference image.")
