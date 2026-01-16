@@ -6,6 +6,7 @@ import numpy as np
 import SimpleITK as sitk
 from loguru import logger
 from matplotlib.axes import Axes
+from scipy import ndimage as ndi
 
 
 class Affine:
@@ -141,6 +142,60 @@ class Affine:
         return sitk.GetArrayFromImage(resampler.Execute(image))
 
 
+def apply_dense_xy_displacement_field(
+    img: np.ndarray[np.float32, Any],
+    *,
+    dx_dense: np.ndarray[np.float32, Any],
+    dy_dense: np.ndarray[np.float32, Any],
+    default_pixel_value: float = 100.0,
+) -> np.ndarray[np.float32, Any]:
+    """
+    Apply a dense per-pixel displacement field to a zyx image.
+
+    The displacement field is interpreted in pixel units as a pull-resampling map:
+      output(x, y) samples input at (x + dx(x, y), y + dy(x, y)).
+    This matches the convention used by `useful/register_genmaster.py`.
+    """
+    img = np.asarray(img, dtype=np.float32)
+    dx_dense = np.asarray(dx_dense, dtype=np.float32)
+    dy_dense = np.asarray(dy_dense, dtype=np.float32)
+    if img.ndim != 3:
+        raise ValueError(f"img must be a zyx array, got shape {img.shape}")
+    if dx_dense.shape != dy_dense.shape:
+        raise ValueError(f"dx_dense and dy_dense must match, got {dx_dense.shape} vs {dy_dense.shape}")
+    if dx_dense.ndim != 2:
+        raise ValueError(f"dx_dense/dy_dense must be yx arrays, got shape {dx_dense.shape}")
+    z, h, w = img.shape
+    if dx_dense.shape != (h, w):
+        raise ValueError(f"Displacement field shape {dx_dense.shape} does not match image yx={(h, w)}")
+
+    cval = float(default_pixel_value)
+    out = np.empty_like(img, dtype=np.float32)
+
+    # Avoid allocating a (z, h, w, 3) displacement volume (can be huge in practice).
+    xs = np.arange(w, dtype=np.float64)[None, :]
+    block_rows = 256
+    for zi in range(z):
+        moving = np.asarray(img[zi], dtype=np.float32, order="C")
+        warped = out[zi]
+        for y0i in range(0, h, block_rows):
+            y1i = min(h, y0i + block_rows)
+            ys = np.arange(y0i, y1i, dtype=np.float64)[:, None]
+            dx_blk = dx_dense[y0i:y1i].astype(np.float64, copy=False)
+            dy_blk = dy_dense[y0i:y1i].astype(np.float64, copy=False)
+            sample_y = ys + dy_blk
+            sample_x = xs + dx_blk
+            warped[y0i:y1i] = ndi.map_coordinates(
+                moving,
+                [sample_y, sample_x],
+                order=1,
+                mode="constant",
+                cval=cval,
+            ).astype(np.float32, copy=False)
+
+    return out
+
+
 def overlay(
     ref: np.ndarray[np.float32, Any],
     img: np.ndarray[np.float32, Any],
@@ -219,14 +274,33 @@ class FitAffine:
     optimization-based registration.
     """
 
-    def __init__(self):
-        """Initialize elastix parameter object with affine registration settings."""
-        self.parameter_object = itk.ParameterObject.New()
-        default_rigid_parameter_map = self.parameter_object.GetDefaultParameterMap("affine")
-        default_rigid_parameter_map["AutomaticScalesEstimation"] = ["true"]
-        self.parameter_object.AddParameterMap(default_rigid_parameter_map)
+    def __init__(
+        self,
+        *,
+        optimizer: str | None = None,
+        max_iterations: int | None = None,
+        log_to_console: bool = True,
+    ):
+        """Initialize elastix parameter object with affine registration settings.
 
-    def fit(self, ref: np.ndarray, target: np.ndarray):
+        Args:
+            optimizer: Elastix optimizer name (e.g., "AdaptiveStochasticGradientDescent",
+                "QuasiNewtonLBFGS"). If None, uses the default affine parameter map.
+            max_iterations: Override elastix MaximumNumberOfIterations. If None, uses
+                the default affine parameter map.
+            log_to_console: Forward elastix logs to console.
+        """
+        self.parameter_object = itk.ParameterObject.New()
+        default_affine_parameter_map = self.parameter_object.GetDefaultParameterMap("affine")
+        default_affine_parameter_map["AutomaticScalesEstimation"] = ["true"]
+        if optimizer is not None:
+            default_affine_parameter_map["Optimizer"] = [optimizer]
+        if max_iterations is not None:
+            default_affine_parameter_map["MaximumNumberOfIterations"] = [str(int(max_iterations))]
+        self.parameter_object.AddParameterMap(default_affine_parameter_map)
+        self._log_to_console = bool(log_to_console)
+
+    def fit(self, ref: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Fit affine transform from reference to target image.
 
         Args:
@@ -234,18 +308,14 @@ class FitAffine:
             target: Target image to be aligned
 
         Returns:
-            Tuple of (affine_matrices, translation_vectors) as lists
+            Tuple of (A, t, warped), where A is 2x2, t is (2,), and warped is
+            the target image resampled into the reference geometry.
         """
-        # As is a 2x2 matrix
-        # ts is a 2x1 matrix (translation)
-        As = []
-        ts = []
-
         result_image, self.parameter_object = itk.elastix_registration_method(
             ref.astype(np.float32),
             target.astype(np.float32),
             parameter_object=self.parameter_object,
-            log_to_console=True,
+            log_to_console=self._log_to_console,
         )
 
         params = np.array(
@@ -256,9 +326,19 @@ class FitAffine:
                 )
             )
         )
-        As.append(params[:4].reshape(2, 2))
-        ts.append(params[-2:])
-        return As, ts
+        A = params[:4].reshape(2, 2)
+        t = params[-2:]
+
+        if isinstance(result_image, np.ndarray):
+            warped = result_image
+        else:
+            warped = itk.array_from_image(result_image)
+        if warped.ndim == 3 and warped.shape[0] == 1:
+            warped = warped[0]
+        if warped.ndim != 2:
+            raise ValueError(f"Expected warped 2D image, got shape {warped.shape}")
+
+        return A, t, warped.astype(np.float32, copy=False)
 
     @staticmethod
     def write(

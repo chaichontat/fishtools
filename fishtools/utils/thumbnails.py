@@ -75,11 +75,27 @@ def save_thumbnail_png(
     output_path: Path,
     *,
     options: ThumbnailOptions | None = None,
+    lowhigh: np.ndarray | None = None,
 ) -> None:
-    """Save a downsampled RGB thumbnail using the stitch pipeline's logic."""
+    """Save a downsampled RGB thumbnail."""
+    rgb = thumbnail_rgb(thumbnail_data, options=options, lowhigh=lowhigh)
+    thumbnail_img = Image.fromarray(rgb, mode="RGB")
+    thumbnail_img.save(output_path)
+
+
+def thumbnail_rgb(
+    thumbnail_data: np.ndarray,
+    *,
+    options: ThumbnailOptions | None = None,
+    lowhigh: np.ndarray | None = None,
+) -> np.ndarray:
+    """Render a thumbnail as an RGB uint8 array."""
     opts = options or ThumbnailOptions()
     td = thumbnail_data[:: opts.xy_downsample, :: opts.xy_downsample]
-    td = _normalize_to_uint8(td, opts)
+    if lowhigh is not None:
+        td = _normalize_to_uint8_by_lowhigh(td, lowhigh)
+    else:
+        td = _normalize_to_uint8(td, opts)
     if td.dtype != np.uint8:
         td = td.astype(np.uint8)
     if td.ndim == 2:
@@ -88,5 +104,26 @@ def save_thumbnail_png(
         td = np.repeat(td, 3, axis=2)
     elif td.shape[2] == 2:
         td = np.concatenate([td, np.zeros_like(td[:, :, :1])], axis=2)
-    thumbnail_img = Image.fromarray(td, mode="RGB")
-    thumbnail_img.save(output_path)
+    return td
+
+
+def _normalize_to_uint8_by_lowhigh(data: np.ndarray, lowhigh: np.ndarray) -> np.ndarray:
+    if data.ndim == 2:
+        data = data[:, :, None]
+    if data.ndim != 3:
+        raise ValueError(f"Expected YX or YXC array, got shape={data.shape}")
+
+    if lowhigh.ndim != 2 or lowhigh.shape[1] != 2 or lowhigh.shape[0] < data.shape[2]:
+        raise ValueError(f"lowhigh must be shaped (C,2) with C>=data channels; got shape={lowhigh.shape}")
+
+    out = np.empty(data.shape, dtype=np.uint8)
+    data_f = data.astype(np.float32, copy=False)
+    for ch in range(data.shape[2]):
+        lo = float(lowhigh[ch, 0])
+        hi = float(lowhigh[ch, 1])
+        if hi <= lo:
+            out[:, :, ch] = 0
+            continue
+        scaled = (data_f[:, :, ch] - lo) / (hi - lo)
+        out[:, :, ch] = (np.clip(scaled, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return out

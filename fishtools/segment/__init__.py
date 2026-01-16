@@ -7,7 +7,7 @@ import rich_click as click
 
 from fishtools.segment.cli import app, main
 from fishtools.utils.pretty_print import TaskCancelledException, progress_bar
-from fishtools.utils.thumbnails import load_thumbnail_options, save_thumbnail_png
+from fishtools.utils.thumbnails import load_thumbnail_options, thumbnail_rgb
 from fishtools.utils.utils import batch_roi
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -1337,6 +1337,18 @@ def extract_single_command(
 )
 @click.argument("roi", required=False, default="*")
 @click.option(
+    "--seg-codebook",
+    type=str,
+    default=None,
+    help="Segmentation codebook used to locate the mask zarr for boundary overlays (enables outlines).",
+)
+@click.option(
+    "--segmentation-name",
+    default="output_segmentation-sam_postproc_s1-2-2_v500.zarr",
+    show_default=True,
+    help="Segmentation zarr name (Z,Y,X integer labels) inside stitch--ROI+<seg_codebook>.",
+)
+@click.option(
     "--z-stride",
     type=click.IntRange(min=1),
     default=None,
@@ -1352,6 +1364,14 @@ def extract_single_command(
     type=click.IntRange(min=1),
     default=None,
     help="Spatial downsampling factor (overrides --options).",
+)
+@click.option(
+    "--channels",
+    default=None,
+    help=(
+        "Comma-separated channel names (from fused.zarr attrs['key']) or 0-based indices to render (max 3 for RGB). "
+        "Example: --channels Cy3,ATTO647N or --channels 0,2. Default: first up to 3 channels."
+    ),
 )
 @click.option(
     "--options",
@@ -1371,25 +1391,39 @@ def extract_single_command(
     default=False,
     help="Also generate thumbnails from fused_n4.zarr when present.",
 )
+@click.option(
+    "--boundary-color",
+    default="128,128,128",
+    show_default=True,
+    help="Boundary RGB triplet like '0,255,0' (only used when --seg-codebook is set).",
+)
 @click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing thumbnails.")
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def thumbnail_command(
     path: Path,
     roi: str,
+    seg_codebook: str | None,
+    segmentation_name: str,
     z_stride: int | None,
     z_range: str | None,
     downsample: int | None,
+    channels: str | None,
     thumbnail_options: Path | None,
     output_dir: Path | None,
     codebook: str,
     include_n4: bool,
+    boundary_color: str,
     overwrite: bool,
 ) -> None:
     """Generate RGB PNG thumbnails from stitched fused.zarr volumes."""
+    import numpy as np
     import zarr
     from loguru import logger
+    from scipy.ndimage import rotate as ndimage_rotate
 
+    from fishtools.ccf.landmark import LandmarkRegistrationOutputs
     from fishtools.io.workspace import Workspace
+    from fishtools.segment.normalize import sample_percentile
 
     ws = Workspace(path)
     try:
@@ -1397,7 +1431,14 @@ def thumbnail_command(
     except Exception as exc:
         raise click.ClickException(f"Invalid --options file: {exc}") from exc
 
+    channels_spec = channels
+
     from dataclasses import replace
+
+    # When outlines are requested, default to the historical `segment plot` subsample (2)
+    # unless the user explicitly overrides via --downsample or --options.
+    if seg_codebook is not None and downsample is None and thumbnail_options is None:
+        thumb_options = replace(thumb_options, xy_downsample=2)
 
     if z_stride is not None:
         thumb_options = replace(thumb_options, z_stride=z_stride)
@@ -1421,6 +1462,28 @@ def thumbnail_command(
     stitched_dir = ws.stitch(roi, codebook)
     thumbnail_dir = output_root / f"{roi}+{codebook}"
 
+    boundary_rgb = _parse_rgb_triplet(boundary_color)
+    mask_path: Path | None = None
+    if seg_codebook is not None:
+        seg_dir = ws.stitch(roi, seg_codebook)
+        mask_path = seg_dir / segmentation_name
+        if not mask_path.exists():
+            raise click.ClickException(f"ROI '{roi}': segmentation zarr not found at {mask_path}")
+
+    if (
+        not overwrite
+        and channels_spec is None
+        and seg_codebook is None
+        and thumbnail_dir.exists()
+        and any(thumbnail_dir.iterdir())
+    ):
+        raise click.ClickException(f"Refusing to write into non-empty output directory {thumbnail_dir}; pass --overwrite.")
+
+    try:
+        pose = _try_read_thumbnail_pose(ws, roi, LandmarkRegistrationOutputs=LandmarkRegistrationOutputs)
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"Failed to read CCF pose transform for ROI '{roi}': {exc}") from exc
+
     def _process_zarr(*, zarr_path: Path, prefix: str) -> None:
         if not zarr_path.exists():
             logger.warning(f"Skipping ROI '{roi}': {zarr_path.name} not found at {zarr_path}")
@@ -1437,10 +1500,105 @@ def thumbnail_command(
             return
 
         zs, _, _, cs = z_array.shape
-        preview_c = min(3, cs)
+        channel_names = _read_channel_names_from_zarr_array(z_array)
+        selected_channels = _resolve_thumbnail_channels(
+            channels_spec=channels_spec, channel_names=channel_names, channel_count=int(cs)
+        )
+        preview_c = len(selected_channels)
         if preview_c <= 0:
             logger.warning(f"Skipping ROI '{roi}': {zarr_path.name} has no channels.")
             return
+
+        mask_arr = None
+        if mask_path is not None:
+            try:
+                mask_arr = zarr.open_array(mask_path, mode="r")
+            except Exception as exc:
+                raise click.ClickException(f"ROI '{roi}': failed to open segmentation zarr at {mask_path}: {exc}") from exc
+            if mask_arr.ndim != 3:
+                raise click.ClickException(
+                    f"ROI '{roi}': segmentation zarr has shape {mask_arr.shape}, expected 3D (Z,Y,X)."
+                )
+            if int(mask_arr.shape[0]) != int(zs):
+                raise click.ClickException(
+                    f"ROI '{roi}': Z mismatch between {zarr_path} (Z={zs}) and {mask_path} (Z={mask_arr.shape[0]})."
+                )
+            if int(mask_arr.shape[1]) != int(z_array.shape[1]) or int(mask_arr.shape[2]) != int(z_array.shape[2]):
+                raise click.ClickException(
+                    f"ROI '{roi}': XY mismatch between {zarr_path} (YX={z_array.shape[1:3]}) and "
+                    f"{mask_path} (YX={mask_arr.shape[1:3]})."
+                )
+
+        low, high = (1.0, 99.9)
+        if thumb_options.percentiles is not None:
+            low, high = thumb_options.percentiles
+
+        lowhigh_by_channel: dict[int, np.ndarray] = {}
+        missing: list[int] = []
+        for ch_idx in selected_channels:
+            cache_path = _thumbnail_channel_percentiles_cache_path(
+                ws=ws,
+                roi=roi,
+                codebook=codebook,
+                zarr_name=zarr_path.name,
+                channel_key=_thumbnail_channel_key(ch_idx, channel_names),
+                low=low,
+                high=high,
+            )
+            try:
+                cached = _try_load_thumbnail_channel_percentiles(cache_path)
+            except (OSError, ValueError) as exc:
+                logger.warning(f"Ignoring invalid percentile cache at {cache_path}: {exc}")
+                cached = None
+            if cached is None:
+                missing.append(ch_idx)
+            else:
+                lowhigh_by_channel[ch_idx] = cached
+
+        if missing:
+            try:
+                block_y = max(1, min(256, int(z_array.shape[1]) - 1))
+                block_x = max(1, min(1024, int(z_array.shape[2]) - 1))
+                computed, _ = sample_percentile(
+                    z_array,
+                    channels=[ch + 1 for ch in missing],
+                    block=(block_y, block_x),
+                    n=30,
+                    low=low,
+                    high=high,
+                )
+                computed = np.asarray(computed, dtype=np.float64)
+            except (ValueError, RuntimeError) as exc:
+                logger.warning(
+                    f"Failed to compute random-crop percentiles for {zarr_path} ({exc}); falling back to strided sampling."
+                )
+                z_step = max(1, zs // 8)
+                y_step = max(1, int(z_array.shape[1]) // 256)
+                x_step = max(1, int(z_array.shape[2]) // 256)
+                sample = np.asarray(z_array[::z_step, ::y_step, ::x_step, missing])
+                bounds = np.percentile(sample, [low, high], axis=(0, 1, 2)).T  # (len(missing), 2)
+                computed = np.asarray(bounds, dtype=np.float64)
+
+            if computed.shape != (len(missing), 2):
+                raise click.ClickException(
+                    f"ROI '{roi}': computed percentile bounds have shape {computed.shape}, expected ({len(missing)}, 2)."
+                )
+
+            for out_idx, ch_idx in enumerate(missing):
+                cache_path = _thumbnail_channel_percentiles_cache_path(
+                    ws=ws,
+                    roi=roi,
+                    codebook=codebook,
+                    zarr_name=zarr_path.name,
+                    channel_key=_thumbnail_channel_key(ch_idx, channel_names),
+                    low=low,
+                    high=high,
+                )
+                row = np.asarray(computed[out_idx], dtype=np.float64)
+                _save_thumbnail_channel_percentiles(cache_path, row)
+                lowhigh_by_channel[ch_idx] = row
+
+        lowhigh = np.stack([lowhigh_by_channel[ch_idx] for ch_idx in selected_channels], axis=0).astype(np.float64)
 
         start = z_start if z_start is not None else 0
         end = z_end if z_end is not None else zs
@@ -1456,15 +1614,39 @@ def thumbnail_command(
             return
 
         thumbnail_dir.mkdir(parents=True, exist_ok=True)
+        from PIL import Image
+        from skimage.segmentation import find_boundaries
+
         with progress_bar(len(z_indices)) as progress:
             for i in z_indices:
-                thumbnail_path = thumbnail_dir / f"{prefix}_z{i:03d}.png"
-                if thumbnail_path.exists() and not overwrite:
+                stem = f"{prefix}{_channels_filename_suffix(channels_spec)}"
+                thumbnail_path = thumbnail_dir / f"{stem}_z{i:03d}.png"
+                overlay_path = thumbnail_dir / f"{stem}_mask_z{i:03d}.png"
+
+                need_thumbnail = overwrite or not thumbnail_path.exists()
+                need_overlay = mask_arr is not None and (overwrite or not overlay_path.exists())
+                if not (need_thumbnail or need_overlay):
                     progress()
                     continue
-                thumbnail_data = z_array[i, :, :, :preview_c]
-                save_thumbnail_png(thumbnail_data, thumbnail_path, options=thumb_options)
-                logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
+
+                thumbnail_data = z_array[i, :, :, selected_channels]
+                base_raw = thumbnail_rgb(thumbnail_data, options=thumb_options, lowhigh=lowhigh)
+
+                if need_thumbnail:
+                    base = _apply_thumbnail_pose(base_raw, pose=pose, ndimage_rotate=ndimage_rotate) if pose else base_raw
+                    Image.fromarray(base, mode="RGB").save(thumbnail_path)
+                    logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
+
+                if need_overlay:
+                    mask_slice = np.asarray(mask_arr[i, :: thumb_options.xy_downsample, :: thumb_options.xy_downsample])
+                    boundaries = find_boundaries(mask_slice, mode="outer")
+                    overlay_raw = base_raw.copy()
+                    overlay_raw[boundaries] = boundary_rgb
+                    overlay = (
+                        _apply_thumbnail_pose(overlay_raw, pose=pose, ndimage_rotate=ndimage_rotate) if pose else overlay_raw
+                    )
+                    Image.fromarray(overlay, mode="RGB").save(overlay_path)
+                    logger.debug(f"Saved thumbnail overlay for Z-plane {i} to {overlay_path}")
                 progress()
 
     _process_zarr(zarr_path=stitched_dir / "fused.zarr", prefix="thumbnail")
@@ -1485,6 +1667,232 @@ def _parse_rgb_triplet(val: str) -> tuple[int, int, int]:
         if x < 0 or x > 255:
             raise click.BadParameter("--boundary-color values must be in [0, 255].")
     return (r, g, b)
+
+
+def _normalize_channel_names(names: object) -> list[str] | None:
+    if isinstance(names, (list, tuple)):
+        return [str(x) for x in names]
+    return None
+
+
+def _read_channel_names_from_zarr_array(arr: object) -> list[str] | None:
+    attrs = getattr(arr, "attrs", None)
+    if attrs is None:
+        return None
+    if hasattr(attrs, "get"):
+        raw = attrs.get("key") or attrs.get("channel_names")
+        return _normalize_channel_names(raw)
+    return None
+
+
+def _resolve_thumbnail_channels(
+    *, channels_spec: str | None, channel_names: list[str] | None, channel_count: int
+) -> list[int]:
+    if channel_count <= 0:
+        return []
+
+    if channels_spec is None:
+        return list(range(min(3, channel_count)))
+
+    raw = channels_spec.strip().replace(" ", ",")
+    parts = [p for p in raw.split(",") if p]
+    if not parts:
+        raise click.BadParameter("--channels must not be empty.", param_hint="--channels")
+    if len(parts) > 3:
+        raise click.BadParameter("--channels supports up to 3 channels (RGB).", param_hint="--channels")
+
+    selected: list[int] = []
+    for part in parts:
+        try:
+            idx = int(part)
+        except ValueError:
+            if not channel_names:
+                raise click.BadParameter(
+                    "Channel names are missing from fused.zarr metadata (attrs['key']); "
+                    "pass numeric indices instead.",
+                    param_hint="--channels",
+                )
+            try:
+                idx = channel_names.index(part)
+            except ValueError as exc:
+                raise click.BadParameter(
+                    f"Unknown channel name {part!r}. Available: {channel_names}", param_hint="--channels"
+                ) from exc
+        if idx < 0:
+            raise click.BadParameter("--channels indices must be >= 0.", param_hint="--channels")
+        if idx >= channel_count:
+            raise click.BadParameter(
+                f"--channels index {idx} out of range for C={channel_count}.", param_hint="--channels"
+            )
+        if idx in selected:
+            raise click.BadParameter("--channels must not contain duplicates.", param_hint="--channels")
+        selected.append(idx)
+
+    return selected
+
+
+def _read_similarity2d_angle_rad(tfm_path: Path) -> float:
+    if not tfm_path.exists():
+        raise FileNotFoundError(f"Missing similarity transform: {tfm_path}")
+    for line in tfm_path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("Parameters:"):
+            continue
+        parts = line.split(":", 1)[1].strip().split()
+        if len(parts) < 2:
+            raise ValueError(f"Invalid Similarity2DTransform parameters line in {tfm_path}: {line!r}")
+        return float(parts[1])
+    raise ValueError(f"Missing 'Parameters:' line in Similarity2DTransform file {tfm_path}")
+
+
+def _try_read_thumbnail_pose(
+    ws: Any,
+    roi: str,
+    *,
+    LandmarkRegistrationOutputs: type[Any],
+) -> tuple[float, bool] | None:
+    import math
+
+    out = LandmarkRegistrationOutputs(ws.ccf_transforms(roi))
+    if not out.p1_similarity_tfm.exists():
+        return None
+
+    landmarks = out.try_read_p1_landmarks()
+    prior_rotation_deg = 0 if landmarks is None else int(landmarks.prior_rotation_deg)
+    prior_flip_x = False if landmarks is None else bool(landmarks.prior_flip_x)
+
+    theta_rad = _read_similarity2d_angle_rad(out.p1_similarity_tfm)
+    theta_deg = float(math.degrees(theta_rad))
+    net_rotation_deg = float(prior_rotation_deg - theta_deg)
+    return (net_rotation_deg, prior_flip_x)
+
+
+def _apply_thumbnail_pose(
+    rgb: Any,
+    *,
+    pose: tuple[float, bool] | None,
+    ndimage_rotate: Any,
+) -> Any:
+    import numpy as np
+
+    if pose is None:
+        return rgb
+
+    rotation_deg, flip_x = pose
+    out = rgb
+    if flip_x:
+        out = out[:, ::-1, :]
+    if rotation_deg != 0:
+        # Expand the canvas so rotation does not crop content.
+        out = ndimage_rotate(out, angle=-rotation_deg, reshape=True, order=1, mode="nearest")
+    if out.dtype != np.uint8:
+        out = np.clip(out, 0, 255).astype(np.uint8)
+    return out
+
+
+def _channels_filename_suffix(channels_spec: str | None) -> str:
+    if channels_spec is None:
+        return ""
+    raw = channels_spec.strip()
+    if not raw:
+        return ""
+
+    out_chars: list[str] = []
+    for ch in raw:
+        if ch.isalnum():
+            out_chars.append(ch)
+            continue
+        if ch in {",", " ", "+", ":", ";"}:
+            out_chars.append("-")
+            continue
+        if ch in {"_", "-", "."}:
+            out_chars.append(ch)
+            continue
+        out_chars.append("_")
+
+    cleaned = "".join(out_chars).strip("-_.")
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    if not cleaned:
+        return ""
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80].rstrip("-_.")
+    return f"_channels-{cleaned}"
+
+
+def _thumbnail_channel_key(channel_index: int, channel_names: list[str] | None) -> str:
+    if channel_names is not None and channel_index < len(channel_names):
+        return str(channel_names[channel_index])
+    return f"channel_{channel_index}"
+
+
+def _sanitize_thumbnail_channel_key(key: str) -> str:
+    raw = key.strip()
+    if not raw:
+        return "unknown"
+
+    out_chars: list[str] = []
+    for ch in raw:
+        if ch.isalnum():
+            out_chars.append(ch)
+            continue
+        if ch in {"_", "-", "."}:
+            out_chars.append(ch)
+            continue
+        out_chars.append("_")
+
+    cleaned = "".join(out_chars).strip("-_.")
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    if not cleaned:
+        return "unknown"
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80].rstrip("-_.")
+    return cleaned
+
+
+def _thumbnail_channel_percentiles_cache_path(
+    *,
+    ws: Any,
+    roi: str,
+    codebook: str,
+    zarr_name: str,
+    channel_key: str,
+    low: float,
+    high: float,
+) -> Path:
+    low_str = str(float(low)).replace(".", "p")
+    high_str = str(float(high)).replace(".", "p")
+    base = ws.output / "thumbnail_percentiles" / f"{roi}+{codebook}"
+    ch = _sanitize_thumbnail_channel_key(channel_key)
+    return base / f"{zarr_name}__ch-{ch}__p-{low_str}-{high_str}.npy"
+
+
+def _try_load_thumbnail_channel_percentiles(path: Path) -> Any | None:
+    import numpy as np
+
+    if not path.exists():
+        return None
+    try:
+        arr = np.load(path)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Failed to load cached percentiles at {path}: {exc}") from exc
+    if arr.shape != (2,):
+        raise ValueError(f"Cached channel percentiles at {path} have shape {arr.shape}; expected (2,).")
+    if not np.isfinite(arr).all():
+        raise ValueError(f"Cached percentiles at {path} contain non-finite values.")
+    return arr.astype(np.float64, copy=False)
+
+
+def _save_thumbnail_channel_percentiles(path: Path, lowhigh: Any) -> None:
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    row = np.asarray(lowhigh, dtype=np.float64)
+    if row.shape != (2,):
+        raise ValueError(f"Expected lowhigh shape (2,), got shape={row.shape}")
+    np.save(tmp, row)
+    tmp.with_suffix(tmp.suffix + ".npy").replace(path)
 
 
 @app.command("plot")

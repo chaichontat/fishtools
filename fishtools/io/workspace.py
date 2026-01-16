@@ -222,6 +222,11 @@ class WorkspaceOutput:
         return self.root / "ccf-transforms"
 
     @property
+    def chromatic(self) -> Path:
+        """Return path to chromatic correction files under ``analysis/output``."""
+        return self.root / "chromatic"
+
+    @property
     def spotlook(self) -> WorkspaceSpotlookOutput:
         return WorkspaceSpotlookOutput(self.root)
 
