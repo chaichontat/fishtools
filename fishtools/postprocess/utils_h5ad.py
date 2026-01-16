@@ -18,6 +18,7 @@ __all__ = [
     "normalize_pearson",
     "leiden_umap",
     "normalize_total",
+    "coerce_float32_for_concat",
     "filter_leiden",
     "run_tricycle",
     "get_leiden_genes",
@@ -140,6 +141,43 @@ def normalize_total(adata: ad.AnnData):
     sc.pp.normalize_total(adata)
     sc.pp.log1p(adata)
     return adata, None
+
+
+def coerce_float32_for_concat(adata: ad.AnnData) -> ad.AnnData:
+    """Force float-like payloads to float32 to avoid concat precision mismatches."""
+
+    from scipy import sparse
+
+    def _cast(value: object):
+        if sparse.issparse(value):
+            if np.issubdtype(value.dtype, np.floating) and value.dtype != np.float32:
+                return value.astype(np.float32)
+            return value
+        if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.floating) and value.dtype != np.float32:
+            return value.astype(np.float32, copy=False)
+        dtype = getattr(value, "dtype", None)
+        if dtype is not None and np.issubdtype(dtype, np.floating) and dtype != np.float32 and hasattr(value, "astype"):
+            return value.astype(np.float32)
+        return value
+
+    adata.X = _cast(adata.X)
+    for key in list(adata.layers.keys()):
+        adata.layers[key] = _cast(adata.layers[key])
+    for key in list(adata.obsm.keys()):
+        adata.obsm[key] = _cast(adata.obsm[key])
+    for key in list(adata.varm.keys()):
+        adata.varm[key] = _cast(adata.varm[key])
+    for key in list(adata.obsp.keys()):
+        adata.obsp[key] = _cast(adata.obsp[key])
+
+    float_obs_cols = adata.obs.select_dtypes(include=["float"]).columns
+    if len(float_obs_cols):
+        adata.obs[float_obs_cols] = adata.obs[float_obs_cols].astype(np.float32)
+    float_var_cols = adata.var.select_dtypes(include=["float"]).columns
+    if len(float_var_cols):
+        adata.var[float_var_cols] = adata.var[float_var_cols].astype(np.float32)
+
+    return adata
 
 
 def filter_leiden(adata: ad.AnnData, keep: Sequence[int | str]) -> ad.AnnData:

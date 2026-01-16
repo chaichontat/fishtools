@@ -82,7 +82,8 @@ def sample_percentiles(
         # Light sharpening before measuring percentiles
         if unsharp:
             crop = unsharp_mask(crop, preserve_range=True, radius=3, channel_axis=3)
-        samples.append(np.percentile(crop[::subsample_z, ch_idx], [low, high], axis=(0, 1, 2)))
+        # Compute percentiles per selected channel (keep channel axis last).
+        samples.append(np.percentile(crop[::subsample_z, :, :, ch_idx], [low, high], axis=(0, 1, 2)))
         taken += 1
 
     if not samples:
