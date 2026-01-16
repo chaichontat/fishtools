@@ -494,7 +494,7 @@ class TestRunFiducial:
         return Config(
             dataPath="/tmp",
             registration=RegisterConfig(
-                chromatic_shifts={"650": "dummy", "750": "dummy"},
+                chromatic_path=Path("dummy"),
                 fiducial=Fiducial(
                     priors=priors,
                     overrides=overrides,
@@ -1384,7 +1384,7 @@ def test_run_prefers_repaired_round_directories(
     config = Config(
         dataPath="/tmp",
         registration=RegisterConfig(
-            chromatic_shifts={"650": "dummy", "750": "dummy"},
+            chromatic_path=cli_register_module.DATA,
             fiducial=Fiducial(
                 priors=None,
                 overrides=None,
@@ -1457,6 +1457,7 @@ def test_run_prefers_repaired_round_directories(
         debug: bool,
         no_priors: bool,
         fids_raw: dict[str, np.ndarray] | None = None,
+        max_iters: int = 5,
     ) -> dict[str, np.ndarray]:
         assert roi == "roiA"
         assert idx == 1

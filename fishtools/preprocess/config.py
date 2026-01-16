@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import numpy as np
-from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator
 
 
@@ -167,7 +166,7 @@ class Fiducial(BaseModel):
 class RegisterConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    fiducial: Fiducial
+    fiducial: Fiducial = Field(default_factory=Fiducial)
     downsample: int = Field(default=1, description="Downsample factor")
     reduce_bit_depth: int = Field(
         default=0,
@@ -182,8 +181,14 @@ class RegisterConfig(BaseModel):
         PlainSerializer(lambda x: str(x)),
     ] = Field(default=slice(None), description="Slice range to use for registration")
     split_channels: bool = False
-    chromatic_shifts: dict[str, Annotated[str, "path for 560to{channel}.txt"]]
-    reference: str = Field(default="4_12_20", description="Reference round to align others to.")
+    chromatic_path: Path = Field(
+        default_factory=resolve_data_path,
+        description=(
+            "Directory containing chromatic correction files (560to650.txt, 560to750.txt) "
+            "and optional displacement fields (560to650_field.npz, 560to750_field.npz)."
+        ),
+    )
+    reference: str = Field(default="2_10_18", description="Reference round to align others to.")
     # Moved from HardwareConfig - threads used specifically for registration
     threads: int = Field(default=15, description="Number of threads for registration operations")
     gpu_affine: bool = Field(
@@ -211,48 +216,10 @@ class RegisterConfig(BaseModel):
                 )
         return v
 
-    # Canonicalize chromatic shift keys to wavelengths {560, 650, 750}
-    @field_validator("chromatic_shifts", mode="before")
-    @classmethod
-    def canonicalize_chromatic(cls, v: dict[str, str] | None) -> dict[str, str]:
-        # Fallback to sensible defaults when empty or missing
-        if not v:
-            return {"650": "data/560to650.txt", "750": "data/560to750.txt"}
-        if not isinstance(v, dict):  # type: ignore
-            return v  # type: ignore
-        synonym_map = {"561": "560", "640": "650", "647": "650"}
-        allowed = {"650", "750"}  # chromatic shifts are defined relative to 560
-        out: dict[str, str] = {}
-        for k, path in v.items():
-            ks = str(k)
-            kc = synonym_map.get(ks, ks)
-            if kc != ks:
-                logger.warning(
-                    f"Normalized chromatic key '{ks}' -> '{kc}' (canonical wavelengths: 560, 650, 750)"
-                )
-            out[kc] = path
-        # Warn on unexpected keys; keep them for backward-compat
-        for k in list(out.keys()):
-            if k not in allowed:
-                logger.warning(
-                    "Chromatic shift provided for '%s'. Expected only target channels {'650','750'} relative to 560.",
-                    k,
-                )
-        return out
-
-
 def default_register_config() -> "RegisterConfig":
-    """Factory for RegisterConfig with built-in chromatic shift defaults.
-
-    Uses canonical target wavelengths (650, 750) relative to the 560 channel.
-    Paths are relative and can be resolved by the caller as needed.
-    """
+    """Factory for RegisterConfig with built-in chromatic defaults."""
     return RegisterConfig(
-        chromatic_shifts={
-            "650": (DATA / "560to650.txt").resolve().as_posix(),
-            "750": (DATA / "560to750.txt").resolve().as_posix(),
-        },
-        fiducial=Fiducial(),
+        chromatic_path=DATA,
         downsample=1,
         crop=40,
         slices=slice(None),
@@ -487,7 +454,7 @@ class Config(BaseModel):
         default_factory=SystemConfig,
         description="System paths and infrastructure configuration",
     )
-    # RegisterConfig cannot have a safe default (requires chromatic_shifts); leave optional
+    # RegisterConfig has safe defaults via chromatic_path → data/
     registration: RegisterConfig = Field(
         default_factory=default_register_config,
         description="Image registration parameters",

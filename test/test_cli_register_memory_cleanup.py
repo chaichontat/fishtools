@@ -18,14 +18,15 @@ def test_cli_register_calls_gpu_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pat
     (deconv_path / f"{round_name}--{roi}").mkdir(parents=True)
     # Tile presence required for Workspace.img(...).exists()
     (deconv_path / f"{round_name}--{roi}" / f"{round_name}-0002.tif").touch()
+    (tmp_path / "workspace.DONE").write_text("")
 
     # Minimal codebook with one bit matching our fake Image.bits
     codebook_path = tmp_path / "cb.json"
-    codebook_path.write_text("{gene: [1]}")
+    codebook_path.write_text('{"gene": [1, 2]}')
 
     # Fake Image loader
     def fake_from_file(*args: Any, **kwargs: Any) -> SimpleNamespace:
-        bits = ["1"]
+        bits = ["1", "2"]
         return SimpleNamespace(
             name=round_name,
             idx=2,
@@ -33,8 +34,8 @@ def test_cli_register_calls_gpu_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pat
             fid=np.zeros((8, 8), dtype=np.float32),
             fid_raw=np.zeros((8, 8), dtype=np.float32),
             bits=bits,
-            powers=[560],  # channel metadata -> "560"
-            metadata={"prenormalized": False},
+            powers=["ilm560", "ilm560"],  # channel metadata -> "560"
+            metadata={"prenormalized": True},
             global_deconv_scaling=np.ones((2, len(bits)), dtype=np.float32),
             basic=lambda: None,
         )
@@ -72,7 +73,7 @@ def test_cli_register_calls_gpu_cleanup(monkeypatch: pytest.MonkeyPatch, tmp_pat
     config = Config(
         dataPath=str(tmp_path),
         registration=RegisterConfig(
-            chromatic_shifts={"650": "dummy", "750": "dummy"},
+            chromatic_path=cli_register_module.DATA,
             fiducial=Fiducial(use_fft=False, fwhm=3.0, threshold=3.0, n_fids=1),
             downsample=2,
             crop=0,

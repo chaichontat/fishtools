@@ -44,6 +44,21 @@ def _make_workspace(tmp_path: Path) -> tuple[Path, Path]:
     return root, deconv
 
 
+def _write_config_file(
+    tmp_path: Path,
+    *,
+    chromatic_path: Path | None = None,
+    registration: dict[str, Any] | None = None,
+    filename: str = "config.json",
+) -> Path:
+    reg: dict[str, Any] = dict(registration or {})
+    if chromatic_path is not None:
+        reg["chromatic_path"] = str(chromatic_path)
+    path = tmp_path / filename
+    path.write_text(json.dumps({"registration": reg}), encoding="utf-8")
+    return path
+
+
 def test_debug_fid_paths_include_roi(tmp_path: Path) -> None:
     base = tmp_path / "ws" / "analysis" / "deconv"
     debug_dir, raw, shifted = _debug_fid_paths(base, "roiA", 7, "cb")
@@ -163,6 +178,16 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
         fake_setup_workspace_logging,
     )
 
+    config_path = _write_config_file(
+        tmp_path,
+        chromatic_path=DATA,
+        registration={
+            "reference": "4_12_20",
+            "fiducial": {"fwhm": 4.0, "threshold": 5.0},
+        },
+        filename="register_config.json",
+    )
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -170,6 +195,8 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
             "run",
             str(deconv),
             "42",
+            "--config",
+            str(config_path),
             "--codebook",
             str(cb),
             "--roi",
@@ -201,9 +228,227 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
     assert cfg.registration.fiducial.detailed.allow_large_shifts is False
 
 
-def test_cli_register_copies_chromatic_corrections_to_workspace(tmp_path: Path, monkeypatch: Any) -> None:
+def test_cli_register_run_accepts_config_file(tmp_path: Path, monkeypatch: Any) -> None:
     _root, deconv = _make_workspace(tmp_path)
     cb = _make_codebook(tmp_path)
+
+    register_config = RegisterConfig(
+        fiducial=Fiducial(
+            threshold=9.5,
+            fwhm=7.25,
+            use_fft=True,
+            use_itk=True,
+        ),
+        chromatic_path=DATA,
+        reference="2_10_18",
+        crop=12,
+        downsample=3,
+        reduce_bit_depth=1,
+    )
+    config_path = tmp_path / "register_config.json"
+    config_path.write_text(register_config.model_dump_json(), encoding="utf-8")
+
+    called: dict[str, Any] = {}
+
+    def fake__run(
+        path: Path,
+        roi: str,
+        idx: int,
+        *,
+        codebook: str | Path,
+        reference: str,
+        config,
+        debug: bool,
+        overwrite: bool,
+        no_priors: bool,
+        repaired_rounds: set[str] | None = None,
+        max_iters: int = 5,
+        use_shifts_from: str | None = None,
+    ) -> None:  # type: ignore[no-untyped-def]
+        called.update({
+            "path": path,
+            "roi": roi,
+            "idx": idx,
+            "reference": reference,
+            "config": config,
+        })
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.setup_cli_logging", lambda *_a, **_k: deconv)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(deconv),
+            "42",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--config",
+            str(config_path),
+            "--overwrite",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called["reference"] == "2_10_18"
+    cfg = called["config"]
+    assert cfg.registration.crop == 12
+    assert cfg.registration.downsample == 3
+    assert cfg.registration.reduce_bit_depth == 1
+    assert pytest.approx(cfg.registration.fiducial.threshold, rel=0, abs=1e-6) == 9.5
+    assert pytest.approx(cfg.registration.fiducial.fwhm, rel=0, abs=1e-6) == 7.25
+    assert cfg.registration.fiducial.use_fft is True
+    assert cfg.registration.fiducial.use_itk is True
+
+
+def test_cli_register_run_accepts_partial_config_file(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+    cb = _make_codebook(tmp_path)
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"registration": {"crop": 120}}), encoding="utf-8")
+
+    called: dict[str, Any] = {}
+
+    def fake__run(
+        path: Path,
+        roi: str,
+        idx: int,
+        *,
+        codebook: str | Path,
+        reference: str,
+        config,
+        debug: bool,
+        overwrite: bool,
+        no_priors: bool,
+        repaired_rounds: set[str] | None = None,
+        max_iters: int = 5,
+        use_shifts_from: str | None = None,
+    ) -> None:  # type: ignore[no-untyped-def]
+        called.update({"reference": reference, "config": config})
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.setup_cli_logging", lambda *_a, **_k: deconv)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(deconv),
+            "42",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--config",
+            str(config_path),
+            "--overwrite",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = called["config"]
+    assert cfg.registration.crop == 120
+    assert cfg.registration.fiducial is not None
+    assert cfg.registration.chromatic_path is not None
+
+
+def test_cli_register_run_config_overridden_by_cli(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+    cb = _make_codebook(tmp_path)
+
+    register_config = RegisterConfig(
+        fiducial=Fiducial(
+            threshold=9.5,
+            fwhm=7.25,
+        ),
+        chromatic_path=DATA,
+        reference="2_10_18",
+    )
+    config_path = tmp_path / "register_config.json"
+    config_path.write_text(register_config.model_dump_json(), encoding="utf-8")
+
+    called: dict[str, Any] = {}
+
+    def fake__run(
+        path: Path,
+        roi: str,
+        idx: int,
+        *,
+        codebook: str | Path,
+        reference: str,
+        config,
+        debug: bool,
+        overwrite: bool,
+        no_priors: bool,
+        repaired_rounds: set[str] | None = None,
+        max_iters: int = 5,
+        use_shifts_from: str | None = None,
+    ) -> None:  # type: ignore[no-untyped-def]
+        called.update({"reference": reference, "config": config})
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+    monkeypatch.setattr("fishtools.preprocess.cli_register.setup_cli_logging", lambda *_a, **_k: deconv)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(deconv),
+            "42",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--config",
+            str(config_path),
+            "--threshold",
+            "1.25",
+            "--reference",
+            "4_12_20",
+            "--overwrite",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called["reference"] == "4_12_20"
+    cfg = called["config"]
+    assert pytest.approx(cfg.registration.fiducial.threshold, rel=0, abs=1e-6) == 1.25
+
+
+def test_cli_register_run_requires_config(tmp_path: Path) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+    cb = _make_codebook(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(deconv),
+            "1",
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--overwrite",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Missing option '--config'" in result.output
+
+
+def test_cli_register_copies_used_chromatic_corrections_to_output(tmp_path: Path, monkeypatch: Any) -> None:
+    root, deconv = _make_workspace(tmp_path)
+    cb = _make_codebook(tmp_path)
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, filename="register_config.json")
 
     def fake_setup_workspace_logging(*_: Any, **__: Any) -> Path:
         return deconv / "analysis" / "logs" / "noop.log"
@@ -224,6 +469,8 @@ def test_cli_register_copies_chromatic_corrections_to_workspace(tmp_path: Path, 
             "run",
             str(deconv),
             "42",
+            "--config",
+            str(config_path),
             "--codebook",
             str(cb),
             "--roi",
@@ -235,10 +482,136 @@ def test_cli_register_copies_chromatic_corrections_to_workspace(tmp_path: Path, 
     )
     assert result.exit_code == 0, result.output
 
+    ws = Workspace(root)
     for filename in ("560to650.txt", "560to750.txt"):
-        copied = deconv / "chromatic" / filename
+        copied = ws.output.chromatic / filename
         assert copied.exists()
         assert copied.read_bytes() == (DATA / filename).read_bytes()
+
+    assert (ws.output.chromatic / "chromatic_provenance.json").exists()
+
+
+def test_cli_register_does_not_overwrite_existing_output_chromatic_files(tmp_path: Path, monkeypatch: Any) -> None:
+    root, deconv = _make_workspace(tmp_path)
+    cb = _make_codebook(tmp_path)
+
+    ws = Workspace(root)
+    chromatic_dir = ws.output.chromatic
+    chromatic_dir.mkdir(parents=True, exist_ok=True)
+    (chromatic_dir / "560to650.txt").write_bytes(b"old\n")
+    (chromatic_dir / "560to750.txt").write_bytes(b"old\n")
+
+    chromatic_source = tmp_path / "chromatic"
+    chromatic_source.mkdir(parents=True, exist_ok=True)
+    sentinel = b"custom-chromatic-contents\n"
+    (chromatic_source / "560to650.txt").write_bytes(sentinel)
+    (chromatic_source / "560to750.txt").write_bytes(sentinel)
+    config_path = _write_config_file(
+        tmp_path,
+        chromatic_path=chromatic_source,
+        filename="register_config.json",
+    )
+
+    def fake_setup_workspace_logging(*_: Any, **__: Any) -> Path:
+        return deconv / "analysis" / "logs" / "noop.log"
+
+    def fake__run(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+    monkeypatch.setattr(
+        "fishtools.preprocess.cli_register.setup_cli_logging",
+        fake_setup_workspace_logging,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(deconv),
+            "42",
+            "--config",
+            str(config_path),
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--reference",
+            "4_12_20",
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (ws.output.chromatic / "560to650.txt").read_bytes() == sentinel
+    assert (ws.output.chromatic / "560to750.txt").read_bytes() == sentinel
+
+
+def test_cli_register_overwrites_mismatched_output_chromatic_files(tmp_path: Path, monkeypatch: Any) -> None:
+    root, deconv = _make_workspace(tmp_path)
+    cb = _make_codebook(tmp_path)
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, filename="register_config.json")
+
+    ws = Workspace(root)
+    chromatic_dir = ws.output.chromatic
+    chromatic_dir.mkdir(parents=True, exist_ok=True)
+    (chromatic_dir / "560to650.txt").write_bytes(b"old\n")
+    (chromatic_dir / "560to750.txt").write_bytes(b"old\n")
+
+    def fake_setup_workspace_logging(*_: Any, **__: Any) -> Path:
+        return deconv / "analysis" / "logs" / "noop.log"
+
+    def fake__run(*_: Any, **__: Any) -> None:
+        return None
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
+    monkeypatch.setattr(
+        "fishtools.preprocess.cli_register.setup_cli_logging",
+        fake_setup_workspace_logging,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "run",
+            str(deconv),
+            "42",
+            "--config",
+            str(config_path),
+            "--codebook",
+            str(cb),
+            "--roi",
+            "roiA",
+            "--reference",
+            "4_12_20",
+            "--overwrite",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (ws.output.chromatic / "560to650.txt").read_bytes() == (DATA / "560to650.txt").read_bytes()
+    assert (ws.output.chromatic / "560to750.txt").read_bytes() == (DATA / "560to750.txt").read_bytes()
+    assert (ws.output.chromatic / "chromatic_provenance.json").exists()
+
+
+def test_load_chromatic_affines_prefers_output_chromatic_dir(tmp_path: Path) -> None:
+    root, _deconv = _make_workspace(tmp_path)
+    ws = Workspace(root)
+
+    out_dir = ws.output.chromatic
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "560to650.txt").write_text("1 2 3 4 5 6\n", encoding="utf-8")
+    (out_dir / "560to750.txt").write_text("7 8 9 10 11 12\n", encoding="utf-8")
+
+    As, ats, meta = cli_register_module._load_chromatic_affines(ws)
+    assert meta["650"]["source"] == str(out_dir / "560to650.txt")
+    assert meta["750"]["source"] == str(out_dir / "560to750.txt")
+    assert meta["650"]["A"] == [[1.0, 2.0], [3.0, 4.0]]
+    assert meta["650"]["t"] == [5.0, 6.0]
+    assert meta["750"]["A"] == [[7.0, 8.0], [9.0, 10.0]]
+    assert meta["750"]["t"] == [11.0, 12.0]
+    assert set(As.keys()) == {"650", "750"}
+    assert set(ats.keys()) == {"650", "750"}
 
 
 def test_register_writes_chromatic_values_to_metadata(tmp_path: Path, monkeypatch: Any) -> None:
@@ -371,7 +744,8 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
 
         @property
         def output(self) -> SimpleNamespace:
-            return SimpleNamespace(root=self.path / "analysis" / "output")
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -397,12 +771,21 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
+    config_path = _write_config_file(
+        tmp_path,
+        chromatic_path=DATA,
+        registration={"reference": "2_10_18"},
+        filename="register_config.json",
+    )
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
         [
             "batch",
             str(base),
+            "--config",
+            str(config_path),
             "--codebook",
             str(cb),
             "--overwrite",
@@ -422,20 +805,27 @@ def test_cli_register_batch_spawns_subprocess(tmp_path: Path, monkeypatch: Any) 
     assert str(base) in argv
     copied_codebook = base / "codebooks" / cb.name
     assert f"--codebook={copied_codebook}" in argv
-    assert "--reference" in argv  # ref auto-selected
-    # Batch should forward default fwhm/threshold into child command
-    assert any(a.startswith("--fwhm=") and float(a.split("=", 1)[1]) == 4.0 for a in argv)
-    assert any(a.startswith("--threshold=") and float(a.split("=", 1)[1]) == 6.0 for a in argv)
+    assert f"--config={config_path}" in argv
+    assert "--reference" not in argv
+    assert not any(a.startswith("--fwhm=") for a in argv)
+    assert not any(a.startswith("--threshold=") for a in argv)
     assert "--allow-large-shifts" in argv
     assert "--offset-brightest=10" in argv
 
 
-def test_cli_register_batch_forwards_debug(tmp_path: Path, monkeypatch: Any) -> None:
+def test_cli_register_batch_forwards_config_file_without_overrides(tmp_path: Path, monkeypatch: Any) -> None:
     _root, base = _make_workspace(tmp_path)
     (base / "2_10_18--roiA").mkdir(parents=True)
     (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
 
     cb = _make_codebook(tmp_path)
+    register_config = RegisterConfig(
+        fiducial=Fiducial(threshold=10.0, fwhm=9.0),
+        chromatic_path=DATA,
+        reference="2_10_18",
+    )
+    config_path = tmp_path / "register_config.json"
+    config_path.write_text(register_config.model_dump_json(), encoding="utf-8")
 
     class _WS:
         def __init__(self, path: Path, *_: Any, **__: Any) -> None:
@@ -459,7 +849,96 @@ def test_cli_register_batch_forwards_debug(tmp_path: Path, monkeypatch: Any) -> 
 
         @property
         def output(self) -> SimpleNamespace:
-            return SimpleNamespace(root=self.path / "analysis" / "output")
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
+
+        def regimg(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
+
+        def registered(self, roi: str, codebook: str) -> Path:
+            return self._deconved / f"registered--{roi}+{codebook}"
+
+        def shift_json(self, roi: str, codebook: str, idx: int) -> Path:
+            return self._deconved / f"shifts--{roi}+{codebook}" / f"shifts-{idx:04d}.json"
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], *, check: bool = True):  # type: ignore[no-untyped-def]
+        assert check is True
+        calls.append(argv)
+
+        class _R:
+            returncode = 0
+
+        return _R()
+
+    monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        register_cli,
+        [
+            "batch",
+            str(base),
+            "--config",
+            str(config_path),
+            "--codebook",
+            str(cb),
+            "--overwrite",
+            "--threads",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    argv = calls[0]
+    assert f"--config={config_path}" in argv
+    assert "--reference" not in argv
+    assert not any(a.startswith("--fwhm=") for a in argv)
+    assert not any(a.startswith("--threshold=") for a in argv)
+    assert not any(a.startswith("--use-brightest=") for a in argv)
+
+
+def test_cli_register_batch_forwards_debug(tmp_path: Path, monkeypatch: Any) -> None:
+    _root, base = _make_workspace(tmp_path)
+    (base / "2_10_18--roiA").mkdir(parents=True)
+    (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
+
+    cb = _make_codebook(tmp_path)
+    config_path = _write_config_file(
+        tmp_path,
+        chromatic_path=DATA,
+        registration={"reference": "2_10_18"},
+        filename="register_config.json",
+    )
+
+    class _WS:
+        def __init__(self, path: Path, *_: Any, **__: Any) -> None:
+            path = Path(path)
+            if path.name == "deconv" and path.parent.name == "analysis":
+                self.path = path.parent.parent
+                self._deconved = path
+            else:
+                self.path = path
+                self._deconved = self.path / "analysis" / "deconv"
+            self.rois = ["roiA"]
+            self.rounds = ["2_10_18"]
+
+        @property
+        def deconved(self) -> Path:
+            return self._deconved
+
+        @property
+        def chromatic(self) -> Path:
+            return self._deconved / "chromatic"
+
+        @property
+        def output(self) -> SimpleNamespace:
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -485,6 +964,8 @@ def test_cli_register_batch_forwards_debug(tmp_path: Path, monkeypatch: Any) -> 
         [
             "batch",
             str(base),
+            "--config",
+            str(config_path),
             "--codebook",
             str(cb),
             "--overwrite",
@@ -506,6 +987,12 @@ def test_cli_register_batch_only_median_gt_requires_overwrite(tmp_path: Path, mo
     (base / "2_10_18--roiA" / "2_10_18-0001.tif").write_text("")
 
     cb = _make_codebook(tmp_path)
+    config_path = _write_config_file(
+        tmp_path,
+        chromatic_path=DATA,
+        registration={"reference": "2_10_18"},
+        filename="register_config.json",
+    )
 
     class _WS:
         def __init__(self, path: Path, *_: Any, **__: Any) -> None:
@@ -527,6 +1014,11 @@ def test_cli_register_batch_only_median_gt_requires_overwrite(tmp_path: Path, mo
         def chromatic(self) -> Path:
             return self._deconved / "chromatic"
 
+        @property
+        def output(self) -> SimpleNamespace:
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
+
     monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
 
     runner = CliRunner()
@@ -535,6 +1027,8 @@ def test_cli_register_batch_only_median_gt_requires_overwrite(tmp_path: Path, mo
         [
             "batch",
             str(base),
+            "--config",
+            str(config_path),
             "--codebook",
             str(cb),
             "--threads",
@@ -578,7 +1072,8 @@ def test_cli_register_batch_only_median_gt_filters_tiles(tmp_path: Path, monkeyp
 
         @property
         def output(self) -> SimpleNamespace:
-            return SimpleNamespace(root=self.path / "analysis" / "output")
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -612,6 +1107,8 @@ def test_cli_register_batch_only_median_gt_filters_tiles(tmp_path: Path, monkeyp
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -620,6 +1117,8 @@ def test_cli_register_batch_only_median_gt_filters_tiles(tmp_path: Path, monkeyp
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--overwrite",
             "--threads",
             "1",
@@ -664,7 +1163,14 @@ def test_cli_register_batch_only_corr_lt_requires_overwrite(tmp_path: Path, monk
         def chromatic(self) -> Path:
             return self._deconved / "chromatic"
 
+        @property
+        def output(self) -> SimpleNamespace:
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
+
     monkeypatch.setattr("fishtools.preprocess.cli_register.Workspace", _WS)
+
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
 
     runner = CliRunner()
     result = runner.invoke(
@@ -674,6 +1180,8 @@ def test_cli_register_batch_only_corr_lt_requires_overwrite(tmp_path: Path, monk
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--threads",
             "1",
             "--only-corr-lt",
@@ -715,7 +1223,8 @@ def test_cli_register_batch_only_corr_lt_filters_tiles(tmp_path: Path, monkeypat
 
         @property
         def output(self) -> SimpleNamespace:
-            return SimpleNamespace(root=self.path / "analysis" / "output")
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -749,6 +1258,8 @@ def test_cli_register_batch_only_corr_lt_filters_tiles(tmp_path: Path, monkeypat
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -757,6 +1268,8 @@ def test_cli_register_batch_only_corr_lt_filters_tiles(tmp_path: Path, monkeypat
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--overwrite",
             "--threads",
             "1",
@@ -804,6 +1317,11 @@ def test_cli_register_batch_falls_back_to_fids_for_idx_discovery(tmp_path: Path,
         def chromatic(self) -> Path:
             return self._deconved / "chromatic"
 
+        @property
+        def output(self) -> SimpleNamespace:
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
+
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
 
@@ -831,6 +1349,8 @@ def test_cli_register_batch_falls_back_to_fids_for_idx_discovery(tmp_path: Path,
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -839,6 +1359,8 @@ def test_cli_register_batch_falls_back_to_fids_for_idx_discovery(tmp_path: Path,
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--overwrite",
             "--threads",
             "1",
@@ -882,10 +1404,7 @@ def test_run_fiducial_debug_prints_priors(tmp_path: Path, monkeypatch: Any) -> N
         dataPath=str(DATA),
         exclude=None,
         registration=RegisterConfig(
-            chromatic_shifts={
-                "650": str(DATA / "560to650.txt"),
-                "750": str(DATA / "560to750.txt"),
-            },
+            chromatic_path=DATA,
             fiducial=Fiducial(
                 use_fft=False,
                 fwhm=4.0,
@@ -953,10 +1472,7 @@ def test_run_fiducial_debug_logs_when_no_priors(tmp_path: Path, monkeypatch: Any
         dataPath=str(DATA),
         exclude=None,
         registration=RegisterConfig(
-            chromatic_shifts={
-                "650": str(DATA / "560to650.txt"),
-                "750": str(DATA / "560to750.txt"),
-            },
+            chromatic_path=DATA,
             fiducial=Fiducial(
                 use_fft=False,
                 fwhm=4.0,
@@ -1030,10 +1546,7 @@ def test_run_fiducial_auto_derives_priors_when_empty(tmp_path: Path, monkeypatch
         dataPath=str(DATA),
         exclude=None,
         registration=RegisterConfig(
-            chromatic_shifts={
-                "650": str(DATA / "560to650.txt"),
-                "750": str(DATA / "560to750.txt"),
-            },
+            chromatic_path=DATA,
             fiducial=Fiducial(
                 use_fft=False,
                 fwhm=4.0,
@@ -1126,6 +1639,11 @@ def test_cli_register_batch_verify_respects_allow_large_shifts(tmp_path: Path, m
         def chromatic(self) -> Path:
             return self._deconved / "chromatic"
 
+        @property
+        def output(self) -> SimpleNamespace:
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
+
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
 
@@ -1150,6 +1668,8 @@ def test_cli_register_batch_verify_respects_allow_large_shifts(tmp_path: Path, m
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1158,6 +1678,8 @@ def test_cli_register_batch_verify_respects_allow_large_shifts(tmp_path: Path, m
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--threads",
             "1",
             "--verify",
@@ -1199,6 +1721,8 @@ def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: An
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1208,6 +1732,8 @@ def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: An
             "7",
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--roi",
             "roiB",
             "--reference",
@@ -1245,6 +1771,8 @@ def test_cli_register_run_skips_when_reg_file_exists(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1254,6 +1782,8 @@ def test_cli_register_run_skips_when_reg_file_exists(tmp_path: Path, monkeypatch
             "42",
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--roi",
             "roiA",
             "--reference",
@@ -1279,10 +1809,7 @@ def test_run_internal_returns_early_when_reg_file_exists(tmp_path: Path) -> None
         dataPath=str(DATA),
         exclude=None,
         registration=RegisterConfig(
-            chromatic_shifts={
-                "650": str(DATA / "560to650.txt"),
-                "750": str(DATA / "560to750.txt"),
-            },
+            chromatic_path=DATA,
             fiducial=Fiducial(
                 use_fft=False,
                 fwhm=4.0,
@@ -1377,7 +1904,7 @@ def test_run_uses_previous_run_fids_when_reference_round_missing(
         dataPath=str(DATA),
         exclude=None,
         registration=RegisterConfig(
-            chromatic_shifts={},
+            chromatic_path=DATA,
             fiducial=Fiducial(
                 use_fft=True,
                 fwhm=4.0,
@@ -1443,6 +1970,11 @@ def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: A
         def chromatic(self) -> Path:
             return self._deconved / "chromatic"
 
+        @property
+        def output(self) -> SimpleNamespace:
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
+
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
 
@@ -1466,6 +1998,8 @@ def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: A
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1474,6 +2008,8 @@ def test_cli_register_batch_skips_existing_shifts(tmp_path: Path, monkeypatch: A
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--threads",
             "1",
         ],
@@ -1526,6 +2062,11 @@ def test_cli_register_batch_verify_reruns_on_read_failure(tmp_path: Path, monkey
         @property
         def chromatic(self) -> Path:
             return self._deconved / "chromatic"
+
+        @property
+        def output(self) -> SimpleNamespace:
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -1583,6 +2124,8 @@ def test_cli_register_batch_verify_reruns_on_read_failure(tmp_path: Path, monkey
 
     monkeypatch.setattr("fishtools.preprocess.cli_register.TiffFile", _TF)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1591,6 +2134,8 @@ def test_cli_register_batch_verify_reruns_on_read_failure(tmp_path: Path, monkey
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--threads",
             "1",
             "--verify",
@@ -1647,6 +2192,11 @@ def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
         @property
         def chromatic(self) -> Path:
             return self._deconved / "chromatic"
+
+        @property
+        def output(self) -> SimpleNamespace:
+            output_root = self.path / "analysis" / "output"
+            return SimpleNamespace(root=output_root, chromatic=output_root / "chromatic")
 
         def regimg(self, roi: str, codebook: str, idx: int) -> Path:
             return self._deconved / f"registered--{roi}+{codebook}" / f"reg-{idx:04d}.tif"
@@ -1708,6 +2258,8 @@ def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
 
     monkeypatch.setattr("fishtools.preprocess.cli_register.TiffFile", _TF)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": "2_10_18"})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1716,6 +2268,8 @@ def test_cli_register_batch_verify_checks_existing_outputs_without_overwrite(
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--threads",
             "1",
             "--verify",
@@ -1821,6 +2375,8 @@ def test_cli_register_run_use_shifts_from_skips_fiducial_registration(
     monkeypatch.setattr("fishtools.preprocess.cli_register._run", fake__run)
     monkeypatch.setattr("fishtools.preprocess.cli_register.run_fiducial", fake_run_fiducial)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA)
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1830,6 +2386,8 @@ def test_cli_register_run_use_shifts_from_skips_fiducial_registration(
             "42",
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--roi",
             "roiA",
             "--reference",
@@ -1864,6 +2422,8 @@ def test_cli_register_batch_forwards_use_shifts_from(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA)
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1872,6 +2432,8 @@ def test_cli_register_batch_forwards_use_shifts_from(tmp_path: Path, monkeypatch
             str(base),
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--threads",
             "1",
             "--overwrite",
@@ -1914,6 +2476,8 @@ def test_cli_register_batch_use_shifts_from_does_not_require_ref_images(tmp_path
 
     monkeypatch.setattr("fishtools.preprocess.cli_register._run_child_cli", fake_run)
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": ref})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -1924,6 +2488,8 @@ def test_cli_register_batch_use_shifts_from_does_not_require_ref_images(tmp_path
             ref,
             "--codebook",
             str(cb),
+            "--config",
+            str(config_path),
             "--threads",
             "1",
             f"--use-shifts-from={source_cb}",
@@ -1990,7 +2556,7 @@ def test_run_internal_uses_shifts_from_source_codebook(tmp_path: Path, monkeypat
         dataPath=str(DATA),
         exclude=None,
         registration=RegisterConfig(
-            chromatic_shifts={},
+            chromatic_path=DATA,
             fiducial=Fiducial(
                 use_fft=True,
                 fwhm=4.0,
@@ -2068,6 +2634,8 @@ def test_cli_fix_shifts_accepts_star_roi(tmp_path: Path, monkeypatch: Any) -> No
         lambda *_, **__: Path("dummy.log"),
     )
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": reference})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -2075,6 +2643,8 @@ def test_cli_fix_shifts_accepts_star_roi(tmp_path: Path, monkeypatch: Any) -> No
             "fix-shifts",
             str(root),
             "1",
+            "--config",
+            str(config_path),
             "--roi",
             "*",
             "--rounds",
@@ -2143,6 +2713,8 @@ def test_cli_fix_shifts_merges_existing_tiles(tmp_path: Path, monkeypatch: Any) 
         lambda *_, **__: Path("dummy.log"),
     )
 
+    config_path = _write_config_file(tmp_path, chromatic_path=DATA, registration={"reference": reference})
+
     runner = CliRunner()
     result = runner.invoke(
         register_cli,
@@ -2150,6 +2722,8 @@ def test_cli_fix_shifts_merges_existing_tiles(tmp_path: Path, monkeypatch: Any) 
             "fix-shifts",
             str(root),
             "1",
+            "--config",
+            str(config_path),
             "--roi",
             roi,
             "--rounds",

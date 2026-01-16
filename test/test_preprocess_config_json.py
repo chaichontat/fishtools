@@ -18,13 +18,9 @@ def _write_json(path: Path, data: dict) -> Path:
 
 def _minimal_registration(data_path: Path) -> dict:
     return {
-        # dataPath is injected by the loader; include chromatic to satisfy model
+        # dataPath is injected by the loader; include chromatic_path for determinism
         "registration": {
-            "fiducial": {},
-            "chromatic_shifts": {
-                "650": str(data_path / "560to650.txt"),
-                "750": str(data_path / "560to750.txt"),
-            },
+            "chromatic_path": str(data_path),
         }
     }
 
@@ -38,8 +34,7 @@ def test_load_config_from_json_valid(tmp_path: Path) -> None:
 
     assert cfg.dataPath == str(tmp_path)
     assert cfg.registration.reference == "4_12_20"  # default
-    assert "650" in cfg.registration.chromatic_shifts
-    assert "750" in cfg.registration.chromatic_shifts
+    assert cfg.registration.chromatic_path == tmp_path
 
 
 def test_load_config_from_json_with_overrides(tmp_path: Path) -> None:

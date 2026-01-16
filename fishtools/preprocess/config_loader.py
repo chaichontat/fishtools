@@ -50,6 +50,15 @@ def load_config_from_json(config_path: Path, data_path: str, **overrides) -> Con
             else:
                 config_dict[key] = value
 
+    registration = config_dict.get("registration")
+    if isinstance(registration, dict) and "chromatic_path" in registration:
+        chromatic_path = registration.get("chromatic_path")
+        if isinstance(chromatic_path, str) and chromatic_path:
+            p = Path(chromatic_path).expanduser()
+            if not p.is_absolute():
+                p = (config_path.parent / p).resolve()
+            registration["chromatic_path"] = str(p)
+
     try:
         return Config(**config_dict)
     except ValidationError as e:
@@ -68,7 +77,7 @@ def load_minimal_config(
     This is designed to be a drop-in replacement for existing config creation
     patterns while still providing access to all the new configuration sections.
     """
-    # Keep minimal shape; rely on default_register_config() from Config for chromatic shifts
+    # Keep minimal shape; rely on Config defaults for registration/chromatic_path
     return Config(dataPath=data_path)
 
 
@@ -84,7 +93,7 @@ def generate_config_template(output_path: Path) -> None:
             "reduce_bit_depth": 0,
             "split_channels": False,
             "fiducial": Fiducial().model_dump(),
-            "chromatic_shifts": {"647": "data/560to647.txt", "750": "data/560to750.txt"},
+            "chromatic_path": "data",
         },
     }
     output_path.write_text(json.dumps(config_dict, indent=2))

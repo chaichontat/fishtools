@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 import numpy as np
 import rich_click as click
 import toml
+import tifffile  # noqa: F401
 from basicpy import BaSiC
 from loguru import logger
 from pydantic import ValidationError
@@ -22,13 +23,14 @@ from scipy import ndimage
 from scipy.ndimage import shift
 from tifffile import TiffFile
 
-from fishtools.preprocess.chromatic import Affine
+from fishtools.preprocess.chromatic import Affine, apply_dense_xy_displacement_field
 from fishtools.preprocess.config import (
     Config,
     Fiducial,
     FiducialDetailedConfig,
     NumpyEncoder,
     RegisterConfig,
+    default_register_config,
     resolve_data_path,
 )
 from fishtools.preprocess.deconv.helpers import scale_deconv
@@ -39,6 +41,7 @@ from fishtools.preprocess.fiducial import (
     align_fiducials_with_stats,
     shifts_from_anchor_roi,
 )
+from fishtools.gpu.memory import release_all as gpu_release_all
 from fishtools.utils.io import FiducialPaths, Workspace, safe_imwrite
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.pretty_print import progress_bar_threadpool, run_subprocess_streaming
@@ -75,7 +78,7 @@ def _silence_matplotlib_debug_logs() -> None:
 
 
 def _load_chromatic_affines(
-    ws: Workspace | None = None,
+    ws: Workspace,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, dict[str, Any]]]:
     As: dict[str, np.ndarray] = {}
     ats: dict[str, np.ndarray] = {}
@@ -83,8 +86,12 @@ def _load_chromatic_affines(
 
     for λ in ["650", "750"]:
         filename = f"560to{λ}.txt"
-        candidate = (ws.chromatic / filename) if ws is not None else None
-        path = candidate if candidate is not None and candidate.exists() else (DATA / filename)
+        path = ws.output.chromatic / filename
+        if not path.exists():
+            raise click.ClickException(
+                f"Missing chromatic correction file {path}. "
+                "Stage chromatic corrections under analysis/output/chromatic (set registration.chromatic_path via --config)."
+            )
         a_ = np.loadtxt(path)
         A = np.zeros((3, 3), dtype=np.float64)
         A[:2, :2] = a_[:4].reshape(2, 2)
@@ -104,6 +111,48 @@ def _load_chromatic_affines(
 
     meta["ref"] = {"channel": "560"}
     return As, ats, meta
+
+
+def _load_optional_chromatic_displacement_fields(
+    ws: Workspace,
+) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict[str, dict[str, Any]]]:
+    fields: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    meta: dict[str, dict[str, Any]] = {}
+    for λ in ["650", "750"]:
+        path = ws.output.chromatic / f"560to{λ}_field.npz"
+        if not path.exists():
+            continue
+        with np.load(path, allow_pickle=False) as loaded:
+            if "dx_dense" not in loaded or "dy_dense" not in loaded or "meta_json" not in loaded:
+                raise click.ClickException(
+                    f"Invalid chromatic field file {path} (expected keys: dx_dense, dy_dense, meta_json)."
+                )
+            dx = np.asarray(loaded["dx_dense"], dtype=np.float32)
+            dy = np.asarray(loaded["dy_dense"], dtype=np.float32)
+            if dx.shape != dy.shape or dx.ndim != 2:
+                raise click.ClickException(
+                    f"Invalid chromatic field file {path} (dx_dense/dy_dense must be 2D and same shape)."
+                )
+            fields[λ] = (dx, dy)
+            meta_json = str(loaded["meta_json"].item())
+            mj = json.loads(meta_json)
+            if not isinstance(mj, dict) or "kind" not in mj:
+                raise click.ClickException(f"Invalid chromatic field file {path} (meta_json missing 'kind').")
+            meta[λ] = {"source": str(path), "kind": str(mj["kind"])}
+    return fields, meta
+
+
+_chromatic_logged = False
+
+
+def _log_chromatic_matrices_once(As: dict[str, np.ndarray], ats: dict[str, np.ndarray]) -> None:
+    """Log chromatic affine matrices once per process (debug mode only)."""
+    global _chromatic_logged
+    if _chromatic_logged:
+        return
+    _chromatic_logged = True
+    for λ in ["650", "750"]:
+        logger.debug(f"Chromatic 560→{λ}: A=\n{As[λ][:2,:2]}\n  t={ats[λ][:2]}")
 
 
 def spillover_correction(spillee: np.ndarray, spiller: np.ndarray, corr: float):
@@ -267,23 +316,33 @@ def _copy_codebook_to_workspace(cli_path: Path, codebook_path: Path) -> Path:
     return destination
 
 
-def _copy_chromatic_corrections_to_workspace(cli_path: Path) -> None:
+def _copy_chromatic_corrections_to_output(cli_path: Path, chromatic_dir: Path) -> None:
     workspace = Workspace(cli_path)
-    chromatic_dir = workspace.chromatic
-    chromatic_dir.mkdir(parents=True, exist_ok=True)
+    output_chromatic_dir = workspace.output.chromatic
+    output_chromatic_dir.mkdir(parents=True, exist_ok=True)
 
-    for filename in ("560to650.txt", "560to750.txt"):
-        source = (DATA / filename).resolve(strict=True)
-        destination = chromatic_dir / filename
+    source_dir = chromatic_dir.resolve(strict=True)
+    required = ("560to650.txt", "560to750.txt")
+    for filename in required:
+        source = source_dir / filename
+        if not source.exists():
+            raise click.ClickException(f"Chromatic directory {source_dir} is missing required file {source.name}")
 
-        if destination.exists():
-            try:
-                if destination.read_bytes() == source.read_bytes():
-                    continue
-            except OSError:
-                pass
-
+    copied: dict[str, dict[str, str]] = {}
+    optional = ("560to650_field.npz", "560to750_field.npz")
+    for filename in required + optional:
+        source = source_dir / filename
+        if not source.exists():
+            continue
+        destination = output_chromatic_dir / filename
         shutil.copy2(source, destination)
+        copied[filename] = {"source": str(source), "destination": str(destination)}
+
+    provenance: dict[str, Any] = {"source_dir": str(source_dir), "files": copied}
+    (output_chromatic_dir / "chromatic_provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def sort_key(x: tuple[str, np.ndarray]) -> int | str:
@@ -413,6 +472,118 @@ def _parse_priors_file(path: Path | None) -> dict[str, tuple[float, float]] | No
     return parsed or None
 
 
+def _load_register_config_from_json(path: Path) -> RegisterConfig:
+    raw = path.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise click.ClickException(f"--config file is empty: {path}")
+
+    try:
+        payload: Any = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise click.ClickException(f"Invalid JSON in --config file {path}: {e}") from e
+
+    if not isinstance(payload, dict):
+        raise click.ClickException(f"--config JSON must be an object/dict, got {type(payload).__name__}: {path}")
+
+    def _deep_merge(base: Any, patch: Any) -> Any:
+        if isinstance(base, dict) and isinstance(patch, dict):
+            merged = dict(base)
+            for k, v in patch.items():
+                merged[k] = _deep_merge(merged.get(k), v) if k in merged else v
+            return merged
+        return patch
+
+    config_keys = set(Config.model_fields.keys())
+    is_config_shape = bool(set(payload.keys()) & config_keys)
+
+    if is_config_shape:
+        base = Config()
+        merged_dict = _deep_merge(base.model_dump(mode="python"), payload)
+        try:
+            full_config = Config.model_validate(merged_dict)
+        except ValidationError as e:
+            raise click.ClickException(f"Invalid --config JSON at {path}:\n{e}") from e
+        config = full_config.registration
+    else:
+        base = default_register_config()
+        merged_dict = _deep_merge(base.model_dump(mode="python"), payload)
+        try:
+            config = RegisterConfig.model_validate(merged_dict)
+        except ValidationError as e:
+            raise click.ClickException(f"Invalid --config JSON at {path}:\n{e}") from e
+
+    chromatic_path = config.chromatic_path
+    if not chromatic_path.is_absolute():
+        chromatic_path = (path.parent / chromatic_path).resolve()
+
+    anchor_roi = config.fiducial.anchor_roi
+    if anchor_roi is not None and not anchor_roi.is_absolute():
+        anchor_roi = (path.parent / anchor_roi).resolve()
+
+    fiducial = config.fiducial.model_copy(update={"anchor_roi": anchor_roi})
+    return config.model_copy(update={"chromatic_path": chromatic_path, "fiducial": fiducial})
+
+
+def _apply_cli_overrides_to_registration_config(
+    loaded: RegisterConfig,
+    *,
+    reference: str | None = None,
+    threshold: float | None = None,
+    fwhm: float | None = None,
+    use_fft: bool | None = None,
+    use_itk: bool | None = None,
+    anchors: Path | None = None,
+    use_brightest: int | None = None,
+    offset_brightest: int | None = None,
+    allow_large_shifts: bool | None = None,
+    n_fids: int | None = None,
+    priors: dict[str, tuple[float, float]] | None = None,
+) -> RegisterConfig:
+    """Apply non-None CLI overrides onto a loaded RegisterConfig."""
+
+    fid_updates: dict[str, Any] = {}
+    detailed_updates: dict[str, Any] = {}
+
+    if threshold is not None:
+        fid_updates["threshold"] = threshold
+    if fwhm is not None:
+        fid_updates["fwhm"] = fwhm
+    if use_fft is not None:
+        fid_updates["use_fft"] = use_fft
+    if use_itk is not None:
+        fid_updates["use_itk"] = use_itk
+    if anchors is not None:
+        fid_updates["anchor_roi"] = anchors
+    if n_fids is not None:
+        fid_updates["n_fids"] = n_fids
+    if priors is not None:
+        fid_updates["priors"] = priors
+
+    if use_brightest is not None:
+        detailed_updates["use_brightest"] = max(use_brightest, 0)
+    if offset_brightest is not None:
+        detailed_updates["offset_brightest"] = max(offset_brightest, 0)
+    if allow_large_shifts is not None:
+        detailed_updates["allow_large_shifts"] = allow_large_shifts
+
+    detailed = (
+        loaded.fiducial.detailed.model_copy(update=detailed_updates)
+        if detailed_updates
+        else loaded.fiducial.detailed
+    )
+    fiducial = (
+        loaded.fiducial.model_copy(update={**fid_updates, "detailed": detailed})
+        if (fid_updates or detailed_updates)
+        else loaded.fiducial
+    )
+
+    updates: dict[str, Any] = {"fiducial": fiducial}
+    if reference is not None:
+        updates["reference"] = reference
+
+    return loaded.model_copy(update=updates)
+
+
 def _build_register_config(
     *,
     reference: str,
@@ -424,6 +595,7 @@ def _build_register_config(
     offset_brightest: int,
     allow_large_shifts: bool,
     n_fids: int,
+    chromatic_dir: Path,
     anchor_roi: Path | None = None,
     priors: dict[str, tuple[float, float]] | None = None,
 ) -> RegisterConfig:
@@ -431,10 +603,7 @@ def _build_register_config(
 
     resolved_priors = priors if priors is not None else {}
     return RegisterConfig(
-        chromatic_shifts={
-            "650": str(DATA / "560to650.txt"),
-            "750": str(DATA / "560to750.txt"),
-        },
+        chromatic_path=chromatic_dir.resolve(),
         fiducial=Fiducial(
             use_fft=use_fft,
             use_itk=use_itk,
@@ -1080,61 +1249,87 @@ def _run(
             slices = slice(None)
         return img[slices]
 
+    bits_in_output = sorted(codebook_bits & set(bits))
+    missing_channels = [bit for bit in bits_in_output if bit not in channels]
+    if missing_channels:
+        raise KeyError(missing_channels[0])
+
     transformed: dict[str, np.ndarray] = {}
     ref = None
 
+    required_chromatic = ("560to650.txt", "560to750.txt")
+    if any(not (ws.output.chromatic / filename).exists() for filename in required_chromatic):
+        source_dir = config.registration.chromatic_path.resolve()
+        output_dir = ws.output.chromatic.resolve()
+        if source_dir != output_dir:
+            _copy_chromatic_corrections_to_output(path, source_dir)
+
     As, ats, chromatic_meta = _load_chromatic_affines(ws)
+    chromatic_fields, chromatic_field_meta = _load_optional_chromatic_displacement_fields(ws)
+    for k, v in chromatic_field_meta.items():
+        chromatic_meta.setdefault(k, {})
+        chromatic_meta[k]["field"] = v
+    if debug:
+        _log_chromatic_matrices_once(As, ats)
     affine = Affine(As=As, ats=ats)
-    bits_in_output = sorted(codebook_bits & set(bits))
-    for i, bit in enumerate(bits_in_output):
-        bit = str(bit)
-        img = bits[bit]
-        del bits[bit]
-        c = str(channels[bit])
-        # Deconvolution scaling
-        orig_name, orig_idx = bit_name_mapping[bit]
-        img = collapse_z(img, config.registration.slices).astype(np.float32)
-        metadata = imgs[orig_name].metadata
 
-        if not metadata.get("prenormalized"):
-            scaling = imgs[orig_name].global_deconv_scaling
-            assert scaling is not None
-            img = apply_deconv_scaling(
-                img,
-                idx=orig_idx,
-                orig_name=orig_name,
-                global_deconv_scaling=scaling,
-                metadata=metadata,
-                debug=debug,
-            )
-            del scaling
+    needs_gpu_cleanup = config.registration.downsample > 1
+    try:
+        for i, bit in enumerate(bits_in_output):
+            bit = str(bit)
+            img = bits[bit]
+            del bits[bit]
+            c = str(channels[bit])
+            # Deconvolution scaling
+            orig_name, orig_idx = bit_name_mapping[bit]
+            img = collapse_z(img, config.registration.slices).astype(np.float32)
+            metadata = imgs[orig_name].metadata
 
-        if ref is None:
-            # Need to put this here because of shape change during collapse_z.
-            affine.ref_image = ref = img
+            if not metadata.get("prenormalized"):
+                scaling = imgs[orig_name].global_deconv_scaling
+                assert scaling is not None
+                img = apply_deconv_scaling(
+                    img,
+                    idx=orig_idx,
+                    orig_name=orig_name,
+                    global_deconv_scaling=scaling,
+                    metadata=metadata,
+                    debug=debug,
+                )
+                del scaling
 
-        # Within-tile alignment. Chromatic corrections.
-        logger.debug(f"{bit}: before affine channel={c}, shiftpx={-bits_shifted[bit]}")
-        img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
-        crop = config.registration.crop
-        downsample = config.registration.downsample
-        if crop:
-            img = img[:, crop:-crop, crop:-crop]
+            if ref is None:
+                # Need to put this here because of shape change during collapse_z.
+                affine.ref_image = ref = img
 
-        if downsample > 1:
-            transformed_img = gpu_downsample_xy(
-                img,
-                crop=0,
-                factor=downsample,
-                clip_range=(0, 65534),
-                output_dtype=np.uint16,
-            )
-        else:
-            transformed_img = np.clip(img, 0, 65534).astype(np.uint16)
+            # Within-tile alignment. Chromatic corrections.
+            logger.debug(f"{bit}: before affine channel={c}, shiftpx={-bits_shifted[bit]}")
+            img = affine(img, channel=c, shiftpx=-bits_shifted[bit], debug=debug)
+            if c in chromatic_fields:
+                dx_dense, dy_dense = chromatic_fields[c]
+                img = apply_dense_xy_displacement_field(img, dx_dense=dx_dense, dy_dense=dy_dense)
+            crop = config.registration.crop
+            downsample = config.registration.downsample
+            if crop:
+                img = img[:, crop:-crop, crop:-crop]
 
-        transformed[bit] = transformed_img
-        logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
-        logger.info("Finished")
+            if downsample > 1:
+                transformed_img = gpu_downsample_xy(
+                    img,
+                    crop=0,
+                    factor=downsample,
+                    clip_range=(0, 65534),
+                    output_dtype=np.uint16,
+                )
+            else:
+                transformed_img = np.clip(img, 0, 65534).astype(np.uint16)
+
+            transformed[bit] = transformed_img
+            logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
+            logger.debug(f"Finished transforming bit={bit} ({i + 1}/{len(bits_in_output)}) for idx={idx:04d}")
+    finally:
+        if needs_gpu_cleanup:
+            gpu_release_all()
 
     if not len(transformed):
         raise ValueError("No images were transformed.")
@@ -1171,10 +1366,11 @@ def _run(
             "key": keys,
             "axes": "ZCYX",
             "shifts": json.dumps(shifts, cls=NumpyEncoder),
-            "config": json.dumps(config.model_dump(), cls=NumpyEncoder),
+            "config": json.dumps(config.model_dump(mode="json"), cls=NumpyEncoder),
             "chromatic": json.dumps(chromatic_meta),
         },
     )
+    logger.info(f"Wrote reg-{idx:04d}.tif to {out_path}")
 
     # for i in range(0, len(out), 3):
     #     (path / "down2" / str(i)).mkdir(exist_ok=True, parents=True)
@@ -1202,19 +1398,20 @@ def _build_register_run_argv(
     path: Path,
     idx: int,
     codebook: Path,
-    fwhm: int,
-    threshold: int,
-    reference: str,
+    config: Path,
+    fwhm: float | None,
+    threshold: float | None,
+    reference: str | None,
     roi: str,
     max_iters: int,
     overwrite: bool,
     debug: bool,
     repaired: str | None,
-    use_fft: bool,
-    use_itk: bool,
-    use_brightest: int,
-    offset_brightest: int,
-    allow_large_shifts: bool,
+    use_fft: bool | None,
+    use_itk: bool | None,
+    use_brightest: int | None,
+    offset_brightest: int | None,
+    allow_large_shifts: bool | None,
     use_shifts_from: str | None,
 ) -> list[str]:
     argv = [
@@ -1224,10 +1421,10 @@ def _build_register_run_argv(
         str(path),
         str(idx),
         f"--codebook={codebook}",
-        f"--fwhm={fwhm}",
-        f"--threshold={threshold}",
-        "--reference",
-        reference,
+        f"--config={config}",
+        *([f"--fwhm={fwhm}"] if fwhm is not None else []),
+        *([f"--threshold={threshold}"] if threshold is not None else []),
+        *(["--reference", reference] if reference is not None else []),
         f"--roi={roi}",
         f"--max-iters={max_iters}",
         *(["--overwrite"] if overwrite else []),
@@ -1235,8 +1432,12 @@ def _build_register_run_argv(
         *([f"--repaired={repaired}"] if repaired else []),
         *(["--use-fft"] if use_fft else []),
         *(["--use-itk"] if use_itk else []),
-        *([f"--use-brightest={use_brightest}"] if use_brightest > 0 else []),
-        *([f"--offset-brightest={offset_brightest}"] if offset_brightest > 0 else []),
+        *([f"--use-brightest={use_brightest}"] if use_brightest is not None and use_brightest > 0 else []),
+        *(
+            [f"--offset-brightest={offset_brightest}"]
+            if offset_brightest is not None and offset_brightest > 0
+            else []
+        ),
         *(["--allow-large-shifts"] if allow_large_shifts else []),
         *([f"--use-shifts-from={use_shifts_from}"] if use_shifts_from else []),
     ]
@@ -1250,34 +1451,52 @@ def register(): ...
 @register.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path, resolve_path=True))
 @click.argument("idx", type=int)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path, resolve_path=True),
+    required=True,
+    help="Path to a JSON RegisterConfig (or Config containing 'registration'). Command-line flags override config values.",
+)
 @click.option("--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path))
 @click.option("--roi", type=str, default="*")
-@click.option("--reference", "-r", type=str, default="4_12_20")
+@click.option("--reference", "-r", type=str, default=None, show_default="from config")
 @click.option("--debug", is_flag=True)
-@click.option("--threshold", type=float, default=5.0)
-@click.option("--fwhm", type=float, default=4.0)
+@click.option("--threshold", type=float, default=None, show_default="from config")
+@click.option("--fwhm", type=float, default=None, show_default="from config")
 @click.option("--overwrite", is_flag=True)
 @click.option("--no-priors", is_flag=True)
-@click.option("--use-fft", is_flag=True, help="Use FFT phase correlation instead of spot-based matching")
-@click.option("--use-itk", is_flag=True, help="Use SimpleITK gradient descent for alignment (more robust for low-contrast)")
+@click.option(
+    "--use-fft",
+    is_flag=True,
+    default=None,
+    help="Use FFT phase correlation instead of spot-based matching.",
+)
+@click.option(
+    "--use-itk",
+    is_flag=True,
+    default=None,
+    help="Use SimpleITK gradient descent for alignment (more robust for low-contrast).",
+)
 @click.option("--anchors", type=click.Path(exists=True, path_type=Path), help="Path to ImageJ RoiSet.zip with anchor points. Skips automatic registration.")
 @click.option(
     "--use-brightest",
     type=int,
-    default=20,
-    show_default=True,
+    default=None,
+    show_default="from config",
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
 @click.option(
     "--offset-brightest",
     type=click.IntRange(min=0),
-    default=0,
-    show_default=True,
+    default=None,
+    show_default="from config",
     help="Skip the first N brightest fiducial spots before applying --use-brightest.",
 )
 @click.option(
     "--allow-large-shifts",
     is_flag=True,
+    default=None,
     help="Accept shifts larger than the configured threshold instead of raising DriftTooLarge.",
 )
 @click.option(
@@ -1302,20 +1521,21 @@ def register(): ...
 def run(
     path: Path,
     idx: int,
+    config_path: Path,
     codebook: Path,
     roi: str | None,
     debug: bool = False,
-    reference: str = "4_12_20",
+    reference: str | None = None,
     overwrite: bool = False,
-    threshold: float = 6,
-    fwhm: float = 4,
+    threshold: float | None = None,
+    fwhm: float | None = None,
     no_priors: bool = False,
-    use_fft: bool = False,
-    use_itk: bool = False,
+    use_fft: bool | None = None,
+    use_itk: bool | None = None,
     anchors: Path | None = None,
-    use_brightest: int = 20,
-    offset_brightest: int = 0,
-    allow_large_shifts: bool = False,
+    use_brightest: int | None = None,
+    offset_brightest: int | None = None,
+    allow_large_shifts: bool | None = None,
     repaired: str | None = None,
     max_iters: int = 5,
     use_shifts_from: str | None = None,
@@ -1328,16 +1548,33 @@ def run(
         roi: ROI to work on.
         debug: More logs and write fids. Defaults to False.
         overwrite: Defaults to False.
-        threshold: σ above median to call fiducial spots. Defaults to 6.
-        fwhm: FWHM for the Gaussian spot detector. More == more spots but slower.Defaults to 4.
+        threshold: σ above median to call fiducial spots. Defaults to the value in --config.
+        fwhm: FWHM for the Gaussian spot detector. Defaults to the value in --config.
     """
     rois = get_rois(path, roi)
     codebook = _copy_codebook_to_workspace(path, codebook)
     codebook_name = codebook.stem
     ws = Workspace(path)
-    _copy_chromatic_corrections_to_workspace(path)
 
-    if offset_brightest > 0 and use_brightest <= 0:
+    loaded_registration = _load_register_config_from_json(config_path)
+    _copy_chromatic_corrections_to_output(path, loaded_registration.chromatic_path)
+    staged_chromatic_dir = ws.output.chromatic
+
+    reference_effective = reference or loaded_registration.reference
+    registration = _apply_cli_overrides_to_registration_config(
+        loaded_registration,
+        reference=reference_effective,
+        threshold=threshold,
+        fwhm=fwhm,
+        use_fft=use_fft,
+        use_itk=use_itk,
+        anchors=anchors,
+        use_brightest=use_brightest,
+        offset_brightest=offset_brightest,
+        allow_large_shifts=allow_large_shifts,
+    ).model_copy(update={"chromatic_path": staged_chromatic_dir})
+
+    if registration.fiducial.detailed.offset_brightest > 0 and registration.fiducial.detailed.use_brightest <= 0:
         raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
 
     for roi in rois:
@@ -1366,23 +1603,12 @@ def run(
             idx,
             codebook=codebook,
             debug=debug,
-            reference=reference,
+            reference=reference_effective,
             no_priors=no_priors,
             config=Config(
                 dataPath=str(DATA),
                 exclude=None,
-                registration=_build_register_config(
-                    reference=reference,
-                    threshold=threshold,
-                    fwhm=fwhm,
-                    use_fft=use_fft,
-                    use_itk=use_itk,
-                    use_brightest=use_brightest,
-                    offset_brightest=offset_brightest,
-                    allow_large_shifts=allow_large_shifts,
-                    n_fids=2,
-                    anchor_roi=anchors,
-                ),
+                registration=registration,
             ),
             overwrite=overwrite,
             repaired_rounds=repaired_rounds,
@@ -1395,13 +1621,20 @@ def run(
 @click.argument("path", type=click.Path(exists=True, path_type=Path))
 @click.argument("roi", type=str, default="*")
 @click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path, resolve_path=True),
+    required=True,
+    help="Path to a JSON RegisterConfig (or Config containing 'registration'). Batch forwards it to child runs.",
+)
+@click.option(
     "--codebook",
     help="Path to the codebook file",
     type=click.Path(exists=True, file_okay=True, path_type=Path),
 )
 @click.option("--reference", "--ref", default=None, help="Reference identifier")
-@click.option("--fwhm", type=float, default=4, help="FWHM value")
-@click.option("--threshold", type=float, default=6, help="Threshold value")
+@click.option("--fwhm", type=float, default=None, show_default="from config", help="FWHM value")
+@click.option("--threshold", type=float, default=None, show_default="from config", help="Threshold value")
 @click.option("--threads", type=int, default=15, help="Number of threads to use")
 @click.option("--overwrite", is_flag=True)
 @click.option("--debug", is_flag=True)
@@ -1432,25 +1665,36 @@ def run(
         "the single 'run' command with --overwrite."
     ),
 )
-@click.option("--use-fft", is_flag=True, help="Use FFT phase correlation instead of spot-based matching")
-@click.option("--use-itk", is_flag=True, help="Use SimpleITK gradient descent for alignment (more robust for low-contrast)")
+@click.option(
+    "--use-fft",
+    is_flag=True,
+    default=None,
+    help="Use FFT phase correlation instead of spot-based matching.",
+)
+@click.option(
+    "--use-itk",
+    is_flag=True,
+    default=None,
+    help="Use SimpleITK gradient descent for alignment (more robust for low-contrast).",
+)
 @click.option(
     "--use-brightest",
     type=int,
-    default=20,
-    show_default=True,
+    default=None,
+    show_default="from config",
     help="If >0, use only the N brightest fiducial spots per image for spot-based alignment.",
 )
 @click.option(
     "--offset-brightest",
     type=click.IntRange(min=0),
-    default=0,
-    show_default=True,
+    default=None,
+    show_default="from config",
     help="Skip the first N brightest fiducial spots before applying --use-brightest.",
 )
 @click.option(
     "--allow-large-shifts",
     is_flag=True,
+    default=None,
     help="Accept shifts larger than the configured threshold instead of raising DriftTooLarge.",
 )
 @click.option(
@@ -1475,21 +1719,22 @@ def run(
 def batch(
     path: Path,
     roi: str,
+    config_path: Path,
     reference: str | None,
     codebook: Path,
-    fwhm: int,
-    threshold: int,
+    fwhm: float | None,
+    threshold: float | None,
     threads: int,
     overwrite: bool,
     debug: bool,
     only_median_gt: float | None,
     only_corr_lt: float | None,
     verify: bool,
-    use_fft: bool = False,
-    use_itk: bool = False,
-    use_brightest: int = 20,
-    offset_brightest: int = 0,
-    allow_large_shifts: bool = False,
+    use_fft: bool | None = None,
+    use_itk: bool | None = None,
+    use_brightest: int | None = None,
+    offset_brightest: int | None = None,
+    allow_large_shifts: bool | None = None,
     repaired: str | None = None,
     max_iters: int = 5,
     use_shifts_from: str | None = None,
@@ -1507,23 +1752,34 @@ def batch(
     )
     _silence_matplotlib_debug_logs()
     ws = Workspace(path)
-    _copy_chromatic_corrections_to_workspace(path)
     logger.info(f"Found {ws.rois}")
 
-    if offset_brightest > 0 and use_brightest <= 0:
-        raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
     if only_median_gt is not None and not overwrite:
         raise click.ClickException("--only-median-gt requires --overwrite.")
     if only_corr_lt is not None and not overwrite:
         raise click.ClickException("--only-corr-lt requires --overwrite.")
 
-    if reference is None:
-        if "2_10_18" in ws.rounds:
-            reference = "2_10_18"
-        elif "7_15_23" in ws.rounds:
-            reference = "7_15_23"
-        else:
-            raise ValueError("No reference specified and no default found.")
+    loaded_registration = _load_register_config_from_json(config_path)
+    _copy_chromatic_corrections_to_output(path, loaded_registration.chromatic_path)
+
+    registration_effective = _apply_cli_overrides_to_registration_config(
+        loaded_registration,
+        reference=reference,
+        threshold=threshold,
+        fwhm=fwhm,
+        use_fft=use_fft,
+        use_itk=use_itk,
+        use_brightest=use_brightest,
+        offset_brightest=offset_brightest,
+        allow_large_shifts=allow_large_shifts,
+    )
+    reference_effective = registration_effective.reference
+
+    if (
+        registration_effective.fiducial.detailed.offset_brightest > 0
+        and registration_effective.fiducial.detailed.use_brightest <= 0
+    ):
+        raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
 
     # Progressive scoping: default to all ROIs ("*"/"all"), otherwise process the
     # single provided ROI to align with other preprocess CLIs.
@@ -1536,8 +1792,9 @@ def batch(
                 raise ValueError(f"No shift files found for {roi}+{use_shifts_from} in {shift_dir}")
             all_idxs = sorted({int(p.stem.split("-")[1]) for p in shift_files})
         else:
-            assert reference is not None
-            names = sorted({name for name in path.rglob(f"{reference}--{roi}/{reference}*.tif")})
+            names = sorted(
+                {name for name in path.rglob(f"{reference_effective}--{roi}/{reference_effective}*.tif")}
+            )
             if not len(names):
                 fid_dir = ws.fids(roi)
                 fid_files = sorted(fid_dir.glob("fids-*.tif")) if fid_dir.exists() else []
@@ -1549,10 +1806,10 @@ def batch(
                         continue
 
                 if not fid_idxs:
-                    raise ValueError(f"No images found for {reference}--{roi}")
+                    raise ValueError(f"No images found for {reference_effective}--{roi}")
 
                 logger.warning(
-                    f"No images found for {reference}--{roi}; using fiducials in {fid_dir} to determine indices."
+                    f"No images found for {reference_effective}--{roi}; using fiducials in {fid_dir} to determine indices."
                 )
                 all_idxs = sorted(set(fid_idxs))
             else:
@@ -1594,14 +1851,14 @@ def batch(
                     parts.append(f"corr < {only_corr_lt}")
                 filters = " or ".join(parts) if parts else "the requested filter"
                 logger.warning(
-                    f"Skipping {reference}--{roi}: no tiles found with {filters}."
+                    f"Skipping {reference_effective}--{roi}: no tiles found with {filters}."
                 )
                 continue
 
         idxs = [i for i in all_idxs if overwrite or not ws.regimg(roi, codebook.stem, i).exists()]
 
         if not idxs and not verify:
-            logger.warning(f"Skipping {reference}--{roi}, already registered.")
+            logger.warning(f"Skipping {reference_effective}--{roi}, already registered.")
             continue
 
         with progress_bar_threadpool(len(idxs), threads=threads, debug=debug) as submit:
@@ -1612,6 +1869,7 @@ def batch(
                         path=path,
                         idx=i,
                         codebook=codebook,
+                        config=config_path,
                         fwhm=fwhm,
                         threshold=threshold,
                         reference=reference,
@@ -1688,6 +1946,7 @@ def batch(
                         path=path,
                         idx=i,
                         codebook=codebook,
+                        config=config_path,
                         fwhm=fwhm,
                         threshold=threshold,
                         reference=reference,
@@ -1849,6 +2108,13 @@ def _load_reference_fid_from_previous_run(
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path, resolve_path=True))
 @click.argument("idx", required=False, type=int)
 @click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path, resolve_path=True),
+    required=True,
+    help="Path to a JSON RegisterConfig (or Config containing 'registration').",
+)
+@click.option(
     "--roi",
     "-o",
     "roi_option",
@@ -1856,35 +2122,35 @@ def _load_reference_fid_from_previous_run(
     required=False,
     help="ROI to process. Use '*' for all ROIs.",
 )
-@click.option("--reference", "-r", type=str, default="2_10_18", help="Reference round name")
+@click.option("--reference", "-r", type=str, default=None, show_default="from config", help="Reference round name")
 @click.option(
     "--rounds",
     type=str,
     required=True,
     help="Comma-separated list of rounds to fix (e.g., '1_9_17,3_11_19')",
 )
-@click.option("--use-fft/--use-spots", default=False, help="Use FFT phase correlation or spot-based (default)")
-@click.option("--n-fids", type=int, default=2, help="Number of fiducial frames per image")
-@click.option("--threshold", type=float, default=5.0, help="Spot detection threshold (sigma)")
-@click.option("--fwhm", type=float, default=4.0, help="Fiducial spot FWHM")
+@click.option("--use-fft/--use-spots", default=None, show_default="from config", help="Use FFT phase correlation or spot-based matching.")
+@click.option("--n-fids", type=int, default=None, show_default="from config", help="Number of fiducial frames per image")
+@click.option("--threshold", type=float, default=None, show_default="from config", help="Spot detection threshold (sigma)")
+@click.option("--fwhm", type=float, default=None, show_default="from config", help="Fiducial spot FWHM")
 @click.option(
     "--use-brightest",
     type=int,
-    default=20,
-    show_default=True,
+    default=None,
+    show_default="from config",
     help="If >0, use only the N brightest fiducials (matches register run).",
 )
 @click.option(
     "--offset-brightest",
     type=click.IntRange(min=0),
-    default=0,
-    show_default=True,
+    default=None,
+    show_default="from config",
     help="Skip the first N brightest fiducial spots before applying --use-brightest.",
 )
 @click.option(
     "--allow-large-shifts/--strict-shifts",
-    default=True,
-    show_default=True,
+    default=None,
+    show_default="from config",
     help="Enable the same allow_large_shifts toggle used in register run.",
 )
 @click.option(
@@ -1897,24 +2163,24 @@ def _load_reference_fid_from_previous_run(
 def fix_shifts(
     path: Path,
     idx: int | None,
+    config_path: Path,
     roi_option: str | None,
-    reference: str,
+    reference: str | None,
     rounds: str,
-    use_fft: bool,
-    n_fids: int,
-    threshold: float,
-    fwhm: float,
-    use_brightest: int,
-    offset_brightest: int,
-    allow_large_shifts: bool,
+    use_fft: bool | None,
+    n_fids: int | None,
+    threshold: float | None,
+    fwhm: float | None,
+    use_brightest: int | None,
+    offset_brightest: int | None,
+    allow_large_shifts: bool | None,
     priors: str | None,
     debug: bool,
 ):
     """Detect large drift offsets and write shifts to JSON.
 
     Uses the SAME registration algorithm as the main pipeline (align_fiducials)
-    but with allow_large_shifts=True. Only detects and writes shifts - does NOT
-    apply them to images.
+    but only detects and writes shifts - does NOT apply them to images.
 
     The output JSON can be used to inform priors for `register batch`.
 
@@ -1933,7 +2199,10 @@ def fix_shifts(
     """
     import json as json_module
 
+    loaded_registration = _load_register_config_from_json(config_path)
     ws = Workspace(path)
+    _copy_chromatic_corrections_to_output(path, loaded_registration.chromatic_path)
+    staged_chromatic_dir = ws.output.chromatic
     roi_value = roi_option
     if roi_value is None:
         raise click.ClickException("ROI is required. Pass it with --roi.")
@@ -1960,24 +2229,31 @@ def fix_shifts(
     if cli_priors:
         logger.info(f"Using explicit priors for rounds: {sorted(cli_priors)}")
 
-    if offset_brightest > 0 and use_brightest <= 0:
+    reference_effective = reference or loaded_registration.reference
+    priors_update = (cli_priors or {}) if priors is not None else None
+    registration = _apply_cli_overrides_to_registration_config(
+        loaded_registration,
+        reference=reference_effective,
+        threshold=threshold,
+        fwhm=fwhm,
+        use_fft=use_fft,
+        n_fids=n_fids,
+        use_brightest=use_brightest,
+        offset_brightest=offset_brightest,
+        allow_large_shifts=allow_large_shifts,
+        priors=priors_update,
+    ).model_copy(update={"chromatic_path": staged_chromatic_dir})
+
+    if (
+        registration.fiducial.detailed.offset_brightest > 0
+        and registration.fiducial.detailed.use_brightest <= 0
+    ):
         raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
 
     config = Config(
         dataPath=str(DATA),
         exclude=None,
-        registration=_build_register_config(
-            reference=reference,
-            threshold=threshold,
-            fwhm=fwhm,
-            use_fft=use_fft,
-            use_itk=False,
-            use_brightest=use_brightest,
-            offset_brightest=offset_brightest,
-            allow_large_shifts=allow_large_shifts,
-            n_fids=n_fids,
-            priors=cli_priors,
-        ),
+        registration=registration,
     )
     fiducial_cfg = config.registration.fiducial
 
@@ -1987,15 +2263,15 @@ def fix_shifts(
             component="preprocess.register.fix-shifts",
             file=f"fix-shifts-{roi}",
             debug=debug,
-            extra={"roi": roi, "reference": reference},
+            extra={"roi": roi, "reference": reference_effective},
         )
         _silence_matplotlib_debug_logs()
 
         logger.info(f"Processing rounds: {rounds_to_fix}")
-        logger.info(f"Reference round: {reference}")
+        logger.info(f"Reference round: {reference_effective}")
         logger.info(f"ROI: {roi}")
 
-        ref_dir = path / f"{reference}--{roi}"
+        ref_dir = path / f"{reference_effective}--{roi}"
         if not ref_dir.exists():
             raise ValueError(f"Reference round directory not found: {ref_dir}")
 
@@ -2005,7 +2281,7 @@ def fix_shifts(
                 raise ValueError(f"Round directory not found: {round_dir}")
 
         if idx is not None:
-            ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
+            ref_path = ref_dir / f"{reference_effective}-{idx:04d}.tif"
             if not ref_path.exists():
                 raise ValueError(f"Reference tile not found: {ref_path}")
             for round_name in rounds_to_fix:
@@ -2014,7 +2290,7 @@ def fix_shifts(
                     raise ValueError(f"Round tile not found: {round_path}")
             idxs = [idx]
         else:
-            ref_tiles = sorted(ref_dir.glob(f"{reference}-*.tif"))
+            ref_tiles = sorted(ref_dir.glob(f"{reference_effective}-*.tif"))
             if not ref_tiles:
                 raise ValueError(f"No tiles found in reference directory: {ref_dir}")
             idxs = [int(p.stem.split("-")[1]) for p in ref_tiles]
@@ -2028,13 +2304,13 @@ def fix_shifts(
             fids: dict[str, np.ndarray] = {}
             use_raw = fiducial_cfg.use_fft or fiducial_cfg.use_itk
 
-            ref_path = ref_dir / f"{reference}-{idx:04d}.tif"
-            ref_img = Image.from_file(ref_path, n_fids=n_fids)
-            fids[reference] = ref_img.fid_raw.astype(np.float32) if use_raw else ref_img.fid
+            ref_path = ref_dir / f"{reference_effective}-{idx:04d}.tif"
+            ref_img = Image.from_file(ref_path, n_fids=fiducial_cfg.n_fids)
+            fids[reference_effective] = ref_img.fid_raw.astype(np.float32) if use_raw else ref_img.fid
 
             fid_raw_images: dict[str, np.ndarray] | None = None
             if debug:
-                fid_raw_images = {reference: ref_img.fid_raw.astype(np.float32)}
+                fid_raw_images = {reference_effective: ref_img.fid_raw.astype(np.float32)}
 
             for round_name in rounds_to_fix:
                 round_dir = path / f"{round_name}--{roi}"
@@ -2042,7 +2318,7 @@ def fix_shifts(
                 if not target_path.exists():
                     logger.warning(f"Target tile not found: {target_path}, skipping")
                     continue
-                target_img = Image.from_file(target_path, n_fids=n_fids)
+                target_img = Image.from_file(target_path, n_fids=fiducial_cfg.n_fids)
                 fid = target_img.fid_raw.astype(np.float32) if use_raw else target_img.fid
                 fids[round_name] = fid
                 if fid_raw_images is not None:
@@ -2058,7 +2334,7 @@ def fix_shifts(
 
             shifts, residuals, _ = align_fiducials_with_stats(
                 fids,
-                reference=reference,
+                reference=reference_effective,
                 debug=debug,
                 max_iters=5,
                 threshold_sigma=fiducial_cfg.threshold,
@@ -2098,8 +2374,8 @@ def fix_shifts(
 
         existing_tiles: dict[str, Any] = {}
         existing_priors: dict[str, Any] | None = None
-        output_reference = reference
-        output_use_fft = use_fft
+        output_reference = reference_effective
+        output_use_fft = fiducial_cfg.use_fft
         if output_path.exists():
             try:
                 existing_data = json_module.loads(output_path.read_text())
@@ -2111,17 +2387,17 @@ def fix_shifts(
                 raise click.ClickException(
                     f"Existing coarse shifts JSON must be an object: {output_path}"
                 )
-            if "reference" in existing_data and existing_data["reference"] != reference:
+            if "reference" in existing_data and existing_data["reference"] != reference_effective:
                 logger.warning(
                     "Existing coarse shifts reference "
-                    f"'{existing_data['reference']}' does not match '{reference}'. "
+                    f"'{existing_data['reference']}' does not match '{reference_effective}'. "
                     "Keeping the existing reference to avoid clobbering metadata."
                 )
                 output_reference = existing_data["reference"]
-            if "use_fft" in existing_data and existing_data["use_fft"] != use_fft:
+            if "use_fft" in existing_data and existing_data["use_fft"] != fiducial_cfg.use_fft:
                 logger.warning(
                     "Existing coarse shifts use_fft "
-                    f"{existing_data['use_fft']} does not match {use_fft}. "
+                    f"{existing_data['use_fft']} does not match {fiducial_cfg.use_fft}. "
                     "Keeping the existing use_fft to avoid clobbering metadata."
                 )
                 output_use_fft = existing_data["use_fft"]
