@@ -20,6 +20,7 @@ DEFAULT_REGIONPROPS: Final[tuple[str, ...]] = (
     "centroid",
     "bbox",
     "mean_intensity",
+    "intensity_std",
     "max_intensity",
     "min_intensity",
 )
@@ -89,7 +90,18 @@ def compute_regionprops_table(
 ) -> pl.DataFrame:
     """Compute a Polars DataFrame of region properties for a single slice."""
 
-    props_table = regionprops_table(seg_mask, intensity_image=intensity_image, properties=properties)
+    def median_intensity(mask: np.ndarray, intensity: np.ndarray) -> float:
+        values = intensity[mask]
+        if values.size == 0:
+            return float("nan")
+        return float(np.median(values))
+
+    props_table = regionprops_table(
+        seg_mask,
+        intensity_image=intensity_image,
+        properties=properties,
+        extra_properties=[median_intensity] if intensity_image is not None else None,
+    )
     df = pl.DataFrame(props_table)
     if "label" in df.columns:
         df = df.with_columns(pl.col("label").cast(pl.UInt32))

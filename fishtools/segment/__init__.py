@@ -263,12 +263,6 @@ def trt_build_cmd(model: Path, batch_size: int, backend: str, opset: int) -> Non
     help="Decoded spots codebook labels to include in the export (repeatable).",
 )
 @click.option(
-    "--base-segmentation-name",
-    default="output_segmentation-sam.zarr",
-    show_default=True,
-    help="Base (pre-postproc) segmentation zarr name to export.",
-)
-@click.option(
     "--segmentation-name",
     default="output_segmentation-sam_postproc_s1-2-2_v500.zarr",
     show_default=True,
@@ -298,7 +292,6 @@ def export_command(
     roi: str | None,
     seg_codebook: str,
     codebooks: tuple[str, ...],
-    base_segmentation_name: str,
     segmentation_name: str,
     channels: str,
     thumbnail_scale: float,
@@ -310,47 +303,27 @@ def export_command(
     from fishtools.segment.export import export_cmd as segment_export_cmd
 
     ws = Workspace(path)
-    import shlex
-    import subprocess
-
-    roi_for_thumbnails = roi if roi is not None else "*"
-    thumb_cmd = ["segment", "thumbnail", str(ws.path)]
-    if roi is not None:
-        thumb_cmd.append(roi)
-    thumb_cmd.extend(["--codebook", seg_codebook])
-    try:
-        subprocess.run(thumb_cmd, check=True)
-    except subprocess.CalledProcessError as exc:
-        cmd_str = " ".join(shlex.quote(part) for part in thumb_cmd)
-        raise click.ClickException(
-            f"Thumbnail generation failed (exit code {exc.returncode}). Command: {cmd_str}"
-        ) from exc
+    roi_label = roi if roi is not None else "*"
 
     rois_to_check = [roi] if roi else ws.rois
-    existing_segmentation_names: list[str] = []
-    for candidate in (base_segmentation_name, segmentation_name):
-        if candidate in existing_segmentation_names:
-            continue
-        if any((ws.stitch(r, seg_codebook) / candidate).exists() for r in rois_to_check):
-            existing_segmentation_names.append(candidate)
-
-    if not existing_segmentation_names:
+    if any((ws.stitch(r, seg_codebook) / segmentation_name).exists() for r in rois_to_check):
+        seg_name = segmentation_name
+    else:
         raise click.ClickException(
-            f"No segmentation outputs found for roi={roi_for_thumbnails!r}, seg_codebook={seg_codebook!r}. "
-            f"Checked: {base_segmentation_name!r}, {segmentation_name!r}"
+            f"No segmentation outputs found for roi={roi_label!r}, seg_codebook={seg_codebook!r}. "
+            f"Checked: {segmentation_name!r}"
         )
 
-    for seg_name in existing_segmentation_names:
-        segment_export_cmd(
-            path=path,
-            roi=roi,
-            seg_codebook=seg_codebook,
-            codebooks=codebooks,
-            segmentation_name=seg_name,
-            channels=channels,
-            thumbnail_scale=thumbnail_scale,
-            diag=debug,
-        )
+    segment_export_cmd(
+        path=path,
+        roi=roi,
+        seg_codebook=seg_codebook,
+        codebooks=codebooks,
+        segmentation_name=seg_name,
+        channels=channels,
+        thumbnail_scale=thumbnail_scale,
+        diag=debug,
+    )
 
 
 def _parse_xyz_triple(name: str, val: str) -> tuple[float, float, float]:
@@ -1397,7 +1370,6 @@ def extract_single_command(
     show_default=True,
     help="Boundary RGB triplet like '0,255,0' (only used when --seg-codebook is set).",
 )
-@click.option("--overwrite", is_flag=True, default=False, help="Overwrite existing thumbnails.")
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def thumbnail_command(
     path: Path,
@@ -1413,7 +1385,6 @@ def thumbnail_command(
     codebook: str,
     include_n4: bool,
     boundary_color: str,
-    overwrite: bool,
 ) -> None:
     """Generate RGB PNG thumbnails from stitched fused.zarr volumes."""
     import numpy as np
@@ -1470,15 +1441,6 @@ def thumbnail_command(
         if not mask_path.exists():
             raise click.ClickException(f"ROI '{roi}': segmentation zarr not found at {mask_path}")
 
-    if (
-        not overwrite
-        and channels_spec is None
-        and seg_codebook is None
-        and thumbnail_dir.exists()
-        and any(thumbnail_dir.iterdir())
-    ):
-        raise click.ClickException(f"Refusing to write into non-empty output directory {thumbnail_dir}; pass --overwrite.")
-
     try:
         pose = _try_read_thumbnail_pose(ws, roi, LandmarkRegistrationOutputs=LandmarkRegistrationOutputs)
     except (OSError, ValueError) as exc:
@@ -1502,7 +1464,7 @@ def thumbnail_command(
         zs, _, _, cs = z_array.shape
         channel_names = _read_channel_names_from_zarr_array(z_array)
         selected_channels = _resolve_thumbnail_channels(
-            channels_spec=channels_spec, channel_names=channel_names, channel_count=int(cs)
+            channels_spec=channels_spec, channel_names=channel_names, channmel_count=int(cs)
         )
         preview_c = len(selected_channels)
         if preview_c <= 0:
@@ -1623,21 +1585,14 @@ def thumbnail_command(
                 thumbnail_path = thumbnail_dir / f"{stem}_z{i:03d}.png"
                 overlay_path = thumbnail_dir / f"{stem}_mask_z{i:03d}.png"
 
-                need_thumbnail = overwrite or not thumbnail_path.exists()
-                need_overlay = mask_arr is not None and (overwrite or not overlay_path.exists())
-                if not (need_thumbnail or need_overlay):
-                    progress()
-                    continue
-
                 thumbnail_data = z_array[i, :, :, selected_channels]
                 base_raw = thumbnail_rgb(thumbnail_data, options=thumb_options, lowhigh=lowhigh)
 
-                if need_thumbnail:
-                    base = _apply_thumbnail_pose(base_raw, pose=pose, ndimage_rotate=ndimage_rotate) if pose else base_raw
-                    Image.fromarray(base, mode="RGB").save(thumbnail_path)
-                    logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
+                base = _apply_thumbnail_pose(base_raw, pose=pose, ndimage_rotate=ndimage_rotate) if pose else base_raw
+                Image.fromarray(base, mode="RGB").save(thumbnail_path)
+                logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
 
-                if need_overlay:
+                if mask_arr is not None:
                     mask_slice = np.asarray(mask_arr[i, :: thumb_options.xy_downsample, :: thumb_options.xy_downsample])
                     boundaries = find_boundaries(mask_slice, mode="outer")
                     overlay_raw = base_raw.copy()
@@ -1650,6 +1605,9 @@ def thumbnail_command(
                 progress()
 
     _process_zarr(zarr_path=stitched_dir / "fused.zarr", prefix="thumbnail")
+    highpass_path = stitched_dir / "fused_highpassed.zarr"
+    if highpass_path.exists():
+        _process_zarr(zarr_path=highpass_path, prefix="thumbnail_highpass")
     if include_n4:
         _process_zarr(zarr_path=stitched_dir / "fused_n4.zarr", prefix="thumbnail_n4")
 

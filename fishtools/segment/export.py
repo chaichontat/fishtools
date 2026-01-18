@@ -92,6 +92,19 @@ def _pl_weighted_mean(value_col: str, weight_col: str) -> pl.Expr:
     return (values * weights).sum().truediv(weights.sum()).fill_nan(None)
 
 
+def _pl_weighted_pooled_std(mean_col: str, std_col: str, weight_col: str) -> pl.Expr:
+    means = pl.col(mean_col)
+    stds = pl.col(std_col)
+    weights = pl.when(means.is_not_null() & stds.is_not_null()).then(pl.col(weight_col)).otherwise(None)
+    w_sum = weights.sum()
+
+    mu = pl.when(w_sum > 0).then((means * weights).sum().truediv(w_sum)).otherwise(None)
+    m2 = pl.when(w_sum > 0).then(((stds**2 + means**2) * weights).sum().truediv(w_sum)).otherwise(None)
+    var = m2 - mu**2
+    var = pl.when(var.is_not_null() & (var < 0)).then(0.0).otherwise(var)
+    return var.sqrt().fill_nan(None)
+
+
 def _gene_name_from_target(target: str) -> str:
     base, sep, _ = target.rpartition("-")
     return base if sep else target
@@ -259,24 +272,41 @@ def _load_intensity_shards(
         if not any(channel_dir.glob("intensity-*.parquet")):
             logger.warning(f"ROI={roi} channel={channel}: no intensity shards under {channel_dir}")
             continue
+        scan = pl.scan_parquet(glob_path, include_file_paths="path", missing_columns="insert")
+        has_std = "intensity_std" in scan.collect_schema()
+        has_median = "median_intensity" in scan.collect_schema()
+
+        cols = ["z", "roi", "label", "mean_intensity", "max_intensity", "min_intensity"]
+        if has_std:
+            cols.append("intensity_std")
+        if has_median:
+            cols.append("median_intensity")
+
+        rename_map = {
+            "mean_intensity": f"{channel}_mean",
+            "max_intensity": f"{channel}_max",
+            "min_intensity": f"{channel}_min",
+        }
+        if has_std:
+            rename_map["intensity_std"] = f"{channel}_std"
+        if has_median:
+            rename_map["median_intensity"] = f"{channel}_median"
+
         intensity_df = (
-            pl.scan_parquet(glob_path, include_file_paths="path", missing_columns="insert")
-            .with_columns(
+            scan.with_columns(
                 z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt16),
                 roi=pl.lit(roi),
                 label=pl.col("label").cast(pl.UInt32),
             )
-            .select(["z", "roi", "label", "mean_intensity", "max_intensity", "min_intensity"])
+            .select(cols)
             .collect()
-            .rename({
-                "mean_intensity": f"{channel}_mean",
-                "max_intensity": f"{channel}_max",
-                "min_intensity": f"{channel}_min",
-            })
+            .rename(rename_map)
             .with_columns(
                 pl.col(f"{channel}_mean").cast(pl.Float32),
                 pl.col(f"{channel}_max").cast(pl.Float32),
                 pl.col(f"{channel}_min").cast(pl.Float32),
+                *( [pl.col(f"{channel}_std").cast(pl.Float32)] if has_std else [] ),
+                *( [pl.col(f"{channel}_median").cast(pl.Float32)] if has_median else [] ),
             )
         )
         if not intensity_df.is_empty():
@@ -388,6 +418,13 @@ def _build_cells_dataframe(
     intensities: dict[_IntensityKey, pl.DataFrame],
     channel_list: Iterable[str],
 ) -> pl.DataFrame:
+    channels_with_std = {
+        key.channel for key, df in intensities.items() if f"{key.channel}_std" in df.columns
+    }
+    channels_with_median = {
+        key.channel for key, df in intensities.items() if f"{key.channel}_median" in df.columns
+    }
+
     polygons: list[pl.DataFrame] = []
     for roi, poly in polygons_by_roi.items():
         joined = poly.with_columns(label=pl.col("label").cast(pl.UInt32))
@@ -395,17 +432,46 @@ def _build_cells_dataframe(
             key = _IntensityKey(roi=roi, channel=channel)
             if key in intensities:
                 joined = joined.join(intensities[key], on=["z", "roi", "label"], how="left")
+                if channel in channels_with_std and f"{channel}_std" not in joined.columns:
+                    joined = joined.with_columns(pl.lit(None, dtype=pl.Float32).alias(f"{channel}_std"))
+                if channel in channels_with_median and f"{channel}_median" not in joined.columns:
+                    joined = joined.with_columns(
+                        pl.lit(None, dtype=pl.Float32).alias(f"{channel}_median")
+                    )
             else:
-                joined = joined.with_columns(
+                exprs: list[pl.Expr] = [
                     pl.lit(None, dtype=pl.Float32).alias(f"{channel}_mean"),
                     pl.lit(None, dtype=pl.Float32).alias(f"{channel}_max"),
                     pl.lit(None, dtype=pl.Float32).alias(f"{channel}_min"),
-                )
+                ]
+                if channel in channels_with_std:
+                    exprs.append(pl.lit(None, dtype=pl.Float32).alias(f"{channel}_std"))
+                if channel in channels_with_median:
+                    exprs.append(pl.lit(None, dtype=pl.Float32).alias(f"{channel}_median"))
+                joined = joined.with_columns(*exprs)
         polygons.append(joined)
     if not polygons:
         raise ValueError("Failed to assemble polygons with intensities; no data available.")
 
     polygons_df = pl.concat(polygons)
+    weighted_medians: list[pl.DataFrame] = []
+    for channel in channel_list:
+        if channel not in channels_with_median:
+            continue
+        col = f"{channel}_median"
+        weighted_medians.append(
+            polygons_df.select("roilabel", "area", col)
+            .drop_nulls(subset=[col])
+            .sort(["roilabel", col])
+            .with_columns(
+                _cum_area=pl.col("area").cum_sum().over("roilabel"),
+                _total_area=pl.col("area").sum().over("roilabel"),
+            )
+            .filter(pl.col("_cum_area") >= pl.col("_total_area") / 2)
+            .group_by("roilabel")
+            .agg(pl.col(col).first().cast(pl.Float32).alias(col))
+        )
+
     agg: dict[str, pl.Expr] = dict(
         area=pl.col("area").sum().cast(pl.Float32),
         x=((pl.col("centroid_x") * pl.col("area")).sum() / pl.col("area").sum()).cast(pl.Float32),
@@ -419,8 +485,15 @@ def _build_cells_dataframe(
             f"{channel}_max": pl.col(f"{channel}_max").max().cast(pl.Float32),
             f"{channel}_min": pl.col(f"{channel}_min").min().cast(pl.Float32),
         })
+        if channel in channels_with_std:
+            agg[f"{channel}_std"] = _pl_weighted_pooled_std(
+                f"{channel}_mean", f"{channel}_std", "area"
+            ).cast(pl.Float32)
 
-    return polygons_df.group_by(pl.col("roilabel")).agg(**agg).sort("roilabel")
+    cells = polygons_df.group_by(pl.col("roilabel")).agg(**agg)
+    for median_df in weighted_medians:
+        cells = cells.join(median_df, on="roilabel", how="left")
+    return cells.sort("roilabel")
 
 
 def _write_cells_parquet(cells: pl.DataFrame, target_path: Path) -> Path:
@@ -670,7 +743,9 @@ def _apply_roiset_annotations(
     thumbnail_dir = ws.output / "thumbnails" / f"{roi}+{seg_codebook}"
     roi_path = thumbnail_dir / "RoiSet.zip"
     if not roi_path.exists():
-        logger.warning(f"Skipping ROI {roi}: RoiSet.zip not found at {roi_path}")
+        logger.warning(
+            f"ROI {roi}: RoiSet.zip not found at {roi_path}; skipping RoiSet-based annotations (subroi/spatial)."
+        )
         return
 
     line, polygons = _load_roiset_line_and_polygons(roi_path, scale=scale)
@@ -679,7 +754,7 @@ def _apply_roiset_annotations(
 
     roi_mask = adata.obs["roi"] == roi
     if not roi_mask.any():
-        logger.warning(f"Skipping ROI {roi}: no cells found in export.")
+        logger.warning(f"ROI {roi}: no cells found in export; skipping RoiSet-based annotations.")
         return
 
     coords = adata.obs.loc[roi_mask, ["x", "y"]].to_numpy(dtype=np.float64)
@@ -690,7 +765,7 @@ def _apply_roiset_annotations(
         adata.obs.loc[roi_mask, "subroi"] = ""
 
     if line is None:
-        logger.warning(f"Skipping ROI {roi}: no line ROI found in {roi_path}")
+        logger.warning(f"ROI {roi}: no line ROI found in {roi_path}; skipping RoiSet-based spatial rotation.")
         return
 
     dx = line.p1_xy[0] - line.p0_xy[0]
