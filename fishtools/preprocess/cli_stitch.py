@@ -69,9 +69,14 @@ def _label_for_max_from(path: Path | None) -> str | None:
 
 
 def create_tile_config(
-    path: Path, df: pd.DataFrame, *, name: str = "TileConfiguration.txt", pixel: int = 1024
+    path: Path,
+    df: pd.DataFrame,
+    *,
+    name: str = "TileConfiguration.txt",
+    pixel: int = 1024,
+    pixel_size_um: float = 0.108,
 ) -> None:
-    TileConfiguration.from_pos(df).write(path / name)
+    TileConfiguration.from_pos(df, pixel_size_um=pixel_size_um).write(path / name)
 
 
 def run_imagej(
@@ -320,8 +325,12 @@ def register(
         file=f"stitch-register-{roi}",
         extra={"roi": roi, "codebook": codebook, "debug": debug},
     )
-    sc = load_config(json_config).stitching if json_config else None
     ws = Workspace(path)
+    if json_config is None:
+        json_config = ws.config_json()
+    cfg = load_config(json_config) if json_config else None
+    sc = cfg.stitching if cfg else None
+    pixel_size_um = cfg.pixel_size_um if cfg else 0.108
     out_path = ws.tileconfig_dir(roi)
     tileconfig_registered = ws.tileconfig_registered_txt(roi)
     if tileconfig_registered.exists() and not overwrite:
@@ -411,7 +420,8 @@ def register(
             pd.read_csv(
                 ws.tile_positions_csv(roi, position_file=position_file),
                 header=None,
-            ).iloc[sorted(files_idx)]
+            ).iloc[sorted(files_idx)],
+            pixel_size_um=pixel_size_um,
         )
 
         # Connected components detection and optional filtering.
@@ -486,7 +496,7 @@ def register(
         ys = df["y"].to_numpy()
         labels = [str(int(i)) for i in df["index"].to_numpy()]
         place_labels_avoid_overlap(ax, xs, ys, labels, fontsize=6, use_arrows=True)
-        fmt = micron_tick_formatter(0.108)
+        fmt = micron_tick_formatter(pixel_size_um)
         ax.xaxis.set_major_formatter(fmt)
         ax.yaxis.set_major_formatter(fmt)
         ax.set_xlabel("X (µm)")
@@ -939,6 +949,8 @@ def fuse(
         raise ValueError("Either --codebook or --round-name must be provided.")
 
     ws = Workspace(path)
+    if json_config is None:
+        json_config = ws.config_json()
 
     shift_lookup: dict[int, tuple[float, float]] = {}
     coarse_round_name: str | None = None
@@ -1596,6 +1608,68 @@ def n4(
     click.echo(f"Correction field saved to {result.field_path}")
     if result.corrected_path is not None:
         click.echo(f"Corrected imagery saved to {result.corrected_path}")
+
+
+@stitch.command()
+@click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
+@click.argument("roi", type=str, default="*")
+@click.option("--codebook", type=str, required=True, help="Codebook used in the stitch directory name.")
+@click.option(
+    "--highpass-px",
+    type=float,
+    default=20.0,
+    show_default=True,
+    help="Gaussian high-pass sigma in XY pixels.",
+)
+@click.option(
+    "--anisotropy",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Z/XY voxel-size ratio used to set sigma_z = highpass_px / anisotropy.",
+)
+@click.option("--overwrite", is_flag=True, help="Overwrite existing outputs.")
+@batch_roi("stitch--*", include_codebook=True, split_codebook=True)
+def highpass(
+    path: Path,
+    roi: str,
+    codebook: str,
+    *,
+    highpass_px: float,
+    anisotropy: float,
+    overwrite: bool,
+) -> None:
+    """Write a high-pass filtered fused zarr as `fused_highpassed.zarr` (uint16)."""
+
+    setup_cli_logging(
+        path,
+        component="preprocess.stitch.highpass",
+        file=f"stitch-highpass-{roi}+{codebook}",
+        extra={"roi": roi, "codebook": codebook, "highpass_px": highpass_px, "anisotropy": anisotropy},
+    )
+
+    if anisotropy <= 0:
+        raise click.ClickException("--anisotropy must be > 0.")
+    if highpass_px <= 0:
+        raise click.ClickException("--highpass-px must be > 0.")
+
+    from fishtools.io.workspace import Workspace
+    from fishtools.preprocess.highpass import run_highpass_workflow
+
+    ws = Workspace(path)
+    stitch_root = ws.stitch(roi, codebook)
+
+    try:
+        out = run_highpass_workflow(
+            stitch_root=stitch_root,
+            sigma_px=highpass_px,
+            anisotropy=anisotropy,
+            overwrite=overwrite,
+        )
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Highpassed imagery saved to {out}")
 
 
 @stitch.command()

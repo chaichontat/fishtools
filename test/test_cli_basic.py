@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+from threading import Event, Lock, Thread
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -14,6 +16,7 @@ from fishtools.preprocess.cli_basic import (
     basic,
     extract_data_from_registered,
     extract_data_from_tiff,
+    fit_and_save_basic,
     run_with_extractor,
     sample_canonical_unique_tiles,
 )
@@ -570,6 +573,25 @@ class TestBasicCliOverwriteGuard:
         _, kwargs = mock_run.call_args
         assert kwargs["random_flip"] is True
 
+    def test_max_n_tiles_option_is_forwarded(self, tmp_path: Path, mocker: MockerFixture) -> None:
+        round_name = "dapi_b2_b4"
+
+        d = tmp_path / f"{round_name}--roiA"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{round_name}-0000.tif").touch()
+
+        mocker.patch("fishtools.preprocess.cli_basic.setup_cli_logging")
+        mocker.patch("fishtools.preprocess.cli_basic.get_channels", return_value=["560", "650"])
+        mock_run = mocker.patch("fishtools.preprocess.cli_basic.run_with_extractor", return_value=None)
+
+        runner = CliRunner()
+        res = runner.invoke(basic, ["run", str(tmp_path), round_name, "--max-n-tiles", "123"])
+        assert res.exit_code == 0, res.output
+
+        assert mock_run.called
+        _, kwargs = mock_run.call_args
+        assert kwargs["max_n_tiles"] == 123
+
     def test_complete_pkls_trigger_skip(self, tmp_path: Path, mocker: MockerFixture) -> None:
         round_name = "dapi_b2_b4"
 
@@ -675,6 +697,79 @@ def test_run_writes_sampling_json(tmp_path: Path, mocker: MockerFixture) -> None
     assert len(payload["sampled_tiles"]) == 48
 
 
+def test_run_with_extractor_respects_max_n_tiles(tmp_path: Path, mocker: MockerFixture) -> None:
+    # One ROI grid 12x10 → 48 interior indices
+    roi = "roiA"
+    round_name = "R3"
+    coords = []
+    for y in range(10):
+        for x in range(12):
+            coords.append((float(x), float(y)))
+    (tmp_path / f"{roi}.csv").write_text("\n".join(f"{y},{x}" for x, y in coords))
+
+    d = tmp_path / f"{round_name}--{roi}"
+    d.mkdir(parents=True, exist_ok=True)
+
+    def is_interior(i: int) -> bool:
+        y, x = divmod(i, 12)
+        return (x >= 2 and x <= 9) and (y >= 2 and y <= 7)
+
+    for idx in range(12 * 10):
+        p = d / f"{round_name}-{idx:04d}.tif"
+        if is_interior(idx):
+            p.write_bytes(b"1")
+        else:
+            p.touch()
+
+    mocker.patch("fishtools.preprocess.cli_basic.get_channels", return_value=["560", "650", "750"])
+    mocker.patch("fishtools.preprocess.cli_basic.fit_and_save_basic", return_value=[])
+    mocker.patch("numpy.loadtxt", return_value=None)
+    mocker.patch("random.sample", side_effect=lambda x, k: list(x)[:k])
+
+    captured: dict[str, int] = {}
+
+    def fake_extractor(
+        files, zs, deconv_meta=None, max_files=800, nc=None, *, random_flip=False, rng=None
+    ) -> np.ndarray:
+        captured["n_files"] = len(files)
+        captured["max_files"] = max_files
+        c = nc or 3
+        return np.zeros((len(files), c, IMG_HEIGHT, IMG_WIDTH), dtype=np.float32)
+
+    run_with_extractor(
+        tmp_path,
+        round_name,
+        fake_extractor,
+        plot=False,
+        zs=(0.5,),
+        max_n_tiles=10,
+    )
+
+    assert captured["n_files"] == 10
+    assert captured["max_files"] == 10
+
+    manifest = tmp_path / "basic" / f"{round_name}-sampling.json"
+    payload = json.loads(manifest.read_text())
+    assert payload["n_selected"] == 10
+    assert len(payload["sampled_tiles"]) == 10
+
+    run_with_extractor(
+        tmp_path,
+        round_name,
+        fake_extractor,
+        plot=False,
+        zs=(0.5,),
+        max_n_tiles=0,
+    )
+
+    assert captured["n_files"] == 48
+    assert captured["max_files"] == 48
+
+    payload = json.loads(manifest.read_text())
+    assert payload["n_selected"] == 48
+    assert len(payload["sampled_tiles"]) == 48
+
+
 def test_run_all_canonical_deduplicates_indices(tmp_path: Path, mocker: MockerFixture) -> None:
     # Workspace with one ROI and two canonical rounds; ensure 'all' sampling dedups indices across rounds
     roi = "roiA"
@@ -736,3 +831,57 @@ def test_run_all_canonical_deduplicates_indices(tmp_path: Path, mocker: MockerFi
         key = (roi_base, idx)
         assert key not in seen
         seen.add(key)
+
+
+def test_fit_and_save_basic_limits_parallelism(tmp_path: Path, mocker: MockerFixture) -> None:
+    state_lock = Lock()
+    active = 0
+    max_active = 0
+    two_active = Event()
+    release = Event()
+
+    def fake_fit_basic(_imgs: np.ndarray, _c: int) -> object:
+        nonlocal active, max_active
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active >= 2:
+                two_active.set()
+
+        # Block so multiple tasks can overlap and we can measure concurrency.
+        assert release.wait(timeout=2.0)
+
+        with state_lock:
+            active -= 1
+        return object()
+
+    mocker.patch("fishtools.preprocess.cli_basic.fit_basic", side_effect=fake_fit_basic)
+    mocker.patch("fishtools.preprocess.cli_basic.plot_basic")
+    mocker.patch("fishtools.preprocess.cli_basic.pickle.dump")
+    mocker.patch("fishtools.preprocess.cli_basic.plt.savefig")
+    mocker.patch("fishtools.preprocess.cli_basic.plt.close")
+
+    data = np.zeros((2, 3, 8, 8), dtype=np.float32)
+    result: dict[str, object] = {}
+
+    def run() -> None:
+        result["basics"] = fit_and_save_basic(
+            data,
+            tmp_path / "basic",
+            "R1",
+            ["560", "650", "750"],
+            plot=False,
+            overwrite=True,
+            threads=2,
+        )
+
+    t = Thread(target=run)
+    t.start()
+
+    assert two_active.wait(timeout=2.0)
+    release.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+    assert "basics" in result
+    assert max_active == 2

@@ -422,7 +422,7 @@ def test_cli_register_run_config_overridden_by_cli(tmp_path: Path, monkeypatch: 
     assert pytest.approx(cfg.registration.fiducial.threshold, rel=0, abs=1e-6) == 1.25
 
 
-def test_cli_register_run_requires_config(tmp_path: Path) -> None:
+def test_cli_register_run_requires_config_when_no_default_found(tmp_path: Path) -> None:
     _root, deconv = _make_workspace(tmp_path)
     cb = _make_codebook(tmp_path)
 
@@ -442,7 +442,7 @@ def test_cli_register_run_requires_config(tmp_path: Path) -> None:
     )
 
     assert result.exit_code != 0
-    assert "Missing option '--config'" in result.output
+    assert "No config.json found." in result.output
 
 
 def test_cli_register_copies_used_chromatic_corrections_to_output(tmp_path: Path, monkeypatch: Any) -> None:

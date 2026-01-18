@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
+from click.core import ParameterSource
 import matplotlib as mpl
 
 # Force a non-interactive backend to avoid GUI/event-loop hangs in headless runs
@@ -18,6 +19,7 @@ from fishtools.plot.diagnostics.stitch import (
     make_combined_stitch_layout,
     make_roi_stitch_layout,
 )
+from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.tileconfig import TileConfiguration
 from fishtools.utils.logging import setup_cli_logging
 from fishtools.utils.plot import scatter_spots
@@ -49,11 +51,11 @@ def _load_spots_final(ws: Workspace, rois: list[str], codebook: str) -> dict[str
 
         schema = pl.scan_parquet(parquet_path).collect_schema()
         if "y" in schema and "x" in schema:
-            x_col = "y"
-            y_col = "x"
+            x_col = "x"
+            y_col = "y"
         elif "y_" in schema and "x_" in schema:
-            x_col = "y_"
-            y_col = "x_"
+            x_col = "x_"
+            y_col = "y_"
         else:
             raise click.ClickException(
                 f"Spots parquet {parquet_path} for ROI '{roi}' is missing required coordinates (x/y or x_/y_)."
@@ -97,6 +99,16 @@ def _load_spots_final(ws: Workspace, rois: list[str], codebook: str) -> dict[str
 )
 @click.option("--cols", type=int, default=None, help="Grid columns; default sqrt(#ROIs)")
 @click.option(
+    "--config",
+    "json_config",
+    type=click.Path(exists=True, dir_okay=False, file_okay=True, readable=True, resolve_path=True, path_type=Path),
+    default=None,
+    help=(
+        "Project config JSON; derives pixel size and tile size from config. "
+        "Defaults to <workspace>/analysis/deconv/config.json then <workspace>/config.json when present."
+    ),
+)
+@click.option(
     "--pixel-size-um",
     type=float,
     default=0.108,
@@ -135,6 +147,7 @@ def check_stitch(
     rois: list[str] | None,
     output_dir: Path | None,
     cols: int | None,
+    json_config: Path | None,
     pixel_size_um: float,
     per_roi: bool,
     label_skip: int,
@@ -148,12 +161,39 @@ def check_stitch(
     """
 
     setup_cli_logging(path, component="preprocess.check_stitch", file="check-stitch", extra={})
-    logger.info(
-        f"check-stitch: path={path}, rois={rois or 'ALL'}, cols={cols}, pixel_size_um={pixel_size_um}, "
-        f"per_roi={per_roi}, label_skip={label_skip}, tile_size_px={tile_size_px}, spots={spots_codebook}"
-    )
 
     ws = Workspace(path)
+    ctx = click.get_current_context()
+    explicit_config = ctx.get_parameter_source("json_config") == ParameterSource.COMMANDLINE
+    if json_config is None:
+        json_config = ws.config_json()
+
+    if json_config is not None:
+        if explicit_config:
+            if ctx.get_parameter_source("pixel_size_um") == ParameterSource.COMMANDLINE:
+                raise click.ClickException(
+                    "--pixel-size-um cannot be used with --config; set pixel_size_um in config."
+                )
+            if ctx.get_parameter_source("tile_size_px") == ParameterSource.COMMANDLINE:
+                raise click.ClickException(
+                    "--tile-size-px cannot be used with --config; tile size is derived as image_size - 2*crop."
+                )
+
+        cfg = load_config(json_config)
+        if explicit_config or ctx.get_parameter_source("pixel_size_um") != ParameterSource.COMMANDLINE:
+            pixel_size_um = cfg.pixel_size_um
+        if explicit_config or ctx.get_parameter_source("tile_size_px") != ParameterSource.COMMANDLINE:
+            tile_size_px = cfg.image_size - 2 * cfg.registration.crop
+            if tile_size_px <= 0:
+                raise click.ClickException(
+                    f"Derived tile_size_px={tile_size_px} from image_size={cfg.image_size} and crop={cfg.registration.crop}."
+                )
+
+    logger.info(
+        f"check-stitch: path={path}, rois={rois or 'ALL'}, cols={cols}, config={json_config}, "
+        f"pixel_size_um={pixel_size_um}, "
+        f"per_roi={per_roi}, label_skip={label_skip}, tile_size_px={tile_size_px}, spots={spots_codebook}"
+    )
     roi_list = ws.resolve_rois(rois)
     if not roi_list:
         raise click.ClickException("No ROIs found.")
