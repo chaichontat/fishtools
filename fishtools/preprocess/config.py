@@ -417,11 +417,6 @@ class SystemConfig(BaseModel):
 class ImageProcessingConfig(BaseModel):
     """Low-level image processing parameters."""
 
-    image_size: int = Field(default=2048, description="Standard image size in pixels")
-    pixel_size_um: float = Field(
-        default=0.108,
-        description="Pixel size in micrometers for plotting/scale bars (used by spotlook and figures)",
-    )
     log_sigma: float = Field(default=3.0, description="Sigma parameter for Laplacian of Gaussian filtering")
     percentiles: list[float] = Field(
         default=[1.0, 99.99],
@@ -450,6 +445,12 @@ class Config(BaseModel):
 
     dataPath: str | None = None
     exclude: list[str] | None = Field(None, description="Exclude rounds with these prefixes.")
+    image_size: int = Field(default=2048, gt=0, description="Standard image size in pixels")
+    pixel_size_um: float = Field(
+        default=0.108,
+        gt=0,
+        description="Physical pixel size in micrometers (µm/px). Used for stitching coordinate scaling and plotting.",
+    )
     system: SystemConfig | None = Field(
         default_factory=SystemConfig,
         description="System paths and infrastructure configuration",

@@ -85,6 +85,8 @@ def generate_config_template(output_path: Path) -> None:
     """Generate a JSON configuration file with minimal required defaults."""
     config_dict = {
         "dataPath": "/path/to/your/data",
+        "image_size": 2048,
+        "pixel_size_um": 0.108,
         "registration": {
             "reference": "4_12_20",
             "crop": 40,

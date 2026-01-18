@@ -745,6 +745,23 @@ class Workspace:
 
         return self.deconved / "chromatic"
 
+    def config_json(self) -> Path | None:
+        """Return the preferred project ``config.json`` if present.
+
+        Precedence:
+        1) ``<workspace>/analysis/deconv/config.json``
+        2) ``<workspace>/config.json``
+        """
+
+        candidates = [
+            self.deconved / "config.json",
+            self.path / "config.json",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
     def deconv_round_dir(self, round_name: str, roi: str) -> Path:
         """Return path to a deconvolved round/ROI directory under analysis/deconv."""
 
