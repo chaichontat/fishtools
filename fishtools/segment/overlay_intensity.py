@@ -8,6 +8,7 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import rich_click as click
 import zarr
 from loguru import logger
@@ -23,12 +24,34 @@ from fishtools.segment.utils import (
 )
 
 
+def _erode_labels_2d(seg_mask: np.ndarray, *, erode_px: int) -> np.ndarray:
+    if erode_px <= 0:
+        return seg_mask
+
+    from scipy.ndimage import distance_transform_edt
+    from skimage.segmentation import find_boundaries
+
+    if seg_mask.ndim != 2:
+        raise ValueError(f"--erode only supports 2D masks; got shape={seg_mask.shape}")
+
+    background = seg_mask == 0
+    boundaries = find_boundaries(seg_mask, mode="inner")
+    inside = ~(background | boundaries)
+    if not np.any(inside):
+        return np.zeros_like(seg_mask)
+
+    dist = distance_transform_edt(inside)
+    keep = dist > float(erode_px)
+    return np.where(keep, seg_mask, 0)
+
+
 def _process_slice_shared_detection(
     idx: int,
     segmentation_zarr_path: Path,
     intensity_zarr_path: Path,
     channel: str,
     output_dir: Path,
+    erode: int,
     overwrite: bool = False,
 ) -> None:
     """Compute per-label intensity statistics for a single slice."""
@@ -44,6 +67,8 @@ def _process_slice_shared_detection(
 
     # Load segmentation slice using the same helper as spots overlay
     seg_mask = load_segmentation_slice(segmentation_zarr_path, idx)
+    if erode:
+        seg_mask = _erode_labels_2d(seg_mask, erode_px=int(erode))
 
     if seg_mask.shape != intensity_img.shape:
         raise ValueError(
@@ -81,9 +106,10 @@ def _run_overlay_for_roi(
     seg_codebook: str,
     intensity_codebook: str,
     segmentation_name: str,
-    intensity_store: str,
+    fused_name: str,
     channel: str | None,
     threads: int,
+    erode: int,
     overwrite: bool,
 ) -> None:
     stitch_paths = StitchPaths.from_workspace(workspace, roi, seg_codebook)
@@ -92,7 +118,7 @@ def _run_overlay_for_roi(
         raise FileNotFoundError(f"ROI '{roi}': segmentation Zarr not found at {segmentation_zarr_path}")
 
     intensity_zarr_path = resolve_intensity_store(
-        stitch_paths, intensity_codebook, store_name=intensity_store
+        stitch_paths, intensity_codebook, store_name=fused_name
     )
 
     try:
@@ -141,6 +167,7 @@ def _run_overlay_for_roi(
                 intensity_zarr_path,
                 ch,
                 output_dir,
+                erode,
                 overwrite,
             )
             futures[fut] = (ch, idx)
@@ -191,11 +218,18 @@ def _run_overlay_for_roi(
     help="Relative path to the segmentation Zarr within the stitched ROI directory.",
 )
 @click.option(
-    "--intensity-store",
+    "--fused-name",
     type=str,
     default="fused.zarr",
     show_default=True,
-    help="Filename of the intensity Zarr inside stitch--ROI+<codebook>.",
+    help="Filename of the intensity Zarr inside stitch--ROI+<codebook> (e.g., fused.zarr, fused_n4.zarr, fused_highpassed.zarr).",
+)
+@click.option(
+    "--erode",
+    type=click.IntRange(min=0),
+    default=2,
+    show_default=True,
+    help="Erode segmentation labels by N pixels before measuring intensity (2D only; set 0 to disable).",
 )
 @click.option(
     "--channel",
@@ -216,7 +250,8 @@ def overlay_intensity(
     seg_codebook: str,
     intensity_codebook: str,
     segmentation_name: str,
-    intensity_store: str,
+    fused_name: str,
+    erode: int,
     channel: str | None,
     threads: int,
     overwrite: bool,
@@ -244,9 +279,10 @@ def overlay_intensity(
                 seg_codebook,
                 intensity_codebook,
                 segmentation_name,
-                intensity_store,
+                fused_name,
                 channel,
                 threads,
+                erode,
                 overwrite,
             )
         except Exception as exc:

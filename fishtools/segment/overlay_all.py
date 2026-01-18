@@ -52,11 +52,11 @@ from fishtools.segment.utils import StitchPaths, resolve_intensity_store
     help="Relative path to the segmentation Zarr store within the input directory.",
 )
 @click.option(
-    "--intensity-store",
+    "--fused-name",
     type=str,
     default="fused.zarr",
     show_default=True,
-    help="Filename of the intensity Zarr inside stitch--ROI+<codebook>.",
+    help="Filename of the intensity Zarr inside stitch--ROI+<codebook> (e.g., fused.zarr, fused_n4.zarr, fused_highpassed.zarr).",
 )
 @click.option(
     "--channel",
@@ -69,6 +69,13 @@ from fishtools.segment.utils import StitchPaths, resolve_intensity_store
     default=12,
     show_default=True,
     help="Number of parallel worker processes to use per ROI.",
+)
+@click.option(
+    "--erode",
+    type=click.IntRange(min=0),
+    default=2,
+    show_default=True,
+    help="Erode segmentation labels by N pixels before measuring intensity (2D only; set 0 to disable).",
 )
 @click.option(
     "--export",
@@ -87,9 +94,10 @@ def overlay_all(
     intensity_codebook: str,
     spots_opt: Path | None,
     segmentation_name: str,
-    intensity_store: str,
+    fused_name: str,
     channel: str | None,
     threads: int,
+    erode: int,
     export_opt: bool,
     overwrite: bool,
     debug: bool,
@@ -142,7 +150,7 @@ def overlay_all(
             raise
 
         try:
-            resolve_intensity_store(stitch, intensity_codebook, store_name=intensity_store)
+            resolve_intensity_store(stitch, intensity_codebook, store_name=fused_name)
         except FileNotFoundError as exc:
             if batch_mode:
                 click.echo(f"Skipping ROI '{current_roi}': {exc}", err=True)
@@ -156,7 +164,8 @@ def overlay_all(
                 seg_codebook=seg_cb,
                 intensity_codebook=intensity_codebook,
                 segmentation_name=segmentation_name,
-                intensity_store=intensity_store,
+                fused_name=fused_name,
+                erode=erode,
                 channel=channel,
                 threads=threads,
                 overwrite=overwrite,
