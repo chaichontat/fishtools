@@ -9,6 +9,7 @@ from typing import Callable, Literal, Sequence
 
 import numpy as np
 import rich_click as click
+from click.core import ParameterSource
 from loguru import logger
 
 from fishtools.io.workspace import Workspace, get_channels
@@ -294,6 +295,7 @@ def _collect_round_tiles(
     *,
     rois: Sequence[str] | None = None,
     ref_round: str | None = None,
+    max_idx: int | None = None,
 ) -> list[Path]:
     """Discover tiles for a round, optionally constrained by ROI and reference indices."""
 
@@ -332,10 +334,22 @@ def _collect_round_tiles(
             continue
         if roi_filter and roi_name not in roi_filter:
             continue
-        if ref_round is not None:
+        tile_idx: int | None = None
+        if ref_round is not None or max_idx is not None:
             tile_idx = _parse_tile_index(tile.stem)
+            if tile_idx is None:
+                if max_idx is not None:
+                    raise click.ClickException(
+                        f"--max-idx requires tile filenames to end with '-<digits>'; cannot parse index from '{tile.name}'."
+                    )
+                continue
+
+        if max_idx is not None and tile_idx is not None and tile_idx > max_idx:
+            continue
+
+        if ref_round is not None:
             allowed = ref_indices.get(roi_name)
-            if tile_idx is None or not allowed or tile_idx not in allowed:
+            if not allowed or tile_idx not in allowed:
                 continue
         tiles.append(tile)
 
@@ -640,6 +654,7 @@ def _plan_and_execute(
     ref_round: str | None,
     limit: int | None,
     limit_scope: Literal["total", "per_roi"],
+    max_idx: int | None,
     basic_name: str | None,
     n_fids: int,
     histogram_bins: int,
@@ -682,7 +697,13 @@ def _plan_and_execute(
         files_to_process: list[Path] = []
         total_assigned = 0
         for roi in scope_rois:
-            roi_files = _collect_round_tiles(path, round_token, rois=[roi], ref_round=ref_round)
+            roi_files = _collect_round_tiles(
+                path,
+                round_token,
+                rois=[roi],
+                ref_round=ref_round,
+                max_idx=max_idx,
+            )
             if not roi_files:
                 logger.warning(f"{prefix}No files found for ROI '{roi}'; skipping.")
                 continue
@@ -838,6 +859,7 @@ def multi_run(
         ref_round=ref_round,
         limit=limit,
         limit_scope="total",
+        max_idx=None,
         basic_name=basic_name,
         n_fids=n_fids,
         histogram_bins=histogram_bins,
@@ -1022,6 +1044,13 @@ def prepare(
 @click.argument("round_name", type=str, required=False)
 @click.option("--roi", "roi_name", type=str, default="*")
 @click.option("--ref", "ref_round", type=str, default=None)
+@click.option(
+    "--max-idx",
+    type=click.IntRange(min=0),
+    default=None,
+    show_default=False,
+    help="Only process tiles with index <= MAX_IDX (parsed from filenames like '<round>-0007.tif').",
+)
 @click.option("--limit", type=int, default=None)
 @click.option(
     "--mode",
@@ -1075,6 +1104,7 @@ def run(
     *,
     roi_name: str,
     ref_round: str | None,
+    max_idx: int | None = None,
     limit: int | None,
     mode: str = _DEFAULT_OUTPUT_MODE.value,
     histogram_bins: int,
@@ -1151,6 +1181,18 @@ def run(
     if ref_token is not None and ref_token not in all_rounds:
         raise click.ClickException(f"Reference round '{ref_token}' not found in {path}.")
 
+    if max_idx is not None:
+        ctx = click.get_current_context(silent=True)
+        if delete_origin:
+            source = None if ctx is None else ctx.get_parameter_source("delete_origin")
+            if source is None or source != ParameterSource.DEFAULT:
+                raise click.ClickException(
+                    "Refusing to delete origin directories with --max-idx: tile selection is partial, "
+                    "and deletion occurs per round/ROI directory."
+                )
+            logger.info("--max-idx selected; forcing --no-delete-origin to avoid deleting partial directories.")
+        delete_origin = False
+
     _plan_and_execute(
         path=path,
         rounds=selected_rounds,
@@ -1158,6 +1200,7 @@ def run(
         ref_round=ref_token,
         limit=limit,
         limit_scope="per_roi",
+        max_idx=max_idx,
         basic_name=basic_name,
         n_fids=n_fids,
         histogram_bins=histogram_bins,
@@ -1178,6 +1221,13 @@ def run(
 @click.argument("round_name", type=str, required=False)
 @click.option("--roi", "roi_name", type=str, default="*")
 @click.option("--ref", "ref_round", type=str, default=None)
+@click.option(
+    "--max-idx",
+    type=click.IntRange(min=0),
+    default=None,
+    show_default=False,
+    help="Only process tiles with index <= MAX_IDX (parsed from filenames like '<round>-0007.tif').",
+)
 @click.option("--limit", type=int, default=None)
 @click.option(
     "--mode",
@@ -1231,6 +1281,7 @@ def batch(
     *,
     roi_name: str,
     ref_round: str | None,
+    max_idx: int | None = None,
     limit: int | None,
     mode: str,
     histogram_bins: int,
@@ -1251,6 +1302,7 @@ def batch(
         round_name,
         roi_name=roi_name,
         ref_round=ref_round,
+        max_idx=max_idx,
         limit=limit,
         mode=mode,
         histogram_bins=histogram_bins,

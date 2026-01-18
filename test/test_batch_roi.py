@@ -22,7 +22,9 @@ from fishtools.utils.utils import batch_roi
 def temp_workspace() -> Generator[Path, None, None]:
     """Create a temporary directory for testing."""
     with tempfile.TemporaryDirectory() as temp_dir:
-        yield Path(temp_dir)
+        workspace_root = Path(temp_dir)
+        (workspace_root / "ROOT.DONE").write_text("ok\n")
+        yield workspace_root
 
 
 @pytest.fixture
@@ -46,8 +48,10 @@ def codebook_roi_structure(temp_workspace: Path) -> Path:
         "registered--roi2+book1",
         "registered--cortex+book2",
     ]
+    deconv_root = temp_workspace / "analysis" / "deconv"
+    deconv_root.mkdir(parents=True, exist_ok=True)
     for roi_dir in codebook_dirs:
-        (temp_workspace / roi_dir).mkdir(parents=True, exist_ok=True)
+        (deconv_root / roi_dir).mkdir(parents=True, exist_ok=True)
     return temp_workspace
 
 
@@ -57,15 +61,18 @@ def realistic_workspace(temp_workspace: Path) -> tuple[Path, list[str], list[str
     rois: list[str] = ["cortex", "hippocampus", "striatum"]
     codebooks: list[str] = ["geneA", "geneB"]
 
+    deconv_root = temp_workspace / "analysis" / "deconv"
+    deconv_root.mkdir(parents=True, exist_ok=True)
+
     for roi in rois:
         for codebook in codebooks:
             # Create various processing stage directories
-            (temp_workspace / f"registered--{roi}+{codebook}").mkdir(parents=True, exist_ok=True)
-            (temp_workspace / f"stitch--{roi}+{codebook}").mkdir(parents=True, exist_ok=True)
+            (deconv_root / f"registered--{roi}+{codebook}").mkdir(parents=True, exist_ok=True)
+            (deconv_root / f"stitch--{roi}+{codebook}").mkdir(parents=True, exist_ok=True)
 
             # Add some realistic files
             for i in range(3):
-                (temp_workspace / f"registered--{roi}+{codebook}" / f"image-{i:03d}.tif").touch()
+                (deconv_root / f"registered--{roi}+{codebook}" / f"image-{i:03d}.tif").touch()
 
     return temp_workspace, rois, codebooks
 
@@ -153,8 +160,8 @@ class TestBatchRoiWildcardBehavior:
     def test_wildcard_with_custom_pattern(self, basic_roi_structure: Path) -> None:
         """Test wildcard with custom directory pattern."""
         # Create additional directories with different pattern
-        (basic_roi_structure / "stitch--roi1").mkdir(exist_ok=True)
-        (basic_roi_structure / "stitch--roi2").mkdir(exist_ok=True)
+        (basic_roi_structure / "analysis" / "deconv" / "stitch--roi1").mkdir(parents=True, exist_ok=True)
+        (basic_roi_structure / "analysis" / "deconv" / "stitch--roi2").mkdir(parents=True, exist_ok=True)
 
         call_log: list[str] = []
 
@@ -613,8 +620,10 @@ class TestBatchRoiLogging:
     def test_logging_with_codebook(self, temp_workspace: Path, log_capture: list[str]) -> None:
         """Test logging messages include codebook information."""
         # Create codebook directories
+        deconv_root = temp_workspace / "analysis" / "deconv"
+        deconv_root.mkdir(parents=True, exist_ok=True)
         for roi in ["roi1", "roi2"]:
-            (temp_workspace / f"registered--{roi}+book1").mkdir(exist_ok=True)
+            (deconv_root / f"registered--{roi}+book1").mkdir(exist_ok=True)
 
         @batch_roi(include_codebook=True)
         def mock_func(path: Path, roi: str, codebook: str) -> None:
