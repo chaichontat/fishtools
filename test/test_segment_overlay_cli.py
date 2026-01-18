@@ -33,7 +33,8 @@ def test_segment_overlay_all_help():
     assert "--seg-codebook" in result.output
     assert "--intensity-codebook" in result.output
     assert "--segmentation-name" in result.output
-    assert "--intensity-store" in result.output
+    assert "--fused-name" in result.output
+    assert "--erode" in result.output
     assert "--threads" in result.output
     assert "--export" in result.output
 
@@ -83,7 +84,8 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
         seg_codebook: str,
         intensity_codebook: str,
         segmentation_name: str,
-        intensity_store: str,
+        fused_name: str,
+        erode: int,
         channel: str | None,
         threads: int,
         overwrite: bool,
@@ -94,7 +96,8 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
             "seg_codebook": seg_codebook,
             "intensity_codebook": intensity_codebook,
             "segmentation_name": segmentation_name,
-            "intensity_store": intensity_store,
+            "fused_name": fused_name,
+            "erode": erode,
             "channel": channel,
             "threads": threads,
             "overwrite": overwrite,
@@ -116,9 +119,10 @@ def test_segment_overlay_all_uses_callbacks(tmp_path, monkeypatch):
         intensity_codebook="cb_int",
         spots_opt=None,
         segmentation_name="output_segmentation-sam.zarr",
-        intensity_store="fused.zarr",
+        fused_name="fused.zarr",
         channel=None,
         threads=2,
+        erode=2,
         export_opt=False,
         overwrite=False,
         debug=False,
@@ -248,7 +252,7 @@ def test_segment_overlay_all_skips_rois_missing_segmentation_zarr(tmp_path, monk
             "edu",
             "--segmentation-name",
             "output_segmentation.zarr",
-            "--intensity-store",
+            "--fused-name",
             "fused.zarr",
         ],
     )
@@ -277,7 +281,8 @@ def test_segment_overlay_intensity_help():
     assert "--segmentation-name" in result.output
     assert "--seg-codebook" in result.output
     assert "--intensity-codebook" in result.output
-    assert "--intensity-store" in result.output
+    assert "--fused-name" in result.output
+    assert "--erode" in result.output
     assert "--threads" in result.output
 
 
@@ -290,7 +295,8 @@ def test_segment_overlay_intensity_direct():
     assert result.exit_code == 0
     assert "--seg-codebook" in result.output
     assert "--intensity-codebook" in result.output
-    assert "--intensity-store" in result.output
+    assert "--fused-name" in result.output
+    assert "--erode" in result.output
     assert "--threads" in result.output
 
 
@@ -312,9 +318,10 @@ def test_segment_overlay_intensity_all_token_triggers_batch_mode(tmp_path, monke
         seg_codebook: str,
         intensity_codebook: str,
         segmentation_name: str,
-        intensity_store: str,
+        fused_name: str,
         channel: str | None,
         threads: int,
+        erode: int,
         overwrite: bool,
     ) -> None:
         called.append(roi)
@@ -782,10 +789,109 @@ def test_overlay_intensity_cli_skips_when_outputs_exist_and_no_overwrite(tmp_pat
             intensity_cb,
             "--segmentation-name",
             "output_segmentation.zarr",
-            "--intensity-store",
+            "--fused-name",
             "fused.zarr",
             "--threads",
             "1",
         ],
     )
     assert result.exit_code == 0, result.output
+
+
+@pytest.mark.usefixtures("sync_executor_intensity")
+def test_overlay_intensity_erode_affects_intensity_stats(tmp_path: Path) -> None:
+    ensure_cellpose_stub()
+    from fishtools.segment import app
+
+    roi = "roi"
+    seg_cb = "seg"
+    intensity_cb = "cb_int"
+    ws = _make_workspace(tmp_path)
+
+    seg = np.zeros((1, 10, 10), dtype=np.int32)
+    seg[0, 1:9, 1:9] = 1
+    seg_dir = _write_segmentation(ws, roi, seg_cb, seg)
+
+    intensity = np.zeros((1, 10, 10), dtype=np.uint16)
+    intensity[:, 1:9, 1:9] = 10
+    ring = np.zeros((10, 10), dtype=bool)
+    ring[1, 1:9] = True
+    ring[8, 1:9] = True
+    ring[1:9, 1] = True
+    ring[1:9, 8] = True
+    intensity[0, ring] = 1000
+    _write_intensity_store(ws, roi, intensity_cb, intensity, key=["ch0"])
+
+    runner = CliRunner()
+    res0 = runner.invoke(
+        app,
+        [
+            "overlay",
+            "intensity",
+            str(ws),
+            roi,
+            "--seg-codebook",
+            seg_cb,
+            "--intensity-codebook",
+            intensity_cb,
+            "--segmentation-name",
+            "output_segmentation.zarr",
+            "--fused-name",
+            "fused.zarr",
+            "--channel",
+            "ch0",
+            "--erode",
+            "0",
+            "--threads",
+            "1",
+            "--overwrite",
+        ],
+    )
+    assert res0.exit_code == 0, res0.output
+
+    df0 = pl.read_parquet(seg_dir / "output_segmentation.zarr" / "intensity_ch0" / "intensity-00.parquet")
+    mean0 = float(df0.filter(pl.col("label") == 1)["mean_intensity"][0])
+    assert "median_intensity" in df0.columns
+    median0 = float(df0.filter(pl.col("label") == 1)["median_intensity"][0])
+    assert "intensity_std" in df0.columns
+    std0 = float(df0.filter(pl.col("label") == 1)["intensity_std"][0])
+
+    assert median0 == pytest.approx(10.0)
+
+    res2 = runner.invoke(
+        app,
+        [
+            "overlay",
+            "intensity",
+            str(ws),
+            roi,
+            "--seg-codebook",
+            seg_cb,
+            "--intensity-codebook",
+            intensity_cb,
+            "--segmentation-name",
+            "output_segmentation.zarr",
+            "--fused-name",
+            "fused.zarr",
+            "--channel",
+            "ch0",
+            "--erode",
+            "2",
+            "--threads",
+            "1",
+            "--overwrite",
+        ],
+    )
+    assert res2.exit_code == 0, res2.output
+
+    df2 = pl.read_parquet(seg_dir / "output_segmentation.zarr" / "intensity_ch0" / "intensity-00.parquet")
+    mean2 = float(df2.filter(pl.col("label") == 1)["mean_intensity"][0])
+    assert "median_intensity" in df2.columns
+    median2 = float(df2.filter(pl.col("label") == 1)["median_intensity"][0])
+    assert "intensity_std" in df2.columns
+    std2 = float(df2.filter(pl.col("label") == 1)["intensity_std"][0])
+
+    assert mean2 < mean0
+    assert median2 == pytest.approx(10.0)
+    assert std0 > 0.0
+    assert std2 == pytest.approx(0.0)

@@ -218,6 +218,34 @@ class TestWorkspaceStructureDiscovery:
         assert set(rois) == {"cortex", "hippocampus", "striatum"}
         assert rois == ["cortex", "hippocampus", "striatum"]  # Should be sorted
 
+
+class TestWorkspaceConfigJson:
+    def test_config_json_prefers_deconved(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        root.mkdir(parents=True)
+        _write_done_sentinel(root)
+        (root / "analysis" / "deconv").mkdir(parents=True, exist_ok=True)
+
+        root_cfg = root / "config.json"
+        deconv_cfg = root / "analysis" / "deconv" / "config.json"
+        root_cfg.write_text("{}", encoding="utf-8")
+        deconv_cfg.write_text("{}", encoding="utf-8")
+
+        ws = Workspace(root)
+        assert ws.config_json() == deconv_cfg
+
+    def test_config_json_falls_back_to_root(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        root.mkdir(parents=True)
+        _write_done_sentinel(root)
+        (root / "analysis" / "deconv").mkdir(parents=True, exist_ok=True)
+
+        root_cfg = root / "config.json"
+        root_cfg.write_text("{}", encoding="utf-8")
+
+        ws = Workspace(root)
+        assert ws.config_json() == root_cfg
+
     def test_rois_with_codebook_suffix(self):
         """Test ROI discovery strips codebook suffixes correctly."""
         directories = [

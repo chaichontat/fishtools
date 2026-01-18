@@ -56,31 +56,10 @@ def test_segment_thumbnail_respects_z_range_and_overwrite(tmp_path: Path) -> Non
         ],
         prog_name="segment",
     )
-    assert res.exit_code != 0
-    assert res.exception is not None
-    assert "--overwrite" in str(res.exception)
-    assert sentinel_path.read_bytes() == b"sentinel"
-
-    res_overwrite = runner.invoke(
-        segment_app,
-        [
-            "thumbnail",
-            str(ws),
-            "roi",
-            "--codebook",
-            "cb1",
-            "--z-stride",
-            "1",
-            "--z-range",
-            "1:3",
-            "--downsample",
-            "1",
-            "--overwrite",
-        ],
-        prog_name="segment",
-    )
-    assert res_overwrite.exit_code == 0, res_overwrite.output
+    assert res.exit_code == 0, res.output
     assert sentinel_path.read_bytes() != b"sentinel"
+    assert not (thumb_dir / "thumbnail_z000.png").exists()
+    assert (thumb_dir / "thumbnail_z002.png").exists()
 
 
 def test_segment_thumbnail_include_n4(tmp_path: Path) -> None:
@@ -113,6 +92,35 @@ def test_segment_thumbnail_include_n4(tmp_path: Path) -> None:
     assert (thumb_dir / "thumbnail_n4_z000.png").exists()
 
 
+def test_segment_thumbnail_includes_highpass_when_present(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path)
+    _write_fused(ws, roi="roi", codebook="cb1", name="fused.zarr", shape=(2, 4, 4, 1))
+    _write_fused(ws, roi="roi", codebook="cb1", name="fused_highpassed.zarr", shape=(2, 4, 4, 1))
+
+    runner = CliRunner()
+    res = runner.invoke(
+        segment_app,
+        [
+            "thumbnail",
+            str(ws),
+            "roi",
+            "--codebook",
+            "cb1",
+            "--z-range",
+            "0:1",
+            "--downsample",
+            "1",
+        ],
+        prog_name="segment",
+    )
+    assert res.exit_code == 0, res.output
+
+    workspace = Workspace(ws)
+    thumb_dir = (workspace.output / "thumbnails") / "roi+cb1"
+    assert (thumb_dir / "thumbnail_z000.png").exists()
+    assert (thumb_dir / "thumbnail_highpass_z000.png").exists()
+
+
 def test_segment_thumbnail_random_percentile_normalization(tmp_path: Path) -> None:
     from PIL import Image
 
@@ -142,7 +150,6 @@ def test_segment_thumbnail_random_percentile_normalization(tmp_path: Path) -> No
             "0:1",
             "--downsample",
             "1",
-            "--overwrite",
         ],
         prog_name="segment",
     )
@@ -196,7 +203,6 @@ def test_segment_thumbnail_outlines_from_seg_codebook_default_downsample(tmp_pat
             "masks.zarr",
             "--z-range",
             "0:1",
-            "--overwrite",
         ],
         prog_name="segment",
     )

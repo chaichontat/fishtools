@@ -33,7 +33,7 @@ def test_load_config_from_json_valid(tmp_path: Path) -> None:
     cfg = load_config_from_json(cfg_path, data_path=str(tmp_path))
 
     assert cfg.dataPath == str(tmp_path)
-    assert cfg.registration.reference == "4_12_20"  # default
+    assert cfg.registration.reference == "2_10_18"  # default
     assert cfg.registration.chromatic_path == tmp_path
 
 
@@ -52,7 +52,7 @@ def test_load_config_autodetect_json(tmp_path: Path) -> None:
     cfg_path = tmp_path / "project.json"
     _write_json(cfg_path, _minimal_registration(tmp_path))
     cfg = load_config(cfg_path, data_path=str(tmp_path))
-    assert cfg.registration.reference == "4_12_20"
+    assert cfg.registration.reference == "2_10_18"
 
 
 def test_load_config_json_errors(tmp_path: Path) -> None:
