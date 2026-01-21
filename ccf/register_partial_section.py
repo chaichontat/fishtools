@@ -47,9 +47,9 @@ if ip is not None:
 # === EDIT THESE ===
 
 # Workspace configuration
-WORKSPACE = Path("/working/20251228_JaxA4_Sag4")
+WORKSPACE = Path.home() / ("nvme/20251015_JaxA2_Sag7")
 ws = Workspace(WORKSPACE)
-ROI = ws.rois[1]
+ROI = ws.rois[0]
 
 STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.zarr
 
@@ -180,7 +180,7 @@ atlas_slice_picker = pick_atlas_slice_idx(
 # ### Interactive Landmark Selection
 #
 # Click paired landmarks (atlas first, then sample). Use "Save landmarks" to persist
-# `p1_landmarks.json` without running the next cell (status will confirm saves).
+# `p1_landmarks.json` and compute `p1_similarity.tfm` + `p1_result.png` (status will confirm saves).
 #
 # Edit helpers:
 # - Ctrl+click near an existing marker to delete that pair (removes both atlas+sample points)
@@ -199,6 +199,83 @@ atlas_slice_masked = atlas_slice_full.copy()
 atlas_slice_masked[~atlas_brain_mask] = 0
 
 atlas_slice, atlas_crop_bbox = crop_to_content(atlas_slice_masked, atlas_brain_mask, pad=5)
+
+# In sagittal mode, we only need the left-side context for partial sections.
+# Cropping out the rightmost ~40% makes the atlas appear larger in the fixed panel.
+if ATLAS_PLANE == "sagittal":
+    keep_w = int(round(atlas_slice.shape[1] * 0.6))
+    keep_w = max(1, min(int(atlas_slice.shape[1]), keep_w))
+    atlas_slice = atlas_slice[:, :keep_w]
+    r0, r1, c0, c1 = atlas_crop_bbox
+    atlas_crop_bbox = (r0, r1, c0, c0 + keep_w)
+
+def _pallium_subtree_ids(atlas: BrainGlobeAtlas) -> set[int]:
+    df = atlas.lookup_df
+    if "name" not in df.columns or "acronym" not in df.columns or "id" not in df.columns:
+        raise ValueError(f"Unexpected atlas.lookup_df schema: columns={list(df.columns)}")
+
+    candidates = df[
+        (df["name"].astype(str).str.lower() == "pallium")
+        | (df["acronym"].astype(str).str.lower().isin({"pal", "pallium"}))
+    ]
+    if candidates.empty:
+        candidates = df[df["name"].astype(str).str.lower().str.contains("pallium", na=False)]
+    if candidates.empty:
+        raise ValueError("Could not find a 'pallium' structure in atlas lookup table.")
+
+    candidate_ids = [int(v) for v in candidates["id"].tolist()]
+    best_id = min(candidate_ids, key=lambda rid: len(atlas.structures[rid]["structure_id_path"]))
+
+    subtree_ids: set[int] = set()
+    for struct in atlas.structures_list:
+        path = struct.get("structure_id_path", [])
+        if isinstance(path, list) and best_id in {int(v) for v in path}:
+            subtree_ids.add(int(struct["id"]))
+    return subtree_ids
+
+
+def _ventricles_subtree_ids(atlas: BrainGlobeAtlas) -> set[int]:
+    df = atlas.lookup_df
+    if "name" not in df.columns or "acronym" not in df.columns or "id" not in df.columns:
+        raise ValueError(f"Unexpected atlas.lookup_df schema: columns={list(df.columns)}")
+
+    candidates = df[
+        (df["name"].astype(str).str.lower() == "ventricles")
+        | (df["acronym"].astype(str).str.lower().isin({"ventricles"}))
+    ]
+    if candidates.empty:
+        candidates = df[df["name"].astype(str).str.lower().str.contains("ventric", na=False)]
+    if candidates.empty:
+        raise ValueError("Could not find a 'ventricles' structure in atlas lookup table.")
+
+    candidate_ids = [int(v) for v in candidates["id"].tolist()]
+    best_id = min(candidate_ids, key=lambda rid: len(atlas.structures[rid]["structure_id_path"]))
+
+    subtree_ids: set[int] = set()
+    for struct in atlas.structures_list:
+        path = struct.get("structure_id_path", [])
+        if isinstance(path, list) and best_id in {int(v) for v in path}:
+            subtree_ids.add(int(struct["id"]))
+    return subtree_ids
+
+
+PALLIUM_OVERLAY_MASK: np.ndarray | None = None
+VENTRICLES_OVERLAY_MASK: np.ndarray | None = None
+try:
+    pallium_ids = _pallium_subtree_ids(atlas)
+    r0, r1, c0, c1 = atlas_crop_bbox
+    pallium_full = np.isin(atlas_annotation_full, list(pallium_ids))
+    PALLIUM_OVERLAY_MASK = pallium_full[r0:r1, c0:c1]
+except Exception as exc:
+    print(f"WARNING: Pallium overlay disabled: {exc}")
+
+try:
+    vent_ids = _ventricles_subtree_ids(atlas)
+    r0, r1, c0, c1 = atlas_crop_bbox
+    vent_full = np.isin(atlas_annotation_full, list(vent_ids))
+    VENTRICLES_OVERLAY_MASK = vent_full[r0:r1, c0:c1]
+except Exception as exc:
+    print(f"WARNING: Ventricles overlay disabled: {exc}")
 
 ATLAS_CROP_OFFSET = (atlas_crop_bbox[2], atlas_crop_bbox[0])  # (x_offset, y_offset)
 
@@ -230,28 +307,238 @@ def _save_p1_landmarks(
         encoder=NumpyEncoder,
     )
 
+
+def _run_p1_similarity2d(
+    *,
+    fixed_points_cropped_xy: list[tuple[float, float]],
+    moving_points_fullres_xy_in_rotated_crop: list[tuple[float, float]],
+    show: bool,
+) -> tuple[sitk.Similarity2DTransform, list[tuple[float, float]], list[tuple[float, float]], np.ndarray]:
+    if len(fixed_points_cropped_xy) != len(moving_points_fullres_xy_in_rotated_crop):
+        raise ValueError(
+            "Mismatched landmark pair counts: "
+            f"fixed={len(fixed_points_cropped_xy)} vs moving={len(moving_points_fullres_xy_in_rotated_crop)}"
+        )
+
+    _save_p1_landmarks(
+        fixed_points_cropped_xy=fixed_points_cropped_xy,
+        moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
+    )
+
+    print(f"Landmark pairs: {len(fixed_points_cropped_xy)}")
+
+    # Convert cropped pixel landmarks to physical coordinates in full-image space.
+    fixed_points_full = [(x + ATLAS_CROP_OFFSET[0], y + ATLAS_CROP_OFFSET[1]) for x, y in fixed_points_cropped_xy]
+    moving_points_full = [
+        (x + SAMPLE_CROP_OFFSET[0], y + SAMPLE_CROP_OFFSET[1]) for x, y in moving_points_fullres_xy_in_rotated_crop
+    ]
+
+    fixed_pts_phys = pixels_to_physical_um(fixed_points_full, ATLAS_VOXEL)
+    moving_pts_phys = pixels_to_physical_um(moving_points_full, SAMPLE_VOXEL_XY)
+
+    transform_similarity = compute_similarity2d_from_landmarks(fixed_pts_phys, moving_pts_phys)
+
+    print("Similarity2D transform:")
+    print(f"  Center: {transform_similarity.GetCenter()}")
+    print(f"  Angle: {np.degrees(transform_similarity.GetAngle()):.2f}°")
+    print(f"  Scale: {transform_similarity.GetScale():.4f}")
+    print(f"  Translation: {transform_similarity.GetTranslation()}")
+
+    # Verify landmark errors
+    errors: list[float] = []
+    for fp, mp in zip(fixed_pts_phys, moving_pts_phys):
+        transformed = transform_similarity.TransformPoint(fp)
+        error = float(np.linalg.norm(np.array(transformed) - np.array(mp)))
+        errors.append(error)
+
+    max_error = max(errors)
+    mean_error = float(np.mean(errors))
+    print(f"Landmark error: max={max_error:.2f} µm, mean={mean_error:.2f} µm")
+    if max_error > 100:
+        print("WARNING: High landmark error - check landmark correspondences")
+
+    sitk.WriteTransform(transform_similarity, str(P1_TFM_PATH))
+    print(f"Saved: {P1_TFM_PATH}")
+
+    def array_to_sitk(arr: np.ndarray, spacing: tuple[float, float]) -> sitk.Image:
+        img = sitk.GetImageFromArray(arr.astype(np.float32))
+        img.SetSpacing(spacing)
+        return img
+
+    atlas_slice_full_masked = atlas_slice_full.copy().astype(np.float32)
+    atlas_slice_full_masked[~atlas_brain_mask] = 0.0
+
+    atlas_sitk = array_to_sitk(atlas_slice_full_masked, (ATLAS_VOXEL, ATLAS_VOXEL))
+    sample_sitk = array_to_sitk(sample_slice_full, (SAMPLE_VOXEL_XY, SAMPLE_VOXEL_XY))
+
+    sample_warped = sitk.Resample(
+        sample_sitk,
+        atlas_sitk,
+        transform_similarity,
+        sitk.sitkLinear,
+        0.0,
+        sample_sitk.GetPixelID(),
+    )
+    sample_warped_arr = sitk.GetArrayFromImage(sample_warped)
+
+    r0, r1, c0, c1 = atlas_crop_bbox
+    sample_warped_arr_preview = sample_warped_arr[r0:r1, c0:c1]
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    axes[0].imshow(atlas_slice, cmap="gray")
+    axes[0].set_title("Atlas cropped (FIXED)")
+    axes[0].axis("off")
+
+    axes[1].imshow(sample_warped_arr_preview, cmap="gray")
+    axes[1].set_title("Sample warped to atlas space (raw)")
+    axes[1].axis("off")
+
+    overlay = np.zeros((*atlas_slice.shape, 3), dtype=np.float32)
+    ATLAS_LO_PERCENTILE = 1.0
+    ATLAS_HI_PERCENTILE = 99.8
+    ATLAS_GAMMA = 0.85
+    atlas_vals = atlas_slice[atlas_slice > 0] if np.any(atlas_slice > 0) else atlas_slice
+    atlas_lo, atlas_hi = (float(v) for v in np.percentile(atlas_vals, [ATLAS_LO_PERCENTILE, ATLAS_HI_PERCENTILE]))
+    atlas_norm = (atlas_slice - atlas_lo) / (atlas_hi - atlas_lo + 1e-8)
+    atlas_norm = np.clip(atlas_norm, 0.0, 1.0) ** ATLAS_GAMMA
+    SAMPLE_LO_PERCENTILE = 1.0
+    SAMPLE_HI_PERCENTILE = 99.5
+    SAMPLE_GAMMA = 0.7
+    sample_lo, sample_hi = (
+        float(v) for v in np.percentile(sample_warped_arr_preview, [SAMPLE_LO_PERCENTILE, SAMPLE_HI_PERCENTILE])
+    )
+    sample_norm = (sample_warped_arr_preview - sample_lo) / (sample_hi - sample_lo + 1e-8)
+    sample_norm = np.clip(sample_norm, 0.0, 1.0) ** SAMPLE_GAMMA
+
+    MOVING_ALPHA = 1.0
+    SAMPLE_GAIN = 0.75
+    ATLAS_ALPHA = 0.8
+    EDGE_SIGMA = 0.25
+    EDGE_THRESH = 0.25
+    EDGE_GAMMA = 2.5
+
+    atlas_blur = gaussian_filter(atlas_norm.astype(np.float32), sigma=EDGE_SIGMA)
+    gx = sobel(atlas_blur, axis=1)
+    gy = sobel(atlas_blur, axis=0)
+    edges = np.hypot(gx, gy)
+    edges_p99 = float(np.percentile(edges, 99))
+    edges_norm = edges / (edges_p99 + 1e-8)
+    edges_norm = np.clip(edges_norm, 0.0, 1.0)
+    edges_norm = np.clip((edges_norm - EDGE_THRESH) / (1.0 - EDGE_THRESH + 1e-8), 0.0, 1.0)
+    edges_norm = edges_norm**EDGE_GAMMA
+    atlas_edge_enhanced = np.clip(0.8 * atlas_norm + 1.2 * edges_norm, 0.0, 1.0)
+    overlay[..., 0] = ATLAS_ALPHA * atlas_edge_enhanced  # R
+    overlay[..., 1] = MOVING_ALPHA * SAMPLE_GAIN * sample_norm  # G
+    overlay[..., 2] = ATLAS_ALPHA * atlas_edge_enhanced  # B (magenta = R+B)
+
+    axes[2].imshow(overlay)
+    axes[2].set_title("Overlay (magenta=atlas, green=sample)")
+    axes[2].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(OUT.p1_result_png, dpi=150)
+    print(f"Saved: {OUT.p1_result_png}")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    print("Phase 1 complete.")
+    return transform_similarity, fixed_pts_phys, moving_pts_phys, overlay
+
+
 sample_preview_rotated = sample_slice_rotated[::PREVIEW_DOWNSAMPLE, ::PREVIEW_DOWNSAMPLE]
+
+_existing_landmark_picker = globals().get("landmark_picker")
+if _existing_landmark_picker is not None:
+    # Cell re-run safety: don't lose an existing editing session.
+    if plt.fignum_exists(_existing_landmark_picker.fig.number):
+        choice = input(
+            "Existing landmark editor is open. Save before restarting? "
+            "[s]ave/[d]iscard/[c]ancel (default: cancel): "
+        ).strip().lower()
+        if choice in {"s", "save"}:
+            fixed_prev = list(_existing_landmark_picker.fixed_points_cropped_xy)
+            moving_prev = list(_existing_landmark_picker.moving_points_fullres_xy_in_rotated_crop)
+            n_pairs = min(len(fixed_prev), len(moving_prev))
+            if n_pairs == 0:
+                print("No complete landmark pairs to save.")
+            else:
+                if len(fixed_prev) != len(moving_prev):
+                    print(
+                        f"Dropping incomplete pair: fixed={len(fixed_prev)} moving={len(moving_prev)}; saving {n_pairs} pair(s)."
+                    )
+                _save_p1_landmarks(
+                    fixed_points_cropped_xy=fixed_prev[:n_pairs],
+                    moving_points_fullres_xy_in_rotated_crop=moving_prev[:n_pairs],
+                )
+                print(f"Saved: {OUT.p1_landmarks_json}")
+        elif choice in {"d", "discard"}:
+            print("Discarding unsaved landmark edits.")
+        else:
+            raise RuntimeError("Canceled: keeping existing landmark editor session.")
+
+    _existing_landmark_picker.close()
+    globals()["landmark_picker"] = None
 
 initial_fixed: list[tuple[float, float]] = []
 initial_moving: list[tuple[float, float]] = []
-if existing_p1 is not None:
-    initial_fixed = existing_p1.fixed_points_cropped_xy
-    initial_moving = existing_p1.moving_points_fullres_xy_in_rotated_crop
-    print(f"Loaded existing landmarks: slice_idx={existing_p1.atlas_slice_idx} pairs={len(initial_fixed)}")
+p1_for_init = OUT.try_read_p1_landmarks()
+if p1_for_init is not None:
+    if p1_for_init.prior_rotation_deg != PRIOR_ROTATION_DEG or p1_for_init.prior_flip_x != PRIOR_FLIP_X:
+        print(
+            "Found existing landmarks, but rotation/flip differs from the current selection; not loading them. "
+            f"(saved rot={p1_for_init.prior_rotation_deg}°, flip_x={p1_for_init.prior_flip_x})"
+        )
+    elif p1_for_init.atlas_slice_idx is not None and p1_for_init.atlas_slice_idx != atlas_slice_idx:
+        print(
+            "Found existing landmarks, but atlas_slice_idx differs from the current selection; not loading them. "
+            f"(saved slice_idx={p1_for_init.atlas_slice_idx})"
+        )
+    else:
+        initial_fixed = p1_for_init.fixed_points_cropped_xy
+        initial_moving = p1_for_init.moving_points_fullres_xy_in_rotated_crop
+        print(f"Loaded existing landmarks from {OUT.p1_landmarks_json}: pairs={len(initial_fixed)}")
 
 
 def _on_landmarks_change(
     fixed_points_cropped_xy: list[tuple[float, float]],
     moving_points_fullres_xy_in_rotated_crop: list[tuple[float, float]],
 ) -> None:
-    _save_p1_landmarks(
+    globals()["fixed_points"] = list(fixed_points_cropped_xy)
+    globals()["moving_points_fullres"] = list(moving_points_fullres_xy_in_rotated_crop)
+
+    if len(fixed_points_cropped_xy) < 3:
+        _save_p1_landmarks(
+            fixed_points_cropped_xy=fixed_points_cropped_xy,
+            moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
+        )
+        print(f"Saved: {OUT.p1_landmarks_json}")
+        print("Need at least 3 landmark pairs to compute Similarity2D. Keep clicking, then Save again.")
+        return
+
+    transform_similarity_, fixed_pts_phys_, moving_pts_phys_, overlay_ = _run_p1_similarity2d(
         fixed_points_cropped_xy=fixed_points_cropped_xy,
         moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
+        show=False,
     )
+    globals()["transform_similarity"] = transform_similarity_
+    globals()["fixed_pts_phys"] = fixed_pts_phys_
+    globals()["moving_pts_phys"] = moving_pts_phys_
+    globals()["overlay"] = overlay_
+
+fixed_overlays: list[tuple[np.ndarray, tuple[float, float, float, float]]] = []
+if PALLIUM_OVERLAY_MASK is not None:
+    fixed_overlays.append((PALLIUM_OVERLAY_MASK, (0.1, 0.4, 1.0, 0.30)))  # blue
+if VENTRICLES_OVERLAY_MASK is not None:
+    fixed_overlays.append((VENTRICLES_OVERLAY_MASK, (0.5, 1.0, 0.5, 0.25)))  # light green
 
 
 landmark_picker = pick_paired_landmarks(
     fixed_image_yx=atlas_slice,
+    fixed_overlays=fixed_overlays,
     moving_image_yx_preview=sample_preview_rotated,
     moving_downsample=PREVIEW_DOWNSAMPLE,
     initial_fixed_points_cropped_xy=initial_fixed,
@@ -269,141 +556,11 @@ landmark_picker = pick_paired_landmarks(
 
 # %%
 fixed_points, moving_points_fullres = landmark_picker.get_points()
-if len(fixed_points) != len(moving_points_fullres):
-    raise ValueError(
-        f"Landmark UI returned mismatched pair counts: fixed={len(fixed_points)} vs moving={len(moving_points_fullres)}"
-    )
-
-_save_p1_landmarks(
+transform_similarity, fixed_pts_phys, moving_pts_phys, overlay = _run_p1_similarity2d(
     fixed_points_cropped_xy=fixed_points,
     moving_points_fullres_xy_in_rotated_crop=moving_points_fullres,
+    show=True,
 )
-
-print(f"Landmark pairs: {len(fixed_points)}")
-
-# Convert cropped pixel landmarks to physical coordinates in full-image space.
-
-fixed_points_full = [(x + ATLAS_CROP_OFFSET[0], y + ATLAS_CROP_OFFSET[1]) for x, y in fixed_points]
-moving_points_full = [(x + SAMPLE_CROP_OFFSET[0], y + SAMPLE_CROP_OFFSET[1]) for x, y in moving_points_fullres]
-
-fixed_pts_phys = pixels_to_physical_um(fixed_points_full, ATLAS_VOXEL)
-moving_pts_phys = pixels_to_physical_um(moving_points_full, SAMPLE_VOXEL_XY)
-
-# Compute transform
-transform_similarity = compute_similarity2d_from_landmarks(fixed_pts_phys, moving_pts_phys)
-
-print("Similarity2D transform:")
-print(f"  Center: {transform_similarity.GetCenter()}")
-print(f"  Angle: {np.degrees(transform_similarity.GetAngle()):.2f}°")
-print(f"  Scale: {transform_similarity.GetScale():.4f}")
-print(f"  Translation: {transform_similarity.GetTranslation()}")
-
-# Verify landmark errors
-errors = []
-for fp, mp in zip(fixed_pts_phys, moving_pts_phys):
-    transformed = transform_similarity.TransformPoint(fp)
-    error = np.linalg.norm(np.array(transformed) - np.array(mp))
-    errors.append(error)
-
-max_error = max(errors)
-mean_error = np.mean(errors)
-print(f"Landmark error: max={max_error:.2f} µm, mean={mean_error:.2f} µm")
-
-if max_error > 100:
-    print("WARNING: High landmark error - check landmark correspondences")
-
-# Save Phase 1 transform
-sitk.WriteTransform(transform_similarity, str(P1_TFM_PATH))
-print(f"Saved: {P1_TFM_PATH}")
-
-# Visualize Phase 1 results: warp sample to atlas space
-# Using FULL images so the transform applies to the moving image definition (rotated full sample).
-def array_to_sitk(arr: np.ndarray, spacing: tuple[float, float]) -> sitk.Image:
-    """Convert 2D numpy array to SimpleITK image."""
-    img = sitk.GetImageFromArray(arr.astype(np.float32))
-    img.SetSpacing(spacing)
-    return img
-
-atlas_slice_full_masked = atlas_slice_full.copy().astype(np.float32)
-atlas_slice_full_masked[~atlas_brain_mask] = 0.0
-
-# Create SimpleITK images from FULL versions
-atlas_sitk = array_to_sitk(atlas_slice_full_masked, (ATLAS_VOXEL, ATLAS_VOXEL))
-sample_sitk = array_to_sitk(sample_slice_full, (SAMPLE_VOXEL_XY, SAMPLE_VOXEL_XY))
-
-# Resample sample to atlas space using the transform
-sample_warped = sitk.Resample(
-    sample_sitk,
-    atlas_sitk,
-    transform_similarity,
-    sitk.sitkLinear,
-    0.0,
-    sample_sitk.GetPixelID()
-)
-
-sample_warped_arr = sitk.GetArrayFromImage(sample_warped)
-
-# Show Phase 1 results (preview uses CROPPED reference)
-fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-
-r0, r1, c0, c1 = atlas_crop_bbox
-sample_warped_arr_preview = sample_warped_arr[r0:r1, c0:c1]
-
-axes[0].imshow(atlas_slice, cmap="gray")
-axes[0].set_title("Atlas cropped (FIXED)")
-axes[0].axis("off")
-
-axes[1].imshow(sample_warped_arr_preview, cmap="gray")
-axes[1].set_title("Sample warped to atlas space (raw)")
-axes[1].axis("off")
-
-# Overlay: atlas in magenta, sample in green
-overlay = np.zeros((*atlas_slice.shape, 3), dtype=np.float32)
-ATLAS_LO_PERCENTILE = 1.0
-ATLAS_HI_PERCENTILE = 99.8
-ATLAS_GAMMA = 0.85
-atlas_vals = atlas_slice[atlas_slice > 0] if np.any(atlas_slice > 0) else atlas_slice
-atlas_lo, atlas_hi = (float(v) for v in np.percentile(atlas_vals, [ATLAS_LO_PERCENTILE, ATLAS_HI_PERCENTILE]))
-atlas_norm = (atlas_slice - atlas_lo) / (atlas_hi - atlas_lo + 1e-8)
-atlas_norm = np.clip(atlas_norm, 0.0, 1.0) ** ATLAS_GAMMA
-SAMPLE_LO_PERCENTILE = 1.0
-SAMPLE_HI_PERCENTILE = 99.5
-SAMPLE_GAMMA = 0.7
-sample_lo, sample_hi = (float(v) for v in np.percentile(sample_warped_arr_preview, [SAMPLE_LO_PERCENTILE, SAMPLE_HI_PERCENTILE]))
-sample_norm = (sample_warped_arr_preview - sample_lo) / (sample_hi - sample_lo + 1e-8)
-sample_norm = np.clip(sample_norm, 0.0, 1.0) ** SAMPLE_GAMMA
-
-# Edge-enhance the atlas (fixed) image for easier visual alignment.
-MOVING_ALPHA = 1.0
-SAMPLE_GAIN = 0.75
-ATLAS_ALPHA = 0.8
-EDGE_SIGMA = 0.25
-EDGE_THRESH = 0.25
-EDGE_GAMMA = 2.5
-
-atlas_blur = gaussian_filter(atlas_norm.astype(np.float32), sigma=EDGE_SIGMA)
-gx = sobel(atlas_blur, axis=1)
-gy = sobel(atlas_blur, axis=0)
-edges = np.hypot(gx, gy)
-edges_p99 = float(np.percentile(edges, 99))
-edges_norm = edges / (edges_p99 + 1e-8)
-edges_norm = np.clip(edges_norm, 0.0, 1.0)
-edges_norm = np.clip((edges_norm - EDGE_THRESH) / (1.0 - EDGE_THRESH + 1e-8), 0.0, 1.0)
-edges_norm = edges_norm**EDGE_GAMMA
-atlas_edge_enhanced = np.clip(0.8 * atlas_norm + 1.2 * edges_norm, 0.0, 1.0)
-overlay[..., 0] = ATLAS_ALPHA * atlas_edge_enhanced  # R
-overlay[..., 1] = MOVING_ALPHA * SAMPLE_GAIN * sample_norm  # G
-overlay[..., 2] = ATLAS_ALPHA * atlas_edge_enhanced  # B (magenta = R+B)
-
-axes[2].imshow(overlay)
-axes[2].set_title("Overlay (magenta=atlas, green=sample)")
-axes[2].axis("off")
-
-plt.tight_layout()
-plt.savefig(OUT.p1_result_png, dpi=150)
-plt.show()
-
-print("Phase 1 complete.")
 
 # %% [markdown]
 # ## Summary

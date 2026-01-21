@@ -236,6 +236,7 @@ class PairedLandmarksPicker:
 def pick_paired_landmarks(
     *,
     fixed_image_yx: np.ndarray,
+    fixed_overlays: list[tuple[np.ndarray, tuple[float, float, float, float]]] | None = None,
     moving_image_yx_preview: np.ndarray,
     moving_downsample: int,
     initial_fixed_points_cropped_xy: list[PointXY] | None = None,
@@ -262,18 +263,32 @@ def pick_paired_landmarks(
 
     fixed_points: list[PointXY] = list(initial_fixed_points_cropped_xy or [])
     moving_points_fullres: list[PointXY] = list(initial_moving_points_fullres_xy_in_rotated_crop or [])
-
     if len(fixed_points) != len(moving_points_fullres):
-        fixed_points = []
-        moving_points_fullres = []
+        n_pairs = min(len(fixed_points), len(moving_points_fullres))
+        fixed_points = fixed_points[:n_pairs]
+        moving_points_fullres = moving_points_fullres[:n_pairs]
 
     next_side: str = "fixed"
     ctrl_state: dict[str, bool] = {"down": False}
+    landmarks_visible: dict[str, bool] = {"visible": True}
 
     fig, (ax_fixed, ax_moving) = plt.subplots(1, 2, figsize=(16, 8))
     plt.subplots_adjust(bottom=0.16)
 
     ax_fixed.imshow(fixed_image_yx, cmap="gray")
+    if fixed_overlays:
+        for overlay_mask_yx, (r, g, b, a) in fixed_overlays:
+            mask = np.asarray(overlay_mask_yx, dtype=bool)
+            if mask.shape != fixed_image_yx.shape:
+                raise ValueError(
+                    f"fixed_overlays mask shape mismatch: mask={mask.shape}, fixed_image_yx={fixed_image_yx.shape}"
+                )
+            rgba = np.zeros((*mask.shape, 4), dtype=np.float32)
+            rgba[..., 0] = float(r)
+            rgba[..., 1] = float(g)
+            rgba[..., 2] = float(b)
+            rgba[..., 3] = mask.astype(np.float32) * float(a)
+            ax_fixed.imshow(rgba)
     ax_fixed.axis("off")
 
     ax_moving.imshow(moving_image_yx_preview, cmap="gray")
@@ -286,14 +301,17 @@ def pick_paired_landmarks(
 
     status = fig.suptitle("", fontsize=11, fontweight="bold")
 
-    ax_undo = plt.axes([0.15, 0.06, 0.2, 0.05])
+    ax_undo = plt.axes([0.12, 0.06, 0.18, 0.05])
     Button(ax_undo, "Undo last pair")
 
-    ax_clear = plt.axes([0.38, 0.06, 0.2, 0.05])
+    ax_clear = plt.axes([0.32, 0.06, 0.18, 0.05])
     Button(ax_clear, "Clear all")
 
-    ax_save = plt.axes([0.61, 0.06, 0.2, 0.05])
+    ax_save = plt.axes([0.52, 0.06, 0.18, 0.05])
     Button(ax_save, "Save landmarks")
+
+    ax_toggle = plt.axes([0.72, 0.06, 0.23, 0.05])
+    toggle_button = Button(ax_toggle, "Hide landmarks")
 
     def _moving_points_preview() -> list[PointXY]:
         return [(x / moving_downsample_, y / moving_downsample_) for x, y in moving_points_fullres]
@@ -303,6 +321,9 @@ def pick_paired_landmarks(
 
     def _update_artists(*, msg: str | None = None) -> None:
         nonlocal fixed_texts, moving_texts
+
+        scatter_fixed.set_visible(landmarks_visible["visible"])
+        scatter_moving.set_visible(landmarks_visible["visible"])
 
         if fixed_points:
             xs, ys = zip(*fixed_points)
@@ -324,37 +345,35 @@ def pick_paired_landmarks(
         fixed_texts = []
         moving_texts = []
 
-        for i, (x, y) in enumerate(fixed_points, start=1):
-            fixed_texts.append(
-                ax_fixed.annotate(
-                    str(i),
-                    (x, y),
-                    xytext=(4, 4),
-                    textcoords="offset points",
-                    color="red",
-                    fontsize=9,
-                    weight="bold",
+        if landmarks_visible["visible"]:
+            for i, (x, y) in enumerate(fixed_points, start=1):
+                fixed_texts.append(
+                    ax_fixed.annotate(
+                        str(i),
+                        (x, y),
+                        xytext=(4, 4),
+                        textcoords="offset points",
+                        color="red",
+                        fontsize=9,
+                        weight="bold",
+                    )
                 )
-            )
 
-        for i, (x, y) in enumerate(moving_preview, start=1):
-            moving_texts.append(
-                ax_moving.annotate(
-                    str(i),
-                    (x, y),
-                    xytext=(4, 4),
-                    textcoords="offset points",
-                    color="cyan",
-                    fontsize=9,
-                    weight="bold",
+            for i, (x, y) in enumerate(moving_preview, start=1):
+                moving_texts.append(
+                    ax_moving.annotate(
+                        str(i),
+                        (x, y),
+                        xytext=(4, 4),
+                        textcoords="offset points",
+                        color="cyan",
+                        fontsize=9,
+                        weight="bold",
+                    )
                 )
-            )
 
         ax_fixed.set_title(f"{fixed_title}: {len(fixed_points)}")
         ax_moving.set_title(f"{moving_title}: {len(moving_points_fullres)}")
-
-        if on_change is not None:
-            on_change(list(fixed_points), list(moving_points_fullres))
 
         if msg is not None:
             _set_status(msg)
@@ -366,6 +385,11 @@ def pick_paired_landmarks(
                 _set_status(f"Next: click {moving_title} for point #{len(moving_points_fullres) + 1}")
 
         fig.canvas.draw_idle()
+
+    def _toggle_landmarks(*args: object) -> None:
+        landmarks_visible["visible"] = not landmarks_visible["visible"]
+        toggle_button.label.set_text("Hide landmarks" if landmarks_visible["visible"] else "Show landmarks")
+        _update_artists(msg="Landmarks hidden." if not landmarks_visible["visible"] else "Landmarks shown.")
 
     def _ctrl_pressed(event) -> bool:
         key = getattr(event, "key", None)
@@ -464,6 +488,9 @@ def pick_paired_landmarks(
         if event.inaxes == ax_save:
             _save()
             return
+        if event.inaxes == ax_toggle:
+            _toggle_landmarks()
+            return
         if event.xdata is None or event.ydata is None:
             return
         if _maybe_ctrl_click_delete(event):
@@ -526,6 +553,7 @@ def pick_paired_landmarks(
         _set_status(f"Saved {len(fixed_points)} landmark pair(s).")
         fig.canvas.draw_idle()
 
+    toggle_button.on_clicked(_toggle_landmarks)
     fig.canvas.mpl_connect("button_press_event", _on_click)
     fig.canvas.mpl_connect("key_press_event", _on_key_press)
     fig.canvas.mpl_connect("key_release_event", _on_key_release)
@@ -581,8 +609,9 @@ def pick_paired_landmarks_overlay(
     fixed_points: list[PointXY] = list(initial_fixed_points_cropped_xy or [])
     moving_points: list[PointXY] = list(initial_moving_points_in_fixed_cropped_xy or [])
     if len(fixed_points) != len(moving_points):
-        fixed_points = []
-        moving_points = []
+        n_pairs = min(len(fixed_points), len(moving_points))
+        fixed_points = fixed_points[:n_pairs]
+        moving_points = moving_points[:n_pairs]
 
     next_side: str = "fixed"
     ctrl_state: dict[str, bool] = {"down": False}
