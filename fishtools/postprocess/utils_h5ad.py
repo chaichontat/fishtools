@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from itertools import chain
 from typing import Literal
 
@@ -75,12 +75,33 @@ def qc(adata: ad.AnnData) -> ad.AnnData:
     return adata
 
 
-def normalize_pearson(adata: ad.AnnData, n_top_genes: int = 2000):
-    """Select HVGs via Pearson residuals, then normalize residuals."""
+def normalize_pearson(
+    adata: ad.AnnData,
+    n_top_genes: int = 2000,
+    *,
+    batch_key: str | None = None,
+    theta: float = 100,
+    clip: float | None = None,
+) -> tuple[ad.AnnData, Callable[[], None]]:
+    """Select HVGs via Pearson residuals, then normalize Pearson residuals.
+
+    When ``batch_key`` is provided, Pearson residuals are computed separately
+    for each batch (similar to per-dataset SCTransform-style normalization).
+    """
 
     import scanpy as sc
 
-    sc.experimental.pp.highly_variable_genes(adata, flavor="pearson_residuals", n_top_genes=n_top_genes)
+    if batch_key is not None and batch_key not in adata.obs:
+        raise KeyError(f"Missing batch column in `adata.obs`: {batch_key!r}")
+
+    sc.experimental.pp.highly_variable_genes(
+        adata,
+        flavor="pearson_residuals",
+        n_top_genes=n_top_genes,
+        batch_key=batch_key,
+        theta=theta,
+        clip=clip,
+    )
 
     def plot():
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -105,11 +126,32 @@ def normalize_pearson(adata: ad.AnnData, n_top_genes: int = 2000):
         ax.xaxis.set_ticks_position("bottom")
         plt.legend()
 
-    adata = adata[:, adata.var["highly_variable"]]
+    adata = adata[:, adata.var["highly_variable"]].copy()
 
     adata.layers["raw"] = adata.X.copy()
     adata.layers["sqrt_norm"] = np.sqrt(sc.pp.normalize_total(adata, inplace=False)["X"])
-    sc.experimental.pp.normalize_pearson_residuals(adata)
+
+    if batch_key is None:
+        sc.experimental.pp.normalize_pearson_residuals(adata, theta=theta, clip=clip)
+        return adata, plot
+
+    from scipy import sparse
+
+    residuals = np.empty((adata.n_obs, adata.n_vars), dtype=np.float32)
+    batch = adata.obs[batch_key]
+    for value in batch.unique():
+        mask = (batch == value).to_numpy(dtype=bool, copy=False)
+        if not bool(mask.any()):
+            continue
+        sub = adata[mask].copy()
+        sc.experimental.pp.normalize_pearson_residuals(sub, theta=theta, clip=clip)
+        x = sub.X
+        if sparse.issparse(x):
+            x = x.toarray()
+        x = np.asarray(x, dtype=np.float32)
+        residuals[mask] = x
+
+    adata.X = residuals
     return adata, plot
 
 
@@ -189,18 +231,30 @@ def filter_leiden(adata: ad.AnnData, keep: Sequence[int | str]) -> ad.AnnData:
 def run_tricycle(adata: ad.AnnData, trc: pd.DataFrame) -> ad.AnnData:
     """Project AnnData onto tricycle cell-cycle embeddings."""
 
+    import scipy.sparse as sp
+
     shared = sorted(set(trc["symbol"]) & set(adata.var_names))
+    if not shared:
+        raise ValueError("No shared genes between `trc['symbol']` and `adata.var_names`.")
     loadings = (
         trc[trc["symbol"].isin(shared)]
         .set_index("symbol")
         .reindex(shared)
         .reset_index()[["pc1.rot", "pc2.rot"]]
     )
-    pls = adata[:, shared].X @ loadings.to_numpy()
+    x = adata[:, shared].X
+    if sp.issparse(x):
+        x = x.toarray()
+    else:
+        x = np.asarray(x)
+
+    x = x.astype(np.float32, copy=False)
+    x_centered = x - np.mean(x, axis=0, keepdims=True)
+    pls = x_centered @ loadings.to_numpy(dtype=np.float32)
+
     adata.obsm["tricycle"] = pls
-    adata.obs["tricycle"] = (
-        np.arctan2(adata.obsm["tricycle"][:, 1], adata.obsm["tricycle"][:, 0] + 1.0) + np.pi / 2
-    ) % (2 * np.pi) - np.pi
+    adata.obsm["X_tricycle"] = pls
+    adata.obs["tricycle"] = (np.arctan2(pls[:, 1], pls[:, 0]) + 2 * np.pi) % (2 * np.pi)
     return adata
 
 
