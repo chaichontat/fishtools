@@ -36,10 +36,10 @@ def _quantize_to_uint16(data: np.ndarray, params: HighpassQuantParams) -> np.nda
     max_u16 = int(np.iinfo(np.uint16).max)
     width = float(max(params.upper - params.lower, 1e-6))
     scale = float(max_u16 - 1) / width
-    out = (arr - float(params.lower)) * scale
+    out = (arr - params.lower) * scale
     np.nan_to_num(out, copy=False)
     out = np.clip(out, 0.0, float(max_u16 - 1))
-    out = np.where(arr > float(params.upper), float(max_u16), out)
+    out = np.where(arr > params.upper, float(max_u16), out)
     return (out + 0.5).astype(np.uint16)
 
 
@@ -48,10 +48,10 @@ def _quantize_to_uint16_gpu(data: cp.ndarray, params: HighpassQuantParams) -> cp
     max_u16 = int(np.iinfo(np.uint16).max)
     width = float(max(params.upper - params.lower, 1e-6))
     scale = float(max_u16 - 1) / width
-    out = (arr - float(params.lower)) * scale
+    out = (arr - params.lower) * scale
     cp.nan_to_num(out, copy=False)
     out = cp.clip(out, 0.0, float(max_u16 - 1))
-    out = cp.where(arr > float(params.upper), float(max_u16), out)
+    out = cp.where(arr > params.upper, float(max_u16), out)
     return cp.rint(out).astype(cp.uint16)
 
 
@@ -64,8 +64,11 @@ def _pick_input_zarr(stitch_root: Path) -> Path:
     )
 
 
-def _copy_zarr_attrs(dst_attrs: zarr.core.attributes.Attributes, src_attrs: zarr.core.attributes.Attributes) -> None:
-    for key in list(src_attrs.keys()):
+def _copy_zarr_attrs(
+    dst_attrs: zarr.core.attributes.Attributes,
+    src_attrs: zarr.core.attributes.Attributes,
+) -> None:
+    for key in src_attrs:
         try:
             dst_attrs[key] = src_attrs[key]
         except TypeError:
@@ -134,14 +137,15 @@ def _compute_quant_params_from_reference_plane(
                 np.maximum(hp, 0.0, out=hp)
                 ref = hp[:, yin0:yin1, xin0:xin1]
 
+            flat = ref.ravel()
+            if flat.size == 0:
+                continue
+
             take = min(remaining, 512)
-            flat = np.asarray(ref, dtype=np.float32).ravel()
-            if flat.size:
-                if flat.size > take:
-                    idx = rng.choice(flat.size, size=take, replace=False)
-                    flat = flat[idx]
-                samples.append(flat)
-                remaining -= int(flat.size)
+            if flat.size > take:
+                flat = flat[rng.choice(flat.size, size=take, replace=False)]
+            samples.append(flat)
+            remaining -= flat.size
 
         if remaining <= 0:
             break
@@ -150,8 +154,6 @@ def _compute_quant_params_from_reference_plane(
         return HighpassQuantParams(lower=0.0, upper=1.0)
 
     data = np.concatenate(samples, axis=0)
-    if data.size == 0:
-        return HighpassQuantParams(lower=0.0, upper=1.0)
 
     lower = float(np.percentile(data, float(percentile_lo)))
     upper = float(np.percentile(data, float(percentile_hi)))
@@ -252,7 +254,7 @@ def run_highpass_workflow(
     }
 
     use_gpu = _cupy_available()
-    y_step, x_step = (base_y, base_x)
+    y_step, x_step = base_y, base_x
     if use_gpu:
         y_step, x_step = _choose_xy_step(
             dim_y=y_dim,
@@ -267,11 +269,8 @@ def run_highpass_workflow(
         logger.info(f"Highpass: using SciPy gaussian_filter (tile={y_step}x{x_step}, pad={pad_xy})")
 
     logger.info(
-        "Computing highpass (sigma_px={sigma}, anisotropy={aniso}, pad_xy={pad}) for shape={shape}",
-        sigma=sigma_px_f,
-        aniso=anisotropy_f,
-        pad=pad_xy,
-        shape=src.shape,
+        f"Computing highpass (sigma_px={sigma_px_f}, anisotropy={anisotropy_f}, pad_xy={pad_xy}) "
+        f"for shape={src.shape}"
     )
 
     quant_params: list[HighpassQuantParams] = []
@@ -344,11 +343,8 @@ def run_highpass_workflow(
                 dest_path.unlink()
         partial_dest_path.replace(dest_path)
     except Exception:
-        try:
-            if partial_dest_path.exists():
-                shutil.rmtree(partial_dest_path, ignore_errors=True)
-        finally:
-            raise
+        shutil.rmtree(partial_dest_path, ignore_errors=True)
+        raise
 
     thumbnail_dir = dest_path.parent / "thumbnails"
     thumbnail_dir.mkdir(exist_ok=True)
