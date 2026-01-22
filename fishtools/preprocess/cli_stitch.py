@@ -32,7 +32,7 @@ from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
 from fishtools.utils.tiff import compose_metadata, normalize_channel_names, read_metadata_from_tif
 from fishtools.utils.utils import add_file_context, batch_roi
 from fishtools.utils.thumbnails import load_thumbnail_options, save_thumbnail_png
-from fishtools.utils.zarr_utils import default_zarr_codecs
+from fishtools.utils.zarr_utils import create_sharded_array
 from fishtools.utils.zarr_utils import numpy_array_to_zarr as _numpy_array_to_zarr
 
 run_cli_workflow: Callable[..., Any] | None = None
@@ -1329,7 +1329,6 @@ def combine(
         extra={"roi": roi, "codebook": codebook, "round_name": round_name, "chunk_size": chunk_size},
     )
     import json as json_module
-    import zarr
 
     ws = Workspace(path)
     target_rois = ws.resolve_rois(None if roi == "*" else [roi])
@@ -1382,16 +1381,12 @@ def combine(
 
         zarr_path = stitched_dir / "fused.zarr"
         logger.info(f"Writing to {zarr_path.resolve()}")
-        zarr_chunks = (1, chunk_size, chunk_size, cs)
-        zarr.config.set({"array.target_shard_size_bytes": "10MB"})
-        codecs = default_zarr_codecs(dtype)
-        z_array = zarr.create_array(
+        zarr_chunks = (1, chunk_size, chunk_size, 1)
+        z_array = create_sharded_array(
             zarr_path,
             shape=final_shape,
             chunks=zarr_chunks,
             dtype=dtype,
-            serializer=codecs[0],
-            compressors=tuple(codecs[1:]),
             overwrite=overwrite,
         )
         fuse_args_path = stitched_dir / "fuse_args.json"
@@ -1628,6 +1623,20 @@ def n4(
     show_default=True,
     help="Z/XY voxel-size ratio used to set sigma_z = highpass_px / anisotropy.",
 )
+@click.option(
+    "--perc-lo",
+    type=float,
+    default=1.0,
+    show_default=True,
+    help="Lower percentile for highpass quantization (0-100).",
+)
+@click.option(
+    "--perc-hi",
+    type=float,
+    default=99.999,
+    show_default=True,
+    help="Upper percentile for highpass quantization (0-100).",
+)
 @click.option("--overwrite", is_flag=True, help="Overwrite existing outputs.")
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def highpass(
@@ -1637,6 +1646,8 @@ def highpass(
     *,
     highpass_px: float,
     anisotropy: float,
+    perc_lo: float,
+    perc_hi: float,
     overwrite: bool,
 ) -> None:
     """Write a high-pass filtered fused zarr as `fused_highpassed.zarr` (uint16)."""
@@ -1645,13 +1656,22 @@ def highpass(
         path,
         component="preprocess.stitch.highpass",
         file=f"stitch-highpass-{roi}+{codebook}",
-        extra={"roi": roi, "codebook": codebook, "highpass_px": highpass_px, "anisotropy": anisotropy},
+        extra={
+            "roi": roi,
+            "codebook": codebook,
+            "highpass_px": highpass_px,
+            "anisotropy": anisotropy,
+            "perc_lo": perc_lo,
+            "perc_hi": perc_hi,
+        },
     )
 
     if anisotropy <= 0:
         raise click.ClickException("--anisotropy must be > 0.")
     if highpass_px <= 0:
         raise click.ClickException("--highpass-px must be > 0.")
+    if not (0.0 <= perc_lo < perc_hi <= 100.0):
+        raise click.ClickException("--perc-lo/--perc-hi must satisfy 0 <= perc_lo < perc_hi <= 100.")
 
     from fishtools.io.workspace import Workspace
     from fishtools.preprocess.highpass import run_highpass_workflow
@@ -1664,6 +1684,8 @@ def highpass(
             stitch_root=stitch_root,
             sigma_px=highpass_px,
             anisotropy=anisotropy,
+            percentile_lo=perc_lo,
+            percentile_hi=perc_hi,
             overwrite=overwrite,
         )
     except Exception as exc:

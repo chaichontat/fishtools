@@ -47,6 +47,7 @@ from fishtools.segmentation.distributed.merge_utils import (
 )
 from fishtools.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
 from fishtools.segmentation.distributed.tiling import solve_internal_xy_for_tiles
+from fishtools.utils.zarr_utils import create_sharded_array, label_zarr_codecs
 
 # Increase Dask timeouts to prevent "Event loop was unresponsive" warnings
 # during long-running GPU operations (Cellpose inference can hold the GIL for seconds)
@@ -378,22 +379,13 @@ def numpy_array_to_zarr(write_path: Path | str, array: NDArray[Any], chunks: tup
         A read+write reference to the zarr array on disk
     """
 
-    zarr.config.set({"array.target_shard_size_bytes": "10MB"})
-    zarr_array = zarr.open(
+    zarr_array = create_sharded_array(
         write_path,
-        mode="w",
-        shape=array.shape,
+        shape=tuple(int(s) for s in array.shape),
         chunks=chunks,
         dtype=array.dtype,
-        codecs=[
-            zarr.codecs.BytesCodec(),
-            zarr.codecs.BloscCodec(
-                cname="zstd",
-                clevel=4,
-                shuffle=zarr.codecs.BloscShuffle.shuffle,
-                typesize=array.dtype.itemsize,
-            ),
-        ],
+        overwrite=True,
+        codecs=label_zarr_codecs(array.dtype) if np.dtype(array.dtype) == np.dtype(np.uint32) else None,
     )
     zarr_array[...] = array
     return zarr_array
@@ -926,14 +918,17 @@ def distributed_eval(
         f"Blocks to process: {len(remaining_block_indices)} (skipped {len(completed_indices)} already completed)"
     )
 
-    zarr.config.set({"array.target_shard_size_bytes": "10MB"})
-    temp_zarr = zarr.open(
-        temp_zarr_path,
-        mode="r+" if is_resume else "w",
-        shape=output_shape,  # Use 3D shape
-        chunks=output_blocksize,  # Use 3D chunks
-        dtype=np.uint32,
-    )
+    if is_resume:
+        temp_zarr = zarr.open(temp_zarr_path, mode="r+")
+    else:
+        temp_zarr = create_sharded_array(
+            temp_zarr_path,
+            shape=output_shape,  # Use 3D shape
+            chunks=output_blocksize,  # Use 3D chunks
+            dtype=np.uint32,
+            overwrite=True,
+            codecs=label_zarr_codecs(np.uint32),
+        )
 
     if not remaining_block_indices:
         logger.info("All blocks already completed, proceeding to merge")

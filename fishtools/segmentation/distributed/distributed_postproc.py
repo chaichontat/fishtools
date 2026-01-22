@@ -125,6 +125,7 @@ from fishtools.segmentation.distributed.merge_utils import (
     stitch_labels,
 )
 from fishtools.utils.logging import setup_cli_logging
+from fishtools.utils.zarr_utils import create_sharded_array, label_zarr_codecs
 
 setup_cli_logging(None, component="distributed_postproc", file="")
 
@@ -505,16 +506,13 @@ def distributed_postproc(
 
     # Create temp zarr for unstitched output
     temp_zarr_path = temporary_directory / "postproc_unstitched.zarr"
-    temp_zarr = zarr.open(
+    temp_zarr = create_sharded_array(
         temp_zarr_path,
-        mode="w",
-        shape=input_zarr.shape,
+        shape=tuple(int(s) for s in input_zarr.shape),
         chunks=blocksize,
         dtype=np.uint32,
-        codecs=[
-            zarr.codecs.BytesCodec(),
-            zarr.codecs.BloscCodec(cname="zstd", clevel=4, shuffle=zarr.codecs.BloscShuffle.shuffle),
-        ],
+        overwrite=True,
+        codecs=label_zarr_codecs(np.uint32),
     )
 
     # Prepare postproc kwargs
@@ -580,7 +578,15 @@ def distributed_postproc(
     if len(box_ids_list) == 0:
         logger.warning("No labels found in any block")
         # Just copy temp to output
-        dask.array.to_zarr(dask.array.from_zarr(temp_zarr), str(write_path), overwrite=True)
+        out = create_sharded_array(
+            write_path,
+            shape=tuple(int(s) for s in temp_zarr.shape),
+            chunks=tuple(int(c) for c in temp_zarr.chunks),
+            dtype=np.uint32,
+            overwrite=True,
+            codecs=label_zarr_codecs(np.uint32),
+        )
+        dask.array.to_zarr(dask.array.from_zarr(temp_zarr), out, overwrite=False)
         _copy_zarr_metadata(
             input_zarr, write_path, input_path=input_path, postproc_params={**postproc_kwargs, "margin": margin}
         )
