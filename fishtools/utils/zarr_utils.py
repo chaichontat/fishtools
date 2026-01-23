@@ -47,17 +47,6 @@ def label_zarr_codecs(dtype: np.dtype | type[np.generic] | str) -> list[Any]:
     ]
 
 
-def configure_zarr_defaults(*, target_shard_size_bytes: int = DEFAULT_TARGET_SHARD_SIZE_BYTES) -> None:
-    import zarr
-
-    zarr.config.set(
-        {
-            "array.target_shard_size_bytes": int(target_shard_size_bytes),
-            "array.write_empty_chunks": False,
-        }
-    )
-
-
 def choose_shard_shape(
     *,
     shape: tuple[int, ...],
@@ -120,7 +109,6 @@ def create_sharded_array(
 ):
     import zarr
 
-    configure_zarr_defaults(target_shard_size_bytes=target_shard_size_bytes)
     codecs = default_zarr_codecs(dtype) if codecs is None else codecs
     shards = choose_shard_shape(
         shape=shape,
@@ -137,6 +125,7 @@ def create_sharded_array(
         serializer=codecs[0],
         compressors=tuple(codecs[1:]),
         overwrite=overwrite,
+        config={"write_empty_chunks": False},
     )
 
 
