@@ -32,7 +32,7 @@ from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
 from fishtools.utils.tiff import compose_metadata, normalize_channel_names, read_metadata_from_tif
 from fishtools.utils.utils import add_file_context, batch_roi
 from fishtools.utils.thumbnails import load_thumbnail_options, save_thumbnail_png
-from fishtools.utils.zarr_utils import create_sharded_array
+from fishtools.utils.zarr_utils import create_zarr_array
 from fishtools.utils.zarr_utils import numpy_array_to_zarr as _numpy_array_to_zarr
 
 run_cli_workflow: Callable[..., Any] | None = None
@@ -1382,7 +1382,7 @@ def combine(
         zarr_path = stitched_dir / "fused.zarr"
         logger.info(f"Writing to {zarr_path.resolve()}")
         zarr_chunks = (1, chunk_size, chunk_size, 1)
-        z_array = create_sharded_array(
+        z_array = create_zarr_array(
             zarr_path,
             shape=final_shape,
             chunks=zarr_chunks,

@@ -23,7 +23,7 @@ import scipy.sparse.csgraph
 import zarr
 from numpy.typing import NDArray
 
-from fishtools.utils.zarr_utils import create_sharded_array, label_zarr_codecs
+from fishtools.utils.zarr_utils import create_zarr_array, label_zarr_codecs
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +126,7 @@ def relabel_and_write(
         chunks=segmentation_da.chunks,
     )
     write_path.parent.mkdir(parents=True, exist_ok=True)
-    out = create_sharded_array(
+    out = create_zarr_array(
         write_path,
         shape=tuple(int(s) for s in relabeled.shape),
         chunks=tuple(int(c[0]) for c in relabeled.chunks),

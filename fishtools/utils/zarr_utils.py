@@ -97,30 +97,28 @@ def choose_shard_shape(
 
     return tuple(int(c * m) for c, m in zip(chunks, multipliers, strict=True))
 
-def create_sharded_array(
+
+def create_zarr_array(
     write_path: Path | str,
     *,
     shape: tuple[int, ...],
     chunks: tuple[int, ...],
     dtype: np.dtype | type[np.generic] | str,
     overwrite: bool,
-    target_shard_size_bytes: int = DEFAULT_TARGET_SHARD_SIZE_BYTES,
     codecs: list[Any] | None = None,
 ):
+    """Create a Zarr array using our default codecs.
+
+    This creates *unsharded* arrays (i.e. no `shards=`) because sharding proved
+    slower for our access patterns.
+    """
     import zarr
 
     codecs = default_zarr_codecs(dtype) if codecs is None else codecs
-    shards = choose_shard_shape(
-        shape=shape,
-        chunks=chunks,
-        dtype=dtype,
-        target_shard_size_bytes=target_shard_size_bytes,
-    )
     return zarr.create_array(
         str(write_path),
         shape=shape,
         chunks=chunks,
-        shards=shards,
         dtype=dtype,
         serializer=codecs[0],
         compressors=tuple(codecs[1:]),
@@ -130,7 +128,7 @@ def create_sharded_array(
 
 
 def numpy_array_to_zarr(write_path: Path | str, array: np.ndarray, chunks: tuple[int, ...]):
-    zarr_array = create_sharded_array(
+    zarr_array = create_zarr_array(
         write_path,
         shape=array.shape,
         chunks=chunks,

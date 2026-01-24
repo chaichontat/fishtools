@@ -125,7 +125,7 @@ from fishtools.segmentation.distributed.merge_utils import (
     stitch_labels,
 )
 from fishtools.utils.logging import setup_cli_logging
-from fishtools.utils.zarr_utils import create_sharded_array, label_zarr_codecs
+from fishtools.utils.zarr_utils import create_zarr_array, label_zarr_codecs
 
 setup_cli_logging(None, component="distributed_postproc", file="")
 
@@ -506,7 +506,7 @@ def distributed_postproc(
 
     # Create temp zarr for unstitched output
     temp_zarr_path = temporary_directory / "postproc_unstitched.zarr"
-    temp_zarr = create_sharded_array(
+    temp_zarr = create_zarr_array(
         temp_zarr_path,
         shape=tuple(int(s) for s in input_zarr.shape),
         chunks=blocksize,
@@ -578,7 +578,7 @@ def distributed_postproc(
     if len(box_ids_list) == 0:
         logger.warning("No labels found in any block")
         # Just copy temp to output
-        out = create_sharded_array(
+        out = create_zarr_array(
             write_path,
             shape=tuple(int(s) for s in temp_zarr.shape),
             chunks=tuple(int(c) for c in temp_zarr.chunks),

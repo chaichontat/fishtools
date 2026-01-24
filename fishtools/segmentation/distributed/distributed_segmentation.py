@@ -47,7 +47,7 @@ from fishtools.segmentation.distributed.merge_utils import (
 )
 from fishtools.segmentation.distributed.model_cache import CellposeModelPlugin, get_cached_model
 from fishtools.segmentation.distributed.tiling import solve_internal_xy_for_tiles
-from fishtools.utils.zarr_utils import create_sharded_array, label_zarr_codecs
+from fishtools.utils.zarr_utils import create_zarr_array, label_zarr_codecs
 
 # Increase Dask timeouts to prevent "Event loop was unresponsive" warnings
 # during long-running GPU operations (Cellpose inference can hold the GIL for seconds)
@@ -379,7 +379,7 @@ def numpy_array_to_zarr(write_path: Path | str, array: NDArray[Any], chunks: tup
         A read+write reference to the zarr array on disk
     """
 
-    zarr_array = create_sharded_array(
+    zarr_array = create_zarr_array(
         write_path,
         shape=tuple(int(s) for s in array.shape),
         chunks=chunks,
@@ -921,7 +921,7 @@ def distributed_eval(
     if is_resume:
         temp_zarr = zarr.open(temp_zarr_path, mode="r+")
     else:
-        temp_zarr = create_sharded_array(
+        temp_zarr = create_zarr_array(
             temp_zarr_path,
             shape=output_shape,  # Use 3D shape
             chunks=output_blocksize,  # Use 3D chunks

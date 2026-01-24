@@ -12,7 +12,7 @@ from loguru import logger
 from zarr.core.array import Array as ZarrArray
 
 from fishtools.utils.pretty_print import progress_bar
-from fishtools.utils.zarr_utils import create_sharded_array
+from fishtools.utils.zarr_utils import create_zarr_array
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,7 +230,7 @@ def run_highpass_workflow(
     anisotropy_f = float(anisotropy)
     pad_xy = int(math.ceil(4.0 * sigma_px_f))
 
-    dest = create_sharded_array(
+    dest = create_zarr_array(
         partial_dest_path,
         shape=(z_dim, y_dim, x_dim, c_dim),
         chunks=dest_chunks,

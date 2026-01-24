@@ -45,7 +45,7 @@ from fishtools.io.workspace import Workspace, safe_imwrite
 from fishtools.utils.logging import setup_logging
 from fishtools.utils.pretty_print import progress_bar
 from fishtools.utils.threading import shared_thread_pool
-from fishtools.utils.zarr_utils import default_zarr_codecs
+from fishtools.utils.zarr_utils import create_zarr_array
 
 setup_logging()
 
@@ -1096,18 +1096,15 @@ def _write_fused_corrected_zyxc(
         # Keep source chunking for Z/Y/X, stream in C with chunk=1
         dest_chunks = (min(zc, max(1, len(z_sel))), yc, xc, 1)
     else:
-        dest_chunks = None
-
-    zarr.config.set({"array.target_shard_size_bytes": "10MB"})
+        dest_chunks = (1, min(2048, y_dim), min(2048, x_dim), 1)
 
     t0_open = perf_counter()
-    dest = zarr.open_array(
+    dest = create_zarr_array(
         partial_dest_path,
-        mode="w",
         shape=(len(z_sel), y_dim, x_dim, len(channels)),
         chunks=dest_chunks,
         dtype=np.uint16,
-        codecs=default_zarr_codecs(np.uint16),
+        overwrite=True,
     )
     logger.info(
         "Opened destination Zarr (partial create) at {path} with shape {shape} (took {dt:.2f}s)",
@@ -1118,13 +1115,12 @@ def _write_fused_corrected_zyxc(
     float_dest = None
     if debug and float_dest_path is not None and float_partial_path is not None:
         t0_fopen = perf_counter()
-        float_dest = zarr.open_array(
+        float_dest = create_zarr_array(
             float_partial_path,
-            mode="w",
             shape=(len(z_sel), y_dim, x_dim, len(channels)),
             chunks=dest_chunks,
             dtype=np.float32,
-            codecs=default_zarr_codecs(np.float32),
+            overwrite=True,
         )
         logger.info(
             "Opened float32 debug Zarr at {path} with shape {shape} (took {dt:.2f}s)",
