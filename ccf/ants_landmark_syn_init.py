@@ -63,6 +63,8 @@ click.rich_click.GROUP_ARGUMENTS_OPTIONS = True
 click.rich_click.USE_MARKDOWN = True
 click.rich_click.STYLE_HELPTEXT = ""
 
+DEFAULT_LANDMARK_HEATMAP_SIGMA_UM = 80.0
+
 
 def _parse_int_tuple(value: str) -> tuple[int, ...]:
     parts = [p.strip() for p in value.split(",") if p.strip()]
@@ -217,6 +219,13 @@ def _parse_int_tuple(value: str) -> tuple[int, ...]:
     help="Inject landmark heatmaps as extra metric channels.",
 )
 @click.option(
+    "--landmark-heatmap-sigma-um",
+    type=float,
+    default=DEFAULT_LANDMARK_HEATMAP_SIGMA_UM,
+    show_default=True,
+    help="Gaussian sigma (um) for landmark heatmaps when used as a metric channel.",
+)
+@click.option(
     "--landmark-heatmap-weight",
     type=float,
     default=0.5,
@@ -253,6 +262,7 @@ def main(
     use_feature_images: bool,
     use_mask_distance_metric: bool,
     use_landmark_heatmap_metric: bool,
+    landmark_heatmap_sigma_um: float,
     landmark_heatmap_weight: float,
     crop_fixed_to_overlap: bool,
 ) -> None:
@@ -297,6 +307,7 @@ def main(
         use_feature_images=bool(use_feature_images),
         use_mask_distance_metric=bool(use_mask_distance_metric),
         use_landmark_heatmap_metric=bool(use_landmark_heatmap_metric),
+        landmark_heatmap_sigma_um=float(landmark_heatmap_sigma_um),
         landmark_heatmap_weight=float(landmark_heatmap_weight),
         crop_fixed_to_overlap=bool(crop_fixed_to_overlap),
     )
@@ -315,6 +326,11 @@ MOVING_MASK_NONZERO = True
 
 N4_APPLY_TO_FIXED = True
 N4_MAX_ITERATIONS = (100, 100, 50, 20)
+N4_SHRINK_FACTOR = 4
+N4_SPLINE_SPACING_UM = 2000.0
+N4_BIAS_FIELD_FWHM_UM = 2000.0
+N4_WIENER_FILTER_NOISE = 0.05
+N4_CONVERGENCE_THRESHOLD = 0.01
 
 FEATURE_SIGMA_UM = 80.0
 FEATURE_WEIGHT = 0.2
@@ -330,7 +346,6 @@ CROP_FIXED_DOMAIN_FOR_SYN = False
 FIXED_METRIC_MASK_DILATE_UM = 75.0
 MOVING_METRIC_MASK_DILATE_UM = 75.0
 
-LANDMARK_HEATMAP_SIGMA_UM = 200
 DEFAULT_LANDMARK_HEATMAP_WEIGHT = 0.5
 
 # Deformation field plotting controls.
@@ -607,13 +622,65 @@ def landmark_heatmaps_per_point_mm(
     return out
 
 
+def points_in_bounds_mm(*, domain_img: ants.ANTsImage, points_mm: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points_mm, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError(f"Expected points_mm shape (N,2), got {pts.shape}.")
+
+    origin_x_mm, origin_y_mm = (float(x) for x in domain_img.origin)
+    spacing_x_mm, spacing_y_mm = (float(x) for x in domain_img.spacing)
+    size_x, size_y = (int(x) for x in domain_img.shape)
+
+    ix = np.round((pts[:, 0] - origin_x_mm) / spacing_x_mm).astype(np.int64, copy=False)
+    iy = np.round((pts[:, 1] - origin_y_mm) / spacing_y_mm).astype(np.int64, copy=False)
+    return (ix >= 0) & (ix < size_x) & (iy >= 0) & (iy < size_y)
+
+
 def n4_correct_sitk(*, img: sitk.Image, mask: sitk.Image, max_iters: tuple[int, ...]) -> sitk.Image:
     img_f = sitk.Cast(img, sitk.sitkFloat32)
     mask_u8 = sitk.Cast(mask, sitk.sitkUInt8)
 
+    shrink = int(N4_SHRINK_FACTOR)
+    if shrink < 1:
+        raise ValueError(f"N4_SHRINK_FACTOR must be >= 1, got {shrink}.")
+
+    img_fit = img_f
+    mask_fit = mask_u8
+    if shrink > 1:
+        shrink_factors = [shrink] * img_f.GetDimension()
+        img_fit = sitk.Shrink(img_f, shrink_factors)
+        # Shrink is not label-aware; preserve foreground support conservatively.
+        mask_fit = sitk.Cast(sitk.Shrink(mask_u8, shrink_factors) > 0, sitk.sitkUInt8)
+
     n4 = sitk.N4BiasFieldCorrectionImageFilter()
+    n4.SetBiasFieldFullWidthAtHalfMaximum(float(N4_BIAS_FIELD_FWHM_UM) * UM_TO_MM)
+    n4.SetWienerFilterNoise(float(N4_WIENER_FILTER_NOISE))
+    n4.SetConvergenceThreshold(float(N4_CONVERGENCE_THRESHOLD))
     n4.SetMaximumNumberOfIterations(list(max_iters))
-    return n4.Execute(img_f, mask_u8)
+
+    # Configure a coarse B-spline grid in physical units to avoid "over-correcting"
+    # local contrast. Control points = mesh_size + spline_order.
+    desired_spacing_mm = float(N4_SPLINE_SPACING_UM) * UM_TO_MM
+    spline_order = int(n4.GetSplineOrder())  # default 3
+    cps: list[int] = []
+    for d in range(img_fit.GetDimension()):
+        spacing_mm = float(img_fit.GetSpacing()[d])
+        physical_len_mm = spacing_mm * float(img_fit.GetSize()[d])
+        mesh = max(1, int(round(physical_len_mm / max(desired_spacing_mm, 1e-9))))
+        cps.append(mesh + spline_order)
+    n4.SetNumberOfControlPoints(cps)
+
+    _ = n4.Execute(img_fit, mask_fit)
+    log_bias_fit = sitk.Cast(n4.GetLogBiasFieldAsImage(img_fit), sitk.sitkFloat32)
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(img_f)
+    resampler.SetInterpolator(sitk.sitkBSpline)
+    log_bias_full = sitk.Cast(resampler.Execute(log_bias_fit), sitk.sitkFloat32)
+
+    bias = sitk.Exp(log_bias_full)
+    corrected = sitk.Cast(img_f / bias, sitk.sitkFloat32)
+    corrected.CopyInformation(img)
+    return corrected
 
 
 def normalize_sitk_intensity(img: sitk.Image) -> sitk.Image:
@@ -708,6 +775,7 @@ def run_pipeline(
     use_feature_images: bool,
     use_mask_distance_metric: bool,
     use_landmark_heatmap_metric: bool,
+    landmark_heatmap_sigma_um: float,
     landmark_heatmap_weight: float,
     crop_fixed_to_overlap: bool,
 ) -> None:
@@ -742,6 +810,7 @@ def run_pipeline(
     MOVING_MASK_NONZERO = True
 
     LANDMARK_LINEAR_TRANSFORM_TYPE = str(landmark_linear_transform_type).lower()
+    LANDMARK_HEATMAP_SIGMA_UM = float(landmark_heatmap_sigma_um)
     LANDMARK_HEATMAP_WEIGHT = float(landmark_heatmap_weight)
 
     WS_OUTDIR = ws.ccf_transforms(ROI)
@@ -819,7 +888,7 @@ def run_pipeline(
     SAMPLE_VOXEL_XY_UM = float(p1.sample_voxel_xy_um) if p1.sample_voxel_xy_um is not None else 0.216
 
     ATLAS_NAME = p1.atlas_name or 'kim_dev_mouse_e15-5_lsfm_20um'
-    ATLAS_PLANE = p1.atlas_plane or ('sagittal' if 'Sag' in Path(WORKSPACE).name else 'coronal')
+    ATLAS_PLANE = str(p1.atlas_plane or ('sagittal' if 'Sag' in Path(WORKSPACE).name else 'coronal')).lower()
     if p1.atlas_slice_idx is None:
         raise ValueError(f"p1_landmarks.json at {OUT.p1_landmarks_json} is missing atlas_slice_idx.")
     ATLAS_SLICE_IDX = int(p1.atlas_slice_idx)
@@ -921,11 +990,16 @@ def run_pipeline(
 
     # %%
     atlas = BrainGlobeAtlas(ATLAS_NAME)
-    atlas_reference_slices = atlas.reference if ATLAS_PLANE == "coronal" else atlas.reference.transpose(2, 1, 0)
-    atlas_annotation_slices = atlas.annotation if ATLAS_PLANE == "coronal" else atlas.annotation.transpose(2, 1, 0)
-
-    atlas_slice_full = atlas_reference_slices[ATLAS_SLICE_IDX, :, :]
-    atlas_annotation_full = atlas_annotation_slices[ATLAS_SLICE_IDX, :, :]
+    if ATLAS_PLANE == "coronal":
+        atlas_slice_full = atlas.reference[ATLAS_SLICE_IDX, :, :]
+        atlas_annotation_full = atlas.annotation[ATLAS_SLICE_IDX, :, :]
+    elif ATLAS_PLANE == "sagittal":
+        # Avoid transposing the full 3D atlas volume (potentially expensive/eager).
+        # We only need one slice, so slice first then transpose the 2D plane.
+        atlas_slice_full = atlas.reference[:, :, ATLAS_SLICE_IDX].T
+        atlas_annotation_full = atlas.annotation[:, :, ATLAS_SLICE_IDX].T
+    else:
+        raise ValueError(f"Unsupported atlas_plane={ATLAS_PLANE!r}. Expected 'coronal' or 'sagittal'.")
     atlas_brain_mask = atlas_annotation_full > 0
     atlas_slice_full_masked = atlas_slice_full.copy().astype(np.float32)
     atlas_slice_full_masked[~atlas_brain_mask] = 0.0
@@ -1517,24 +1591,32 @@ def run_pipeline(
             title=f"Landmark heatmap overlay (sigma={LANDMARK_HEATMAP_SIGMA_UM:.0f} µm)",
         )
         print(f"Wrote: {DEBUG_MOVING_LANDMARK_HEATMAP_OVERLAY_PNG}")
+        valid = points_in_bounds_mm(domain_img=fixed_reg_ants, points_mm=fixed_pts_mm) & points_in_bounds_mm(
+            domain_img=moving_reg_ants, points_mm=moving_pts_mm
+        )
+        if not np.all(valid):
+            bad_idx = np.flatnonzero(~valid).astype(int).tolist()
+            click.echo(
+                f"WARNING: skipping {len(bad_idx)} landmark heatmap channel(s) outside the registration domain: {bad_idx}",
+                err=True,
+            )
+        fixed_pts_mm_valid = fixed_pts_mm[valid]
+        moving_pts_mm_valid = moving_pts_mm[valid]
+
         fixed_lm_per = landmark_heatmaps_per_point_mm(
             domain_img=fixed_reg_ants,
-            points_mm=fixed_pts_mm,
+            points_mm=fixed_pts_mm_valid,
             sigma_um=LANDMARK_HEATMAP_SIGMA_UM,
         )
         moving_lm_per = landmark_heatmaps_per_point_mm(
             domain_img=moving_reg_ants,
-            points_mm=moving_pts_mm,
+            points_mm=moving_pts_mm_valid,
             sigma_um=LANDMARK_HEATMAP_SIGMA_UM,
         )
-        if len(fixed_lm_per) != len(moving_lm_per):
-            raise ValueError(
-                f"Landmark heatmap channel count mismatch: fixed={len(fixed_lm_per)} vs moving={len(moving_lm_per)}."
-            )
 
         n_lm = len(fixed_lm_per)
         if n_lm > 0:
-            w = float(LANDMARK_HEATMAP_WEIGHT) / float(np.sqrt(float(n_lm)))
+            w = float(LANDMARK_HEATMAP_WEIGHT) / np.sqrt(float(n_lm))
             for f_lm_i, m_lm_i in zip(fixed_lm_per, moving_lm_per, strict=True):
                 if crop_syn:
                     f_lm_i = ants.crop_indices(f_lm_i, fixed_crop_lower, fixed_crop_upper)
@@ -2044,6 +2126,11 @@ def run_pipeline(
         "use_n4": USE_N4,
         "n4_apply_to_fixed": N4_APPLY_TO_FIXED if USE_N4 else None,
         "n4_max_iterations": list(N4_MAX_ITERATIONS) if USE_N4 else None,
+        "n4_shrink_factor": N4_SHRINK_FACTOR if USE_N4 else None,
+        "n4_spline_spacing_um": N4_SPLINE_SPACING_UM if USE_N4 else None,
+        "n4_bias_field_fwhm_um": N4_BIAS_FIELD_FWHM_UM if USE_N4 else None,
+        "n4_wiener_filter_noise": N4_WIENER_FILTER_NOISE if USE_N4 else None,
+        "n4_convergence_threshold": N4_CONVERGENCE_THRESHOLD if USE_N4 else None,
         "p1_threshold_override": P1_THRESHOLD_OVERRIDE,
         "landmark_linear_transform_type": LANDMARK_LINEAR_TRANSFORM_TYPE,
         "syn_type_of_transform": SYN_TYPE_OF_TRANSFORM,

@@ -1,19 +1,16 @@
 # %% [markdown]
-# # Partial Section Registration to DevCCF
+# # Partial Section Registration to DevCCF (frontloaded defs)
 #
-# Hybrid pipeline for registering partial LSFM sections to atlas:
-#
-# | Phase | Method | Purpose |
-# |-------|--------|---------|
-# | 1 | Landmark Similarity2D | Solve orientation ambiguity |
-# | 2 | B-spline (optional) | Gentle local deformation |
+# Same workflow as `ccf/register_partial_section.py`, but with *all helper function definitions grouped near the top*,
+# so you can step through the later cells without scrolling around to find `def ...` blocks.
 #
 # Run cells sequentially. Each phase saves outputs for inspection.
 
- # %%
+# %%
 from __future__ import annotations
 
 import json
+from functools import partial
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -43,13 +40,13 @@ ip = get_ipython()
 if ip is not None:
     ip.run_line_magic("matplotlib", "widget")
 
-# %%
+
 # === EDIT THESE ===
 
 # Workspace configuration
-WORKSPACE = Path.home() / ("nvme/20251015_JaxA2_Sag7")
+WORKSPACE = Path("/working/20251001_JaxA3_Coro11")
 ws = Workspace(WORKSPACE)
-ROI = ws.rois[0]
+ROI = "1whole" #ws.rois[4]
 
 STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.zarr
 
@@ -76,20 +73,7 @@ P1_TFM_PATH = OUT.p1_similarity_tfm
 # Preview downsample factor for interactive elements (sample only)
 PREVIEW_DOWNSAMPLE = 16
 
-# %% [markdown]
-# ## Phase 0: Load Data
 
-# %%
-atlas = BrainGlobeAtlas(ATLAS_NAME)
-atlas_reference_slices = atlas.reference if ATLAS_PLANE == "coronal" else atlas.reference.transpose(2, 1, 0)
-atlas_annotation_slices = atlas.annotation if ATLAS_PLANE == "coronal" else atlas.annotation.transpose(2, 1, 0)
-
-arr = zarr.open(str(SAMPLE_ZARR), mode="r")
-keys = list(arr.attrs.get("key", []))
-ch_idx = keys.index(SAMPLE_CHANNEL) if SAMPLE_CHANNEL in keys else 0
-sample_slice_full_raw = np.asarray(arr[SAMPLE_Z_IDX, :, :, ch_idx])
-
-# Mask atlas to brain only (non-zero annotations) and crop
 def crop_to_content(img: np.ndarray, mask: np.ndarray, pad: int = 10) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     """Crop image to bounding box of mask with padding."""
     rows = np.any(mask, axis=1)
@@ -99,7 +83,6 @@ def crop_to_content(img: np.ndarray, mask: np.ndarray, pad: int = 10) -> tuple[n
     rmin, rmax = np.where(rows)[0][[0, -1]]
     cmin, cmax = np.where(cols)[0][[0, -1]]
 
-    # Add padding
     rmin = max(0, rmin - pad)
     rmax = min(img.shape[0], rmax + pad + 1)
     cmin = max(0, cmin - pad)
@@ -107,107 +90,6 @@ def crop_to_content(img: np.ndarray, mask: np.ndarray, pad: int = 10) -> tuple[n
 
     return img[rmin:rmax, cmin:cmax], (rmin, rmax, cmin, cmax)
 
-
-# Crop sample to non-zero content (preview crop for rotation slider only)
-sample_mask_raw = sample_slice_full_raw > np.percentile(sample_slice_full_raw, 5)  # threshold above noise
-sample_slice, _sample_crop_bbox = crop_to_content(sample_slice_full_raw, sample_mask_raw, pad=50)
-
-
-# %% [markdown]
-# ### Interactive Rotation (find approximate angle first)
-#
-# Use the slider to rotate the sample to a sensible orientation (upright-ish),
-# then run the next cell.
-
-# %%
-# Downsample sample only for fast rotation preview (rotation UI is always shown).
-ROTATION_PREVIEW_DOWNSAMPLE = PREVIEW_DOWNSAMPLE * 2
-sample_preview = sample_slice[::ROTATION_PREVIEW_DOWNSAMPLE, ::ROTATION_PREVIEW_DOWNSAMPLE]
-
-existing_p1 = OUT.try_read_p1_landmarks()
-initial_rotation_deg = existing_p1.prior_rotation_deg if existing_p1 is not None else 0
-initial_flip_x = existing_p1.prior_flip_x if existing_p1 is not None else False
-
-rotation_picker = pick_rotation_deg(
-    moving_image_yx=sample_preview,
-    initial_deg=initial_rotation_deg,
-    initial_flip_x=initial_flip_x,
-)
-
-# %%
-PRIOR_ROTATION_DEG = rotation_picker.deg
-PRIOR_FLIP_X = rotation_picker.flip_x
-print(f"Selected rotation: {PRIOR_ROTATION_DEG}° (flip_x={PRIOR_FLIP_X})")
-
-# Rotate the FULL sample (raw), then crop for landmark selection.
-sample_slice_full_raw_pose = sample_slice_full_raw[:, ::-1] if PRIOR_FLIP_X else sample_slice_full_raw
-if PRIOR_ROTATION_DEG != 0:
-    sample_slice_full = ndimage_rotate(sample_slice_full_raw_pose, PRIOR_ROTATION_DEG, reshape=True, order=1)
-else:
-    sample_slice_full = sample_slice_full_raw_pose
-
-sample_crop_bbox_rot: tuple[int, int, int, int]
-if (
-    existing_p1 is not None
-    and existing_p1.prior_rotation_deg == PRIOR_ROTATION_DEG
-    and existing_p1.prior_flip_x == PRIOR_FLIP_X
-    and existing_p1.sample_rotated_full_shape_yx == tuple(int(x) for x in sample_slice_full.shape)
-):
-    sample_crop_bbox_rot = existing_p1.sample_rotated_crop_bbox
-    sr0, sr1, sc0, sc1 = sample_crop_bbox_rot
-    sample_slice_rotated = sample_slice_full[sr0:sr1, sc0:sc1]
-else:
-    sample_mask = sample_slice_full > np.percentile(sample_slice_full, 5)  # threshold above noise
-    sample_slice_rotated, sample_crop_bbox_rot = crop_to_content(sample_slice_full, sample_mask, pad=50)
-
-# Crop offset in the ROTATED full-image coordinate system (x_offset, y_offset)
-SAMPLE_CROP_OFFSET = (sample_crop_bbox_rot[2], sample_crop_bbox_rot[0])
-
-# Pick atlas Z after rotation (use rotated sample as the fixed reference).
-ATLAS_Z_PREVIEW_DOWNSAMPLE = PREVIEW_DOWNSAMPLE * 2
-atlas_z_sample_preview = sample_slice_rotated[::ATLAS_Z_PREVIEW_DOWNSAMPLE, ::ATLAS_Z_PREVIEW_DOWNSAMPLE]
-
-atlas_slice_picker = pick_atlas_slice_idx(
-    atlas_reference_zyx=atlas_reference_slices,
-    moving_image_yx=atlas_z_sample_preview,
-    initial_idx=(existing_p1.atlas_slice_idx if existing_p1 is not None and existing_p1.atlas_slice_idx is not None else 0),
-    z_min_idx=120,
-    z_max_idx=320,
-)
-
-
-# %% [markdown]
-# ### Interactive Landmark Selection
-#
-# Click paired landmarks (atlas first, then sample). Use "Save landmarks" to persist
-# `p1_landmarks.json` and compute `p1_similarity.tfm` + `p1_result.png` (status will confirm saves).
-#
-# Edit helpers:
-# - Ctrl+click near an existing marker to delete that pair (removes both atlas+sample points)
-# - "Undo last pair" removes the most recent pair (or cancels an unfinished atlas click)
-# - "Clear all" removes all points
-# %%
-atlas_slice_idx = atlas_slice_picker.idx
-print(f"Selected atlas_slice_idx={atlas_slice_idx}")
-
-atlas_slice_full = atlas_reference_slices[atlas_slice_idx, :, :]
-atlas_annotation_full = atlas_annotation_slices[atlas_slice_idx, :, :]
-
-atlas_brain_mask = atlas_annotation_full > 0
-
-atlas_slice_masked = atlas_slice_full.copy()
-atlas_slice_masked[~atlas_brain_mask] = 0
-
-atlas_slice, atlas_crop_bbox = crop_to_content(atlas_slice_masked, atlas_brain_mask, pad=5)
-
-# In sagittal mode, we only need the left-side context for partial sections.
-# Cropping out the rightmost ~40% makes the atlas appear larger in the fixed panel.
-if ATLAS_PLANE == "sagittal":
-    keep_w = int(round(atlas_slice.shape[1] * 0.6))
-    keep_w = max(1, min(int(atlas_slice.shape[1]), keep_w))
-    atlas_slice = atlas_slice[:, :keep_w]
-    r0, r1, c0, c1 = atlas_crop_bbox
-    atlas_crop_bbox = (r0, r1, c0, c0 + keep_w)
 
 def _pallium_subtree_ids(atlas: BrainGlobeAtlas) -> set[int]:
     df = atlas.lookup_df
@@ -259,25 +141,10 @@ def _ventricles_subtree_ids(atlas: BrainGlobeAtlas) -> set[int]:
     return subtree_ids
 
 
-PALLIUM_OVERLAY_MASK: np.ndarray | None = None
-VENTRICLES_OVERLAY_MASK: np.ndarray | None = None
-try:
-    pallium_ids = _pallium_subtree_ids(atlas)
-    r0, r1, c0, c1 = atlas_crop_bbox
-    pallium_full = np.isin(atlas_annotation_full, list(pallium_ids))
-    PALLIUM_OVERLAY_MASK = pallium_full[r0:r1, c0:c1]
-except Exception as exc:
-    print(f"WARNING: Pallium overlay disabled: {exc}")
-
-try:
-    vent_ids = _ventricles_subtree_ids(atlas)
-    r0, r1, c0, c1 = atlas_crop_bbox
-    vent_full = np.isin(atlas_annotation_full, list(vent_ids))
-    VENTRICLES_OVERLAY_MASK = vent_full[r0:r1, c0:c1]
-except Exception as exc:
-    print(f"WARNING: Ventricles overlay disabled: {exc}")
-
-ATLAS_CROP_OFFSET = (atlas_crop_bbox[2], atlas_crop_bbox[0])  # (x_offset, y_offset)
+def _array_to_sitk(arr: np.ndarray, spacing: tuple[float, float]) -> sitk.Image:
+    img = sitk.GetImageFromArray(arr.astype(np.float32))
+    img.SetSpacing(spacing)
+    return img
 
 
 def _save_p1_landmarks(
@@ -327,7 +194,6 @@ def _run_p1_similarity2d(
 
     print(f"Landmark pairs: {len(fixed_points_cropped_xy)}")
 
-    # Convert cropped pixel landmarks to physical coordinates in full-image space.
     fixed_points_full = [(x + ATLAS_CROP_OFFSET[0], y + ATLAS_CROP_OFFSET[1]) for x, y in fixed_points_cropped_xy]
     moving_points_full = [
         (x + SAMPLE_CROP_OFFSET[0], y + SAMPLE_CROP_OFFSET[1]) for x, y in moving_points_fullres_xy_in_rotated_crop
@@ -344,7 +210,6 @@ def _run_p1_similarity2d(
     print(f"  Scale: {transform_similarity.GetScale():.4f}")
     print(f"  Translation: {transform_similarity.GetTranslation()}")
 
-    # Verify landmark errors
     errors: list[float] = []
     for fp, mp in zip(fixed_pts_phys, moving_pts_phys):
         transformed = transform_similarity.TransformPoint(fp)
@@ -360,16 +225,11 @@ def _run_p1_similarity2d(
     sitk.WriteTransform(transform_similarity, str(P1_TFM_PATH))
     print(f"Saved: {P1_TFM_PATH}")
 
-    def array_to_sitk(arr: np.ndarray, spacing: tuple[float, float]) -> sitk.Image:
-        img = sitk.GetImageFromArray(arr.astype(np.float32))
-        img.SetSpacing(spacing)
-        return img
-
     atlas_slice_full_masked = atlas_slice_full.copy().astype(np.float32)
     atlas_slice_full_masked[~atlas_brain_mask] = 0.0
 
-    atlas_sitk = array_to_sitk(atlas_slice_full_masked, (ATLAS_VOXEL, ATLAS_VOXEL))
-    sample_sitk = array_to_sitk(sample_slice_full, (SAMPLE_VOXEL_XY, SAMPLE_VOXEL_XY))
+    atlas_sitk = _array_to_sitk(atlas_slice_full_masked, (ATLAS_VOXEL, ATLAS_VOXEL))
+    sample_sitk = _array_to_sitk(sample_slice_full, (SAMPLE_VOXEL_XY, SAMPLE_VOXEL_XY))
 
     sample_warped = sitk.Resample(
         sample_sitk,
@@ -449,11 +309,294 @@ def _run_p1_similarity2d(
     return transform_similarity, fixed_pts_phys, moving_pts_phys, overlay
 
 
+def _on_landmarks_change(
+    fixed_points_cropped_xy: list[tuple[float, float]],
+    moving_points_fullres_xy_in_rotated_crop: list[tuple[float, float]],
+) -> None:
+    globals()["fixed_points"] = list(fixed_points_cropped_xy)
+    globals()["moving_points_fullres"] = list(moving_points_fullres_xy_in_rotated_crop)
+
+    if len(fixed_points_cropped_xy) < 3:
+        _save_p1_landmarks(
+            fixed_points_cropped_xy=fixed_points_cropped_xy,
+            moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
+        )
+        print(f"Saved: {OUT.p1_landmarks_json}")
+        print("Need at least 3 landmark pairs to compute Similarity2D. Keep clicking, then Save again.")
+        return
+
+    transform_similarity_, fixed_pts_phys_, moving_pts_phys_, overlay_ = _run_p1_similarity2d(
+        fixed_points_cropped_xy=fixed_points_cropped_xy,
+        moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
+        show=False,
+    )
+    globals()["transform_similarity"] = transform_similarity_
+    globals()["fixed_pts_phys"] = fixed_pts_phys_
+    globals()["moving_pts_phys"] = moving_pts_phys_
+    globals()["overlay"] = overlay_
+
+
+def _save_overlay_landmarks(
+    fixed_points_cropped_xy: list[tuple[float, float]],
+    moving_points_in_fixed_cropped_xy: list[tuple[float, float]],
+) -> None:
+    moving_points_fullres_xy_in_rotated_crop: list[tuple[float, float]] = []
+    roundtrip_errors_px: list[float] = []
+    for x_cropped, y_cropped in moving_points_in_fixed_cropped_xy:
+        fixed_full_px = (float(x_cropped) + ATLAS_CROP_OFFSET[0], float(y_cropped) + ATLAS_CROP_OFFSET[1])
+        fixed_phys = (fixed_full_px[0] * ATLAS_VOXEL, fixed_full_px[1] * ATLAS_VOXEL)
+        moving_phys = transform_similarity.TransformPoint(fixed_phys)
+        moving_full_px = (moving_phys[0] / SAMPLE_VOXEL_XY, moving_phys[1] / SAMPLE_VOXEL_XY)
+        moving_points_fullres_xy_in_rotated_crop.append(
+            (moving_full_px[0] - SAMPLE_CROP_OFFSET[0], moving_full_px[1] - SAMPLE_CROP_OFFSET[1])
+        )
+
+        fixed_phys_roundtrip = inverse_similarity.TransformPoint(moving_phys)
+        fixed_full_px_roundtrip = (fixed_phys_roundtrip[0] / ATLAS_VOXEL, fixed_phys_roundtrip[1] / ATLAS_VOXEL)
+        fixed_cropped_px_roundtrip = (
+            fixed_full_px_roundtrip[0] - ATLAS_CROP_OFFSET[0],
+            fixed_full_px_roundtrip[1] - ATLAS_CROP_OFFSET[1],
+        )
+        roundtrip_errors_px.append(
+            float(
+                np.hypot(
+                    fixed_cropped_px_roundtrip[0] - float(x_cropped),
+                    fixed_cropped_px_roundtrip[1] - float(y_cropped),
+                )
+            )
+        )
+
+    _save_p1_landmarks(
+        fixed_points_cropped_xy=fixed_points_cropped_xy,
+        moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
+    )
+    overlay_picker.fig.savefig(out_path, dpi=150)
+    print(f"Saved: {OUT.p1_landmarks_json}")
+    print(f"Saved: {out_path}")
+    if roundtrip_errors_px:
+        print(f"Overlay back-transform roundtrip error: max={max(roundtrip_errors_px):.3g} px")
+
+
+def _otsu_threshold(values: np.ndarray, *, nbins: int = 256) -> float:
+    v = values[np.isfinite(values)].astype(np.float64, copy=False)
+    if v.size == 0:
+        return 0.0
+
+    vmin, vmax = (float(x) for x in np.percentile(v, [0.5, 99.5]))
+    if vmax <= vmin:
+        return vmin
+
+    hist, bin_edges = np.histogram(v, bins=int(nbins), range=(vmin, vmax))
+    hist = hist.astype(np.float64, copy=False)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+
+    weight1 = np.cumsum(hist)
+    weight2 = np.cumsum(hist[::-1])[::-1]
+    mean1 = np.cumsum(hist * bin_centers) / np.maximum(weight1, 1e-12)
+    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / np.maximum(weight2[::-1], 1e-12))[::-1]
+
+    between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
+    if between.size == 0:
+        return float(np.median(v))
+    idx = int(np.argmax(between))
+    return float(bin_centers[idx])
+
+
+def _threshold_update_overlay(
+    *,
+    threshold: float,
+    threshold_img: np.ndarray,
+    overlay_artist: object,
+    hud: object,
+    fig: object,
+) -> None:
+    mask = (threshold_img >= float(threshold)).astype(np.uint8)
+    overlay_artist.set_data(mask)
+    frac = float(mask.mean())
+    hud.set_text(f"thr={float(threshold):.3g}  above={frac:.1%}")
+    fig.canvas.draw_idle()
+
+
+def _threshold_on_save_clicked(
+    _: object,
+    *,
+    slider: Slider,
+    out_json: Path,
+    out_png: Path,
+    preview_downsample: int,
+    prior_rotation_deg: int,
+    prior_flip_x: bool,
+    fig: object,
+) -> None:
+    threshold = float(slider.val)
+    payload = {
+        "threshold": threshold,
+        "image": "sample_preview_rotated",
+        "preview_downsample": int(preview_downsample),
+        "prior_rotation_deg": int(prior_rotation_deg),
+        "prior_flip_x": bool(prior_flip_x),
+    }
+    out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    fig.savefig(out_png, dpi=150)
+    print(f"Saved: {out_json}")
+    print(f"Saved: {out_png}")
+
+
+def _threshold_debounce_flush(
+    *_args: object,
+    debounce_timer: object,
+    pending_threshold: dict[str, float],
+    threshold_img: np.ndarray,
+    overlay_artist: object,
+    hud: object,
+    fig: object,
+) -> None:
+    debounce_timer.stop()
+    _threshold_update_overlay(
+        threshold=float(pending_threshold["value"]),
+        threshold_img=threshold_img,
+        overlay_artist=overlay_artist,
+        hud=hud,
+        fig=fig,
+    )
+
+
+def _threshold_on_slider_change(
+    val: float,
+    *,
+    pending_threshold: dict[str, float],
+    debounce_timer: object,
+) -> None:
+    pending_threshold["value"] = float(val)
+    debounce_timer.stop()
+    debounce_timer.start()
+
+
+atlas = BrainGlobeAtlas(ATLAS_NAME)
+atlas_reference_slices = atlas.reference if ATLAS_PLANE == "coronal" else atlas.reference.transpose(2, 1, 0)
+atlas_annotation_slices = atlas.annotation if ATLAS_PLANE == "coronal" else atlas.annotation.transpose(2, 1, 0)
+
+arr = zarr.open(str(SAMPLE_ZARR), mode="r")
+keys = list(arr.attrs.get("key", []))
+ch_idx = keys.index(SAMPLE_CHANNEL) if SAMPLE_CHANNEL in keys else 0
+sample_slice_full_raw = np.asarray(arr[SAMPLE_Z_IDX, :, :, ch_idx])
+
+# Crop sample to non-zero content (preview crop for rotation slider only)
+sample_mask_raw = sample_slice_full_raw > np.percentile(sample_slice_full_raw, 5)  # threshold above noise
+sample_slice, _sample_crop_bbox = crop_to_content(sample_slice_full_raw, sample_mask_raw, pad=50)
+
+
+# %%
+# ----------------------
+# Rotate (orientation prior)
+# ----------------------
+
+ROTATION_PREVIEW_DOWNSAMPLE = PREVIEW_DOWNSAMPLE * 2
+sample_preview = sample_slice[::ROTATION_PREVIEW_DOWNSAMPLE, ::ROTATION_PREVIEW_DOWNSAMPLE]
+
+existing_p1 = OUT.try_read_p1_landmarks()
+initial_rotation_deg = existing_p1.prior_rotation_deg if existing_p1 is not None else 0
+initial_flip_x = existing_p1.prior_flip_x if existing_p1 is not None else False
+
+rotation_picker = pick_rotation_deg(
+    moving_image_yx=sample_preview,
+    initial_deg=initial_rotation_deg,
+    initial_flip_x=initial_flip_x,
+)
+
+
+# %%
+# ----------------------
+# Pick atlas slice
+# ----------------------
+
+PRIOR_ROTATION_DEG = rotation_picker.deg
+PRIOR_FLIP_X = rotation_picker.flip_x
+print(f"Selected rotation: {PRIOR_ROTATION_DEG}° (flip_x={PRIOR_FLIP_X})")
+
+sample_slice_full_raw_pose = sample_slice_full_raw[:, ::-1] if PRIOR_FLIP_X else sample_slice_full_raw
+if PRIOR_ROTATION_DEG != 0:
+    sample_slice_full = ndimage_rotate(sample_slice_full_raw_pose, PRIOR_ROTATION_DEG, reshape=True, order=1)
+else:
+    sample_slice_full = sample_slice_full_raw_pose
+
+sample_crop_bbox_rot: tuple[int, int, int, int]
+if (
+    existing_p1 is not None
+    and existing_p1.prior_rotation_deg == PRIOR_ROTATION_DEG
+    and existing_p1.prior_flip_x == PRIOR_FLIP_X
+    and existing_p1.sample_rotated_full_shape_yx == tuple(int(x) for x in sample_slice_full.shape)
+):
+    sample_crop_bbox_rot = existing_p1.sample_rotated_crop_bbox
+    sr0, sr1, sc0, sc1 = sample_crop_bbox_rot
+    sample_slice_rotated = sample_slice_full[sr0:sr1, sc0:sc1]
+else:
+    sample_mask = sample_slice_full > np.percentile(sample_slice_full, 5)  # threshold above noise
+    sample_slice_rotated, sample_crop_bbox_rot = crop_to_content(sample_slice_full, sample_mask, pad=50)
+
+SAMPLE_CROP_OFFSET = (sample_crop_bbox_rot[2], sample_crop_bbox_rot[0])
+
+ATLAS_Z_PREVIEW_DOWNSAMPLE = PREVIEW_DOWNSAMPLE * 2
+atlas_z_sample_preview = sample_slice_rotated[::ATLAS_Z_PREVIEW_DOWNSAMPLE, ::ATLAS_Z_PREVIEW_DOWNSAMPLE]
+
+atlas_slice_picker = pick_atlas_slice_idx(
+    atlas_reference_zyx=atlas_reference_slices,
+    moving_image_yx=atlas_z_sample_preview,
+    initial_idx=(existing_p1.atlas_slice_idx if existing_p1 is not None and existing_p1.atlas_slice_idx is not None else 0),
+    z_min_idx=120,
+    z_max_idx=320,
+)
+
+
+# %%
+# ----------------------
+# Phase 1: Prepare atlas crop + overlays
+# ----------------------
+
+atlas_slice_idx = atlas_slice_picker.idx
+print(f"Selected atlas_slice_idx={atlas_slice_idx}")
+
+atlas_slice_full = atlas_reference_slices[atlas_slice_idx, :, :]
+atlas_annotation_full = atlas_annotation_slices[atlas_slice_idx, :, :]
+
+atlas_brain_mask = atlas_annotation_full > 0
+
+atlas_slice_masked = atlas_slice_full.copy()
+atlas_slice_masked[~atlas_brain_mask] = 0
+
+atlas_slice, atlas_crop_bbox = crop_to_content(atlas_slice_masked, atlas_brain_mask, pad=5)
+
+if ATLAS_PLANE == "sagittal":
+    keep_w = int(round(atlas_slice.shape[1] * 0.6))
+    keep_w = max(1, min(int(atlas_slice.shape[1]), keep_w))
+    atlas_slice = atlas_slice[:, :keep_w]
+    r0, r1, c0, c1 = atlas_crop_bbox
+    atlas_crop_bbox = (r0, r1, c0, c0 + keep_w)
+
+PALLIUM_OVERLAY_MASK: np.ndarray | None = None
+VENTRICLES_OVERLAY_MASK: np.ndarray | None = None
+try:
+    pallium_ids = _pallium_subtree_ids(atlas)
+    r0, r1, c0, c1 = atlas_crop_bbox
+    pallium_full = np.isin(atlas_annotation_full, list(pallium_ids))
+    PALLIUM_OVERLAY_MASK = pallium_full[r0:r1, c0:c1]
+except Exception as exc:
+    print(f"WARNING: Pallium overlay disabled: {exc}")
+
+try:
+    vent_ids = _ventricles_subtree_ids(atlas)
+    r0, r1, c0, c1 = atlas_crop_bbox
+    vent_full = np.isin(atlas_annotation_full, list(vent_ids))
+    VENTRICLES_OVERLAY_MASK = vent_full[r0:r1, c0:c1]
+except Exception as exc:
+    print(f"WARNING: Ventricles overlay disabled: {exc}")
+
+ATLAS_CROP_OFFSET = (atlas_crop_bbox[2], atlas_crop_bbox[0])  # (x_offset, y_offset)
+
 sample_preview_rotated = sample_slice_rotated[::PREVIEW_DOWNSAMPLE, ::PREVIEW_DOWNSAMPLE]
 
 _existing_landmark_picker = globals().get("landmark_picker")
 if _existing_landmark_picker is not None:
-    # Cell re-run safety: don't lose an existing editing session.
     if plt.fignum_exists(_existing_landmark_picker.fig.number):
         choice = input(
             "Existing landmark editor is open. Save before restarting? "
@@ -502,39 +645,11 @@ if p1_for_init is not None:
         initial_moving = p1_for_init.moving_points_fullres_xy_in_rotated_crop
         print(f"Loaded existing landmarks from {OUT.p1_landmarks_json}: pairs={len(initial_fixed)}")
 
-
-def _on_landmarks_change(
-    fixed_points_cropped_xy: list[tuple[float, float]],
-    moving_points_fullres_xy_in_rotated_crop: list[tuple[float, float]],
-) -> None:
-    globals()["fixed_points"] = list(fixed_points_cropped_xy)
-    globals()["moving_points_fullres"] = list(moving_points_fullres_xy_in_rotated_crop)
-
-    if len(fixed_points_cropped_xy) < 3:
-        _save_p1_landmarks(
-            fixed_points_cropped_xy=fixed_points_cropped_xy,
-            moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
-        )
-        print(f"Saved: {OUT.p1_landmarks_json}")
-        print("Need at least 3 landmark pairs to compute Similarity2D. Keep clicking, then Save again.")
-        return
-
-    transform_similarity_, fixed_pts_phys_, moving_pts_phys_, overlay_ = _run_p1_similarity2d(
-        fixed_points_cropped_xy=fixed_points_cropped_xy,
-        moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
-        show=False,
-    )
-    globals()["transform_similarity"] = transform_similarity_
-    globals()["fixed_pts_phys"] = fixed_pts_phys_
-    globals()["moving_pts_phys"] = moving_pts_phys_
-    globals()["overlay"] = overlay_
-
 fixed_overlays: list[tuple[np.ndarray, tuple[float, float, float, float]]] = []
 if PALLIUM_OVERLAY_MASK is not None:
     fixed_overlays.append((PALLIUM_OVERLAY_MASK, (0.1, 0.4, 1.0, 0.30)))  # blue
 if VENTRICLES_OVERLAY_MASK is not None:
     fixed_overlays.append((VENTRICLES_OVERLAY_MASK, (0.5, 1.0, 0.5, 0.25)))  # light green
-
 
 landmark_picker = pick_paired_landmarks(
     fixed_image_yx=atlas_slice,
@@ -549,12 +664,12 @@ landmark_picker = pick_paired_landmarks(
     moving_title=f"MOVING (sample, {PREVIEW_DOWNSAMPLE}x ds, rot {PRIOR_ROTATION_DEG}°)",
 )
 
-# %% [markdown]
-# ## Phase 1: Landmark-based Similarity2D
-#
-# Solves: rotation, scale, translation from user-provided landmarks.
 
 # %%
+# ----------------------
+# Phase 1: Compute Similarity2D
+# ----------------------
+
 fixed_points, moving_points_fullres = landmark_picker.get_points()
 transform_similarity, fixed_pts_phys, moving_pts_phys, overlay = _run_p1_similarity2d(
     fixed_points_cropped_xy=fixed_points,
@@ -562,104 +677,7 @@ transform_similarity, fixed_pts_phys, moving_pts_phys, overlay = _run_p1_similar
     show=True,
 )
 
-# %% [markdown]
-# ## Summary
-#
-# | Phase | Transform | File |
-# |-------|-----------|------|
-# | 1 | Landmark Similarity2D | `p1_similarity.tfm` |
-#
-# To apply to full-resolution data or spots:
-# ```python
-# transform = sitk.ReadTransform("transform_final.tfm")
-# warped = sitk.Resample(moving, fixed, transform, sitk.sitkLinear)
-# ```
-
-# %% [markdown]
-# ### Overlay editor (optional)
-#
-# Edit landmark pairs on the final overlay:
-# - Click order: atlas point (magenta structures) → sample point (green structures)
-# - Ctrl+click near an existing marker deletes that pair
-# - Use "Save landmarks" to write `p1_landmarks.json` (and re-save `p1_overlay_landmarks.png`)
-# %%
-overlay_with_landmarks = overlay.copy()
-inverse_similarity = transform_similarity.GetInverse()
-moving_pts_in_fixed_phys = [inverse_similarity.TransformPoint(mp) for mp in moving_pts_phys]
-moving_pts_in_fixed_full_px = [(x / ATLAS_VOXEL, y / ATLAS_VOXEL) for x, y in moving_pts_in_fixed_phys]
-moving_pts_in_fixed_cropped_px = [
-    (x - ATLAS_CROP_OFFSET[0], y - ATLAS_CROP_OFFSET[1]) for x, y in moving_pts_in_fixed_full_px
-]
-
-out_path = OUT.root / "p1_overlay_landmarks.png"
-
-
-def _save_overlay_landmarks(
-    fixed_points_cropped_xy: list[tuple[float, float]],
-    moving_points_in_fixed_cropped_xy: list[tuple[float, float]],
-) -> None:
-    moving_points_fullres_xy_in_rotated_crop: list[tuple[float, float]] = []
-    roundtrip_errors_px: list[float] = []
-    for x_cropped, y_cropped in moving_points_in_fixed_cropped_xy:
-        fixed_full_px = (float(x_cropped) + ATLAS_CROP_OFFSET[0], float(y_cropped) + ATLAS_CROP_OFFSET[1])
-        fixed_phys = (fixed_full_px[0] * ATLAS_VOXEL, fixed_full_px[1] * ATLAS_VOXEL)
-        moving_phys = transform_similarity.TransformPoint(fixed_phys)
-        moving_full_px = (moving_phys[0] / SAMPLE_VOXEL_XY, moving_phys[1] / SAMPLE_VOXEL_XY)
-        moving_points_fullres_xy_in_rotated_crop.append(
-            (moving_full_px[0] - SAMPLE_CROP_OFFSET[0], moving_full_px[1] - SAMPLE_CROP_OFFSET[1])
-        )
-
-        # Sanity check: fixed -> moving -> fixed should recover the clicked location (in fixed/cropped pixels).
-        fixed_phys_roundtrip = inverse_similarity.TransformPoint(moving_phys)
-        fixed_full_px_roundtrip = (fixed_phys_roundtrip[0] / ATLAS_VOXEL, fixed_phys_roundtrip[1] / ATLAS_VOXEL)
-        fixed_cropped_px_roundtrip = (
-            fixed_full_px_roundtrip[0] - ATLAS_CROP_OFFSET[0],
-            fixed_full_px_roundtrip[1] - ATLAS_CROP_OFFSET[1],
-        )
-        roundtrip_errors_px.append(
-            float(
-                np.hypot(
-                    fixed_cropped_px_roundtrip[0] - float(x_cropped),
-                    fixed_cropped_px_roundtrip[1] - float(y_cropped),
-                )
-            )
-        )
-
-    _save_p1_landmarks(
-        fixed_points_cropped_xy=fixed_points_cropped_xy,
-        moving_points_fullres_xy_in_rotated_crop=moving_points_fullres_xy_in_rotated_crop,
-    )
-    overlay_picker.fig.savefig(out_path, dpi=150)
-    print(f"Saved: {OUT.p1_landmarks_json}")
-    print(f"Saved: {out_path}")
-    if roundtrip_errors_px:
-        print(f"Overlay back-transform roundtrip error: max={max(roundtrip_errors_px):.3g} px")
-
-
-overlay_picker = pick_paired_landmarks_overlay(
-    overlay_image_yx_rgb=overlay_with_landmarks,
-    initial_fixed_points_cropped_xy=list(fixed_points),
-    initial_moving_points_in_fixed_cropped_xy=list(moving_pts_in_fixed_cropped_px),
-    min_pairs=3,
-    on_save=_save_overlay_landmarks,
-    title="Overlay + landmarks (magenta=atlas, green=sample)",
-    fixed_label="atlas point",
-    moving_label="sample point",
-)
-
-# %%
-
-# %% [markdown]
-# ## Interactive thresholding (optional)
-#
-# Use this to pick a manual intensity threshold on a *downsampled* view of the rotated+copped sample.
-# Pixels above the threshold are highlighted in red. Click "Save threshold" to write:
-# - `p1_threshold.json`
-# - `p1_threshold_preview.png`
-#
-# If `p1_threshold.json` already exists, it will be loaded and used as the initial value.
-
-# %%
+# %% Threshold
 if "sample_preview_rotated" not in globals():
     raise RuntimeError("Missing sample_preview_rotated; run the earlier cells through Phase 1 first.")
 
@@ -670,32 +688,6 @@ threshold_img = sample_preview_rotated.astype(np.float32, copy=False)
 threshold_vals = threshold_img[np.isfinite(threshold_img)]
 if threshold_vals.size == 0:
     raise ValueError("sample_preview_rotated contains no finite values.")
-
-
-def _otsu_threshold(values: np.ndarray, *, nbins: int = 256) -> float:
-    v = values[np.isfinite(values)].astype(np.float64, copy=False)
-    if v.size == 0:
-        return 0.0
-
-    vmin, vmax = (float(x) for x in np.percentile(v, [0.5, 99.5]))
-    if vmax <= vmin:
-        return vmin
-
-    hist, bin_edges = np.histogram(v, bins=int(nbins), range=(vmin, vmax))
-    hist = hist.astype(np.float64, copy=False)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-
-    weight1 = np.cumsum(hist)
-    weight2 = np.cumsum(hist[::-1])[::-1]
-    mean1 = np.cumsum(hist * bin_centers) / np.maximum(weight1, 1e-12)
-    mean2 = (np.cumsum((hist * bin_centers)[::-1]) / np.maximum(weight2[::-1], 1e-12))[::-1]
-
-    between = weight1[:-1] * weight2[1:] * (mean1[:-1] - mean2[1:]) ** 2
-    if between.size == 0:
-        return float(np.median(v))
-    idx = int(np.argmax(between))
-    return float(bin_centers[idx])
-
 
 existing_threshold: float | None = None
 if P1_THRESHOLD_JSON.exists():
@@ -748,52 +740,69 @@ button_ax = fig.add_axes([0.80, 0.045, 0.16, 0.06])
 save_btn = Button(button_ax, "Save", color="0.85", hovercolor="0.95")
 
 DEBOUNCE_MS = 75
-
-
-def _update_overlay(threshold: float) -> None:
-    mask = (threshold_img >= float(threshold)).astype(np.uint8)
-    overlay_artist.set_data(mask)
-    frac = float(mask.mean())
-    hud.set_text(f"thr={float(threshold):.3g}  above={frac:.1%}")
-    fig.canvas.draw_idle()
-
-
-def _on_save_clicked(_: object) -> None:
-    threshold = float(slider.val)
-    payload = {
-        "threshold": threshold,
-        "image": "sample_preview_rotated",
-        "preview_downsample": int(PREVIEW_DOWNSAMPLE),
-        "prior_rotation_deg": int(PRIOR_ROTATION_DEG),
-        "prior_flip_x": bool(PRIOR_FLIP_X),
-    }
-    P1_THRESHOLD_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    fig.savefig(P1_THRESHOLD_PREVIEW_PNG, dpi=150)
-    print(f"Saved: {P1_THRESHOLD_JSON}")
-    print(f"Saved: {P1_THRESHOLD_PREVIEW_PNG}")
-
-
 pending_threshold: dict[str, float] = {"value": float(slider.val)}
 debounce_timer = fig.canvas.new_timer(interval=DEBOUNCE_MS)
 
+debounce_timer.add_callback(
+    partial(
+        _threshold_debounce_flush,
+        debounce_timer=debounce_timer,
+        pending_threshold=pending_threshold,
+        threshold_img=threshold_img,
+        overlay_artist=overlay_artist,
+        hud=hud,
+        fig=fig,
+    )
+)
+slider.on_changed(partial(_threshold_on_slider_change, pending_threshold=pending_threshold, debounce_timer=debounce_timer))
+save_btn.on_clicked(
+    partial(
+        _threshold_on_save_clicked,
+        slider=slider,
+        out_json=P1_THRESHOLD_JSON,
+        out_png=P1_THRESHOLD_PREVIEW_PNG,
+        preview_downsample=int(PREVIEW_DOWNSAMPLE),
+        prior_rotation_deg=int(PRIOR_ROTATION_DEG),
+        prior_flip_x=bool(PRIOR_FLIP_X),
+        fig=fig,
+    )
+)
 
-def _debounce_flush() -> None:
-    debounce_timer.stop()
-    _update_overlay(float(pending_threshold["value"]))
+_threshold_update_overlay(
+    threshold=float(slider.val),
+    threshold_img=threshold_img,
+    overlay_artist=overlay_artist,
+    hud=hud,
+    fig=fig,
+)
 
+# %% [markdown]
+# ### Overlay editor (optional)
+#
+# Edit landmark pairs on the final overlay:
+# - Click order: atlas point (magenta structures) → sample point (green structures)
+# - Ctrl+click near an existing marker deletes that pair
+# - Use "Save landmarks" to write `p1_landmarks.json` (and re-save `p1_overlay_landmarks.png`)
+# %%
+overlay_with_landmarks = overlay.copy()
+inverse_similarity = transform_similarity.GetInverse()
+moving_pts_in_fixed_phys = [inverse_similarity.TransformPoint(mp) for mp in moving_pts_phys]
+moving_pts_in_fixed_full_px = [(x / ATLAS_VOXEL, y / ATLAS_VOXEL) for x, y in moving_pts_in_fixed_phys]
+moving_pts_in_fixed_cropped_px = [
+    (x - ATLAS_CROP_OFFSET[0], y - ATLAS_CROP_OFFSET[1]) for x, y in moving_pts_in_fixed_full_px
+]
 
-debounce_timer.add_callback(_debounce_flush)
+out_path = OUT.root / "p1_overlay_landmarks.png"
 
-
-def _on_slider_change(val: float) -> None:
-    pending_threshold["value"] = float(val)
-    debounce_timer.stop()
-    debounce_timer.start()
-
-
-slider.on_changed(_on_slider_change)
-save_btn.on_clicked(_on_save_clicked)
-
-_update_overlay(float(slider.val))
+overlay_picker = pick_paired_landmarks_overlay(
+    overlay_image_yx_rgb=overlay_with_landmarks,
+    initial_fixed_points_cropped_xy=list(fixed_points),
+    initial_moving_points_in_fixed_cropped_xy=list(moving_pts_in_fixed_cropped_px),
+    min_pairs=3,
+    on_save=_save_overlay_landmarks,
+    title="Overlay + landmarks (magenta=atlas, green=sample)",
+    fixed_label="atlas point",
+    moving_label="sample point",
+)
 
 # %%
