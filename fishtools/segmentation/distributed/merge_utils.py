@@ -23,6 +23,8 @@ import scipy.sparse.csgraph
 import zarr
 from numpy.typing import NDArray
 
+from fishtools.utils.zarr_utils import create_zarr_array, label_zarr_codecs
+
 logger = logging.getLogger(__name__)
 
 
@@ -124,7 +126,15 @@ def relabel_and_write(
         chunks=segmentation_da.chunks,
     )
     write_path.parent.mkdir(parents=True, exist_ok=True)
-    dask.array.to_zarr(relabeled, str(write_path), overwrite=True)
+    out = create_zarr_array(
+        write_path,
+        shape=tuple(int(s) for s in relabeled.shape),
+        chunks=tuple(int(c[0]) for c in relabeled.chunks),
+        dtype=np.uint32,
+        overwrite=True,
+        codecs=label_zarr_codecs(np.uint32),
+    )
+    dask.array.to_zarr(relabeled, out, overwrite=False)
 
 
 def get_block_crops(

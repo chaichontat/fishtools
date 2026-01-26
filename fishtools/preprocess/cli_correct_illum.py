@@ -19,7 +19,7 @@ from fishtools.preprocess.spots.illumination import RangeFieldPointsModel
 from fishtools.utils.logging import setup_workspace_logging
 from fishtools.utils.pretty_print import progress_bar, progress_bar_threadpool
 from fishtools.utils.tiff import normalize_channel_names, read_metadata_from_tif
-from fishtools.utils.zarr_utils import default_zarr_codecs
+from fishtools.utils.zarr_utils import create_zarr_array
 
 
 def _edges(n: int, grid: int) -> list[int]:
@@ -1761,13 +1761,12 @@ def export_field(
                 md_common["kind"] = "both"
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 if za_store is None:
-                    za_store = zarr.open(
-                        str(output_path),
-                        mode="w",
+                    za_store = create_zarr_array(
+                        output_path,
                         shape=arr_shape,
                         chunks=chunks,
                         dtype=np.float32,
-                        codecs=default_zarr_codecs(np.float32),
+                        overwrite=False,
                     )
                     za_store.attrs["axes"] = "TCYX"
                     za_store.attrs["t_labels"] = ["low", "range"]
@@ -1860,13 +1859,12 @@ def export_field(
             zat_path = output_path
             zat_path.parent.mkdir(parents=True, exist_ok=True)
             io_start = time.perf_counter()
-            za_store = zarr.open(
-                str(zat_path),
-                mode="w",
+            za_store = create_zarr_array(
+                zat_path,
                 shape=arr_shape,
                 chunks=chunks,
                 dtype=np.float32,
-                codecs=default_zarr_codecs(np.float32),
+                overwrite=False,
             )
             za_store.attrs["axes"] = "TCYX"
             za_store.attrs["t_labels"] = ["low", "range"]
