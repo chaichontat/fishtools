@@ -381,6 +381,7 @@ class SpotDecodeConfig(BaseModel):
     )  # (z, y, x) for GaussianHighPass
     threads: int = 12  # CAF/decoding parallelism where applicable
     clip_percentile: float = 40.0  # used by align_prod find_threshold
+    norm_field_correction_dir: str | None = None  # output dir from scripts/decoded_norm_field_correction.py
 
 
 # Optimize round defaults used by align_prod when --calc-deviations is enabled

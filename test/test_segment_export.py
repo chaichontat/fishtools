@@ -168,7 +168,7 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
 
     cb_token = Workspace.sanitize_codebook_name(codebook)
     seg_stem = Path(segmentation_name).stem
-    cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
+    cells_path = ws.output / f"polygons+{roi}+{cb_token}+{seg_stem}.parquet"
     assert cells_path.exists()
     cells_df = pl.read_parquet(cells_path)
     assert set(["x", "y", "roi", "area", "marker_mean"]).issubset(set(cells_df.columns))
@@ -180,7 +180,7 @@ def test_segment_export_produces_cells_and_h5ad(tmp_path: Path) -> None:
     assert cells_df.schema["marker_max"] == pl.Float32
     assert cells_df.schema["marker_min"] == pl.Float32
 
-    h5ad_path = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    h5ad_path = ws.output / "h5ads" / f"{roi}.h5ad"
     assert h5ad_path.exists()
     adata = ad.read_h5ad(h5ad_path)
     assert adata.n_obs == n_cells
@@ -285,18 +285,24 @@ def test_segment_export_pools_intensity_std_across_zs(tmp_path: Path) -> None:
 
     cb_token = Workspace.sanitize_codebook_name(codebook)
     seg_stem = Path(segmentation_name).stem
-    cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
+    cells_path = ws.output / f"polygons+{roi}+{cb_token}+{seg_stem}.parquet"
     cells_df = pl.read_parquet(cells_path)
     assert "marker_std" in cells_df.columns
     assert cells_df.schema["marker_std"] == pl.Float32
+    assert "marker_punctate" in cells_df.columns
+    assert cells_df.schema["marker_punctate"] == pl.Float32
 
     expected = float(np.sqrt(0.75))
     std_value = float(cells_df.filter(pl.col("roilabel") == f"{roi}|1")["marker_std"][0])
     assert std_value == pytest.approx(expected, rel=1e-4, abs=1e-4)
 
-    h5ad_path = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    punct_value = float(cells_df.filter(pl.col("roilabel") == f"{roi}|1")["marker_punctate"][0])
+    assert punct_value == pytest.approx(1.0 / 9.0, rel=1e-4, abs=1e-4)
+
+    h5ad_path = ws.output / "h5ads" / f"{roi}.h5ad"
     adata = ad.read_h5ad(h5ad_path)
     assert "marker_std" in adata.obs.columns
+    assert "marker_punctate" in adata.obs.columns
 
 
 def test_segment_export_pools_median_across_zs(tmp_path: Path) -> None:
@@ -379,14 +385,14 @@ def test_segment_export_pools_median_across_zs(tmp_path: Path) -> None:
 
     cb_token = Workspace.sanitize_codebook_name(codebook)
     seg_stem = Path(segmentation_name).stem
-    cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
+    cells_path = ws.output / f"polygons+{roi}+{cb_token}+{seg_stem}.parquet"
     cells_df = pl.read_parquet(cells_path)
     assert "marker_median" in cells_df.columns
 
     median_value = float(cells_df.filter(pl.col("roilabel") == f"{roi}|1")["marker_median"][0])
     assert median_value == pytest.approx(2.0)
 
-    h5ad_path = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    h5ad_path = ws.output / "h5ads" / f"{roi}.h5ad"
     adata = ad.read_h5ad(h5ad_path)
     assert "marker_median" in adata.obs.columns
 
@@ -443,9 +449,7 @@ def test_segment_export_keeps_cells_without_spots(tmp_path: Path) -> None:
         diag=False,
     )
 
-    cb_token = Workspace.sanitize_codebook_name(codebook)
-    seg_stem = Path(segmentation_name).stem
-    h5ad_path = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    h5ad_path = ws.output / "h5ads" / f"{roi}.h5ad"
     adata = ad.read_h5ad(h5ad_path)
     assert adata.n_obs == n_cells
     assert f"{roi}|{n_cells}" in set(adata.obs_names)
@@ -524,16 +528,22 @@ def test_segment_export_roiset_rotation_and_subroi(tmp_path: Path) -> None:
         diag=False,
     )
 
-    cb_token = Workspace.sanitize_codebook_name(codebook)
-    seg_stem = Path(segmentation_name).stem
-    out_h5ad = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    out_h5ad = ws.output / "h5ads" / f"{roi}.h5ad"
     adata = ad.read_h5ad(out_h5ad)
 
     obs_p0 = adata.obs.loc[f"{roi}|1"]
     obs_p1 = adata.obs.loc[f"{roi}|2"]
     assert obs_p0["subroi"] == "subA"
     assert obs_p1["subroi"] == ""
-    assert abs(float(obs_p0["y"]) - float(obs_p1["y"])) < 1e-3
+
+    # Canonical x/y stay in fused coordinates for downstream indexing.
+    assert abs(float(obs_p0["y"]) - float(obs_p1["y"])) > 1e-3
+
+    # RoiSet line rotation is exposed separately for visualization.
+    assert "spatial_roiset" in adata.obsm
+    assert "x_roiset" in adata.obs.columns
+    assert "y_roiset" in adata.obs.columns
+    assert abs(float(obs_p0["y_roiset"]) - float(obs_p1["y_roiset"])) < 1e-3
 
 
 def test_segment_export_roiset_multiple_lines_errors(tmp_path: Path) -> None:
@@ -674,13 +684,13 @@ def test_segment_export_runs_without_intensity_data(tmp_path: Path) -> None:
 
     cb_token = Workspace.sanitize_codebook_name(codebook)
     seg_stem = Path(segmentation_name).stem
-    cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
+    cells_path = ws.output / f"polygons+{roi}+{cb_token}+{seg_stem}.parquet"
     assert cells_path.exists()
     cells_df = pl.read_parquet(cells_path)
     assert set(["x", "y", "roi", "area"]).issubset(set(cells_df.columns))
     assert "marker_mean" not in cells_df.columns
 
-    h5ad_path = ws.output / f"all+{cb_token}+{seg_stem}.h5ad"
+    h5ad_path = ws.output / "h5ads" / f"{roi}.h5ad"
     assert h5ad_path.exists()
     adata = ad.read_h5ad(h5ad_path)
     assert adata.n_obs == n_cells
@@ -778,10 +788,11 @@ def test_segment_export_multi_codebook_writes_distinct_h5ad_name(tmp_path: Path)
     )
 
     seg_stem = Path(segmentation_name).stem
-    cells_path = ws.output / f"polygons+{primary_codebook}+{seg_stem}.parquet"
+    cb_token = Workspace.sanitize_codebook_name(primary_codebook)
+    cells_path = ws.output / f"polygons+{roi}+{cb_token}+{seg_stem}.parquet"
     assert cells_path.exists()
 
-    out_h5ad = ws.output / f"all+{primary_codebook}__{secondary_codebook}+{seg_stem}.h5ad"
+    out_h5ad = ws.output / "h5ads" / f"{roi}.h5ad"
     assert out_h5ad.exists()
     adata = ad.read_h5ad(out_h5ad)
     assert adata.n_obs == n_cells

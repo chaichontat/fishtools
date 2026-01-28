@@ -345,19 +345,20 @@ def _copy_chromatic_corrections_to_output(cli_path: Path, chromatic_dir: Path) -
     )
 
 
-def sort_key(x: tuple[str, np.ndarray]) -> int | str:
-    """Key function for dict.items() by numerical order.
+def sort_key(x: str | tuple[str, np.ndarray]) -> str:
+    """Key function for dict items / strings by numerical order.
 
     Args:
-        x: dict.items() tuple with bit name as first element and array as second element.
+        x: Bit name string or dict.items() tuple with bit name as first element.
 
     Returns:
         Key for sorting.
     """
+    name = x if isinstance(x, str) else x[0]
     try:
-        return f"{int(x[0]):02d}"
+        return f"{int(name):02d}"
     except ValueError:
-        return x[0]
+        return name
 
 
 def apply_deconv_scaling(
@@ -713,6 +714,7 @@ class Image:
         *,
         discards: dict[str, list[str]] | None = None,
         n_fids: int = 1,
+        load_nofid: bool = True,
     ):
         ws = Workspace(path.parent.parent)
         stem = path.stem
@@ -729,7 +731,18 @@ class Image:
 
         with TiffFile(path) as tif:
             try:
-                img = tif.asarray()
+                if load_nofid:
+                    img = tif.asarray()
+                    fid_stack = np.atleast_3d(img[-n_fids:])
+                else:
+                    if n_fids <= 0:
+                        raise ValueError("n_fids must be > 0")
+                    if len(tif.pages) < n_fids:
+                        raise ValueError(
+                            f"{path}: expected at least {n_fids} frames, got {len(tif.pages)}"
+                        )
+                    fid_stack = np.stack([p.asarray() for p in tif.pages[-n_fids:]], axis=0)
+                    img = None
                 try:
                     metadata = tif.shaped_metadata[0]  # type: ignore
                 except IndexError:
@@ -775,8 +788,13 @@ class Image:
         else:
             global_deconv_scaling = None
 
-        tile_h, tile_w = img.shape[-2], img.shape[-1]
-        nofid = img[:-n_fids].reshape(-1, len(powers), tile_h, tile_w)
+        if img is None:
+            fids_raw = np.atleast_3d(fid_stack).max(axis=0)
+            nofid = np.empty((0, 0, 0, 0), dtype=np.uint16)
+        else:
+            tile_h, tile_w = img.shape[-2], img.shape[-1]
+            nofid = img[:-n_fids].reshape(-1, len(powers), tile_h, tile_w)
+            fids_raw = np.atleast_3d(fid_stack).max(axis=0)
 
         if to_discard_idxs:
             _bits = name.split("_")
@@ -786,12 +804,14 @@ class Image:
                 del powers[power_keys[_idx_d]]
             name = "_".join(_bits)
             keeps = list(sorted(set(range(len(bits))) - set(to_discard_idxs)))
-            nofid = nofid[:, keeps]
+            if img is not None:
+                nofid = nofid[:, keeps]
             bits = [bits[i] for i in keeps]
             global_deconv_scaling = (
                 global_deconv_scaling[:, keeps] if global_deconv_scaling is not None else None
             )
-            assert len(_bits) == nofid.shape[1]
+            if img is not None:
+                assert len(_bits) == nofid.shape[1]
 
         path_basic = path.parent.parent / "basic" / f"{name}.pkl"
         if path_basic.exists():
@@ -805,7 +825,6 @@ class Image:
             # raise Exception(f"No basic template found at {path_basic}")
             basic = lambda: None
 
-        fids_raw = np.atleast_3d(img[-n_fids:]).max(axis=0)
         return cls(
             name=name,
             idx=int(idx),
@@ -824,14 +843,15 @@ class Image:
         if len(fid.shape) == 3:
             fid = fid.max(axis=0)
 
-        temp = -ndimage.gaussian_laplace(fid.astype(np.float32).copy(), sigma=3)  # type: ignore
+        temp = -ndimage.gaussian_laplace(fid.astype(np.float32, copy=False), sigma=3)  # type: ignore
+        temp = temp.astype(np.float32, copy=False)
         temp -= temp.min()
-        percs = np.percentile(temp, [1, 99.99])
+        percs = np.percentile(temp, [1, 99.99]).astype(np.float32, copy=False)
 
         if percs[1] - percs[0] == 0:
             raise ValueError("Uniform image")
         temp = (temp - percs[0]) / (percs[1] - percs[0])
-        return temp
+        return temp.astype(np.float32, copy=False)
 
 
 def run_fiducial(
@@ -844,6 +864,7 @@ def run_fiducial(
     idx: int,
     reference: str,
     debug: bool,
+    prior_only: bool = False,
     no_priors: bool = False,
     fids_raw: dict[str, np.ndarray],
     max_iters: int = 5,
@@ -884,6 +905,17 @@ def run_fiducial(
         anchor_roi=config.registration.fiducial.anchor_roi,
         idx=idx,
     )
+
+    if prior_only:
+        if no_priors:
+            raise click.ClickException("--use-prior-only cannot be combined with --no-priors.")
+        if config.registration.fiducial.anchor_roi is not None:
+            raise click.ClickException("--use-prior-only cannot be combined with --anchors.")
+        if not config.registration.fiducial.priors:
+            raise click.ClickException(
+                "--use-prior-only requires prior shifts. Provide explicit priors or generate them "
+                "by running registration on enough tiles."
+            )
 
     if debug and config.registration.fiducial.anchor_roi is None:
         if no_priors:
@@ -958,6 +990,10 @@ def run_fiducial(
         shifts = {k: anchor_shifts.get(k, np.array([0.0, 0.0])) for k in fids}
         residuals = {k: 0.0 for k in fids}
         stats: dict[str, FiducialAlignmentStats | None] = {k: None for k in fids}
+    elif prior_only:
+        shifts = {k: np.array([0.0, 0.0]) for k in fids}
+        residuals = {k: 0.0 for k in fids}
+        stats = {k: None for k in fids}
     else:
         shifts, residuals, stats = align_fiducials_with_stats(
             fids,
@@ -1057,6 +1093,7 @@ def _run(
     debug: bool = False,
     overwrite: bool = False,
     no_priors: bool = False,
+    prior_only: bool = False,
     repaired_rounds: set[str] | None = None,
     max_iters: int = 5,
     use_shifts_from: str | None = None,
@@ -1156,34 +1193,36 @@ def _run(
         p for p in roi_dirs if set(p.name.split("--")[0].split("_")) & (codebook_bits | reference_bits)
     }
 
-    # Convert file name to bit
-    _imgs: list[Image] = [
-        Image.from_file(
-            file,
-            discards=config.registration and config.registration.discards,
-            n_fids=config.registration.fiducial.n_fids,
-        )
+    files = [
+        file
         for file in chain.from_iterable(p.glob(f"*-{idx:04d}.tif") for p in folders)
         if not any(file.parent.name.startswith(bad) for bad in FORBIDDEN_PREFIXES + (config.exclude or []))
     ]
-    imgs = {img.name: img for img in _imgs}
-    del _imgs
-
-    logger.debug(f"{len(imgs)} files: {list(imgs)}")
-    if not imgs:
+    if not files:
         raise FileNotFoundError(f"No files found in {path} with index {idx}")
 
     if not shifts:
+        # Fiducial-only pass to keep memory low while solving shifts.
+        fid_imgs = {
+            img.name: img
+            for img in (
+                Image.from_file(
+                    file,
+                    discards=config.registration and config.registration.discards,
+                    n_fids=config.registration.fiducial.n_fids,
+                    load_nofid=False,
+                )
+                for file in files
+            )
+        }
+
         # Use raw fiducials for FFT/ITK (ITK applies its own preprocessing)
         # Use LoG-processed fiducials for spot-based alignment
         use_fft = config.registration.fiducial.use_fft
         use_itk = config.registration.fiducial.use_itk
         use_raw = use_fft or use_itk
-        fid_images = {
-            name: img.fid_raw.astype(np.float32) if use_raw else img.fid
-            for name, img in imgs.items()
-        }
-        fid_raw_images = {name: img.fid_raw.astype(np.float32) for name, img in imgs.items()}
+        fid_raw_images = {name: img.fid_raw.astype(np.float32, copy=False) for name, img in fid_imgs.items()}
+        fid_images = fid_raw_images.copy() if use_raw else {name: img.fid for name, img in fid_imgs.items()}
         if reference not in fid_raw_images:
             logger.info(f"Loading reference fiducial {reference} from previous run.")
             raw_ref = _load_reference_fid_from_previous_run(
@@ -1206,10 +1245,27 @@ def _run(
             reference=reference,
             debug=debug,
             idx=idx,
+            prior_only=prior_only,
             no_priors=no_priors,
             fids_raw=fid_raw_images,
             max_iters=max_iters,
         )
+        del fid_imgs, fid_images, fid_raw_images
+
+    # Full pass: load the full stacks after shifts are known.
+    _imgs: list[Image] = [
+        Image.from_file(
+            file,
+            discards=config.registration and config.registration.discards,
+            n_fids=config.registration.fiducial.n_fids,
+        )
+        for file in files
+    ]
+    imgs = {img.name: img for img in _imgs}
+    del _imgs
+
+    logger.debug(f"{len(imgs)} files: {list(imgs)}")
+    assert imgs
 
     for _img in imgs.values():
         del _img.fid, _img.fid_raw
@@ -1254,8 +1310,8 @@ def _run(
     if missing_channels:
         raise KeyError(missing_channels[0])
 
-    transformed: dict[str, np.ndarray] = {}
-    ref = None
+    keys = sorted(bits_in_output, key=sort_key)
+    out: np.ndarray | None = None
 
     required_chromatic = ("560to650.txt", "560to750.txt")
     if any(not (ws.output.chromatic / filename).exists() for filename in required_chromatic):
@@ -1275,14 +1331,15 @@ def _run(
 
     needs_gpu_cleanup = config.registration.downsample > 1
     try:
-        for i, bit in enumerate(bits_in_output):
+        ref_set = False
+        for i, bit in enumerate(keys):
             bit = str(bit)
             img = bits[bit]
             del bits[bit]
             c = str(channels[bit])
             # Deconvolution scaling
             orig_name, orig_idx = bit_name_mapping[bit]
-            img = collapse_z(img, config.registration.slices).astype(np.float32)
+            img = collapse_z(img, config.registration.slices).astype(np.float32, copy=False)
             metadata = imgs[orig_name].metadata
 
             if not metadata.get("prenormalized"):
@@ -1298,9 +1355,10 @@ def _run(
                 )
                 del scaling
 
-            if ref is None:
+            if not ref_set:
                 # Need to put this here because of shape change during collapse_z.
-                affine.ref_image = ref = img
+                affine.ref_image = img
+                ref_set = True
 
             # Within-tile alignment. Chromatic corrections.
             logger.debug(f"{bit}: before affine channel={c}, shiftpx={-bits_shifted[bit]}")
@@ -1324,35 +1382,33 @@ def _run(
             else:
                 transformed_img = np.clip(img, 0, 65534).astype(np.uint16)
 
-            transformed[bit] = transformed_img
+            if out is None:
+                out = np.empty(
+                    (
+                        transformed_img.shape[0],
+                        len(keys),
+                        transformed_img.shape[1],
+                        transformed_img.shape[2],
+                    ),
+                    dtype=np.uint16,
+                )
+            elif transformed_img.shape != out[:, 0].shape:
+                raise ValueError(
+                    f"Transformed images have different shapes: expected {out[:, 0].shape}, got {transformed_img.shape}"
+                )
+            out[:, i] = transformed_img
             logger.debug(f"Transformed {bit}: max={img.max()}, min={img.min()}")
-            logger.debug(f"Finished transforming bit={bit} ({i + 1}/{len(bits_in_output)}) for idx={idx:04d}")
+            logger.debug(f"Finished transforming bit={bit} ({i + 1}/{len(keys)}) for idx={idx:04d}")
     finally:
         if needs_gpu_cleanup:
             gpu_release_all()
 
-    if not len(transformed):
+    # Drop any unrequested bits (e.g., extras present in round files) to release backing arrays.
+    bits.clear()
+
+    if out is None:
         raise ValueError("No images were transformed.")
-
-    if not len({img.shape for img in transformed.values()}) == 1:
-        raise ValueError(
-            f"Transformed images have different shapes: {set(img.shape for img in transformed.values())}"
-        )
-
-    sample = next(iter(transformed.values()))
-    out = np.zeros(
-        (sample.shape[0], len(transformed), sample.shape[1], sample.shape[2]),
-        dtype=np.uint16,
-    )
-
-    # Sort by channel
-    for i, (k, v) in enumerate(items := sorted(transformed.items(), key=sort_key)):
-        out[:, i] = v
-    del transformed
-
     # out[0, -1] = fids[reference][crop:-crop:downsample, crop:-crop:downsample]
-
-    keys: list[str] = [k for k, _ in items]
     logger.debug(str([f"{i}: {k}" for i, k in enumerate(keys, 1)]))
 
     # (path / "down2").mkdir(exist_ok=True)
@@ -1413,6 +1469,7 @@ def _build_register_run_argv(
     offset_brightest: int | None,
     allow_large_shifts: bool | None,
     use_shifts_from: str | None,
+    use_prior_only: bool = False,
 ) -> list[str]:
     argv = [
         "preprocess",
@@ -1440,6 +1497,7 @@ def _build_register_run_argv(
         ),
         *(["--allow-large-shifts"] if allow_large_shifts else []),
         *([f"--use-shifts-from={use_shifts_from}"] if use_shifts_from else []),
+        *(["--use-prior-only"] if use_prior_only else []),
     ]
     return argv
 
@@ -1455,8 +1513,12 @@ def register(): ...
     "--config",
     "config_path",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path, resolve_path=True),
-    required=True,
-    help="Path to a JSON RegisterConfig (or Config containing 'registration'). Command-line flags override config values.",
+    default=None,
+    help=(
+        "Path to a JSON RegisterConfig (or Config containing 'registration'). "
+        "Defaults to <workspace>/analysis/deconv/config.json then <workspace>/config.json when present. "
+        "Command-line flags override config values."
+    ),
 )
 @click.option("--codebook", type=click.Path(exists=True, file_okay=True, path_type=Path))
 @click.option("--roi", type=str, default="*")
@@ -1466,6 +1528,11 @@ def register(): ...
 @click.option("--fwhm", type=float, default=None, show_default="from config")
 @click.option("--overwrite", is_flag=True)
 @click.option("--no-priors", is_flag=True)
+@click.option(
+    "--use-prior-only",
+    is_flag=True,
+    help="Skip automatic registration and use only the prior shifts (after shifting fiducials, residual shift is 0,0).",
+)
 @click.option(
     "--use-fft",
     is_flag=True,
@@ -1521,7 +1588,7 @@ def register(): ...
 def run(
     path: Path,
     idx: int,
-    config_path: Path,
+    config_path: Path | None,
     codebook: Path,
     roi: str | None,
     debug: bool = False,
@@ -1530,6 +1597,7 @@ def run(
     threshold: float | None = None,
     fwhm: float | None = None,
     no_priors: bool = False,
+    use_prior_only: bool = False,
     use_fft: bool | None = None,
     use_itk: bool | None = None,
     anchors: Path | None = None,
@@ -1551,10 +1619,18 @@ def run(
         threshold: σ above median to call fiducial spots. Defaults to the value in --config.
         fwhm: FWHM for the Gaussian spot detector. Defaults to the value in --config.
     """
+    ws = Workspace(path)
+    if config_path is None:
+        config_path = ws.config_json()
+        if config_path is None:
+            raise click.ClickException(
+                "No config.json found. Provide --config or create "
+                "'analysis/deconv/config.json' (preferred) or 'config.json' at the workspace root."
+            )
+
     rois = get_rois(path, roi)
     codebook = _copy_codebook_to_workspace(path, codebook)
     codebook_name = codebook.stem
-    ws = Workspace(path)
 
     loaded_registration = _load_register_config_from_json(config_path)
     _copy_chromatic_corrections_to_output(path, loaded_registration.chromatic_path)
@@ -1576,6 +1652,13 @@ def run(
 
     if registration.fiducial.detailed.offset_brightest > 0 and registration.fiducial.detailed.use_brightest <= 0:
         raise click.ClickException("--offset-brightest requires --use-brightest > 0.")
+
+    if use_prior_only and no_priors:
+        raise click.ClickException("--use-prior-only cannot be combined with --no-priors.")
+    if use_prior_only and anchors is not None:
+        raise click.ClickException("--use-prior-only cannot be combined with --anchors.")
+    if use_prior_only and use_shifts_from is not None:
+        raise click.ClickException("--use-prior-only cannot be combined with --use-shifts-from.")
 
     for roi in rois:
         reg_file = ws.regimg(roi, codebook_name, idx)
@@ -1605,6 +1688,7 @@ def run(
             debug=debug,
             reference=reference_effective,
             no_priors=no_priors,
+            prior_only=use_prior_only,
             config=Config(
                 dataPath=str(DATA),
                 exclude=None,
@@ -1624,8 +1708,12 @@ def run(
     "--config",
     "config_path",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path, resolve_path=True),
-    required=True,
-    help="Path to a JSON RegisterConfig (or Config containing 'registration'). Batch forwards it to child runs.",
+    default=None,
+    help=(
+        "Path to a JSON RegisterConfig (or Config containing 'registration'). "
+        "Defaults to <workspace>/analysis/deconv/config.json then <workspace>/config.json when present. "
+        "Batch forwards it to child runs."
+    ),
 )
 @click.option(
     "--codebook",
@@ -1716,10 +1804,15 @@ def run(
     default=None,
     help="Codebook name to copy shifts from, skipping fiducial registration entirely.",
 )
+@click.option(
+    "--use-prior-only",
+    is_flag=True,
+    help="Skip automatic registration and use only the prior shifts (after shifting fiducials, residual shift is 0,0).",
+)
 def batch(
     path: Path,
     roi: str,
-    config_path: Path,
+    config_path: Path | None,
     reference: str | None,
     codebook: Path,
     fwhm: float | None,
@@ -1738,7 +1831,16 @@ def batch(
     repaired: str | None = None,
     max_iters: int = 5,
     use_shifts_from: str | None = None,
+    use_prior_only: bool = False,
 ):
+    ws = Workspace(path)
+    if config_path is None:
+        config_path = ws.config_json()
+        if config_path is None:
+            raise click.ClickException(
+                "No config.json found. Provide --config or create "
+                "'analysis/deconv/config.json' (preferred) or 'config.json' at the workspace root."
+            )
     # idxs = None
     # use_custom_idx = idxs is not None
     codebook = _copy_codebook_to_workspace(path, codebook)
@@ -1758,6 +1860,8 @@ def batch(
         raise click.ClickException("--only-median-gt requires --overwrite.")
     if only_corr_lt is not None and not overwrite:
         raise click.ClickException("--only-corr-lt requires --overwrite.")
+    if use_prior_only and use_shifts_from is not None:
+        raise click.ClickException("--use-prior-only cannot be combined with --use-shifts-from.")
 
     loaded_registration = _load_register_config_from_json(config_path)
     _copy_chromatic_corrections_to_output(path, loaded_registration.chromatic_path)
@@ -1884,6 +1988,7 @@ def batch(
                         offset_brightest=offset_brightest,
                         allow_large_shifts=allow_large_shifts,
                         use_shifts_from=use_shifts_from,
+                        use_prior_only=use_prior_only,
                     ),
                     check=True,
                 )
@@ -1961,6 +2066,7 @@ def batch(
                         offset_brightest=offset_brightest,
                         allow_large_shifts=allow_large_shifts,
                         use_shifts_from=use_shifts_from,
+                        use_prior_only=use_prior_only,
                     ),
                     check=True,
                 )
@@ -2111,8 +2217,11 @@ def _load_reference_fid_from_previous_run(
     "--config",
     "config_path",
     type=click.Path(exists=True, dir_okay=False, file_okay=True, path_type=Path, resolve_path=True),
-    required=True,
-    help="Path to a JSON RegisterConfig (or Config containing 'registration').",
+    default=None,
+    help=(
+        "Path to a JSON RegisterConfig (or Config containing 'registration'). "
+        "Defaults to <workspace>/analysis/deconv/config.json then <workspace>/config.json when present."
+    ),
 )
 @click.option(
     "--roi",
@@ -2163,7 +2272,7 @@ def _load_reference_fid_from_previous_run(
 def fix_shifts(
     path: Path,
     idx: int | None,
-    config_path: Path,
+    config_path: Path | None,
     roi_option: str | None,
     reference: str | None,
     rounds: str,
@@ -2199,8 +2308,16 @@ def fix_shifts(
     """
     import json as json_module
 
-    loaded_registration = _load_register_config_from_json(config_path)
     ws = Workspace(path)
+    if config_path is None:
+        config_path = ws.config_json()
+        if config_path is None:
+            raise click.ClickException(
+                "No config.json found. Provide --config or create "
+                "'analysis/deconv/config.json' (preferred) or 'config.json' at the workspace root."
+            )
+
+    loaded_registration = _load_register_config_from_json(config_path)
     _copy_chromatic_corrections_to_output(path, loaded_registration.chromatic_path)
     staged_chromatic_dir = ws.output.chromatic
     roi_value = roi_option

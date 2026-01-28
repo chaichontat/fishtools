@@ -2,10 +2,11 @@ import json
 import pickle
 import re
 from collections.abc import Collection
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
+from types import FunctionType
 from typing import Protocol
 
 import matplotlib.pyplot as plt
@@ -282,6 +283,96 @@ def extract_data_from_tiff(
     return out
 
 
+def extract_data_from_tiff_channels(
+    files: list[Path],
+    zs: Collection[float],
+    channel_indices: list[int],
+    deconv_meta: np.ndarray | None = None,
+    max_files: int = 500,
+    nc: int | None = None,
+    *,
+    flips: list[tuple[bool, bool]] | None = None,
+) -> np.ndarray:
+    """Extract data from TIFF files, loading only selected channels.
+
+    Returns a float32 array with shape (n_files * len(zs), len(channel_indices), height, width).
+    """
+    if nc is None:
+        raise ValueError("nc must be provided.")
+    if not channel_indices:
+        raise ValueError("channel_indices must be non-empty.")
+    if any((c < 0) or (c >= nc) for c in channel_indices):
+        raise ValueError(f"channel_indices out of range for nc={nc}: {channel_indices}")
+
+    n = min(len(files), max_files)
+    if flips is not None and len(flips) != n:
+        raise ValueError(f"flips must be length n_files={n}, got {len(flips)}")
+
+    n_zs: dict[str, int] = {}  # Track number of z-slices per file parent directory
+
+    with TiffFile(files[0]) as tif0:
+        first_page = tif0.pages[0].asarray()
+        if first_page.ndim == 3:
+            first_page = first_page[0]
+        if first_page.ndim != 2:
+            raise ValueError(f"Unexpected TIFF page shape {first_page.shape} in {files[0]}.")
+        height, width = first_page.shape
+
+    out = np.zeros((n, len(zs), len(channel_indices), height, width), dtype=np.float32)
+
+    for i, file in enumerate(files[:n]):
+        if i % 100 / max(1, len(channel_indices)) == 0:
+            logger.info(f"Loaded {i}/{n}")
+
+        flip_y = False
+        flip_x = False
+        if flips is not None:
+            flip_y, flip_x = flips[i]
+
+        with TiffFile(file) as tif:
+            if file.parent.name not in n_zs:
+                n_zs[file.parent.name] = len(tif.pages) // nc
+            nz = n_zs[file.parent.name]
+            meta = tif.shaped_metadata[0]
+
+            for out_c, c in enumerate(channel_indices):
+                for k, z in enumerate(zs):
+                    try:
+                        img = tif.pages[int(z * nz) * nc + c].asarray()
+                        if img.ndim == 3:  # single channel
+                            img = img[0]
+                        if img.shape != (height, width):
+                            raise ValueError(
+                                f"Unexpected tile size {img.shape} in {file}; expected {(height, width)}."
+                            )
+
+                        if deconv_meta is not None:
+                            img = scale_deconv(
+                                img,
+                                c,
+                                name=file.name,
+                                global_deconv_scaling=deconv_meta,
+                                metadata=meta,
+                            )
+
+                        if flip_y:
+                            img = img[::-1, :]
+                        if flip_x:
+                            img = img[:, ::-1]
+
+                        out[i, k, out_c] = img
+
+                        if np.sum(out[i, k, out_c]) == 0:
+                            raise ValueError("All zeros.")
+
+                    except Exception as e:
+                        raise Exception(f"Error at {file}, {i}, {k}, {c}.") from e
+
+    out = np.reshape(out, (n * len(zs), len(channel_indices), height, width))
+    logger.info(f"Loaded {n} files. Output shape: {out.shape}")
+    return out
+
+
 def fit_and_save_basic(
     data: np.ndarray,
     output_dir: Path,
@@ -290,6 +381,7 @@ def fit_and_save_basic(
     plot: bool = True,
     *,
     overwrite: bool = False,
+    threads: int = 3,
 ) -> list[BaSiC]:
     """
     Fit BaSiC models for each channel and save the results.
@@ -303,6 +395,8 @@ def fit_and_save_basic(
     Returns:
         List of fitted BaSiC models
     """
+    if threads < 1:
+        raise ValueError(f"threads must be >= 1, got {threads}")
     output_dir.mkdir(exist_ok=True)
     lock = Lock()
 
@@ -344,7 +438,8 @@ def fit_and_save_basic(
 
         return basic
 
-    with ThreadPoolExecutor(3) as exc:
+    max_workers = min(threads, len(channels))
+    with ThreadPoolExecutor(max_workers=max_workers) as exc:
         futs = [exc.submit(fit_write, i, channel) for i, channel in enumerate(channels)]
         basics: list[BaSiC] = []
 
@@ -419,6 +514,130 @@ def extract_data_from_registered(
     return out
 
 
+def extract_data_from_registered_channels(
+    files: list[Path],
+    channel_indices: list[int],
+    max_files: int = 800,
+    *,
+    flips: list[tuple[bool, bool]] | None = None,
+) -> np.ndarray:
+    """Extract data from registered TIFFs, loading only selected channels.
+
+    Computes a max projection over Z and keeps only the requested channels.
+    Returns a float32 array with shape (n_files, len(channel_indices), height, width).
+    """
+    if not channel_indices:
+        raise ValueError("channel_indices must be non-empty.")
+
+    n = min(len(files), max_files)
+    if flips is not None and len(flips) != n:
+        raise ValueError(f"flips must be length n_files={n}, got {len(flips)}")
+
+    with TiffFile(files[0]) as tif0:
+        series0 = tif0.series[0]
+        axes = series0.axes
+        shape = series0.shape
+        if len(axes) != len(shape):
+            raise ValueError(f"Registered TIFF axes/shape mismatch: axes={axes}, shape={shape} in {files[0]}.")
+        if not axes.endswith("YX"):
+            raise ValueError(f"Expected axes ending with YX, got axes={axes} in {files[0]}.")
+        plane_axes = axes[:-2]
+        plane_shape = shape[:-2]
+        if "C" not in plane_axes:
+            raise ValueError(f"Expected a C axis in axes={axes} for {files[0]}.")
+        if any(ax not in {"T", "Z", "C"} for ax in plane_axes):
+            raise ValueError(
+                f"Unsupported registered TIFF plane axes={plane_axes} (full axes={axes}) in {files[0]}."
+            )
+        if "Z" not in plane_axes:
+            raise ValueError(f"Expected a Z axis in axes={axes} for {files[0]}.")
+
+        sizes = dict(zip(plane_axes, plane_shape))
+        nz = int(sizes["Z"])
+        nc = int(sizes["C"])
+        height, width = shape[-2], shape[-1]
+
+        def plane_index(*, t: int = 0, z: int = 0, c: int = 0) -> int:
+            coords = {"T": t, "Z": z, "C": c}
+            idx = 0
+            stride = 1
+            for ax, dim in reversed(list(zip(plane_axes, plane_shape))):
+                idx += int(coords[ax]) * stride
+                stride *= int(dim)
+            return idx
+
+        # Validate early that page indexing is sane for the first file.
+        if plane_index(z=0, c=0) < 0:
+            raise ValueError(f"Invalid plane indexing for axes={axes}, shape={shape} in {files[0]}.")
+
+        if series0.pages is None:
+            raise ValueError(f"Missing pages for series in {files[0]}.")
+        pages0 = series0.pages
+        if len(pages0) != int(np.prod(plane_shape)):
+            raise ValueError(
+                f"Unexpected page count for axes={axes}, shape={shape}: pages={len(pages0)} in {files[0]}."
+            )
+
+        # Read one page to validate plane size without materializing the full stack.
+        first_plane = pages0[plane_index(z=0, c=0)].asarray()
+        if first_plane.ndim == 3:
+            first_plane = first_plane[0]
+        if first_plane.shape != (height, width):
+            raise ValueError(
+                f"Unexpected tile size {first_plane.shape} in {files[0]}; expected {(height, width)}."
+            )
+
+    if any((c < 0) or (c >= nc) for c in channel_indices):
+        raise ValueError(f"channel_indices out of range for nc={nc}: {channel_indices}")
+
+    out = np.zeros((n, len(channel_indices), height, width), dtype=np.float32)
+
+    for i, file in enumerate(files[:n]):
+        if i % 20 == 0:
+            logger.info("Loaded {}/{}", i, n)
+
+        flip_y = False
+        flip_x = False
+        if flips is not None:
+            flip_y, flip_x = flips[i]
+
+        with TiffFile(file) as tif:
+            series = tif.series[0]
+            if series.axes != axes or series.shape[-2:] != (height, width):
+                raise ValueError(
+                    f"Registered TIFF layout mismatch across files: expected axes={axes}, yx={(height, width)}, "
+                    f"got axes={series.axes}, yx={series.shape[-2:]} in {file}."
+                )
+            pages = series.pages
+            if pages is None:
+                raise ValueError(f"Missing pages for series in {file}.")
+
+            for out_c, c in enumerate(channel_indices):
+                max_img: np.ndarray | None = None
+                for z in range(nz):
+                    img = pages[plane_index(z=z, c=c)].asarray()
+                    if img.ndim == 3:
+                        img = img[0]
+                    if img.shape != (height, width):
+                        raise ValueError(
+                            f"Unexpected tile size {img.shape} in {file}; expected {(height, width)}."
+                        )
+                    max_img = img if max_img is None else np.maximum(max_img, img)
+
+                if max_img is None:
+                    raise ValueError(f"Failed to load any pages for channel {c} in {file}.")
+
+                if flip_y:
+                    max_img = max_img[::-1, :]
+                if flip_x:
+                    max_img = max_img[:, ::-1]
+
+                out[i, out_c] = max_img
+
+    logger.info(f"Loaded {n} files. Output shape: {out.shape}")
+    return out
+
+
 def run_with_extractor(
     path: Path,
     round_: str | None,
@@ -427,8 +646,10 @@ def run_with_extractor(
     plot_selected: bool = False,
     zs: Collection[float] = (0.5,),
     *,
+    max_n_tiles: int = 1000,
     seed: int | None = None,
     random_flip: bool = False,
+    threads: int = 3,
     overwrite: bool = False,
     include_edge_tiles: bool = False,
 ):
@@ -453,6 +674,8 @@ def run_with_extractor(
     # Validate inputs
     if not all(0 <= z <= 1 for z in zs):
         raise ValueError("zs must be between 0 and 1.")
+    if max_n_tiles < 0:
+        raise ValueError("max_n_tiles must be >= 0 (0 means no limit).")
 
     # Get rounds/tiles. When round_ is None → sample canonical rounds with dedup & 2-step margin.
     if not round_:
@@ -529,7 +752,8 @@ def run_with_extractor(
             "Please generate ROI CSVs (e.g. via stitching helpers) before running 'preprocess basic run'."
         )
 
-    files = rng.sample(filtered_files, k=min(1000, len(filtered_files)))
+    k = len(filtered_files) if max_n_tiles == 0 else min(max_n_tiles, len(filtered_files))
+    files = rng.sample(filtered_files, k=k)
     # Print sample names
     show_n = min(10, len(files))
     if show_n:
@@ -642,20 +866,111 @@ def run_with_extractor(
     except Exception as e:
         logger.warning(f"Sampling plot generation failed: {e}")
 
-    # Extract data using the provided extractor function
-    flip_rng = np.random.default_rng(seed) if random_flip else None
-    data = extractor_func(
-        files,
-        zs,
-        deconv_meta,
-        nc=len(channels),
-        max_files=1000 if round_ else 1000,
-        random_flip=random_flip,
-        rng=flip_rng,
+    if threads < 1:
+        raise ValueError(f"threads must be >= 1, got {threads}")
+
+    round_token = round_ or "all"
+
+    is_builtin_extractor = (
+        (extractor_func is extract_data_from_tiff and isinstance(extractor_func, FunctionType))
+        or (extractor_func is extract_data_from_registered and isinstance(extractor_func, FunctionType))
     )
 
-    # Fit and save BaSiC models
-    res = fit_and_save_basic(data, basic_dir, round_ or "all", channels, plot, overwrite=overwrite)
+    # For non-built-in extractors (e.g. tests, patched callables), keep the original behavior.
+    if not is_builtin_extractor:
+        flip_rng = np.random.default_rng(seed) if random_flip else None
+        data = extractor_func(
+            files,
+            zs,
+            deconv_meta,
+            nc=len(channels),
+            max_files=len(files),
+            random_flip=random_flip,
+            rng=flip_rng,
+        )
+        res = fit_and_save_basic(
+            data,
+            basic_dir,
+            round_token,
+            channels,
+            plot,
+            overwrite=overwrite,
+            threads=threads,
+        )
+    else:
+        # Precompute per-file flips so channel-batched loading stays consistent across batches.
+        flips: list[tuple[bool, bool]] | None = None
+        if random_flip:
+            flip_rng = np.random.default_rng(seed)
+            flips = [(bool(flip_rng.random() < 0.5), bool(flip_rng.random() < 0.5)) for _ in range(len(files))]
+
+        channels_to_fit: list[str] = []
+        for channel in channels:
+            out_pkl = basic_dir / f"{round_token}-{channel}.pkl"
+            out_png = basic_dir / f"{round_token}-{channel}.png"
+            if overwrite or not out_pkl.exists():
+                channels_to_fit.append(channel)
+            elif out_pkl.exists() and not out_png.exists():
+                loaded = pickle.loads(out_pkl.read_bytes())
+                basic = loaded.get("basic") if isinstance(loaded, dict) else loaded
+                if not isinstance(basic, BaSiC):
+                    raise TypeError(f"Unexpected BaSiC pickle payload at {out_pkl}: {type(basic)}")
+                plot_basic(basic)
+                plt.savefig(out_png)
+                plt.close()
+
+        channel_to_index = {ch: i for i, ch in enumerate(channels)}
+        for start in range(0, len(channels_to_fit), threads):
+            chunk = channels_to_fit[start : start + threads]
+            if not chunk:
+                continue
+
+            for offset, channel in enumerate(chunk):
+                idx = start + offset + 1
+                logger.info(f"Loading channel {idx}/{len(channels_to_fit)} to-fit ({channel}); total={len(channels)}")
+            channel_indices = [channel_to_index[ch] for ch in chunk]
+            if extractor_func is extract_data_from_tiff:
+                data = extract_data_from_tiff_channels(
+                    files,
+                    zs,
+                    channel_indices,
+                    deconv_meta,
+                    nc=len(channels),
+                    max_files=len(files),
+                    flips=flips,
+                )
+            else:
+                data = extract_data_from_registered_channels(
+                    files,
+                    channel_indices,
+                    max_files=len(files),
+                    flips=flips,
+                )
+
+            fit_and_save_basic(
+                data,
+                basic_dir,
+                round_token,
+                chunk,
+                plot,
+                overwrite=overwrite,
+                threads=min(threads, len(chunk)),
+            )
+            del data
+
+        # Match historical return value: one BaSiC per channel for this round.
+        basics_by_channel: dict[str, BaSiC] = {}
+        for channel in channels:
+            out_pkl = basic_dir / f"{round_token}-{channel}.pkl"
+            if not out_pkl.exists():
+                raise FileNotFoundError(f"Expected BaSiC output {out_pkl} was not created.")
+            loaded = pickle.loads(out_pkl.read_bytes())
+            basic = loaded.get("basic") if isinstance(loaded, dict) else loaded
+            if not isinstance(basic, BaSiC):
+                raise TypeError(f"Unexpected BaSiC pickle payload at {out_pkl}: {type(basic)}")
+            basics_by_channel[channel] = basic
+
+        res = [basics_by_channel[ch] for ch in channels]
 
     for r in extra_rounds:
         logger.info(f"Running {r}")
@@ -667,6 +982,7 @@ def run_with_extractor(
             zs=zs,
             seed=seed,
             random_flip=random_flip,
+            threads=threads,
             overwrite=overwrite,
             include_edge_tiles=include_edge_tiles,
         )
@@ -689,6 +1005,21 @@ def basic(): ...
     default=False,
     help="Include edge tiles in BaSiC sampling (does not require ROI CSVs).",
 )
+@click.option(
+    "--max-n-tiles",
+    type=click.IntRange(min=0),
+    default=1000,
+    show_default=True,
+    help="Maximum number of tiles to load (0 = no limit).",
+)
+@click.option(
+    "--threads",
+    "-t",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+    help="Number of channels to load/fit in parallel.",
+)
 @click.option("--seed", type=int, default=None, help="Random seed for sampling (optional)")
 def run(
     path: Path,
@@ -697,6 +1028,8 @@ def run(
     overwrite: bool = False,
     random_flip: bool = False,
     include_edge_tiles: bool = False,
+    max_n_tiles: int = 1000,
+    threads: int = 3,
     zs: str = "0.5",
     seed: int | None = None,
 ):
@@ -731,8 +1064,10 @@ def run(
         extractor,
         plot=False,
         zs=z_values,
+        max_n_tiles=max_n_tiles,
         seed=seed,
         random_flip=random_flip,
+        threads=threads,
         overwrite=overwrite,
         include_edge_tiles=include_edge_tiles,
     )
@@ -741,15 +1076,21 @@ def run(
 @basic.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.option("--overwrite", is_flag=True)
-@click.option("--threads", "-t", type=int, default=1)
 @click.option("--zs", type=str, default="0.5")
+@click.option(
+    "--max-n-tiles",
+    type=click.IntRange(min=0),
+    default=1000,
+    show_default=True,
+    help="Maximum number of tiles to load per round (0 = no limit).",
+)
 @click.option("--seed", type=int, default=None, help="Random seed for sampling (optional)")
 @click.option("--random-flip", is_flag=True, help="Randomly flip tiles vertically and/or horizontally.")
 def batch(
     path: Path,
     overwrite: bool = False,
-    threads: int = 1,
     zs: str = "0.5",
+    max_n_tiles: int = 1000,
     seed: int | None = None,
     random_flip: bool = False,
 ):
@@ -757,17 +1098,19 @@ def batch(
         path,
         component="preprocess.basic.batch",
         file="basic-batch",
-        extra={"threads": threads, "overwrite": overwrite},
+        extra={"overwrite": overwrite},
     )
     rounds = sorted({p.name.split("--")[0] for p in path.glob("*") if p.is_dir() and "--" in p.name})
-    with ThreadPoolExecutor(threads) as exc:
-        futs = [
-            exc.submit(run.callback, path, r, overwrite=overwrite, zs=zs, seed=seed, random_flip=random_flip)
-            for r in rounds  # type: ignore
-        ]
-        for fut in as_completed(futs):
-            fut.result()
-
+    for r in rounds:
+        run.callback(  # type: ignore
+            path,
+            r,
+            overwrite=overwrite,
+            zs=zs,
+            max_n_tiles=max_n_tiles,
+            seed=seed,
+            random_flip=random_flip,
+        )
 
 if __name__ == "__main__":
     basic()

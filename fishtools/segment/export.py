@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import product
 from pathlib import Path
+import time
 from typing import TYPE_CHECKING, Any, Iterable
 
 import numpy as np
@@ -191,9 +192,15 @@ def _load_ident_shards(
     seg_codebook: str,
     segmentation_name: str,
 ) -> dict[tuple[str, str], pl.DataFrame]:
+    rois_list = list(rois)
+    codebooks_list = list(codebooks)
+    logger.info(
+        f"[export] Loading ident shards (spots→cell): rois={len(rois_list)}, codebooks={len(codebooks_list)}"
+    )
+    t0 = time.perf_counter()
     dfs: dict[tuple[str, str], pl.DataFrame] = {}
     available_chunks_by_roi: dict[str, list[str]] = {}
-    for roi, codebook in product(rois, codebooks):
+    for roi, codebook in product(rois_list, codebooks_list):
         seg_root = ws.stitch(roi, seg_codebook) / segmentation_name
         if roi not in available_chunks_by_roi:
             available_chunks_by_roi[roi], _ = _list_segmentation_artifacts(seg_root)
@@ -208,6 +215,7 @@ def _load_ident_shards(
         if not any(root.glob("ident_*.parquet")):
             logger.warning(f"ROI={roi} codebook={codebook}: no ident shards under {root}")
             continue
+        logger.info(f"[export] Loading ident shards: ROI={roi}, codebook={codebook}")
         df_roi = (
             _scan_ident(glob_path)
             .with_columns(
@@ -225,8 +233,8 @@ def _load_ident_shards(
         if not df_roi.is_empty():
             dfs[(roi, codebook)] = df_roi
     if not dfs:
-        roi_list = list(rois)
-        requested_codebooks = list(codebooks)
+        roi_list = rois_list
+        requested_codebooks = codebooks_list
         chunks_summary = "; ".join(
             [f"{roi}: {available_chunks_by_roi.get(roi, [])}" for roi in sorted(set(roi_list))]
         )
@@ -251,6 +259,11 @@ def _load_ident_shards(
                 ]
             )
         )
+    rows_total = int(sum(df.height for df in dfs.values()))
+    dt = time.perf_counter() - t0
+    logger.info(
+        f"[export] Loaded ident shards: pairs={len(dfs)}, rows={rows_total}, elapsed={dt:.2f}s"
+    )
     return dfs
 
 
@@ -261,56 +274,72 @@ def _load_intensity_shards(
     segmentation_name: str,
     channel_list: Iterable[str],
 ) -> dict[_IntensityKey, pl.DataFrame]:
+    rois_list = list(rois)
+    channels_list = list(channel_list)
+    logger.info(
+        f"[export] Loading intensity shards: rois={len(rois_list)}, channels={len(channels_list)}"
+    )
+    t0 = time.perf_counter()
     intensities: dict[_IntensityKey, pl.DataFrame] = {}
-    for channel, roi in product(channel_list, rois):
-        # Intensity outputs are inside the segmentation zarr folder
-        channel_dir = ws.stitch(roi, seg_codebook) / segmentation_name / f"intensity_{channel}"
-        if not channel_dir.exists():
-            logger.warning(f"ROI={roi} channel={channel}: intensity directory missing under {channel_dir}")
-            continue
-        glob_path = channel_dir / "intensity-*.parquet"
-        if not any(channel_dir.glob("intensity-*.parquet")):
-            logger.warning(f"ROI={roi} channel={channel}: no intensity shards under {channel_dir}")
-            continue
-        scan = pl.scan_parquet(glob_path, include_file_paths="path", missing_columns="insert")
-        has_std = "intensity_std" in scan.collect_schema()
-        has_median = "median_intensity" in scan.collect_schema()
+    for roi in rois_list:
+        logger.info(f"[export] ROI={roi}: loading intensity shards")
+        for channel in channels_list:
+            # Intensity outputs are inside the segmentation zarr folder
+            channel_dir = ws.stitch(roi, seg_codebook) / segmentation_name / f"intensity_{channel}"
+            if not channel_dir.exists():
+                logger.warning(f"ROI={roi} channel={channel}: intensity directory missing under {channel_dir}")
+                continue
+            glob_path = channel_dir / "intensity-*.parquet"
+            if not any(channel_dir.glob("intensity-*.parquet")):
+                logger.warning(f"ROI={roi} channel={channel}: no intensity shards under {channel_dir}")
+                continue
 
-        cols = ["z", "roi", "label", "mean_intensity", "max_intensity", "min_intensity"]
-        if has_std:
-            cols.append("intensity_std")
-        if has_median:
-            cols.append("median_intensity")
+            logger.debug(f"[export] Loading intensity shards: ROI={roi}, channel={channel}")
+            scan = pl.scan_parquet(glob_path, include_file_paths="path", missing_columns="insert")
+            schema = scan.collect_schema()
+            has_std = "intensity_std" in schema
+            has_median = "median_intensity" in schema
 
-        rename_map = {
-            "mean_intensity": f"{channel}_mean",
-            "max_intensity": f"{channel}_max",
-            "min_intensity": f"{channel}_min",
-        }
-        if has_std:
-            rename_map["intensity_std"] = f"{channel}_std"
-        if has_median:
-            rename_map["median_intensity"] = f"{channel}_median"
+            cols = ["z", "roi", "label", "mean_intensity", "max_intensity", "min_intensity"]
+            if has_std:
+                cols.append("intensity_std")
+            if has_median:
+                cols.append("median_intensity")
 
-        intensity_df = (
-            scan.with_columns(
-                z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt16),
-                roi=pl.lit(roi),
-                label=pl.col("label").cast(pl.UInt32),
+            rename_map = {
+                "mean_intensity": f"{channel}_mean",
+                "max_intensity": f"{channel}_max",
+                "min_intensity": f"{channel}_min",
+            }
+            if has_std:
+                rename_map["intensity_std"] = f"{channel}_std"
+            if has_median:
+                rename_map["median_intensity"] = f"{channel}_median"
+
+            intensity_df = (
+                scan.with_columns(
+                    z=pl.col("path").str.extract(r"(\d+)\.parquet").cast(pl.UInt16),
+                    roi=pl.lit(roi),
+                    label=pl.col("label").cast(pl.UInt32),
+                )
+                .select(cols)
+                .collect()
+                .rename(rename_map)
+                .with_columns(
+                    pl.col(f"{channel}_mean").cast(pl.Float32),
+                    pl.col(f"{channel}_max").cast(pl.Float32),
+                    pl.col(f"{channel}_min").cast(pl.Float32),
+                    *([pl.col(f"{channel}_std").cast(pl.Float32)] if has_std else []),
+                    *([pl.col(f"{channel}_median").cast(pl.Float32)] if has_median else []),
+                )
             )
-            .select(cols)
-            .collect()
-            .rename(rename_map)
-            .with_columns(
-                pl.col(f"{channel}_mean").cast(pl.Float32),
-                pl.col(f"{channel}_max").cast(pl.Float32),
-                pl.col(f"{channel}_min").cast(pl.Float32),
-                *( [pl.col(f"{channel}_std").cast(pl.Float32)] if has_std else [] ),
-                *( [pl.col(f"{channel}_median").cast(pl.Float32)] if has_median else [] ),
-            )
-        )
-        if not intensity_df.is_empty():
-            intensities[_IntensityKey(roi=roi, channel=channel)] = intensity_df
+            if not intensity_df.is_empty():
+                intensities[_IntensityKey(roi=roi, channel=channel)] = intensity_df
+    rows_total = int(sum(df.height for df in intensities.values()))
+    dt = time.perf_counter() - t0
+    logger.info(
+        f"[export] Loaded intensity shards: pairs={len(intensities)}, rows={rows_total}, elapsed={dt:.2f}s"
+    )
     return intensities
 
 
@@ -321,9 +350,12 @@ def _load_polygon_shards(
     segmentation_name: str,
     primary_codebook: str,
 ) -> dict[str, pl.DataFrame]:
+    rois_list = list(rois)
+    logger.info(f"[export] Loading polygon shards: rois={len(rois_list)}")
+    t0 = time.perf_counter()
     polygons_by_roi: dict[str, pl.DataFrame] = {}
     available_chunks_by_roi: dict[str, list[str]] = {}
-    for roi in rois:
+    for roi in rois_list:
         seg_root = ws.stitch(roi, seg_codebook) / segmentation_name
         available_chunks_by_roi[roi], _ = _list_segmentation_artifacts(seg_root)
         chunks_dir = seg_root / f"chunks+{primary_codebook}"
@@ -336,6 +368,7 @@ def _load_polygon_shards(
         if not any(chunks_dir.glob("polygons_*.parquet")):
             logger.warning(f"ROI={roi}: no polygons shards under {chunks_dir}")
             continue
+        logger.info(f"[export] Loading polygon shards: ROI={roi}, codebook={primary_codebook}")
         pdf = (
             _scan_polygons(glob_path)
             .with_columns(
@@ -350,8 +383,14 @@ def _load_polygon_shards(
         )
         if not pdf.is_empty():
             polygons_by_roi[roi] = pdf
+
+    rows_total = int(sum(df.height for df in polygons_by_roi.values()))
+    dt = time.perf_counter() - t0
+    logger.info(
+        f"[export] Loaded polygon shards: rois={len(polygons_by_roi)}, rows={rows_total}, elapsed={dt:.2f}s"
+    )
     if not polygons_by_roi:
-        roi_list = list(rois)
+        roi_list = rois_list
         chunks_summary = "; ".join(
             [f"{roi}: {available_chunks_by_roi.get(roi, [])}" for roi in sorted(set(roi_list))]
         )
@@ -424,6 +463,7 @@ def _build_cells_dataframe(
     channels_with_median = {
         key.channel for key, df in intensities.items() if f"{key.channel}_median" in df.columns
     }
+    channels_with_punctate = set(channels_with_std)
 
     polygons: list[pl.DataFrame] = []
     for roi, poly in polygons_by_roi.items():
@@ -493,6 +533,31 @@ def _build_cells_dataframe(
     cells = polygons_df.group_by(pl.col("roilabel")).agg(**agg)
     for median_df in weighted_medians:
         cells = cells.join(median_df, on="roilabel", how="left")
+
+    punctate_exprs: list[pl.Expr] = []
+    for channel in channel_list:
+        if channel not in channels_with_punctate:
+            continue
+        mean_col = f"{channel}_mean"
+        std_col = f"{channel}_std"
+        punctate_exprs.append(
+            pl.when(
+                (pl.col("area") > 1)
+                & (pl.col(mean_col).is_not_null())
+                & (pl.col(std_col).is_not_null())
+                & (pl.col(mean_col) > 0)
+            )
+            .then(
+                ((pl.col(std_col).cast(pl.Float64) / pl.col(mean_col).cast(pl.Float64)) ** 2)
+                / (pl.col("area").cast(pl.Float64) - 1.0)
+            )
+            .otherwise(0.0)
+            .fill_nan(0.0)
+            .cast(pl.Float32)
+            .alias(f"{channel}_punctate")
+        )
+    if punctate_exprs:
+        cells = cells.with_columns(*punctate_exprs)
     return cells.sort("roilabel")
 
 
@@ -774,9 +839,19 @@ def _apply_roiset_annotations(
     center = ((line.p0_xy[0] + line.p1_xy[0]) / 2.0, (line.p0_xy[1] + line.p1_xy[1]) / 2.0)
     rotated = rotate_points(coords, -angle_deg, center=center).astype(np.float32, copy=False)
 
-    adata.obsm["spatial"][roi_mask.to_numpy()] = rotated
-    adata.obs.loc[roi_mask, "x"] = rotated[:, 0]
-    adata.obs.loc[roi_mask, "y"] = rotated[:, 1]
+    # RoiSet rotation is useful for visualization, but downstream steps (e.g. reading fused.zarr)
+    # expect `x/y` and `obsm['spatial']` to remain in the fused coordinate system. Store the
+    # rotated coordinates separately instead of overwriting the canonical ones.
+    if "x_roiset" not in adata.obs.columns:
+        adata.obs["x_roiset"] = adata.obs["x"]
+    if "y_roiset" not in adata.obs.columns:
+        adata.obs["y_roiset"] = adata.obs["y"]
+    adata.obs.loc[roi_mask, "x_roiset"] = rotated[:, 0]
+    adata.obs.loc[roi_mask, "y_roiset"] = rotated[:, 1]
+
+    if "spatial_roiset" not in adata.obsm:
+        adata.obsm["spatial_roiset"] = adata.obsm["spatial"].copy()
+    adata.obsm["spatial_roiset"][roi_mask.to_numpy()] = rotated
 
 
 def annotate_cells_with_roi(
@@ -868,52 +943,29 @@ def export_cmd(
     - Emits an AnnData file under <workspace>/analysis/output capturing gene counts, QC metrics, and spatial coordinates.
     """
 
+    t_start = time.perf_counter()
+    codebooks_list = list(codebooks)
+    logger.info(
+        "[export] Starting export "
+        f"(path={path}, roi={roi}, seg_codebook={seg_codebook}, codebooks={codebooks_list}, "
+        f"segmentation_name={segmentation_name}, channels={channels}, thumbnail_scale={thumbnail_scale}, diag={diag})"
+    )
     ws = Workspace(path)
     rois = _resolve_rois(ws, roi)
     rois = _filter_rois_with_segmentation(ws, rois, seg_codebook, segmentation_name)
     if not rois:
         raise ValueError("No ROIs have segmentation output; run segmentation first.")
-    cb_list = _resolve_codebooks(codebooks)
-
-    ident_frames = _load_ident_shards(ws, rois, cb_list, seg_codebook, segmentation_name)
-    channel_list = _resolve_channels(ws, rois, seg_codebook, segmentation_name, channels)
-    intensities = _load_intensity_shards(ws, rois, seg_codebook, segmentation_name, channel_list)
-    if channel_list and not intensities:
-        logger.warning(
-            f"No intensity shards found for ROIs={rois}, channels={channel_list}; exporting without intensity values."
-        )
+    logger.info(f"[export] Resolved ROIs: {rois}")
+    cb_list = _resolve_codebooks(codebooks_list)
+    logger.info(f"[export] Resolved codebooks: {cb_list}")
 
     primary_cb = cb_list[0]
-    polygons_by_roi = _load_polygon_shards(ws, rois, seg_codebook, segmentation_name, primary_cb)
-
-    if diag:
-        _emit_pairing_diagnostics(polygons_by_roi, intensities, channel_list)
-
-    cells = _build_cells_dataframe(polygons_by_roi, intensities, channel_list)
-    counts_by_gene = _build_counts_matrix(ident_frames)
-    adata = _build_anndata(counts_by_gene, cells)
-
-    adata.obs["subroi"] = ""
-    for roi_name in rois:
-        _apply_roiset_annotations(
-            adata,
-            ws=ws,
-            roi=roi_name,
-            seg_codebook=seg_codebook,
-            segmentation_name=segmentation_name,
-            scale=thumbnail_scale,
-        )
-
     cb_token = Workspace.sanitize_codebook_name(primary_cb)
-    h5ad_token = cb_token
-    if len(cb_list) > 1:
-        extra = "__".join(Workspace.sanitize_codebook_name(value) for value in cb_list[1:])
-        h5ad_token = f"{cb_token}__{extra}"
     seg_stem = Path(segmentation_name).stem
 
     ws.output.mkdir(parents=True, exist_ok=True)
-    cells_path = ws.output / f"polygons+{cb_token}+{seg_stem}.parquet"
-    out_h5ad = ws.output / f"all+{h5ad_token}+{seg_stem}.h5ad"
+    h5ads_dir = ws.output / "h5ads"
+    h5ads_dir.mkdir(parents=True, exist_ok=True)
 
     from importlib.metadata import PackageNotFoundError, version as pkg_version
     import platform
@@ -925,51 +977,96 @@ def export_cmd(
         except PackageNotFoundError:
             return None
 
-    artifacts_by_roi: dict[str, dict[str, Any]] = {}
     for roi_name in rois:
-        seg_zarr_path = ws.stitch(roi_name, seg_codebook) / segmentation_name
+        roi_str = str(roi_name)
+        logger.info(f"[export] ROI={roi_str}: collecting shards…")
+        ident_frames = _load_ident_shards(ws, [roi_str], cb_list, seg_codebook, segmentation_name)
+        channel_list = _resolve_channels(ws, [roi_str], seg_codebook, segmentation_name, channels)
+        logger.info(f"[export] ROI={roi_str}: resolved intensity channels: {channel_list}")
+        intensities = _load_intensity_shards(ws, [roi_str], seg_codebook, segmentation_name, channel_list)
+        if channel_list and not intensities:
+            logger.warning(
+                f"ROI={roi_str}: no intensity shards found for channels={channel_list}; exporting without intensity values."
+            )
+
+        polygons_by_roi = _load_polygon_shards(ws, [roi_str], seg_codebook, segmentation_name, primary_cb)
+        if diag:
+            _emit_pairing_diagnostics(polygons_by_roi, intensities, channel_list)
+
+        logger.info(f"[export] ROI={roi_str}: building per-cell table (polygons + intensity aggregates)…")
+        cells = _build_cells_dataframe(polygons_by_roi, intensities, channel_list)
+        logger.info(f"[export] ROI={roi_str}: built per-cell table: n={cells.height}")
+        logger.info(f"[export] ROI={roi_str}: building counts matrix (spots)…")
+        counts_by_gene = _build_counts_matrix(ident_frames)
+        n_genes = max(0, len(counts_by_gene.columns) - 1)
+        logger.info(f"[export] ROI={roi_str}: built counts matrix: n_cells={counts_by_gene.height}, n_genes={n_genes}")
+        logger.info(f"[export] ROI={roi_str}: building AnnData (imports scanpy/anndata)…")
+        adata = _build_anndata(counts_by_gene, cells)
+        logger.info(f"[export] ROI={roi_str}: built AnnData: n_obs={adata.n_obs}, n_vars={adata.n_vars}")
+
+        adata.obs["subroi"] = ""
+        logger.info(f"[export] ROI={roi_str}: applying RoiSet annotations (if available)…")
+        _apply_roiset_annotations(
+            adata,
+            ws=ws,
+            roi=roi_str,
+            seg_codebook=seg_codebook,
+            segmentation_name=segmentation_name,
+            scale=thumbnail_scale,
+        )
+
+        cells_path = ws.output / f"polygons+{roi_str}+{cb_token}+{seg_stem}.parquet"
+        out_h5ad = h5ads_dir / f"{roi_str}.h5ad"
+        logger.info(f"[export] ROI={roi_str}: writing outputs: cells_parquet={cells_path}, h5ad={out_h5ad}")
+
+        seg_zarr_path = ws.stitch(roi_str, seg_codebook) / segmentation_name
         chunks, intensity_channels = _list_segmentation_artifacts(seg_zarr_path)
-        roiset_zip_path = ws.output / "thumbnails" / f"{roi_name}+{seg_codebook}" / "RoiSet.zip"
-        artifacts_by_roi[roi_name] = {
-            "segmentation_path": str(seg_zarr_path),
-            "available_chunks": chunks,
-            "available_intensity_channels": intensity_channels,
-            "roiset_zip_path": str(roiset_zip_path),
-            "roiset_zip_exists": roiset_zip_path.exists(),
+        roiset_zip_path = ws.output / "thumbnails" / f"{roi_str}+{seg_codebook}" / "RoiSet.zip"
+        artifacts_by_roi = {
+            roi_str: {
+                "segmentation_path": str(seg_zarr_path),
+                "available_chunks": chunks,
+                "available_intensity_channels": intensity_channels,
+                "roiset_zip_path": str(roiset_zip_path),
+                "roiset_zip_exists": roiset_zip_path.exists(),
+            }
         }
 
-    adata.uns.setdefault("fishtools", {})["segment_export"] = {
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
-        "workspace_path": str(ws.path),
-        "export_invocation_path": str(path),
-        "args": {
-            "roi": roi,
-            "seg_codebook": seg_codebook,
-            "codebooks": list(cb_list),
-            "segmentation_name": segmentation_name,
-            "channels": channels,
-            "thumbnail_scale": float(thumbnail_scale),
-            "diag": bool(diag),
-        },
-        "resolved": {
-            "rois": list(rois),
-            "channels": list(channel_list),
-            "primary_codebook": primary_cb,
-        },
-        "outputs": {"cells_parquet_path": str(cells_path), "h5ad_path": str(out_h5ad)},
-        "artifacts_by_roi": artifacts_by_roi,
-        "versions": {
-            "python": platform.python_version(),
-            "fishtools": _safe_pkg_version("fishtools"),
-            "anndata": _safe_pkg_version("anndata"),
-            "scanpy": _safe_pkg_version("scanpy"),
-            "polars": _safe_pkg_version("polars"),
-            "numpy": _safe_pkg_version("numpy"),
-            "platform": platform.platform(),
-            "executable": sys.executable,
-        },
-    }
+        adata.uns.setdefault("fishtools", {})["segment_export"] = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "workspace_path": str(ws.path),
+            "export_invocation_path": str(path),
+            "args": {
+                "roi": roi_str,
+                "seg_codebook": seg_codebook,
+                "codebooks": list(cb_list),
+                "segmentation_name": segmentation_name,
+                "channels": channels,
+                "thumbnail_scale": float(thumbnail_scale),
+                "diag": bool(diag),
+            },
+            "resolved": {
+                "rois": [roi_str],
+                "channels": list(channel_list),
+                "primary_codebook": primary_cb,
+            },
+            "outputs": {"cells_parquet_path": str(cells_path), "h5ad_path": str(out_h5ad)},
+            "artifacts_by_roi": artifacts_by_roi,
+            "versions": {
+                "python": platform.python_version(),
+                "fishtools": _safe_pkg_version("fishtools"),
+                "anndata": _safe_pkg_version("anndata"),
+                "scanpy": _safe_pkg_version("scanpy"),
+                "polars": _safe_pkg_version("polars"),
+                "numpy": _safe_pkg_version("numpy"),
+                "platform": platform.platform(),
+                "executable": sys.executable,
+            },
+        }
 
-    _write_cells_parquet(cells, cells_path)
-    adata.write_h5ad(out_h5ad)
-    logger.info(f"Wrote AnnData export to {out_h5ad}")
+        _write_cells_parquet(cells, cells_path)
+        adata.write_h5ad(out_h5ad)
+        logger.info(f"[export] ROI={roi_str}: wrote AnnData export to {out_h5ad}")
+
+    dt = time.perf_counter() - t_start
+    logger.info(f"[export] Done in {dt:.2f}s")

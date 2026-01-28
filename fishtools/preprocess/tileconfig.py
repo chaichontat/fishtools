@@ -22,15 +22,15 @@ class TileConfiguration:
                 f.write(f"{row['index']:04d}.tif; ; ({row['x']}, {row['y']})\n")
 
     @classmethod
-    def from_pos(cls, df: pd.DataFrame):
-        pixel = 2048
-        actual = pixel * 0.108
-        scaling = 200 / actual
+    def from_pos(cls, df: pd.DataFrame, *, pixel_size_um: float = 0.108) -> "TileConfiguration":
+        if pixel_size_um <= 0:
+            raise ValueError("pixel_size_um must be positive.")
+
         adjusted = pd.DataFrame(dict(y=(df[0] - df[0].min()), x=(df[1] - df[1].min())))
         adjusted["x"] -= adjusted["x"].min()
-        adjusted["x"] *= -(1 / 200) * pixel * scaling
+        adjusted["x"] *= -(1 / pixel_size_um)
         adjusted["y"] -= adjusted["y"].min()
-        adjusted["y"] *= -(1 / 200) * pixel * scaling
+        adjusted["y"] *= -(1 / pixel_size_um)
 
         ats = adjusted.copy()
         ats["x"] -= ats["x"].min()
@@ -72,7 +72,7 @@ class TileConfiguration:
         # Perform this on extracted file name
         # since we want both the raw file name and the index.
         filename = (
-            pp.Optional(pp.Word(pp.alphanums) + pp.Literal("-"))
+            pp.Optional(pp.Combine(pp.Word(pp.alphanums) + pp.Literal("-"))("prefix"))
             + integer("index").setParseAction(lambda t: int(t[0]))
             + pp.Literal(".tif")
         )  # type: ignore

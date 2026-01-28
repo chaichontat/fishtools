@@ -114,20 +114,22 @@ def configure_cli_logging(
     if workspace is None:
         return None
 
-    log_root = Workspace(workspace).logs
-    log_root.mkdir(parents=True, exist_ok=True)
-    log_file = log_root / f"{component}.log"
-
-    logger.add(
-        log_file,
-        level=file_level,
-        format=_DEFAULT_LOGGER_FORMAT,
-        rotation=rotation,
-        retention=retention,
-        enqueue=enqueue,
-        backtrace=False,
-        diagnose=False,
-    )
+    log_file = Workspace(workspace).logs / f"{component}.log"
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            log_file,
+            level=file_level,
+            format=_DEFAULT_LOGGER_FORMAT,
+            rotation=rotation,
+            retention=retention,
+            enqueue=enqueue,
+            backtrace=False,
+            diagnose=False,
+        )
+    except PermissionError as e:
+        logger.warning(f"Failed to create workspace log file at {log_file}: {e}. Continuing without file logging.")
+        return None
 
     os.environ["FISHTOOLS_ACTIVE_LOG"] = str(log_file)
     return log_file
@@ -202,7 +204,9 @@ def setup_workspace_logging(
         enqueue=enqueue,
         use_shared_console=use_shared_console,
     )
-    assert log_file is not None
+    if log_file is None:
+        # Use the intended on-disk path for consistency, even if we couldn't create it.
+        return Workspace(workspace).logs / f"{component}.log"
     return log_file
 
 

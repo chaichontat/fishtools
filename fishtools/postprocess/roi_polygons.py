@@ -56,12 +56,29 @@ def load_roi_polygons(roi_path: Path, *, scale: float = 8.0) -> list[RoiPolygon]
         rois = [rois]
 
     polygons: list[RoiPolygon] = []
-    offset = np.array([0.0, 0.0], dtype=np.float64)
     for idx, roi in enumerate(rois):
-        coords = roi.integer_coordinates.astype(np.float64)
-        offset[0] = roi.left
-        offset[1] = roi.top
-        abs_coords = (coords + offset) * scale
+        coords_abs = None
+        coords_fn = getattr(roi, "coordinates", None)
+        if callable(coords_fn):
+            try:
+                coords_abs = coords_fn()
+            except Exception as exc:  # pragma: no cover - passthrough to fallback
+                logger.debug(f"Failed to read ROI '{roi.name}' via coordinates(): {exc}")
+
+        if coords_abs is None:
+            coords_raw = roi.integer_coordinates
+            offset = np.array([float(roi.left), float(roi.top)], dtype=np.float64)
+            if coords_raw is None:
+                coords_raw = roi.subpixel_coordinates
+            if coords_raw is None:
+                logger.debug(f"Skipping ROI '{roi.name}' because it has no coordinates.")
+                continue
+            coords = np.asarray(coords_raw, dtype=np.float64)
+            coords_abs = coords + offset
+        else:
+            coords_abs = np.asarray(coords_abs, dtype=np.float64)
+
+        abs_coords = coords_abs * scale
         if abs_coords.shape[0] < 3:
             continue
         try:
@@ -75,7 +92,12 @@ def load_roi_polygons(roi_path: Path, *, scale: float = 8.0) -> list[RoiPolygon]
         except Exception as exc:  # pragma: no cover - geometry construction failure
             logger.debug(f"Skipping ROI '{roi.name}' due to geometry error: {exc}")
             continue
-        roi_name = str(roi.name) if roi.name else f"roi_{idx}"
+        roi_name = str(roi.name).strip() if roi.name else ""
+        if not roi_name:
+            if suffix == ".roi":
+                roi_name = roi_path.stem if idx == 0 else f"{roi_path.stem}_{idx}"
+            else:
+                roi_name = f"{roi_path.stem}_{idx}" if roi_path.stem else f"roi_{idx}"
         polygons.append(RoiPolygon(geometry=poly, name=roi_name))
 
     if not polygons:

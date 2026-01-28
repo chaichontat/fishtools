@@ -53,6 +53,19 @@ class ROIStatus:
     export: StageStatus = field(default_factory=StageStatus)
 
 
+@dataclass
+class CCFStatus:
+    roi: str
+    h5ad: StageStatus = field(default_factory=StageStatus)
+    tileconfig: StageStatus = field(default_factory=StageStatus)
+    p1: StageStatus = field(default_factory=StageStatus)
+    ants: StageStatus = field(default_factory=StageStatus)
+    mask_edit: StageStatus = field(default_factory=StageStatus)
+    imagej_roi: StageStatus = field(default_factory=StageStatus)
+    warp_h5ad: StageStatus = field(default_factory=StageStatus)
+    filter_h5ad: StageStatus = field(default_factory=StageStatus)
+
+
 _TILE_TIF_RE = re.compile(r".+-\d{4}\.tif$")
 
 
@@ -393,20 +406,12 @@ def check_overlay_intensity(ws: Workspace, roi: str, codebook: str) -> StageStat
 
 
 def check_export(ws: Workspace, roi: str, codebook: str) -> StageStatus:
-    """Check for export outputs ({codebook}.h5ad or all+*.h5ad)."""
-    seg_zarrs = _find_seg_zarrs(ws, roi, codebook)
-
+    """Check for export outputs (analysis/output/h5ads/{roi}.h5ad)."""
     h5ad_files: list[Path] = []
 
-    # Check inside segmentation zarrs for single-ROI exports
-    for seg_zarr in seg_zarrs:
-        h5ad_files.extend(seg_zarr.glob(f"{codebook}.h5ad"))
-        h5ad_files.extend(seg_zarr.glob("*.h5ad"))
-
-    # Check workspace output directory for multi-ROI exports
+    # Current export layout: per-ROI outputs under analysis/output/h5ads/
     if ws.output.exists():
-        h5ad_files.extend(ws.output.glob(f"all+{codebook}+*.h5ad"))
-        h5ad_files.extend(ws.output.glob(f"*+{codebook}+*.h5ad"))
+        h5ad_files.extend((ws.output / "h5ads").glob(f"{roi}.h5ad"))
 
     # Deduplicate
     h5ad_files = list(set(h5ad_files))
@@ -419,6 +424,95 @@ def check_export(ws: Workspace, roi: str, codebook: str) -> StageStatus:
         count=len(h5ad_files),
         last_modified=_last_modified(h5ad_files),
     )
+
+
+def check_ccf_h5ad(ws: Workspace, roi: str) -> StageStatus:
+    h5ad_path = ws.output / "h5ads" / f"{roi}.h5ad"
+    if not h5ad_path.exists():
+        return StageStatus()
+    return StageStatus(complete=True, count=1, last_modified=_mtime(h5ad_path))
+
+
+def check_ccf_p1(ws: Workspace, roi: str) -> StageStatus:
+    root = ws.ccf_transforms(roi)
+    landmarks = root / "p1_landmarks.json"
+    threshold = root / "p1_threshold.json"
+    files = [landmarks, threshold]
+    present = [p for p in files if p.exists()]
+    if not present:
+        return StageStatus()
+    return StageStatus(
+        complete=len(present) == len(files),
+        count=len(present),
+        expected=len(files),
+        last_modified=_last_modified(present),
+    )
+
+
+def check_ccf_ants(ws: Workspace, roi: str, run_dirname: str) -> StageStatus:
+    run_dir = ws.ccf_transforms(roi) / run_dirname
+    summary = run_dir / "similarity_plus_syn_summary.json"
+    if summary.exists():
+        return StageStatus(complete=True, count=1, last_modified=_mtime(summary))
+    if not run_dir.exists():
+        return StageStatus()
+    existing = [p for p in run_dir.iterdir() if p.is_file()]
+    if not existing:
+        return StageStatus()
+    return StageStatus(complete=False, count=1, last_modified=_last_modified(existing))
+
+
+def check_ccf_mask_edit(ws: Workspace, roi: str, run_dirname: str) -> StageStatus:
+    mask_dir = ws.ccf_transforms(roi) / run_dirname / "mask_edit"
+    if not mask_dir.exists():
+        return StageStatus()
+
+    pngs = list(mask_dir.glob("warped_moving_*.png"))
+    masks = list(mask_dir.glob("mask_*.tif"))
+    present = (1 if pngs else 0) + (1 if masks else 0)
+    if present == 0:
+        return StageStatus()
+    return StageStatus(
+        complete=bool(pngs) and bool(masks),
+        count=present,
+        expected=2,
+        details=f"{len(pngs)} png, {len(masks)} tif",
+        last_modified=_last_modified(pngs + masks),
+    )
+
+
+def check_ccf_imagej_roi(ws: Workspace, roi: str, run_dirname: str) -> StageStatus:
+    mask_dir = ws.ccf_transforms(roi) / run_dirname / "mask_edit"
+    if not mask_dir.exists():
+        return StageStatus()
+    roi_files = []
+    roi_zip = mask_dir / "RoiSet.zip"
+    if roi_zip.exists():
+        roi_files.append(roi_zip)
+    roi_files.extend(mask_dir.glob("*.roi"))
+    if not roi_files:
+        return StageStatus()
+    return StageStatus(complete=True, count=len(roi_files), last_modified=_last_modified(roi_files))
+
+
+def check_ccf_warp_h5ad(ws: Workspace, roi: str) -> StageStatus:
+    root = ws.ccf_transforms(roi)
+    syn_files = list(root.glob("*.syn.h5ad"))
+    if not syn_files:
+        return StageStatus()
+    return StageStatus(complete=True, count=len(syn_files), last_modified=_last_modified(syn_files))
+
+
+def check_ccf_filter_h5ad(ws: Workspace, roi: str, run_dirname: str) -> StageStatus:
+    imagej = check_ccf_imagej_roi(ws, roi, run_dirname)
+    if imagej.count == 0:
+        return StageStatus()
+
+    root = ws.ccf_transforms(roi)
+    annotated = list(root.glob("*.annotated.h5ad"))
+    if not annotated:
+        return StageStatus()
+    return StageStatus(complete=True, count=len(annotated), last_modified=_last_modified(annotated))
 
 
 def mark_stale_stages(status: ROIStatus) -> None:
@@ -455,6 +549,26 @@ def mark_stale_stages(status: ROIStatus) -> None:
                 break
 
 
+def mark_stale_ccf(status: CCFStatus) -> None:
+    dependencies: list[tuple[StageStatus, list[StageStatus]]] = [
+        (status.ants, [status.p1]),
+        (status.mask_edit, [status.ants]),
+        (status.imagej_roi, [status.tileconfig]),
+        (status.warp_h5ad, [status.h5ad, status.ants]),
+        (status.filter_h5ad, [status.warp_h5ad, status.imagej_roi]),
+    ]
+
+    for stage, upstreams in dependencies:
+        if stage.last_modified is None:
+            continue
+        for upstream in upstreams:
+            if upstream.last_modified is None:
+                continue
+            if upstream.last_modified > stage.last_modified:
+                stage.stale = True
+                break
+
+
 def get_roi_status(ws: Workspace, roi: str, codebook: str) -> ROIStatus:
     status = ROIStatus(
         roi=roi,
@@ -474,6 +588,22 @@ def get_roi_status(ws: Workspace, roi: str, codebook: str) -> ROIStatus:
         export=check_export(ws, roi, codebook),
     )
     mark_stale_stages(status)
+    return status
+
+
+def get_ccf_status(ws: Workspace, roi: str, run_dirname: str) -> CCFStatus:
+    status = CCFStatus(
+        roi=roi,
+        h5ad=check_ccf_h5ad(ws, roi),
+        tileconfig=check_stitch_register(ws, roi),
+        p1=check_ccf_p1(ws, roi),
+        ants=check_ccf_ants(ws, roi, run_dirname),
+        mask_edit=check_ccf_mask_edit(ws, roi, run_dirname),
+        imagej_roi=check_ccf_imagej_roi(ws, roi, run_dirname),
+        warp_h5ad=check_ccf_warp_h5ad(ws, roi),
+        filter_h5ad=check_ccf_filter_h5ad(ws, roi, run_dirname),
+    )
+    mark_stale_ccf(status)
     return status
 
 
@@ -537,6 +667,39 @@ def render_status_table(ws: Workspace, codebook: str, rois: list[str], *, verbos
     return table
 
 
+def render_ccf_table(ws: Workspace, rois: list[str], *, run_dirname: str, verbose: bool = False) -> Table:
+    table = Table(
+        title=f"CCF status (run_dir={run_dirname})",
+        show_header=True,
+        header_style="bold",
+        border_style="dim",
+    )
+
+    table.add_column("ROI", style="cyan")
+    table.add_column("H5AD", justify="center")
+    table.add_column("P1", justify="center")
+    table.add_column("ANTs", justify="center")
+    table.add_column("MaskEdit", justify="center")
+    table.add_column("ImageJ", justify="center")
+    table.add_column("Warp", justify="center")
+    table.add_column("Filter", justify="center")
+
+    for roi in rois:
+        status = get_ccf_status(ws, roi, run_dirname)
+        table.add_row(
+            roi,
+            status.h5ad.to_cell(verbose),
+            status.p1.to_cell(verbose),
+            status.ants.to_cell(verbose),
+            status.mask_edit.to_cell(verbose),
+            status.imagej_roi.to_cell(verbose),
+            status.warp_h5ad.to_cell(verbose),
+            status.filter_h5ad.to_cell(verbose),
+        )
+
+    return table
+
+
 def status_to_dict(ws: Workspace, codebook: str, rois: list[str]) -> dict:
     result = {
         "workspace": str(ws.path),
@@ -564,6 +727,57 @@ def status_to_dict(ws: Workspace, codebook: str, rois: list[str]) -> dict:
         }
 
     return result
+
+
+def ccf_status_to_dict(ws: Workspace, rois: list[str], *, run_dirname: str) -> dict:
+    result: dict[str, object] = {
+        "workspace": str(ws.path),
+        "mode": "ccf",
+        "run_dirname": run_dirname,
+        "rois": {},
+    }
+
+    rois_payload: dict[str, dict[str, object]] = {}
+    for roi in rois:
+        status = get_ccf_status(ws, roi, run_dirname)
+        rois_payload[roi] = {
+            "h5ad": _stage_dict(status.h5ad),
+            "p1": _stage_dict(status.p1, include_expected=True),
+            "ants": _stage_dict(status.ants),
+            "mask_edit": _stage_dict(status.mask_edit, include_expected=True),
+            "imagej_roi": _stage_dict(status.imagej_roi),
+            "warp_h5ad": _stage_dict(status.warp_h5ad),
+            "filter_h5ad": _stage_dict(status.filter_h5ad),
+        }
+    result["rois"] = rois_payload
+    return result
+
+
+def _ccf_rois_from_h5ads(ws: Workspace) -> list[str]:
+    h5ad_dir = ws.output / "h5ads"
+    if not h5ad_dir.exists():
+        return []
+    rois = [p.stem for p in h5ad_dir.glob("*.h5ad") if p.is_file()]
+    return sorted({r for r in rois if r})
+
+
+def _resolve_ccf_rois(ws: Workspace, roi_filter: str | None) -> list[str]:
+    h5ad_rois = _ccf_rois_from_h5ads(ws)
+    if roi_filter:
+        if roi_filter in h5ad_rois:
+            return [roi_filter]
+        try:
+            return ws.resolve_rois([roi_filter])
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+    if h5ad_rois:
+        return h5ad_rois
+
+    try:
+        return ws.resolve_rois(None)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 @click.command("status")
@@ -595,7 +809,26 @@ def status_to_dict(ws: Workspace, codebook: str, rois: list[str]) -> dict:
     is_flag=True,
     help="Output as JSON for programmatic use.",
 )
-def status(path: Path, codebook: str | None, roi_filter: str | None, verbose: bool, output_json: bool) -> None:
+@click.option(
+    "--ccf",
+    is_flag=True,
+    help="Show CCF pipeline status (starting from analysis/output/h5ads).",
+)
+@click.option(
+    "--ccf-run-dirname",
+    default="landmark_syn_mi",
+    show_default=True,
+    help="Run directory under analysis/output/ccf-transforms/<roi>/ used for ANTs + mask_edit.",
+)
+def status(
+    path: Path,
+    codebook: str | None,
+    roi_filter: str | None,
+    verbose: bool,
+    output_json: bool,
+    ccf: bool,
+    ccf_run_dirname: str,
+) -> None:
     """Check preprocessing pipeline status for each ROI.
 
     Shows the completion status of each pipeline stage:
@@ -620,6 +853,26 @@ def status(path: Path, codebook: str | None, roi_filter: str | None, verbose: bo
         ws = Workspace(path)
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    if ccf:
+        rois = _resolve_ccf_rois(ws, roi_filter)
+        rois = [roi for roi in rois if "--" not in roi]
+        if not rois:
+            raise click.ClickException("No ROIs found for CCF status.")
+
+        if output_json:
+            click.echo(json.dumps(ccf_status_to_dict(ws, rois, run_dirname=ccf_run_dirname), indent=2))
+            return
+
+        console = Console()
+        console.print(f"\n[bold]Workspace:[/bold] {ws.path}\n")
+        console.print(render_ccf_table(ws, rois, run_dirname=ccf_run_dirname, verbose=verbose))
+        console.print()
+        console.print(
+            "[dim]Legend: [green]✓[/green] Complete | [yellow]⧖[/yellow] Partial | - Not started | "
+            "[red]![/red] Stale (upstream newer)[/dim]\n"
+        )
+        return
 
     # Discover ROIs
     try:

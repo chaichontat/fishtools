@@ -30,13 +30,19 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
         "fishtools.postprocess.io_concat",
         "merge_polygons_with_intensity",
     ),
+    # roi_polygons
+    "annotate_cells_with_roi": ("fishtools.postprocess.roi_polygons", "annotate_cells_with_roi"),
+    "load_roi_polygons": ("fishtools.postprocess.roi_polygons", "load_roi_polygons"),
     # plot_h5ad
     "plot_embedding": ("fishtools.postprocess.plot_h5ad", "plot_embedding"),
     "plot_genes": ("fishtools.postprocess.plot_h5ad", "plot_genes"),
     "plot_leiden_genes": ("fishtools.postprocess.plot_h5ad", "plot_leiden_genes"),
     "plot_ranked_genes": ("fishtools.postprocess.plot_h5ad", "plot_ranked_genes"),
+    # spatial_arrange
+    "auto_translate_groups": ("fishtools.postprocess.spatial_arrange", "auto_translate_groups"),
     # utils_h5ad
     "cluster": ("fishtools.postprocess.utils_h5ad", "cluster"),
+    "coerce_float32_for_concat": ("fishtools.postprocess.utils_h5ad", "coerce_float32_for_concat"),
     "filter_leiden": ("fishtools.postprocess.utils_h5ad", "filter_leiden"),
     "get_leiden_genes": ("fishtools.postprocess.utils_h5ad", "get_leiden_genes"),
     "leiden_umap": ("fishtools.postprocess.utils_h5ad", "leiden_umap"),
@@ -91,6 +97,15 @@ if TYPE_CHECKING:  # pragma: no cover - for editors only
     from fishtools.postprocess.io_concat import (
         merge_polygons_with_intensity as merge_polygons_with_intensity,
     )
+    from fishtools.postprocess.roi_polygons import (  # noqa: F401
+        annotate_cells_with_roi as annotate_cells_with_roi,
+    )
+    from fishtools.postprocess.roi_polygons import (  # noqa: F401
+        load_roi_polygons as load_roi_polygons,
+    )
+    from fishtools.postprocess.spatial_arrange import (  # noqa: F401
+        auto_translate_groups as auto_translate_groups,
+    )
     from fishtools.postprocess.plot_h5ad import (  # noqa: F401
         plot_embedding as plot_embedding,
     )
@@ -105,6 +120,9 @@ if TYPE_CHECKING:  # pragma: no cover - for editors only
     )
     from fishtools.postprocess.utils_h5ad import (  # noqa: F401
         cluster as cluster,
+    )
+    from fishtools.postprocess.utils_h5ad import (
+        coerce_float32_for_concat as coerce_float32_for_concat,
     )
     from fishtools.postprocess.utils_h5ad import (
         filter_leiden as filter_leiden,
