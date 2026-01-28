@@ -212,9 +212,9 @@ def _default_outputs(
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="roi") from exc
 
-    out_dir = ws.output.ccf_transforms / "h5ads"
+    out_dir = ws.output.ccf_transforms / roi_resolved
     if out_name is None:
-        out_name = f"{input_h5ad.stem}__{roi_resolved}.h5ad"
+        out_name = f"{roi_resolved}.syn.h5ad"
     output_h5ad = out_dir / out_name
     plot_png = output_h5ad.with_suffix(".qc.png")
     metrics_json = output_h5ad.with_suffix(".metrics.json")
@@ -260,7 +260,7 @@ def _format_mtime(path: Path) -> str:
         path_type=Path,
     ),
 )
-@click.argument("roi", type=str)
+@click.argument("roi", type=str, required=False)
 @click.option(
     "--h5ad-name",
     default=None,
@@ -275,9 +275,8 @@ def _format_mtime(path: Path) -> str:
     default=None,
     show_default=False,
     help=(
-        "Output filename (written under <workspace>/analysis/output/ccf-transforms/h5ads). "
-        "Default: <input_h5ad.stem>__<roi>.h5ad where input_h5ad is inferred as "
-        "<workspace>/analysis/output/h5ads/<roi>.h5ad."
+        "Output filename (written under <workspace>/analysis/output/ccf-transforms/<roi>/). "
+        "Default: <roi>.syn.h5ad."
     ),
 )
 @click.option(
@@ -392,7 +391,7 @@ def _format_mtime(path: Path) -> str:
 )
 def main(  # noqa: PLR0913
     workspace: Path,
-    roi: str,
+    roi: str | None,
     *,
     h5ad_name: str | None,
     out_name: str | None,
@@ -418,10 +417,86 @@ def main(  # noqa: PLR0913
 ) -> None:
     ws = Workspace(workspace)
     try:
-        (roi_resolved,) = tuple(ws.resolve_rois((roi,)))
+        rois_resolved = ws.resolve_rois((roi,)) if roi is not None else ws.resolve_rois(None)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="roi") from exc
 
+    processed = 0
+    skipped_missing_h5ad = 0
+    process_all_rois = roi is None
+    for roi_resolved in rois_resolved:
+        try:
+            _run_one_roi(
+                ws=ws,
+                workspace=workspace,
+                roi_resolved=str(roi_resolved),
+                h5ad_name=h5ad_name,
+                out_name=out_name,
+                overwrite=overwrite,
+                run_dirname=run_dirname,
+                direction=direction,
+                input_space=input_space,
+                output_space=output_space,
+                input_units=input_units,
+                output_units=output_units,
+                in_key=in_key,
+                out_key=out_key,
+                spatial_order=spatial_order,
+                filter_roi=filter_roi,
+                roi_col=roi_col,
+                keep_input=keep_input,
+                stitch_codebook=stitch_codebook,
+                thumbnail_downsample=thumbnail_downsample,
+                max_points_plot=max_points_plot,
+                metrics_max_points=metrics_max_points,
+                random_seed=random_seed,
+                debug=debug,
+            )
+            processed += 1
+        except FileNotFoundError as exc:
+            click.echo(f"[{roi_resolved}] Skipping: {exc}")
+            continue
+        except click.ClickException as exc:
+            msg = getattr(exc, "message", str(exc))
+            if process_all_rois and str(msg).startswith("Missing export h5ad"):
+                click.echo(f"[{roi_resolved}] Skipping: {msg}")
+                skipped_missing_h5ad += 1
+                continue
+            raise click.ClickException(f"ROI {roi_resolved!r}: {msg}") from exc
+        except Exception as exc:
+            raise click.ClickException(f"ROI {roi_resolved!r}: {exc}") from exc
+
+    if process_all_rois and processed == 0 and skipped_missing_h5ad == len(rois_resolved):
+        click.echo("No ROIs processed (all missing input h5ads).")
+
+
+def _run_one_roi(  # noqa: PLR0913
+    *,
+    ws: Workspace,
+    workspace: Path,
+    roi_resolved: str,
+    h5ad_name: str | None,
+    out_name: str | None,
+    overwrite: bool,
+    run_dirname: str,
+    direction: str,
+    input_space: str,
+    output_space: str,
+    input_units: str,
+    output_units: str,
+    in_key: str,
+    out_key: str,
+    spatial_order: str,
+    filter_roi: bool,
+    roi_col: str,
+    keep_input: bool,
+    stitch_codebook: str,
+    thumbnail_downsample: int,
+    max_points_plot: int,
+    metrics_max_points: int,
+    random_seed: int,
+    debug: bool,
+) -> None:
     input_h5ad_resolved = _resolve_input_h5ad(ws, roi=str(roi_resolved), h5ad_name=h5ad_name)
     roi_resolved, output_h5ad, plot_png, metrics_json = _default_outputs(
         ws,
