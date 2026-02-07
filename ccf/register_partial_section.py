@@ -31,7 +31,13 @@ from fishtools.ccf.landmark_ui import (
     pick_paired_landmarks_overlay,
     pick_rotation_deg,
 )
-from fishtools.ccf.sitk_utils import compute_similarity2d_from_landmarks, pixels_to_physical_um
+from fishtools.ccf.sitk_utils import (
+    compute_similarity2d_from_landmarks,
+    normalize_robust,
+    pixels_to_physical_um,
+    resample_sitk_to_spacing,
+    sitk_from_numpy_2d,
+)
 from fishtools.io.workspace import Workspace
 from fishtools.preprocess.config import NumpyEncoder
 
@@ -44,9 +50,10 @@ if ip is not None:
 # === EDIT THESE ===
 
 # Workspace configuration
-WORKSPACE = Path("/working/20251001_JaxA3_Coro11")
+WORKSPACE = Path("/working/20251201_JaxA6_Coro6")
 ws = Workspace(WORKSPACE)
-ROI = "1whole" #ws.rois[4]
+print(ws.rois)
+ROI = "6" #ws.rois[4]
 
 STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.zarr
 
@@ -539,12 +546,93 @@ SAMPLE_CROP_OFFSET = (sample_crop_bbox_rot[2], sample_crop_bbox_rot[0])
 ATLAS_Z_PREVIEW_DOWNSAMPLE = PREVIEW_DOWNSAMPLE * 2
 atlas_z_sample_preview = sample_slice_rotated[::ATLAS_Z_PREVIEW_DOWNSAMPLE, ::ATLAS_Z_PREVIEW_DOWNSAMPLE]
 
+
+def _save_pose_and_slice_idx(atlas_slice_idx: int) -> None:
+    DS = 8
+    TARGET_UM = 2.0
+
+    atlas_slice_full_tmp = atlas_reference_slices[int(atlas_slice_idx), :, :]
+    atlas_annotation_full_tmp = atlas_annotation_slices[int(atlas_slice_idx), :, :]
+
+    atlas_brain_mask_tmp = atlas_annotation_full_tmp > 0
+    atlas_slice_masked_tmp = atlas_slice_full_tmp.copy()
+    atlas_slice_masked_tmp[~atlas_brain_mask_tmp] = 0
+
+    atlas_slice_tmp, atlas_crop_bbox_tmp = crop_to_content(atlas_slice_masked_tmp, atlas_brain_mask_tmp, pad=5)
+    if ATLAS_PLANE == "sagittal":
+        keep_w = int(round(atlas_slice_tmp.shape[1] * 0.6))
+        keep_w = max(1, min(int(atlas_slice_tmp.shape[1]), keep_w))
+        r0, r1, c0, c1 = atlas_crop_bbox_tmp
+        atlas_crop_bbox_tmp = (r0, r1, c0, c0 + keep_w)
+
+    OUT.write_p1_landmarks(
+        P1Landmarks(
+            prior_rotation_deg=PRIOR_ROTATION_DEG,
+            prior_flip_x=PRIOR_FLIP_X,
+            atlas_slice_idx=int(atlas_slice_idx),
+            fixed_points_cropped_xy=[],
+            moving_points_fullres_xy_in_rotated_crop=[],
+            atlas_crop_bbox=atlas_crop_bbox_tmp,
+            sample_rotated_crop_bbox=sample_crop_bbox_rot,
+        ),
+        encoder=NumpyEncoder,
+    )
+    print(f"Saved pose + atlas slice to: {OUT.p1_landmarks_json}")
+
+    run_dirname = "landmark_syn_mi"
+    out_dir = OUTDIR / run_dirname / "mask_edit"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"z{int(SAMPLE_Z_IDX)}_ds{DS}_target{TARGET_UM:g}um"
+    warped_moving_png = out_dir / f"warped_moving_{tag}.png"
+
+    arr = zarr.open(str(SAMPLE_ZARR), mode="r")
+    sample_slice_full_yxc = np.asarray(arr[SAMPLE_Z_IDX, :, :, :], dtype=np.float32)
+    if sample_slice_full_yxc.ndim != 3:
+        raise ValueError(f"Expected fused slice shape (y,x,c), got {sample_slice_full_yxc.shape}.")
+
+    if PRIOR_FLIP_X:
+        sample_slice_full_yxc = sample_slice_full_yxc[:, ::-1, :]
+    if PRIOR_ROTATION_DEG != 0:
+        rotated: list[np.ndarray] = []
+        for c in range(int(sample_slice_full_yxc.shape[2])):
+            rotated.append(ndimage_rotate(sample_slice_full_yxc[:, :, c], PRIOR_ROTATION_DEG, reshape=True, order=1))
+        sample_slice_full_yxc = np.stack(rotated, axis=2)
+
+    sr0, sr1, sc0, sc1 = sample_crop_bbox_rot
+    moving_crop_yxc = sample_slice_full_yxc[int(sr0) : int(sr1), int(sc0) : int(sc1), :]
+    moving_crop_ds_yxc = moving_crop_yxc[::DS, ::DS, :].astype(np.float32, copy=False)
+    moving_spacing_um = float(SAMPLE_VOXEL_XY) * float(DS)
+
+    n_in = int(moving_crop_ds_yxc.shape[2])
+    n_rgb = min(3, n_in)
+    if n_rgb <= 0:
+        raise ValueError("Fused image has no channels.")
+
+    norms_yx: list[np.ndarray] = []
+    for c in range(n_rgb):
+        moving_sitk = sitk_from_numpy_2d(moving_crop_ds_yxc[:, :, c], spacing_um=moving_spacing_um)
+        moving_out_sitk = resample_sitk_to_spacing(moving_sitk, target_spacing_um=TARGET_UM, interp=sitk.sitkLinear)
+        out_yx = sitk.GetArrayFromImage(moving_out_sitk).astype(np.float32, copy=False)
+        norms_yx.append(normalize_robust(out_yx, 1.0, 99.0))
+
+    if len(norms_yx) == 1:
+        rgb = np.repeat(norms_yx[0][:, :, None], 3, axis=2)
+    elif len(norms_yx) == 2:
+        rgb = np.stack([norms_yx[0], norms_yx[1], np.zeros_like(norms_yx[0])], axis=2)
+    else:
+        rgb = np.stack(norms_yx[:3], axis=2)
+
+    plt.imsave(warped_moving_png.as_posix(), rgb, vmin=0.0, vmax=1.0)
+    print(f"Wrote: {warped_moving_png} (NOTE: unwarped moving crop thumbnail)")
+
+
 atlas_slice_picker = pick_atlas_slice_idx(
     atlas_reference_zyx=atlas_reference_slices,
     moving_image_yx=atlas_z_sample_preview,
     initial_idx=(existing_p1.atlas_slice_idx if existing_p1 is not None and existing_p1.atlas_slice_idx is not None else 0),
     z_min_idx=120,
     z_max_idx=320,
+    on_save=_save_pose_and_slice_idx,
 )
 
 
