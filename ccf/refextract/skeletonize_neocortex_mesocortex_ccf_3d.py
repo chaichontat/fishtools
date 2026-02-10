@@ -506,6 +506,139 @@ def _sample_bilinear(img: np.ndarray, yx: np.ndarray) -> np.ndarray:
     return map_coordinates(img, [yx[:, 0], yx[:, 1]], order=1, mode="nearest")
 
 
+def _sample_mask_linear(mask: np.ndarray, yx: np.ndarray) -> np.ndarray:
+    if yx.ndim != 2 or yx.shape[1] != 2:
+        raise ValueError(f"Expected yx shape (N,2), got {yx.shape}")
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape={mask.shape}")
+    return map_coordinates(mask.astype(np.float64, copy=False), [yx[:, 0], yx[:, 1]], order=1, mode="constant", cval=0.0)
+
+
+def _march_to_boundary_along_normal(
+    mask: np.ndarray,
+    *,
+    p_yx: np.ndarray,
+    n_yx: np.ndarray,
+    direction: float,
+    max_t: float,
+    step: float,
+    bisect_iters: int = 14,
+) -> float:
+    if p_yx.shape != (2,) or n_yx.shape != (2,):
+        raise ValueError("p_yx and n_yx must be shape (2,).")
+    if direction not in (-1.0, 1.0):
+        raise ValueError("direction must be -1.0 or +1.0.")
+    if max_t <= 0 or step <= 0:
+        raise ValueError("max_t and step must be > 0.")
+    if bisect_iters < 1:
+        raise ValueError("bisect_iters must be >= 1.")
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape={mask.shape}")
+
+    h, w = mask.shape
+    p0 = p_yx.astype(np.float64, copy=False)
+    n = n_yx.astype(np.float64, copy=False)
+
+    # Fast inside check with bounds: outside the image is outside the mask.
+    def inside_at(t: float) -> bool:
+        pt = p0 + (direction * float(t)) * n
+        y = float(pt[0])
+        x = float(pt[1])
+        if y < 0.0 or x < 0.0 or y > float(h - 1) or x > float(w - 1):
+            return False
+        yi = int(np.rint(y))
+        xi = int(np.rint(x))
+        yi = int(np.clip(yi, 0, h - 1))
+        xi = int(np.clip(xi, 0, w - 1))
+        return bool(mask[yi, xi])
+
+    if not inside_at(0.0):
+        return float("nan")
+
+    last_inside_t = 0.0
+    for t in np.arange(step, max_t + step, step, dtype=np.float64):
+        if inside_at(float(t)):
+            last_inside_t = float(t)
+            continue
+
+        lo = float(last_inside_t)
+        hi = float(t)
+        # Refine boundary using linear sampling (treat off-image as 0).
+        for _ in range(int(bisect_iters)):
+            mid = 0.5 * (lo + hi)
+            pt = (p0 + (direction * mid) * n)[None, :]
+            v = float(_sample_mask_linear(mask, pt)[0])
+            if v >= 0.5:
+                lo = mid
+            else:
+                hi = mid
+
+        return float(direction * (0.5 * (lo + hi)))
+
+    return float("nan")
+
+
+def _snap_points_to_mask(yx: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if yx.ndim != 2 or yx.shape[1] != 2:
+        raise ValueError(f"Expected yx shape (N,2), got {yx.shape}")
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape={mask.shape}")
+    if not np.any(mask):
+        raise ValueError("Mask is empty; cannot snap points to mask.")
+
+    h, w = mask.shape
+    yi = np.rint(yx[:, 0]).astype(np.int32)
+    xi = np.rint(yx[:, 1]).astype(np.int32)
+    yi = np.clip(yi, 0, h - 1)
+    xi = np.clip(xi, 0, w - 1)
+    outside = ~mask[yi, xi]
+    if not np.any(outside):
+        return yx
+
+    _, nearest_idx = distance_transform_edt(~mask, return_distances=True, return_indices=True)
+    yx_out = yx.copy()
+    oy = yi[outside]
+    ox = xi[outside]
+    yx_out[outside, 0] = nearest_idx[0, oy, ox].astype(np.float64)
+    yx_out[outside, 1] = nearest_idx[1, oy, ox].astype(np.float64)
+    return yx_out
+
+
+def _push_points_inside_mask(
+    yx: np.ndarray, signed: np.ndarray, *, radius_px: int = 2, min_signed: float = 0.5
+) -> np.ndarray:
+    if yx.ndim != 2 or yx.shape[1] != 2:
+        raise ValueError(f"Expected yx shape (N,2), got {yx.shape}")
+    if signed.ndim != 2:
+        raise ValueError(f"Expected signed 2D, got shape={signed.shape}")
+
+    h, w = signed.shape
+    yx_out = yx.copy()
+    y_idx = np.clip(np.rint(yx_out[:, 0]).astype(np.int32), 0, h - 1)
+    x_idx = np.clip(np.rint(yx_out[:, 1]).astype(np.int32), 0, w - 1)
+    needs_push = signed[y_idx, x_idx] <= float(min_signed)
+    if not np.any(needs_push):
+        return yx_out
+
+    r = int(max(radius_px, 1))
+    for idx in np.where(needs_push)[0].tolist():
+        y0 = int(y_idx[idx])
+        x0 = int(x_idx[idx])
+        y1 = max(0, y0 - r)
+        y2 = min(h, y0 + r + 1)
+        x1 = max(0, x0 - r)
+        x2 = min(w, x0 + r + 1)
+        patch = signed[y1:y2, x1:x2]
+        flat_best = int(np.argmax(patch))
+        best_val = float(patch.ravel()[flat_best])
+        if best_val > 0.0:
+            py, px = np.unravel_index(flat_best, patch.shape)
+            yx_out[idx, 0] = float(y1 + int(py))
+            yx_out[idx, 1] = float(x1 + int(px))
+
+    return yx_out
+
+
 def _first_zero_crossing_along_normal(
     signed: np.ndarray,
     *,
@@ -531,19 +664,26 @@ def _first_zero_crossing_along_normal(
 
     prev_t = 0.0
     prev_v = v0
+    inside = bool(prev_v > 0.0)
     for t in np.arange(step, max_t + step, step, dtype=np.float64):
         pt = p0 + (direction * t) * n
         vt = float(_sample_bilinear(signed, pt[None, :])[0])
         if not np.isfinite(vt):
             return float("nan")
-        if vt <= 0.0 < prev_v:
-            # Linear interpolation in t for the 0-crossing.
-            denom = prev_v - vt
-            if denom <= 0:
-                return float(direction * t)
-            frac = prev_v / denom
-            t0 = prev_t + frac * (t - prev_t)
-            return float(direction * t0)
+
+        if inside:
+            if vt <= 0.0:
+                # Linear interpolation in t for the inside->outside 0-crossing.
+                denom = prev_v - vt
+                if denom <= 0:
+                    return float(direction * t)
+                frac = prev_v / denom
+                t0 = prev_t + frac * (t - prev_t)
+                return float(direction * t0)
+        elif vt > 0.0:
+            # Boundary/outside start: first enter mask, then look for the exit crossing.
+            inside = True
+
         prev_t = float(t)
         prev_v = vt
 
@@ -566,8 +706,7 @@ def measure_thickness_along_coronal_spline(
     if u.ndim != 1 or u.shape[0] != spline_yx.shape[0]:
         raise ValueError(f"Expected u shape (N,), got {u.shape} for spline length {spline_yx.shape[0]}")
 
-    signed = _signed_distance_field(mask_yx)
-
+    spline_yx = _snap_points_to_mask(spline_yx.astype(np.float64, copy=False), mask_yx)
     y = spline_yx[:, 0].astype(np.float64, copy=False)
     x = spline_yx[:, 1].astype(np.float64, copy=False)
     du = np.gradient(u.astype(np.float64, copy=False))
@@ -598,11 +737,11 @@ def measure_thickness_along_coronal_spline(
         n = np.array([ny[idx], nx[idx]], dtype=np.float64)
         if not np.isfinite(n).all() or float(np.linalg.norm(n)) <= 0:
             continue
-        t_pos[idx] = _first_zero_crossing_along_normal(
-            signed, p_yx=p, n_yx=n, direction=1.0, max_t=float(max_t), step=float(step)
+        t_pos[idx] = _march_to_boundary_along_normal(
+            mask_yx, p_yx=p, n_yx=n, direction=1.0, max_t=float(max_t), step=float(step)
         )
-        t_neg[idx] = _first_zero_crossing_along_normal(
-            signed, p_yx=p, n_yx=n, direction=-1.0, max_t=float(max_t), step=float(step)
+        t_neg[idx] = _march_to_boundary_along_normal(
+            mask_yx, p_yx=p, n_yx=n, direction=-1.0, max_t=float(max_t), step=float(step)
         )
 
     p_vent = np.full((spline_yx.shape[0], 2), np.nan, dtype=np.float64)
