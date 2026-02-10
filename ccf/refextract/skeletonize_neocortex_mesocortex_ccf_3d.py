@@ -1,22 +1,19 @@
-# %% [markdown]
+#%%
 # # 3D cortex skeleton (per-coronal slice lines) (E15.5 DevCCF)
 #
 # This workflow builds a 3D cortex mask (term + descendants), skeletonizes it into a 2D sheet-like
 # medial scaffold, then extracts a single polyline per coronal slice and visualizes them in 3D.
 #
-# Run cells sequentially. Each phase writes artifacts under `OUTDIR`.
+# Run top-to-bottom as a script. Each phase writes artifacts under `OUTDIR`.
 
-# %%
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
-from IPython import get_ipython
-from matplotlib.widgets import Slider
 from scipy.interpolate import splprep, splev
 from scipy.ndimage import distance_transform_edt, map_coordinates
 from skimage.morphology import (
@@ -30,16 +27,10 @@ from skimage.morphology import (
 
 from fishtools.ccf.cli_export_mask_edit_pack import _term_mask_from_annotation_yx
 
-# Optional: VS Code interactive Matplotlib backend
-ip = get_ipython()
-if ip is not None:
-    ip.run_line_magic("matplotlib", "widget")
-
 # Fixed atlas (DevCCF E15.5 reference used elsewhere in `ccf/`).
 ATLAS_NAME = "kim_dev_mouse_e15-5_lsfm_20um"
 
 
-# %%
 # === EDIT THESE ===
 
 # Terms to include (each term includes all descendants).
@@ -65,6 +56,13 @@ MIN_MASK_PX_PER_SLICE = 500
 MIN_SKELETON_PX_PER_SLICE = 50
 MAX_SLICES_TO_PLOT = 150
 
+# Hybrid chart-source rules (avoid unstable per-slice extraction near discontinuities):
+# - For coronal slices i < 177, derive the coronal line from sagittal-extracted points.
+# - For sagittal slices k < 148 or k > 225, derive the sagittal line from coronal-extracted points.
+CORONAL_USE_SAGITTAL_BELOW_I = 177
+SAGITTAL_USE_CORONAL_BELOW_K = 148
+SAGITTAL_USE_CORONAL_ABOVE_K = 225
+
 # Spline parametrization of the extracted coronal line (in pixel space).
 SPLINE_ORDER = 3
 SPLINE_SMOOTHING = 25.0
@@ -76,10 +74,8 @@ OUTDIR.mkdir(parents=True, exist_ok=True)
 BRAINGLOBE_CONFIG_DIR = Path("ccf/out/atlases/.brainglobe_config")
 
 
-# %% [markdown]
 # ## Phase 0: Load atlas annotation volume
 
-# %%
 if BRAINGLOBE_CONFIG_DIR.exists():
     os.environ["BRAINGLOBE_CONFIG_DIR"] = str(BRAINGLOBE_CONFIG_DIR.resolve())
 
@@ -106,10 +102,8 @@ def _resolution_ijk_um(res: object) -> tuple[float, float, float]:
 RES_I_UM, RES_J_UM, RES_K_UM = _resolution_ijk_um(atlas.resolution)
 
 
-# %% [markdown]
 # ## Phase 1: Build 3D mask (term + descendants)
 
-# %%
 annotation_3d = np.load(OUTDIR / "annotation_3d.npy")
 
 # Reuse shared term subtree logic by flattening spatial dims; restore to 3D afterward.
@@ -130,10 +124,8 @@ print(f"Mask voxels (raw)={int(mask_3d.sum())}")
 np.save(OUTDIR / "mask_3d.npy", mask_3d.astype(np.bool_))
 
 
-# %% [markdown]
 # ## Phase 2: 3D cleanup + skeletonize
 
-# %%
 mask_3d = np.load(OUTDIR / "mask_3d.npy").astype(bool)
 
 mask_clean_3d = mask_3d.copy()
@@ -176,10 +168,8 @@ np.save(OUTDIR / "mask_clean_3d.npy", mask_clean_3d.astype(np.bool_))
 np.save(OUTDIR / "skeleton_3d.npy", skeleton_3d.astype(np.bool_))
 
 
-# %% [markdown]
 # ## Phase 3: Coronal slice skeletons → 3D polylines
 
-# %%
 mask_3d = np.load(OUTDIR / "mask_3d.npy").astype(bool)
 mask_clean_3d = np.load(OUTDIR / "mask_clean_3d.npy").astype(bool)
 neo_meso_path = OUTDIR / "neo_meso_3d.npy"
@@ -366,6 +356,151 @@ def _slice_plane_path_from_ijk(path_ijk: np.ndarray, *, axis: Literal[0, 2]) -> 
     raise ValueError(f"Unsupported axis={axis}. Expected 0 or 2.")
 
 
+def _extract_axis_lines_raw(
+    *,
+    mask_3d: np.ndarray,
+    axis: Literal[0, 2],
+) -> tuple[list[np.ndarray], list[int]]:
+    n_slices_axis = int(mask_3d.shape[int(axis)])
+    lines_ijk_axis: list[np.ndarray] = []
+    slice_indices_axis: list[int] = []
+
+    for slice_idx in range(0, n_slices_axis, int(SLICE_STRIDE)):
+        if axis == 0:
+            mask_2d = mask_3d[slice_idx, :, :]
+        else:
+            mask_2d = mask_3d[:, :, slice_idx]
+        if int(mask_2d.sum()) < int(MIN_MASK_PX_PER_SLICE):
+            continue
+        skel_2d = skeletonize(mask_2d)
+        if int(skel_2d.sum()) < int(MIN_SKELETON_PX_PER_SLICE):
+            continue
+
+        path_yx = _longest_shortest_path_yx(skel_2d)
+        path_ijk = _embed_slice_path_in_ijk(path_yx.astype(np.int32), slice_idx=int(slice_idx), axis=axis).astype(
+            np.int32, copy=False
+        )
+        if path_ijk.shape[0] < 2:
+            continue
+
+        lines_ijk_axis.append(path_ijk)
+        slice_indices_axis.append(int(slice_idx))
+
+    return lines_ijk_axis, slice_indices_axis
+
+
+def _cross_section_path_from_other_axis(
+    *,
+    slice_idx: int,
+    axis: Literal[0, 2],
+    other_lines_ijk: list[np.ndarray],
+    mask_shape_ijk: tuple[int, int, int],
+) -> np.ndarray | None:
+    # axis=0: build coronal (j,k) path from sagittal (i,j,k) lines at i==slice_idx
+    # axis=2: build sagittal (i,j) path from coronal (i,j,k) lines at k==slice_idx
+    if axis == 0:
+        h, w = int(mask_shape_ijk[1]), int(mask_shape_ijk[2])
+        pts: list[np.ndarray] = []
+        for p in other_lines_ijk:
+            sel = p[:, 0] == int(slice_idx)
+            if np.any(sel):
+                pts.append(p[sel][:, 1:3])
+        if not pts:
+            return None
+        yx = np.vstack(pts).astype(np.int32, copy=False)
+        yx = _unique_rows_preserve_order(yx)
+        yx = yx[(yx[:, 0] >= 0) & (yx[:, 0] < h) & (yx[:, 1] >= 0) & (yx[:, 1] < w)]
+        if yx.shape[0] < 2:
+            return None
+        skel_2d = np.zeros((h, w), dtype=bool)
+        skel_2d[yx[:, 0], yx[:, 1]] = True
+        path_yx = _longest_shortest_path_yx(skel_2d)
+        return _embed_slice_path_in_ijk(path_yx.astype(np.int32), slice_idx=int(slice_idx), axis=axis).astype(
+            np.int32, copy=False
+        )
+
+    h, w = int(mask_shape_ijk[0]), int(mask_shape_ijk[1])
+    pts: list[np.ndarray] = []
+    for p in other_lines_ijk:
+        sel = p[:, 2] == int(slice_idx)
+        if np.any(sel):
+            pts.append(p[sel][:, 0:2])
+    if not pts:
+        return None
+    yx = np.vstack(pts).astype(np.int32, copy=False)
+    yx = _unique_rows_preserve_order(yx)
+    yx = yx[(yx[:, 0] >= 0) & (yx[:, 0] < h) & (yx[:, 1] >= 0) & (yx[:, 1] < w)]
+    if yx.shape[0] < 2:
+        return None
+    skel_2d = np.zeros((h, w), dtype=bool)
+    skel_2d[yx[:, 0], yx[:, 1]] = True
+    path_yx = _longest_shortest_path_yx(skel_2d)
+    return _embed_slice_path_in_ijk(path_yx.astype(np.int32), slice_idx=int(slice_idx), axis=axis).astype(
+        np.int32, copy=False
+    )
+
+
+def _build_axis_lines_with_spline_hybrid(
+    *,
+    axis: Literal[0, 2],
+    lines_ijk_raw: list[np.ndarray],
+    slice_indices_raw: list[int],
+    other_lines_ijk_raw: list[np.ndarray],
+    include_mask_3d: np.ndarray,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[int]]:
+    lines_ijk_axis: list[np.ndarray] = []
+    lines_spline_ijk_axis: list[np.ndarray] = []
+    lines_spline_u_axis: list[np.ndarray] = []
+    slice_indices_axis: list[int] = []
+
+    raw_by_slice = {int(s): p for s, p in zip(slice_indices_raw, lines_ijk_raw, strict=True)}
+    mask_shape_ijk = (int(include_mask_3d.shape[0]), int(include_mask_3d.shape[1]), int(include_mask_3d.shape[2]))
+
+    for slice_idx in sorted(raw_by_slice.keys()):
+        path_ijk = raw_by_slice[int(slice_idx)]
+
+        if axis == 0 and int(slice_idx) < int(CORONAL_USE_SAGITTAL_BELOW_I):
+            alt = _cross_section_path_from_other_axis(
+                slice_idx=int(slice_idx),
+                axis=axis,
+                other_lines_ijk=other_lines_ijk_raw,
+                mask_shape_ijk=mask_shape_ijk,
+            )
+            if alt is not None and alt.shape[0] >= 2:
+                path_ijk = alt
+        elif axis == 2 and (
+            int(slice_idx) < int(SAGITTAL_USE_CORONAL_BELOW_K) or int(slice_idx) > int(SAGITTAL_USE_CORONAL_ABOVE_K)
+        ):
+            alt = _cross_section_path_from_other_axis(
+                slice_idx=int(slice_idx),
+                axis=axis,
+                other_lines_ijk=other_lines_ijk_raw,
+                mask_shape_ijk=mask_shape_ijk,
+            )
+            if alt is not None and alt.shape[0] >= 2:
+                path_ijk = alt
+
+        # Allocortex exclusion (neo+meso include mask) happens after hybrid sourcing.
+        keep = include_mask_3d[path_ijk[:, 0], path_ijk[:, 1], path_ijk[:, 2]]
+        path_ijk = path_ijk[keep]
+        if path_ijk.shape[0] < 2:
+            continue
+
+        yx_spline, u_spline = _resample_polyline_yx_spline(
+            _slice_plane_path_from_ijk(path_ijk, axis=axis).astype(np.float64, copy=False),
+            n_samples=int(SPLINE_N_SAMPLES),
+            smoothing=float(SPLINE_SMOOTHING),
+            order=int(SPLINE_ORDER),
+        )
+
+        lines_ijk_axis.append(path_ijk.astype(np.int32, copy=False))
+        lines_spline_ijk_axis.append(_embed_slice_path_in_ijk(yx_spline, slice_idx=int(slice_idx), axis=axis))
+        lines_spline_u_axis.append(u_spline)
+        slice_indices_axis.append(int(slice_idx))
+
+    return lines_ijk_axis, lines_spline_ijk_axis, lines_spline_u_axis, slice_indices_axis
+
+
 def _extract_axis_lines_with_spline(
     *,
     mask_3d: np.ndarray,
@@ -462,13 +597,61 @@ def _save_spline_lines_um_csv(
     )
 
 
-lines_ijk, lines_spline_ijk, lines_spline_u, slice_indices = _extract_axis_lines_with_spline(
-    mask_3d=mask_clean_3d,
-    include_mask_3d=neo_meso_3d,
+def _extract_save_axis_lines(
+    *,
+    mask_3d: np.ndarray,
+    include_mask_3d: np.ndarray,
+    axis: Literal[0, 2],
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[int]]:
+    if axis == 0:
+        axis_name = "coronal"
+        slice_col = "slice_i"
+    elif axis == 2:
+        axis_name = "sagittal"
+        slice_col = "slice_k"
+    else:
+        raise ValueError(f"Unsupported axis={axis}. Expected 0 or 2.")
+
+    lines_ijk_axis, lines_spline_ijk_axis, lines_spline_u_axis, slice_indices_axis = _extract_axis_lines_with_spline(
+        mask_3d=mask_3d,
+        include_mask_3d=include_mask_3d,
+        axis=axis,
+    )
+    if not lines_ijk_axis:
+        raise ValueError(f"No {axis_name} slice skeleton lines were extracted; lower thresholds or check terms.")
+
+    _save_lines_um_csv(
+        lines_ijk=lines_ijk_axis,
+        slice_indices=slice_indices_axis,
+        out_csv=OUTDIR / f"{axis_name}_slice_lines_um.csv",
+        slice_col=slice_col,
+    )
+    _save_spline_lines_um_csv(
+        lines_spline_ijk=lines_spline_ijk_axis,
+        lines_spline_u=lines_spline_u_axis,
+        slice_indices=slice_indices_axis,
+        out_csv=OUTDIR / f"{axis_name}_slice_lines_spline_um.csv",
+        slice_col=slice_col,
+    )
+    return lines_ijk_axis, lines_spline_ijk_axis, lines_spline_u_axis, slice_indices_axis
+
+
+coronal_lines_ijk_raw, coronal_slice_indices_raw = _extract_axis_lines_raw(mask_3d=mask_clean_3d, axis=0)
+sagittal_lines_ijk_raw, sagittal_slice_indices_raw = _extract_axis_lines_raw(mask_3d=mask_clean_3d, axis=2)
+if not coronal_lines_ijk_raw:
+    raise ValueError("No coronal slice skeleton lines were extracted; lower thresholds or check terms.")
+if not sagittal_lines_ijk_raw:
+    raise ValueError("No sagittal slice skeleton lines were extracted; lower thresholds or check terms.")
+
+lines_ijk, lines_spline_ijk, lines_spline_u, slice_indices = _build_axis_lines_with_spline_hybrid(
     axis=0,
+    lines_ijk_raw=coronal_lines_ijk_raw,
+    slice_indices_raw=coronal_slice_indices_raw,
+    other_lines_ijk_raw=sagittal_lines_ijk_raw,
+    include_mask_3d=neo_meso_3d,
 )
 if not lines_ijk:
-    raise ValueError("No coronal slice skeleton lines were extracted; lower thresholds or check terms.")
+    raise ValueError("No coronal slice skeleton lines remained after hybrid sourcing + include-mask filtering.")
 
 _save_lines_um_csv(
     lines_ijk=lines_ijk,
@@ -485,13 +668,11 @@ _save_spline_lines_um_csv(
 )
 
 
-# %% [markdown]
 # ## Phase 3h: Thickness along coronal spline (orthogonal to curve)
 #
 # For each slice, for each spline point, cast rays along the local normal direction to find the two
 # mask boundaries and measure thickness (ventricular↔pial). We keep `v=0` as ventricular convention.
 
-# %%
 def _signed_distance_field(mask: np.ndarray) -> np.ndarray:
     if mask.ndim != 2:
         raise ValueError(f"Expected 2D mask, got shape={mask.shape}")
@@ -697,6 +878,7 @@ def measure_thickness_along_coronal_spline(
     mask_yx: np.ndarray,
     spline_yx: np.ndarray,
     u: np.ndarray,
+    force_vent_minus_pia_positive: bool | None = None,
     max_t: float = 250.0,
     step: float = 0.5,
 ) -> dict[str, np.ndarray]:
@@ -810,7 +992,18 @@ def measure_thickness_along_coronal_spline(
     vent_x = p_vent[:, 1]
     pia_x = p_pia[:, 1]
     finite = np.isfinite(vent_x) & np.isfinite(pia_x)
-    if int(np.sum(finite)) >= 20:
+    finite_n = int(np.sum(finite))
+    if force_vent_minus_pia_positive is not None:
+        # Cross-slice continuity mode: enforce a consistent vent/pia sign (vent_x - pia_x).
+        # This intentionally relaxes the per-slice thresholds that were meant to avoid flipping on noise.
+        if finite_n >= 5:
+            med_dx = float(np.nanmedian(vent_x[finite] - pia_x[finite]))
+            if np.isfinite(med_dx):
+                wants_positive = bool(force_vent_minus_pia_positive)
+                if (med_dx < 0.0) == wants_positive:
+                    p_vent, p_pia = p_pia, p_vent
+                    v_skel = 1.0 - v_skel
+    elif finite_n >= 20:
         med_dx = float(np.nanmedian(vent_x[finite] - pia_x[finite]))
         if np.isfinite(med_dx) and abs(med_dx) >= 0.25:
             wants_positive = midline_is_high_x
@@ -836,317 +1029,116 @@ def measure_thickness_along_coronal_spline(
     }
 
 
-thickness_rows: list[np.ndarray] = []
-thickness_by_slice_i: dict[int, dict[str, np.ndarray]] = {}
-for i, path_spline, u in zip(slice_indices, lines_spline_ijk, lines_spline_u, strict=True):
-    i_int = int(i)
-    # Use raw (non-eroded) neo+meso mask for thickness/v; erosion is only to prevent skeleton bridging.
-    mask_yx = (mask_3d[i_int, :, :] & neo_meso_3d[i_int, :, :]).astype(bool)
-    yx = path_spline[:, 1:].astype(np.float64, copy=False)
-    meas = measure_thickness_along_coronal_spline(slice_i=i_int, mask_yx=mask_yx, spline_yx=yx, u=u)
-    thickness_by_slice_i[i_int] = meas
+def _compute_thickness_by_slice_for_axis(
+    *,
+    axis: Literal[0, 2],
+    slice_indices_axis: list[int],
+    lines_spline_ijk_axis: list[np.ndarray],
+    lines_spline_u_axis: list[np.ndarray],
+    mask_3d_for_thickness: np.ndarray,
+    include_mask_3d: np.ndarray,
+) -> dict[int, dict[str, np.ndarray]]:
+    if axis == 0:
+        slice_col = "slice_i"
+        out_csv = OUTDIR / "coronal_spline_thickness.csv"
+        res_y_um = float(RES_J_UM)
+        res_x_um = float(RES_K_UM)
+    elif axis == 2:
+        slice_col = "slice_k"
+        out_csv = OUTDIR / "sagittal_spline_thickness.csv"
+        res_y_um = float(RES_I_UM)
+        res_x_um = float(RES_J_UM)
+    else:
+        raise ValueError(f"Unsupported axis={axis}. Expected 0 or 2.")
 
-    vent_y_um = meas["vent_y"] * RES_J_UM
-    vent_x_um = meas["vent_x"] * RES_K_UM
-    pia_y_um = meas["pia_y"] * RES_J_UM
-    pia_x_um = meas["pia_x"] * RES_K_UM
-    thickness_um = np.sqrt((vent_y_um - pia_y_um) ** 2 + (vent_x_um - pia_x_um) ** 2)
+    rows: list[np.ndarray] = []
+    thickness_by_slice: dict[int, dict[str, np.ndarray]] = {}
+    force_vent_minus_pia_positive: bool | None = None
 
-    thickness_rows.append(
-        np.column_stack(
-            [
-                meas["slice_i"].astype(np.int32),
-                meas["u"],
-                meas["thickness_px"],
-                thickness_um.astype(np.float64),
-                meas["v_skel"],
-                meas["y"],
-                meas["x"],
-                meas["vent_y"],
-                meas["vent_x"],
-                meas["pia_y"],
-                meas["pia_x"],
-            ]
+    for slice_idx, path_spline, u in zip(slice_indices_axis, lines_spline_ijk_axis, lines_spline_u_axis, strict=True):
+        slice_index = int(slice_idx)
+        if axis == 0:
+            mask_yx = (mask_3d_for_thickness[slice_index, :, :] & include_mask_3d[slice_index, :, :]).astype(bool)
+        else:
+            mask_yx = (mask_3d_for_thickness[:, :, slice_index] & include_mask_3d[:, :, slice_index]).astype(bool)
+
+        yx = _slice_plane_path_from_ijk(path_spline, axis=axis).astype(np.float64, copy=False)
+
+        meas = measure_thickness_along_coronal_spline(
+            slice_i=slice_index,
+            mask_yx=mask_yx,
+            spline_yx=yx,
+            u=u,
+            force_vent_minus_pia_positive=force_vent_minus_pia_positive if axis == 0 else None,
         )
-    )
+        thickness_by_slice[slice_index] = meas
+        if axis == 0:
+            vent_x = meas["vent_x"]
+            pia_x = meas["pia_x"]
+            finite = np.isfinite(vent_x) & np.isfinite(pia_x)
+            if int(np.sum(finite)) >= 5:
+                med_dx = float(np.nanmedian(vent_x[finite] - pia_x[finite]))
+                if np.isfinite(med_dx):
+                    force_vent_minus_pia_positive = bool(med_dx >= 0.0)
 
-thickness_table = np.vstack(thickness_rows)
-np.savetxt(
-    OUTDIR / "coronal_spline_thickness.csv",
-    thickness_table,
-    delimiter=",",
-    header="slice_i,u,thickness_px,thickness_um,v_skel,y,x,vent_y,vent_x,pia_y,pia_x",
-    comments="",
+        vent_y_um = meas["vent_y"] * res_y_um
+        vent_x_um = meas["vent_x"] * res_x_um
+        pia_y_um = meas["pia_y"] * res_y_um
+        pia_x_um = meas["pia_x"] * res_x_um
+        thickness_um = np.sqrt((vent_y_um - pia_y_um) ** 2 + (vent_x_um - pia_x_um) ** 2)
+
+        rows.append(
+            np.column_stack(
+                [
+                    np.full((meas["u"].shape[0],), slice_index, dtype=np.int32),
+                    meas["u"],
+                    meas["thickness_px"],
+                    thickness_um.astype(np.float64),
+                    meas["v_skel"],
+                    meas["y"],
+                    meas["x"],
+                    meas["vent_y"],
+                    meas["vent_x"],
+                    meas["pia_y"],
+                    meas["pia_x"],
+                ]
+            )
+        )
+
+    table = np.vstack(rows)
+    np.savetxt(
+        out_csv,
+        table,
+        delimiter=",",
+        header=f"{slice_col},u,thickness_px,thickness_um,v_skel,y,x,vent_y,vent_x,pia_y,pia_x",
+        comments="",
+    )
+    return thickness_by_slice
+
+
+thickness_by_slice_i = _compute_thickness_by_slice_for_axis(
+    axis=0,
+    slice_indices_axis=slice_indices,
+    lines_spline_ijk_axis=lines_spline_ijk,
+    lines_spline_u_axis=lines_spline_u,
+    mask_3d_for_thickness=mask_3d,
+    include_mask_3d=neo_meso_3d,
 )
 
 
-# %% [markdown]
-# ## Phase 3i: Coronal slider with v-parameter shading
-#
-# Visualizes the per-slice `v ∈ [0,1]` coordinate by rasterizing normal segments (ventricular→pial).
-
-# %%
-def _v_shading_image(
-    *,
-    shape: tuple[int, int],
-    vent_yx: np.ndarray,
-    pia_yx: np.ndarray,
-    mask_yx: np.ndarray,
-    n_v_samples: int = 64,
-) -> np.ndarray:
-    if vent_yx.shape != pia_yx.shape or vent_yx.ndim != 2 or vent_yx.shape[1] != 2:
-        raise ValueError(f"Expected vent/pia shape (N,2), got {vent_yx.shape} and {pia_yx.shape}")
-    h, w = int(shape[0]), int(shape[1])
-    v_img = np.full((h, w), np.nan, dtype=np.float32)
-
-    v_vals = np.linspace(0.0, 1.0, int(n_v_samples), dtype=np.float64)
-    for v in v_vals:
-        y = vent_yx[:, 0] + v * (pia_yx[:, 0] - vent_yx[:, 0])
-        x = vent_yx[:, 1] + v * (pia_yx[:, 1] - vent_yx[:, 1])
-        yi = np.rint(y).astype(np.int32)
-        xi = np.rint(x).astype(np.int32)
-        ok = (yi >= 0) & (yi < h) & (xi >= 0) & (xi < w)
-        yi = yi[ok]
-        xi = xi[ok]
-        if yi.size == 0:
-            continue
-        v_img[yi, xi] = float(v)
-
-    v_img[~mask_yx.astype(bool, copy=False)] = np.nan
-    return v_img
-
-
-def view_v_parameterization_coronal(
-    *,
-    mask_3d: np.ndarray,
-    background_3d: np.ndarray,
-    thickness_by_slice: dict[int, dict[str, np.ndarray]],
-) -> None:
-    n_i = int(mask_3d.shape[0])
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
-
-    slices = sorted(thickness_by_slice.keys())
-    if not slices:
-        raise ValueError("thickness_by_slice is empty.")
-    cur_i = int(np.clip(int(np.median(slices)), 0, n_i - 1))
-
-    cmap = plt.get_cmap("turbo").copy()
-    cmap.set_bad(alpha=0.0)
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Coronal: v-parameter shading (ventricular=0)")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[cur_i, :, :],
-        cmap="gray",
-        interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    v_im = ax.imshow(
-        np.full_like(background_3d[cur_i, :, :], np.nan, dtype=np.float32),
-        cmap=cmap,
-        interpolation="nearest",
-        vmin=0.0,
-        vmax=1.0,
-        alpha=0.65,
-        zorder=2,
-    )
-    (spline_line,) = ax.plot([], [], c="white", lw=1.0, alpha=0.9)
-    ax.set_xlabel("x (k)")
-    ax.set_ylabel("y (j)")
-    cbar = fig.colorbar(v_im, ax=ax, pad=0.02, fraction=0.04)
-    cbar.set_label("v (ventricular=0 → pial=1)")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "slice i", 0, n_i - 1, valinit=cur_i, valstep=1)
-
-    cache: dict[int, np.ndarray] = {}
-    cache_order: list[int] = []
-
-    def v_for_slice(i: int) -> np.ndarray:
-        if i in cache:
-            return cache[i]
-        meas = thickness_by_slice.get(i)
-        if meas is None:
-            return np.full(mask_3d.shape[1:], np.nan, dtype=np.float32)
-
-        vent = np.column_stack([meas["vent_y"], meas["vent_x"]]).astype(np.float64)
-        pia = np.column_stack([meas["pia_y"], meas["pia_x"]]).astype(np.float64)
-        finite = np.isfinite(vent).all(axis=1) & np.isfinite(pia).all(axis=1)
-        vent = vent[finite]
-        pia = pia[finite]
-
-        mask_yx = (mask_3d[i, :, :]).astype(bool, copy=False)
-        out = _v_shading_image(shape=mask_yx.shape, vent_yx=vent, pia_yx=pia, mask_yx=mask_yx)
-
-        cache[i] = out
-        cache_order.append(i)
-        if len(cache_order) > 12:
-            drop = cache_order.pop(0)
-            cache.pop(drop, None)
-        return out
-
-    def set_i(i: int) -> None:
-        i = int(np.clip(i, 0, n_i - 1))
-        img.set_data(background_3d[i, :, :])
-        v_im.set_data(v_for_slice(i))
-
-        meas = thickness_by_slice.get(i)
-        if meas is None:
-            spline_line.set_data([], [])
-            n_pts = 0
-        else:
-            spline_line.set_data(meas["x"], meas["y"])
-            n_pts = int(meas["x"].shape[0])
-
-        ax.set_title(f"coronal i={i}  |  u_samples={n_pts}  |  mask_px={int(mask_3d[i].sum())}")
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        cur = int(slider.val)
-        if key in {"right", "up", "d"}:
-            slider.set_val(cur + 1)
-        elif key in {"left", "down", "a"}:
-            slider.set_val(cur - 1)
-
-    slider.on_changed(lambda v: set_i(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-    set_i(cur_i)
-    plt.show()
-
-
-def view_v_parameterization_sagittal(
-    *,
-    mask_3d: np.ndarray,
-    background_3d: np.ndarray,
-    thickness_by_slice: dict[int, dict[str, np.ndarray]],
-) -> None:
-    n_k = int(mask_3d.shape[2])
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
-
-    slices = sorted(thickness_by_slice.keys())
-    if not slices:
-        raise ValueError("thickness_by_slice is empty.")
-    cur_k = int(np.clip(int(np.median(slices)), 0, n_k - 1))
-
-    cmap = plt.get_cmap("turbo").copy()
-    cmap.set_bad(alpha=0.0)
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Sagittal: v-parameter shading (ventricular=0)")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[:, :, cur_k],
-        cmap="gray",
-        interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
-        aspect="auto",
-    )
-    v_im = ax.imshow(
-        np.full_like(background_3d[:, :, cur_k], np.nan, dtype=np.float32),
-        cmap=cmap,
-        interpolation="nearest",
-        vmin=0.0,
-        vmax=1.0,
-        alpha=0.65,
-        aspect="auto",
-        zorder=2,
-    )
-    (spline_line,) = ax.plot([], [], c="white", lw=1.0, alpha=0.9)
-    ax.set_xlabel("y (j)")
-    ax.set_ylabel("coronal slice (i)")
-    cbar = fig.colorbar(v_im, ax=ax, pad=0.02, fraction=0.04)
-    cbar.set_label("v (ventricular=0 → pial=1)")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "x (k)", 0, n_k - 1, valinit=cur_k, valstep=1)
-
-    cache: dict[int, np.ndarray] = {}
-    cache_order: list[int] = []
-
-    def v_for_slice(k: int) -> np.ndarray:
-        if k in cache:
-            return cache[k]
-        meas = thickness_by_slice.get(k)
-        if meas is None:
-            return np.full(mask_3d.shape[:2], np.nan, dtype=np.float32)
-
-        vent = np.column_stack([meas["vent_y"], meas["vent_x"]]).astype(np.float64)
-        pia = np.column_stack([meas["pia_y"], meas["pia_x"]]).astype(np.float64)
-        finite = np.isfinite(vent).all(axis=1) & np.isfinite(pia).all(axis=1)
-        vent = vent[finite]
-        pia = pia[finite]
-
-        mask_ij = mask_3d[:, :, k].astype(bool, copy=False)
-        out = _v_shading_image(shape=mask_ij.shape, vent_yx=vent, pia_yx=pia, mask_yx=mask_ij)
-
-        cache[k] = out
-        cache_order.append(k)
-        if len(cache_order) > 12:
-            drop = cache_order.pop(0)
-            cache.pop(drop, None)
-        return out
-
-    def set_k(k: int) -> None:
-        k = int(np.clip(k, 0, n_k - 1))
-        img.set_data(background_3d[:, :, k])
-        v_im.set_data(v_for_slice(k))
-
-        meas = thickness_by_slice.get(k)
-        if meas is None:
-            spline_line.set_data([], [])
-            n_pts = 0
-        else:
-            spline_line.set_data(meas["x"], meas["y"])
-            n_pts = int(meas["x"].shape[0])
-
-        ax.set_title(f"sagittal k={k}  |  u_samples={n_pts}  |  mask_px={int(mask_3d[:, :, k].sum())}")
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        cur = int(slider.val)
-        if key in {"right", "up", "d"}:
-            slider.set_val(cur + 1)
-        elif key in {"left", "down", "a"}:
-            slider.set_val(cur - 1)
-
-    slider.on_changed(lambda v: set_k(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-    set_k(cur_k)
-    plt.show()
-
-
-
-# %% [markdown]
 # ## Phase 3d: Sagittal slice skeletons → 3D polylines
 #
 # Same idea as Phase 3, but per-sagittal slice (axis 2).
 
-# %%
-sagittal_lines_ijk, sagittal_lines_spline_ijk, sagittal_lines_spline_u, sagittal_slice_indices = (
-    _extract_axis_lines_with_spline(
-        mask_3d=mask_clean_3d,
-        include_mask_3d=neo_meso_3d,
-        axis=2,
-    )
+sagittal_lines_ijk, sagittal_lines_spline_ijk, sagittal_lines_spline_u, sagittal_slice_indices = _build_axis_lines_with_spline_hybrid(
+    axis=2,
+    lines_ijk_raw=sagittal_lines_ijk_raw,
+    slice_indices_raw=sagittal_slice_indices_raw,
+    other_lines_ijk_raw=coronal_lines_ijk_raw,
+    include_mask_3d=neo_meso_3d,
 )
-
 if not sagittal_lines_ijk:
-    raise ValueError("No sagittal slice skeleton lines were extracted; lower thresholds or check terms.")
+    raise ValueError("No sagittal slice skeleton lines remained after hybrid sourcing + include-mask filtering.")
 
 _save_lines_um_csv(
     lines_ijk=sagittal_lines_ijk,
@@ -1162,912 +1154,338 @@ _save_spline_lines_um_csv(
     slice_col="slice_k",
 )
 
-sagittal_thickness_rows: list[np.ndarray] = []
-thickness_by_slice_k: dict[int, dict[str, np.ndarray]] = {}
-for k, path_spline, u in zip(sagittal_slice_indices, sagittal_lines_spline_ijk, sagittal_lines_spline_u, strict=True):
-    k_int = int(k)
-    mask_ij = (mask_3d[:, :, k_int] & neo_meso_3d[:, :, k_int]).astype(bool)
-    yx = path_spline[:, :2].astype(np.float64, copy=False)
-    meas = measure_thickness_along_coronal_spline(slice_i=k_int, mask_yx=mask_ij, spline_yx=yx, u=u)
-    thickness_by_slice_k[k_int] = meas
-
-    vent_i_um = meas["vent_y"] * RES_I_UM
-    vent_j_um = meas["vent_x"] * RES_J_UM
-    pia_i_um = meas["pia_y"] * RES_I_UM
-    pia_j_um = meas["pia_x"] * RES_J_UM
-    thickness_um = np.sqrt((vent_i_um - pia_i_um) ** 2 + (vent_j_um - pia_j_um) ** 2)
-
-    sagittal_thickness_rows.append(
-        np.column_stack(
-            [
-                np.full((meas["u"].shape[0],), k_int, dtype=np.int32),
-                meas["u"],
-                meas["thickness_px"],
-                thickness_um.astype(np.float64),
-                meas["v_skel"],
-                meas["y"],
-                meas["x"],
-                meas["vent_y"],
-                meas["vent_x"],
-                meas["pia_y"],
-                meas["pia_x"],
-            ]
-        )
-    )
-
-sagittal_thickness_table = np.vstack(sagittal_thickness_rows)
-np.savetxt(
-    OUTDIR / "sagittal_spline_thickness.csv",
-    sagittal_thickness_table,
-    delimiter=",",
-    header="slice_k,u,thickness_px,thickness_um,v_skel,y,x,vent_y,vent_x,pia_y,pia_x",
-    comments="",
+thickness_by_slice_k = _compute_thickness_by_slice_for_axis(
+    axis=2,
+    slice_indices_axis=sagittal_slice_indices,
+    lines_spline_ijk_axis=sagittal_lines_spline_ijk,
+    lines_spline_u_axis=sagittal_lines_spline_u,
+    mask_3d_for_thickness=mask_3d,
+    include_mask_3d=neo_meso_3d,
 )
 
-
-# %% [markdown]
-# ## Phase 3b: Scroll through coronal slices (mask + per-slice skeleton line)
+# ## Phase 5: Coronal↔sagittal chart transition maps (slice, u)
 #
-# Controls:
-# - Arrow keys: ←/→ or ↑/↓
+# We treat the extracted medial scaffold as a 2D manifold embedded in 3D:
+# - Coronal chart:   ϕ_c(slice_i, u_c) → (i,j,k)
+# - Sagittal chart:  ϕ_s(slice_k, u_s) → (i,j,k)
 #
-# Notes:
-# - The overlay is the *extracted per-slice line* (not the full 3D skeleton voxel set).
+# To map between charts, we evaluate forward into 3D using the per-slice spline, then invert
+# approximately by projecting onto candidate per-slice polylines in the other chart.
+#
+# Note: This intentionally ignores `v` / thickness and only unifies the sheet-like scaffold.
 
-# %%
-def _robust_vmin_vmax(vol_3d: np.ndarray) -> tuple[float, float]:
-    sample = vol_3d[::4, ::4, ::4].astype(np.float32, copy=False)
-    vmin, vmax = np.percentile(sample, [1, 99]).astype(np.float64)
-    if not np.isfinite(vmin) or not np.isfinite(vmax) or float(vmax) <= float(vmin):
-        vmin = float(np.nanmin(sample))
-        vmax = float(np.nanmax(sample))
-        if not np.isfinite(vmin) or not np.isfinite(vmax) or float(vmax) <= float(vmin):
-            vmin, vmax = 0.0, 1.0
-    return float(vmin), float(vmax)
+@dataclass(frozen=True)
+class SlicePolyline:
+    u: np.ndarray  # (N,) in [0,1], increasing
+    p2_um: np.ndarray  # (N,2) in-plane coordinates (um)
+    p3_vox: np.ndarray  # (N,3) voxel coordinates (float ok)
 
+    def flipped(self) -> "SlicePolyline":
+        u = self.u.astype(np.float64, copy=False)
+        return SlicePolyline(
+            u=(1.0 - u[::-1]).astype(np.float64, copy=False),
+            p2_um=self.p2_um[::-1].astype(np.float64, copy=False),
+            p3_vox=self.p3_vox[::-1].astype(np.float64, copy=False),
+        )
 
-def view_mask_and_line_by_slice(
-    mask_3d: np.ndarray, lines_ijk_: list[np.ndarray], background_3d: np.ndarray | None = None
-) -> None:
-    if mask_3d.ndim != 3:
-        raise ValueError(f"Expected mask_3d.ndim==3, got shape={mask_3d.shape}")
-    if not lines_ijk_:
-        raise ValueError("lines_ijk is empty.")
+    def eval_p3_vox(self, u_query: float) -> np.ndarray:
+        uq = float(np.clip(float(u_query), 0.0, 1.0))
+        u = self.u.astype(np.float64, copy=False)
+        p3 = self.p3_vox.astype(np.float64, copy=False)
+        out = np.empty((3,), dtype=np.float64)
+        out[0] = float(np.interp(uq, u, p3[:, 0]))
+        out[1] = float(np.interp(uq, u, p3[:, 1]))
+        out[2] = float(np.interp(uq, u, p3[:, 2]))
+        return out
 
-    n_slices_ = int(mask_3d.shape[0])
-    if background_3d is None:
-        background_3d = mask_3d.astype(np.float32)
-    if background_3d.shape[0] != mask_3d.shape[0] or background_3d.shape[1] != mask_3d.shape[1]:
-        raise ValueError(f"background_3d shape must match mask_3d in i/j, got {background_3d.shape} vs {mask_3d.shape}")
-    if background_3d.shape[2] < mask_3d.shape[2]:
-        raise ValueError(f"background_3d has fewer x-slices than mask_3d: {background_3d.shape} vs {mask_3d.shape}")
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
+    def project_u(self, q2_um: np.ndarray) -> tuple[float, float]:
+        q = np.asarray(q2_um, dtype=np.float64).reshape(1, 2)
+        p = self.p2_um.astype(np.float64, copy=False)
+        if p.shape[0] < 2:
+            raise ValueError("Need at least 2 polyline points to project.")
 
-    line_by_slice_yx: dict[int, np.ndarray] = {}
-    for path_ijk in lines_ijk_:
-        if path_ijk.ndim != 2 or path_ijk.shape[1] != 3:
-            raise ValueError(f"Expected (N,3) path_ijk, got shape={path_ijk.shape}")
-        slice_i = int(path_ijk[0, 0])
-        if not np.all(path_ijk[:, 0] == slice_i):
-            raise ValueError("Each path_ijk must belong to a single slice.")
-        line_by_slice_yx[slice_i] = path_ijk[:, 1:].astype(np.int32)
+        p0 = p[:-1]
+        p1 = p[1:]
+        v = p1 - p0  # (M,2)
+        w = q - p0  # (M,2) via broadcast
+        vv = np.sum(v * v, axis=1)  # (M,)
+        vv = np.where(vv > 0.0, vv, 1.0)
+        t = np.sum(w * v, axis=1) / vv
+        t = np.clip(t, 0.0, 1.0)
+        proj = p0 + v * t[:, None]
+        d2 = np.sum((proj - q) ** 2, axis=1)
 
-    cur_slice = int(np.clip(int(np.median(list(line_by_slice_yx.keys()))), 0, n_slices_ - 1))
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Mask + skeleton line (coronal slices)")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[cur_slice, :, :],
-        cmap="gray",
-        interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    mask_img = ax.imshow(
-        mask_3d[cur_slice, :, :],
-        cmap="Greens",
-        interpolation="nearest",
-        alpha=0.22,
-        vmin=0.0,
-        vmax=1.0,
-    )
-    (line_plot,) = ax.plot([], [], c="cyan", lw=1.5, alpha=0.95)
-    ax.set_title(f"slice i={cur_slice}  |  mask_px={int(mask_3d[cur_slice].sum())}")
-    ax.set_xlabel("x (k)")
-    ax.set_ylabel("y (j)")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "slice i", 0, n_slices_ - 1, valinit=cur_slice, valstep=1)
-
-    def set_slice(i: int) -> None:
-        nonlocal cur_slice
-        i = int(np.clip(i, 0, n_slices_ - 1))
-        cur_slice = i
-        img.set_data(background_3d[i, :, :])
-        mask_img.set_data(mask_3d[i, :, :])
-        line_yx = line_by_slice_yx.get(i)
-        if line_yx is None or line_yx.size == 0:
-            line_plot.set_data([], [])
-        else:
-            # imshow uses (row=y, col=x); plot expects x then y.
-            line_plot.set_data(line_yx[:, 1], line_yx[:, 0])
-        ax.set_title(f"slice i={i}  |  mask_px={int(mask_3d[i].sum())}")
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        if key in {"right", "up"}:
-            slider.set_val(int(cur_slice + 1))
-        elif key in {"left", "down"}:
-            slider.set_val(int(cur_slice - 1))
-
-    slider.on_changed(lambda v: set_slice(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-
-    set_slice(cur_slice)
-    plt.show()
+        m = int(np.argmin(d2))
+        u0 = float(self.u[m])
+        u1 = float(self.u[m + 1])
+        u_proj = u0 + float(t[m]) * (u1 - u0)
+        return float(u_proj), float(d2[m])
 
 
-if "atlas" not in globals():
-    from brainglobe_atlasapi import BrainGlobeAtlas  # noqa: E402
+def _nearest_existing(sorted_keys: np.ndarray, key: int) -> int:
+    idx = int(np.searchsorted(sorted_keys, int(key)))
+    if idx <= 0:
+        return int(sorted_keys[0])
+    if idx >= int(sorted_keys.size):
+        return int(sorted_keys[-1])
+    a = int(sorted_keys[idx - 1])
+    b = int(sorted_keys[idx])
+    return a if abs(int(key) - a) <= abs(int(key) - b) else b
 
-    atlas = BrainGlobeAtlas(ATLAS_NAME)
 
-reference_3d = np.asarray(atlas.reference)[:, :, : mask_3d.shape[2]]
+def _orient_slice_family(polys: dict[int, SlicePolyline]) -> dict[int, SlicePolyline]:
+    keys = sorted(polys.keys())
+    if not keys:
+        raise ValueError("No slice polylines to orient.")
+    out: dict[int, SlicePolyline] = {}
+    prev: SlicePolyline | None = None
+    for k in keys:
+        cur = polys[int(k)]
+        if prev is None:
+            out[int(k)] = cur
+            prev = cur
+            continue
+        err_keep = float(np.mean((cur.p2_um - prev.p2_um) ** 2))
+        cur_flip = cur.flipped()
+        err_flip = float(np.mean((cur_flip.p2_um - prev.p2_um) ** 2))
+        out[int(k)] = cur_flip if err_flip < err_keep else cur
+        prev = out[int(k)]
+    return out
 
-mask_neo_meso_3d = (mask_3d & neo_meso_3d).astype(bool)
-view_v_parameterization_coronal(mask_3d=mask_neo_meso_3d, background_3d=reference_3d, thickness_by_slice=thickness_by_slice_i)
-view_v_parameterization_sagittal(mask_3d=mask_neo_meso_3d, background_3d=reference_3d, thickness_by_slice=thickness_by_slice_k)
 
-
-def view_coronal_raw_vs_spline(
-    mask_3d: np.ndarray,
-    raw_lines_ijk: list[np.ndarray],
-    spline_lines_ijk: list[np.ndarray],
+def _build_coronal_polylines(
     *,
-    background_3d: np.ndarray,
-) -> None:
-    if mask_3d.ndim != 3:
-        raise ValueError(f"Expected mask_3d.ndim==3, got shape={mask_3d.shape}")
-    if not raw_lines_ijk:
-        raise ValueError("raw_lines_ijk is empty.")
-    if not spline_lines_ijk:
-        raise ValueError("spline_lines_ijk is empty.")
-
-    n_slices_ = int(mask_3d.shape[0])
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
-
-    raw_by_slice_yx: dict[int, np.ndarray] = {int(p[0, 0]): p[:, 1:].astype(np.int32) for p in raw_lines_ijk}
-    spline_by_slice_yx: dict[int, np.ndarray] = {int(p[0, 0]): p[:, 1:].astype(np.float64) for p in spline_lines_ijk}
-    common_slices = sorted(set(raw_by_slice_yx) & set(spline_by_slice_yx))
-    if not common_slices:
-        raise ValueError("No overlapping slices between raw and spline lines.")
-
-    cur_slice = int(np.clip(int(np.median(common_slices)), 0, n_slices_ - 1))
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Coronal: raw points vs spline curve")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[cur_slice, :, :],
-        cmap="gray",
-        interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    mask_img = ax.imshow(
-        mask_3d[cur_slice, :, :],
-        cmap="Greens",
-        interpolation="nearest",
-        alpha=0.22,
-        vmin=0.0,
-        vmax=1.0,
-    )
-    raw_sc = ax.scatter([], [], s=6.0, c="magenta", alpha=0.45, linewidths=0, label="raw")
-    (spline_line,) = ax.plot([], [], c="cyan", lw=1.5, alpha=0.95, label="spline")
-    ax.set_xlabel("x (k)")
-    ax.set_ylabel("y (j)")
-    ax.legend(loc="upper right")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "slice i", 0, n_slices_ - 1, valinit=cur_slice, valstep=1)
-
-    def set_slice(i: int) -> None:
-        i = int(np.clip(i, 0, n_slices_ - 1))
-        img.set_data(background_3d[i, :, :])
-        mask_img.set_data(mask_3d[i, :, :])
-
-        raw_yx = raw_by_slice_yx.get(i)
-        spline_yx = spline_by_slice_yx.get(i)
-        if raw_yx is None:
-            raw_sc.set_offsets(np.empty((0, 2), dtype=np.float64))
-            n_raw = 0
-        else:
-            raw_sc.set_offsets(np.column_stack([raw_yx[:, 1], raw_yx[:, 0]]).astype(np.float64))
-            n_raw = int(raw_yx.shape[0])
-
-        if spline_yx is None:
-            spline_line.set_data([], [])
-            n_spline = 0
-        else:
-            spline_line.set_data(spline_yx[:, 1], spline_yx[:, 0])
-            n_spline = int(spline_yx.shape[0])
-
-        ax.set_title(
-            f"slice i={i}  |  raw_pts={n_raw}  |  spline_pts={n_spline}  |  mask_px={int(mask_3d[i].sum())}"
-        )
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        cur = int(slider.val)
-        if key in {"right", "up", "d"}:
-            slider.set_val(cur + 1)
-        elif key in {"left", "down", "a"}:
-            slider.set_val(cur - 1)
-
-    slider.on_changed(lambda v: set_slice(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-    set_slice(cur_slice)
-    plt.show()
-
-
-# %% [markdown]
-# ## Phase 3c: Scroll through sagittal slices (spots from all coronal section lines)
-#
-# Shows a sagittal slice (axis 2) of the cleaned mask and overlays all extracted line points that lie
-# on that x-slice.
-
-# %%
-def view_spots_sagittal(
-    mask_3d: np.ndarray, lines_ijk_: list[np.ndarray], background_3d: np.ndarray | None = None
-) -> None:
-    if mask_3d.ndim != 3:
-        raise ValueError(f"Expected mask_3d.ndim==3, got shape={mask_3d.shape}")
-    if not lines_ijk_:
-        raise ValueError("lines_ijk is empty.")
-
-    if background_3d is None:
-        background_3d = mask_3d.astype(np.float32)
-    if background_3d.shape[0] != mask_3d.shape[0] or background_3d.shape[1] != mask_3d.shape[1]:
-        raise ValueError(f"background_3d shape must match mask_3d in i/j, got {background_3d.shape} vs {mask_3d.shape}")
-    if background_3d.shape[2] < mask_3d.shape[2]:
-        raise ValueError(f"background_3d has fewer x-slices than mask_3d: {background_3d.shape} vs {mask_3d.shape}")
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
-
-    points_ijk = np.vstack(lines_ijk_).astype(np.int32)
-    i_vals = points_ijk[:, 0]
-    j_vals = points_ijk[:, 1]
-    k_vals = points_ijk[:, 2]
-
-    n_k = int(mask_3d.shape[2])
-    order = np.argsort(k_vals, kind="stable")
-    k_sorted = k_vals[order]
-    i_sorted = i_vals[order]
-    j_sorted = j_vals[order]
-
-    unique_k, starts = np.unique(k_sorted, return_index=True)
-    ends = np.concatenate([starts[1:], np.asarray([k_sorted.size], dtype=starts.dtype)])
-    k_to_slice = {int(k): (int(s), int(e)) for k, s, e in zip(unique_k.tolist(), starts.tolist(), ends.tolist(), strict=True)}
-
-    cur_k = int(np.clip(int(np.median(unique_k)), 0, n_k - 1))
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Sagittal view: mask + coronal-line points")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[:, :, cur_k],
-        cmap="gray",
-        interpolation="nearest",
-        aspect="auto",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    mask_img = ax.imshow(
-        mask_3d[:, :, cur_k],
-        cmap="Greens",
-        interpolation="nearest",
-        aspect="auto",
-        alpha=0.18,
-        vmin=0.0,
-        vmax=1.0,
-    )
-    sc = ax.scatter([], [], s=2.0, c="magenta", alpha=0.9, linewidths=0)
-    ax.set_xlabel("y (j)")
-    ax.set_ylabel("coronal slice (i)")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "x (k)", 0, n_k - 1, valinit=cur_k, valstep=1)
-
-    def set_k(k: int) -> None:
-        nonlocal cur_k
-        k = int(np.clip(k, 0, n_k - 1))
-        cur_k = k
-        img.set_data(background_3d[:, :, k])
-        mask_img.set_data(mask_3d[:, :, k])
-
-        se = k_to_slice.get(k)
-        if se is None:
-            sc.set_offsets(np.empty((0, 2), dtype=np.float64))
-            n_pts = 0
-        else:
-            s, e = se
-            # scatter expects (x, y) = (j, i)
-            offsets = np.column_stack([j_sorted[s:e], i_sorted[s:e]]).astype(np.float64)
-            sc.set_offsets(offsets)
-            n_pts = int(e - s)
-
-        ax.set_title(f"sagittal k={k}  |  points={n_pts}  |  mask_px={int(mask_3d[:, :, k].sum())}")
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        if key in {"right", "up", "d"}:
-            slider.set_val(int(cur_k + 1))
-        elif key in {"left", "down", "a"}:
-            slider.set_val(int(cur_k - 1))
-
-    slider.on_changed(lambda v: set_k(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-
-    set_k(cur_k)
-    plt.show()
-
-
-
-
-# %% [markdown]
-# ## Phase 3e: Slider view of sagittal per-slice line (mask + extracted line)
-
-# %%
-def view_mask_and_line_by_sagittal_slice(
-    mask_3d: np.ndarray, lines_ijk_: list[np.ndarray], background_3d: np.ndarray | None = None
-) -> None:
-    if mask_3d.ndim != 3:
-        raise ValueError(f"Expected mask_3d.ndim==3, got shape={mask_3d.shape}")
-    if not lines_ijk_:
-        raise ValueError("lines_ijk is empty.")
-
-    n_k = int(mask_3d.shape[2])
-    if background_3d is None:
-        background_3d = mask_3d.astype(np.float32)
-    if background_3d.shape[0] != mask_3d.shape[0] or background_3d.shape[1] != mask_3d.shape[1]:
-        raise ValueError(
-            f"background_3d shape must match mask_3d in i/j, got {background_3d.shape} vs {mask_3d.shape}"
-        )
-    if background_3d.shape[2] < mask_3d.shape[2]:
-        raise ValueError(f"background_3d has fewer x-slices than mask_3d: {background_3d.shape} vs {mask_3d.shape}")
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
-
-    line_by_k_ij: dict[int, np.ndarray] = {}
-    for path_ijk in lines_ijk_:
-        if path_ijk.ndim != 2 or path_ijk.shape[1] != 3:
-            raise ValueError(f"Expected (N,3) path_ijk, got shape={path_ijk.shape}")
-        slice_k = int(path_ijk[0, 2])
-        if not np.all(path_ijk[:, 2] == slice_k):
-            raise ValueError("Each path_ijk must belong to a single sagittal slice (constant k).")
-        line_by_k_ij[slice_k] = path_ijk[:, :2].astype(np.int32)
-
-    cur_k = int(np.clip(int(np.median(list(line_by_k_ij.keys()))), 0, n_k - 1))
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Mask + skeleton line (sagittal slices)")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[:, :, cur_k],
-        cmap="gray",
-        interpolation="nearest",
-        aspect="auto",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    mask_img = ax.imshow(
-        mask_3d[:, :, cur_k],
-        cmap="Greens",
-        interpolation="nearest",
-        aspect="auto",
-        alpha=0.22,
-        vmin=0.0,
-        vmax=1.0,
-    )
-    (line_plot,) = ax.plot([], [], c="cyan", lw=1.5, alpha=0.95)
-    ax.set_xlabel("y (j)")
-    ax.set_ylabel("coronal slice (i)")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "x (k)", 0, n_k - 1, valinit=cur_k, valstep=1)
-
-    def set_k(k: int) -> None:
-        nonlocal cur_k
-        k = int(np.clip(k, 0, n_k - 1))
-        cur_k = k
-        img.set_data(background_3d[:, :, k])
-        mask_img.set_data(mask_3d[:, :, k])
-
-        line_ij = line_by_k_ij.get(k)
-        if line_ij is None or line_ij.size == 0:
-            line_plot.set_data([], [])
-        else:
-            # plot expects x then y -> (j, i)
-            line_plot.set_data(line_ij[:, 1], line_ij[:, 0])
-
-        ax.set_title(f"sagittal k={k}  |  mask_px={int(mask_3d[:, :, k].sum())}")
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        if key in {"right", "up", "d"}:
-            slider.set_val(int(cur_k + 1))
-        elif key in {"left", "down", "a"}:
-            slider.set_val(int(cur_k - 1))
-
-    slider.on_changed(lambda v: set_k(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-
-    set_k(cur_k)
-    plt.show()
-
-
-
-
-# %% [markdown]
-# ## Phase 3f: Slider view of sagittal-line points on coronal slices
-#
-# For each coronal slice `i`, overlay all points from the sagittal per-slice lines that fall on that `i`.
-
-# %%
-def view_sagittal_points_on_coronal(
-    mask_3d: np.ndarray, sagittal_lines_ijk_: list[np.ndarray], background_3d: np.ndarray | None = None
-) -> None:
-    if mask_3d.ndim != 3:
-        raise ValueError(f"Expected mask_3d.ndim==3, got shape={mask_3d.shape}")
-    if not sagittal_lines_ijk_:
-        raise ValueError("sagittal_lines_ijk is empty.")
-
-    n_i = int(mask_3d.shape[0])
-    if background_3d is None:
-        background_3d = mask_3d.astype(np.float32)
-    if background_3d.shape[0] != mask_3d.shape[0] or background_3d.shape[1] != mask_3d.shape[1]:
-        raise ValueError(
-            f"background_3d shape must match mask_3d in i/j, got {background_3d.shape} vs {mask_3d.shape}"
-        )
-    if background_3d.shape[2] < mask_3d.shape[2]:
-        raise ValueError(f"background_3d has fewer x-slices than mask_3d: {background_3d.shape} vs {mask_3d.shape}")
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
-
-    points_ijk = np.vstack(sagittal_lines_ijk_).astype(np.int32)
-    i_vals = points_ijk[:, 0]
-    j_vals = points_ijk[:, 1]
-    k_vals = points_ijk[:, 2]
-
-    order = np.argsort(i_vals, kind="stable")
-    i_sorted = i_vals[order]
-    j_sorted = j_vals[order]
-    k_sorted = k_vals[order]
-
-    unique_i, starts = np.unique(i_sorted, return_index=True)
-    ends = np.concatenate([starts[1:], np.asarray([i_sorted.size], dtype=starts.dtype)])
-    i_to_slice = {
-        int(i): (int(s), int(e)) for i, s, e in zip(unique_i.tolist(), starts.tolist(), ends.tolist(), strict=True)
-    }
-
-    cur_i = int(np.clip(int(np.median(unique_i)), 0, n_i - 1))
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Coronal view: sagittal-line points")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[cur_i, :, :],
-        cmap="gray",
-        interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    mask_img = ax.imshow(
-        mask_3d[cur_i, :, :],
-        cmap="Greens",
-        interpolation="nearest",
-        alpha=0.18,
-        vmin=0.0,
-        vmax=1.0,
-    )
-    sc = ax.scatter([], [], s=2.0, c="magenta", alpha=0.9, linewidths=0)
-    ax.set_xlabel("x (k)")
-    ax.set_ylabel("y (j)")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "slice i", 0, n_i - 1, valinit=cur_i, valstep=1)
-
-    def set_i(i: int) -> None:
-        nonlocal cur_i
-        i = int(np.clip(i, 0, n_i - 1))
-        cur_i = i
-        img.set_data(background_3d[i, :, :])
-        mask_img.set_data(mask_3d[i, :, :])
-
-        se = i_to_slice.get(i)
-        if se is None:
-            sc.set_offsets(np.empty((0, 2), dtype=np.float64))
-            n_pts = 0
-        else:
-            s, e = se
-            # scatter expects (x, y) = (k, j)
-            offsets = np.column_stack([k_sorted[s:e], j_sorted[s:e]]).astype(np.float64)
-            sc.set_offsets(offsets)
-            n_pts = int(e - s)
-
-        ax.set_title(f"coronal i={i}  |  points={n_pts}  |  mask_px={int(mask_3d[i].sum())}")
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        if key in {"right", "up", "d"}:
-            slider.set_val(int(cur_i + 1))
-        elif key in {"left", "down", "a"}:
-            slider.set_val(int(cur_i - 1))
-
-    slider.on_changed(lambda v: set_i(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-
-    set_i(cur_i)
-    plt.show()
-
-
-
-
-# %% [markdown]
-# ## Phase 3g: Combine coronal + sagittal points (piecewise rules) + slider viewers
-#
-# Rules:
-# - Use sagittal points by default
-# - For k < 160 and k > 224, use coronal curves
-
-# %%
-def combine_points_piecewise(
-    sagittal_lines_ijk_: list[np.ndarray],
-    coronal_lines_ijk_: list[np.ndarray],
+    lines_spline_ijk: list[np.ndarray],
+    lines_spline_u: list[np.ndarray],
+    slice_indices: list[int],
+) -> dict[int, SlicePolyline]:
+    out: dict[int, SlicePolyline] = {}
+    for slice_i, p3_vox, u in zip(slice_indices, lines_spline_ijk, lines_spline_u, strict=True):
+        p3 = p3_vox.astype(np.float64, copy=False)
+        u = u.astype(np.float64, copy=False)
+        # coronal in-plane coords: (j,k) in um
+        p2_um = np.column_stack([p3[:, 1] * RES_J_UM, p3[:, 2] * RES_K_UM]).astype(np.float64, copy=False)
+        out[int(slice_i)] = SlicePolyline(u=u, p2_um=p2_um, p3_vox=p3)
+    return _orient_slice_family(out)
+
+
+def _build_sagittal_polylines(
     *,
-    coronal_curves_k_lt: int = 160,
-    coronal_curves_k_gt: int = 224,
-) -> np.ndarray:
-    if not sagittal_lines_ijk_:
-        raise ValueError("sagittal_lines_ijk is empty.")
-    if not coronal_lines_ijk_:
-        raise ValueError("coronal lines_ijk is empty.")
-
-    sag_points = np.vstack(sagittal_lines_ijk_).astype(np.int32, copy=False)
-    cor_points = np.vstack(coronal_lines_ijk_).astype(np.int32, copy=False)
-
-    # Default: sagittal points everywhere.
-    k = sag_points[:, 2]
-    keep_sag = (k >= int(coronal_curves_k_lt)) & (k <= int(coronal_curves_k_gt))
-    sag_mid = sag_points[keep_sag]
-
-    k_cor = cor_points[:, 2]
-    cor_extremes = cor_points[(k_cor < int(coronal_curves_k_lt)) | (k_cor > int(coronal_curves_k_gt))]
-
-    points = np.vstack([sag_mid, cor_extremes])
-
-    # De-duplicate while preserving original geometric ordering.
-    return _unique_rows_preserve_order(points)
+    sagittal_lines_spline_ijk: list[np.ndarray],
+    sagittal_lines_spline_u: list[np.ndarray],
+    sagittal_slice_indices: list[int],
+) -> dict[int, SlicePolyline]:
+    out: dict[int, SlicePolyline] = {}
+    for slice_k, p3_vox, u in zip(sagittal_slice_indices, sagittal_lines_spline_ijk, sagittal_lines_spline_u, strict=True):
+        p3 = p3_vox.astype(np.float64, copy=False)
+        u = u.astype(np.float64, copy=False)
+        # sagittal in-plane coords: (i,j) in um
+        p2_um = np.column_stack([p3[:, 0] * RES_I_UM, p3[:, 1] * RES_J_UM]).astype(np.float64, copy=False)
+        out[int(slice_k)] = SlicePolyline(u=u, p2_um=p2_um, p3_vox=p3)
+    return _orient_slice_family(out)
 
 
-combined_points_ijk = combine_points_piecewise(
-    sagittal_lines_ijk_=sagittal_lines_ijk,
-    coronal_lines_ijk_=lines_ijk,
-    coronal_curves_k_lt=160,
-    coronal_curves_k_gt=224,
+def coronal_to_sagittal(
+    *,
+    slice_i: int,
+    u_c: float,
+    coronal: dict[int, SlicePolyline],
+    sagittal: dict[int, SlicePolyline],
+    coronal_keys: np.ndarray | None = None,
+    sagittal_keys: np.ndarray | None = None,
+    k_window: int = 2,
+) -> tuple[int, float, float, float]:
+    """
+    Map canonical coronal coords (slice_i, u_c) -> (slice_k, u_s) by:
+      1) forward eval into 3D, then
+      2) inverse via polyline projection in candidate sagittal slices.
+
+    Returns (slice_k, u_s, err_um, k_vox_pred).
+    """
+    if coronal_keys is None:
+        coronal_keys = np.asarray(sorted(coronal.keys()), dtype=np.int32)
+    if sagittal_keys is None:
+        sagittal_keys = np.asarray(sorted(sagittal.keys()), dtype=np.int32)
+    if coronal_keys.size == 0 or sagittal_keys.size == 0:
+        raise ValueError("Empty coronal/sagittal polyline dict.")
+
+    i0 = _nearest_existing(coronal_keys, int(slice_i))
+    p3 = coronal[int(i0)].eval_p3_vox(float(u_c))
+
+    return _p3_vox_to_sagittal(p3, sagittal=sagittal, sagittal_keys=sagittal_keys, k_window=k_window)
+
+
+def _p3_vox_to_sagittal(
+    p3_vox: np.ndarray,
+    *,
+    sagittal: dict[int, SlicePolyline],
+    sagittal_keys: np.ndarray,
+    k_window: int,
+) -> tuple[int, float, float, float]:
+    i_um = float(p3_vox[0]) * RES_I_UM
+    j_um = float(p3_vox[1]) * RES_J_UM
+    k_vox = float(p3_vox[2])
+    k_center = int(np.rint(k_vox))
+
+    cand: list[int] = []
+    for dk in range(-int(k_window), int(k_window) + 1):
+        cand.append(_nearest_existing(sagittal_keys, int(k_center + dk)))
+    cand = sorted(set(cand))
+
+    best_d2: float | None = None
+    best_k: int = int(cand[0])
+    best_u: float = 0.0
+    for k_idx in cand:
+        u_s, d2_inplane = sagittal[int(k_idx)].project_u(np.array([i_um, j_um], dtype=np.float64))
+        dk_um = (k_vox - float(k_idx)) * RES_K_UM
+        d2 = float(d2_inplane + dk_um * dk_um)
+        if best_d2 is None or d2 < best_d2:
+            best_d2 = d2
+            best_k = int(k_idx)
+            best_u = float(u_s)
+
+    err_um = float(np.sqrt(best_d2)) if best_d2 is not None else float("nan")
+    return int(best_k), float(best_u), float(err_um), float(k_vox)
+
+
+def sagittal_to_coronal(
+    *,
+    slice_k: int,
+    u_s: float,
+    sagittal: dict[int, SlicePolyline],
+    coronal: dict[int, SlicePolyline],
+    sagittal_keys: np.ndarray | None = None,
+    coronal_keys: np.ndarray | None = None,
+    i_window: int = 2,
+) -> tuple[int, float, float, float]:
+    """
+    Map sagittal coords (slice_k, u_s) -> canonical coronal (slice_i, u_c).
+
+    Returns (slice_i, u_c, err_um, i_vox_pred).
+    """
+    if sagittal_keys is None:
+        sagittal_keys = np.asarray(sorted(sagittal.keys()), dtype=np.int32)
+    if coronal_keys is None:
+        coronal_keys = np.asarray(sorted(coronal.keys()), dtype=np.int32)
+    if sagittal_keys.size == 0 or coronal_keys.size == 0:
+        raise ValueError("Empty sagittal/coronal polyline dict.")
+
+    k0 = _nearest_existing(sagittal_keys, int(slice_k))
+    p3 = sagittal[int(k0)].eval_p3_vox(float(u_s))
+
+    return _p3_vox_to_coronal(p3, coronal=coronal, coronal_keys=coronal_keys, i_window=i_window)
+
+
+def _p3_vox_to_coronal(
+    p3_vox: np.ndarray,
+    *,
+    coronal: dict[int, SlicePolyline],
+    coronal_keys: np.ndarray,
+    i_window: int,
+) -> tuple[int, float, float, float]:
+    i_vox = float(p3_vox[0])
+    j_um = float(p3_vox[1]) * RES_J_UM
+    k_um = float(p3_vox[2]) * RES_K_UM
+    i_center = int(np.rint(i_vox))
+
+    cand: list[int] = []
+    for di in range(-int(i_window), int(i_window) + 1):
+        cand.append(_nearest_existing(coronal_keys, int(i_center + di)))
+    cand = sorted(set(cand))
+
+    best_d2: float | None = None
+    best_i: int = int(cand[0])
+    best_u: float = 0.0
+    for i_idx in cand:
+        u_c, d2_inplane = coronal[int(i_idx)].project_u(np.array([j_um, k_um], dtype=np.float64))
+        di_um = (i_vox - float(i_idx)) * RES_I_UM
+        d2 = float(d2_inplane + di_um * di_um)
+        if best_d2 is None or d2 < best_d2:
+            best_d2 = d2
+            best_i = int(i_idx)
+            best_u = float(u_c)
+
+    err_um = float(np.sqrt(best_d2)) if best_d2 is not None else float("nan")
+    return int(best_i), float(best_u), float(err_um), float(i_vox)
+
+
+coronal_polys = _build_coronal_polylines(
+    lines_spline_ijk=lines_spline_ijk, lines_spline_u=lines_spline_u, slice_indices=slice_indices
 )
-combined_points_ijk = combined_points_ijk[
-    neo_meso_3d[combined_points_ijk[:, 0], combined_points_ijk[:, 1], combined_points_ijk[:, 2]]
-]
-
-
-def view_points_coronal(
-    mask_3d: np.ndarray, points_ijk: np.ndarray, background_3d: np.ndarray | None = None, *, title: str = ""
-) -> None:
-    if mask_3d.ndim != 3:
-        raise ValueError(f"Expected mask_3d.ndim==3, got shape={mask_3d.shape}")
-    if points_ijk.ndim != 2 or points_ijk.shape[1] != 3:
-        raise ValueError(f"Expected points_ijk shape (N,3), got {points_ijk.shape}")
-
-    n_i = int(mask_3d.shape[0])
-    if background_3d is None:
-        background_3d = mask_3d.astype(np.float32)
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
-
-    i_vals = points_ijk[:, 0].astype(np.int32, copy=False)
-    j_vals = points_ijk[:, 1].astype(np.int32, copy=False)
-    k_vals = points_ijk[:, 2].astype(np.int32, copy=False)
-
-    order = np.argsort(i_vals, kind="stable")
-    i_sorted = i_vals[order]
-    j_sorted = j_vals[order]
-    k_sorted = k_vals[order]
-
-    unique_i, starts = np.unique(i_sorted, return_index=True)
-    ends = np.concatenate([starts[1:], np.asarray([i_sorted.size], dtype=starts.dtype)])
-    i_to_slice = {
-        int(i): (int(s), int(e)) for i, s, e in zip(unique_i.tolist(), starts.tolist(), ends.tolist(), strict=True)
-    }
-    cur_i = int(np.clip(int(np.median(unique_i)), 0, n_i - 1))
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Coronal view: combined points")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[cur_i, :, :],
-        cmap="gray",
-        interpolation="nearest",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    mask_img = ax.imshow(
-        mask_3d[cur_i, :, :],
-        cmap="Greens",
-        interpolation="nearest",
-        alpha=0.18,
-        vmin=0.0,
-        vmax=1.0,
-    )
-    sc = ax.scatter([], [], s=2.0, c="magenta", alpha=0.9, linewidths=0)
-    ax.set_xlabel("x (k)")
-    ax.set_ylabel("y (j)")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "slice i", 0, n_i - 1, valinit=cur_i, valstep=1)
-
-    def set_i(i: int) -> None:
-        i = int(np.clip(i, 0, n_i - 1))
-        img.set_data(background_3d[i, :, :])
-        mask_img.set_data(mask_3d[i, :, :])
-
-        se = i_to_slice.get(i)
-        if se is None:
-            sc.set_offsets(np.empty((0, 2), dtype=np.float64))
-            n_pts = 0
-        else:
-            s, e = se
-            offsets = np.column_stack([k_sorted[s:e], j_sorted[s:e]]).astype(np.float64)
-            sc.set_offsets(offsets)
-            n_pts = int(e - s)
-
-        prefix = f"{title} | " if title else ""
-        ax.set_title(f"{prefix}coronal i={i}  |  points={n_pts}  |  mask_px={int(mask_3d[i].sum())}")
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        cur = int(slider.val)
-        if key in {"right", "up", "d"}:
-            slider.set_val(cur + 1)
-        elif key in {"left", "down", "a"}:
-            slider.set_val(cur - 1)
-
-    slider.on_changed(lambda v: set_i(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-    set_i(cur_i)
-    plt.show()
-
-
-def view_points_sagittal(
-    mask_3d: np.ndarray, points_ijk: np.ndarray, background_3d: np.ndarray | None = None, *, title: str = ""
-) -> None:
-    if mask_3d.ndim != 3:
-        raise ValueError(f"Expected mask_3d.ndim==3, got shape={mask_3d.shape}")
-    if points_ijk.ndim != 2 or points_ijk.shape[1] != 3:
-        raise ValueError(f"Expected points_ijk shape (N,3), got {points_ijk.shape}")
-
-    n_k = int(mask_3d.shape[2])
-    if background_3d is None:
-        background_3d = mask_3d.astype(np.float32)
-    background_3d = background_3d[:, :, : mask_3d.shape[2]]
-    vmin, vmax = _robust_vmin_vmax(background_3d)
-
-    i_vals = points_ijk[:, 0].astype(np.int32, copy=False)
-    j_vals = points_ijk[:, 1].astype(np.int32, copy=False)
-    k_vals = points_ijk[:, 2].astype(np.int32, copy=False)
-
-    order = np.argsort(k_vals, kind="stable")
-    k_sorted = k_vals[order]
-    i_sorted = i_vals[order]
-    j_sorted = j_vals[order]
-
-    unique_k, starts = np.unique(k_sorted, return_index=True)
-    ends = np.concatenate([starts[1:], np.asarray([k_sorted.size], dtype=starts.dtype)])
-    k_to_slice = {
-        int(k): (int(s), int(e)) for k, s, e in zip(unique_k.tolist(), starts.tolist(), ends.tolist(), strict=True)
-    }
-    cur_k = int(np.clip(int(np.median(unique_k)), 0, n_k - 1))
-
-    fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    manager = getattr(fig.canvas, "manager", None)
-    set_window_title = getattr(manager, "set_window_title", None)
-    if callable(set_window_title):
-        set_window_title("Sagittal view: combined points")
-    plt.subplots_adjust(bottom=0.14)
-
-    img = ax.imshow(
-        background_3d[:, :, cur_k],
-        cmap="gray",
-        interpolation="nearest",
-        aspect="auto",
-        vmin=vmin,
-        vmax=vmax,
-    )
-    mask_img = ax.imshow(
-        mask_3d[:, :, cur_k],
-        cmap="Greens",
-        interpolation="nearest",
-        aspect="auto",
-        alpha=0.18,
-        vmin=0.0,
-        vmax=1.0,
-    )
-    sc = ax.scatter([], [], s=2.0, c="magenta", alpha=0.9, linewidths=0)
-    ax.set_xlabel("y (j)")
-    ax.set_ylabel("coronal slice (i)")
-
-    slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
-    slider = Slider(slider_ax, "x (k)", 0, n_k - 1, valinit=cur_k, valstep=1)
-
-    def set_k(k: int) -> None:
-        k = int(np.clip(k, 0, n_k - 1))
-        img.set_data(background_3d[:, :, k])
-        mask_img.set_data(mask_3d[:, :, k])
-
-        se = k_to_slice.get(k)
-        if se is None:
-            sc.set_offsets(np.empty((0, 2), dtype=np.float64))
-            n_pts = 0
-        else:
-            s, e = se
-            offsets = np.column_stack([j_sorted[s:e], i_sorted[s:e]]).astype(np.float64)
-            sc.set_offsets(offsets)
-            n_pts = int(e - s)
-
-        prefix = f"{title} | " if title else ""
-        ax.set_title(f"{prefix}sagittal k={k}  |  points={n_pts}  |  mask_px={int(mask_3d[:, :, k].sum())}")
-        fig.canvas.draw_idle()
-
-    def on_key(event: object) -> None:
-        key = getattr(event, "key", "")
-        cur = int(slider.val)
-        if key in {"right", "up", "d"}:
-            slider.set_val(cur + 1)
-        elif key in {"left", "down", "a"}:
-            slider.set_val(cur - 1)
-
-    slider.on_changed(lambda v: set_k(int(v)))
-    fig.canvas.mpl_connect("key_press_event", on_key)
-    set_k(cur_k)
-    plt.show()
-
-
-# %% [markdown]
-# ## Phase 4: mpl3d visualization of per-slice lines in 3D
-
-# %%
-lines_to_plot = lines_ijk
-slice_to_plot = slice_indices
-if len(lines_to_plot) > int(MAX_SLICES_TO_PLOT):
-    pick = np.linspace(0, len(lines_to_plot) - 1, int(MAX_SLICES_TO_PLOT)).astype(np.int64)
-    lines_to_plot = [lines_to_plot[int(p)] for p in pick.tolist()]
-    slice_to_plot = [slice_to_plot[int(p)] for p in pick.tolist()]
-
-# Optional: scatter the full 3D skeleton as context (dim).
-skel_ijk = np.column_stack(np.nonzero(np.load(OUTDIR / "skeleton_3d.npy").astype(bool))).astype(np.float64)
-if skel_ijk.shape[0] > PLOT_MAX_SKELETON_POINTS:
-    idx = np.linspace(0, skel_ijk.shape[0] - 1, PLOT_MAX_SKELETON_POINTS).astype(np.int64)
-    skel_ijk = skel_ijk[idx]
-skel_um_scatter = np.column_stack([skel_ijk[:, 0] * RES_I_UM, skel_ijk[:, 1] * RES_J_UM, skel_ijk[:, 2] * RES_K_UM])
-
-fig = plt.figure(figsize=(11, 8))
-ax = fig.add_subplot(111, projection="3d")
-
-def _set_axes_equal_3d(ax_: object, xyz_um: np.ndarray) -> None:
-    mins = np.min(xyz_um, axis=0)
-    maxs = np.max(xyz_um, axis=0)
-    ctr = (mins + maxs) / 2.0
-    half = (maxs - mins) / 2.0
-    radius = float(np.max(half))
-    if not np.isfinite(radius) or radius <= 0:
-        return
-    ax_.set_xlim(ctr[0] - radius, ctr[0] + radius)
-    ax_.set_ylim(ctr[1] - radius, ctr[1] + radius)
-    ax_.set_zlim(ctr[2] - radius, ctr[2] + radius)
-    # Matplotlib >= 3.3: enforce equal box aspect in 3D.
-    set_box_aspect = getattr(ax_, "set_box_aspect", None)
-    if callable(set_box_aspect):
-        ax_.set_box_aspect((1, 1, 1))
-
-
-ax.scatter(
-    skel_um_scatter[:, 0],
-    skel_um_scatter[:, 1],
-    skel_um_scatter[:, 2],
-    s=0.25,
-    c="dimgray",
-    alpha=0.18,
-    linewidths=0,
+sagittal_polys = _build_sagittal_polylines(
+    sagittal_lines_spline_ijk=sagittal_lines_spline_ijk,
+    sagittal_lines_spline_u=sagittal_lines_spline_u,
+    sagittal_slice_indices=sagittal_slice_indices,
 )
 
-if len(lines_to_plot) == 1:
-    colors = ["cyan"]
-    k_medians_um = [float(lines_to_plot[0][:, 2].astype(np.float64).mean() * RES_K_UM)]
-else:
-    k_medians_um = [
-        float(np.median(path_ijk[:, 2].astype(np.float64) * RES_K_UM)) for path_ijk in lines_to_plot
-    ]
-    k0, k1 = np.percentile(np.asarray(k_medians_um, dtype=np.float64), [1, 99])
-    if not np.isfinite(k0) or not np.isfinite(k1) or float(k1) <= float(k0):
-        k0 = float(min(k_medians_um))
-        k1 = float(max(k_medians_um))
-        if float(k1) <= float(k0):
-            k1 = k0 + 1.0
+coronal_keys = np.asarray(sorted(coronal_polys.keys()), dtype=np.int32)
+sagittal_keys = np.asarray(sorted(sagittal_polys.keys()), dtype=np.int32)
+u_grid = coronal_polys[int(coronal_keys[0])].u.astype(np.float64, copy=False)
 
-    cmap = plt.get_cmap("viridis")
-    norm = plt.Normalize(vmin=float(k0), vmax=float(k1))
-    colors = [cmap(norm(k)) for k in k_medians_um]
+map_c2s_k_idx = np.full((coronal_keys.size, u_grid.size), -1, dtype=np.int32)
+map_c2s_u_s = np.full((coronal_keys.size, u_grid.size), np.nan, dtype=np.float64)
+map_c2s_err_um = np.full((coronal_keys.size, u_grid.size), np.nan, dtype=np.float64)
+map_c2s_k_vox = np.full((coronal_keys.size, u_grid.size), np.nan, dtype=np.float64)
 
-for path_ijk, color in zip(lines_to_plot, colors, strict=True):
-    path_um = np.column_stack(
-        [
-            path_ijk[:, 0].astype(np.float64) * RES_I_UM,
-            path_ijk[:, 1].astype(np.float64) * RES_J_UM,
-            path_ijk[:, 2].astype(np.float64) * RES_K_UM,
-        ]
-    )
-    ax.plot(path_um[:, 0], path_um[:, 1], path_um[:, 2], c=color, lw=1.0, alpha=0.9)
+for ii, slice_i in enumerate(coronal_keys.tolist()):
+    p3_samples = coronal_polys[int(slice_i)].p3_vox.astype(np.float64, copy=False)
+    for uu in range(int(u_grid.size)):
+        k_idx, u_s, err_um, k_vox = _p3_vox_to_sagittal(
+            p3_samples[uu],
+            sagittal=sagittal_polys,
+            sagittal_keys=sagittal_keys,
+            k_window=2,
+        )
+        map_c2s_k_idx[ii, uu] = int(k_idx)
+        map_c2s_u_s[ii, uu] = float(u_s)
+        map_c2s_err_um[ii, uu] = float(err_um)
+        map_c2s_k_vox[ii, uu] = float(k_vox)
 
-if len(lines_to_plot) > 1:
-    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, pad=0.02, fraction=0.04)
-    cbar.set_label("median k (um)")
-
-ax.set_xlabel("i_um")
-ax.set_ylabel("j_um")
-ax.set_zlabel("k_um")
-ax.set_title(
-    f"{ATLAS_NAME} | TERMS={TERMS}\ncoronal lines={len(lines_ijk)} (plotted {len(lines_to_plot)})"
+np.savez_compressed(
+    OUTDIR / "chart_map_coronal_to_sagittal.npz",
+    slice_i=coronal_keys,
+    u_c=u_grid,
+    slice_k=map_c2s_k_idx,
+    u_s=map_c2s_u_s,
+    err_um=map_c2s_err_um,
+    k_vox_pred=map_c2s_k_vox,
 )
-_set_axes_equal_3d(ax, skel_um_scatter)
-ax.view_init(elev=23, azim=40)
-fig.tight_layout()
-fig.savefig(OUTDIR / "mpl3d_coronal_slice_lines.png", dpi=220)
-plt.show()
 
+map_s2c_i_idx = np.full((sagittal_keys.size, u_grid.size), -1, dtype=np.int32)
+map_s2c_u_c = np.full((sagittal_keys.size, u_grid.size), np.nan, dtype=np.float64)
+map_s2c_err_um = np.full((sagittal_keys.size, u_grid.size), np.nan, dtype=np.float64)
+map_s2c_i_vox = np.full((sagittal_keys.size, u_grid.size), np.nan, dtype=np.float64)
+
+for kk, slice_k in enumerate(sagittal_keys.tolist()):
+    p3_samples = sagittal_polys[int(slice_k)].p3_vox.astype(np.float64, copy=False)
+    for uu in range(int(u_grid.size)):
+        i_idx, u_c, err_um, i_vox = _p3_vox_to_coronal(
+            p3_samples[uu],
+            coronal=coronal_polys,
+            coronal_keys=coronal_keys,
+            i_window=2,
+        )
+        map_s2c_i_idx[kk, uu] = int(i_idx)
+        map_s2c_u_c[kk, uu] = float(u_c)
+        map_s2c_err_um[kk, uu] = float(err_um)
+        map_s2c_i_vox[kk, uu] = float(i_vox)
+
+np.savez_compressed(
+    OUTDIR / "chart_map_sagittal_to_coronal.npz",
+    slice_k=sagittal_keys,
+    u_s=u_grid,
+    slice_i=map_s2c_i_idx,
+    u_c=map_s2c_u_c,
+    err_um=map_s2c_err_um,
+    i_vox_pred=map_s2c_i_vox,
+)
+
+print(
+    "Chart maps saved:",
+    f"coronal→sagittal={OUTDIR/'chart_map_coronal_to_sagittal.npz'}",
+    f"sagittal→coronal={OUTDIR/'chart_map_sagittal_to_coronal.npz'}",
+)
+
+print("Generation complete. Run ccf/refextract/skeletonize_neocortex_mesocortex_ccf_3d_plot.py for plotting.")
 
 # %%
