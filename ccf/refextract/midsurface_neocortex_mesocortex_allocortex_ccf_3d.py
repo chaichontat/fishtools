@@ -2,23 +2,20 @@
 # # 3D cortex mid-surface extraction (DevCCF E15.5)
 #
 # Goal: reduce a folded cortical ribbon mask (neocortex+mesocortex+allocortex) to a 2D manifold.
-# This script tries two approaches:
-#   (1) 3D thinning skeletonization (medial-axis-like; sensitive to boundary noise)
-#   (2) Harmonic (Laplace) mid-surface between pial vs inner (non-cortex) boundaries (more stable)
+# This script computes a fold-preserving "halfway" field using Euclidean distance transforms:
+#   u = d(pial) / (d(pial) + d(inner))
+# and extracts the u=0.5 isosurface as the midsurface.
 #
 # Artifacts are written under `OUTDIR`.
 
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import ndimage as ndi
-from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import cg
 from skimage.measure import marching_cubes
 from skimage.morphology import (
     ball,
@@ -43,9 +40,9 @@ TERM_KIND: str = "auto"  # "auto" | "id" | "acronym" | "name"
 
 KEEP_LEFT_HEMISPHERE_ONLY = True
 
-# Downsample factor for all computations (recommended for Laplace solve).
+# Downsample factor for all computations.
 # Uses nearest-neighbor slicing (annotation[::DS,::DS,::DS]).
-DS = 2
+DS = 1
 
 # Morphological cleanup on the downsampled mask.
 FILL_HOLES = True
@@ -54,14 +51,10 @@ FILL_SMALL_HOLES_VOX = 5_000
 CLOSE_RADIUS_VOX = 1
 OPEN_RADIUS_VOX = 0
 
-# Erode cortex mask before Laplace fit (voxels in the DS grid).
-ERODE_RADIUS_VOX_BEFORE_LAPLACE = 1
-
-# Laplace midsurface parameters.
-LAPLACE_MAX_ITERS = 10_000
-LAPLACE_CG_RTOL = 1e-4
-LAPLACE_JACOBI_TOL_MAXDELTA = 5e-5
+# Erode cortex mask before computing the EDT field (voxels in the DS grid).
+ERODE_RADIUS_VOX_BEFORE_EDT = 1
 MIDSURF_EPS = 0.03  # u-band around 0.5 (smaller => thinner but sparser)
+BBOX_PAD_VOX = 4  # compute EDT on a padded bounding box around the fit mask
 
 # Visualization sampling.
 PLOT_MAX_MASK_POINTS = 80_000
@@ -243,151 +236,20 @@ def _boundary_partition_pial_inner(
     return pial, inner
 
 
-def _solve_laplace_dirichlet_jacobi(
-    *,
-    mask: np.ndarray,
-    b0: np.ndarray,
-    b1: np.ndarray,
-    max_iters: int,
-    tol_maxdelta: float,
-) -> np.ndarray:
-    mask = mask.astype(bool, copy=False)
-    b0 = (b0 & mask).astype(bool, copy=False)
-    b1 = (b1 & mask).astype(bool, copy=False)
-    if np.any(b0 & b1):
-        raise ValueError("b0 and b1 must be disjoint.")
-
-    structure6 = ndi.generate_binary_structure(3, 1)
-    interior = binary_erosion(mask, footprint=structure6)
-    fixed = b0 | b1 | (mask & ~interior)
-    update = interior & ~fixed
-    if not np.any(update):
-        raise ValueError("No interior voxels to solve (mask too thin at this DS).")
-
-    u = np.zeros(mask.shape, dtype=np.float32)
-    u[b1] = 1.0
-
-    core = (slice(1, -1), slice(1, -1), slice(1, -1))
-    update_core = update[core]
-    if not np.any(update_core):
-        raise ValueError("No interior voxels in core (mask touches volume edges).")
-
-    t0 = time.perf_counter()
-    for it in range(int(max_iters)):
-        u_new = u.copy()
-        nbr_avg = (
-            u[:-2, 1:-1, 1:-1]
-            + u[2:, 1:-1, 1:-1]
-            + u[1:-1, :-2, 1:-1]
-            + u[1:-1, 2:, 1:-1]
-            + u[1:-1, 1:-1, :-2]
-            + u[1:-1, 1:-1, 2:]
-        ) / 6.0
-
-        u_core = u[core]
-        u_new_core = u_new[core]
-        u_new_core[update_core] = nbr_avg[update_core].astype(np.float32, copy=False)
-        u_new[core] = u_new_core
-
-        # Re-apply boundary conditions.
-        u_new[~mask] = 0.0
-        u_new[b0] = 0.0
-        u_new[b1] = 1.0
-
-        max_delta = float(np.max(np.abs(u_new_core[update_core] - u_core[update_core])))
-        u = u_new
-        if max_delta <= float(tol_maxdelta):
-            dt = time.perf_counter() - t0
-            print(f"[laplace] converged it={it + 1} max_delta={max_delta:.3e} time={dt:.1f}s")
-            return u
-        if (it + 1) % 200 == 0:
-            dt = time.perf_counter() - t0
-            print(f"[laplace] it={it + 1} max_delta={max_delta:.3e} time={dt:.1f}s")
-
-    dt = time.perf_counter() - t0
-    raise RuntimeError(f"[laplace] did not converge in {max_iters} iters (last max_delta={max_delta:.3e}, {dt:.1f}s)")
-
-
-def _solve_laplace_dirichlet_cg(
-    *,
-    mask: np.ndarray,
-    b0: np.ndarray,
-    b1: np.ndarray,
-    maxiter: int,
-    rtol: float,
-) -> np.ndarray:
-    mask = mask.astype(bool, copy=False)
-    b0 = (b0 & mask).astype(bool, copy=False)
-    b1 = (b1 & mask).astype(bool, copy=False)
-    if np.any(b0 & b1):
-        raise ValueError("b0 and b1 must be disjoint.")
-    if not np.any(b0) or not np.any(b1):
-        raise ValueError("Both b0 and b1 must be non-empty.")
-
-    idx = -np.ones(mask.shape, dtype=np.int32)
-    coords = np.argwhere(mask)
-    n = int(coords.shape[0])
-    idx[mask] = np.arange(n, dtype=np.int32)
-
-    rows: list[int] = []
-    cols: list[int] = []
-    data: list[float] = []
-    b = np.zeros(n, dtype=np.float64)
-
-    nbrs = np.asarray(
-        [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
-        dtype=np.int32,
-    )
-
-    b0_flat = b0[mask]
-    b1_flat = b1[mask]
-
-    zmax, ymax, xmax = mask.shape
-    for i, (z, y, x) in enumerate(coords.tolist()):
-        if b0_flat[i]:
-            rows.append(i)
-            cols.append(i)
-            data.append(1.0)
-            b[i] = 0.0
-            continue
-        if b1_flat[i]:
-            rows.append(i)
-            cols.append(i)
-            data.append(1.0)
-            b[i] = 1.0
-            continue
-
-        rows.append(i)
-        cols.append(i)
-        data.append(6.0)
-
-        for dz, dy, dx in nbrs.tolist():
-            zz, yy, xx = int(z + dz), int(y + dy), int(x + dx)
-            if 0 <= zz < zmax and 0 <= yy < ymax and 0 <= xx < xmax and mask[zz, yy, xx]:
-                j = int(idx[zz, yy, xx])
-                rows.append(i)
-                cols.append(j)
-                data.append(-1.0)
-
-    a = csr_matrix((data, (rows, cols)), shape=(n, n))
-    t0 = time.perf_counter()
-    diag = a.diagonal().astype(np.float64, copy=False)
-    inv_diag = np.zeros_like(diag)
-    ok = diag != 0
-    inv_diag[ok] = 1.0 / diag[ok]
-    from scipy.sparse.linalg import LinearOperator
-
-    m = LinearOperator((n, n), matvec=lambda x: inv_diag * x)
-
-    u_vec, info = cg(a, b, maxiter=int(maxiter), atol=0.0, rtol=float(rtol), M=m)
-    dt = time.perf_counter() - t0
-    if info != 0:
-        raise RuntimeError(f"[laplace] CG did not converge (info={info}) after {dt:.1f}s. Try DS=2/3.")
-    print(f"[laplace] CG converged in {dt:.1f}s (n={n})")
-
-    u = np.zeros(mask.shape, dtype=np.float32)
-    u[mask] = u_vec.astype(np.float32, copy=False)
-    return u
+def _bbox_slices(mask: np.ndarray, *, pad: int) -> tuple[slice, slice, slice]:
+    pts = np.argwhere(mask)
+    if pts.size == 0:
+        raise ValueError("Mask was empty; cannot compute bounding box.")
+    mins = pts.min(axis=0).astype(np.int64)
+    maxs = pts.max(axis=0).astype(np.int64) + 1
+    pad = int(max(0, int(pad)))
+    z0 = max(int(mins[0]) - pad, 0)
+    y0 = max(int(mins[1]) - pad, 0)
+    x0 = max(int(mins[2]) - pad, 0)
+    z1 = min(int(maxs[0]) + pad, int(mask.shape[0]))
+    y1 = min(int(maxs[1]) + pad, int(mask.shape[1]))
+    x1 = min(int(maxs[2]) + pad, int(mask.shape[2]))
+    return (slice(z0, z1), slice(y0, y1), slice(x0, x1))
 
 
 # ## Phase 0: Load atlas annotation volume
@@ -456,15 +318,15 @@ print(f"Cortex voxels (clean)={int(np.count_nonzero(cortex_clean_3d))}")
 np.save(OUTDIR / "cortex_mask_clean_3d_ds.npy", cortex_clean_3d.astype(np.bool_))
 
 
-# ## Phase 3: Laplace harmonic mid-surface (fit on eroded mask)
+# ## Phase 3: EDT halfway mid-surface (fit on eroded mask)
 
 cortex_fit_3d = cortex_clean_3d.copy()
-if ERODE_RADIUS_VOX_BEFORE_LAPLACE > 0:
-    cortex_fit_3d = binary_erosion(cortex_fit_3d, footprint=ball(int(ERODE_RADIUS_VOX_BEFORE_LAPLACE)))
+if ERODE_RADIUS_VOX_BEFORE_EDT > 0:
+    cortex_fit_3d = binary_erosion(cortex_fit_3d, footprint=ball(int(ERODE_RADIUS_VOX_BEFORE_EDT)))
 cortex_fit_3d = _keep_largest_component(cortex_fit_3d)
 if not np.any(cortex_fit_3d):
     raise ValueError(
-        f"Erosion emptied cortex mask (ERODE_RADIUS_VOX_BEFORE_LAPLACE={ERODE_RADIUS_VOX_BEFORE_LAPLACE}, DS={DS})."
+        f"Erosion emptied cortex mask (ERODE_RADIUS_VOX_BEFORE_EDT={ERODE_RADIUS_VOX_BEFORE_EDT}, DS={DS})."
     )
 print(f"Cortex voxels (fit)={int(np.count_nonzero(cortex_fit_3d))}")
 np.save(OUTDIR / "cortex_mask_fit_3d_ds.npy", cortex_fit_3d.astype(np.bool_))
@@ -472,45 +334,58 @@ np.save(OUTDIR / "cortex_mask_fit_3d_ds.npy", cortex_fit_3d.astype(np.bool_))
 pial_b0, inner_b1 = _boundary_partition_pial_inner(
     cortex_mask=cortex_fit_3d, brain_mask=brain_mask_3d, cortex_reference_mask=cortex_clean_3d
 )
-print(f"[laplace] b0(pial)={int(np.count_nonzero(pial_b0))} b1(inner)={int(np.count_nonzero(inner_b1))}")
+print(f"[edt] b0(pial)={int(np.count_nonzero(pial_b0))} b1(inner)={int(np.count_nonzero(inner_b1))}")
 np.save(OUTDIR / "laplace_b0_pial_3d_ds.npy", pial_b0.astype(np.bool_))
 np.save(OUTDIR / "laplace_b1_inner_3d_ds.npy", inner_b1.astype(np.bool_))
 
-try:
-    u = _solve_laplace_dirichlet_cg(
-        mask=cortex_fit_3d,
-        b0=pial_b0,  # u=0
-        b1=inner_b1,  # u=1
-        maxiter=int(LAPLACE_MAX_ITERS),
-        rtol=float(LAPLACE_CG_RTOL),
-    )
-except RuntimeError as exc:
-    print(str(exc))
-    print("[laplace] falling back to Jacobi relaxation (slower but robust).")
-    u = _solve_laplace_dirichlet_jacobi(
-        mask=cortex_fit_3d,
-        b0=pial_b0,
-        b1=inner_b1,
-        max_iters=int(LAPLACE_MAX_ITERS),
-        tol_maxdelta=float(LAPLACE_JACOBI_TOL_MAXDELTA),
-    )
+crop = _bbox_slices(cortex_fit_3d, pad=int(BBOX_PAD_VOX))
+z0, y0, x0 = (int(crop[0].start), int(crop[1].start), int(crop[2].start))
+
+mask_crop = cortex_fit_3d[crop]
+b0_crop = pial_b0[crop]
+b1_crop = inner_b1[crop]
+
+d0 = ndi.distance_transform_edt(~b0_crop).astype(np.float32, copy=False)
+d1 = ndi.distance_transform_edt(~b1_crop).astype(np.float32, copy=False)
+den = d0 + d1
+u_crop = np.zeros(mask_crop.shape, dtype=np.float32)
+ok = mask_crop & (den > 0.0)
+u_crop[ok] = (d0[ok] / den[ok]).astype(np.float32, copy=False)
+u_crop[b0_crop] = 0.0
+u_crop[b1_crop] = 1.0
+
+u = np.zeros(cortex_fit_3d.shape, dtype=np.float32)
+u[crop] = u_crop
+np.save(OUTDIR / "halfway_u_3d_ds.npy", u.astype(np.float32, copy=False))
+# Back-compat name for the plot script.
 np.save(OUTDIR / "laplace_u_3d_ds.npy", u.astype(np.float32, copy=False))
 
-mid_band = cortex_fit_3d & (np.abs(u - 0.5) <= float(MIDSURF_EPS))
-mid_band = _keep_largest_component(mid_band)
-print(f"[laplace] mid_band voxels={int(np.count_nonzero(mid_band))}")
+mid_band_crop = mask_crop & (np.abs(u_crop - 0.5) <= float(MIDSURF_EPS))
+mid_band = np.zeros(cortex_fit_3d.shape, dtype=bool)
+mid_band[crop] = _keep_largest_component(mid_band_crop)
+print(f"[edt] mid_band voxels={int(np.count_nonzero(mid_band))}")
+np.save(OUTDIR / "midsurface_halfway_midband_3d_ds.npy", mid_band.astype(np.bool_))
 np.save(OUTDIR / "midsurface_laplace_midband_3d_ds.npy", mid_band.astype(np.bool_))
 
-# Optional: marching cubes mesh of the u=0.5 isosurface (in um coordinates).
-u_mc = u.copy()
-u_mc[~cortex_fit_3d] = -1.0
-verts_ijk, faces, _, _ = marching_cubes(u_mc, level=0.5, spacing=res_ds_ijk_um)
-np.save(OUTDIR / "midsurface_laplace_mc_verts_ijk_um.npy", verts_ijk.astype(np.float32, copy=False))
-np.save(OUTDIR / "midsurface_laplace_mc_faces.npy", faces.astype(np.int32, copy=False))
-print(f"[laplace] marching_cubes verts={verts_ijk.shape[0]} faces={faces.shape[0]}")
+verts_ijk_um, faces, _, _ = marching_cubes(
+    u_crop,
+    level=0.5,
+    spacing=res_ds_ijk_um,
+    mask=mask_crop,
+)
+offset_ijk_um = np.asarray(
+    [z0 * res_ds_ijk_um[0], y0 * res_ds_ijk_um[1], x0 * res_ds_ijk_um[2]],
+    dtype=np.float32,
+)
+verts_ijk_um = verts_ijk_um.astype(np.float32, copy=False) + offset_ijk_um[None, :]
+faces = faces.astype(np.int32, copy=False)
+np.save(OUTDIR / "midsurface_halfway_mc_verts_ijk_um.npy", verts_ijk_um.astype(np.float32, copy=False))
+np.save(OUTDIR / "midsurface_halfway_mc_faces.npy", faces.astype(np.int32, copy=False))
+print(f"[edt] marching_cubes verts={verts_ijk_um.shape[0]} faces={faces.shape[0]}")
 
-laplace_mesh = Mesh(vertices_xyz=verts_ijk[:, [2, 1, 0]].astype(np.float32, copy=False), faces=faces.astype(np.int32))
-write_ply_binary_little_endian(OUTDIR / "midsurface_laplace_u0p5.ply", laplace_mesh)
+mesh = Mesh(vertices_xyz=verts_ijk_um[:, [2, 1, 0]].astype(np.float32, copy=False), faces=faces)
+write_ply_binary_little_endian(OUTDIR / "midsurface_halfway_u0p5.ply", mesh)
+write_ply_binary_little_endian(OUTDIR / "midsurface_laplace_u0p5.ply", mesh)
 
 
 # ## Phase 4: 3D visualization (Matplotlib)
@@ -518,14 +393,14 @@ write_ply_binary_little_endian(OUTDIR / "midsurface_laplace_u0p5.ply", laplace_m
 mask_xyz_um = _mask_to_xyz_um(cortex_fit_3d, res_ijk_um=res_ds_ijk_um)
 mask_xyz_um = _subsample_points(mask_xyz_um, max_points=int(PLOT_MAX_MASK_POINTS), seed=0)
 
-laplace_mesh_xyz_um = np.stack([verts_ijk[:, 2], verts_ijk[:, 1], verts_ijk[:, 0]], axis=1)
-laplace_mesh_xyz_um = _subsample_points(laplace_mesh_xyz_um, max_points=int(PLOT_MAX_RESULT_POINTS), seed=2)
+mesh_xyz_um = verts_ijk_um[:, [2, 1, 0]].astype(np.float64, copy=False)
+mesh_xyz_um = _subsample_points(mesh_xyz_um, max_points=int(PLOT_MAX_RESULT_POINTS), seed=2)
 
 _save_scatter_3d(
-    out_png=OUTDIR / "mpl3d_midsurface_laplace.png",
+    out_png=OUTDIR / "mpl3d_midsurface_halfway_edt.png",
     mask_xyz_um=mask_xyz_um,
-    result_xyz_um=laplace_mesh_xyz_um,
-    title=f"Laplace midsurface mesh verts (u=0.5, DS={DS}, erode={ERODE_RADIUS_VOX_BEFORE_LAPLACE})",
+    result_xyz_um=mesh_xyz_um,
+    title=f"EDT halfway midsurface mesh verts (u=0.5, DS={DS}, erode={ERODE_RADIUS_VOX_BEFORE_EDT})",
 )
 
 print(f"Wrote artifacts to {OUTDIR}")

@@ -35,7 +35,7 @@ OUTDIR = Path("/home/chaichontat/fishtools2/ccf/out/refextract/midsurface_neocor
 BRAINGLOBE_CONFIG_DIR = Path("ccf/out/atlases/.brainglobe_config")
 
 KEEP_LEFT_HEMISPHERE_ONLY = True
-DS = 2
+DS = 1
 
 SHOW_FIGURES = True
 CONTOUR_LEVEL = 0.5
@@ -121,23 +121,27 @@ print(f"reference_3d (downsampled) shape={reference_3d.shape} dtype={reference_3
 req = {
     "cortex_fit": OUTDIR / "cortex_mask_fit_3d_ds.npy",
     "cortex_clean": OUTDIR / "cortex_mask_clean_3d_ds.npy",
-    "u": OUTDIR / "laplace_u_3d_ds.npy",
+    "u_halfway": OUTDIR / "halfway_u_3d_ds.npy",
+    "u_laplace": OUTDIR / "laplace_u_3d_ds.npy",
     "b0": OUTDIR / "laplace_b0_pial_3d_ds.npy",
     "b1": OUTDIR / "laplace_b1_inner_3d_ds.npy",
 }
-required = ["u", "b0", "b1"]
-missing = [name for name in required if not req[name].exists()]
-if missing or (not req["cortex_fit"].exists() and not req["cortex_clean"].exists()):
+missing = [name for name in ["b0", "b1"] if not req[name].exists()]
+if missing or (not req["cortex_fit"].exists() and not req["cortex_clean"].exists()) or (
+    not req["u_halfway"].exists() and not req["u_laplace"].exists()
+):
     raise FileNotFoundError(
         f"Missing artifacts in {OUTDIR}: {missing}. Run midsurface_neocortex_mesocortex_allocortex_ccf_3d.py first."
     )
 
 mask_path = req["cortex_fit"] if req["cortex_fit"].exists() else req["cortex_clean"]
 cortex_3d = np.load(mask_path).astype(bool)
-u_3d = np.load(req["u"]).astype(np.float32, copy=False)
+u_path = req["u_halfway"] if req["u_halfway"].exists() else req["u_laplace"]
+u_3d = np.load(u_path).astype(np.float32, copy=False)
 b0_3d = np.load(req["b0"]).astype(bool)
 b1_3d = np.load(req["b1"]).astype(bool)
 print(f"Loaded cortex mask: {mask_path}")
+print(f"Loaded u field: {u_path}")
 
 if KEEP_LEFT_HEMISPHERE_ONLY:
     # Reference is already halved; make sure overlays match.
