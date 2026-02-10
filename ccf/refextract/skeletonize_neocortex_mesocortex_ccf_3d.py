@@ -180,6 +180,7 @@ np.save(OUTDIR / "skeleton_3d.npy", skeleton_3d.astype(np.bool_))
 # ## Phase 3: Coronal slice skeletons → 3D polylines
 
 # %%
+mask_3d = np.load(OUTDIR / "mask_3d.npy").astype(bool)
 mask_clean_3d = np.load(OUTDIR / "mask_clean_3d.npy").astype(bool)
 neo_meso_path = OUTDIR / "neo_meso_3d.npy"
 if neo_meso_path.exists():
@@ -839,8 +840,8 @@ thickness_rows: list[np.ndarray] = []
 thickness_by_slice_i: dict[int, dict[str, np.ndarray]] = {}
 for i, path_spline, u in zip(slice_indices, lines_spline_ijk, lines_spline_u, strict=True):
     i_int = int(i)
-    # Use neo+meso only for thickness.
-    mask_yx = (mask_clean_3d[i_int, :, :] & neo_meso_3d[i_int, :, :]).astype(bool)
+    # Use raw (non-eroded) neo+meso mask for thickness/v; erosion is only to prevent skeleton bridging.
+    mask_yx = (mask_3d[i_int, :, :] & neo_meso_3d[i_int, :, :]).astype(bool)
     yx = path_spline[:, 1:].astype(np.float64, copy=False)
     meas = measure_thickness_along_coronal_spline(slice_i=i_int, mask_yx=mask_yx, spline_yx=yx, u=u)
     thickness_by_slice_i[i_int] = meas
@@ -1165,7 +1166,7 @@ sagittal_thickness_rows: list[np.ndarray] = []
 thickness_by_slice_k: dict[int, dict[str, np.ndarray]] = {}
 for k, path_spline, u in zip(sagittal_slice_indices, sagittal_lines_spline_ijk, sagittal_lines_spline_u, strict=True):
     k_int = int(k)
-    mask_ij = (mask_clean_3d[:, :, k_int] & neo_meso_3d[:, :, k_int]).astype(bool)
+    mask_ij = (mask_3d[:, :, k_int] & neo_meso_3d[:, :, k_int]).astype(bool)
     yx = path_spline[:, :2].astype(np.float64, copy=False)
     meas = measure_thickness_along_coronal_spline(slice_i=k_int, mask_yx=mask_ij, spline_yx=yx, u=u)
     thickness_by_slice_k[k_int] = meas
@@ -1318,9 +1319,9 @@ if "atlas" not in globals():
 
     atlas = BrainGlobeAtlas(ATLAS_NAME)
 
-reference_3d = np.asarray(atlas.reference)[:, :, : mask_clean_3d.shape[2]]
+reference_3d = np.asarray(atlas.reference)[:, :, : mask_3d.shape[2]]
 
-mask_neo_meso_3d = (mask_clean_3d & neo_meso_3d).astype(bool)
+mask_neo_meso_3d = (mask_3d & neo_meso_3d).astype(bool)
 view_v_parameterization_coronal(mask_3d=mask_neo_meso_3d, background_3d=reference_3d, thickness_by_slice=thickness_by_slice_i)
 view_v_parameterization_sagittal(mask_3d=mask_neo_meso_3d, background_3d=reference_3d, thickness_by_slice=thickness_by_slice_k)
 
