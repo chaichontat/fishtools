@@ -744,6 +744,20 @@ def measure_thickness_along_coronal_spline(
             mask_yx, p_yx=p, n_yx=n, direction=-1.0, max_t=float(max_t), step=float(step)
         )
 
+    # Decide a stable vent/pia assignment for initialization. Our convention assumes the ventricular side
+    # is the more-medial boundary, which in this cropped hemisphere corresponds to larger x in the 2D plane.
+    # Using a slice-level median avoids arbitrary flips when the first sample is nearly vertical (b0_x≈b1_x).
+    midline_is_high_x = True
+    init_prefer_b0_as_vent: bool | None = None
+    valid = np.isfinite(t_neg) & np.isfinite(t_pos) & (t_pos > t_neg) & np.isfinite(nx)
+    if np.any(valid):
+        b0_x = x[valid] + t_neg[valid] * nx[valid]
+        b1_x = x[valid] + t_pos[valid] * nx[valid]
+        dx = b0_x - b1_x
+        med_dx = float(np.nanmedian(dx))
+        if np.isfinite(med_dx) and abs(med_dx) >= 0.25:
+            init_prefer_b0_as_vent = bool(med_dx >= 0.0) if midline_is_high_x else bool(med_dx < 0.0)
+
     p_vent = np.full((spline_yx.shape[0], 2), np.nan, dtype=np.float64)
     p_pia = np.full((spline_yx.shape[0], 2), np.nan, dtype=np.float64)
     thickness_px = np.full((spline_yx.shape[0],), np.nan, dtype=np.float64)
@@ -764,7 +778,10 @@ def measure_thickness_along_coronal_spline(
 
         if prev_vent is None or prev_pia is None:
             # Initialize by ventricular convention: closer to midline -> larger x (k in coronal view).
-            if float(b0[1]) >= float(b1[1]):
+            prefer_b0 = init_prefer_b0_as_vent
+            if prefer_b0 is None:
+                prefer_b0 = bool(float(b0[1]) >= float(b1[1])) if midline_is_high_x else bool(float(b0[1]) < float(b1[1]))
+            if prefer_b0:
                 vent, pia = b0, b1
                 t_vent, t_pia = float(t_neg[idx]), float(t_pos[idx])
             else:
@@ -787,6 +804,18 @@ def measure_thickness_along_coronal_spline(
         v_skel[idx] = float((0.0 - t_vent) / (t_pia - t_vent))
         prev_vent = vent
         prev_pia = pia
+
+    # Slice-level sanity: if the final assignment contradicts our ventricular side convention, flip.
+    vent_x = p_vent[:, 1]
+    pia_x = p_pia[:, 1]
+    finite = np.isfinite(vent_x) & np.isfinite(pia_x)
+    if int(np.sum(finite)) >= 20:
+        med_dx = float(np.nanmedian(vent_x[finite] - pia_x[finite]))
+        if np.isfinite(med_dx) and abs(med_dx) >= 0.25:
+            wants_positive = midline_is_high_x
+            if (med_dx < 0.0) == wants_positive:
+                p_vent, p_pia = p_pia, p_vent
+                v_skel = 1.0 - v_skel
 
     return {
         "slice_i": np.full((spline_yx.shape[0],), int(slice_i), dtype=np.int32),
@@ -918,7 +947,6 @@ def view_v_parameterization_coronal(
         vmin=vmin,
         vmax=vmax,
     )
-    (spline_line,) = ax.plot([], [], c="white", lw=1.0, alpha=0.9)
     v_im = ax.imshow(
         np.full_like(background_3d[cur_i, :, :], np.nan, dtype=np.float32),
         cmap=cmap,
@@ -926,7 +954,9 @@ def view_v_parameterization_coronal(
         vmin=0.0,
         vmax=1.0,
         alpha=0.65,
+        zorder=2,
     )
+    (spline_line,) = ax.plot([], [], c="white", lw=1.0, alpha=0.9)
     ax.set_xlabel("x (k)")
     ax.set_ylabel("y (j)")
     cbar = fig.colorbar(v_im, ax=ax, pad=0.02, fraction=0.04)
@@ -1024,7 +1054,6 @@ def view_v_parameterization_sagittal(
         vmax=vmax,
         aspect="auto",
     )
-    (spline_line,) = ax.plot([], [], c="white", lw=1.0, alpha=0.9)
     v_im = ax.imshow(
         np.full_like(background_3d[:, :, cur_k], np.nan, dtype=np.float32),
         cmap=cmap,
@@ -1033,7 +1062,9 @@ def view_v_parameterization_sagittal(
         vmax=1.0,
         alpha=0.65,
         aspect="auto",
+        zorder=2,
     )
+    (spline_line,) = ax.plot([], [], c="white", lw=1.0, alpha=0.9)
     ax.set_xlabel("y (j)")
     ax.set_ylabel("coronal slice (i)")
     cbar = fig.colorbar(v_im, ax=ax, pad=0.02, fraction=0.04)
