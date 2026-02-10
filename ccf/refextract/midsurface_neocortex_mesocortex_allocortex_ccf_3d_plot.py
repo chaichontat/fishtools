@@ -45,6 +45,9 @@ MASK_ALPHA = 0.18
 BOUNDARY_ALPHA = 0.85
 SLIDER_DEBOUNCE_MS = 40
 
+SHOW_R_OVERLAY = True
+R_CLIP_UM = 800.0
+
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -122,26 +125,46 @@ req = {
     "cortex_fit": OUTDIR / "cortex_mask_fit_3d_ds.npy",
     "cortex_clean": OUTDIR / "cortex_mask_clean_3d_ds.npy",
     "u_halfway": OUTDIR / "halfway_u_3d_ds.npy",
-    "u_laplace": OUTDIR / "laplace_u_3d_ds.npy",
     "b0": OUTDIR / "laplace_b0_pial_3d_ds.npy",
     "b1": OUTDIR / "laplace_b1_inner_3d_ds.npy",
+    "r_um": OUTDIR / "halfway_r_um_crop.npy",
+    "crop_origin": OUTDIR / "halfway_crop_origin_ijk.npy",
+    "midline_include": OUTDIR / "midline_include_neo_meso_3d_ds.npy",
 }
 missing = [name for name in ["b0", "b1"] if not req[name].exists()]
-if missing or (not req["cortex_fit"].exists() and not req["cortex_clean"].exists()) or (
-    not req["u_halfway"].exists() and not req["u_laplace"].exists()
-):
+if missing or (not req["cortex_fit"].exists() and not req["cortex_clean"].exists()) or (not req["u_halfway"].exists()):
     raise FileNotFoundError(
         f"Missing artifacts in {OUTDIR}: {missing}. Run midsurface_neocortex_mesocortex_allocortex_ccf_3d.py first."
     )
 
 mask_path = req["cortex_fit"] if req["cortex_fit"].exists() else req["cortex_clean"]
 cortex_3d = np.load(mask_path).astype(bool)
-u_path = req["u_halfway"] if req["u_halfway"].exists() else req["u_laplace"]
-u_3d = np.load(u_path).astype(np.float32, copy=False)
+u_path = req["u_halfway"]
+u_3d = np.load(req["u_halfway"]).astype(np.float32, copy=False)
 b0_3d = np.load(req["b0"]).astype(bool)
 b1_3d = np.load(req["b1"]).astype(bool)
 print(f"Loaded cortex mask: {mask_path}")
 print(f"Loaded u field: {u_path}")
+
+midline_include_3d: np.ndarray | None = None
+if req["midline_include"].exists():
+    midline_include_3d = np.load(req["midline_include"]).astype(bool)
+    if midline_include_3d.shape != cortex_3d.shape:
+        raise ValueError(
+            f"midline_include shape mismatch: {midline_include_3d.shape} vs cortex {cortex_3d.shape} (check DS)."
+        )
+    print(f"Loaded midline include mask: {req['midline_include']}")
+
+r_um_crop: np.ndarray | None = None
+crop_origin: np.ndarray | None = None
+if bool(SHOW_R_OVERLAY):
+    if not req["r_um"].exists() or not req["crop_origin"].exists():
+        raise FileNotFoundError(f"SHOW_R_OVERLAY=True but missing {req['r_um'].name} or {req['crop_origin'].name}")
+    r_um_crop = np.load(req["r_um"]).astype(np.float32, copy=False)
+    crop_origin = np.load(req["crop_origin"]).astype(np.int32, copy=False)
+    if crop_origin.shape != (3,):
+        raise ValueError(f"Expected crop_origin shape (3,), got {crop_origin.shape}")
+    print(f"Loaded r field: {req['r_um']}")
 
 if KEEP_LEFT_HEMISPHERE_ONLY:
     # Reference is already halved; make sure overlays match.
@@ -186,6 +209,20 @@ def view_coronal_overlay(*, show: bool = True) -> None:
         vmax=1.0,
         zorder=2,
     )
+    r_im = None
+    if bool(SHOW_R_OVERLAY):
+        cmap_r = plt.get_cmap("coolwarm").copy()
+        cmap_r.set_bad(alpha=0.0)
+        r_im = ax.imshow(
+            np.full_like(reference_3d[cur_i, :, :], np.nan, dtype=np.float32),
+            cmap=cmap_r,
+            interpolation="nearest",
+            origin="upper",
+            vmin=-float(R_CLIP_UM),
+            vmax=float(R_CLIP_UM),
+            alpha=0.55,
+            zorder=2.5,
+        )
 
     cont = None
     sc_b0 = ax.scatter([], [], s=3.0, c="#1f77b4", alpha=0.7, linewidths=0.0, zorder=4, label="pial seed")
@@ -202,9 +239,23 @@ def view_coronal_overlay(*, show: bool = True) -> None:
         i = int(np.clip(int(i), 0, n_i - 1))
         img.set_data(reference_3d[i, :, :])
         mask_im.set_data(cortex_3d[i, :, :].astype(np.float32, copy=False))
+        if r_im is not None:
+            assert r_um_crop is not None and crop_origin is not None
+            zi0, y0, x0 = (int(crop_origin[0]), int(crop_origin[1]), int(crop_origin[2]))
+            z = int(i)
+            r2 = np.full_like(reference_3d[i, :, :], np.nan, dtype=np.float32)
+            if zi0 <= z < zi0 + int(r_um_crop.shape[0]):
+                zz = z - zi0
+                r2[y0 : y0 + int(r_um_crop.shape[1]), x0 : x0 + int(r_um_crop.shape[2])] = r_um_crop[zz]
+                if midline_include_3d is not None:
+                    r2[~midline_include_3d[i, :, :]] = np.nan
+            r_im.set_data(r2)
 
         _clear_contours(cont)
-        u2 = _masked_u_slice(u_3d[i, :, :], cortex_3d[i, :, :])
+        contour_mask = cortex_3d[i, :, :]
+        if midline_include_3d is not None:
+            contour_mask = contour_mask & midline_include_3d[i, :, :]
+        u2 = _masked_u_slice(u_3d[i, :, :], contour_mask)
         if np.isfinite(u2).any():
             cont = ax.contour(
                 u2,
@@ -300,6 +351,21 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
         vmax=1.0,
         zorder=2,
     )
+    r_im = None
+    if bool(SHOW_R_OVERLAY):
+        cmap_r = plt.get_cmap("coolwarm").copy()
+        cmap_r.set_bad(alpha=0.0)
+        r_im = ax.imshow(
+            np.full_like(reference_3d[:, :, cur_k], np.nan, dtype=np.float32),
+            cmap=cmap_r,
+            interpolation="nearest",
+            origin="upper",
+            aspect="auto",
+            vmin=-float(R_CLIP_UM),
+            vmax=float(R_CLIP_UM),
+            alpha=0.55,
+            zorder=2.5,
+        )
 
     cont = None
     sc_b0 = ax.scatter([], [], s=3.0, c="#1f77b4", alpha=0.7, linewidths=0.0, zorder=4, label="pial seed")
@@ -316,9 +382,23 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
         k = int(np.clip(int(k), 0, n_k - 1))
         img.set_data(reference_3d[:, :, k])
         mask_im.set_data(cortex_3d[:, :, k].astype(np.float32, copy=False))
+        if r_im is not None:
+            assert r_um_crop is not None and crop_origin is not None
+            z0, y0, x0 = (int(crop_origin[0]), int(crop_origin[1]), int(crop_origin[2]))
+            x = int(k)
+            r2 = np.full_like(reference_3d[:, :, k], np.nan, dtype=np.float32)
+            if x0 <= x < x0 + int(r_um_crop.shape[2]):
+                xx = x - x0
+                r2[z0 : z0 + int(r_um_crop.shape[0]), y0 : y0 + int(r_um_crop.shape[1])] = r_um_crop[:, :, xx]
+                if midline_include_3d is not None:
+                    r2[~midline_include_3d[:, :, k]] = np.nan
+            r_im.set_data(r2)
 
         _clear_contours(cont)
-        u2 = _masked_u_slice(u_3d[:, :, k], cortex_3d[:, :, k])
+        contour_mask = cortex_3d[:, :, k]
+        if midline_include_3d is not None:
+            contour_mask = contour_mask & midline_include_3d[:, :, k]
+        u2 = _masked_u_slice(u_3d[:, :, k], contour_mask)
         if np.isfinite(u2).any():
             cont = ax.contour(
                 u2,

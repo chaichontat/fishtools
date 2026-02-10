@@ -2,9 +2,10 @@
 # # 3D cortex mid-surface extraction (DevCCF E15.5)
 #
 # Goal: reduce a folded cortical ribbon mask (neocortex+mesocortex+allocortex) to a 2D manifold.
-# This script computes a fold-preserving "halfway" field using Euclidean distance transforms:
+# This script computes fold-preserving scalar fields using Euclidean distance transforms:
 #   u = d(pial) / (d(pial) + d(inner))
-# and extracts the u=0.5 isosurface as the midsurface.
+#   r_um = d(inner)_um - d(pial)_um   (so r=0 is the midsurface, r>0 toward pial)
+# and extracts a thin u≈0.5 voxel band as the midsurface.
 #
 # Artifacts are written under `OUTDIR`.
 
@@ -37,6 +38,7 @@ ATLAS_NAME = "kim_dev_mouse_e15-5_lsfm_20um"
 
 TERMS: tuple[str, ...] = ("neocortex", "mesocortex", "allocortex")
 TERM_KIND: str = "auto"  # "auto" | "id" | "acronym" | "name"
+MIDLINE_TERMS: tuple[str, ...] = ("neocortex", "mesocortex")
 
 KEEP_LEFT_HEMISPHERE_ONLY = True
 
@@ -52,6 +54,7 @@ CLOSE_RADIUS_VOX = 1
 OPEN_RADIUS_VOX = 0
 
 # Erode cortex mask before computing the EDT field (voxels in the DS grid).
+# Note: r_um is always computed to the boundary of the non-eroded `cortex_clean_3d`.
 ERODE_RADIUS_VOX_BEFORE_EDT = 1
 MIDSURF_EPS = 0.03  # u-band around 0.5 (smaller => thinner but sparser)
 BBOX_PAD_VOX = 4  # compute EDT on a padded bounding box around the fit mask
@@ -297,6 +300,20 @@ if KEEP_LEFT_HEMISPHERE_ONLY:
 print(f"Cortex voxels (raw)={int(np.count_nonzero(cortex_3d))}")
 np.save(OUTDIR / "cortex_mask_3d_ds.npy", cortex_3d.astype(np.bool_))
 
+# Include-mask for clipping midsurface to neocortex+mesocortex only.
+ann_flat_mid = annotation_3d.reshape(annotation_3d.shape[0], -1)
+mask_flat_mid = _term_mask_from_annotation_yx(
+    annotation_yx=ann_flat_mid,
+    terms=MIDLINE_TERMS,
+    kind=TERM_KIND,  # type: ignore[arg-type]
+    combine="any",
+    invert=False,
+    atlas=atlas,
+)
+midline_include_3d = mask_flat_mid.reshape(annotation_3d.shape).astype(bool)
+midline_include_3d = midline_include_3d[:, :, : cortex_3d.shape[2]] & cortex_3d
+np.save(OUTDIR / "midline_include_neo_meso_3d_ds.npy", midline_include_3d.astype(np.bool_))
+
 
 # ## Phase 2: Cleanup mask (for both methods)
 
@@ -344,34 +361,48 @@ z0, y0, x0 = (int(crop[0].start), int(crop[1].start), int(crop[2].start))
 mask_crop = cortex_fit_3d[crop]
 b0_crop = pial_b0[crop]
 b1_crop = inner_b1[crop]
+include_crop = midline_include_3d[crop]
 
-d0 = ndi.distance_transform_edt(~b0_crop).astype(np.float32, copy=False)
-d1 = ndi.distance_transform_edt(~b1_crop).astype(np.float32, copy=False)
-den = d0 + d1
+d_pial_um = ndi.distance_transform_edt(~b0_crop, sampling=res_ds_ijk_um).astype(np.float32, copy=False)
+d_inner_um = ndi.distance_transform_edt(~b1_crop, sampling=res_ds_ijk_um).astype(np.float32, copy=False)
+den_um = d_pial_um + d_inner_um
 u_crop = np.zeros(mask_crop.shape, dtype=np.float32)
-ok = mask_crop & (den > 0.0)
-u_crop[ok] = (d0[ok] / den[ok]).astype(np.float32, copy=False)
+ok = mask_crop & (den_um > 0.0)
+u_crop[ok] = (d_pial_um[ok] / den_um[ok]).astype(np.float32, copy=False)
 u_crop[b0_crop] = 0.0
 u_crop[b1_crop] = 1.0
 
 u = np.zeros(cortex_fit_3d.shape, dtype=np.float32)
 u[crop] = u_crop
 np.save(OUTDIR / "halfway_u_3d_ds.npy", u.astype(np.float32, copy=False))
-# Back-compat name for the plot script.
-np.save(OUTDIR / "laplace_u_3d_ds.npy", u.astype(np.float32, copy=False))
 
-mid_band_crop = mask_crop & (np.abs(u_crop - 0.5) <= float(MIDSURF_EPS))
+crop_origin_ijk = np.asarray([z0, y0, x0], dtype=np.int32)
+np.save(OUTDIR / "halfway_crop_origin_ijk.npy", crop_origin_ijk)
+
+# Signed radial coordinate (microns): r=0 midsurface, r>0 toward pial.
+# Compute r to the boundary of the non-eroded mask by using distances to boundary seeds and
+# masking by `cortex_clean_3d` (not the eroded fit mask).
+mask_clean_crop = cortex_clean_3d[crop]
+r_um_crop = np.full(mask_crop.shape, np.nan, dtype=np.float32)
+t_um_crop = np.full(mask_crop.shape, np.nan, dtype=np.float32)
+ok_clean = mask_clean_crop & (den_um > 0.0)
+r_um_crop[ok_clean] = (d_inner_um[ok_clean] - d_pial_um[ok_clean]).astype(np.float32, copy=False)
+t_um_crop[ok_clean] = den_um[ok_clean].astype(np.float32, copy=False)
+np.save(OUTDIR / "halfway_r_um_crop.npy", r_um_crop)
+np.save(OUTDIR / "halfway_thickness_um_crop.npy", t_um_crop)
+
+mid_band_crop = mask_crop & include_crop & (np.abs(u_crop - 0.5) <= float(MIDSURF_EPS))
 mid_band = np.zeros(cortex_fit_3d.shape, dtype=bool)
 mid_band[crop] = _keep_largest_component(mid_band_crop)
 print(f"[edt] mid_band voxels={int(np.count_nonzero(mid_band))}")
 np.save(OUTDIR / "midsurface_halfway_midband_3d_ds.npy", mid_band.astype(np.bool_))
-np.save(OUTDIR / "midsurface_laplace_midband_3d_ds.npy", mid_band.astype(np.bool_))
 
+# Mesh only the neocortex+mesocortex portion of the u=0.5 surface (exclude allocortex).
 verts_ijk_um, faces, _, _ = marching_cubes(
     u_crop,
     level=0.5,
     spacing=res_ds_ijk_um,
-    mask=mask_crop,
+    mask=mask_crop & include_crop,
 )
 offset_ijk_um = np.asarray(
     [z0 * res_ds_ijk_um[0], y0 * res_ds_ijk_um[1], x0 * res_ds_ijk_um[2]],
@@ -385,7 +416,6 @@ print(f"[edt] marching_cubes verts={verts_ijk_um.shape[0]} faces={faces.shape[0]
 
 mesh = Mesh(vertices_xyz=verts_ijk_um[:, [2, 1, 0]].astype(np.float32, copy=False), faces=faces)
 write_ply_binary_little_endian(OUTDIR / "midsurface_halfway_u0p5.ply", mesh)
-write_ply_binary_little_endian(OUTDIR / "midsurface_laplace_u0p5.ply", mesh)
 
 
 # ## Phase 4: 3D visualization (Matplotlib)
@@ -393,14 +423,14 @@ write_ply_binary_little_endian(OUTDIR / "midsurface_laplace_u0p5.ply", mesh)
 mask_xyz_um = _mask_to_xyz_um(cortex_fit_3d, res_ijk_um=res_ds_ijk_um)
 mask_xyz_um = _subsample_points(mask_xyz_um, max_points=int(PLOT_MAX_MASK_POINTS), seed=0)
 
-mesh_xyz_um = verts_ijk_um[:, [2, 1, 0]].astype(np.float64, copy=False)
-mesh_xyz_um = _subsample_points(mesh_xyz_um, max_points=int(PLOT_MAX_RESULT_POINTS), seed=2)
+mid_xyz_um = _mask_to_xyz_um(mid_band, res_ijk_um=res_ds_ijk_um)
+mid_xyz_um = _subsample_points(mid_xyz_um, max_points=int(PLOT_MAX_RESULT_POINTS), seed=2)
 
 _save_scatter_3d(
     out_png=OUTDIR / "mpl3d_midsurface_halfway_edt.png",
     mask_xyz_um=mask_xyz_um,
-    result_xyz_um=mesh_xyz_um,
-    title=f"EDT halfway midsurface mesh verts (u=0.5, DS={DS}, erode={ERODE_RADIUS_VOX_BEFORE_EDT})",
+    result_xyz_um=mid_xyz_um,
+    title=f"EDT halfway midsurface voxels (u≈0.5, DS={DS}, erode={ERODE_RADIUS_VOX_BEFORE_EDT})",
 )
 
 print(f"Wrote artifacts to {OUTDIR}")
