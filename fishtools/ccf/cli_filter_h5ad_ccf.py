@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, TypedDict, cast
 
 import anndata as ad
+import ants
 import matplotlib as mpl
 import numpy as np
 import pandas as pd
 import rich_click as click
 from brainglobe_atlasapi import BrainGlobeAtlas
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
 from scipy.spatial import cKDTree
 
 # Force a non-interactive backend to avoid GUI/event-loop hangs in headless runs
@@ -18,8 +22,9 @@ mpl.use("Agg", force=True)
 import matplotlib.pyplot as plt  # noqa: E402
 
 from fishtools.ccf.ontology import CCFTermKind, mask_ccf_subtree
-from fishtools.ccf.landmark import LandmarkRegistrationOutputs
+from fishtools.ccf.landmark import LandmarkRegistrationOutputs, P1Landmarks
 from fishtools.ccf.ndimage_geometry import fused_xy_to_rotated_crop_xy
+from fishtools.ccf.sitk_utils import UM_TO_MM, normalize_robust
 from fishtools.io.workspace import Workspace
 from fishtools.postprocess.roi_polygons import load_roi_polygons
 from fishtools.utils.logging import setup_cli_logging
@@ -37,6 +42,886 @@ CoordUnits = Literal["px", "um", "mm"]
 SpatialOrder = Literal["xy", "yx"]
 CoordSpace = Literal["crop", "full"]
 InputSpace = Literal["crop", "full", "fused"]
+T_AXIS_T_CMAP = "viridis"
+T_AXIS_OVERLAP_TOL_PX = 12.0
+
+
+class _SummaryPaths(TypedDict, total=False):
+    fixed_nifti: str
+    warped_after_nifti: str
+    moving_mask_warped_final_nifti: str
+    qc_zoom_masked_png: str
+
+
+class _Summary(TypedDict, total=False):
+    fwdtransforms: list[str] | str
+    paths: _SummaryPaths
+
+
+@dataclass(frozen=True, slots=True)
+class TAxisOverlay:
+    line_xy: np.ndarray
+    line_t: np.ndarray
+    tick_xy: np.ndarray
+    tick_t: np.ndarray
+    minor_tick_xy: np.ndarray
+    minor_tick_t: np.ndarray
+    tick_labels: list[str]
+
+
+def _load_json_object(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid JSON payload in {path}: expected object, got {type(payload).__name__}.")
+    return cast(dict[str, object], payload)
+
+
+def _as_list_of_str(value: object, *, key: str, path: Path) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return list(value)
+    raise ValueError(f"Invalid {key} in {path}: expected string or list[str], got {type(value).__name__}.")
+
+
+def _resolve_paths(paths: list[str], *, base_dir: Path) -> list[str]:
+    resolved: list[str] = []
+    for p in paths:
+        pp = Path(p)
+        if not pp.is_absolute():
+            pp = base_dir / pp
+        resolved.append(str(pp))
+    return resolved
+
+
+def _ants_numpy_yx(img: ants.ANTsImage) -> np.ndarray:
+    arr_xy = np.asarray(img.numpy())
+    if arr_xy.ndim != 2:
+        raise ValueError(f"Expected 2D ANTsImage, got shape={arr_xy.shape}.")
+    return arr_xy.T
+
+
+def _ants_from_mask_yx(*, mask_yx: np.ndarray, spacing_um: float) -> ants.ANTsImage:
+    arr = np.asarray(mask_yx, dtype=np.float32)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape={arr.shape}.")
+    sp_mm = float(spacing_um) * UM_TO_MM
+    return ants.from_numpy(arr.T, origin=[0.0, 0.0], spacing=[sp_mm, sp_mm])
+
+
+def _bbox_indices_from_mask(*, mask_xy: np.ndarray, pad_vox: int = 0) -> tuple[list[int], list[int]] | None:
+    mask_xy = np.asarray(mask_xy, dtype=bool)
+    if mask_xy.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape={mask_xy.shape}.")
+    if not np.any(mask_xy):
+        return None
+
+    idx = np.argwhere(mask_xy)
+    lo = idx.min(axis=0)
+    hi = idx.max(axis=0)
+    pad = int(pad_vox)
+    lo = np.maximum(lo - pad, 0)
+    hi = np.minimum(hi + pad + 1, np.asarray(mask_xy.shape, dtype=int))
+    return lo.astype(int).tolist(), hi.astype(int).tolist()
+
+
+def _compute_t_axis_overlay_for_fixed_view(
+    *,
+    fixed_view: ants.ANTsImage,
+    atlas_name: str,
+    atlas_plane: str,
+    atlas_slice_idx: int,
+    atlas_crop_bbox: tuple[int, int, int, int],
+    atlas_voxel_um: float,
+    coverage_mask_yx: np.ndarray | None = None,
+    side_filter: Literal["both", "primary", "mirrored"] = "both",
+    tick_step: float = 0.1,
+) -> TAxisOverlay | None:
+    expected_atlas_name = "kim_dev_mouse_e15-5_lsfm_20um"
+    if atlas_name != expected_atlas_name:
+        return None
+
+    atlas_plane_t = str(atlas_plane).lower()
+    if atlas_plane_t not in {"coronal", "sagittal"}:
+        return None
+
+    outdir = (
+        Path(__file__).resolve().parents[2]
+        / "ccf"
+        / "out"
+        / "refextract"
+        / "midsurface_neocortex_mesocortex_allocortex_3d"
+    )
+    u_path = outdir / "halfway_u_3d_ds.npy"
+    mask_fit_path = outdir / "cortex_mask_fit_3d_ds.npy"
+    mask_clean_path = outdir / "cortex_mask_clean_3d_ds.npy"
+    include_path = outdir / "midline_include_neo_meso_3d_ds.npy"
+    mask_path = mask_fit_path if mask_fit_path.exists() else mask_clean_path
+
+    missing: list[Path] = []
+    if not u_path.exists():
+        missing.append(u_path)
+    if not mask_path.exists():
+        missing.extend([mask_fit_path, mask_clean_path])
+    if missing:
+        raise FileNotFoundError(f"Missing midsurface artifacts for t-axis overlay: {[str(p) for p in missing]}")
+
+    u_3d = np.load(u_path).astype(np.float32, copy=False)
+    cortex_3d = np.load(mask_path).astype(bool)
+    if u_3d.shape != cortex_3d.shape:
+        raise ValueError(f"u/cortex shape mismatch for t-axis overlay: u={u_3d.shape} cortex={cortex_3d.shape}")
+
+    include_3d: np.ndarray | None = None
+    if include_path.exists():
+        include_3d = np.load(include_path).astype(bool)
+        if include_3d.shape != u_3d.shape:
+            raise ValueError(f"midline_include shape mismatch: include={include_3d.shape} u={u_3d.shape}")
+
+    if atlas_plane_t == "coronal":
+        if not (0 <= int(atlas_slice_idx) < int(u_3d.shape[0])):
+            raise ValueError(f"atlas_slice_idx {atlas_slice_idx} out of bounds for coronal midsurface shape {u_3d.shape}.")
+        contour_mask = cortex_3d[int(atlas_slice_idx), :, :]
+        if include_3d is not None:
+            contour_mask = contour_mask & include_3d[int(atlas_slice_idx), :, :]
+        u2 = np.full(u_3d[int(atlas_slice_idx), :, :].shape, np.nan, dtype=np.float32)
+        u2[contour_mask] = u_3d[int(atlas_slice_idx), :, :][contour_mask]
+    else:
+        if not (0 <= int(atlas_slice_idx) < int(u_3d.shape[2])):
+            raise ValueError(
+                f"atlas_slice_idx {atlas_slice_idx} out of bounds for sagittal midsurface shape {u_3d.shape}."
+            )
+        contour_mask = cortex_3d[:, :, int(atlas_slice_idx)]
+        if include_3d is not None:
+            contour_mask = contour_mask & include_3d[:, :, int(atlas_slice_idx)]
+        u2 = np.full(u_3d[:, :, int(atlas_slice_idx)].shape, np.nan, dtype=np.float32)
+        u2[contour_mask] = u_3d[:, :, int(atlas_slice_idx)][contour_mask]
+
+    if not np.isfinite(u2).any():
+        raise ValueError(f"No finite midsurface contour values for atlas_slice_idx={atlas_slice_idx} ({atlas_plane_t}).")
+
+    fig_tmp, ax_tmp = plt.subplots()
+    cont = ax_tmp.contour(u2, levels=[0.5], linewidths=0.0, alpha=0.0)
+    segs = [np.asarray(seg, dtype=np.float64) for seg in cont.allsegs[0] if np.asarray(seg).shape[0] >= 2]
+    plt.close(fig_tmp)
+    if not segs:
+        raise ValueError(f"No u=0.5 contour segments extracted for atlas_slice_idx={atlas_slice_idx} ({atlas_plane_t}).")
+    if side_filter not in {"both", "primary", "mirrored"}:
+        raise ValueError(f"Invalid side_filter={side_filter!r}.")
+    fixed_shape_xy = tuple(int(v) for v in fixed_view.shape)
+    if len(fixed_shape_xy) != 2:
+        raise ValueError(f"Expected 2D fixed_view shape, got {fixed_shape_xy}.")
+    fixed_width_px = int(fixed_shape_xy[0])
+
+    primary_candidates: list[TAxisOverlay] = []
+    mirrored_candidates: list[TAxisOverlay] = []
+    for seg in segs:
+        if atlas_plane_t == "coronal":
+            row = seg[:, 1]
+            col = seg[:, 0]
+        else:
+            row = seg[:, 0]
+            col = seg[:, 1]
+
+        primary = _build_t_axis_overlay_from_row_col(
+            fixed_view=fixed_view,
+            row=row,
+            col=col,
+            atlas_crop_bbox=atlas_crop_bbox,
+            atlas_voxel_um=atlas_voxel_um,
+            tick_step=tick_step,
+        )
+        if primary is not None:
+            primary_candidates.append(primary)
+
+        if atlas_plane_t == "coronal":
+            mirrored = _mirror_t_axis_overlay_in_fixed_space(
+                t_axis_overlay=primary,
+                width_px=fixed_width_px,
+            )
+            if mirrored is not None:
+                mirrored_candidates.append(mirrored)
+
+    primary = _pick_best_t_axis_candidate(candidates=primary_candidates, coverage_mask_yx=coverage_mask_yx)
+    if atlas_plane_t != "coronal":
+        return primary
+    if side_filter == "primary":
+        return primary
+
+    mirrored = _pick_best_t_axis_candidate(candidates=mirrored_candidates, coverage_mask_yx=coverage_mask_yx)
+    if side_filter == "mirrored":
+        return mirrored
+    if primary is None:
+        return mirrored
+    if mirrored is None or coverage_mask_yx is None:
+        return primary
+
+    return _select_t_axis_overlay_by_coverage(
+        primary=primary,
+        mirrored=mirrored,
+        coverage_mask_yx=coverage_mask_yx,
+    )
+
+
+def _pick_best_t_axis_candidate(
+    *,
+    candidates: list[TAxisOverlay],
+    coverage_mask_yx: np.ndarray | None,
+) -> TAxisOverlay | None:
+    if not candidates:
+        return None
+    if coverage_mask_yx is None:
+        return max(candidates, key=lambda ov: int(np.asarray(ov.line_xy).shape[0]))
+
+    best: TAxisOverlay | None = None
+    best_key: tuple[int, float, int] | None = None
+    for ov in candidates:
+        score, median_dist = _t_axis_line_coverage_metrics(t_axis_overlay=ov, mask_yx=coverage_mask_yx)
+        key = (int(score), float(-median_dist), int(np.asarray(ov.line_xy).shape[0]))
+        if best_key is None or key > best_key:
+            best = ov
+            best_key = key
+    return best
+
+
+def _build_t_axis_overlay_from_row_col(
+    *,
+    fixed_view: ants.ANTsImage,
+    row: np.ndarray,
+    col: np.ndarray,
+    atlas_crop_bbox: tuple[int, int, int, int],
+    atlas_voxel_um: float,
+    tick_step: float,
+) -> TAxisOverlay | None:
+    ar0, _, ac0, _ = (
+        int(atlas_crop_bbox[0]),
+        int(atlas_crop_bbox[1]),
+        int(atlas_crop_bbox[2]),
+        int(atlas_crop_bbox[3]),
+    )
+    spacing_mm = float(atlas_voxel_um) * UM_TO_MM
+    origin_x_mm, origin_y_mm = (float(fixed_view.origin[0]), float(fixed_view.origin[1]))
+    sp_x_mm, sp_y_mm = (float(fixed_view.spacing[0]), float(fixed_view.spacing[1]))
+
+    row_c = np.asarray(row, dtype=np.float64) - float(ar0)
+    col_c = np.asarray(col, dtype=np.float64) - float(ac0)
+    x_mm = col_c * spacing_mm
+    y_mm = row_c * spacing_mm
+    x_idx = (x_mm - origin_x_mm) / sp_x_mm
+    y_idx = (y_mm - origin_y_mm) / sp_y_mm
+
+    line_xy = np.column_stack([x_idx, y_idx]).astype(np.float64, copy=False)
+    valid = np.isfinite(line_xy).all(axis=1)
+    line_xy = line_xy[valid]
+    if line_xy.shape[0] < 2:
+        return None
+
+    seg_len = np.linalg.norm(np.diff(line_xy, axis=0), axis=1)
+    seg_len = np.where(np.isfinite(seg_len), np.maximum(seg_len, 0.0), 0.0)
+    cum = np.concatenate(([0.0], np.cumsum(seg_len, dtype=np.float64)))
+    total = float(cum[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        line_t = np.linspace(0.0, 1.0, line_xy.shape[0], dtype=np.float64)
+    else:
+        line_t = cum / total
+
+    ticks = np.arange(0.0, 1.0 + 1.0e-9, float(tick_step), dtype=np.float64)
+    tick_idx = np.argmin(np.abs(line_t[None, :] - ticks[:, None]), axis=1)
+    tick_xy = line_xy[tick_idx]
+    tick_t = line_t[tick_idx]
+    tick_labels = [f"t={float(t):.1f}" for t in ticks.tolist()]
+
+    minor_step = float(tick_step) * 0.5
+    minor_ticks = np.arange(0.0, 1.0 + 1.0e-9, minor_step, dtype=np.float64)
+    is_major = np.isclose(minor_ticks[:, None], ticks[None, :], atol=1.0e-9, rtol=0.0).any(axis=1)
+    minor_ticks = minor_ticks[~is_major]
+    minor_tick_idx = np.argmin(np.abs(line_t[None, :] - minor_ticks[:, None]), axis=1)
+    minor_tick_xy = line_xy[minor_tick_idx]
+    minor_tick_t = line_t[minor_tick_idx]
+
+    return TAxisOverlay(
+        line_xy=line_xy,
+        line_t=line_t,
+        tick_xy=tick_xy,
+        tick_t=tick_t,
+        minor_tick_xy=minor_tick_xy,
+        minor_tick_t=minor_tick_t,
+        tick_labels=tick_labels,
+    )
+
+
+def _mirror_t_axis_overlay_in_fixed_space(
+    *,
+    t_axis_overlay: TAxisOverlay | None,
+    width_px: int,
+) -> TAxisOverlay | None:
+    if t_axis_overlay is None:
+        return None
+    if int(width_px) <= 0:
+        raise ValueError(f"Invalid width_px={width_px}.")
+    width = float(width_px) - 1.0
+
+    def mirror_xy(xy_in: np.ndarray) -> np.ndarray:
+        xy = np.asarray(xy_in, dtype=np.float64)
+        if xy.ndim != 2 or xy.shape[1] != 2:
+            raise ValueError(f"Expected XY array with shape (N,2), got {xy.shape}.")
+        out = xy.copy()
+        if out.size:
+            out[:, 0] = width - out[:, 0]
+        return out
+
+    return TAxisOverlay(
+        line_xy=mirror_xy(np.asarray(t_axis_overlay.line_xy, dtype=np.float64)),
+        line_t=np.asarray(t_axis_overlay.line_t, dtype=np.float64).copy(),
+        tick_xy=mirror_xy(np.asarray(t_axis_overlay.tick_xy, dtype=np.float64)),
+        tick_t=np.asarray(t_axis_overlay.tick_t, dtype=np.float64).copy(),
+        minor_tick_xy=mirror_xy(np.asarray(t_axis_overlay.minor_tick_xy, dtype=np.float64)),
+        minor_tick_t=np.asarray(t_axis_overlay.minor_tick_t, dtype=np.float64).copy(),
+        tick_labels=[str(v) for v in t_axis_overlay.tick_labels],
+    )
+
+
+def _t_axis_line_t_and_distances_to_mask(
+    *,
+    t_axis_overlay: TAxisOverlay,
+    mask_yx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    mask = np.asarray(mask_yx, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D coverage mask, got shape={mask.shape}.")
+    if not np.any(mask):
+        return None
+
+    line_xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
+    line_t = np.asarray(t_axis_overlay.line_t, dtype=np.float64)
+    if line_xy.ndim != 2 or line_xy.shape[1] != 2 or line_t.ndim != 1 or line_t.shape[0] != line_xy.shape[0]:
+        return None
+
+    valid = np.isfinite(line_xy).all(axis=1)
+    valid &= np.isfinite(line_t)
+    if not np.any(valid):
+        return None
+
+    line_xy = line_xy[valid]
+    line_t = line_t[valid]
+
+    mask_pts_yx = np.argwhere(mask)
+    if mask_pts_yx.shape[0] == 0:
+        return None
+    line_pts_yx = np.column_stack([line_xy[:, 1], line_xy[:, 0]])
+    tree = cKDTree(mask_pts_yx.astype(np.float64, copy=False))
+    distances, _ = tree.query(line_pts_yx, k=1)
+    return (line_t, np.asarray(distances, dtype=np.float64))
+
+
+def _t_axis_line_coverage_metrics(*, t_axis_overlay: TAxisOverlay, mask_yx: np.ndarray) -> tuple[int, float]:
+    pair = _t_axis_line_t_and_distances_to_mask(t_axis_overlay=t_axis_overlay, mask_yx=mask_yx)
+    if pair is None:
+        return (0, float("inf"))
+    _, distances = pair
+    if distances.size == 0:
+        return (0, float("inf"))
+    covered = distances <= float(T_AXIS_OVERLAP_TOL_PX)
+    count = int(np.count_nonzero(covered))
+    if count > 0:
+        return (count, float(np.median(distances[covered])))
+    return (0, float(np.min(distances)))
+
+
+def _select_t_axis_overlay_by_coverage(
+    *,
+    primary: TAxisOverlay,
+    mirrored: TAxisOverlay,
+    coverage_mask_yx: np.ndarray,
+) -> TAxisOverlay:
+    primary_score, primary_median = _t_axis_line_coverage_metrics(t_axis_overlay=primary, mask_yx=coverage_mask_yx)
+    mirrored_score, mirrored_median = _t_axis_line_coverage_metrics(t_axis_overlay=mirrored, mask_yx=coverage_mask_yx)
+    if mirrored_score > primary_score:
+        return mirrored
+    if mirrored_score < primary_score:
+        return primary
+    return mirrored if mirrored_median < primary_median else primary
+
+
+def _t_axis_range_for_mask(*, t_axis_overlay: TAxisOverlay, mask_yx: np.ndarray) -> tuple[float, float] | None:
+    pair = _t_axis_line_t_and_distances_to_mask(t_axis_overlay=t_axis_overlay, mask_yx=mask_yx)
+    if pair is None:
+        return None
+    line_t, distances = pair
+    covered = distances <= float(T_AXIS_OVERLAP_TOL_PX)
+    if not np.any(covered):
+        return None
+
+    t_vals = np.clip(line_t[covered], 0.0, 1.0)
+    return (float(np.min(t_vals)), float(np.max(t_vals)))
+
+
+def _t_axis_range_for_mask_with_mirroring(
+    *,
+    primary: TAxisOverlay | None,
+    mirrored: TAxisOverlay | None,
+    mask_yx: np.ndarray,
+) -> tuple[tuple[float, float] | None, Literal["primary", "mirrored"] | None]:
+    selected: TAxisOverlay | None
+    side: Literal["primary", "mirrored"] | None
+    if primary is None and mirrored is None:
+        return (None, None)
+    if primary is None:
+        selected = mirrored
+        side = "mirrored"
+    elif mirrored is None:
+        selected = primary
+        side = "primary"
+    else:
+        selected = _select_t_axis_overlay_by_coverage(
+            primary=primary,
+            mirrored=mirrored,
+            coverage_mask_yx=np.asarray(mask_yx, dtype=bool),
+        )
+        side = "mirrored" if selected is mirrored else "primary"
+    if selected is None:
+        return (None, side)
+    return (_t_axis_range_for_mask(t_axis_overlay=selected, mask_yx=mask_yx), side)
+
+
+def _moving_thumbnail_shape_yx(*, p1: P1Landmarks, target_spacing_um: float) -> tuple[int, int]:
+    sample_voxel_um = float(p1.sample_voxel_xy_um) if p1.sample_voxel_xy_um is not None else 0.216
+    sr0, sr1, sc0, sc1 = p1.sample_rotated_crop_bbox
+    h_px = int(sr1) - int(sr0)
+    w_px = int(sc1) - int(sc0)
+    if h_px <= 0 or w_px <= 0:
+        raise ValueError(f"Invalid sample_rotated_crop_bbox={p1.sample_rotated_crop_bbox}.")
+    scale = float(sample_voxel_um) / float(target_spacing_um)
+    return (
+        max(1, int(math.ceil(float(h_px) * scale))),
+        max(1, int(math.ceil(float(w_px) * scale))),
+    )
+
+
+def _rasterize_imagej_roi_masks(
+    *,
+    roi_path: Path,
+    shape_yx: tuple[int, int],
+) -> list[tuple[int, str, np.ndarray]]:
+    from matplotlib.path import Path as MplPath
+    from shapely.geometry import MultiPolygon, Polygon
+
+    h, w = int(shape_yx[0]), int(shape_yx[1])
+    if h <= 0 or w <= 0:
+        raise ValueError(f"Invalid shape_yx={shape_yx}.")
+
+    roi_polys = load_roi_polygons(roi_path, scale=1.0)
+    if not roi_polys:
+        raise ValueError(f"No valid ROI polygons found in {roi_path}.")
+
+    masks: list[tuple[int, str, np.ndarray]] = []
+    for mask_index, entry in enumerate(roi_polys, start=1):
+        mask = np.zeros((h, w), dtype=bool)
+        geom = entry.geometry
+        if isinstance(geom, Polygon):
+            polys = [geom]
+        elif isinstance(geom, MultiPolygon):
+            polys = list(geom.geoms)
+        else:  # pragma: no cover - load_roi_polygons filters unsupported geometries
+            continue
+
+        for poly in polys:
+            minx, miny, maxx, maxy = poly.bounds
+            c0 = max(0, int(math.floor(minx)))
+            c1 = min(w - 1, int(math.ceil(maxx)))
+            r0 = max(0, int(math.floor(miny)))
+            r1 = min(h - 1, int(math.ceil(maxy)))
+            if c1 < c0 or r1 < r0:
+                continue
+
+            xs = np.arange(c0, c1 + 1, dtype=np.float64) + 0.5
+            ys = np.arange(r0, r1 + 1, dtype=np.float64) + 0.5
+            xx, yy = np.meshgrid(xs, ys, indexing="xy")
+            points = np.column_stack([xx.ravel(), yy.ravel()])
+
+            ext = np.asarray(poly.exterior.coords, dtype=np.float64)
+            if ext.ndim != 2 or ext.shape[1] != 2:
+                continue
+            inside = MplPath(ext, closed=True).contains_points(points, radius=1e-9)
+            for hole in poly.interiors:
+                hole_xy = np.asarray(hole.coords, dtype=np.float64)
+                if hole_xy.ndim == 2 and hole_xy.shape[1] == 2:
+                    inside &= ~MplPath(hole_xy, closed=True).contains_points(points, radius=1e-9)
+            if np.any(inside):
+                mask[r0 : (r1 + 1), c0 : (c1 + 1)] |= inside.reshape((ys.size, xs.size))
+
+        if np.any(mask):
+            masks.append((int(mask_index), str(entry.name), mask))
+
+    if not masks:
+        raise ValueError(f"Rasterized user ROI masks are empty for {roi_path}.")
+    return masks
+
+
+def _write_syn_zoom_overlay_with_user_mask(
+    *,
+    fixed_yx: np.ndarray,
+    moving_yx: np.ndarray,
+    moving_mask_yx: np.ndarray | None,
+    user_mask_yx: np.ndarray,
+    t_axis_overlay: TAxisOverlay | None,
+    reflect_t_axis_midline: bool,
+    out_png: Path,
+    title: str,
+) -> None:
+    fixed = np.asarray(fixed_yx, dtype=np.float32)
+    moving = np.asarray(moving_yx, dtype=np.float32)
+    user_mask = np.asarray(user_mask_yx, dtype=bool)
+    if fixed.shape != moving.shape or fixed.shape != user_mask.shape:
+        raise ValueError(f"Overlay shape mismatch: fixed={fixed.shape}, moving={moving.shape}, user={user_mask.shape}.")
+
+    moving_mask = None
+    if moving_mask_yx is not None:
+        moving_mask = np.asarray(moving_mask_yx, dtype=bool)
+        if moving_mask.shape != fixed.shape:
+            raise ValueError(f"moving_mask shape mismatch: moving_mask={moving_mask.shape}, fixed={fixed.shape}.")
+
+    union = user_mask.copy()
+    if moving_mask is not None:
+        union |= moving_mask
+    lo_hi = _bbox_indices_from_mask(mask_xy=union, pad_vox=20)
+    lo: np.ndarray
+    hi: np.ndarray
+    if lo_hi is None:
+        lo = np.asarray([fixed.shape[0], fixed.shape[1]], dtype=int)
+        hi = np.asarray([0, 0], dtype=int)
+    else:
+        lo = np.asarray(lo_hi[0], dtype=int)
+        hi = np.asarray(lo_hi[1], dtype=int)
+
+    if t_axis_overlay is not None and t_axis_overlay.line_xy.size:
+        t_xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
+        valid = np.isfinite(t_xy).all(axis=1)
+        t_xy = t_xy[valid]
+        if t_xy.size:
+            if reflect_t_axis_midline:
+                t_xy_reflected = t_xy.copy()
+                t_xy_reflected[:, 0] = (float(fixed.shape[1]) - 1.0) - t_xy_reflected[:, 0]
+                t_xy = np.vstack([t_xy, t_xy_reflected])
+            pad = 20
+            row_min = max(0, int(math.floor(float(np.min(t_xy[:, 1])))) - pad)
+            row_max = min(int(fixed.shape[0]), int(math.ceil(float(np.max(t_xy[:, 1])))) + pad + 1)
+            col_min = max(0, int(math.floor(float(np.min(t_xy[:, 0])))) - pad)
+            col_max = min(int(fixed.shape[1]), int(math.ceil(float(np.max(t_xy[:, 0])))) + pad + 1)
+            lo = np.minimum(lo, np.asarray([row_min, col_min], dtype=int))
+            hi = np.maximum(hi, np.asarray([row_max, col_max], dtype=int))
+
+    if not ((hi > lo).all()):
+        raise ValueError("Union mask and t-axis overlay are empty after warping user ROI mask.")
+
+    row_slice = slice(int(lo[0]), int(hi[0]))
+    col_slice = slice(int(lo[1]), int(hi[1]))
+
+    f = normalize_robust(fixed[row_slice, col_slice].astype(np.float32))
+    m = normalize_robust(moving[row_slice, col_slice].astype(np.float32))
+    if moving_mask is not None:
+        m = m * moving_mask[row_slice, col_slice].astype(np.float32)
+    user = user_mask[row_slice, col_slice]
+
+    overlay = np.stack([f, m, f], axis=-1)
+    height_px = int(max(f.shape[0], m.shape[0]))
+    width_px = int(max(f.shape[1], m.shape[1]))
+    fig_w_in = max(15.0, (3.0 * float(width_px)) / 220.0)
+    fig_h_in = max(5.0, float(height_px) / 220.0)
+
+    fig, axes = plt.subplots(1, 3, figsize=(fig_w_in, fig_h_in))
+    axes[0].imshow(f, cmap="gray", interpolation="nearest", resample=False)
+    axes[0].set_title("Fixed (atlas crop)")
+    axes[0].axis("off")
+    axes[1].imshow(m, cmap="gray", interpolation="nearest", resample=False)
+    axes[1].set_title("Warped moving")
+    axes[1].axis("off")
+    axes[2].imshow(overlay, interpolation="nearest", resample=False)
+    axes[2].set_title("Overlay + user ROI mask")
+    axes[2].axis("off")
+
+    user_alpha = np.where(user, 0.24, 0.0).astype(np.float32)
+    user_rgba = np.stack(
+        [
+            np.ones_like(user_alpha),
+            np.full_like(user_alpha, 0.20),
+            np.full_like(user_alpha, 0.15),
+            user_alpha,
+        ],
+        axis=-1,
+    )
+    axes[2].imshow(user_rgba, interpolation="nearest", resample=False)
+    axes[2].contour(user.astype(np.uint8), levels=[0.5], colors=["#ffd54f"], linewidths=0.8, alpha=0.95)
+
+    if t_axis_overlay is not None:
+        ax = axes[2]
+        line_t = np.asarray(t_axis_overlay.line_t, dtype=np.float64)
+        norm = Normalize(vmin=0.0, vmax=1.0)
+        xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
+        minor_ticks_xy = np.asarray(t_axis_overlay.minor_tick_xy, dtype=np.float64)
+        minor_ticks_t = np.asarray(t_axis_overlay.minor_tick_t, dtype=np.float64)
+        ticks_xy = np.asarray(t_axis_overlay.tick_xy, dtype=np.float64)
+        ticks_t = np.asarray(t_axis_overlay.tick_t, dtype=np.float64)
+        overlays = [(xy, minor_ticks_xy, ticks_xy, True)]
+        if reflect_t_axis_midline:
+            mirrored_xy = xy.copy()
+            mirrored_xy[:, 0] = (float(fixed.shape[1]) - 1.0) - mirrored_xy[:, 0]
+            mirrored_minor = minor_ticks_xy.copy()
+            mirrored_minor[:, 0] = (float(fixed.shape[1]) - 1.0) - mirrored_minor[:, 0]
+            mirrored_ticks = ticks_xy.copy()
+            mirrored_ticks[:, 0] = (float(fixed.shape[1]) - 1.0) - mirrored_ticks[:, 0]
+            overlays.append((mirrored_xy, mirrored_minor, mirrored_ticks, False))
+
+        colorbar_added = False
+        for line_xy, line_minor_xy, line_ticks_xy, draw_labels in overlays:
+            if line_xy.shape[0] >= 2 and line_t.shape[0] == line_xy.shape[0]:
+                xy_local = line_xy.copy()
+                xy_local[:, 0] -= float(lo[1])
+                xy_local[:, 1] -= float(lo[0])
+                segments = np.stack([xy_local[:-1], xy_local[1:]], axis=1)
+                segment_t = 0.5 * (line_t[:-1] + line_t[1:])
+                valid_segments = np.isfinite(segments).all(axis=(1, 2)) & np.isfinite(segment_t)
+                if np.any(valid_segments):
+                    line = LineCollection(
+                        segments[valid_segments],
+                        cmap=T_AXIS_T_CMAP,
+                        norm=norm,
+                        linewidths=2.0,
+                        alpha=0.85,
+                        zorder=10,
+                        antialiased=True,
+                    )
+                    line.set_array(np.clip(segment_t[valid_segments], 0.0, 1.0))
+                    ax.add_collection(line)
+                    if not colorbar_added:
+                        cbar = fig.colorbar(line, ax=ax, fraction=0.046, pad=0.02)
+                        cbar.set_label("u-curve t")
+                        colorbar_added = True
+
+            if line_minor_xy.size:
+                line_minor_local = line_minor_xy.copy()
+                line_minor_local[:, 0] -= float(lo[1])
+                line_minor_local[:, 1] -= float(lo[0])
+                clipped_minor_t = np.clip(minor_ticks_t, 0.0, 1.0)
+                ax.scatter(
+                    line_minor_local[:, 0],
+                    line_minor_local[:, 1],
+                    s=8,
+                    c=clipped_minor_t,
+                    cmap=T_AXIS_T_CMAP,
+                    norm=norm,
+                    marker="o",
+                    linewidths=0.0,
+                    alpha=0.9,
+                    zorder=10.5,
+                )
+
+            if line_ticks_xy.size:
+                line_ticks_local = line_ticks_xy.copy()
+                line_ticks_local[:, 0] -= float(lo[1])
+                line_ticks_local[:, 1] -= float(lo[0])
+                clipped_ticks_t = np.clip(ticks_t, 0.0, 1.0)
+                ax.scatter(
+                    line_ticks_local[:, 0],
+                    line_ticks_local[:, 1],
+                    s=18,
+                    c=clipped_ticks_t,
+                    cmap=T_AXIS_T_CMAP,
+                    norm=norm,
+                    marker="o",
+                    linewidths=0.0,
+                    alpha=0.95,
+                    zorder=11,
+                )
+                if draw_labels:
+                    for (x, y), label in zip(line_ticks_local.tolist(), t_axis_overlay.tick_labels, strict=False):
+                        ax.text(
+                            float(x) + 4.0,
+                            float(y) - 4.0,
+                            str(label),
+                            color="white",
+                            fontsize=7,
+                            bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.45, "pad": 1.4},
+                            zorder=12,
+                        )
+
+    fig.suptitle(title)
+    plt.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=220)
+    plt.close(fig)
+
+
+def _write_ccf_user_mask_overlay_png(
+    *,
+    ws: Workspace,
+    roi: str,
+    run_dirname: str,
+    roi_path: Path,
+    imagej_target_spacing_um: float,
+    overwrite: bool,
+) -> dict[str, Path] | None:
+    run_dir = ws.ccf_transforms(roi) / str(run_dirname)
+    summary_path = run_dir / "similarity_plus_syn_summary.json"
+    summary = cast(_Summary, _load_json_object(summary_path))
+
+    if "fwdtransforms" not in summary:
+        raise KeyError(f"Missing fwdtransforms in {summary_path}.")
+    fwd = _resolve_paths(_as_list_of_str(summary["fwdtransforms"], key="fwdtransforms", path=summary_path), base_dir=run_dir)
+    if not fwd:
+        raise ValueError(f"No forward transforms listed in {summary_path}.")
+
+    paths = summary.get("paths", {})
+    if not isinstance(paths, dict):
+        raise ValueError(f"Invalid paths payload in {summary_path}: expected object.")
+
+    def path_from_summary(key: str, default_name: str) -> Path:
+        raw = paths.get(key, default_name)
+        p = Path(str(raw))
+        if not p.is_absolute():
+            p = run_dir / p
+        return p
+
+    fixed_nifti = path_from_summary("fixed_nifti", "fixed_atlas_crop.nii.gz")
+    warped_after_nifti = path_from_summary("warped_after_nifti", "moving_warped_similarity_plus_syn.nii.gz")
+    moving_mask_nifti = path_from_summary("moving_mask_warped_final_nifti", "moving_mask_warped_final.nii.gz")
+    qc_zoom_masked_png = path_from_summary("qc_zoom_masked_png", "similarity_plus_syn_qc_zoom_masked.png")
+
+    out_png = qc_zoom_masked_png.with_name("similarity_plus_syn_qc_zoom_masked_with_user_mask.png")
+    out_json = qc_zoom_masked_png.with_name("similarity_plus_syn_qc_zoom_masked_with_user_mask_t_axis_endpoints.json")
+    skip_overlay_write = bool(out_png.exists() and not overwrite)
+    if skip_overlay_write and out_json.exists() and not overwrite:
+        return None
+
+    for required_path in (fixed_nifti, warped_after_nifti):
+        if not required_path.exists():
+            raise FileNotFoundError(f"Missing required file for CCF user-mask overlay: {required_path}")
+    for tfm in fwd:
+        if not Path(tfm).exists():
+            raise FileNotFoundError(f"Missing transform file for CCF user-mask overlay: {tfm}")
+
+    out_contract = LandmarkRegistrationOutputs(ws.ccf_transforms(roi))
+    p1 = out_contract.read_p1_landmarks()
+    shape_yx = _moving_thumbnail_shape_yx(p1=p1, target_spacing_um=float(imagej_target_spacing_um))
+    roi_masks_moving = _rasterize_imagej_roi_masks(roi_path=roi_path, shape_yx=shape_yx)
+
+    fixed_ants = ants.image_read(str(fixed_nifti))
+    moving_warped_ants = ants.image_read(str(warped_after_nifti))
+    moving_mask_ants = ants.image_read(str(moving_mask_nifti)) if moving_mask_nifti.exists() else None
+    atlas_name = p1.atlas_name or "kim_dev_mouse_e15-5_lsfm_20um"
+    atlas_plane = p1.atlas_plane or ("sagittal" if "Sag" in str(ws.path) else "coronal")
+    if p1.atlas_slice_idx is None:
+        raise ValueError(f"p1_landmarks.json at {out_contract.p1_landmarks_json} is missing atlas_slice_idx.")
+    atlas_slice_idx = int(p1.atlas_slice_idx)
+    atlas_voxel_um = float(p1.atlas_voxel_um) if p1.atlas_voxel_um is not None else 20.0
+
+    fixed_yx = _ants_numpy_yx(fixed_ants)
+    moving_yx = _ants_numpy_yx(moving_warped_ants)
+    moving_mask_yx = _ants_numpy_yx(moving_mask_ants) > 0 if moving_mask_ants is not None else None
+    roi_mask_fixed_yx = np.zeros_like(fixed_yx, dtype=bool)
+    warped_masks_fixed: list[tuple[int, str, np.ndarray]] = []
+
+    per_mask_payload: list[dict[str, object]] = []
+    for mask_index, mask_name, moving_mask_yx_single in roi_masks_moving:
+        roi_mask_moving_ants = _ants_from_mask_yx(
+            mask_yx=moving_mask_yx_single, spacing_um=float(imagej_target_spacing_um)
+        )
+        roi_mask_fixed_ants = ants.apply_transforms(
+            fixed=fixed_ants,
+            moving=roi_mask_moving_ants,
+            transformlist=fwd,
+            interpolator="nearestNeighbor",
+            defaultvalue=0,
+        )
+        fixed_mask_single = _ants_numpy_yx(roi_mask_fixed_ants) > 0
+        roi_mask_fixed_yx |= fixed_mask_single
+        warped_masks_fixed.append((int(mask_index), str(mask_name), fixed_mask_single))
+
+    t_axis_overlay = _compute_t_axis_overlay_for_fixed_view(
+        fixed_view=fixed_ants,
+        atlas_name=atlas_name,
+        atlas_plane=atlas_plane,
+        atlas_slice_idx=atlas_slice_idx,
+        atlas_crop_bbox=p1.atlas_crop_bbox,
+        atlas_voxel_um=atlas_voxel_um,
+        coverage_mask_yx=roi_mask_fixed_yx,
+        side_filter="both",
+        tick_step=0.1,
+    )
+
+    for mask_index, mask_name, fixed_mask_single in warped_masks_fixed:
+        row: dict[str, object] = {
+            "mask_index": int(mask_index),
+            "mask_name": str(mask_name),
+            "selected_side": None,
+            "has_overlap_with_t_axis": False,
+            "begin": None,
+            "end": None,
+        }
+        t_axis_overlay_primary_mask = _compute_t_axis_overlay_for_fixed_view(
+            fixed_view=fixed_ants,
+            atlas_name=atlas_name,
+            atlas_plane=atlas_plane,
+            atlas_slice_idx=atlas_slice_idx,
+            atlas_crop_bbox=p1.atlas_crop_bbox,
+            atlas_voxel_um=atlas_voxel_um,
+            coverage_mask_yx=fixed_mask_single,
+            side_filter="primary",
+            tick_step=0.1,
+        )
+        t_axis_overlay_mirrored_mask: TAxisOverlay | None = None
+        if str(atlas_plane).lower() == "coronal":
+            t_axis_overlay_mirrored_mask = _compute_t_axis_overlay_for_fixed_view(
+                fixed_view=fixed_ants,
+                atlas_name=atlas_name,
+                atlas_plane=atlas_plane,
+                atlas_slice_idx=atlas_slice_idx,
+                atlas_crop_bbox=p1.atlas_crop_bbox,
+                atlas_voxel_um=atlas_voxel_um,
+                coverage_mask_yx=fixed_mask_single,
+                side_filter="mirrored",
+                tick_step=0.1,
+            )
+        t_range, selected_side = _t_axis_range_for_mask_with_mirroring(
+            primary=t_axis_overlay_primary_mask,
+            mirrored=t_axis_overlay_mirrored_mask,
+            mask_yx=fixed_mask_single,
+        )
+        row["selected_side"] = selected_side
+        if t_range is not None:
+            row["has_overlap_with_t_axis"] = True
+            row["begin"] = float(t_range[0])
+            row["end"] = float(t_range[1])
+        per_mask_payload.append(row)
+
+    written: dict[str, Path] = {}
+    if not skip_overlay_write:
+        _write_syn_zoom_overlay_with_user_mask(
+            fixed_yx=fixed_yx,
+            moving_yx=moving_yx,
+            moving_mask_yx=moving_mask_yx,
+            user_mask_yx=roi_mask_fixed_yx,
+            t_axis_overlay=t_axis_overlay,
+            reflect_t_axis_midline=str(atlas_plane).lower() == "coronal",
+            out_png=out_png,
+            title=f"SyN(MI) zoom (masked) + user ROI | roi={roi}",
+        )
+        written["overlay_png"] = out_png
+
+    endpoints_payload: dict[str, object] = {
+        "roi": str(roi),
+        "value_domain": [0.0, 1.0],
+        "available": t_axis_overlay is not None,
+        "masks": per_mask_payload,
+    }
+    if t_axis_overlay is None:
+        endpoints_payload["reason"] = "t_axis_overlay_unavailable"
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(endpoints_payload, indent=2), encoding="utf-8")
+    written["t_axis_endpoints_json"] = out_json
+    return written
 
 
 def _write_qc_mask_overlay_plot(
@@ -797,6 +1682,8 @@ def main(  # noqa: PLR0913
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="rois") from exc
 
+    is_batch = len(resolved_rois) > 1
+
     if qc_plot_png is not None and len(resolved_rois) > 1:
         raise click.BadParameter("--qc-plot-png cannot be used when running multiple ROIs.")
 
@@ -879,7 +1766,11 @@ def main(  # noqa: PLR0913
                 if mask_edit_dir.exists():
                     roi_path = _find_imagej_roi_file(mask_edit_dir)
                 if roi_path is None:
-                    raise click.ClickException(f"--imagej-roi was requested but no ROI was found under {mask_edit_dir}.")
+                    msg = f"--imagej-roi was requested but no ROI was found under {mask_edit_dir}."
+                    if is_batch:
+                        click.echo(f"Warning: {msg} Falling back to --term filtering for roi={roi_resolved!r}.", err=True)
+                    else:
+                        raise click.ClickException(msg)
 
         imagej_labels: np.ndarray | None = None
         if roi_path is not None:
@@ -1023,6 +1914,30 @@ def main(  # noqa: PLR0913
                 units=qc_units,
             )
             click.echo(f"Wrote QC plot: {plot_png}")
+
+        if roi_path is not None:
+            try:
+                user_overlay_outputs = _write_ccf_user_mask_overlay_png(
+                    ws=ws,
+                    roi=str(roi_resolved),
+                    run_dirname=str(run_dirname),
+                    roi_path=roi_path,
+                    imagej_target_spacing_um=float(imagej_target_spacing_um),
+                    overwrite=bool(overwrite),
+                )
+            except (FileNotFoundError, KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
+                click.echo(
+                    f"Warning: skipping CCF user-mask overlay for roi={roi_resolved!r}: {exc}",
+                    err=True,
+                )
+            else:
+                if user_overlay_outputs is not None:
+                    overlay_png = user_overlay_outputs.get("overlay_png")
+                    if overlay_png is not None:
+                        click.echo(f"Wrote CCF user-mask overlay: {overlay_png}")
+                    t_axis_json = user_overlay_outputs.get("t_axis_endpoints_json")
+                    if t_axis_json is not None:
+                        click.echo(f"Wrote CCF t-axis endpoints JSON: {t_axis_json}")
 
         out = adata.copy()
         out.obs[ccf_col] = pd.Series([""] * n_total, index=out.obs_names)

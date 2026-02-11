@@ -15,11 +15,9 @@
 # %%
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import sys
-import types
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,6 +34,8 @@ import pandas as pd
 import SimpleITK as sitk
 import zarr
 from brainglobe_atlasapi import BrainGlobeAtlas
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
 import rich_click as click
 from scipy.ndimage import distance_transform_edt
 from scipy.ndimage import rotate as ndimage_rotate
@@ -91,7 +91,7 @@ def _parse_int_tuple(value: str) -> tuple[int, ...]:
         path_type=Path,
     ),
 )
-@click.argument("roi", type=str)
+@click.argument("rois", type=str, nargs=-1)
 @click.option(
     "--stitch-codebook",
     default="pi",
@@ -243,7 +243,7 @@ def _parse_int_tuple(value: str) -> tuple[int, ...]:
 )
 def main(
     workspace: Path,
-    roi: str,
+    rois: tuple[str, ...],
     *,
     stitch_codebook: str,
     run_dirname: str,
@@ -269,51 +269,59 @@ def main(
     landmark_heatmap_weight: float,
     crop_fixed_to_overlap: bool,
 ) -> None:
+    """Run landmark-driven linear init + diffeomorphic SyN refinement.
+
+    If no ROIs are provided, runs for all ROIs in the workspace (similar to other fishtools CLIs).
+    """
+
     workspace = Path(workspace)
     ws = Workspace(workspace)
+
+    selected_rois = list(rois) if rois else None
     try:
-        (roi_resolved,) = tuple(ws.resolve_rois((roi,)))
+        roi_list = ws.resolve_rois(selected_rois)
     except ValueError as exc:
-        raise click.BadParameter(str(exc), param_hint="roi") from exc
+        raise click.BadParameter(str(exc), param_hint="rois") from exc
 
-    setup_cli_logging(
-        workspace,
-        component="ccf.ants_landmark_syn_init",
-        file=f"ants-landmark-syn-init-{roi_resolved}",
-        debug=debug,
-        extra={
-            "roi": str(roi_resolved),
-            "stitch_codebook": str(stitch_codebook),
-            "run_dirname": str(run_dirname),
-        },
-    )
+    for roi in roi_list:
+        setup_cli_logging(
+            workspace,
+            component="ccf.ants_landmark_syn_init",
+            file=f"ants-landmark-syn-init-{roi}",
+            debug=debug,
+            extra={
+                "roi": str(roi),
+                "stitch_codebook": str(stitch_codebook),
+                "run_dirname": str(run_dirname),
+            },
+        )
 
-    run_pipeline(
-        workspace=workspace,
-        roi=roi_resolved,
-        stitch_codebook=str(stitch_codebook),
-        run_dirname=str(run_dirname),
-        p1_threshold=p1_threshold,
-        landmark_linear_transform_type=str(landmark_linear_transform_type).lower(),
-        syn_type_of_transform=str(syn_type_of_transform),
-        syn_metric=str(syn_metric).lower(),
-        syn_metric_param=int(syn_metric_param),
-        syn_reg_iterations=_parse_int_tuple(syn_reg_iterations),
-        syn_grad_step=float(syn_grad_step),
-        syn_flow_sigma=float(syn_flow_sigma),
-        syn_total_sigma=float(syn_total_sigma),
-        moving_presmooth_sigma_um=float(moving_presmooth_sigma_um),
-        fixed_edge_guard_um=float(fixed_edge_guard_um),
-        moving_edge_guard_um=float(moving_edge_guard_um),
-        use_affine_refine=bool(use_affine_refine),
-        use_n4=bool(use_n4),
-        use_feature_images=bool(use_feature_images),
-        use_mask_distance_metric=bool(use_mask_distance_metric),
-        use_landmark_heatmap_metric=bool(use_landmark_heatmap_metric),
-        landmark_heatmap_sigma_um=float(landmark_heatmap_sigma_um),
-        landmark_heatmap_weight=float(landmark_heatmap_weight),
-        crop_fixed_to_overlap=bool(crop_fixed_to_overlap),
-    )
+        run_pipeline(
+            workspace=workspace,
+            roi=roi,
+            stitch_codebook=str(stitch_codebook),
+            run_dirname=str(run_dirname),
+            p1_threshold=p1_threshold,
+            landmark_linear_transform_type=str(landmark_linear_transform_type).lower(),
+            syn_type_of_transform=str(syn_type_of_transform),
+            syn_metric=str(syn_metric).lower(),
+            syn_metric_param=int(syn_metric_param),
+            syn_reg_iterations=_parse_int_tuple(syn_reg_iterations),
+            syn_grad_step=float(syn_grad_step),
+            syn_flow_sigma=float(syn_flow_sigma),
+            syn_total_sigma=float(syn_total_sigma),
+            moving_presmooth_sigma_um=float(moving_presmooth_sigma_um),
+            fixed_edge_guard_um=float(fixed_edge_guard_um),
+            moving_edge_guard_um=float(moving_edge_guard_um),
+            use_affine_refine=bool(use_affine_refine),
+            use_n4=bool(use_n4),
+            use_feature_images=bool(use_feature_images),
+            use_mask_distance_metric=bool(use_mask_distance_metric),
+            use_landmark_heatmap_metric=bool(use_landmark_heatmap_metric),
+            landmark_heatmap_sigma_um=float(landmark_heatmap_sigma_um),
+            landmark_heatmap_weight=float(landmark_heatmap_weight),
+            crop_fixed_to_overlap=bool(crop_fixed_to_overlap),
+        )
 
 # --- Fixed knobs (not exposed via CLI) ---
 AFFINE_REFINE_TYPE_OF_TRANSFORM = "Rigid"
@@ -364,6 +372,7 @@ DEFORMATION_MAX_FIG_IN = 18.0
 QC_SAVE_DPI = 300
 QC_VIS_SPACING_UM = 2.0
 MOVING_BBOX_PAD_VOX = 16
+T_AXIS_T_CMAP = "viridis"
 
 # %% [markdown]
 # ## Helpers
@@ -483,30 +492,12 @@ def ants_numpy_yx(img: ants.ANTsImage) -> np.ndarray:
 @dataclass(frozen=True, slots=True)
 class TAxisOverlay:
     line_xy: np.ndarray
+    line_t: np.ndarray
     tick_xy: np.ndarray
+    tick_t: np.ndarray
+    minor_tick_xy: np.ndarray
+    minor_tick_t: np.ndarray
     tick_labels: list[str]
-
-
-_MIDSURFACE_COORDS: types.ModuleType | None = None
-
-
-def _load_midsurface_coords_module() -> types.ModuleType:
-    global _MIDSURFACE_COORDS
-    if _MIDSURFACE_COORDS is not None:
-        return _MIDSURFACE_COORDS
-
-    script_path = Path(__file__).resolve().parent / "refextract" / "midsurface_coords.py"
-    if not script_path.exists():
-        raise FileNotFoundError(f"Missing midsurface_coords.py at {script_path}")
-
-    spec = importlib.util.spec_from_file_location("midsurface_coords", script_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load module from {script_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    _MIDSURFACE_COORDS = module
-    return module
 
 
 def _compute_t_axis_overlay_for_fixed_view(
@@ -517,8 +508,7 @@ def _compute_t_axis_overlay_for_fixed_view(
     atlas_slice_idx: int,
     atlas_crop_bbox: tuple[int, int, int, int],
     atlas_voxel_um: float,
-    tick_step: float = 0.2,
-    line_samples: int = 200,
+    tick_step: float = 0.1,
 ) -> TAxisOverlay | None:
     expected_atlas_name = "kim_dev_mouse_e15-5_lsfm_20um"
     if atlas_name != expected_atlas_name:
@@ -539,81 +529,118 @@ def _compute_t_axis_overlay_for_fixed_view(
         / "refextract"
         / "midsurface_neocortex_mesocortex_allocortex_3d"
     )
-    cols_path = outdir / ("coronal_midline_columns.csv" if atlas_plane == "coronal" else "sagittal_midline_columns.csv")
-    if not cols_path.exists():
-        print(f"Skipping t-axis overlay: missing precomputed midsurface columns at {cols_path}.")
-        return None
+    u_path = outdir / "halfway_u_3d_ds.npy"
+    mask_fit_path = outdir / "cortex_mask_fit_3d_ds.npy"
+    mask_clean_path = outdir / "cortex_mask_clean_3d_ds.npy"
+    include_path = outdir / "midline_include_neo_meso_3d_ds.npy"
+    mask_path = mask_fit_path if mask_fit_path.exists() else mask_clean_path
+    missing: list[Path] = []
+    if not u_path.exists():
+        missing.append(u_path)
+    if not mask_path.exists():
+        missing.extend([mask_fit_path, mask_clean_path])
+    if missing:
+        raise FileNotFoundError(f"Missing midsurface artifacts for t-axis overlay: {[str(p) for p in missing]}")
 
-    mod = _load_midsurface_coords_module()
+    u_3d = np.load(u_path).astype(np.float32, copy=False)
+    cortex_3d = np.load(mask_path).astype(bool)
+    if u_3d.shape != cortex_3d.shape:
+        raise ValueError(f"u/cortex shape mismatch for t-axis overlay: u={u_3d.shape} cortex={cortex_3d.shape}")
+    include_3d: np.ndarray | None = None
+    if include_path.exists():
+        include_3d = np.load(include_path).astype(bool)
+        if include_3d.shape != u_3d.shape:
+            raise ValueError(
+                f"midline_include shape mismatch for t-axis overlay: include={include_3d.shape} u={u_3d.shape}"
+            )
+
     if atlas_plane == "coronal":
-        cols_by_slice = mod.load_coronal_midline_columns(cols_path)
-        query = lambda t: mod.query_coronal_ijk(cols_by_slice, slice_i=int(atlas_slice_idx), t=float(t), r01=0.5)
-        ijk_to_row_col = lambda ijk: (float(ijk[1]), float(ijk[2]))
+        if not (0 <= int(atlas_slice_idx) < int(u_3d.shape[0])):
+            raise ValueError(f"atlas_slice_idx {atlas_slice_idx} out of bounds for coronal midsurface shape {u_3d.shape}.")
+        contour_mask = cortex_3d[int(atlas_slice_idx), :, :]
+        if include_3d is not None:
+            contour_mask = contour_mask & include_3d[int(atlas_slice_idx), :, :]
+        u2 = np.full(u_3d[int(atlas_slice_idx), :, :].shape, np.nan, dtype=np.float32)
+        u2[contour_mask] = u_3d[int(atlas_slice_idx), :, :][contour_mask]
     else:
-        cols_by_slice = mod.load_sagittal_midline_columns(cols_path)
-        query = lambda t: mod.query_sagittal_ijk(cols_by_slice, slice_k=int(atlas_slice_idx), t=float(t), r01=0.5)
-        # Our sagittal slice view is transposed: rows=j (x), cols=i (y).
-        ijk_to_row_col = lambda ijk: (float(ijk[1]), float(ijk[0]))
+        if not (0 <= int(atlas_slice_idx) < int(u_3d.shape[2])):
+            raise ValueError(f"atlas_slice_idx {atlas_slice_idx} out of bounds for sagittal midsurface shape {u_3d.shape}.")
+        contour_mask = cortex_3d[:, :, int(atlas_slice_idx)]
+        if include_3d is not None:
+            contour_mask = contour_mask & include_3d[:, :, int(atlas_slice_idx)]
+        u2 = np.full(u_3d[:, :, int(atlas_slice_idx)].shape, np.nan, dtype=np.float32)
+        u2[contour_mask] = u_3d[:, :, int(atlas_slice_idx)][contour_mask]
 
-    if not cols_by_slice:
-        print(f"Skipping t-axis overlay: empty midsurface columns loaded from {cols_path}.")
-        return None
-    if int(atlas_slice_idx) not in cols_by_slice:
-        print(f"Skipping t-axis overlay: slice {int(atlas_slice_idx)} not present in {cols_path.name}.")
-        return None
+    if not (u2.size and np.isfinite(u2).any()):
+        raise ValueError(f"No finite midsurface contour values for atlas_slice_idx={atlas_slice_idx} ({atlas_plane}).")
 
-    ar0, ar1, ac0, ac1 = (int(atlas_crop_bbox[0]), int(atlas_crop_bbox[1]), int(atlas_crop_bbox[2]), int(atlas_crop_bbox[3]))
+    fig_tmp, ax_tmp = plt.subplots()
+    cont = ax_tmp.contour(u2, levels=[0.5], linewidths=0.0, alpha=0.0)
+    segs = [np.asarray(seg, dtype=np.float64) for seg in cont.allsegs[0] if np.asarray(seg).shape[0] >= 2]
+    plt.close(fig_tmp)
+    if not segs:
+        raise ValueError(f"No u=0.5 contour segments extracted for atlas_slice_idx={atlas_slice_idx} ({atlas_plane}).")
+    seg = max(segs, key=lambda s: int(s.shape[0]))
+    if atlas_plane == "coronal":
+        row = seg[:, 1]
+        col = seg[:, 0]
+    else:
+        row = seg[:, 0]
+        col = seg[:, 1]
+
+    ar0, _, ac0, _ = (
+        int(atlas_crop_bbox[0]),
+        int(atlas_crop_bbox[1]),
+        int(atlas_crop_bbox[2]),
+        int(atlas_crop_bbox[3]),
+    )
     spacing_mm = float(atlas_voxel_um) * UM_TO_MM
     origin_x_mm, origin_y_mm = (float(fixed_view.origin[0]), float(fixed_view.origin[1]))
     sp_x_mm, sp_y_mm = (float(fixed_view.spacing[0]), float(fixed_view.spacing[1]))
 
-    def _row_col_to_view_xy(row: float, col: float) -> tuple[float, float] | None:
-        if not np.isfinite(row) or not np.isfinite(col):
-            return None
-        row_c = float(row) - float(ar0)
-        col_c = float(col) - float(ac0)
-        if row_c < -0.5 or col_c < -0.5 or row_c > float(ar1 - ar0 - 0.5) or col_c > float(ac1 - ac0 - 0.5):
-            return None
-        x_mm = float(col_c) * spacing_mm
-        y_mm = float(row_c) * spacing_mm
-        x = (x_mm - origin_x_mm) / sp_x_mm
-        y = (y_mm - origin_y_mm) / sp_y_mm
-        if not np.isfinite(x) or not np.isfinite(y):
-            return None
-        return float(x), float(y)
-
-    line_samples = int(line_samples)
-    if line_samples < 2:
-        raise ValueError("line_samples must be >= 2.")
-    t_line = np.linspace(0.0, 1.0, line_samples, dtype=np.float64)
-    line_xy = np.full((t_line.shape[0], 2), np.nan, dtype=np.float64)
-    for idx, t in enumerate(t_line.tolist()):
-        ijk = query(float(t))
-        row, col = ijk_to_row_col(ijk)
-        xy = _row_col_to_view_xy(row, col)
-        if xy is not None:
-            line_xy[idx, 0] = xy[0]
-            line_xy[idx, 1] = xy[1]
+    row_c = row - float(ar0)
+    col_c = col - float(ac0)
+    x_mm = col_c * spacing_mm
+    y_mm = row_c * spacing_mm
+    x_idx = (x_mm - origin_x_mm) / sp_x_mm
+    y_idx = (y_mm - origin_y_mm) / sp_y_mm
+    line_xy = np.column_stack([x_idx, y_idx]).astype(np.float64, copy=False)
+    valid = np.isfinite(line_xy).all(axis=1)
+    line_xy = line_xy[valid]
+    if line_xy.shape[0] < 2:
+        return None
+    seg_len = np.linalg.norm(np.diff(line_xy, axis=0), axis=1)
+    seg_len = np.where(np.isfinite(seg_len), np.maximum(seg_len, 0.0), 0.0)
+    cum = np.concatenate(([0.0], np.cumsum(seg_len, dtype=np.float64)))
+    total = float(cum[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        line_t = np.linspace(0.0, 1.0, line_xy.shape[0], dtype=np.float64)
+    else:
+        line_t = cum / total
 
     ticks = np.arange(0.0, 1.0 + 1.0e-9, float(tick_step), dtype=np.float64)
-    tick_xy_list: list[tuple[float, float]] = []
-    tick_labels: list[str] = []
-    for t in ticks.tolist():
-        ijk = query(float(t))
-        row, col = ijk_to_row_col(ijk)
-        xy = _row_col_to_view_xy(row, col)
-        if xy is None:
-            continue
-        # Only label ticks that land inside the rendered view.
-        if 0.0 <= xy[0] < float(fixed_view.shape[0]) and 0.0 <= xy[1] < float(fixed_view.shape[1]):
-            tick_xy_list.append((xy[0], xy[1]))
-            tick_labels.append(f"t={float(t):.1f}")
+    tick_idx = np.argmin(np.abs(line_t[None, :] - ticks[:, None]), axis=1)
+    tick_xy = line_xy[tick_idx]
+    tick_t = line_t[tick_idx]
+    tick_labels = [f"t={float(t):.1f}" for t in ticks.tolist()]
 
-    tick_xy = np.asarray(tick_xy_list, dtype=np.float64).reshape(-1, 2)
-    if not np.any(np.isfinite(line_xy)):
-        return None
+    minor_step = float(tick_step) * 0.5
+    minor_ticks = np.arange(0.0, 1.0 + 1.0e-9, minor_step, dtype=np.float64)
+    is_major = np.isclose(minor_ticks[:, None], ticks[None, :], atol=1.0e-9, rtol=0.0).any(axis=1)
+    minor_ticks = minor_ticks[~is_major]
+    minor_tick_idx = np.argmin(np.abs(line_t[None, :] - minor_ticks[:, None]), axis=1)
+    minor_tick_xy = line_xy[minor_tick_idx]
+    minor_tick_t = line_t[minor_tick_idx]
 
-    return TAxisOverlay(line_xy=line_xy, tick_xy=tick_xy, tick_labels=tick_labels)
+    return TAxisOverlay(
+        line_xy=line_xy,
+        line_t=line_t,
+        tick_xy=tick_xy,
+        tick_t=tick_t,
+        minor_tick_xy=minor_tick_xy,
+        minor_tick_t=minor_tick_t,
+        tick_labels=tick_labels,
+    )
 
 
 def qc_overlay_png(
@@ -650,14 +677,53 @@ def qc_overlay_png(
     if t_axis_overlay is not None:
         ax = axes[2]
         xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
-        ax.plot(xy[:, 0], xy[:, 1], "-", color="cyan", lw=2.0, alpha=0.85, zorder=10)
+        line_t = np.asarray(t_axis_overlay.line_t, dtype=np.float64)
+        norm = Normalize(vmin=0.0, vmax=1.0)
+        if xy.shape[0] >= 2 and line_t.shape[0] == xy.shape[0]:
+            segments = np.stack([xy[:-1], xy[1:]], axis=1)
+            segment_t = 0.5 * (line_t[:-1] + line_t[1:])
+            valid_segments = np.isfinite(segments).all(axis=(1, 2)) & np.isfinite(segment_t)
+            if np.any(valid_segments):
+                line = LineCollection(
+                    segments[valid_segments],
+                    cmap=T_AXIS_T_CMAP,
+                    norm=norm,
+                    linewidths=2.0,
+                    alpha=0.85,
+                    zorder=10,
+                    antialiased=True,
+                )
+                line.set_array(np.clip(segment_t[valid_segments], 0.0, 1.0))
+                ax.add_collection(line)
+                cbar = fig.colorbar(line, ax=ax, fraction=0.046, pad=0.02)
+                cbar.set_label("u-curve t")
         if t_axis_overlay.tick_xy.size:
+            minor_ticks_xy = np.asarray(t_axis_overlay.minor_tick_xy, dtype=np.float64)
+            minor_ticks_t = np.asarray(t_axis_overlay.minor_tick_t, dtype=np.float64)
+            minor_ticks_t = np.clip(minor_ticks_t, 0.0, 1.0)
+            if minor_ticks_xy.size:
+                ax.scatter(
+                    minor_ticks_xy[:, 0],
+                    minor_ticks_xy[:, 1],
+                    s=8,
+                    c=minor_ticks_t,
+                    cmap=T_AXIS_T_CMAP,
+                    norm=norm,
+                    marker="o",
+                    linewidths=0.0,
+                    alpha=0.9,
+                    zorder=10.5,
+                )
             ticks_xy = np.asarray(t_axis_overlay.tick_xy, dtype=np.float64)
+            ticks_t = np.asarray(t_axis_overlay.tick_t, dtype=np.float64)
+            ticks_t = np.clip(ticks_t, 0.0, 1.0)
             ax.scatter(
                 ticks_xy[:, 0],
                 ticks_xy[:, 1],
-                s=36,
-                c="cyan",
+                s=18,
+                c=ticks_t,
+                cmap=T_AXIS_T_CMAP,
+                norm=norm,
                 marker="o",
                 linewidths=0.0,
                 alpha=0.95,
@@ -669,7 +735,7 @@ def qc_overlay_png(
                     float(y) - 4.0,
                     str(label),
                     color="white",
-                    fontsize=9,
+                    fontsize=7,
                     bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.45, "pad": 1.4},
                     zorder=12,
                 )
@@ -1581,6 +1647,23 @@ def run_pipeline(
             lo_y = int(min(lo_y, int(fixed_pts_vox_y.min(initial=lo_y))))
             hi_x = int(max(hi_x, int(fixed_pts_vox_x.max(initial=hi_x))))
             hi_y = int(max(hi_y, int(fixed_pts_vox_y.max(initial=hi_y))))
+            # Keep the full t-axis overlay visible in QC zoom outputs.
+            t_overlay_full = _compute_t_axis_overlay_for_fixed_view(
+                fixed_view=fixed_ants,
+                atlas_name=str(ATLAS_NAME),
+                atlas_plane=str(ATLAS_PLANE),
+                atlas_slice_idx=int(ATLAS_SLICE_IDX),
+                atlas_crop_bbox=tuple(p1.atlas_crop_bbox),
+                atlas_voxel_um=float(ATLAS_VOXEL_UM),
+            )
+            if t_overlay_full is not None and t_overlay_full.line_xy.size:
+                t_xy = np.asarray(t_overlay_full.line_xy, dtype=np.float64)
+                t_valid = np.isfinite(t_xy).all(axis=1)
+                if np.any(t_valid):
+                    lo_x = int(min(lo_x, int(np.floor(float(t_xy[t_valid, 0].min())))))
+                    lo_y = int(min(lo_y, int(np.floor(float(t_xy[t_valid, 1].min())))))
+                    hi_x = int(max(hi_x, int(np.ceil(float(t_xy[t_valid, 0].max())))))
+                    hi_y = int(max(hi_y, int(np.ceil(float(t_xy[t_valid, 1].max())))))
             pad = int(CROP_PAD_VOX)
             lo = [max(0, int(lo_x - pad)), max(0, int(lo_y - pad))]
             hi = [min(fixed_reg_ants.shape[0] - 1, int(hi_x + pad)), min(fixed_reg_ants.shape[1] - 1, int(hi_y + pad))]

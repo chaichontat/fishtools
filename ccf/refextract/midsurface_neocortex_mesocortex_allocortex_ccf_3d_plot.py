@@ -17,6 +17,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from IPython import get_ipython
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
 from matplotlib.widgets import Slider
 
 # Optional: VS Code interactive Matplotlib backend
@@ -40,6 +42,7 @@ DS = 1
 SHOW_FIGURES = True
 CONTOUR_LEVEL = 0.5
 CONTOUR_COLOR = "#d62728"
+U_CURVE_T_CMAP = "viridis"
 MASK_COLOR = "#2ca02c"
 MASK_ALPHA = 0.18
 BOUNDARY_ALPHA = 0.85
@@ -94,6 +97,49 @@ def _clear_contours(cont: object | None) -> None:
             c.remove()
         except Exception:
             pass
+
+
+def _clear_artist(artist: object | None) -> None:
+    if artist is None:
+        return
+    remove = getattr(artist, "remove", None)
+    if callable(remove):
+        remove()
+
+
+def _plot_parametrized_curve(
+    ax: plt.Axes,
+    contour_segments: list[np.ndarray],
+    *,
+    cmap: str,
+    norm: Normalize,
+    linewidth: float,
+    alpha: float,
+    zorder: float,
+) -> LineCollection | None:
+    segments: list[np.ndarray] = []
+    t_values: list[np.ndarray] = []
+    for path_xy in contour_segments:
+        path_xy = np.asarray(path_xy, dtype=np.float32)
+        if path_xy.ndim != 2 or path_xy.shape[0] < 2 or path_xy.shape[1] != 2:
+            continue
+        t_vertices = np.linspace(0.0, 1.0, path_xy.shape[0], dtype=np.float32)
+        segments.append(np.stack([path_xy[:-1], path_xy[1:]], axis=1))
+        t_values.append(0.5 * (t_vertices[:-1] + t_vertices[1:]))
+    if not segments:
+        return None
+
+    lc = LineCollection(
+        np.concatenate(segments, axis=0),
+        cmap=cmap,
+        norm=norm,
+        linewidths=linewidth,
+        alpha=alpha,
+        zorder=zorder,
+    )
+    lc.set_array(np.concatenate(t_values, axis=0))
+    ax.add_collection(lc)
+    return lc
 
 
 # %% [markdown]
@@ -224,9 +270,13 @@ def view_coronal_overlay(*, show: bool = True) -> None:
             zorder=2.5,
         )
 
-    cont = None
+    curve_lc: LineCollection | None = None
     sc_b0 = ax.scatter([], [], s=3.0, c="#1f77b4", alpha=0.7, linewidths=0.0, zorder=4, label="pial seed")
     sc_b1 = ax.scatter([], [], s=3.0, c="#ff7f0e", alpha=0.7, linewidths=0.0, zorder=4, label="inner seed")
+    curve_norm = Normalize(vmin=0.0, vmax=1.0)
+    curve_sm = plt.cm.ScalarMappable(norm=curve_norm, cmap=U_CURVE_T_CMAP)
+    curve_sm.set_array(np.array([0.0, 1.0], dtype=np.float32))
+    fig.colorbar(curve_sm, ax=ax, fraction=0.046, pad=0.02, label="u-curve t")
 
     ax.set_xlabel("k (x)")
     ax.set_ylabel("j (y)")
@@ -235,7 +285,7 @@ def view_coronal_overlay(*, show: bool = True) -> None:
     slider = Slider(slider_ax, "slice i", 0, n_i - 1, valinit=cur_i, valstep=1)
 
     def set_i(i: int) -> None:
-        nonlocal cont
+        nonlocal curve_lc
         i = int(np.clip(int(i), 0, n_i - 1))
         img.set_data(reference_3d[i, :, :])
         mask_im.set_data(cortex_3d[i, :, :].astype(np.float32, copy=False))
@@ -251,7 +301,8 @@ def view_coronal_overlay(*, show: bool = True) -> None:
                     r2[~midline_include_3d[i, :, :]] = np.nan
             r_im.set_data(r2)
 
-        _clear_contours(cont)
+        _clear_artist(curve_lc)
+        curve_lc = None
         contour_mask = cortex_3d[i, :, :]
         if midline_include_3d is not None:
             contour_mask = contour_mask & midline_include_3d[i, :, :]
@@ -260,13 +311,22 @@ def view_coronal_overlay(*, show: bool = True) -> None:
             cont = ax.contour(
                 u2,
                 levels=[float(CONTOUR_LEVEL)],
-                colors=[CONTOUR_COLOR],
-                linewidths=1.2,
+                linewidths=0.0,
+                alpha=0.0,
+            )
+            contour_segments = [np.asarray(seg, dtype=np.float32) for seg in cont.allsegs[0]]
+            _clear_contours(cont)
+            curve_lc = _plot_parametrized_curve(
+                ax,
+                contour_segments,
+                cmap=U_CURVE_T_CMAP,
+                norm=curve_norm,
+                linewidth=1.2,
                 alpha=BOUNDARY_ALPHA,
                 zorder=3,
             )
         else:
-            cont = None
+            curve_lc = None
 
         b0 = np.argwhere(b0_3d[i, :, :])
         b1 = np.argwhere(b1_3d[i, :, :])
@@ -367,9 +427,13 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
             zorder=2.5,
         )
 
-    cont = None
+    curve_lc: LineCollection | None = None
     sc_b0 = ax.scatter([], [], s=3.0, c="#1f77b4", alpha=0.7, linewidths=0.0, zorder=4, label="pial seed")
     sc_b1 = ax.scatter([], [], s=3.0, c="#ff7f0e", alpha=0.7, linewidths=0.0, zorder=4, label="inner seed")
+    curve_norm = Normalize(vmin=0.0, vmax=1.0)
+    curve_sm = plt.cm.ScalarMappable(norm=curve_norm, cmap=U_CURVE_T_CMAP)
+    curve_sm.set_array(np.array([0.0, 1.0], dtype=np.float32))
+    fig.colorbar(curve_sm, ax=ax, fraction=0.046, pad=0.02, label="u-curve t")
 
     ax.set_xlabel("j (y)")
     ax.set_ylabel("i (coronal slice)")
@@ -378,7 +442,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
     slider = Slider(slider_ax, "slice k", 0, n_k - 1, valinit=cur_k, valstep=1)
 
     def set_k(k: int) -> None:
-        nonlocal cont
+        nonlocal curve_lc
         k = int(np.clip(int(k), 0, n_k - 1))
         img.set_data(reference_3d[:, :, k])
         mask_im.set_data(cortex_3d[:, :, k].astype(np.float32, copy=False))
@@ -394,7 +458,8 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
                     r2[~midline_include_3d[:, :, k]] = np.nan
             r_im.set_data(r2)
 
-        _clear_contours(cont)
+        _clear_artist(curve_lc)
+        curve_lc = None
         contour_mask = cortex_3d[:, :, k]
         if midline_include_3d is not None:
             contour_mask = contour_mask & midline_include_3d[:, :, k]
@@ -403,13 +468,22 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
             cont = ax.contour(
                 u2,
                 levels=[float(CONTOUR_LEVEL)],
-                colors=[CONTOUR_COLOR],
-                linewidths=1.0,
+                linewidths=0.0,
+                alpha=0.0,
+            )
+            contour_segments = [np.asarray(seg, dtype=np.float32) for seg in cont.allsegs[0]]
+            _clear_contours(cont)
+            curve_lc = _plot_parametrized_curve(
+                ax,
+                contour_segments,
+                cmap=U_CURVE_T_CMAP,
+                norm=curve_norm,
+                linewidth=1.0,
                 alpha=BOUNDARY_ALPHA,
                 zorder=3,
             )
         else:
-            cont = None
+            curve_lc = None
 
         b0 = np.argwhere(b0_3d[:, :, k])
         b1 = np.argwhere(b1_3d[:, :, k])
