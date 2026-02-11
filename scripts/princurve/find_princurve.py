@@ -13,7 +13,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from patsy import dmatrix
-from scipy.interpolate import RBFInterpolator, splprep, splev
+from scipy import sparse
+from scipy.interpolate import CubicSpline, RBFInterpolator, splprep, splev
+from scipy.ndimage import distance_transform_edt
+from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
 from fishtools.io.workspace import Workspace
@@ -35,7 +38,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "roi",
         nargs="?",
-        help="ROI name (expects output/ccf-transforms/{ROI}/{ROI}.syn.annotated.h5ad).",
+        help=(
+            "ROI name (expects output/ccf-transforms/{ROI}/{ROI}.syn.annotated.h5ad). "
+            "If omitted in workspace mode, process all ROIs."
+        ),
     )
     p.add_argument("--input", default=None, help="Path to input .h5ad")
     p.add_argument("--output", default=None, help="Path to output .h5ad")
@@ -55,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path to anchors JSON produced by scripts/pick_curve_anchors.py "
-            "(applies orientation/rescaling to t)."
+            "(curve is built directly from anchors; first/last anchors define endpoints)."
         ),
     )
     p.add_argument(
@@ -72,6 +78,45 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="TPS warp smoothing (soft constraint) for multi-anchor curve warping (default: 0.0).",
+    )
+    p.add_argument(
+        "--anchor-smoothing",
+        type=float,
+        default=2.0,
+        help=(
+            "Smoothing strength for anchor-only curve construction (default: 2.0). "
+            "0.0 means interpolate anchors exactly."
+        ),
+    )
+    p.add_argument(
+        "--anchor-t-smooth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Apply screened harmonic smoothing of anchored t on a spatial kNN graph "
+            "(default: on)."
+        ),
+    )
+    p.add_argument(
+        "--anchor-t-smooth-k",
+        type=int,
+        default=20,
+        help="Number of neighbors for spatial kNN t smoothing (default: 20).",
+    )
+    p.add_argument(
+        "--anchor-t-smooth-lambda",
+        type=float,
+        default=0.15,
+        help=(
+            "Data-fidelity weight for screened harmonic t smoothing (default: 0.15). "
+            "Lower is smoother."
+        ),
+    )
+    p.add_argument(
+        "--anchor-t-smooth-sigma-scale",
+        type=float,
+        default=1.0,
+        help="Kernel width scale for spatial kNN weights in t smoothing (default: 1.0).",
     )
     p.add_argument(
         "--anchor-clamp",
@@ -274,19 +319,18 @@ def fit_constrained_spline(
     else:
         u = s / float(s[-1])
 
-    k = min(3, path_xy.shape[0] - 1)
-    if k < 1:
-        raise SystemExit("Not enough points to fit a spline.")
-
-    tck, _ = splprep([path_xy[:, 0], path_xy[:, 1]], u=u, s=0.0, k=k)
-
     u_dense = np.linspace(0.0, 1.0, int(n_dense))
     if u_include is not None:
         u_dense = np.concatenate([u_dense, np.asarray(u_include, dtype=float)])
     u_dense = np.unique(np.clip(u_dense, 0.0, 1.0))
     u_dense.sort()
-    x_dense, y_dense = splev(u_dense, tck)
-    dx_dense, dy_dense = splev(u_dense, tck, der=1)
+
+    x_spline = CubicSpline(u, path_xy[:, 0], bc_type="natural")
+    y_spline = CubicSpline(u, path_xy[:, 1], bc_type="natural")
+    x_dense = x_spline(u_dense)
+    y_dense = y_spline(u_dense)
+    dx_dense = x_spline(u_dense, 1)
+    dy_dense = y_spline(u_dense, 1)
     curve = np.column_stack([np.asarray(x_dense, float), np.asarray(y_dense, float)])
     deriv = np.column_stack([np.asarray(dx_dense, float), np.asarray(dy_dense, float)])
     return u_dense, curve, deriv, u
@@ -607,6 +651,391 @@ def project_to_polyline_arclength(
     sign = np.where(cross >= 0, 1.0, -1.0)
     r_signed = sign * np.sqrt(best_d2)
     return t.astype(float), r_signed.astype(float), best_proj.astype(float)
+
+
+def assign_t_via_edt_to_anchor_curve(
+    *,
+    xy: np.ndarray,
+    line: np.ndarray,
+    max_grid_dim: int = 1536,
+    pad_pixels: int = 8,
+) -> np.ndarray:
+    """Assign t by EDT nearest-wall lookup in spatial coordinates.
+
+    The wall is the anchor spline polyline in `line`. We rasterize that wall in a
+    bounded grid, run EDT with feature indices, then map each point in `xy` to
+    its nearest wall pixel and inherit that wall-pixel arc-length t.
+    """
+
+    pts = np.asarray(xy, dtype=float)[:, :2]
+    wall = np.asarray(line, dtype=float)[:, :2]
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise SystemExit(f"Unexpected xy shape: {pts.shape}")
+    if wall.ndim != 2 or wall.shape[1] != 2 or wall.shape[0] < 2:
+        raise SystemExit(f"Unexpected anchor curve shape: {wall.shape}")
+    if max_grid_dim < 32:
+        raise SystemExit("Internal error: max_grid_dim must be >= 32.")
+    if pad_pixels < 0:
+        raise SystemExit("Internal error: pad_pixels must be >= 0.")
+
+    seg = np.linalg.norm(np.diff(wall, axis=0), axis=1)
+    keep = np.concatenate([[True], seg > 1e-12])
+    wall = wall[keep]
+    if wall.shape[0] < 2:
+        raise SystemExit("Degenerate anchor curve for EDT-based t assignment.")
+
+    seg = np.linalg.norm(np.diff(wall, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    if not np.isfinite(total) or total <= 0:
+        raise SystemExit("Degenerate anchor curve arc-length for EDT-based t assignment.")
+    wall_t = cum / total
+
+    both = np.vstack([pts, wall])
+    finite_xy = np.isfinite(both).all(axis=1)
+    if not np.any(finite_xy):
+        raise SystemExit("No finite points available for EDT-based t assignment.")
+    finite_pts = both[finite_xy]
+    min_x = float(np.min(finite_pts[:, 0]))
+    max_x = float(np.max(finite_pts[:, 0]))
+    min_y = float(np.min(finite_pts[:, 1]))
+    max_y = float(np.max(finite_pts[:, 1]))
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    span_max = max(span_x, span_y, 1e-9)
+    step = float(span_max / float(max_grid_dim - 1))
+    if not np.isfinite(step) or step <= 0:
+        raise SystemExit("Failed to derive finite grid step for EDT-based t assignment.")
+
+    x0 = min_x - float(pad_pixels) * step
+    y0 = min_y - float(pad_pixels) * step
+    width = int(np.floor((span_x / step))) + 1 + (2 * int(pad_pixels))
+    height = int(np.floor((span_y / step))) + 1 + (2 * int(pad_pixels))
+    width = max(width, 2)
+    height = max(height, 2)
+
+    wall_ix = np.rint((wall[:, 0] - x0) / step).astype(int)
+    wall_iy = np.rint((wall[:, 1] - y0) / step).astype(int)
+    wall_ix = np.clip(wall_ix, 0, width - 1)
+    wall_iy = np.clip(wall_iy, 0, height - 1)
+
+    wall_mask = np.zeros((height, width), dtype=bool)
+    wall_t_grid = np.full((height, width), np.nan, dtype=float)
+    for ti, iy, ix in zip(wall_t.tolist(), wall_iy.tolist(), wall_ix.tolist(), strict=True):
+        if not wall_mask[iy, ix]:
+            wall_t_grid[iy, ix] = float(ti)
+        wall_mask[iy, ix] = True
+
+    if not np.any(wall_mask):
+        raise SystemExit("Failed to rasterize anchor wall for EDT-based t assignment.")
+
+    nearest_iy, nearest_ix = distance_transform_edt(~wall_mask, return_distances=False, return_indices=True)
+
+    pt_ix = np.rint((pts[:, 0] - x0) / step).astype(int)
+    pt_iy = np.rint((pts[:, 1] - y0) / step).astype(int)
+    pt_ix = np.clip(pt_ix, 0, width - 1)
+    pt_iy = np.clip(pt_iy, 0, height - 1)
+
+    nn_iy = nearest_iy[pt_iy, pt_ix]
+    nn_ix = nearest_ix[pt_iy, pt_ix]
+    t_out = wall_t_grid[nn_iy, nn_ix]
+    if np.any(~np.isfinite(t_out)):
+        bad = int(np.flatnonzero(~np.isfinite(t_out))[0])
+        raise SystemExit(
+            "EDT-based t assignment produced non-finite values. "
+            f"First bad point index={bad}, xy=({float(pts[bad, 0]):.3f}, {float(pts[bad, 1]):.3f})."
+        )
+    return np.clip(np.asarray(t_out, dtype=float), 0.0, 1.0)
+
+
+def smooth_t_on_spatial_knn(
+    *,
+    xy: np.ndarray,
+    t0: np.ndarray,
+    anchor_indices: np.ndarray | list[int],
+    anchor_t: np.ndarray | None = None,
+    k: int = 20,
+    lam: float = 0.15,
+    sigma_scale: float = 1.0,
+) -> np.ndarray:
+    """Screened harmonic smoothing of t on a spatial kNN graph with fixed anchors."""
+
+    points = np.asarray(xy, dtype=float)[:, :2]
+    t_base = np.asarray(t0, dtype=float).reshape(-1)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise SystemExit(f"Unexpected xy shape for t smoothing: {points.shape}")
+    if t_base.shape != (points.shape[0],):
+        raise SystemExit(f"Unexpected t0 shape for t smoothing: {t_base.shape}")
+    if np.any(~np.isfinite(points)):
+        raise SystemExit("Non-finite xy encountered in t smoothing.")
+    if np.any(~np.isfinite(t_base)):
+        raise SystemExit("Non-finite t0 encountered in t smoothing.")
+    if int(k) < 1:
+        raise SystemExit("--anchor-t-smooth-k must be >= 1.")
+    if float(lam) <= 0:
+        raise SystemExit("--anchor-t-smooth-lambda must be > 0.")
+    if float(sigma_scale) <= 0:
+        raise SystemExit("--anchor-t-smooth-sigma-scale must be > 0.")
+
+    n = int(points.shape[0])
+    if n < 2:
+        return np.clip(t_base, 0.0, 1.0)
+
+    idx = np.asarray(anchor_indices, dtype=int).reshape(-1)
+    if idx.size < 2:
+        raise SystemExit("Need at least 2 anchors for t smoothing.")
+    if np.any(idx < 0) or np.any(idx >= n):
+        raise SystemExit("Anchor index out of bounds in t smoothing.")
+    fixed_idx = np.unique(idx)
+
+    if anchor_t is None:
+        fixed_t = t_base[fixed_idx].astype(float, copy=True)
+    else:
+        anchor_t_arr = np.asarray(anchor_t, dtype=float).reshape(-1)
+        if anchor_t_arr.shape != (idx.size,):
+            raise SystemExit(
+                "Internal error: anchor_t length mismatch in t smoothing "
+                f"({anchor_t_arr.shape[0]} vs {idx.size})."
+            )
+        if np.any(~np.isfinite(anchor_t_arr)):
+            raise SystemExit("Non-finite anchor_t encountered in t smoothing.")
+        fixed_t_by_idx: dict[int, float] = {}
+        for ii, tt in zip(idx.tolist(), anchor_t_arr.tolist(), strict=True):
+            fixed_t_by_idx[int(ii)] = float(tt)
+        fixed_t = np.asarray([fixed_t_by_idx[int(ii)] for ii in fixed_idx.tolist()], dtype=float)
+
+    k_eff = min(int(k), max(1, n - 1))
+    tree = cKDTree(points)
+    dists, neighbors = tree.query(points, k=k_eff + 1)
+    if k_eff == 1:
+        dists = dists[:, None]
+        neighbors = neighbors[:, None]
+    dists = np.asarray(dists[:, 1:], dtype=float)
+    neighbors = np.asarray(neighbors[:, 1:], dtype=int)
+
+    positive = dists[np.isfinite(dists) & (dists > 0)]
+    sigma = float(np.median(positive)) if positive.size else 1.0
+    sigma *= float(sigma_scale)
+    if not np.isfinite(sigma) or sigma <= 0:
+        sigma = 1.0
+
+    weights = np.exp(-0.5 * (dists / sigma) ** 2)
+    weights[~np.isfinite(weights)] = 0.0
+
+    row_idx = np.repeat(np.arange(n, dtype=int), k_eff)
+    col_idx = neighbors.reshape(-1)
+    data = weights.reshape(-1)
+    keep_edges = (row_idx != col_idx) & np.isfinite(data) & (data > 0)
+    row_idx = row_idx[keep_edges]
+    col_idx = col_idx[keep_edges]
+    data = data[keep_edges]
+    if data.size == 0:
+        out = np.clip(t_base, 0.0, 1.0)
+        for ii, tt in zip(fixed_idx.tolist(), fixed_t.tolist(), strict=True):
+            out[int(ii)] = float(tt)
+        return out
+
+    W = sparse.coo_matrix(
+        (
+            np.concatenate([data, data]),
+            (np.concatenate([row_idx, col_idx]), np.concatenate([col_idx, row_idx])),
+        ),
+        shape=(n, n),
+        dtype=float,
+    ).tocsr()
+    W.sum_duplicates()
+    W.setdiag(0.0)
+    W.eliminate_zeros()
+
+    degree = np.asarray(W.sum(axis=1)).reshape(-1)
+    L = sparse.diags(degree) - W
+    A = (L + sparse.diags(np.full((n,), float(lam), dtype=float))).tocsr()
+
+    fixed_mask = np.zeros((n,), dtype=bool)
+    fixed_mask[fixed_idx] = True
+    free_idx = np.flatnonzero(~fixed_mask)
+
+    out = t_base.astype(float, copy=True)
+    out[fixed_idx] = fixed_t
+    if free_idx.size == 0:
+        return np.clip(out, 0.0, 1.0)
+
+    rhs = float(lam) * t_base
+    A_ff = A[free_idx][:, free_idx]
+    A_fc = A[free_idx][:, fixed_idx]
+    rhs_f = rhs[free_idx] - (A_fc @ out[fixed_idx])
+    try:
+        solved = spsolve(A_ff.tocsc(), rhs_f)
+    except Exception as exc:
+        raise SystemExit(f"Failed to solve screened harmonic t smoothing: {exc}") from exc
+    solved_arr = np.asarray(solved, dtype=float).reshape(-1)
+    if np.any(~np.isfinite(solved_arr)):
+        raise SystemExit("Screened harmonic t smoothing produced non-finite values.")
+    out[free_idx] = solved_arr
+    out[fixed_idx] = fixed_t
+    return np.clip(out, 0.0, 1.0)
+
+
+def enforce_curve_through_anchors(
+    *,
+    curve: np.ndarray,
+    anchor_xy: np.ndarray,
+    n_dense: int | None = None,
+    anchor_labels: list[str] | None = None,
+) -> np.ndarray:
+    curve_xy = np.asarray(curve, dtype=float)
+    if curve_xy.ndim != 2 or curve_xy.shape[1] < 2:
+        raise ValueError(f"Unexpected curve shape: {curve_xy.shape}")
+    curve_xy = curve_xy[:, :2]
+
+    anchors = np.asarray(anchor_xy, dtype=float)
+    if anchors.ndim != 2 or anchors.shape[1] < 2:
+        raise ValueError(f"Unexpected anchor_xy shape: {anchors.shape}")
+    anchors = anchors[:, :2]
+    if anchors.shape[0] < 2:
+        raise ValueError("Need at least 2 anchors to constrain the curve.")
+    if anchor_labels is not None and len(anchor_labels) != anchors.shape[0]:
+        raise SystemExit(
+            "Internal error: anchor_labels length does not match anchor count "
+            f"({len(anchor_labels)} vs {anchors.shape[0]})."
+        )
+
+    t_anchor, _, _ = project_to_polyline_arclength(xy=anchors, line=curve_xy)
+    if np.any(~np.isfinite(t_anchor)):
+        raise SystemExit("Non-finite anchor t after warping.")
+    dt = np.diff(t_anchor)
+    if dt.size and not (np.all(dt > 0) or np.all(dt < 0)):
+        default_labels = [f"#{i + 1}" for i in range(int(anchors.shape[0]))]
+        labels = list(anchor_labels) if anchor_labels is not None else default_labels
+        if dt.size == 1:
+            inversion_at = 0
+        else:
+            inc_bad = np.flatnonzero(dt <= 0)
+            dec_bad = np.flatnonzero(dt >= 0)
+            bad = inc_bad if inc_bad.size <= dec_bad.size else dec_bad
+            inversion_at = int(bad[0]) if bad.size else 0
+        i0 = inversion_at
+        i1 = inversion_at + 1
+        t_vals = ", ".join(f"{float(v):.4f}" for v in t_anchor.tolist())
+        raise SystemExit(
+            "Anchors are not monotone along the fitted curve. "
+            f"Projected t in click order: [{t_vals}]. "
+            f"First inversion at anchors {i0 + 1}->{i1 + 1} ({labels[i0]} -> {labels[i1]}): "
+            f"{float(t_anchor[i0]):.4f} -> {float(t_anchor[i1]):.4f}. "
+            "Reorder anchors along the path or use fewer anchors."
+        )
+
+    if dt.size and np.all(dt < 0):
+        curve_xy = curve_xy[::-1].copy()
+        anchors = anchors[::-1].copy()
+        t_anchor = 1.0 - t_anchor[::-1]
+
+    seg = np.linalg.norm(np.diff(curve_xy, axis=0), axis=1)
+    ok = seg > 1e-12
+    if not np.all(ok):
+        curve_xy = curve_xy[np.concatenate([[True], ok])]
+        seg = np.linalg.norm(np.diff(curve_xy, axis=0), axis=1)
+    if curve_xy.shape[0] < 2:
+        raise SystemExit("Degenerate curve while enforcing anchors.")
+
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(s[-1])
+    if total <= 0 or not np.isfinite(total):
+        raise SystemExit("Degenerate curve while enforcing anchors.")
+    t_curve = s / total
+
+    tol = 1e-8
+    keep = np.ones((curve_xy.shape[0],), dtype=bool)
+    for ta in t_anchor:
+        keep &= np.abs(t_curve - float(ta)) > tol
+
+    t_nodes = np.concatenate([t_anchor, t_curve[keep]])
+    xy_nodes = np.vstack([anchors, curve_xy[keep]])
+    is_anchor = np.concatenate([np.ones((anchors.shape[0],), dtype=bool), np.zeros((int(keep.sum()),), dtype=bool)])
+
+    order = np.argsort(t_nodes, kind="mergesort")
+    t_sorted = t_nodes[order]
+    xy_sorted = xy_nodes[order]
+    is_anchor_sorted = is_anchor[order]
+
+    t_uniq: list[float] = []
+    xy_uniq: list[np.ndarray] = []
+    i = 0
+    while i < t_sorted.size:
+        j = i + 1
+        while j < t_sorted.size and abs(float(t_sorted[j]) - float(t_sorted[i])) <= tol:
+            j += 1
+
+        grp_anchor = np.flatnonzero(is_anchor_sorted[i:j])
+        if grp_anchor.size > 0:
+            pick = int(i + grp_anchor[0])
+        else:
+            pick = int(j - 1)
+        t_uniq.append(float(t_sorted[pick]))
+        xy_uniq.append(xy_sorted[pick].astype(float, copy=False))
+        i = j
+
+    if len(t_uniq) < 2:
+        raise SystemExit("Not enough distinct points after enforcing anchors.")
+
+    t_final = np.asarray(t_uniq, dtype=float)
+    xy_final = np.asarray(xy_uniq, dtype=float)
+    x_spline = CubicSpline(t_final, xy_final[:, 0], bc_type="natural")
+    y_spline = CubicSpline(t_final, xy_final[:, 1], bc_type="natural")
+
+    n_out = int(n_dense) if n_dense is not None else int(curve_xy.shape[0])
+    n_out = max(2, n_out)
+    t_eval = np.linspace(0.0, 1.0, n_out)
+    t_eval = np.unique(np.clip(np.concatenate([t_eval, t_anchor]), 0.0, 1.0))
+    return np.column_stack([x_spline(t_eval), y_spline(t_eval)]).astype(float, copy=False)
+
+
+def apply_anchor_constraints_to_curvefit_projection(
+    *,
+    xy: np.ndarray,
+    anchor_indices: list[int],
+    anchor_smoothing: float = 0.5,
+    anchor_t_smooth: bool = True,
+    anchor_t_smooth_k: int = 20,
+    anchor_t_smooth_lambda: float = 0.15,
+    anchor_t_smooth_sigma_scale: float = 1.0,
+    n_dense: int = 5000,
+    clamp_endpoints: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    xy_arr = np.asarray(xy, dtype=float)[:, :2]
+    idx = np.asarray(anchor_indices, dtype=int)
+    if idx.ndim != 1 or idx.size < 2:
+        raise SystemExit("Need at least 2 anchor indices.")
+    if np.any(idx < 0) or np.any(idx >= xy_arr.shape[0]):
+        raise SystemExit("Anchor index out of bounds.")
+
+    anchor_xy = xy_arr[idx, :2].astype(float, copy=False)
+    line = fit_anchor_curve(anchor_xy=anchor_xy, n_dense=int(n_dense), smoothing=float(anchor_smoothing))
+
+    _t_proj, r_signed, proj_new = project_to_polyline_arclength(xy=xy_arr, line=line)
+    t_new = assign_t_via_edt_to_anchor_curve(xy=xy_arr, line=line)
+    if anchor_t_smooth:
+        anchor_t_target, _, _ = project_to_polyline_arclength(xy=anchor_xy, line=line)
+        anchor_t_target = np.asarray(anchor_t_target, dtype=float)
+        anchor_t_target[0] = 0.0
+        anchor_t_target[-1] = 1.0
+        t_new = smooth_t_on_spatial_knn(
+            xy=xy_arr,
+            t0=t_new,
+            anchor_indices=idx,
+            anchor_t=anchor_t_target,
+            k=int(anchor_t_smooth_k),
+            lam=float(anchor_t_smooth_lambda),
+            sigma_scale=float(anchor_t_smooth_sigma_scale),
+        )
+    if clamp_endpoints:
+        t_new[int(idx[0])] = 0.0
+        t_new[int(idx[-1])] = 1.0
+        proj_new[int(idx[0]), :2] = anchor_xy[0, :2]
+        proj_new[int(idx[-1]), :2] = anchor_xy[-1, :2]
+        r_signed[int(idx[0])] = 0.0
+        r_signed[int(idx[-1])] = 0.0
+    return t_new, r_signed, proj_new, line
 
 
 def curve_polyline_from_proj(
@@ -965,6 +1394,110 @@ def resolve_workspace_input_path(ws: Workspace, roi: str) -> Path:
     raise SystemExit(f"Input not found: {expected}")
 
 
+def resolve_workspace_rois(ws: Workspace, roi: str | None) -> list[str]:
+    roi_clean = str(roi).strip() if roi is not None else ""
+    if roi_clean:
+        return [roi_clean]
+
+    ccf_root = ws.output.ccf_transforms
+    if ccf_root.exists():
+        ccf_rois = sorted(path.name for path in ccf_root.iterdir() if path.is_dir())
+        if ccf_rois:
+            return ccf_rois
+
+    return ws.resolve_rois(None)
+
+
+def infer_t_endpoints_json(*, ws: Workspace, roi: str) -> Path | None:
+    roi_clean = str(roi).strip()
+    roi_dir = ws.ccf_transforms(roi_clean)
+    filename = "similarity_plus_syn_qc_zoom_masked_with_user_mask_t_axis_endpoints.json"
+    preferred = roi_dir / "landmark_syn_mi" / filename
+    if preferred.exists():
+        return preferred
+
+    candidates = sorted(p for p in roi_dir.glob(f"*/{filename}") if p.is_file())
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        names = "\n".join([f"  - {p}" for p in candidates])
+        raise SystemExit(
+            "Found multiple t-endpoints JSON candidates; please keep a single run directory under ROI:\n"
+            f"{names}"
+        )
+    return None
+
+
+def _parse_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(out):
+        return None
+    return out
+
+
+def load_t_intervals_by_mask_name(path: Path) -> dict[str, tuple[float, float]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Invalid t-endpoints JSON (expected object): {path}")
+
+    masks = payload.get("masks")
+    if not isinstance(masks, list):
+        raise SystemExit(f"Invalid t-endpoints JSON (missing list 'masks'): {path}")
+
+    by_name: dict[str, tuple[float, float]] = {}
+    for item in masks:
+        if not isinstance(item, dict):
+            continue
+        raw_name = item.get("mask_name")
+        if not isinstance(raw_name, str):
+            continue
+        name = raw_name.strip()
+        if name == "":
+            continue
+
+        begin = _parse_optional_float(item.get("begin"))
+        end = _parse_optional_float(item.get("end"))
+        if begin is None or end is None:
+            continue
+        lo = float(np.clip(min(begin, end), 0.0, 1.0))
+        hi = float(np.clip(max(begin, end), 0.0, 1.0))
+        prev = by_name.get(name)
+        if prev is None:
+            by_name[name] = (lo, hi)
+        else:
+            by_name[name] = (min(prev[0], lo), max(prev[1], hi))
+    return by_name
+
+
+def compute_global_t_from_local(
+    *,
+    t_local: np.ndarray,
+    mask_names: np.ndarray,
+    intervals_by_name: dict[str, tuple[float, float]],
+) -> np.ndarray:
+    t = np.asarray(t_local, dtype=float)
+    names = np.asarray(mask_names).astype(str)
+    if t.shape[0] != names.shape[0]:
+        raise SystemExit(f"Local t / mask name length mismatch: {t.shape[0]} vs {names.shape[0]}")
+
+    out = np.full((t.shape[0],), np.nan, dtype=float)
+    for i, (ti, name) in enumerate(zip(t.tolist(), names.tolist(), strict=True)):
+        if not np.isfinite(ti):
+            continue
+        interval = intervals_by_name.get(str(name))
+        if interval is None:
+            continue
+        start, end = interval
+        ti_clip = float(np.clip(float(ti), 0.0, 1.0))
+        out[i] = float(start) + ti_clip * float(end - start)
+    return out
+
+
 def infer_anchors_json(
     *,
     in_path: Path,
@@ -1012,23 +1545,85 @@ def infer_anchors_json(
     return None
 
 
-def main() -> None:
-    args = parse_args()
+def list_anchor_json_candidates(*, in_path: Path) -> list[Path]:
+    return sorted(in_path.parent.glob(f"{in_path.stem}*.anchors.json"))
 
-    if args.workspace is not None or args.roi is not None:
-        if args.input is not None or args.output is not None:
-            raise SystemExit("Use either WORKSPACE ROI positional args or --input/--output (not both).")
-        if args.workspace is None or args.roi is None:
-            raise SystemExit("Provide both WORKSPACE and ROI.")
-        ws = Workspace(str(args.workspace).strip())
-        roi = str(args.roi).strip()
-        in_path = resolve_workspace_input_path(ws, roi)
-        out_path = in_path.with_name(f"{in_path.stem}.princurve.h5ad")
-    else:
-        if args.input is None or args.output is None:
-            raise SystemExit("Provide either --workspace/--roi or --input/--output.")
-        in_path = Path(args.input)
-        out_path = Path(args.output)
+
+def infer_anchor_subroi_from_path(*, in_path: Path, anchor_path: Path) -> str | None:
+    name = anchor_path.name
+    stem = in_path.stem
+    prefix = f"{stem}."
+    suffix = ".anchors.json"
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        return None
+    subroi = name[len(prefix) : -len(suffix)]
+    return subroi if subroi != "" else None
+
+
+def include_anchor_indices_in_fit_mask(*, fit_mask: np.ndarray, anchor_indices: list[int] | None) -> np.ndarray:
+    out = np.asarray(fit_mask, dtype=bool).copy()
+    if anchor_indices is None:
+        return out
+
+    idx = np.asarray(anchor_indices, dtype=int)
+    if idx.ndim != 1:
+        raise SystemExit("Internal error: anchor indices must be a 1D sequence.")
+    if idx.size == 0:
+        return out
+    if np.any(idx < 0) or np.any(idx >= out.shape[0]):
+        raise SystemExit("Internal error: anchor index out of bounds for fitting mask.")
+
+    out[idx] = True
+    return out
+
+
+def fit_anchor_curve(*, anchor_xy: np.ndarray, n_dense: int, smoothing: float) -> np.ndarray:
+    points = np.asarray(anchor_xy, dtype=float)
+    if points.ndim != 2 or points.shape[1] < 2:
+        raise SystemExit(f"Unexpected anchor shape: {points.shape}")
+    points = points[:, :2]
+    if points.shape[0] < 2:
+        raise SystemExit("Need at least 2 anchors to build curve.")
+    if smoothing < 0:
+        raise SystemExit("--anchor-smoothing must be >= 0.")
+
+    if points.shape[0] >= 2:
+        d = np.linalg.norm(np.diff(points, axis=0), axis=1)
+        keep = np.concatenate([[True], d > 1e-12])
+        points = points[keep]
+    if points.shape[0] < 2:
+        raise SystemExit("Anchors are degenerate (all identical after deduplication).")
+
+    if smoothing <= 0:
+        _u_dense, curve, _deriv, _ = fit_constrained_spline(points, n_dense=int(n_dense))
+        return curve
+
+    seg = np.sqrt(np.sum(np.diff(points, axis=0) ** 2, axis=1))
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    u = np.linspace(0.0, 1.0, points.shape[0]) if float(s[-1]) == 0 else s / float(s[-1])
+
+    k = min(3, points.shape[0] - 1)
+    if k < 1:
+        raise SystemExit("Not enough anchors to fit a spline.")
+    smooth_s = float(smoothing) * float(points.shape[0])
+    tck, _ = splprep([points[:, 0], points[:, 1]], u=u, s=smooth_s, k=k)
+
+    u_dense = np.linspace(0.0, 1.0, int(max(2, n_dense)))
+    x_dense, y_dense = splev(u_dense, tck)
+    curve = np.column_stack([np.asarray(x_dense, float), np.asarray(y_dense, float)])
+    curve[0, :] = points[0, :]
+    curve[-1, :] = points[-1, :]
+    return curve
+
+
+def _run_single(
+    args: argparse.Namespace,
+    *,
+    in_path: Path,
+    out_path: Path,
+    ws_for_t_endpoints: Workspace | None,
+    roi_for_t_endpoints: str | None,
+) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_prefix = out_path.with_suffix("")
 
@@ -1111,6 +1706,11 @@ def main() -> None:
                     f"got: {uniq}"
                 )
             anchor_roi_value = str(uniq[0])
+    else:
+        raise SystemExit(
+            "Anchor-driven mode requires anchors JSON. "
+            "Provide --anchors-json (or ensure one is inferable next to the input)."
+        )
 
     if args.curvefit is None:
         if curvefit_path is not None:
@@ -1183,6 +1783,7 @@ def main() -> None:
                     cortex_mask = roi == "cortex"
                     if np.any(cortex_mask):
                         fit_mask = cortex_mask
+            fit_mask = include_anchor_indices_in_fit_mask(fit_mask=fit_mask, anchor_indices=anchor_indices)
 
             used_idx = np.flatnonzero(fit_mask)
             if used_idx.size == 0:
@@ -1192,104 +1793,67 @@ def main() -> None:
             full_to_used = np.full((xy.shape[0],), -1, dtype=int)
             full_to_used[used_idx] = np.arange(used_idx.size, dtype=int)
 
-            n = int(xy_used.shape[0])
-            rng = np.random.default_rng(args.pc_seed)
-            fit_n = min(int(args.pc_fit_points), n)
-            init_curve: np.ndarray | None = None
-
-            required_idx: np.ndarray | None = None
+            curve_for_proj: np.ndarray
             if args.anchors_json is not None:
                 if anchor_indices is None or anchor_ids is None:
                     raise SystemExit("Internal error: anchors are not available after parsing --anchors-json.")
                 required_idx_full = np.asarray(anchor_indices, dtype=int)
                 required_idx = full_to_used[required_idx_full]
                 if np.any(required_idx < 0):
-                    if anchor_roi_value is None:
-                        raise SystemExit("Anchors must be within the cells used for fitting.")
-                    raise SystemExit(f"Anchors must be within obs['ccf_adjusted']=={anchor_roi_value!r} for fitting.")
-                fit_n = max(fit_n, max(5, int(required_idx.size)))
-                init_curve = xy_used[required_idx, :2].astype(float, copy=False)
-
-            if fit_n >= n:
-                fit_idx = np.arange(n)
-            elif required_idx is None:
-                fit_idx = rng.choice(np.arange(n), size=fit_n, replace=False)
-            else:
-                required_mask = np.zeros((n,), dtype=bool)
-                required_mask[required_idx] = True
-                available = np.flatnonzero(~required_mask)
-                extra_n = int(fit_n - required_idx.size)
-                if extra_n <= 0:
-                    fit_idx = required_idx
-                else:
-                    extra = (
-                        rng.choice(available, size=extra_n, replace=False)
-                        if extra_n < available.size
-                        else available
-                    )
-                    fit_idx = np.concatenate([required_idx, extra])
-            xy_fit = xy_used[fit_idx]
-
-            curve_pts = run_princurve_py(
-                xy=xy_fit,
-                init_curve=init_curve,
-                df=int(args.pc_df),
-                df_final=int(args.pc_df_final) if args.pc_df_final is not None else None,
-                robust=bool(args.pc_robust),
-                robust_quantile=float(args.pc_robust_quantile),
-                robust_c=float(args.pc_robust_c),
-            )
-            if curve_pts.shape[0] > args.pc_control_points:
-                pick = np.linspace(0, curve_pts.shape[0] - 1, args.pc_control_points).round().astype(int)
-                curve_pts = curve_pts[pick]
-
-            _u_dense, curve, _deriv, _ = fit_constrained_spline(curve_pts, n_dense=n_dense)
-
-            curve_for_proj = curve
-            curve_xy_for_qc = curve
-
-            if args.anchors_json is not None:
-                if anchor_indices is None or anchor_ids is None:
-                    raise SystemExit("Internal error: anchors are not available after parsing --anchors-json.")
-                assert required_idx is not None
+                    raise SystemExit("Internal error: anchor indices were excluded from fitting after mask inclusion.")
                 anchor_xy = xy_used[np.asarray(required_idx, dtype=int), :2].astype(float, copy=False)
+                curve_for_proj = fit_anchor_curve(
+                    anchor_xy=anchor_xy,
+                    n_dense=n_dense,
+                    smoothing=float(args.anchor_smoothing),
+                )
+                curve_xy_for_qc = curve_for_proj
+            else:
+                n = int(xy_used.shape[0])
+                rng = np.random.default_rng(args.pc_seed)
+                fit_n = min(int(args.pc_fit_points), n)
+                fit_idx = rng.choice(np.arange(n), size=fit_n, replace=False) if fit_n < n else np.arange(n)
+                xy_fit = xy_used[fit_idx]
 
-                if len(anchor_ids) == 2:
-                    start_i, end_i = int(required_idx[0]), int(required_idx[-1])
-                    tree0 = cKDTree(curve)
-                    _, nn0 = tree0.query(xy_used, k=1)
-                    nn0 = nn0.astype(int)
-                    src0 = curve[nn0[start_i]].copy()
-                    src1 = curve[nn0[end_i]].copy()
-                    dst0 = xy_used[start_i].copy()
-                    dst1 = xy_used[end_i].copy()
-                    scale, R, tt = similarity_transform_from_two_points(src0=src0, src1=src1, dst0=dst0, dst1=dst1)
-                    curve_for_proj = apply_similarity_transform(curve, scale, R, tt)
-                else:
-                    curve_for_proj = tps_warp_curve_to_anchors(
-                        curve=curve,
-                        anchor_xy=anchor_xy,
-                        smoothing=float(args.anchor_tps_smoothing),
-                    )
-
-                    t_anchor, _, _ = project_to_polyline_arclength(
-                        xy=anchor_xy,
-                        line=curve_for_proj,
-                    )
-                    if np.any(~np.isfinite(t_anchor)):
-                        raise SystemExit("Non-finite anchor t after TPS warping.")
-                    dt = np.diff(t_anchor)
-                    if not (np.all(dt > 0) or np.all(dt < 0)):
-                        raise SystemExit(
-                            "Anchors are not monotone along the fitted curve (order inversion); "
-                            "click anchors in path order or use fewer anchors."
-                        )
-
+                curve_pts = run_princurve_py(
+                    xy=xy_fit,
+                    df=int(args.pc_df),
+                    df_final=int(args.pc_df_final) if args.pc_df_final is not None else None,
+                    robust=bool(args.pc_robust),
+                    robust_quantile=float(args.pc_robust_quantile),
+                    robust_c=float(args.pc_robust_c),
+                )
+                if curve_pts.shape[0] > args.pc_control_points:
+                    pick = np.linspace(0, curve_pts.shape[0] - 1, args.pc_control_points).round().astype(int)
+                    curve_pts = curve_pts[pick]
+                _u_dense, curve_for_proj, _deriv, _ = fit_constrained_spline(curve_pts, n_dense=n_dense)
                 curve_xy_for_qc = curve_for_proj
 
-            t_used, r_signed_used, proj_used = project_to_polyline_arclength(xy=xy_used, line=curve_for_proj)
-            r_q = rcoord_scale_q(r_signed_used, quantile=r_scale_abs_quantile)
-            r_used = rcoord_scale_quantile(r_signed_used, r_q)
+            _t_proj_used, r_signed_used, proj_used = project_to_polyline_arclength(xy=xy_used, line=curve_for_proj)
+            t_used = assign_t_via_edt_to_anchor_curve(xy=xy_used, line=curve_for_proj)
+            anchor_t_mode = "edt_nearest_wall_spatial"
+            if args.anchor_t_smooth:
+                anchor_t_target_used, _, _ = project_to_polyline_arclength(xy=anchor_xy, line=curve_for_proj)
+                anchor_t_target_used = np.asarray(anchor_t_target_used, dtype=float)
+                anchor_t_target_used[0] = 0.0
+                anchor_t_target_used[-1] = 1.0
+                t_used = smooth_t_on_spatial_knn(
+                    xy=xy_used,
+                    t0=t_used,
+                    anchor_indices=required_idx,
+                    anchor_t=anchor_t_target_used,
+                    k=int(args.anchor_t_smooth_k),
+                    lam=float(args.anchor_t_smooth_lambda),
+                    sigma_scale=float(args.anchor_t_smooth_sigma_scale),
+                )
+                anchor_t_mode = "knn_screened_harmonic_spatial"
+            assert required_idx is not None
+            t_used[int(required_idx[0])] = 0.0
+            t_used[int(required_idx[-1])] = 1.0
+            r_signed_used[int(required_idx[0])] = 0.0
+            r_signed_used[int(required_idx[-1])] = 0.0
+            proj_used[int(required_idx[0]), :2] = xy_used[int(required_idx[0]), :2]
+            proj_used[int(required_idx[-1]), :2] = xy_used[int(required_idx[-1]), :2]
 
             t = np.full((xy.shape[0],), np.nan, dtype=float)
             r_ = np.full((xy.shape[0],), np.nan, dtype=float)
@@ -1297,13 +1861,13 @@ def main() -> None:
             r_signed_store = np.full((xy.shape[0],), np.nan, dtype=float)
 
             t[fit_mask] = t_used
-            r_[fit_mask] = r_used
+            r_[fit_mask] = r_signed_used
             proj[fit_mask] = proj_used
             r_signed_store[fit_mask] = r_signed_used
             r_scale_info = {
-                "abs_quantile": float(r_scale_abs_quantile),
-                "q": float(r_q),
-                "subset": {"obs_key": "ccf_adjusted", "obs_value": "cortex", "n_used": int(used_idx.size)},
+                "mode": "signed_normal_distance",
+                "t_mode": anchor_t_mode,
+                "subset": {"obs_key": "ccf_adjusted", "obs_value": anchor_roi_value, "n_used": int(used_idx.size)},
             }
 
         with curvefit_path.open("w", newline="") as fcsv:
@@ -1338,27 +1902,86 @@ def main() -> None:
             extra = "" if len(missing) <= 10 else f" (+{len(missing) - 10} more)"
             raise SystemExit(f"curvefit CSV missing {len(missing)} cell_ids: {preview}{extra}")
 
+        if args.anchors_json is not None:
+            if anchor_indices is None:
+                raise SystemExit("Internal error: expected anchor_indices when --anchors-json is provided.")
+            t, r_, proj, curve_xy_for_qc = apply_anchor_constraints_to_curvefit_projection(
+                xy=xy,
+                anchor_indices=anchor_indices,
+                anchor_smoothing=float(args.anchor_smoothing),
+                anchor_t_smooth=bool(args.anchor_t_smooth),
+                anchor_t_smooth_k=int(args.anchor_t_smooth_k),
+                anchor_t_smooth_lambda=float(args.anchor_t_smooth_lambda),
+                anchor_t_smooth_sigma_scale=float(args.anchor_t_smooth_sigma_scale),
+                n_dense=5_000,
+            )
+            r_signed_store = np.asarray(r_, dtype=float).copy()
+            r_scale_info = {
+                "mode": "signed_normal_distance",
+                "t_mode": "knn_screened_harmonic_spatial" if args.anchor_t_smooth else "edt_nearest_wall_spatial",
+                "source": "curvefit_anchored",
+            }
+
     if args.anchors_json is not None:
         if anchor_ids is None:
             raise SystemExit("Internal error: anchor_ids are not available after parsing --anchors-json.")
-        start_id = anchor_ids[0]
-        end_id = anchor_ids[-1]
-        t, anchor_meta = apply_anchor_transform(
-            t=t,
-            obs_names=obs_names,
-            start_cell_id=start_id,
-            end_cell_id=end_id,
-            clamp=args.anchor_clamp,
-        )
+        start_id = str(anchor_ids[0])
+        end_id = str(anchor_ids[-1])
+        start_matches = np.where(obs_names == start_id)[0]
+        end_matches = np.where(obs_names == end_id)[0]
+        if start_matches.size != 1 or end_matches.size != 1:
+            raise SystemExit("Internal error: could not locate first/last anchors in obs_names.")
+        t[int(start_matches[0])] = 0.0
+        t[int(end_matches[0])] = 1.0
+        anchor_meta = {
+            "start_cell_id": start_id,
+            "end_cell_id": end_id,
+            "start_index": int(start_matches[0]),
+            "end_index": int(end_matches[0]),
+            "mode": "anchor_endpoints",
+            "anchor_count": int(len(anchor_ids)),
+        }
         print(
             "Anchors applied:",
             f"start={start_id}",
             f"end={end_id}",
-            "mode=rescale",
-            f"clamp={args.anchor_clamp}",
-            f"flipped={anchor_meta['flipped']}",
+            "mode=anchor_endpoints",
+            f"count={len(anchor_ids)}",
         )
 
+    t_global = np.full((t.shape[0],), np.nan, dtype=float)
+    t_global_meta: dict[str, Any] | None = None
+    if ws_for_t_endpoints is not None and roi_for_t_endpoints is not None:
+        endpoints_json = infer_t_endpoints_json(ws=ws_for_t_endpoints, roi=roi_for_t_endpoints)
+        if endpoints_json is None:
+            print(
+                "Note: t-endpoints JSON not found under workspace ROI output; "
+                "leaving obs['t_global'] as NaN."
+            )
+            t_global_meta = {"source": None, "status": "missing_json"}
+        elif "ccf_adjusted" not in adata.obs.columns:
+            print("Note: obs['ccf_adjusted'] is missing; leaving obs['t_global'] as NaN.")
+            t_global_meta = {"source": str(endpoints_json), "status": "missing_ccf_adjusted"}
+        else:
+            intervals = load_t_intervals_by_mask_name(endpoints_json)
+            if not intervals:
+                print("Note: no valid begin/end entries found in t-endpoints JSON; leaving obs['t_global'] as NaN.")
+                t_global_meta = {"source": str(endpoints_json), "status": "empty_intervals"}
+            else:
+                mask_names = adata.obs["ccf_adjusted"].astype(str).to_numpy()
+                t_global = compute_global_t_from_local(
+                    t_local=t,
+                    mask_names=mask_names,
+                    intervals_by_name=intervals,
+                )
+                t_global_meta = {
+                    "source": str(endpoints_json),
+                    "status": "applied",
+                    "mask_key": "ccf_adjusted",
+                    "interval_count": int(len(intervals)),
+                }
+
+    adata.obs["t_global"] = t_global
     adata.obsm["principal"] = np.column_stack([t, r_]).astype(float, copy=False)
     adata.obsm["principal_curve_proj_xy"] = proj
     if r_signed_store is not None:
@@ -1371,6 +1994,8 @@ def main() -> None:
         fit_meta["rois"] = list(rois_to_process)
     if r_scale_info is not None:
         fit_meta["r_scale"] = r_scale_info
+    if t_global_meta is not None:
+        fit_meta["t_global"] = t_global_meta
     uns["principal_curve_fit"] = fit_meta
     if anchor_meta is not None:
         uns["principal_anchors"] = anchor_meta
@@ -1485,6 +2110,88 @@ def main() -> None:
 
     adata.write_h5ad(out_path)
     print(f"Wrote: {out_path}")
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.workspace is not None or args.roi is not None:
+        if args.input is not None or args.output is not None:
+            raise SystemExit("Use either WORKSPACE [ROI] positional args or --input/--output (not both).")
+        if args.workspace is None:
+            raise SystemExit("Provide WORKSPACE when using workspace mode.")
+
+        ws = Workspace(str(args.workspace).strip())
+        rois = resolve_workspace_rois(ws, args.roi)
+        if not rois:
+            raise SystemExit(f"No ROIs found in workspace: {ws.path}")
+
+        for roi in rois:
+            print(f"Processing ROI: {roi}")
+            in_path = resolve_workspace_input_path(ws, roi)
+            out_path = in_path.with_name(f"{in_path.stem}.princurve.h5ad")
+            candidates = (
+                list_anchor_json_candidates(in_path=in_path)
+                if args.anchors_json is None and args.anchors_subroi is None
+                else []
+            )
+            if len(candidates) > 1:
+                print(
+                    f"Found {len(candidates)} anchors JSON files for {in_path.name}; "
+                    "running each in anchored mode (no unanchored fallback)."
+                )
+                used_suffixes: set[str] = set()
+                for i, anchor_path in enumerate(candidates):
+                    run_args = argparse.Namespace(**vars(args))
+                    run_args.anchors_json = str(anchor_path)
+                    subroi = infer_anchor_subroi_from_path(in_path=in_path, anchor_path=anchor_path)
+                    if (
+                        subroi is not None
+                        and run_args.subset_obs_key is None
+                        and run_args.subset_obs_value is None
+                    ):
+                        run_args.subset_obs_key = "ccf_adjusted"
+                        run_args.subset_obs_value = subroi
+
+                    suffix = subroi if subroi is not None else f"anchors{i + 1}"
+                    base_suffix = suffix
+                    j = 2
+                    while suffix in used_suffixes:
+                        suffix = f"{base_suffix}_{j}"
+                        j += 1
+                    used_suffixes.add(suffix)
+                    out_path_multi = in_path.with_name(f"{in_path.stem}.{suffix}.princurve.h5ad")
+                    print(f"Processing anchors file: {anchor_path.name}")
+                    _run_single(
+                        args=run_args,
+                        in_path=in_path,
+                        out_path=out_path_multi,
+                        ws_for_t_endpoints=ws,
+                        roi_for_t_endpoints=roi,
+                    )
+                continue
+
+            run_args = argparse.Namespace(**vars(args))
+            _run_single(
+                args=run_args,
+                in_path=in_path,
+                out_path=out_path,
+                ws_for_t_endpoints=ws,
+                roi_for_t_endpoints=roi,
+            )
+        return
+
+    if args.input is None or args.output is None:
+        raise SystemExit("Provide either WORKSPACE [ROI] or --input/--output.")
+
+    run_args = argparse.Namespace(**vars(args))
+    _run_single(
+        args=run_args,
+        in_path=Path(args.input),
+        out_path=Path(args.output),
+        ws_for_t_endpoints=None,
+        roi_for_t_endpoints=None,
+    )
 
 
 if __name__ == "__main__":

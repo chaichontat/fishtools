@@ -43,7 +43,7 @@ SpatialOrder = Literal["xy", "yx"]
 CoordSpace = Literal["crop", "full"]
 InputSpace = Literal["crop", "full", "fused"]
 T_AXIS_T_CMAP = "viridis"
-T_AXIS_OVERLAP_TOL_PX = 12.0
+T_AXIS_OVERLAP_TOL_PX = 1.0
 
 
 class _SummaryPaths(TypedDict, total=False):
@@ -446,16 +446,41 @@ def _select_t_axis_overlay_by_coverage(
 
 
 def _t_axis_range_for_mask(*, t_axis_overlay: TAxisOverlay, mask_yx: np.ndarray) -> tuple[float, float] | None:
-    pair = _t_axis_line_t_and_distances_to_mask(t_axis_overlay=t_axis_overlay, mask_yx=mask_yx)
-    if pair is None:
-        return None
-    line_t, distances = pair
-    covered = distances <= float(T_AXIS_OVERLAP_TOL_PX)
-    if not np.any(covered):
+    mask = np.asarray(mask_yx, dtype=bool)
+    if mask.ndim != 2 or not np.any(mask):
         return None
 
-    t_vals = np.clip(line_t[covered], 0.0, 1.0)
-    return (float(np.min(t_vals)), float(np.max(t_vals)))
+    line_xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
+    line_t = np.asarray(t_axis_overlay.line_t, dtype=np.float64)
+    if line_xy.ndim != 2 or line_xy.shape[1] != 2 or line_t.ndim != 1 or line_t.shape[0] != line_xy.shape[0]:
+        return None
+    valid = np.isfinite(line_xy).all(axis=1) & np.isfinite(line_t)
+    if not np.any(valid):
+        return None
+    line_xy = line_xy[valid]
+    line_t = line_t[valid]
+
+    mask_pts_yx = np.argwhere(mask)
+    if mask_pts_yx.shape[0] == 0:
+        return None
+    tree = cKDTree(np.column_stack([line_xy[:, 1], line_xy[:, 0]]))
+    distances, nearest_idx = tree.query(mask_pts_yx.astype(np.float64, copy=False), k=1)
+    covered = np.isfinite(distances) & (distances <= float(T_AXIS_OVERLAP_TOL_PX))
+    if not np.any(covered):
+        return None
+    nearest_idx = np.asarray(nearest_idx[covered], dtype=np.int64)
+    if nearest_idx.size == 0:
+        return None
+    t_vals = np.sort(np.clip(line_t[nearest_idx], 0.0, 1.0))
+    n = int(t_vals.size)
+    if n == 0:
+        return None
+    trim = max(1, int(math.floor(0.01 * float(n))))
+    if (2 * trim) >= n:
+        trim = max(0, (n - 1) // 2)
+    low_idx = int(trim)
+    high_idx = int(n - 1 - trim)
+    return (float(t_vals[low_idx]), float(t_vals[high_idx]))
 
 
 def _t_axis_range_for_mask_with_mirroring(
@@ -464,26 +489,50 @@ def _t_axis_range_for_mask_with_mirroring(
     mirrored: TAxisOverlay | None,
     mask_yx: np.ndarray,
 ) -> tuple[tuple[float, float] | None, Literal["primary", "mirrored"] | None]:
-    selected: TAxisOverlay | None
-    side: Literal["primary", "mirrored"] | None
-    if primary is None and mirrored is None:
-        return (None, None)
-    if primary is None:
-        selected = mirrored
-        side = "mirrored"
-    elif mirrored is None:
-        selected = primary
-        side = "primary"
-    else:
-        selected = _select_t_axis_overlay_by_coverage(
-            primary=primary,
-            mirrored=mirrored,
-            coverage_mask_yx=np.asarray(mask_yx, dtype=bool),
-        )
-        side = "mirrored" if selected is mirrored else "primary"
+    selected, side = _select_t_axis_overlay_for_mask_with_mirroring(
+        primary=primary,
+        mirrored=mirrored,
+        mask_yx=mask_yx,
+    )
     if selected is None:
         return (None, side)
     return (_t_axis_range_for_mask(t_axis_overlay=selected, mask_yx=mask_yx), side)
+
+
+def _select_t_axis_overlay_for_mask_with_mirroring(
+    *,
+    primary: TAxisOverlay | None,
+    mirrored: TAxisOverlay | None,
+    mask_yx: np.ndarray,
+) -> tuple[TAxisOverlay | None, Literal["primary", "mirrored"] | None]:
+    if primary is None and mirrored is None:
+        return (None, None)
+    if primary is None:
+        return (mirrored, "mirrored")
+    if mirrored is None:
+        return (primary, "primary")
+    selected = _select_t_axis_overlay_by_coverage(
+        primary=primary,
+        mirrored=mirrored,
+        coverage_mask_yx=np.asarray(mask_yx, dtype=bool),
+    )
+    side: Literal["primary", "mirrored"] = "mirrored" if selected is mirrored else "primary"
+    return (selected, side)
+
+
+def _t_axis_xy_for_t_value(*, t_axis_overlay: TAxisOverlay, t_value: float) -> np.ndarray | None:
+    xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
+    line_t = np.asarray(t_axis_overlay.line_t, dtype=np.float64)
+    if xy.ndim != 2 or xy.shape[1] != 2 or line_t.ndim != 1 or line_t.shape[0] != xy.shape[0]:
+        return None
+    valid = np.isfinite(xy).all(axis=1) & np.isfinite(line_t)
+    if not np.any(valid):
+        return None
+    xy = xy[valid]
+    line_t = line_t[valid]
+    target = float(np.clip(t_value, 0.0, 1.0))
+    idx = int(np.argmin(np.abs(line_t - target)))
+    return np.asarray(xy[idx], dtype=np.float64)
 
 
 def _moving_thumbnail_shape_yx(*, p1: P1Landmarks, target_spacing_um: float) -> tuple[int, int]:
@@ -567,6 +616,7 @@ def _write_syn_zoom_overlay_with_user_mask(
     moving_mask_yx: np.ndarray | None,
     user_mask_yx: np.ndarray,
     t_axis_overlay: TAxisOverlay | None,
+    t_axis_endpoint_markers: list[dict[str, object]],
     reflect_t_axis_midline: bool,
     out_png: Path,
     title: str,
@@ -747,6 +797,52 @@ def _write_syn_zoom_overlay_with_user_mask(
                             zorder=12,
                         )
 
+        if t_axis_endpoint_markers:
+            for marker in t_axis_endpoint_markers:
+                mask_name = str(marker.get("mask_name", "mask"))
+                for endpoint_key, endpoint_label in (("begin", "start"), ("end", "end")):
+                    xy = marker.get(f"{endpoint_key}_xy")
+                    t_val = marker.get(f"{endpoint_key}_t")
+                    if not isinstance(xy, np.ndarray):
+                        continue
+                    if not isinstance(t_val, (float, int)):
+                        continue
+                    xy_local = np.asarray(xy, dtype=np.float64).copy()
+                    if xy_local.shape != (2,):
+                        continue
+                    xy_local[0] -= float(lo[1])
+                    xy_local[1] -= float(lo[0])
+                    color = plt.get_cmap(T_AXIS_T_CMAP)(float(np.clip(float(t_val), 0.0, 1.0)))
+                    ax.scatter(
+                        [xy_local[0]],
+                        [xy_local[1]],
+                        s=70,
+                        c=["black"],
+                        marker="x",
+                        linewidths=2.2,
+                        alpha=0.95,
+                        zorder=13,
+                    )
+                    ax.scatter(
+                        [xy_local[0]],
+                        [xy_local[1]],
+                        s=46,
+                        c=[color],
+                        marker="x",
+                        linewidths=1.7,
+                        alpha=0.95,
+                        zorder=14,
+                    )
+                    ax.text(
+                        float(xy_local[0]) + 4.0,
+                        float(xy_local[1]) + 4.0,
+                        f"{mask_name} {endpoint_label}",
+                        color="white",
+                        fontsize=6,
+                        bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.45, "pad": 1.2},
+                        zorder=15,
+                    )
+
     fig.suptitle(title)
     plt.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -822,6 +918,7 @@ def _write_ccf_user_mask_overlay_png(
     moving_mask_yx = _ants_numpy_yx(moving_mask_ants) > 0 if moving_mask_ants is not None else None
     roi_mask_fixed_yx = np.zeros_like(fixed_yx, dtype=bool)
     warped_masks_fixed: list[tuple[int, str, np.ndarray]] = []
+    t_axis_endpoint_markers: list[dict[str, object]] = []
 
     per_mask_payload: list[dict[str, object]] = []
     for mask_index, mask_name, moving_mask_yx_single in roi_masks_moving:
@@ -884,16 +981,36 @@ def _write_ccf_user_mask_overlay_png(
                 side_filter="mirrored",
                 tick_step=0.1,
             )
-        t_range, selected_side = _t_axis_range_for_mask_with_mirroring(
+        selected_overlay, selected_side = _select_t_axis_overlay_for_mask_with_mirroring(
             primary=t_axis_overlay_primary_mask,
             mirrored=t_axis_overlay_mirrored_mask,
             mask_yx=fixed_mask_single,
+        )
+        t_range = (
+            _t_axis_range_for_mask(t_axis_overlay=selected_overlay, mask_yx=fixed_mask_single)
+            if selected_overlay is not None
+            else None
         )
         row["selected_side"] = selected_side
         if t_range is not None:
             row["has_overlap_with_t_axis"] = True
             row["begin"] = float(t_range[0])
             row["end"] = float(t_range[1])
+            if selected_overlay is not None:
+                begin_xy = _t_axis_xy_for_t_value(t_axis_overlay=selected_overlay, t_value=float(t_range[0]))
+                end_xy = _t_axis_xy_for_t_value(t_axis_overlay=selected_overlay, t_value=float(t_range[1]))
+                if begin_xy is not None and end_xy is not None:
+                    t_axis_endpoint_markers.append(
+                        {
+                            "mask_index": int(mask_index),
+                            "mask_name": str(mask_name),
+                            "selected_side": selected_side,
+                            "begin_t": float(t_range[0]),
+                            "end_t": float(t_range[1]),
+                            "begin_xy": begin_xy,
+                            "end_xy": end_xy,
+                        }
+                    )
         per_mask_payload.append(row)
 
     written: dict[str, Path] = {}
@@ -904,6 +1021,7 @@ def _write_ccf_user_mask_overlay_png(
             moving_mask_yx=moving_mask_yx,
             user_mask_yx=roi_mask_fixed_yx,
             t_axis_overlay=t_axis_overlay,
+            t_axis_endpoint_markers=t_axis_endpoint_markers,
             reflect_t_axis_midline=str(atlas_plane).lower() == "coronal",
             out_png=out_png,
             title=f"SyN(MI) zoom (masked) + user ROI | roi={roi}",
