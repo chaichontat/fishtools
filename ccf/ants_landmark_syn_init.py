@@ -15,11 +15,14 @@
 # %%
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
+import types
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import ants
@@ -477,6 +480,142 @@ def ants_numpy_yx(img: ants.ANTsImage) -> np.ndarray:
     return arr_xy.T
 
 
+@dataclass(frozen=True, slots=True)
+class TAxisOverlay:
+    line_xy: np.ndarray
+    tick_xy: np.ndarray
+    tick_labels: list[str]
+
+
+_MIDSURFACE_COORDS: types.ModuleType | None = None
+
+
+def _load_midsurface_coords_module() -> types.ModuleType:
+    global _MIDSURFACE_COORDS
+    if _MIDSURFACE_COORDS is not None:
+        return _MIDSURFACE_COORDS
+
+    script_path = Path(__file__).resolve().parent / "refextract" / "midsurface_coords.py"
+    if not script_path.exists():
+        raise FileNotFoundError(f"Missing midsurface_coords.py at {script_path}")
+
+    spec = importlib.util.spec_from_file_location("midsurface_coords", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load module from {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _MIDSURFACE_COORDS = module
+    return module
+
+
+def _compute_t_axis_overlay_for_fixed_view(
+    *,
+    fixed_view: ants.ANTsImage,
+    atlas_name: str,
+    atlas_plane: str,
+    atlas_slice_idx: int,
+    atlas_crop_bbox: tuple[int, int, int, int],
+    atlas_voxel_um: float,
+    tick_step: float = 0.2,
+    line_samples: int = 200,
+) -> TAxisOverlay | None:
+    expected_atlas_name = "kim_dev_mouse_e15-5_lsfm_20um"
+    if atlas_name != expected_atlas_name:
+        print(
+            f"Skipping t-axis overlay: atlas_name={atlas_name!r} != {expected_atlas_name!r} "
+            "(no matching precomputed midsurface columns)."
+        )
+        return None
+
+    atlas_plane = str(atlas_plane).lower()
+    if atlas_plane not in {"coronal", "sagittal"}:
+        print(f"Skipping t-axis overlay: unsupported atlas_plane={atlas_plane!r}.")
+        return None
+
+    outdir = (
+        Path(__file__).resolve().parent
+        / "out"
+        / "refextract"
+        / "midsurface_neocortex_mesocortex_allocortex_3d"
+    )
+    cols_path = outdir / ("coronal_midline_columns.csv" if atlas_plane == "coronal" else "sagittal_midline_columns.csv")
+    if not cols_path.exists():
+        print(f"Skipping t-axis overlay: missing precomputed midsurface columns at {cols_path}.")
+        return None
+
+    mod = _load_midsurface_coords_module()
+    if atlas_plane == "coronal":
+        cols_by_slice = mod.load_coronal_midline_columns(cols_path)
+        query = lambda t: mod.query_coronal_ijk(cols_by_slice, slice_i=int(atlas_slice_idx), t=float(t), r01=0.5)
+        ijk_to_row_col = lambda ijk: (float(ijk[1]), float(ijk[2]))
+    else:
+        cols_by_slice = mod.load_sagittal_midline_columns(cols_path)
+        query = lambda t: mod.query_sagittal_ijk(cols_by_slice, slice_k=int(atlas_slice_idx), t=float(t), r01=0.5)
+        # Our sagittal slice view is transposed: rows=j (x), cols=i (y).
+        ijk_to_row_col = lambda ijk: (float(ijk[1]), float(ijk[0]))
+
+    if not cols_by_slice:
+        print(f"Skipping t-axis overlay: empty midsurface columns loaded from {cols_path}.")
+        return None
+    if int(atlas_slice_idx) not in cols_by_slice:
+        print(f"Skipping t-axis overlay: slice {int(atlas_slice_idx)} not present in {cols_path.name}.")
+        return None
+
+    ar0, ar1, ac0, ac1 = (int(atlas_crop_bbox[0]), int(atlas_crop_bbox[1]), int(atlas_crop_bbox[2]), int(atlas_crop_bbox[3]))
+    spacing_mm = float(atlas_voxel_um) * UM_TO_MM
+    origin_x_mm, origin_y_mm = (float(fixed_view.origin[0]), float(fixed_view.origin[1]))
+    sp_x_mm, sp_y_mm = (float(fixed_view.spacing[0]), float(fixed_view.spacing[1]))
+
+    def _row_col_to_view_xy(row: float, col: float) -> tuple[float, float] | None:
+        if not np.isfinite(row) or not np.isfinite(col):
+            return None
+        row_c = float(row) - float(ar0)
+        col_c = float(col) - float(ac0)
+        if row_c < -0.5 or col_c < -0.5 or row_c > float(ar1 - ar0 - 0.5) or col_c > float(ac1 - ac0 - 0.5):
+            return None
+        x_mm = float(col_c) * spacing_mm
+        y_mm = float(row_c) * spacing_mm
+        x = (x_mm - origin_x_mm) / sp_x_mm
+        y = (y_mm - origin_y_mm) / sp_y_mm
+        if not np.isfinite(x) or not np.isfinite(y):
+            return None
+        return float(x), float(y)
+
+    line_samples = int(line_samples)
+    if line_samples < 2:
+        raise ValueError("line_samples must be >= 2.")
+    t_line = np.linspace(0.0, 1.0, line_samples, dtype=np.float64)
+    line_xy = np.full((t_line.shape[0], 2), np.nan, dtype=np.float64)
+    for idx, t in enumerate(t_line.tolist()):
+        ijk = query(float(t))
+        row, col = ijk_to_row_col(ijk)
+        xy = _row_col_to_view_xy(row, col)
+        if xy is not None:
+            line_xy[idx, 0] = xy[0]
+            line_xy[idx, 1] = xy[1]
+
+    ticks = np.arange(0.0, 1.0 + 1.0e-9, float(tick_step), dtype=np.float64)
+    tick_xy_list: list[tuple[float, float]] = []
+    tick_labels: list[str] = []
+    for t in ticks.tolist():
+        ijk = query(float(t))
+        row, col = ijk_to_row_col(ijk)
+        xy = _row_col_to_view_xy(row, col)
+        if xy is None:
+            continue
+        # Only label ticks that land inside the rendered view.
+        if 0.0 <= xy[0] < float(fixed_view.shape[0]) and 0.0 <= xy[1] < float(fixed_view.shape[1]):
+            tick_xy_list.append((xy[0], xy[1]))
+            tick_labels.append(f"t={float(t):.1f}")
+
+    tick_xy = np.asarray(tick_xy_list, dtype=np.float64).reshape(-1, 2)
+    if not np.any(np.isfinite(line_xy)):
+        return None
+
+    return TAxisOverlay(line_xy=line_xy, tick_xy=tick_xy, tick_labels=tick_labels)
+
+
 def qc_overlay_png(
     *,
     fixed_img: ants.ANTsImage,
@@ -484,6 +623,7 @@ def qc_overlay_png(
     out_png: Path,
     title: str,
     moving_mask_fixed: ants.ANTsImage | None = None,
+    t_axis_overlay: TAxisOverlay | None = None,
 ) -> None:
     f = normalize_robust(ants_numpy_yx(fixed_img).astype(np.float32))
     m = normalize_robust(ants_numpy_yx(moving_warped).astype(np.float32))
@@ -507,6 +647,32 @@ def qc_overlay_png(
     axes[2].imshow(overlay, interpolation="nearest", resample=False)
     axes[2].set_title("Overlay (magenta=fixed, green=warped moving)")
     axes[2].axis("off")
+    if t_axis_overlay is not None:
+        ax = axes[2]
+        xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
+        ax.plot(xy[:, 0], xy[:, 1], "-", color="cyan", lw=2.0, alpha=0.85, zorder=10)
+        if t_axis_overlay.tick_xy.size:
+            ticks_xy = np.asarray(t_axis_overlay.tick_xy, dtype=np.float64)
+            ax.scatter(
+                ticks_xy[:, 0],
+                ticks_xy[:, 1],
+                s=36,
+                c="cyan",
+                marker="o",
+                linewidths=0.0,
+                alpha=0.95,
+                zorder=11,
+            )
+            for (x, y), label in zip(ticks_xy.tolist(), t_axis_overlay.tick_labels, strict=False):
+                ax.text(
+                    float(x) + 4.0,
+                    float(y) - 4.0,
+                    str(label),
+                    color="white",
+                    fontsize=9,
+                    bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.45, "pad": 1.4},
+                    zorder=12,
+                )
     fig.suptitle(title)
     plt.tight_layout()
     plt.savefig(out_png, dpi=int(QC_SAVE_DPI))
@@ -2092,6 +2258,14 @@ def run_pipeline(
             transformlist=tx["fwdtransforms"],
             interpolator="nearestNeighbor",
         )
+        t_axis_overlay = _compute_t_axis_overlay_for_fixed_view(
+            fixed_view=fixed_zoom_vis,
+            atlas_name=str(ATLAS_NAME),
+            atlas_plane=str(ATLAS_PLANE),
+            atlas_slice_idx=int(ATLAS_SLICE_IDX),
+            atlas_crop_bbox=tuple(p1.atlas_crop_bbox),
+            atlas_voxel_um=float(ATLAS_VOXEL_UM),
+        )
         qc_overlay_png(
             fixed_img=fixed_zoom_vis,
             moving_warped=moving_zoom,
@@ -2106,6 +2280,7 @@ def run_pipeline(
             moving_warped=moving_zoom,
             moving_mask_fixed=mask_zoom,
             out_png=QC_ZOOM_MASKED_PNG,
+            t_axis_overlay=t_axis_overlay,
             title=(
                 f"SyN(MI) zoom (masked) | MI(opt,masked) {mi_before:.3f}→{mi_after:.3f} | "
                 f"MI(raw) {mi_before_raw:.3f}→{mi_after_raw:.3f} | lm_rmse={lm_err['rmse_mm']*1e3:.1f} µm"
