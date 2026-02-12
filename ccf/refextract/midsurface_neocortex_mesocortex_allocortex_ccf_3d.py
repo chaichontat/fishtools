@@ -62,12 +62,66 @@ OPEN_RADIUS_VOX = 0
 ERODE_RADIUS_VOX_BEFORE_EDT = 1
 MIDSURF_EPS = 0.03  # u-band around 0.5 (smaller => thinner but sparser)
 BBOX_PAD_VOX = 4  # compute EDT on a padded bounding box around the fit mask
-# Manual one-off overrides: connect split u=0.5 contours on these coronal slices.
-MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (183, 185, 233, 234, 235, 236, 237)
+# Manual one-off overrides: connect split u=0.5 contours on affected coronal slices.
+MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (
+    183,
+    184,
+    185,
+    230,
+    231,
+    233,
+    234,
+    235,
+    236,
+    237,
+    238,
+    239,
+    240,
+    241,
+    242,
+    246,
+    247,
+    248,
+    284,
+    289,
+    290,
+    291,
+    292,
+    293,
+    294,
+    295,
+    296,
+    297,
+    298,
+)
 MANUAL_CONNECT_CORONAL_PATH_TEMPLATE = "manual_coronal_midcurve_override_slice{slice_i}_yx.npy"
+# Manual one-off overrides: use only largest contour path on these coronal slices
+# to avoid snapping to tiny wall-adjacent fragments.
+MANUAL_KEEP_LARGEST_CORONAL_SLICE_IS: tuple[int, ...] = (230, 231, 232, 234, 235, 236, 237, 238, 239, 240, 241)
+# Slice-specific smoothing override in output coordinates:
+# rewrite target slice as midpoint interpolation between two neighboring manual paths.
+MANUAL_BLEND_CORONAL_NEIGHBOR_SLICES: dict[int, tuple[int, int]] = {233: (232, 234)}
+# Slice-specific direction correction: enforce the target path orientation to match the previous slice.
+MANUAL_ALIGN_CORONAL_DIRECTION_WITH_PREV_SLICE_IS: tuple[int, ...] = (242, 246, 247, 248, 249)
 # Manual one-off overrides: connect split u=0.5 contours on these sagittal slices.
 MANUAL_CONNECT_SAGITTAL_SLICE_KS: tuple[int, ...] = (212, 213, 214, 215, 216, 217, 218, 219)
 MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE = "manual_sagittal_midcurve_override_slice{slice_k}_yx.npy"
+# Manual one-off overrides: keep only the largest sagittal contour path (ignore short disconnected segments).
+MANUAL_KEEP_LARGEST_SAGITTAL_SLICE_KS: tuple[int, ...] = (
+    176,
+    177,
+    178,
+    179,
+    180,
+    181,
+    182,
+    183,
+    184,
+    185,
+    186,
+    187,
+    188,
+)
 
 # Visualization sampling.
 PLOT_MAX_MASK_POINTS = 80_000
@@ -116,6 +170,23 @@ def _polyline_length(path_yx: np.ndarray) -> float:
         return 0.0
     d = np.diff(path_yx.astype(np.float64, copy=False), axis=0)
     return float(np.sum(np.sqrt(np.sum(d * d, axis=1))))
+
+
+def _resample_polyline(path_yx: np.ndarray, *, n_points: int) -> np.ndarray:
+    if path_yx.ndim != 2 or path_yx.shape[1] != 2 or path_yx.shape[0] < 2:
+        raise ValueError(f"Expected path shape (N,2) with N>=2, got {path_yx.shape}.")
+    if int(n_points) < 2:
+        raise ValueError("n_points must be >=2.")
+    pts = path_yx.astype(np.float64, copy=False)
+    seg = np.sqrt(np.sum(np.diff(pts, axis=0) ** 2, axis=1))
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(s[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        return np.repeat(pts[:1], int(n_points), axis=0).astype(np.float64, copy=False)
+    q = np.linspace(0.0, total, int(n_points), dtype=np.float64)
+    y = np.interp(q, s, pts[:, 0])
+    x = np.interp(q, s, pts[:, 1])
+    return np.column_stack([y, x]).astype(np.float64, copy=False)
 
 
 def _connect_two_largest_u05_contours_in_slice(
@@ -202,6 +273,30 @@ def _connect_two_largest_u05_contours_in_slice(
     x_arr = np.asarray(x_idx, dtype=np.int64)
     uniq = np.unique(np.column_stack([y_arr, x_arr]), axis=0)
     return out, uniq[:, 0].astype(np.int64, copy=False), uniq[:, 1].astype(np.int64, copy=False), merged_path
+
+
+def _extract_largest_u05_contour_in_slice(
+    *,
+    u_yx: np.ndarray,
+    mask_yx: np.ndarray,
+    include_yx: np.ndarray,
+) -> np.ndarray | None:
+    valid = (mask_yx & include_yx).astype(bool, copy=False)
+    if not np.any(valid):
+        return None
+    vals = u_yx[valid]
+    finite = np.isfinite(vals)
+    if not np.any(finite):
+        return None
+    min_v = float(np.min(vals[finite]))
+    max_v = float(np.max(vals[finite]))
+    if not (min_v <= 0.5 <= max_v):
+        return None
+    contours = find_contours(u_yx.astype(np.float64, copy=False), level=0.5, mask=valid)
+    contours = [np.asarray(c, dtype=np.float64) for c in contours if np.asarray(c).shape[0] >= 2]
+    if not contours:
+        return None
+    return max(contours, key=_polyline_length)
 
 
 def _mask_to_xyz_um(
@@ -513,6 +608,129 @@ for manual_slice_i in MANUAL_CONNECT_CORONAL_SLICE_IS:
             f"[{z0}, {z0 + u_crop.shape[0] - 1}]; skipping manual contour connection."
         )
 
+for manual_slice_i in MANUAL_KEEP_LARGEST_CORONAL_SLICE_IS:
+    local_override_i = int(manual_slice_i) - int(z0)
+    if 0 <= local_override_i < int(u_crop.shape[0]):
+        largest_path = _extract_largest_u05_contour_in_slice(
+            u_yx=u_crop[local_override_i, :, :],
+            mask_yx=mask_crop[local_override_i, :, :],
+            include_yx=include_crop[local_override_i, :, :],
+        )
+        if largest_path is None or largest_path.shape[0] < 2:
+            print(
+                f"[manual] coronal slice {int(manual_slice_i)}: "
+                "no valid largest u=0.5 contour for manual override."
+            )
+            continue
+        largest_path_full = largest_path.copy()
+        largest_path_full[:, 0] += float(y0)
+        largest_path_full[:, 1] += float(x0)
+        out_name = MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(manual_slice_i))
+        np.save(OUTDIR / out_name, largest_path_full.astype(np.float32, copy=False))
+        print(
+            f"[manual] coronal slice {int(manual_slice_i)}: "
+            f"saved largest u=0.5 contour override with {int(largest_path.shape[0])} points"
+        )
+    else:
+        print(
+            f"[manual] coronal slice {int(manual_slice_i)} outside crop "
+            f"[{z0}, {z0 + u_crop.shape[0] - 1}]; skipping largest-contour override."
+        )
+
+for target_slice_i, (prev_slice_i, next_slice_i) in MANUAL_BLEND_CORONAL_NEIGHBOR_SLICES.items():
+    prev_path = OUTDIR / MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(prev_slice_i))
+    next_path = OUTDIR / MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(next_slice_i))
+    if not prev_path.exists() or not next_path.exists():
+        print(
+            f"[manual] coronal slice {int(target_slice_i)}: missing neighbor manual paths "
+            f"({prev_path.name}, {next_path.name}); skipping blend override."
+        )
+        continue
+    path_prev = np.load(prev_path).astype(np.float64, copy=False)
+    path_next = np.load(next_path).astype(np.float64, copy=False)
+    if path_prev.ndim != 2 or path_prev.shape[1] != 2 or path_prev.shape[0] < 2:
+        print(f"[manual] coronal slice {int(target_slice_i)}: invalid prev path; skipping blend override.")
+        continue
+    if path_next.ndim != 2 or path_next.shape[1] != 2 or path_next.shape[0] < 2:
+        print(f"[manual] coronal slice {int(target_slice_i)}: invalid next path; skipping blend override.")
+        continue
+    n_points = max(64, int((path_prev.shape[0] + path_next.shape[0]) // 2))
+    prev_rs = _resample_polyline(path_prev, n_points=int(n_points))
+    next_rs = _resample_polyline(path_next, n_points=int(n_points))
+    fwd = float(np.linalg.norm(prev_rs[0] - next_rs[0]) + np.linalg.norm(prev_rs[-1] - next_rs[-1]))
+    rev = float(np.linalg.norm(prev_rs[0] - next_rs[-1]) + np.linalg.norm(prev_rs[-1] - next_rs[0]))
+    if rev < fwd:
+        next_rs = next_rs[::-1]
+    blended = 0.5 * (prev_rs + next_rs)
+    out_name = MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(target_slice_i))
+    np.save(OUTDIR / out_name, blended.astype(np.float32, copy=False))
+    print(
+        f"[manual] coronal slice {int(target_slice_i)}: "
+        f"saved blended override from slices {int(prev_slice_i)} and {int(next_slice_i)} "
+        f"with {int(blended.shape[0])} points"
+    )
+
+for target_slice_i in MANUAL_ALIGN_CORONAL_DIRECTION_WITH_PREV_SLICE_IS:
+    prev_slice_i = int(target_slice_i) - 1
+    prev_path_file = OUTDIR / MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(prev_slice_i))
+    target_path_file = OUTDIR / MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(target_slice_i))
+    for slice_i_for_path, path_file in ((int(prev_slice_i), prev_path_file), (int(target_slice_i), target_path_file)):
+        if path_file.exists():
+            continue
+        local_i = int(slice_i_for_path) - int(z0)
+        if not (0 <= local_i < int(u_crop.shape[0])):
+            print(
+                f"[manual] coronal slice {int(target_slice_i)}: needed slice {int(slice_i_for_path)} is outside crop "
+                f"[{z0}, {z0 + u_crop.shape[0] - 1}]; skipping direction alignment."
+            )
+            break
+        largest_path = _extract_largest_u05_contour_in_slice(
+            u_yx=u_crop[local_i, :, :],
+            mask_yx=mask_crop[local_i, :, :],
+            include_yx=include_crop[local_i, :, :],
+        )
+        if largest_path is None or largest_path.shape[0] < 2:
+            print(
+                f"[manual] coronal slice {int(target_slice_i)}: could not build largest contour for "
+                f"slice {int(slice_i_for_path)}; skipping direction alignment."
+            )
+            break
+        largest_full = largest_path.copy()
+        largest_full[:, 0] += float(y0)
+        largest_full[:, 1] += float(x0)
+        np.save(path_file, largest_full.astype(np.float32, copy=False))
+        print(
+            f"[manual] coronal slice {int(target_slice_i)}: "
+            f"saved largest u=0.5 contour for slice {int(slice_i_for_path)} "
+            f"to support direction alignment ({int(largest_path.shape[0])} points)"
+        )
+    else:
+        prev_path = np.load(prev_path_file).astype(np.float64, copy=False)
+        target_path = np.load(target_path_file).astype(np.float64, copy=False)
+        if prev_path.ndim != 2 or prev_path.shape[1] != 2 or prev_path.shape[0] < 2:
+            print(f"[manual] coronal slice {int(target_slice_i)}: invalid prev path; skipping direction alignment.")
+            continue
+        if target_path.ndim != 2 or target_path.shape[1] != 2 or target_path.shape[0] < 2:
+            print(f"[manual] coronal slice {int(target_slice_i)}: invalid target path; skipping direction alignment.")
+            continue
+        n_points = max(64, min(int(prev_path.shape[0]), int(target_path.shape[0])))
+        prev_rs = _resample_polyline(prev_path, n_points=int(n_points))
+        target_rs = _resample_polyline(target_path, n_points=int(n_points))
+        fwd = float(np.linalg.norm(prev_rs[0] - target_rs[0]) + np.linalg.norm(prev_rs[-1] - target_rs[-1]))
+        rev = float(np.linalg.norm(prev_rs[0] - target_rs[-1]) + np.linalg.norm(prev_rs[-1] - target_rs[0]))
+        if rev < fwd:
+            np.save(target_path_file, target_path[::-1].astype(np.float32, copy=False))
+            print(
+                f"[manual] coronal slice {int(target_slice_i)}: reversed path direction to match "
+                f"slice {int(prev_slice_i)} (forward={fwd:.3f}, reversed={rev:.3f})"
+            )
+        else:
+            print(
+                f"[manual] coronal slice {int(target_slice_i)}: kept path direction "
+                f"(forward={fwd:.3f}, reversed={rev:.3f})"
+            )
+        continue
+
 for manual_slice_k in MANUAL_CONNECT_SAGITTAL_SLICE_KS:
     local_override_k = int(manual_slice_k) - int(x0)
     if 0 <= local_override_k < int(u_crop.shape[2]):
@@ -543,6 +761,35 @@ for manual_slice_k in MANUAL_CONNECT_SAGITTAL_SLICE_KS:
         print(
             f"[manual] sagittal slice {int(manual_slice_k)} outside crop "
             f"[{x0}, {x0 + u_crop.shape[2] - 1}]; skipping manual contour connection."
+        )
+
+for manual_slice_k in MANUAL_KEEP_LARGEST_SAGITTAL_SLICE_KS:
+    local_override_k = int(manual_slice_k) - int(x0)
+    if 0 <= local_override_k < int(u_crop.shape[2]):
+        largest_path = _extract_largest_u05_contour_in_slice(
+            u_yx=u_crop[:, :, local_override_k],
+            mask_yx=mask_crop[:, :, local_override_k],
+            include_yx=include_crop[:, :, local_override_k],
+        )
+        if largest_path is None or largest_path.shape[0] < 2:
+            print(
+                f"[manual] sagittal slice {int(manual_slice_k)}: "
+                "no valid largest u=0.5 contour for manual override."
+            )
+            continue
+        largest_path_full = largest_path.copy()
+        largest_path_full[:, 0] += float(z0)
+        largest_path_full[:, 1] += float(y0)
+        out_name = MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE.format(slice_k=int(manual_slice_k))
+        np.save(OUTDIR / out_name, largest_path_full.astype(np.float32, copy=False))
+        print(
+            f"[manual] sagittal slice {int(manual_slice_k)}: "
+            f"saved largest u=0.5 contour override with {int(largest_path.shape[0])} points"
+        )
+    else:
+        print(
+            f"[manual] sagittal slice {int(manual_slice_k)} outside crop "
+            f"[{x0}, {x0 + u_crop.shape[2] - 1}]; skipping largest-contour override."
         )
 
 u = np.zeros(cortex_fit_3d.shape, dtype=np.float32)

@@ -104,6 +104,8 @@ def _load_manual_override_paths(outdir: Path, *, axis: str) -> dict[int, np.ndar
         if not stem.startswith(prefix):
             continue
         tail = stem[len(prefix) :]
+        if tail.endswith("_yx"):
+            tail = tail[: -len("_yx")]
         if not tail.isdigit():
             continue
         arr = np.load(path).astype(np.float32, copy=False)

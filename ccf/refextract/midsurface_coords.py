@@ -10,7 +10,37 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 from skimage.measure import find_contours
 
-MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (183, 185, 233, 234, 235, 236, 237)
+MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (
+    183,
+    184,
+    185,
+    230,
+    231,
+    233,
+    234,
+    235,
+    236,
+    237,
+    238,
+    239,
+    240,
+    241,
+    242,
+    246,
+    247,
+    248,
+    284,
+    289,
+    290,
+    291,
+    292,
+    293,
+    294,
+    295,
+    296,
+    297,
+    298,
+)
 MANUAL_CONNECT_CORONAL_PATH_TEMPLATE = "manual_coronal_midcurve_override_slice{slice_i}_yx.npy"
 MANUAL_CONNECT_SAGITTAL_SLICE_KS: tuple[int, ...] = (212, 213, 214, 215, 216, 217, 218, 219)
 MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE = "manual_sagittal_midcurve_override_slice{slice_k}_yx.npy"
@@ -178,8 +208,6 @@ def _extract_largest_midline_contour(u_yx: np.ndarray, mask_yx: np.ndarray) -> n
 
 
 def _load_manual_coronal_override_path(outdir: Path, *, slice_i: int) -> np.ndarray | None:
-    if int(slice_i) not in set(MANUAL_CONNECT_CORONAL_SLICE_IS):
-        return None
     path = outdir / MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(slice_i))
     if not path.exists():
         return None
@@ -192,8 +220,6 @@ def _load_manual_coronal_override_path(outdir: Path, *, slice_i: int) -> np.ndar
 
 
 def _load_manual_sagittal_override_path(outdir: Path, *, slice_k: int) -> np.ndarray | None:
-    if int(slice_k) not in set(MANUAL_CONNECT_SAGITTAL_SLICE_KS):
-        return None
     path = outdir / MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE.format(slice_k=int(slice_k))
     if not path.exists():
         return None
