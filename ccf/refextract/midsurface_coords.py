@@ -49,6 +49,8 @@ CORONAL_T_SMOOTH_N_T = 257
 SAGITTAL_T_SMOOTH_WINDOW_SLICES = 5
 SAGITTAL_T_SMOOTH_N_T = 257
 SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS: tuple[int, ...] = (173, 174, 175)
+CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES = 9
+SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES = 9
 
 
 @dataclass(frozen=True)
@@ -340,11 +342,123 @@ def _nonzero_include_slice_keys(outdir: Path, *, axis: Literal["coronal", "sagit
     return keys
 
 
+def _load_neocortex_mesocortex_overlay_mask(outdir: Path, *, fallback_mask: np.ndarray) -> np.ndarray:
+    path = outdir / "overlay_neocortex_mesocortex_no_allocortex_3d_ds.npy"
+    if path.exists():
+        overlay = np.load(path).astype(bool, copy=False)
+        if overlay.shape != fallback_mask.shape:
+            raise ValueError(
+                "overlay_neocortex_mesocortex_no_allocortex_3d_ds.npy shape mismatch: "
+                f"{overlay.shape} vs {fallback_mask.shape}."
+            )
+        return overlay
+    print(
+        "[midline] overlay_neocortex_mesocortex_no_allocortex_3d_ds.npy missing; "
+        "falling back to include-mask for t remapping."
+    )
+    return np.asarray(fallback_mask, dtype=bool)
+
+
 def _polyline_length(path_yx: np.ndarray) -> float:
     if path_yx.ndim != 2 or path_yx.shape[0] < 2 or path_yx.shape[1] != 2:
         return 0.0
     d = np.diff(path_yx.astype(np.float64, copy=False), axis=0)
     return float(np.sum(np.sqrt(np.sum(d * d, axis=1))))
+
+
+def _normalized_arc_t_for_path(path_yx: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    yx = _dedupe_consecutive_points(path_yx)
+    if yx.shape[0] < 2:
+        raise ValueError("Path must have at least 2 unique points.")
+    y = yx[:, 0].astype(np.float64, copy=False)
+    x = yx[:, 1].astype(np.float64, copy=False)
+    seg = np.sqrt(np.sum(np.diff(yx, axis=0) ** 2, axis=1))
+    s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(seg, dtype=np.float64)])
+    total = float(s[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("Path had invalid arc-length.")
+    t = (s / total).astype(np.float64, copy=False)
+    return y, x, t
+
+
+def _t_anchor_range_from_overlap(
+    *,
+    y: np.ndarray,
+    x: np.ndarray,
+    t: np.ndarray,
+    overlap_mask_yx: np.ndarray,
+) -> tuple[float, float] | None:
+    overlap_mask = np.asarray(overlap_mask_yx, dtype=bool)
+    if overlap_mask.ndim != 2:
+        raise ValueError(f"Expected 2D overlap mask, got shape={overlap_mask.shape}.")
+    if y.shape != x.shape or y.shape != t.shape:
+        raise ValueError(f"Shape mismatch for y/x/t: {y.shape}, {x.shape}, {t.shape}.")
+
+    yi = np.clip(np.rint(y).astype(np.int64, copy=False), 0, overlap_mask.shape[0] - 1)
+    xi = np.clip(np.rint(x).astype(np.int64, copy=False), 0, overlap_mask.shape[1] - 1)
+    inside = overlap_mask[yi, xi]
+    inside_idx = np.flatnonzero(inside).astype(np.int64, copy=False)
+    if inside_idx.size < 2:
+        return None
+    i0 = int(inside_idx[0])
+    i1 = int(inside_idx[-1])
+    if i1 <= i0:
+        return None
+    t0 = float(t[i0])
+    t1 = float(t[i1])
+    if not np.isfinite(t0) or not np.isfinite(t1) or (t1 - t0) <= 1.0e-9:
+        return None
+    return (t0, t1)
+
+
+def _raw_t_anchor_range_for_path(path_yx: np.ndarray, overlap_mask_yx: np.ndarray) -> tuple[float, float] | None:
+    try:
+        y, x, t = _normalized_arc_t_for_path(path_yx)
+    except ValueError:
+        return None
+    return _t_anchor_range_from_overlap(y=y, x=x, t=t, overlap_mask_yx=overlap_mask_yx)
+
+
+def _smooth_t_anchor_ranges_by_slice(
+    raw_anchors: dict[int, tuple[float, float]],
+    *,
+    window_slices: int,
+    exclude_slice_keys: set[int] | None = None,
+) -> dict[int, tuple[float, float]]:
+    if not raw_anchors:
+        return {}
+    if window_slices <= 1 or len(raw_anchors) < 3:
+        return {int(k): (float(v[0]), float(v[1])) for k, v in raw_anchors.items()}
+    if window_slices % 2 == 0:
+        raise ValueError(f"window_slices must be odd, got {window_slices}.")
+
+    keys = np.asarray(sorted(int(k) for k in raw_anchors.keys()), dtype=np.int32)
+    excluded = set() if exclude_slice_keys is None else {int(k) for k in exclude_slice_keys}
+    vals = np.full((keys.size, 2), np.nan, dtype=np.float64)
+    for idx, key in enumerate(keys.tolist()):
+        t0, t1 = raw_anchors[int(key)]
+        vals[idx, 0] = float(t0)
+        vals[idx, 1] = float(t1)
+
+    smooth_src = vals.copy()
+    for idx, key in enumerate(keys.tolist()):
+        if int(key) in excluded:
+            smooth_src[idx, :] = np.nan
+
+    smoothed = _nanmean_sliding_rows(smooth_src, radius=int(window_slices // 2))
+    out: dict[int, tuple[float, float]] = {}
+    for idx, key in enumerate(keys.tolist()):
+        raw_t0, raw_t1 = raw_anchors[int(key)]
+        if int(key) in excluded:
+            out[int(key)] = (float(raw_t0), float(raw_t1))
+            continue
+        t0 = float(smoothed[idx, 0])
+        t1 = float(smoothed[idx, 1])
+        if np.isfinite(t0) and np.isfinite(t1) and (t1 - t0) > 1.0e-9:
+            out[int(key)] = (t0, t1)
+        else:
+            out[int(key)] = (float(raw_t0), float(raw_t1))
+    return out
 
 
 def _dedupe_consecutive_points(path_yx: np.ndarray) -> np.ndarray:
@@ -482,19 +596,29 @@ def _build_slice_columns(
     mask_yx: np.ndarray,
     res_y_um: float,
     res_x_um: float,
+    overlap_mask_yx: np.ndarray | None = None,
+    t_anchor_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    yx = _dedupe_consecutive_points(path_yx)
-    if yx.shape[0] < 2:
-        raise ValueError(f"Slice {slice_index}: midline contour had fewer than 2 unique points.")
-
-    y = yx[:, 0].astype(np.float64, copy=False)
-    x = yx[:, 1].astype(np.float64, copy=False)
-    seg = np.sqrt(np.sum(np.diff(yx, axis=0) ** 2, axis=1))
-    s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(seg, dtype=np.float64)])
-    total = float(s[-1])
-    if not np.isfinite(total) or total <= 0.0:
-        raise ValueError(f"Slice {slice_index}: invalid contour arc-length.")
-    t = (s / total).astype(np.float64, copy=False)
+    y, x, t = _normalized_arc_t_for_path(path_yx)
+    if t_anchor_range is not None:
+        t0 = float(t_anchor_range[0])
+        t1 = float(t_anchor_range[1])
+        den = t1 - t0
+        if np.isfinite(den) and den > 1.0e-9:
+            t = ((t - t0) / den).astype(np.float64, copy=False)
+    elif overlap_mask_yx is not None:
+        overlap_mask = np.asarray(overlap_mask_yx, dtype=bool)
+        if overlap_mask.shape != mask_yx.shape:
+            raise ValueError(
+                f"Slice {slice_index}: overlap mask shape mismatch: {overlap_mask.shape} vs {mask_yx.shape}."
+            )
+        t_anchor = _t_anchor_range_from_overlap(y=y, x=x, t=t, overlap_mask_yx=overlap_mask)
+        if t_anchor is not None:
+            t0 = float(t_anchor[0])
+            t1 = float(t_anchor[1])
+            den = t1 - t0
+            if np.isfinite(den) and den > 1.0e-9:
+                t = ((t - t0) / den).astype(np.float64, copy=False)
 
     dt = np.gradient(t)
     dy = np.gradient(y)
@@ -509,7 +633,7 @@ def _build_slice_columns(
     ok = n_norm > 0.0
     ny = np.divide(ny, n_norm, out=np.zeros_like(ny), where=ok)
     nx = np.divide(nx, n_norm, out=np.zeros_like(nx), where=ok)
-    for idx in range(1, yx.shape[0]):
+    for idx in range(1, y.shape[0]):
         if not np.isfinite(ny[idx - 1]) or not np.isfinite(nx[idx - 1]):
             continue
         if not np.isfinite(ny[idx]) or not np.isfinite(nx[idx]):
@@ -518,10 +642,10 @@ def _build_slice_columns(
             ny[idx] = -ny[idx]
             nx[idx] = -nx[idx]
 
-    t_neg = np.full((yx.shape[0],), np.nan, dtype=np.float64)
-    t_pos = np.full((yx.shape[0],), np.nan, dtype=np.float64)
+    t_neg = np.full((y.shape[0],), np.nan, dtype=np.float64)
+    t_pos = np.full((y.shape[0],), np.nan, dtype=np.float64)
     max_t = float(np.hypot(*mask_yx.shape)) + 4.0
-    for idx in range(yx.shape[0]):
+    for idx in range(y.shape[0]):
         p = np.array([y[idx], x[idx]], dtype=np.float64)
         n = np.array([ny[idx], nx[idx]], dtype=np.float64)
         if not np.isfinite(n).all() or float(np.linalg.norm(n)) <= 0.0:
@@ -539,12 +663,12 @@ def _build_slice_columns(
         if np.isfinite(med_dx) and abs(med_dx) >= 0.25:
             init_prefer_b0_as_vent = bool(med_dx >= 0.0) if midline_is_high_x else bool(med_dx < 0.0)
 
-    vent_yx = np.full((yx.shape[0], 2), np.nan, dtype=np.float64)
-    pia_yx = np.full((yx.shape[0], 2), np.nan, dtype=np.float64)
+    vent_yx = np.full((y.shape[0], 2), np.nan, dtype=np.float64)
+    pia_yx = np.full((y.shape[0], 2), np.nan, dtype=np.float64)
     prev_vent: np.ndarray | None = None
     prev_pia: np.ndarray | None = None
 
-    for idx in range(yx.shape[0]):
+    for idx in range(y.shape[0]):
         if not np.isfinite(t_neg[idx]) or not np.isfinite(t_pos[idx]):
             continue
         if float(t_pos[idx]) <= float(t_neg[idx]):
@@ -622,6 +746,7 @@ def _save_sagittal_midline_columns_csv(csv_path: Path, columns: dict[int, Sagitt
 
 def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, CoronalMidlineColumns]:
     u_3d, mask_3d, include_3d = _load_halfway_u_and_masks(outdir)
+    overlay_3d = _load_neocortex_mesocortex_overlay_mask(outdir, fallback_mask=include_3d)
     res = _load_resolution_ds_ijk_um(outdir) or (1.0, 1.0, 1.0)
     res_j_um = float(res[1])
     res_k_um = float(res[2])
@@ -629,7 +754,8 @@ def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Cor
     n_slices = int(u_3d.shape[0])
     print(f"[midline] deriving coronal columns from halfway_u: slices={n_slices}")
 
-    out: dict[int, CoronalMidlineColumns] = {}
+    prepared: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    raw_anchor_ranges: dict[int, tuple[float, float]] = {}
     for slice_i in range(u_3d.shape[0]):
         if slice_i % 50 == 0 or slice_i == (n_slices - 1):
             print(f"[midline] coronal progress {slice_i + 1}/{n_slices}")
@@ -641,12 +767,38 @@ def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Cor
             path = _extract_largest_midline_contour(u_3d[slice_i, :, :], mask_yx)
         if path is None:
             continue
+        overlap_yx = overlay_3d[slice_i, :, :]
+        prepared[int(slice_i)] = (
+            np.asarray(path, dtype=np.float64),
+            np.asarray(mask_yx, dtype=bool),
+            np.asarray(overlap_yx, dtype=bool),
+        )
+        anchor = _raw_t_anchor_range_for_path(path, overlap_yx)
+        if anchor is not None:
+            raw_anchor_ranges[int(slice_i)] = (float(anchor[0]), float(anchor[1]))
+
+    if not prepared:
+        raise ValueError(
+            f"Could not derive coronal midline columns from halfway_u_3d_ds.npy in {outdir}. "
+            "Expected u=0.5 contours inside the cortex include-mask."
+        )
+
+    anchor_ranges = _smooth_t_anchor_ranges_by_slice(
+        raw_anchor_ranges,
+        window_slices=int(CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES),
+        exclude_slice_keys=None,
+    )
+    out: dict[int, CoronalMidlineColumns] = {}
+    for slice_i in sorted(prepared.keys()):
+        path_yx, mask_yx, overlap_yx = prepared[int(slice_i)]
         t, y, x, vent_yx, pia_yx, thickness_um = _build_slice_columns(
             slice_index=int(slice_i),
-            path_yx=path,
+            path_yx=path_yx,
             mask_yx=mask_yx,
             res_y_um=res_j_um,
             res_x_um=res_k_um,
+            overlap_mask_yx=overlap_yx,
+            t_anchor_range=anchor_ranges.get(int(slice_i)),
         )
         out[int(slice_i)] = CoronalMidlineColumns(
             slice_i=int(slice_i),
@@ -660,11 +812,11 @@ def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Cor
             thickness_um=thickness_um,
         )
 
-    if not out:
-        raise ValueError(
-            f"Could not derive coronal midline columns from halfway_u_3d_ds.npy in {outdir}. "
-            "Expected u=0.5 contours inside the cortex include-mask."
-        )
+    print(
+        f"[midline] coronal t-anchor smoothing: "
+        f"raw={len(raw_anchor_ranges)} smoothed={len(anchor_ranges)} "
+        f"window={int(CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES)}"
+    )
     if int(CORONAL_T_SMOOTH_WINDOW_SLICES) > 1:
         out = _smooth_coronal_midline_xy_across_slices(
             out,
@@ -683,6 +835,7 @@ def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Cor
 
 def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, SagittalMidlineColumns]:
     u_3d, mask_3d, include_3d = _load_halfway_u_and_masks(outdir)
+    overlay_3d = _load_neocortex_mesocortex_overlay_mask(outdir, fallback_mask=include_3d)
     res = _load_resolution_ds_ijk_um(outdir) or (1.0, 1.0, 1.0)
     res_i_um = float(res[0])
     res_j_um = float(res[1])
@@ -690,7 +843,8 @@ def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Sa
     n_slices = int(u_3d.shape[2])
     print(f"[midline] deriving sagittal columns from halfway_u: slices={n_slices}")
 
-    out: dict[int, SagittalMidlineColumns] = {}
+    prepared: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    raw_anchor_ranges: dict[int, tuple[float, float]] = {}
     for slice_k in range(u_3d.shape[2]):
         if slice_k % 50 == 0 or slice_k == (n_slices - 1):
             print(f"[midline] sagittal progress {slice_k + 1}/{n_slices}")
@@ -702,12 +856,38 @@ def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Sa
             path = _extract_largest_midline_contour(u_3d[:, :, slice_k], mask_yx)
         if path is None:
             continue
+        overlap_yx = overlay_3d[:, :, slice_k]
+        prepared[int(slice_k)] = (
+            np.asarray(path, dtype=np.float64),
+            np.asarray(mask_yx, dtype=bool),
+            np.asarray(overlap_yx, dtype=bool),
+        )
+        anchor = _raw_t_anchor_range_for_path(path, overlap_yx)
+        if anchor is not None:
+            raw_anchor_ranges[int(slice_k)] = (float(anchor[0]), float(anchor[1]))
+
+    if not prepared:
+        raise ValueError(
+            f"Could not derive sagittal midline columns from halfway_u_3d_ds.npy in {outdir}. "
+            "Expected u=0.5 contours inside the cortex include-mask."
+        )
+
+    anchor_ranges = _smooth_t_anchor_ranges_by_slice(
+        raw_anchor_ranges,
+        window_slices=int(SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES),
+        exclude_slice_keys={int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS},
+    )
+    out: dict[int, SagittalMidlineColumns] = {}
+    for slice_k in sorted(prepared.keys()):
+        path_yx, mask_yx, overlap_yx = prepared[int(slice_k)]
         t, y, x, vent_yx, pia_yx, thickness_um = _build_slice_columns(
             slice_index=int(slice_k),
-            path_yx=path,
+            path_yx=path_yx,
             mask_yx=mask_yx,
             res_y_um=res_i_um,
             res_x_um=res_j_um,
+            overlap_mask_yx=overlap_yx,
+            t_anchor_range=anchor_ranges.get(int(slice_k)),
         )
         out[int(slice_k)] = SagittalMidlineColumns(
             slice_k=int(slice_k),
@@ -721,11 +901,12 @@ def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Sa
             thickness_um=thickness_um,
         )
 
-    if not out:
-        raise ValueError(
-            f"Could not derive sagittal midline columns from halfway_u_3d_ds.npy in {outdir}. "
-            "Expected u=0.5 contours inside the cortex include-mask."
-        )
+    print(
+        f"[midline] sagittal t-anchor smoothing: "
+        f"raw={len(raw_anchor_ranges)} smoothed={len(anchor_ranges)} "
+        f"window={int(SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES)} "
+        f"exclude={tuple(int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS)}"
+    )
     if int(SAGITTAL_T_SMOOTH_WINDOW_SLICES) > 1:
         out = _smooth_sagittal_midline_xy_across_slices(
             out,
