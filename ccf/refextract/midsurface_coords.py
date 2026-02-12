@@ -44,6 +44,11 @@ MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (
 MANUAL_CONNECT_CORONAL_PATH_TEMPLATE = "manual_coronal_midcurve_override_slice{slice_i}_yx.npy"
 MANUAL_CONNECT_SAGITTAL_SLICE_KS: tuple[int, ...] = (212, 213, 214, 215, 216, 217, 218, 219)
 MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE = "manual_sagittal_midcurve_override_slice{slice_k}_yx.npy"
+CORONAL_T_SMOOTH_WINDOW_SLICES = 5
+CORONAL_T_SMOOTH_N_T = 257
+SAGITTAL_T_SMOOTH_WINDOW_SLICES = 5
+SAGITTAL_T_SMOOTH_N_T = 257
+SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS: tuple[int, ...] = (173, 174, 175)
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,106 @@ def _fill_nan_series(values: np.ndarray) -> np.ndarray:
     return out
 
 
+def _interp_series_on_t_grid(*, t: np.ndarray, values: np.ndarray, t_grid: np.ndarray) -> np.ndarray:
+    t_vals = np.asarray(t, dtype=np.float64)
+    v_vals = np.asarray(values, dtype=np.float64)
+    t_out = np.asarray(t_grid, dtype=np.float64)
+    if t_vals.ndim != 1 or v_vals.ndim != 1:
+        raise ValueError(f"Expected 1D arrays, got t={t_vals.shape} values={v_vals.shape}.")
+    if t_vals.shape != v_vals.shape:
+        raise ValueError(f"Shape mismatch: t={t_vals.shape} values={v_vals.shape}.")
+    if t_out.ndim != 1:
+        raise ValueError(f"Expected 1D t_grid, got {t_out.shape}.")
+
+    finite = np.isfinite(t_vals) & np.isfinite(v_vals)
+    if int(np.count_nonzero(finite)) < 2:
+        return np.full(t_out.shape, np.nan, dtype=np.float64)
+
+    t_f = t_vals[finite]
+    v_f = v_vals[finite]
+    order = np.argsort(t_f)
+    t_f = t_f[order]
+    v_f = v_f[order]
+    t_unique, unique_idx = np.unique(t_f, return_index=True)
+    v_unique = v_f[unique_idx]
+    if t_unique.size < 2:
+        return np.full(t_out.shape, np.nan, dtype=np.float64)
+    return np.interp(t_out, t_unique, v_unique, left=np.nan, right=np.nan).astype(np.float64, copy=False)
+
+
+def _nanmean_sliding_rows(values: np.ndarray, *, radius: int) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError(f"Expected 2D array, got {arr.shape}.")
+    if radius < 0:
+        raise ValueError(f"radius must be >= 0, got {radius}.")
+    if radius == 0:
+        return arr.copy()
+
+    out = np.full(arr.shape, np.nan, dtype=np.float64)
+    n_rows = int(arr.shape[0])
+    for row in range(n_rows):
+        lo = max(0, row - radius)
+        hi = min(n_rows, row + radius + 1)
+        window = arr[lo:hi]
+        finite = np.isfinite(window)
+        den = np.sum(finite, axis=0, dtype=np.int32)
+        num = np.nansum(window, axis=0, dtype=np.float64)
+        valid = den > 0
+        out[row, valid] = num[valid] / den[valid]
+    return out
+
+
+def _smooth_coronal_midline_xy_across_slices(
+    columns: dict[int, CoronalMidlineColumns],
+    *,
+    window_slices: int,
+    n_t: int,
+) -> dict[int, CoronalMidlineColumns]:
+    if window_slices <= 1 or len(columns) < 3:
+        return columns
+    if window_slices % 2 == 0:
+        raise ValueError(f"window_slices must be odd, got {window_slices}.")
+    if n_t < 8:
+        raise ValueError(f"n_t must be >= 8, got {n_t}.")
+
+    keys = sorted(columns.keys())
+    t_grid = np.linspace(0.0, 1.0, int(n_t), dtype=np.float64)
+    y_grid = np.full((len(keys), t_grid.size), np.nan, dtype=np.float64)
+    x_grid = np.full((len(keys), t_grid.size), np.nan, dtype=np.float64)
+
+    for idx, key in enumerate(keys):
+        c = columns[int(key)]
+        y_grid[idx] = _interp_series_on_t_grid(t=c.t, values=c.y, t_grid=t_grid)
+        x_grid[idx] = _interp_series_on_t_grid(t=c.t, values=c.x, t_grid=t_grid)
+
+    radius = int(window_slices // 2)
+    y_smooth = _nanmean_sliding_rows(y_grid, radius=radius)
+    x_smooth = _nanmean_sliding_rows(x_grid, radius=radius)
+
+    out: dict[int, CoronalMidlineColumns] = {}
+    for idx, key in enumerate(keys):
+        c = columns[int(key)]
+        y_new = _interp_series_on_t_grid(t=t_grid, values=y_smooth[idx], t_grid=c.t)
+        x_new = _interp_series_on_t_grid(t=t_grid, values=x_smooth[idx], t_grid=c.t)
+        if not np.isfinite(y_new).all():
+            y_new = np.array(c.y, dtype=np.float64, copy=True)
+        if not np.isfinite(x_new).all():
+            x_new = np.array(c.x, dtype=np.float64, copy=True)
+        out[int(key)] = CoronalMidlineColumns(
+            slice_i=int(c.slice_i),
+            t=np.array(c.t, dtype=np.float64, copy=True),
+            y=y_new,
+            x=x_new,
+            vent_y=np.array(c.vent_y, dtype=np.float64, copy=True),
+            vent_x=np.array(c.vent_x, dtype=np.float64, copy=True),
+            pia_y=np.array(c.pia_y, dtype=np.float64, copy=True),
+            pia_x=np.array(c.pia_x, dtype=np.float64, copy=True),
+            thickness_um=np.array(c.thickness_um, dtype=np.float64, copy=True),
+        )
+    return out
+
+
 @dataclass(frozen=True)
 class SagittalMidlineColumns:
     """Same as CoronalMidlineColumns but for sagittal slices k (axis=2).
@@ -110,6 +215,79 @@ class SagittalMidlineColumns:
     pia_y: np.ndarray
     pia_x: np.ndarray
     thickness_um: np.ndarray
+
+
+def _smooth_sagittal_midline_xy_across_slices(
+    columns: dict[int, SagittalMidlineColumns],
+    *,
+    window_slices: int,
+    n_t: int,
+    exclude_slice_keys: set[int] | None = None,
+) -> dict[int, SagittalMidlineColumns]:
+    if window_slices <= 1 or len(columns) < 3:
+        return columns
+    if window_slices % 2 == 0:
+        raise ValueError(f"window_slices must be odd, got {window_slices}.")
+    if n_t < 8:
+        raise ValueError(f"n_t must be >= 8, got {n_t}.")
+
+    keys = sorted(columns.keys())
+    excluded = set() if exclude_slice_keys is None else {int(k) for k in exclude_slice_keys}
+    t_grid = np.linspace(0.0, 1.0, int(n_t), dtype=np.float64)
+    y_grid = np.full((len(keys), t_grid.size), np.nan, dtype=np.float64)
+    x_grid = np.full((len(keys), t_grid.size), np.nan, dtype=np.float64)
+
+    for idx, key in enumerate(keys):
+        c = columns[int(key)]
+        y_grid[idx] = _interp_series_on_t_grid(t=c.t, values=c.y, t_grid=t_grid)
+        x_grid[idx] = _interp_series_on_t_grid(t=c.t, values=c.x, t_grid=t_grid)
+
+    y_smooth_src = y_grid.copy()
+    x_smooth_src = x_grid.copy()
+    for idx, key in enumerate(keys):
+        if int(key) in excluded:
+            y_smooth_src[idx, :] = np.nan
+            x_smooth_src[idx, :] = np.nan
+
+    radius = int(window_slices // 2)
+    y_smooth = _nanmean_sliding_rows(y_smooth_src, radius=radius)
+    x_smooth = _nanmean_sliding_rows(x_smooth_src, radius=radius)
+
+    out: dict[int, SagittalMidlineColumns] = {}
+    for idx, key in enumerate(keys):
+        c = columns[int(key)]
+        if int(key) in excluded:
+            out[int(key)] = SagittalMidlineColumns(
+                slice_k=int(c.slice_k),
+                t=np.array(c.t, dtype=np.float64, copy=True),
+                y=np.array(c.y, dtype=np.float64, copy=True),
+                x=np.array(c.x, dtype=np.float64, copy=True),
+                vent_y=np.array(c.vent_y, dtype=np.float64, copy=True),
+                vent_x=np.array(c.vent_x, dtype=np.float64, copy=True),
+                pia_y=np.array(c.pia_y, dtype=np.float64, copy=True),
+                pia_x=np.array(c.pia_x, dtype=np.float64, copy=True),
+                thickness_um=np.array(c.thickness_um, dtype=np.float64, copy=True),
+            )
+            continue
+
+        y_new = _interp_series_on_t_grid(t=t_grid, values=y_smooth[idx], t_grid=c.t)
+        x_new = _interp_series_on_t_grid(t=t_grid, values=x_smooth[idx], t_grid=c.t)
+        if not np.isfinite(y_new).all():
+            y_new = np.array(c.y, dtype=np.float64, copy=True)
+        if not np.isfinite(x_new).all():
+            x_new = np.array(c.x, dtype=np.float64, copy=True)
+        out[int(key)] = SagittalMidlineColumns(
+            slice_k=int(c.slice_k),
+            t=np.array(c.t, dtype=np.float64, copy=True),
+            y=y_new,
+            x=x_new,
+            vent_y=np.array(c.vent_y, dtype=np.float64, copy=True),
+            vent_x=np.array(c.vent_x, dtype=np.float64, copy=True),
+            pia_y=np.array(c.pia_y, dtype=np.float64, copy=True),
+            pia_x=np.array(c.pia_x, dtype=np.float64, copy=True),
+            thickness_um=np.array(c.thickness_um, dtype=np.float64, copy=True),
+        )
+    return out
 
 
 def load_sagittal_midline_columns(csv_path: Path) -> dict[int, SagittalMidlineColumns]:
@@ -487,6 +665,16 @@ def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Cor
             f"Could not derive coronal midline columns from halfway_u_3d_ds.npy in {outdir}. "
             "Expected u=0.5 contours inside the cortex include-mask."
         )
+    if int(CORONAL_T_SMOOTH_WINDOW_SLICES) > 1:
+        out = _smooth_coronal_midline_xy_across_slices(
+            out,
+            window_slices=int(CORONAL_T_SMOOTH_WINDOW_SLICES),
+            n_t=int(CORONAL_T_SMOOTH_N_T),
+        )
+        print(
+            f"[midline] coronal cross-slice smoothing applied: "
+            f"window={int(CORONAL_T_SMOOTH_WINDOW_SLICES)} n_t={int(CORONAL_T_SMOOTH_N_T)}"
+        )
     _save_coronal_midline_columns_csv(outdir / "coronal_midline_columns.csv", out)
     dt = time.perf_counter() - t0
     print(f"[midline] coronal done: kept_slices={len(out)} elapsed_s={dt:.1f}")
@@ -537,6 +725,18 @@ def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Sa
         raise ValueError(
             f"Could not derive sagittal midline columns from halfway_u_3d_ds.npy in {outdir}. "
             "Expected u=0.5 contours inside the cortex include-mask."
+        )
+    if int(SAGITTAL_T_SMOOTH_WINDOW_SLICES) > 1:
+        out = _smooth_sagittal_midline_xy_across_slices(
+            out,
+            window_slices=int(SAGITTAL_T_SMOOTH_WINDOW_SLICES),
+            n_t=int(SAGITTAL_T_SMOOTH_N_T),
+            exclude_slice_keys={int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS},
+        )
+        print(
+            f"[midline] sagittal cross-slice smoothing applied: "
+            f"window={int(SAGITTAL_T_SMOOTH_WINDOW_SLICES)} n_t={int(SAGITTAL_T_SMOOTH_N_T)} "
+            f"exclude={tuple(int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS)}"
         )
     _save_sagittal_midline_columns_csv(outdir / "sagittal_midline_columns.csv", out)
     dt = time.perf_counter() - t0

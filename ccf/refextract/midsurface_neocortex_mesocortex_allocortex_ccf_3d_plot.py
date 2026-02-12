@@ -11,6 +11,7 @@
 # %%
 from __future__ import annotations
 
+import csv
 import os
 from pathlib import Path
 
@@ -45,6 +46,8 @@ CONTOUR_COLOR = "#d62728"
 U_CURVE_T_CMAP = "viridis"
 MASK_COLOR = "#2ca02c"
 MASK_ALPHA = 0.18
+OVERLAY_NEO_MESO_COLOR = "#ff0000"
+OVERLAY_NEO_MESO_ALPHA = 0.5
 BOUNDARY_ALPHA = 0.85
 SLIDER_DEBOUNCE_MS = 40
 MANUAL_CONNECT_CORONAL_PATH_TEMPLATE = "manual_coronal_midcurve_override_slice{slice_i}_yx.npy"
@@ -85,6 +88,14 @@ def _masked_u_slice(u2: np.ndarray, mask2: np.ndarray) -> np.ndarray:
     mask2 = mask2.astype(bool, copy=False)
     out = np.full(u2.shape, np.nan, dtype=np.float32)
     out[mask2] = u2[mask2]
+    return out
+
+
+def _binary_overlay_slice(mask2: np.ndarray) -> np.ndarray:
+    """Return float image with NaN outside mask so imshow can keep background transparent."""
+    m = np.asarray(mask2, dtype=bool)
+    out = np.full(m.shape, np.nan, dtype=np.float32)
+    out[m] = 1.0
     return out
 
 
@@ -171,6 +182,121 @@ def _plot_parametrized_curve(
     return lc
 
 
+def _polyline_length_xy(path_xy: np.ndarray) -> float:
+    pts = np.asarray(path_xy, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        return 0.0
+    d = np.diff(pts, axis=0)
+    return float(np.sum(np.sqrt(np.sum(d * d, axis=1))))
+
+
+def _point_on_polyline_xy(path_xy: np.ndarray, t: float) -> np.ndarray | None:
+    pts = np.asarray(path_xy, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        return None
+    t_clip = float(np.clip(float(t), 0.0, 1.0))
+    seg = np.sqrt(np.sum(np.diff(pts, axis=0) ** 2, axis=1))
+    s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(seg, dtype=np.float64)])
+    total = float(s[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        return pts[0].astype(np.float64, copy=False)
+    q = t_clip * total
+    x = np.interp(q, s, pts[:, 0])
+    y = np.interp(q, s, pts[:, 1])
+    return np.asarray([x, y], dtype=np.float64)
+
+
+def _t_extent_on_path_xy_for_mask(path_xy: np.ndarray, mask_yx: np.ndarray) -> tuple[float, float] | None:
+    pts = np.asarray(path_xy, dtype=np.float64)
+    mask = np.asarray(mask_yx, dtype=bool)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        return None
+    if mask.ndim != 2:
+        return None
+    h, w = mask.shape
+    xi = np.clip(np.rint(pts[:, 0]).astype(np.int64, copy=False), 0, w - 1)
+    yi = np.clip(np.rint(pts[:, 1]).astype(np.int64, copy=False), 0, h - 1)
+    inside = mask[yi, xi]
+    if not np.any(inside):
+        return None
+    idx = np.flatnonzero(inside).astype(np.int64, copy=False)
+    seg = np.sqrt(np.sum(np.diff(pts, axis=0) ** 2, axis=1))
+    s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(seg, dtype=np.float64)])
+    total = float(s[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        return None
+    t = s / total
+    return (float(t[int(idx[0])]), float(t[int(idx[-1])]))
+
+
+def _load_overlap_t_ranges_csv(path: Path, *, slice_label: str) -> dict[int, list[tuple[float, float]]]:
+    out: dict[int, list[tuple[float, float]]] = {}
+    if not path.exists():
+        return out
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if slice_label not in row or "t_start" not in row or "t_end" not in row:
+                continue
+            raw_slice = row[slice_label]
+            if raw_slice is None:
+                continue
+            slice_val = float(raw_slice)
+            if not np.isfinite(slice_val):
+                continue
+            slice_idx = int(np.rint(slice_val))
+            t0 = float(row["t_start"])
+            t1 = float(row["t_end"])
+            if not np.isfinite(t0) or not np.isfinite(t1):
+                continue
+            out.setdefault(slice_idx, []).append((t0, t1))
+    for slice_idx in out:
+        out[slice_idx].sort(key=lambda x: x[0])
+    return out
+
+
+def _load_midline_paths_csv(path: Path, *, slice_label: str) -> dict[int, np.ndarray]:
+    out: dict[int, np.ndarray] = {}
+    if not path.exists():
+        return out
+
+    grouped: dict[int, list[tuple[float, float, float]]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if slice_label not in row or "t" not in row or "y" not in row or "x" not in row:
+                continue
+            raw_slice = row[slice_label]
+            if raw_slice is None:
+                continue
+            slice_val = float(raw_slice)
+            if not np.isfinite(slice_val):
+                continue
+            slice_idx = int(np.rint(slice_val))
+            t = float(row["t"])
+            y = float(row["y"])
+            x = float(row["x"])
+            if not np.isfinite(t) or not np.isfinite(y) or not np.isfinite(x):
+                continue
+            grouped.setdefault(slice_idx, []).append((t, x, y))
+
+    for slice_idx, vals in grouped.items():
+        if len(vals) < 2:
+            continue
+        vals_sorted = sorted(vals, key=lambda v: v[0])
+        path_xy = np.asarray([[vx, vy] for _, vx, vy in vals_sorted], dtype=np.float32)
+        if path_xy.ndim != 2 or path_xy.shape[0] < 2 or path_xy.shape[1] != 2:
+            continue
+        out[int(slice_idx)] = path_xy
+    return out
+
+
+def _format_t_ranges(ranges: list[tuple[float, float]]) -> str:
+    if not ranges:
+        return "none"
+    return "; ".join([f"{float(t0):.3f}-{float(t1):.3f}" for t0, t1 in ranges])
+
+
 # %% [markdown]
 # ## Phase 0: Load atlas reference
 
@@ -199,12 +325,17 @@ print(f"reference_3d (downsampled) shape={reference_3d.shape} dtype={reference_3
 req = {
     "cortex_fit": OUTDIR / "cortex_mask_fit_3d_ds.npy",
     "cortex_clean": OUTDIR / "cortex_mask_clean_3d_ds.npy",
+    "neo_meso_overlay": OUTDIR / "overlay_neocortex_mesocortex_no_allocortex_3d_ds.npy",
     "u_halfway": OUTDIR / "halfway_u_3d_ds.npy",
     "b0": OUTDIR / "laplace_b0_pial_3d_ds.npy",
     "b1": OUTDIR / "laplace_b1_inner_3d_ds.npy",
     "r_um": OUTDIR / "halfway_r_um_crop.npy",
     "crop_origin": OUTDIR / "halfway_crop_origin_ijk.npy",
     "midline_include": OUTDIR / "midline_include_neo_meso_3d_ds.npy",
+    "coronal_midline_columns": OUTDIR / "coronal_midline_columns.csv",
+    "sagittal_midline_columns": OUTDIR / "sagittal_midline_columns.csv",
+    "coronal_t_ranges": OUTDIR / "coronal_neocortex_mesocortex_overlap_t_ranges.csv",
+    "sagittal_t_ranges": OUTDIR / "sagittal_neocortex_mesocortex_overlap_t_ranges.csv",
 }
 missing = [name for name in ["b0", "b1"] if not req[name].exists()]
 if missing or (not req["cortex_fit"].exists() and not req["cortex_clean"].exists()) or (not req["u_halfway"].exists()):
@@ -229,6 +360,16 @@ if req["midline_include"].exists():
             f"midline_include shape mismatch: {midline_include_3d.shape} vs cortex {cortex_3d.shape} (check DS)."
         )
     print(f"Loaded midline include mask: {req['midline_include']}")
+
+overlay_neo_meso_no_allocortex_3d: np.ndarray | None = None
+if req["neo_meso_overlay"].exists():
+    overlay_neo_meso_no_allocortex_3d = np.load(req["neo_meso_overlay"]).astype(bool)
+    if overlay_neo_meso_no_allocortex_3d.shape != cortex_3d.shape:
+        raise ValueError(
+            "neocortex+mesocortex overlay shape mismatch: "
+            f"{overlay_neo_meso_no_allocortex_3d.shape} vs cortex {cortex_3d.shape} (check DS)."
+        )
+    print(f"Loaded neocortex+mesocortex overlay mask: {req['neo_meso_overlay']}")
 
 r_um_crop: np.ndarray | None = None
 crop_origin: np.ndarray | None = None
@@ -255,10 +396,22 @@ if reference_3d.shape != cortex_3d.shape or cortex_3d.shape != u_3d.shape:
 vmin, vmax = _robust_vmin_vmax(reference_3d)
 manual_coronal_paths = _load_manual_override_paths(OUTDIR, axis="coronal")
 manual_sagittal_paths = _load_manual_override_paths(OUTDIR, axis="sagittal")
+coronal_midline_paths = _load_midline_paths_csv(req["coronal_midline_columns"], slice_label="slice_i")
+sagittal_midline_paths = _load_midline_paths_csv(req["sagittal_midline_columns"], slice_label="slice_k")
 if manual_coronal_paths:
     print(f"Loaded {len(manual_coronal_paths)} coronal manual override paths from {OUTDIR}")
 if manual_sagittal_paths:
     print(f"Loaded {len(manual_sagittal_paths)} sagittal manual override paths from {OUTDIR}")
+if coronal_midline_paths:
+    print(f"Loaded {len(coronal_midline_paths)} coronal midline paths from {req['coronal_midline_columns']}")
+if sagittal_midline_paths:
+    print(f"Loaded {len(sagittal_midline_paths)} sagittal midline paths from {req['sagittal_midline_columns']}")
+coronal_overlap_t_ranges = _load_overlap_t_ranges_csv(req["coronal_t_ranges"], slice_label="slice_i")
+sagittal_overlap_t_ranges = _load_overlap_t_ranges_csv(req["sagittal_t_ranges"], slice_label="slice_k")
+if coronal_overlap_t_ranges:
+    print(f"Loaded coronal neocortex+mesocortex t-ranges for {len(coronal_overlap_t_ranges)} slices.")
+if sagittal_overlap_t_ranges:
+    print(f"Loaded sagittal neocortex+mesocortex t-ranges for {len(sagittal_overlap_t_ranges)} slices.")
 
 
 # %% [markdown]
@@ -281,15 +434,25 @@ def view_coronal_overlay(*, show: bool = True) -> None:
         origin="upper",
     )
     mask_im = ax.imshow(
-        cortex_3d[cur_i, :, :].astype(np.float32),
+        _binary_overlay_slice(cortex_3d[cur_i, :, :]),
         cmap=plt.cm.colors.ListedColormap([MASK_COLOR]),
         interpolation="nearest",
         alpha=MASK_ALPHA,
         origin="upper",
-        vmin=0.0,
-        vmax=1.0,
         zorder=2,
     )
+    mask_im.cmap.set_bad(alpha=0.0)
+    overlay_im = None
+    if overlay_neo_meso_no_allocortex_3d is not None:
+        overlay_im = ax.imshow(
+            _binary_overlay_slice(overlay_neo_meso_no_allocortex_3d[cur_i, :, :]),
+            cmap=plt.cm.colors.ListedColormap([OVERLAY_NEO_MESO_COLOR]),
+            interpolation="nearest",
+            alpha=float(OVERLAY_NEO_MESO_ALPHA),
+            origin="upper",
+            zorder=2.2,
+        )
+        overlay_im.cmap.set_bad(alpha=0.0)
     r_im = None
     if bool(SHOW_R_OVERLAY):
         cmap_r = plt.get_cmap("coolwarm").copy()
@@ -306,6 +469,8 @@ def view_coronal_overlay(*, show: bool = True) -> None:
         )
 
     curve_lc: LineCollection | None = None
+    sc_t_start = ax.scatter([], [], s=88.0, c="#ffff00", marker="*", edgecolors="k", linewidths=0.45, zorder=4.5)
+    sc_t_end = ax.scatter([], [], s=88.0, c="#ff0000", marker="*", edgecolors="k", linewidths=0.45, zorder=4.5)
     sc_b0 = ax.scatter([], [], s=3.0, c="#1f77b4", alpha=0.7, linewidths=0.0, zorder=4, label="pial seed")
     sc_b1 = ax.scatter([], [], s=3.0, c="#ff7f0e", alpha=0.7, linewidths=0.0, zorder=4, label="inner seed")
     curve_norm = Normalize(vmin=0.0, vmax=1.0)
@@ -323,7 +488,9 @@ def view_coronal_overlay(*, show: bool = True) -> None:
         nonlocal curve_lc
         i = int(np.clip(int(i), 0, n_i - 1))
         img.set_data(reference_3d[i, :, :])
-        mask_im.set_data(cortex_3d[i, :, :].astype(np.float32, copy=False))
+        mask_im.set_data(_binary_overlay_slice(cortex_3d[i, :, :]))
+        if overlay_im is not None and overlay_neo_meso_no_allocortex_3d is not None:
+            overlay_im.set_data(_binary_overlay_slice(overlay_neo_meso_no_allocortex_3d[i, :, :]))
         if r_im is not None:
             assert r_um_crop is not None and crop_origin is not None
             zi0, y0, x0 = (int(crop_origin[0]), int(crop_origin[1]), int(crop_origin[2]))
@@ -338,14 +505,30 @@ def view_coronal_overlay(*, show: bool = True) -> None:
 
         _clear_artist(curve_lc)
         curve_lc = None
+        active_path_xy: np.ndarray | None = None
         contour_mask = cortex_3d[i, :, :]
         if midline_include_3d is not None:
             contour_mask = contour_mask & midline_include_3d[i, :, :]
         u2 = _masked_u_slice(u_3d[i, :, :], contour_mask)
+        curve_source = "none"
+        midline_path_xy = coronal_midline_paths.get(int(i))
         manual_path_yx = manual_coronal_paths.get(int(i))
-        if manual_path_yx is not None and manual_path_yx.shape[0] >= 2:
+        if midline_path_xy is not None and midline_path_xy.shape[0] >= 2:
+            active_path_xy = midline_path_xy.astype(np.float32, copy=False)
+            curve_lc = _plot_parametrized_curve(
+                ax,
+                [active_path_xy],
+                cmap=U_CURVE_T_CMAP,
+                norm=curve_norm,
+                linewidth=1.2,
+                alpha=BOUNDARY_ALPHA,
+                zorder=3,
+            )
+            curve_source = "midline_csv"
+        elif manual_path_yx is not None and manual_path_yx.shape[0] >= 2:
             # Manual path arrays are stored as (y, x); LineCollection expects (x, y).
             manual_path_xy = manual_path_yx[:, [1, 0]].astype(np.float32, copy=False)
+            active_path_xy = manual_path_xy
             curve_lc = _plot_parametrized_curve(
                 ax,
                 [manual_path_xy],
@@ -355,6 +538,7 @@ def view_coronal_overlay(*, show: bool = True) -> None:
                 alpha=BOUNDARY_ALPHA,
                 zorder=3,
             )
+            curve_source = "manual"
         elif np.isfinite(u2).any():
             cont = ax.contour(
                 u2,
@@ -363,6 +547,8 @@ def view_coronal_overlay(*, show: bool = True) -> None:
                 alpha=0.0,
             )
             contour_segments = [np.asarray(seg, dtype=np.float32) for seg in cont.allsegs[0]]
+            if contour_segments:
+                active_path_xy = max(contour_segments, key=_polyline_length_xy)
             _clear_contours(cont)
             curve_lc = _plot_parametrized_curve(
                 ax,
@@ -373,8 +559,23 @@ def view_coronal_overlay(*, show: bool = True) -> None:
                 alpha=BOUNDARY_ALPHA,
                 zorder=3,
             )
+            curve_source = "u05"
         else:
             curve_lc = None
+
+        t_path_xy = coronal_midline_paths.get(int(i))
+        t_extent = None
+        if t_path_xy is not None and overlay_neo_meso_no_allocortex_3d is not None:
+            t_extent = _t_extent_on_path_xy_for_mask(t_path_xy, overlay_neo_meso_no_allocortex_3d[i, :, :])
+        if t_path_xy is not None and t_extent is not None:
+            t_start, t_end = t_extent
+            p_start = _point_on_polyline_xy(t_path_xy, t_start)
+            p_end = _point_on_polyline_xy(t_path_xy, t_end)
+            sc_t_start.set_offsets(np.asarray([p_start], dtype=np.float64) if p_start is not None else np.empty((0, 2)))
+            sc_t_end.set_offsets(np.asarray([p_end], dtype=np.float64) if p_end is not None else np.empty((0, 2)))
+        else:
+            sc_t_start.set_offsets(np.empty((0, 2)))
+            sc_t_end.set_offsets(np.empty((0, 2)))
 
         b0 = np.argwhere(b0_3d[i, :, :])
         b1 = np.argwhere(b1_3d[i, :, :])
@@ -384,7 +585,8 @@ def view_coronal_overlay(*, show: bool = True) -> None:
 
         ax.set_title(
             f"coronal i={i} | mask_px={int(cortex_3d[i].sum())} | "
-            f"u finite={int(np.isfinite(u2).sum())} | contour={CONTOUR_LEVEL:g}"
+            f"u finite={int(np.isfinite(u2).sum())} | curve={curve_source} | contour={CONTOUR_LEVEL:g} | "
+            f"neo+meso t={_format_t_ranges(coronal_overlap_t_ranges.get(int(i), []))}"
         )
         fig.canvas.draw_idle()
 
@@ -449,16 +651,27 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
         aspect="auto",
     )
     mask_im = ax.imshow(
-        cortex_3d[:, :, cur_k].astype(np.float32),
+        _binary_overlay_slice(cortex_3d[:, :, cur_k]),
         cmap=plt.cm.colors.ListedColormap([MASK_COLOR]),
         interpolation="nearest",
         alpha=MASK_ALPHA,
         origin="upper",
         aspect="auto",
-        vmin=0.0,
-        vmax=1.0,
         zorder=2,
     )
+    mask_im.cmap.set_bad(alpha=0.0)
+    overlay_im = None
+    if overlay_neo_meso_no_allocortex_3d is not None:
+        overlay_im = ax.imshow(
+            _binary_overlay_slice(overlay_neo_meso_no_allocortex_3d[:, :, cur_k]),
+            cmap=plt.cm.colors.ListedColormap([OVERLAY_NEO_MESO_COLOR]),
+            interpolation="nearest",
+            alpha=float(OVERLAY_NEO_MESO_ALPHA),
+            origin="upper",
+            aspect="auto",
+            zorder=2.2,
+        )
+        overlay_im.cmap.set_bad(alpha=0.0)
     r_im = None
     if bool(SHOW_R_OVERLAY):
         cmap_r = plt.get_cmap("coolwarm").copy()
@@ -476,6 +689,8 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
         )
 
     curve_lc: LineCollection | None = None
+    sc_t_start = ax.scatter([], [], s=88.0, c="#ffff00", marker="*", edgecolors="k", linewidths=0.45, zorder=4.5)
+    sc_t_end = ax.scatter([], [], s=88.0, c="#ff0000", marker="*", edgecolors="k", linewidths=0.45, zorder=4.5)
     sc_b0 = ax.scatter([], [], s=3.0, c="#1f77b4", alpha=0.7, linewidths=0.0, zorder=4, label="pial seed")
     sc_b1 = ax.scatter([], [], s=3.0, c="#ff7f0e", alpha=0.7, linewidths=0.0, zorder=4, label="inner seed")
     curve_norm = Normalize(vmin=0.0, vmax=1.0)
@@ -493,7 +708,9 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
         nonlocal curve_lc
         k = int(np.clip(int(k), 0, n_k - 1))
         img.set_data(reference_3d[:, :, k])
-        mask_im.set_data(cortex_3d[:, :, k].astype(np.float32, copy=False))
+        mask_im.set_data(_binary_overlay_slice(cortex_3d[:, :, k]))
+        if overlay_im is not None and overlay_neo_meso_no_allocortex_3d is not None:
+            overlay_im.set_data(_binary_overlay_slice(overlay_neo_meso_no_allocortex_3d[:, :, k]))
         if r_im is not None:
             assert r_um_crop is not None and crop_origin is not None
             z0, y0, x0 = (int(crop_origin[0]), int(crop_origin[1]), int(crop_origin[2]))
@@ -508,14 +725,30 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
 
         _clear_artist(curve_lc)
         curve_lc = None
+        active_path_xy: np.ndarray | None = None
         contour_mask = cortex_3d[:, :, k]
         if midline_include_3d is not None:
             contour_mask = contour_mask & midline_include_3d[:, :, k]
         u2 = _masked_u_slice(u_3d[:, :, k], contour_mask)
+        curve_source = "none"
+        midline_path_xy = sagittal_midline_paths.get(int(k))
         manual_path_ij = manual_sagittal_paths.get(int(k))
-        if manual_path_ij is not None and manual_path_ij.shape[0] >= 2:
+        if midline_path_xy is not None and midline_path_xy.shape[0] >= 2:
+            active_path_xy = midline_path_xy.astype(np.float32, copy=False)
+            curve_lc = _plot_parametrized_curve(
+                ax,
+                [active_path_xy],
+                cmap=U_CURVE_T_CMAP,
+                norm=curve_norm,
+                linewidth=1.0,
+                alpha=BOUNDARY_ALPHA,
+                zorder=3,
+            )
+            curve_source = "midline_csv"
+        elif manual_path_ij is not None and manual_path_ij.shape[0] >= 2:
             # Manual path arrays are stored as (i, j); LineCollection expects (x=j, y=i).
             manual_path_xy = manual_path_ij[:, [1, 0]].astype(np.float32, copy=False)
+            active_path_xy = manual_path_xy
             curve_lc = _plot_parametrized_curve(
                 ax,
                 [manual_path_xy],
@@ -525,6 +758,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
                 alpha=BOUNDARY_ALPHA,
                 zorder=3,
             )
+            curve_source = "manual"
         elif np.isfinite(u2).any():
             cont = ax.contour(
                 u2,
@@ -533,6 +767,8 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
                 alpha=0.0,
             )
             contour_segments = [np.asarray(seg, dtype=np.float32) for seg in cont.allsegs[0]]
+            if contour_segments:
+                active_path_xy = max(contour_segments, key=_polyline_length_xy)
             _clear_contours(cont)
             curve_lc = _plot_parametrized_curve(
                 ax,
@@ -543,8 +779,23 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
                 alpha=BOUNDARY_ALPHA,
                 zorder=3,
             )
+            curve_source = "u05"
         else:
             curve_lc = None
+
+        t_path_xy = sagittal_midline_paths.get(int(k))
+        t_extent = None
+        if t_path_xy is not None and overlay_neo_meso_no_allocortex_3d is not None:
+            t_extent = _t_extent_on_path_xy_for_mask(t_path_xy, overlay_neo_meso_no_allocortex_3d[:, :, k])
+        if t_path_xy is not None and t_extent is not None:
+            t_start, t_end = t_extent
+            p_start = _point_on_polyline_xy(t_path_xy, t_start)
+            p_end = _point_on_polyline_xy(t_path_xy, t_end)
+            sc_t_start.set_offsets(np.asarray([p_start], dtype=np.float64) if p_start is not None else np.empty((0, 2)))
+            sc_t_end.set_offsets(np.asarray([p_end], dtype=np.float64) if p_end is not None else np.empty((0, 2)))
+        else:
+            sc_t_start.set_offsets(np.empty((0, 2)))
+            sc_t_end.set_offsets(np.empty((0, 2)))
 
         b0 = np.argwhere(b0_3d[:, :, k])
         b1 = np.argwhere(b1_3d[:, :, k])
@@ -554,7 +805,8 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
 
         ax.set_title(
             f"sagittal k={k} | mask_px={int(cortex_3d[:, :, k].sum())} | "
-            f"u finite={int(np.isfinite(u2).sum())} | contour={CONTOUR_LEVEL:g}"
+            f"u finite={int(np.isfinite(u2).sum())} | curve={curve_source} | contour={CONTOUR_LEVEL:g} | "
+            f"neo+meso t={_format_t_ranges(sagittal_overlap_t_ranges.get(int(k), []))}"
         )
         fig.canvas.draw_idle()
 
