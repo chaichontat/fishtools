@@ -17,7 +17,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import ndimage as ndi
-from skimage.measure import marching_cubes
+from skimage.measure import find_contours, marching_cubes
 from skimage.morphology import (
     ball,
     binary_closing,
@@ -38,7 +38,9 @@ ATLAS_NAME = "kim_dev_mouse_e15-5_lsfm_20um"
 
 TERMS: tuple[str, ...] = ("neocortex", "mesocortex", "allocortex")
 TERM_KIND: str = "auto"  # "auto" | "id" | "acronym" | "name"
-MIDLINE_TERMS: tuple[str, ...] = ("neocortex", "mesocortex")
+MIDLINE_TERMS: tuple[str, ...] = ("neocortex", "mesocortex", "allocortex")
+# Keep all connected components so disconnected allocortex is not dropped.
+KEEP_LARGEST_COMPONENT_ONLY = False
 
 KEEP_LEFT_HEMISPHERE_ONLY = True
 
@@ -47,17 +49,25 @@ KEEP_LEFT_HEMISPHERE_ONLY = True
 DS = 1
 
 # Morphological cleanup on the downsampled mask.
-FILL_HOLES = True
+FILL_HOLES = False
 REMOVE_SMALL_OBJECTS_VOX = 10_000
 FILL_SMALL_HOLES_VOX = 5_000
+# Slightly stronger closing helps eliminate thin pinches/holes that can cause u=0.5 level-set tangles.
 CLOSE_RADIUS_VOX = 1
 OPEN_RADIUS_VOX = 0
 
 # Erode cortex mask before computing the EDT field (voxels in the DS grid).
 # Note: r_um is always computed to the boundary of the non-eroded `cortex_clean_3d`.
+# A bit more erosion makes the fitted field avoid near-boundary slivers that create self-intersections.
 ERODE_RADIUS_VOX_BEFORE_EDT = 1
 MIDSURF_EPS = 0.03  # u-band around 0.5 (smaller => thinner but sparser)
 BBOX_PAD_VOX = 4  # compute EDT on a padded bounding box around the fit mask
+# Manual one-off overrides: connect split u=0.5 contours on these coronal slices.
+MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (183, 185, 233, 234, 235, 236, 237)
+MANUAL_CONNECT_CORONAL_PATH_TEMPLATE = "manual_coronal_midcurve_override_slice{slice_i}_yx.npy"
+# Manual one-off overrides: connect split u=0.5 contours on these sagittal slices.
+MANUAL_CONNECT_SAGITTAL_SLICE_KS: tuple[int, ...] = (212, 213, 214, 215, 216, 217, 218, 219)
+MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE = "manual_sagittal_midcurve_override_slice{slice_k}_yx.npy"
 
 # Visualization sampling.
 PLOT_MAX_MASK_POINTS = 80_000
@@ -87,12 +97,111 @@ def _keep_largest_component(mask: np.ndarray) -> np.ndarray:
     return lab == int(np.argmax(sizes))
 
 
+def _maybe_keep_largest_component(mask: np.ndarray) -> np.ndarray:
+    if KEEP_LARGEST_COMPONENT_ONLY:
+        return _keep_largest_component(mask)
+    return mask
+
+
 def _subsample_points(xyz: np.ndarray, *, max_points: int, seed: int = 0) -> np.ndarray:
     if xyz.shape[0] <= max_points:
         return xyz
     rng = np.random.default_rng(seed)
     idx = rng.choice(xyz.shape[0], size=int(max_points), replace=False)
     return xyz[idx]
+
+
+def _polyline_length(path_yx: np.ndarray) -> float:
+    if path_yx.ndim != 2 or path_yx.shape[0] < 2 or path_yx.shape[1] != 2:
+        return 0.0
+    d = np.diff(path_yx.astype(np.float64, copy=False), axis=0)
+    return float(np.sum(np.sqrt(np.sum(d * d, axis=1))))
+
+
+def _connect_two_largest_u05_contours_in_slice(
+    *,
+    u_yx: np.ndarray,
+    mask_yx: np.ndarray,
+    include_yx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+    valid = (mask_yx & include_yx).astype(bool, copy=False)
+    if not np.any(valid):
+        empty = np.zeros((0,), dtype=np.int64)
+        return u_yx, empty, empty, None
+
+    contours = find_contours(u_yx.astype(np.float64, copy=False), level=0.5, mask=valid)
+    contours = [np.asarray(c, dtype=np.float64) for c in contours if np.asarray(c).shape[0] >= 2]
+    if len(contours) < 2:
+        empty = np.zeros((0,), dtype=np.int64)
+        return u_yx, empty, empty, None
+
+    contours.sort(key=_polyline_length, reverse=True)
+    c1 = contours[0]
+    c2 = contours[1]
+
+    # Connect the two curves at their closest approach, then choose the branch combination
+    # that stays most interior (largest mean distance to boundary).
+    diff = c1[:, None, :] - c2[None, :, :]
+    d2 = np.sum(diff * diff, axis=2)
+    i1, i2 = np.unravel_index(int(np.argmin(d2)), d2.shape)
+
+    seg1_options = [c1[: i1 + 1], c1[i1:][::-1]]
+    seg2_options = [c2[i2:], c2[: i2 + 1][::-1]]
+    interior_dist = ndi.distance_transform_edt(valid).astype(np.float64, copy=False)
+
+    best_path: np.ndarray | None = None
+    best_center_score = -np.inf
+    best_len = -np.inf
+    for seg1 in seg1_options:
+        if seg1.shape[0] < 2:
+            continue
+        for seg2 in seg2_options:
+            if seg2.shape[0] < 2:
+                continue
+            a = seg1[-1]
+            b = seg2[0]
+            dist = float(np.linalg.norm(a - b))
+            n_steps = max(2, int(np.ceil(dist)) + 1)
+            t = np.linspace(0.0, 1.0, n_steps, dtype=np.float64)
+            bridge = np.column_stack([(1.0 - t) * a[0] + t * b[0], (1.0 - t) * a[1] + t * b[1]])
+            merged = np.vstack([seg1, bridge[1:-1], seg2]).astype(np.float64, copy=False)
+
+            yi = np.clip(np.rint(merged[:, 0]).astype(np.int64, copy=False), 0, valid.shape[0] - 1)
+            xi = np.clip(np.rint(merged[:, 1]).astype(np.int64, copy=False), 0, valid.shape[1] - 1)
+            center_score = float(np.mean(interior_dist[yi, xi]))
+            path_len = _polyline_length(merged)
+
+            if center_score > best_center_score or (
+                np.isclose(center_score, best_center_score) and path_len > best_len
+            ):
+                best_center_score = center_score
+                best_len = path_len
+                best_path = merged
+
+    if best_path is None:
+        empty = np.zeros((0,), dtype=np.int64)
+        return u_yx, empty, empty, None
+    merged_path = best_path
+    y = np.rint(merged_path[:, 0]).astype(np.int64, copy=False)
+    x = np.rint(merged_path[:, 1]).astype(np.int64, copy=False)
+
+    out = u_yx.copy()
+    h, w = out.shape
+    y_idx: list[int] = []
+    x_idx: list[int] = []
+    for yi, xi in zip(y, x, strict=False):
+        yi_clamped = int(np.clip(yi, 0, h - 1))
+        xi_clamped = int(np.clip(xi, 0, w - 1))
+        out[yi_clamped, xi_clamped] = np.float32(0.5)
+        y_idx.append(yi_clamped)
+        x_idx.append(xi_clamped)
+    if not y_idx:
+        empty = np.zeros((0,), dtype=np.int64)
+        return out, empty, empty, merged_path
+    y_arr = np.asarray(y_idx, dtype=np.int64)
+    x_arr = np.asarray(x_idx, dtype=np.int64)
+    uniq = np.unique(np.column_stack([y_arr, x_arr]), axis=0)
+    return out, uniq[:, 0].astype(np.int64, copy=False), uniq[:, 1].astype(np.int64, copy=False), merged_path
 
 
 def _mask_to_xyz_um(
@@ -300,7 +409,7 @@ if KEEP_LEFT_HEMISPHERE_ONLY:
 print(f"Cortex voxels (raw)={int(np.count_nonzero(cortex_3d))}")
 np.save(OUTDIR / "cortex_mask_3d_ds.npy", cortex_3d.astype(np.bool_))
 
-# Include-mask for clipping midsurface to neocortex+mesocortex only.
+# Include-mask for clipping midsurface calculations.
 ann_flat_mid = annotation_3d.reshape(annotation_3d.shape[0], -1)
 mask_flat_mid = _term_mask_from_annotation_yx(
     annotation_yx=ann_flat_mid,
@@ -318,7 +427,7 @@ np.save(OUTDIR / "midline_include_neo_meso_3d_ds.npy", midline_include_3d.astype
 # ## Phase 2: Cleanup mask (for both methods)
 
 cortex_clean_3d = cortex_3d.copy()
-cortex_clean_3d = _keep_largest_component(cortex_clean_3d)
+cortex_clean_3d = _maybe_keep_largest_component(cortex_clean_3d)
 if FILL_HOLES:
     cortex_clean_3d = ndi.binary_fill_holes(cortex_clean_3d)
 if CLOSE_RADIUS_VOX > 0:
@@ -329,7 +438,7 @@ if REMOVE_SMALL_OBJECTS_VOX > 0:
     cortex_clean_3d = remove_small_objects(cortex_clean_3d, min_size=int(REMOVE_SMALL_OBJECTS_VOX))
 if FILL_SMALL_HOLES_VOX > 0:
     cortex_clean_3d = remove_small_holes(cortex_clean_3d, area_threshold=int(FILL_SMALL_HOLES_VOX))
-cortex_clean_3d = _keep_largest_component(cortex_clean_3d)
+cortex_clean_3d = _maybe_keep_largest_component(cortex_clean_3d)
 
 print(f"Cortex voxels (clean)={int(np.count_nonzero(cortex_clean_3d))}")
 np.save(OUTDIR / "cortex_mask_clean_3d_ds.npy", cortex_clean_3d.astype(np.bool_))
@@ -340,7 +449,7 @@ np.save(OUTDIR / "cortex_mask_clean_3d_ds.npy", cortex_clean_3d.astype(np.bool_)
 cortex_fit_3d = cortex_clean_3d.copy()
 if ERODE_RADIUS_VOX_BEFORE_EDT > 0:
     cortex_fit_3d = binary_erosion(cortex_fit_3d, footprint=ball(int(ERODE_RADIUS_VOX_BEFORE_EDT)))
-cortex_fit_3d = _keep_largest_component(cortex_fit_3d)
+cortex_fit_3d = _maybe_keep_largest_component(cortex_fit_3d)
 if not np.any(cortex_fit_3d):
     raise ValueError(
         f"Erosion emptied cortex mask (ERODE_RADIUS_VOX_BEFORE_EDT={ERODE_RADIUS_VOX_BEFORE_EDT}, DS={DS})."
@@ -372,6 +481,70 @@ u_crop[ok] = (d_pial_um[ok] / den_um[ok]).astype(np.float32, copy=False)
 u_crop[b0_crop] = 0.0
 u_crop[b1_crop] = 1.0
 
+for manual_slice_i in MANUAL_CONNECT_CORONAL_SLICE_IS:
+    local_override_i = int(manual_slice_i) - int(z0)
+    if 0 <= local_override_i < int(u_crop.shape[0]):
+        u_slice, y_bridge, x_bridge, merged_path = _connect_two_largest_u05_contours_in_slice(
+            u_yx=u_crop[local_override_i, :, :],
+            mask_yx=mask_crop[local_override_i, :, :],
+            include_yx=include_crop[local_override_i, :, :],
+        )
+        u_crop[local_override_i, :, :] = u_slice
+        if y_bridge.size > 0:
+            mask_crop[local_override_i, y_bridge, x_bridge] = True
+            include_crop[local_override_i, y_bridge, x_bridge] = True
+            # Persist the manual bridge in masks used by midsurface_coords contour extraction.
+            np.save(OUTDIR / "cortex_mask_fit_3d_ds.npy", cortex_fit_3d.astype(np.bool_))
+            np.save(OUTDIR / "midline_include_neo_meso_3d_ds.npy", midline_include_3d.astype(np.bool_))
+        if merged_path is not None and merged_path.shape[0] >= 2:
+            # Save full-size (y, x) polyline so midsurface_coords can explicitly apply this manual override.
+            merged_path_full = merged_path.copy()
+            merged_path_full[:, 0] += float(y0)
+            merged_path_full[:, 1] += float(x0)
+            out_name = MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(manual_slice_i))
+            np.save(OUTDIR / out_name, merged_path_full.astype(np.float32, copy=False))
+        print(
+            f"[manual] coronal slice {int(manual_slice_i)}: "
+            f"connected two largest u=0.5 contours with {int(y_bridge.size)} bridge voxels"
+        )
+    else:
+        print(
+            f"[manual] coronal slice {int(manual_slice_i)} outside crop "
+            f"[{z0}, {z0 + u_crop.shape[0] - 1}]; skipping manual contour connection."
+        )
+
+for manual_slice_k in MANUAL_CONNECT_SAGITTAL_SLICE_KS:
+    local_override_k = int(manual_slice_k) - int(x0)
+    if 0 <= local_override_k < int(u_crop.shape[2]):
+        u_slice, y_bridge, x_bridge, merged_path = _connect_two_largest_u05_contours_in_slice(
+            u_yx=u_crop[:, :, local_override_k],
+            mask_yx=mask_crop[:, :, local_override_k],
+            include_yx=include_crop[:, :, local_override_k],
+        )
+        u_crop[:, :, local_override_k] = u_slice
+        if y_bridge.size > 0:
+            mask_crop[y_bridge, x_bridge, local_override_k] = True
+            include_crop[y_bridge, x_bridge, local_override_k] = True
+            # Persist the manual bridge in masks used by midsurface_coords contour extraction.
+            np.save(OUTDIR / "cortex_mask_fit_3d_ds.npy", cortex_fit_3d.astype(np.bool_))
+            np.save(OUTDIR / "midline_include_neo_meso_3d_ds.npy", midline_include_3d.astype(np.bool_))
+        if merged_path is not None and merged_path.shape[0] >= 2:
+            # Save full-size (y, x) polyline in sagittal-plane coordinates (i, j).
+            merged_path_full = merged_path.copy()
+            merged_path_full[:, 0] += float(z0)
+            merged_path_full[:, 1] += float(y0)
+            out_name = MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE.format(slice_k=int(manual_slice_k))
+            np.save(OUTDIR / out_name, merged_path_full.astype(np.float32, copy=False))
+        print(
+            f"[manual] sagittal slice {int(manual_slice_k)}: "
+            f"connected two largest u=0.5 contours with {int(y_bridge.size)} bridge voxels"
+        )
+    else:
+        print(
+            f"[manual] sagittal slice {int(manual_slice_k)} outside crop "
+            f"[{x0}, {x0 + u_crop.shape[2] - 1}]; skipping manual contour connection."
+        )
+
 u = np.zeros(cortex_fit_3d.shape, dtype=np.float32)
 u[crop] = u_crop
 np.save(OUTDIR / "halfway_u_3d_ds.npy", u.astype(np.float32, copy=False))
@@ -393,11 +566,11 @@ np.save(OUTDIR / "halfway_thickness_um_crop.npy", t_um_crop)
 
 mid_band_crop = mask_crop & include_crop & (np.abs(u_crop - 0.5) <= float(MIDSURF_EPS))
 mid_band = np.zeros(cortex_fit_3d.shape, dtype=bool)
-mid_band[crop] = _keep_largest_component(mid_band_crop)
+mid_band[crop] = _maybe_keep_largest_component(mid_band_crop)
 print(f"[edt] mid_band voxels={int(np.count_nonzero(mid_band))}")
 np.save(OUTDIR / "midsurface_halfway_midband_3d_ds.npy", mid_band.astype(np.bool_))
 
-# Mesh only the neocortex+mesocortex portion of the u=0.5 surface (exclude allocortex).
+# Mesh the full MIDLINE_TERMS portion of the u=0.5 surface.
 verts_ijk_um, faces, _, _ = marching_cubes(
     u_crop,
     level=0.5,

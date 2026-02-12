@@ -3,10 +3,17 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import Literal
 
 import numpy as np
 from scipy.ndimage import map_coordinates
+from skimage.measure import find_contours
+
+MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (183, 185, 233, 234, 235, 236, 237)
+MANUAL_CONNECT_CORONAL_PATH_TEMPLATE = "manual_coronal_midcurve_override_slice{slice_i}_yx.npy"
+MANUAL_CONNECT_SAGITTAL_SLICE_KS: tuple[int, ...] = (212, 213, 214, 215, 216, 217, 218, 219)
+MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE = "manual_sagittal_midcurve_override_slice{slice_k}_yx.npy"
 
 
 @dataclass(frozen=True)
@@ -34,37 +41,7 @@ class CoronalMidlineColumns:
 
 
 def load_coronal_midline_columns(csv_path: Path) -> dict[int, CoronalMidlineColumns]:
-    table = np.loadtxt(csv_path, delimiter=",", skiprows=1)
-    if table.ndim == 1:
-        table = table[None, :]
-    if table.shape[1] != 9:
-        raise ValueError(f"Unexpected columns in {csv_path} (shape={table.shape})")
-
-    slice_i = table[:, 0].astype(np.int32)
-    t = table[:, 1].astype(np.float64)
-    y = table[:, 2].astype(np.float64)
-    x = table[:, 3].astype(np.float64)
-    vent_y = table[:, 4].astype(np.float64)
-    vent_x = table[:, 5].astype(np.float64)
-    pia_y = table[:, 6].astype(np.float64)
-    pia_x = table[:, 7].astype(np.float64)
-    thickness_um = table[:, 8].astype(np.float64)
-
-    out: dict[int, CoronalMidlineColumns] = {}
-    for s in np.unique(slice_i).tolist():
-        keep = slice_i == int(s)
-        out[int(s)] = CoronalMidlineColumns(
-            slice_i=int(s),
-            t=t[keep],
-            y=y[keep],
-            x=x[keep],
-            vent_y=vent_y[keep],
-            vent_x=vent_x[keep],
-            pia_y=pia_y[keep],
-            pia_x=pia_x[keep],
-            thickness_um=thickness_um[keep],
-        )
-    return out
+    return _build_coronal_midline_columns_from_halfway_u(csv_path.parent)
 
 
 def _interp(t_grid: np.ndarray, values: np.ndarray, t: float) -> float:
@@ -72,6 +49,19 @@ def _interp(t_grid: np.ndarray, values: np.ndarray, t: float) -> float:
     if not np.isfinite(t):
         raise ValueError("t must be finite.")
     return float(np.interp(t, t_grid, values))
+
+
+def _fill_nan_series(values: np.ndarray) -> np.ndarray:
+    x = np.asarray(values, dtype=np.float64)
+    if x.ndim != 1:
+        raise ValueError(f"Expected 1D series, got shape={x.shape}.")
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return x.copy()
+    idx = np.arange(x.size, dtype=np.float64)
+    out = x.copy()
+    out[~finite] = np.interp(idx[~finite], idx[finite], x[finite])
+    return out
 
 
 @dataclass(frozen=True)
@@ -93,36 +83,438 @@ class SagittalMidlineColumns:
 
 
 def load_sagittal_midline_columns(csv_path: Path) -> dict[int, SagittalMidlineColumns]:
-    table = np.loadtxt(csv_path, delimiter=",", skiprows=1)
-    if table.ndim == 1:
-        table = table[None, :]
-    if table.shape[1] != 9:
-        raise ValueError(f"Unexpected columns in {csv_path} (shape={table.shape})")
+    return _build_sagittal_midline_columns_from_halfway_u(csv_path.parent)
 
-    slice_k = table[:, 0].astype(np.int32)
-    t = table[:, 1].astype(np.float64)
-    y = table[:, 2].astype(np.float64)
-    x = table[:, 3].astype(np.float64)
-    vent_y = table[:, 4].astype(np.float64)
-    vent_x = table[:, 5].astype(np.float64)
-    pia_y = table[:, 6].astype(np.float64)
-    pia_x = table[:, 7].astype(np.float64)
-    thickness_um = table[:, 8].astype(np.float64)
+
+def _load_halfway_u_and_masks(outdir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    u_path = outdir / "halfway_u_3d_ds.npy"
+    if not u_path.exists():
+        raise FileNotFoundError(
+            f"Missing {u_path}. Cannot derive midline columns without halfway_u_3d_ds.npy."
+        )
+    u_3d = np.load(u_path).astype(np.float32, copy=False)
+    if u_3d.ndim != 3:
+        raise ValueError(f"Expected halfway_u_3d_ds.npy to be 3D, got shape={u_3d.shape}.")
+
+    fit_mask_path = outdir / "cortex_mask_fit_3d_ds.npy"
+    clean_mask_path = outdir / "cortex_mask_clean_3d_ds.npy"
+    if fit_mask_path.exists():
+        mask_3d = np.load(fit_mask_path).astype(bool, copy=False)
+    elif clean_mask_path.exists():
+        mask_3d = np.load(clean_mask_path).astype(bool, copy=False)
+    else:
+        raise FileNotFoundError(
+            "Missing cortex mask for midline derivation. Expected one of "
+            "{cortex_mask_fit_3d_ds.npy, cortex_mask_clean_3d_ds.npy}."
+        )
+
+    include_path = outdir / "midline_include_neo_meso_3d_ds.npy"
+    if include_path.exists():
+        include_3d = np.load(include_path).astype(bool, copy=False)
+    else:
+        include_3d = mask_3d
+
+    if mask_3d.shape != u_3d.shape:
+        raise ValueError(f"Mask shape mismatch: mask={mask_3d.shape} u={u_3d.shape}.")
+    if include_3d.shape != u_3d.shape:
+        raise ValueError(f"Include-mask shape mismatch: include={include_3d.shape} u={u_3d.shape}.")
+    return u_3d, mask_3d, include_3d
+
+
+def _nonzero_include_slice_keys(outdir: Path, *, axis: Literal["coronal", "sagittal"]) -> np.ndarray:
+    _, _, include_3d = _load_halfway_u_and_masks(outdir)
+    if axis == "coronal":
+        keys = np.where(include_3d.any(axis=(1, 2)))[0].astype(np.int32, copy=False)
+    else:
+        keys = np.where(include_3d.any(axis=(0, 1)))[0].astype(np.int32, copy=False)
+    if keys.size == 0:
+        raise ValueError(f"No non-zero include-mask slices found for axis={axis}.")
+    return keys
+
+
+def _polyline_length(path_yx: np.ndarray) -> float:
+    if path_yx.ndim != 2 or path_yx.shape[0] < 2 or path_yx.shape[1] != 2:
+        return 0.0
+    d = np.diff(path_yx.astype(np.float64, copy=False), axis=0)
+    return float(np.sum(np.sqrt(np.sum(d * d, axis=1))))
+
+
+def _dedupe_consecutive_points(path_yx: np.ndarray) -> np.ndarray:
+    if path_yx.ndim != 2 or path_yx.shape[1] != 2:
+        raise ValueError(f"Expected path shape (N,2), got {path_yx.shape}.")
+    if path_yx.shape[0] <= 1:
+        return path_yx.astype(np.float64, copy=False)
+
+    d = np.diff(path_yx.astype(np.float64, copy=False), axis=0)
+    keep = np.any(np.abs(d) > 1.0e-9, axis=1)
+    return np.concatenate([path_yx[:1], path_yx[1:][keep]], axis=0).astype(np.float64, copy=False)
+
+
+def _extract_largest_midline_contour(u_yx: np.ndarray, mask_yx: np.ndarray) -> np.ndarray | None:
+    if u_yx.ndim != 2 or mask_yx.ndim != 2:
+        raise ValueError(f"Expected 2D arrays, got u={u_yx.shape}, mask={mask_yx.shape}.")
+    if u_yx.shape != mask_yx.shape:
+        raise ValueError(f"Shape mismatch: u={u_yx.shape} mask={mask_yx.shape}.")
+    if not np.any(mask_yx):
+        return None
+
+    in_vals = u_yx[mask_yx]
+    finite = np.isfinite(in_vals)
+    if not np.any(finite):
+        return None
+    min_v = float(np.min(in_vals[finite]))
+    max_v = float(np.max(in_vals[finite]))
+    if not (min_v <= 0.5 <= max_v):
+        return None
+
+    contours = find_contours(u_yx.astype(np.float64, copy=False), level=0.5, mask=mask_yx.astype(bool, copy=False))
+    if not contours:
+        return None
+    path = max(contours, key=_polyline_length)
+    path = _dedupe_consecutive_points(np.asarray(path, dtype=np.float64))
+    if path.shape[0] < 2:
+        return None
+    return path
+
+
+def _load_manual_coronal_override_path(outdir: Path, *, slice_i: int) -> np.ndarray | None:
+    if int(slice_i) not in set(MANUAL_CONNECT_CORONAL_SLICE_IS):
+        return None
+    path = outdir / MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i=int(slice_i))
+    if not path.exists():
+        return None
+    arr = np.load(path).astype(np.float64, copy=False)
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 2:
+        return None
+    if not np.isfinite(arr).all():
+        return None
+    return _dedupe_consecutive_points(arr)
+
+
+def _load_manual_sagittal_override_path(outdir: Path, *, slice_k: int) -> np.ndarray | None:
+    if int(slice_k) not in set(MANUAL_CONNECT_SAGITTAL_SLICE_KS):
+        return None
+    path = outdir / MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE.format(slice_k=int(slice_k))
+    if not path.exists():
+        return None
+    arr = np.load(path).astype(np.float64, copy=False)
+    if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 2:
+        return None
+    if not np.isfinite(arr).all():
+        return None
+    return _dedupe_consecutive_points(arr)
+
+
+def _sample_mask_linear(mask: np.ndarray, yx: np.ndarray) -> np.ndarray:
+    if yx.ndim != 2 or yx.shape[1] != 2:
+        raise ValueError(f"Expected yx shape (N,2), got {yx.shape}")
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape={mask.shape}")
+    return map_coordinates(mask.astype(np.float64, copy=False), [yx[:, 0], yx[:, 1]], order=1, mode="constant", cval=0.0)
+
+
+def _march_to_boundary_along_normal(
+    mask: np.ndarray,
+    *,
+    p_yx: np.ndarray,
+    n_yx: np.ndarray,
+    direction: float,
+    max_t: float,
+    step: float,
+    bisect_iters: int = 14,
+) -> float:
+    if p_yx.shape != (2,) or n_yx.shape != (2,):
+        raise ValueError("p_yx and n_yx must be shape (2,).")
+    if direction not in (-1.0, 1.0):
+        raise ValueError("direction must be -1.0 or +1.0.")
+    if max_t <= 0.0 or step <= 0.0:
+        raise ValueError("max_t and step must be > 0.")
+    if bisect_iters < 1:
+        raise ValueError("bisect_iters must be >= 1.")
+    if mask.ndim != 2:
+        raise ValueError(f"Expected 2D mask, got shape={mask.shape}")
+
+    h, w = mask.shape
+    p0 = p_yx.astype(np.float64, copy=False)
+    n = n_yx.astype(np.float64, copy=False)
+
+    def inside_at(t: float) -> bool:
+        pt = p0 + (direction * float(t)) * n
+        y = float(pt[0])
+        x = float(pt[1])
+        if y < 0.0 or x < 0.0 or y > float(h - 1) or x > float(w - 1):
+            return False
+        yi = int(np.clip(int(np.rint(y)), 0, h - 1))
+        xi = int(np.clip(int(np.rint(x)), 0, w - 1))
+        return bool(mask[yi, xi])
+
+    if not inside_at(0.0):
+        return float("nan")
+
+    last_inside_t = 0.0
+    for t in np.arange(step, max_t + step, step, dtype=np.float64):
+        if inside_at(float(t)):
+            last_inside_t = float(t)
+            continue
+
+        lo = float(last_inside_t)
+        hi = float(t)
+        for _ in range(int(bisect_iters)):
+            mid = 0.5 * (lo + hi)
+            pt = (p0 + (direction * mid) * n)[None, :]
+            v = float(_sample_mask_linear(mask, pt)[0])
+            if v >= 0.5:
+                lo = mid
+            else:
+                hi = mid
+        return float(direction * (0.5 * (lo + hi)))
+    return float("nan")
+
+
+def _build_slice_columns(
+    *,
+    slice_index: int,
+    path_yx: np.ndarray,
+    mask_yx: np.ndarray,
+    res_y_um: float,
+    res_x_um: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    yx = _dedupe_consecutive_points(path_yx)
+    if yx.shape[0] < 2:
+        raise ValueError(f"Slice {slice_index}: midline contour had fewer than 2 unique points.")
+
+    y = yx[:, 0].astype(np.float64, copy=False)
+    x = yx[:, 1].astype(np.float64, copy=False)
+    seg = np.sqrt(np.sum(np.diff(yx, axis=0) ** 2, axis=1))
+    s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(seg, dtype=np.float64)])
+    total = float(s[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError(f"Slice {slice_index}: invalid contour arc-length.")
+    t = (s / total).astype(np.float64, copy=False)
+
+    dt = np.gradient(t)
+    dy = np.gradient(y)
+    dx = np.gradient(x)
+    safe = np.abs(dt) > 1.0e-9
+    dy_dt = np.divide(dy, dt, out=np.zeros_like(dy), where=safe)
+    dx_dt = np.divide(dx, dt, out=np.zeros_like(dx), where=safe)
+
+    ny = -dx_dt
+    nx = dy_dt
+    n_norm = np.sqrt(ny * ny + nx * nx)
+    ok = n_norm > 0.0
+    ny = np.divide(ny, n_norm, out=np.zeros_like(ny), where=ok)
+    nx = np.divide(nx, n_norm, out=np.zeros_like(nx), where=ok)
+    for idx in range(1, yx.shape[0]):
+        if not np.isfinite(ny[idx - 1]) or not np.isfinite(nx[idx - 1]):
+            continue
+        if not np.isfinite(ny[idx]) or not np.isfinite(nx[idx]):
+            continue
+        if (ny[idx - 1] * ny[idx] + nx[idx - 1] * nx[idx]) < 0.0:
+            ny[idx] = -ny[idx]
+            nx[idx] = -nx[idx]
+
+    t_neg = np.full((yx.shape[0],), np.nan, dtype=np.float64)
+    t_pos = np.full((yx.shape[0],), np.nan, dtype=np.float64)
+    max_t = float(np.hypot(*mask_yx.shape)) + 4.0
+    for idx in range(yx.shape[0]):
+        p = np.array([y[idx], x[idx]], dtype=np.float64)
+        n = np.array([ny[idx], nx[idx]], dtype=np.float64)
+        if not np.isfinite(n).all() or float(np.linalg.norm(n)) <= 0.0:
+            continue
+        t_pos[idx] = _march_to_boundary_along_normal(mask_yx, p_yx=p, n_yx=n, direction=1.0, max_t=max_t, step=0.5)
+        t_neg[idx] = _march_to_boundary_along_normal(mask_yx, p_yx=p, n_yx=n, direction=-1.0, max_t=max_t, step=0.5)
+
+    midline_is_high_x = True
+    init_prefer_b0_as_vent: bool | None = None
+    valid = np.isfinite(t_neg) & np.isfinite(t_pos) & (t_pos > t_neg) & np.isfinite(nx)
+    if np.any(valid):
+        b0_x = x[valid] + t_neg[valid] * nx[valid]
+        b1_x = x[valid] + t_pos[valid] * nx[valid]
+        med_dx = float(np.nanmedian(b0_x - b1_x))
+        if np.isfinite(med_dx) and abs(med_dx) >= 0.25:
+            init_prefer_b0_as_vent = bool(med_dx >= 0.0) if midline_is_high_x else bool(med_dx < 0.0)
+
+    vent_yx = np.full((yx.shape[0], 2), np.nan, dtype=np.float64)
+    pia_yx = np.full((yx.shape[0], 2), np.nan, dtype=np.float64)
+    prev_vent: np.ndarray | None = None
+    prev_pia: np.ndarray | None = None
+
+    for idx in range(yx.shape[0]):
+        if not np.isfinite(t_neg[idx]) or not np.isfinite(t_pos[idx]):
+            continue
+        if float(t_pos[idx]) <= float(t_neg[idx]):
+            continue
+
+        p = np.array([y[idx], x[idx]], dtype=np.float64)
+        n = np.array([ny[idx], nx[idx]], dtype=np.float64)
+        b0 = p + t_neg[idx] * n
+        b1 = p + t_pos[idx] * n
+
+        if prev_vent is None or prev_pia is None:
+            prefer_b0 = init_prefer_b0_as_vent
+            if prefer_b0 is None:
+                prefer_b0 = bool(float(b0[1]) >= float(b1[1])) if midline_is_high_x else bool(float(b0[1]) < float(b1[1]))
+            vent, pia = (b0, b1) if prefer_b0 else (b1, b0)
+        else:
+            c_keep = float(np.sum((b0 - prev_vent) ** 2) + np.sum((b1 - prev_pia) ** 2))
+            c_swap = float(np.sum((b1 - prev_vent) ** 2) + np.sum((b0 - prev_pia) ** 2))
+            vent, pia = (b0, b1) if c_keep <= c_swap else (b1, b0)
+
+        vent_yx[idx] = vent
+        pia_yx[idx] = pia
+        prev_vent = vent
+        prev_pia = pia
+
+    vent_x = vent_yx[:, 1]
+    pia_x = pia_yx[:, 1]
+    finite = np.isfinite(vent_x) & np.isfinite(pia_x)
+    if int(np.sum(finite)) >= 20:
+        med_dx = float(np.nanmedian(vent_x[finite] - pia_x[finite]))
+        if np.isfinite(med_dx) and abs(med_dx) >= 0.25:
+            wants_positive = midline_is_high_x
+            if (med_dx < 0.0) == wants_positive:
+                vent_yx, pia_yx = pia_yx, vent_yx
+
+    thickness_um = np.sqrt(
+        ((vent_yx[:, 0] - pia_yx[:, 0]) * float(res_y_um)) ** 2 + ((vent_yx[:, 1] - pia_yx[:, 1]) * float(res_x_um)) ** 2
+    )
+    return t, y, x, vent_yx, pia_yx, thickness_um
+
+
+def _save_coronal_midline_columns_csv(csv_path: Path, columns: dict[int, CoronalMidlineColumns]) -> None:
+    rows: list[np.ndarray] = []
+    for slice_i in sorted(columns.keys()):
+        c = columns[slice_i]
+        rows.append(
+            np.column_stack([np.full_like(c.t, slice_i, dtype=np.int32), c.t, c.y, c.x, c.vent_y, c.vent_x, c.pia_y, c.pia_x, c.thickness_um])
+        )
+    table = np.vstack(rows).astype(np.float64, copy=False)
+    np.savetxt(
+        csv_path,
+        table,
+        delimiter=",",
+        header="slice_i,t,y,x,vent_y,vent_x,pia_y,pia_x,thickness_um",
+        comments="",
+    )
+
+
+def _save_sagittal_midline_columns_csv(csv_path: Path, columns: dict[int, SagittalMidlineColumns]) -> None:
+    rows: list[np.ndarray] = []
+    for slice_k in sorted(columns.keys()):
+        c = columns[slice_k]
+        rows.append(
+            np.column_stack([np.full_like(c.t, slice_k, dtype=np.int32), c.t, c.y, c.x, c.vent_y, c.vent_x, c.pia_y, c.pia_x, c.thickness_um])
+        )
+    table = np.vstack(rows).astype(np.float64, copy=False)
+    np.savetxt(
+        csv_path,
+        table,
+        delimiter=",",
+        header="slice_k,t,y,x,vent_y,vent_x,pia_y,pia_x,thickness_um",
+        comments="",
+    )
+
+
+def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, CoronalMidlineColumns]:
+    u_3d, mask_3d, include_3d = _load_halfway_u_and_masks(outdir)
+    res = _load_resolution_ds_ijk_um(outdir) or (1.0, 1.0, 1.0)
+    res_j_um = float(res[1])
+    res_k_um = float(res[2])
+    t0 = time.perf_counter()
+    n_slices = int(u_3d.shape[0])
+    print(f"[midline] deriving coronal columns from halfway_u: slices={n_slices}")
+
+    out: dict[int, CoronalMidlineColumns] = {}
+    for slice_i in range(u_3d.shape[0]):
+        if slice_i % 50 == 0 or slice_i == (n_slices - 1):
+            print(f"[midline] coronal progress {slice_i + 1}/{n_slices}")
+        mask_yx = (mask_3d[slice_i, :, :] & include_3d[slice_i, :, :]).astype(bool, copy=False)
+        if not np.any(mask_yx):
+            continue
+        path = _load_manual_coronal_override_path(outdir, slice_i=int(slice_i))
+        if path is None:
+            path = _extract_largest_midline_contour(u_3d[slice_i, :, :], mask_yx)
+        if path is None:
+            continue
+        t, y, x, vent_yx, pia_yx, thickness_um = _build_slice_columns(
+            slice_index=int(slice_i),
+            path_yx=path,
+            mask_yx=mask_yx,
+            res_y_um=res_j_um,
+            res_x_um=res_k_um,
+        )
+        out[int(slice_i)] = CoronalMidlineColumns(
+            slice_i=int(slice_i),
+            t=t,
+            y=y,
+            x=x,
+            vent_y=vent_yx[:, 0],
+            vent_x=vent_yx[:, 1],
+            pia_y=pia_yx[:, 0],
+            pia_x=pia_yx[:, 1],
+            thickness_um=thickness_um,
+        )
+
+    if not out:
+        raise ValueError(
+            f"Could not derive coronal midline columns from halfway_u_3d_ds.npy in {outdir}. "
+            "Expected u=0.5 contours inside the cortex include-mask."
+        )
+    _save_coronal_midline_columns_csv(outdir / "coronal_midline_columns.csv", out)
+    dt = time.perf_counter() - t0
+    print(f"[midline] coronal done: kept_slices={len(out)} elapsed_s={dt:.1f}")
+    return out
+
+
+def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, SagittalMidlineColumns]:
+    u_3d, mask_3d, include_3d = _load_halfway_u_and_masks(outdir)
+    res = _load_resolution_ds_ijk_um(outdir) or (1.0, 1.0, 1.0)
+    res_i_um = float(res[0])
+    res_j_um = float(res[1])
+    t0 = time.perf_counter()
+    n_slices = int(u_3d.shape[2])
+    print(f"[midline] deriving sagittal columns from halfway_u: slices={n_slices}")
 
     out: dict[int, SagittalMidlineColumns] = {}
-    for s in np.unique(slice_k).tolist():
-        keep = slice_k == int(s)
-        out[int(s)] = SagittalMidlineColumns(
-            slice_k=int(s),
-            t=t[keep],
-            y=y[keep],
-            x=x[keep],
-            vent_y=vent_y[keep],
-            vent_x=vent_x[keep],
-            pia_y=pia_y[keep],
-            pia_x=pia_x[keep],
-            thickness_um=thickness_um[keep],
+    for slice_k in range(u_3d.shape[2]):
+        if slice_k % 50 == 0 or slice_k == (n_slices - 1):
+            print(f"[midline] sagittal progress {slice_k + 1}/{n_slices}")
+        mask_yx = (mask_3d[:, :, slice_k] & include_3d[:, :, slice_k]).astype(bool, copy=False)
+        if not np.any(mask_yx):
+            continue
+        path = _load_manual_sagittal_override_path(outdir, slice_k=int(slice_k))
+        if path is None:
+            path = _extract_largest_midline_contour(u_3d[:, :, slice_k], mask_yx)
+        if path is None:
+            continue
+        t, y, x, vent_yx, pia_yx, thickness_um = _build_slice_columns(
+            slice_index=int(slice_k),
+            path_yx=path,
+            mask_yx=mask_yx,
+            res_y_um=res_i_um,
+            res_x_um=res_j_um,
         )
+        out[int(slice_k)] = SagittalMidlineColumns(
+            slice_k=int(slice_k),
+            t=t,
+            y=y,
+            x=x,
+            vent_y=vent_yx[:, 0],
+            vent_x=vent_yx[:, 1],
+            pia_y=pia_yx[:, 0],
+            pia_x=pia_yx[:, 1],
+            thickness_um=thickness_um,
+        )
+
+    if not out:
+        raise ValueError(
+            f"Could not derive sagittal midline columns from halfway_u_3d_ds.npy in {outdir}. "
+            "Expected u=0.5 contours inside the cortex include-mask."
+        )
+    _save_sagittal_midline_columns_csv(outdir / "sagittal_midline_columns.csv", out)
+    dt = time.perf_counter() - t0
+    print(f"[midline] sagittal done: kept_slices={len(out)} elapsed_s={dt:.1f}")
     return out
 
 
@@ -425,6 +817,477 @@ def invert_sagittal_from_ijk(
     return InvertedAxisCoordinate(axis="sagittal", slice_index=int(slice_k), t=float(t_opt), r01=r01, residual_vox=float(residual))
 
 
+def _nearest_existing(sorted_keys: np.ndarray, key: int) -> int:
+    idx = int(np.searchsorted(sorted_keys, int(key)))
+    if idx <= 0:
+        return int(sorted_keys[0])
+    if idx >= int(sorted_keys.size):
+        return int(sorted_keys[-1])
+    a = int(sorted_keys[idx - 1])
+    b = int(sorted_keys[idx])
+    return a if abs(int(key) - a) <= abs(int(key) - b) else b
+
+
+def _project_t_on_polyline(*, y: np.ndarray, x: np.ndarray, t: np.ndarray, qy: float, qx: float) -> tuple[float, float]:
+    y = y.astype(np.float64, copy=False)
+    x = x.astype(np.float64, copy=False)
+    t = t.astype(np.float64, copy=False)
+    if y.ndim != 1 or x.ndim != 1 or t.ndim != 1 or y.size != x.size or y.size != t.size:
+        raise ValueError(f"Polyline arrays must be 1D and same length, got {y.shape} {x.shape} {t.shape}.")
+    if y.size < 2:
+        raise ValueError("Polyline must contain at least 2 points.")
+
+    p = np.column_stack([y, x])
+    p0 = p[:-1]
+    p1 = p[1:]
+    v = p1 - p0
+    q = np.asarray([float(qy), float(qx)], dtype=np.float64).reshape(1, 2)
+    w = q - p0
+
+    vv = np.sum(v * v, axis=1)
+    vv = np.where(vv > 0.0, vv, 1.0)
+    alpha = np.clip(np.sum(w * v, axis=1) / vv, 0.0, 1.0)
+    proj = p0 + v * alpha[:, None]
+    d2 = np.sum((proj - q) ** 2, axis=1)
+    m = int(np.argmin(d2))
+
+    t0 = float(t[m])
+    t1 = float(t[m + 1])
+    t_proj = t0 + float(alpha[m]) * (t1 - t0)
+    return float(np.clip(t_proj, 0.0, 1.0)), float(d2[m])
+
+
+def _p3_to_sagittal(
+    *,
+    ijk: tuple[float, float, float],
+    sagittal: dict[int, SagittalMidlineColumns],
+    sagittal_keys: np.ndarray,
+    k_window: int,
+) -> tuple[int, float, float]:
+    i = float(ijk[0])
+    j = float(ijk[1])
+    k = float(ijk[2])
+    k_center = int(np.rint(k))
+
+    cand = sorted({_nearest_existing(sagittal_keys, int(k_center + dk)) for dk in range(-int(k_window), int(k_window) + 1)})
+    best_d2: float | None = None
+    best_slice = int(cand[0])
+    best_t = 0.5
+    for k_idx in cand:
+        cols = sagittal[int(k_idx)]
+        t_proj, d2_plane = _project_t_on_polyline(y=cols.y, x=cols.x, t=cols.t, qy=i, qx=j)
+        d2 = float(d2_plane + (k - float(k_idx)) ** 2)
+        if best_d2 is None or d2 < best_d2:
+            best_d2 = d2
+            best_slice = int(k_idx)
+            best_t = float(t_proj)
+
+    return int(best_slice), float(best_t), float(np.sqrt(best_d2)) if best_d2 is not None else float("nan")
+
+
+def _p3_to_coronal(
+    *,
+    ijk: tuple[float, float, float],
+    coronal: dict[int, CoronalMidlineColumns],
+    coronal_keys: np.ndarray,
+    i_window: int,
+) -> tuple[int, float, float]:
+    i = float(ijk[0])
+    j = float(ijk[1])
+    k = float(ijk[2])
+    i_center = int(np.rint(i))
+
+    cand = sorted({_nearest_existing(coronal_keys, int(i_center + di)) for di in range(-int(i_window), int(i_window) + 1)})
+    best_d2: float | None = None
+    best_slice = int(cand[0])
+    best_t = 0.5
+    for i_idx in cand:
+        cols = coronal[int(i_idx)]
+        t_proj, d2_plane = _project_t_on_polyline(y=cols.y, x=cols.x, t=cols.t, qy=j, qx=k)
+        d2 = float(d2_plane + (i - float(i_idx)) ** 2)
+        if best_d2 is None or d2 < best_d2:
+            best_d2 = d2
+            best_slice = int(i_idx)
+            best_t = float(t_proj)
+
+    return int(best_slice), float(best_t), float(np.sqrt(best_d2)) if best_d2 is not None else float("nan")
+
+
+def build_transition_lut_2d(
+    *,
+    outdir: Path,
+    n_t: int = 1024,
+    i_window: int = 2,
+    k_window: int = 2,
+    overwrite: bool = False,
+) -> tuple[Path, Path]:
+    if n_t < 2:
+        raise ValueError("n_t must be >= 2.")
+    if i_window < 0 or k_window < 0:
+        raise ValueError("i_window and k_window must be >= 0.")
+
+    s2c_path = outdir / "chart_map_sagittal_to_coronal_t2d.npz"
+    c2s_path = outdir / "chart_map_coronal_to_sagittal_t2d.npz"
+    if not overwrite and s2c_path.exists() and c2s_path.exists():
+        try:
+            s2c = np.load(s2c_path)
+            c2s = np.load(c2s_path)
+            s2c_nt = int(np.asarray(s2c["t_grid"]).shape[0])
+            c2s_nt = int(np.asarray(c2s["t_grid"]).shape[0])
+            s2c_iw = int(np.asarray(s2c["i_window"]).reshape(-1)[0])
+            s2c_kw = int(np.asarray(s2c["k_window"]).reshape(-1)[0])
+            c2s_iw = int(np.asarray(c2s["i_window"]).reshape(-1)[0])
+            c2s_kw = int(np.asarray(c2s["k_window"]).reshape(-1)[0])
+            if (
+                s2c_nt == int(n_t)
+                and c2s_nt == int(n_t)
+                and s2c_iw == int(i_window)
+                and c2s_iw == int(i_window)
+                and s2c_kw == int(k_window)
+                and c2s_kw == int(k_window)
+            ):
+                return s2c_path, c2s_path
+        except (KeyError, ValueError, IndexError):
+            pass
+
+    coronal = load_coronal_midline_columns(outdir / "coronal_midline_columns.csv")
+    sagittal = load_sagittal_midline_columns(outdir / "sagittal_midline_columns.csv")
+    coronal_keys_all = np.asarray(sorted(coronal.keys()), dtype=np.int32)
+    sagittal_keys_all = np.asarray(sorted(sagittal.keys()), dtype=np.int32)
+    coronal_nonzero = _nonzero_include_slice_keys(outdir, axis="coronal")
+    sagittal_nonzero = _nonzero_include_slice_keys(outdir, axis="sagittal")
+    coronal_keys = np.intersect1d(coronal_keys_all, coronal_nonzero, assume_unique=False)
+    sagittal_keys = np.intersect1d(sagittal_keys_all, sagittal_nonzero, assume_unique=False)
+    if coronal_keys.size == 0 or sagittal_keys.size == 0:
+        raise ValueError("Cannot build LUT with empty coronal or sagittal columns.")
+    t0 = time.perf_counter()
+    print(
+        f"[lut] building 2D chart LUTs: coronal_rows={coronal_keys.size} sagittal_rows={sagittal_keys.size} n_t={int(n_t)}"
+    )
+
+    t_grid = np.linspace(0.0, 1.0, int(n_t), dtype=np.float64)
+
+    map_s2c_slice = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+    map_s2c_t = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+    map_s2c_err = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+    for row, slice_k in enumerate(sagittal_keys.tolist()):
+        if row % 16 == 0 or row == (sagittal_keys.size - 1):
+            print(f"[lut] s2c rows {row + 1}/{sagittal_keys.size}")
+        cols = sagittal[int(slice_k)]
+        for col, t_val in enumerate(t_grid.tolist()):
+            i = float(_interp(cols.t, cols.y, float(t_val)))
+            j = float(_interp(cols.t, cols.x, float(t_val)))
+            i_idx, t_c, err = _p3_to_coronal(
+                ijk=(i, j, float(slice_k)),
+                coronal=coronal,
+                coronal_keys=coronal_keys,
+                i_window=int(i_window),
+            )
+            map_s2c_slice[row, col] = float(i_idx)
+            map_s2c_t[row, col] = float(t_c)
+            map_s2c_err[row, col] = float(err)
+
+    valid_s2c = np.ones((sagittal_keys.size,), dtype=bool)
+    for row in range(sagittal_keys.size):
+        map_s2c_slice[row] = _fill_nan_series(map_s2c_slice[row]).astype(np.float32, copy=False)
+        map_s2c_t[row] = _fill_nan_series(map_s2c_t[row]).astype(np.float32, copy=False)
+        map_s2c_err[row] = _fill_nan_series(map_s2c_err[row]).astype(np.float32, copy=False)
+        if not (
+            np.isfinite(map_s2c_slice[row]).all()
+            and np.isfinite(map_s2c_t[row]).all()
+            and np.isfinite(map_s2c_err[row]).all()
+        ):
+            valid_s2c[row] = False
+    if not np.all(valid_s2c):
+        dropped = int(np.sum(~valid_s2c))
+        print(f"[lut] s2c dropping invalid rows={dropped}")
+        sagittal_keys = sagittal_keys[valid_s2c]
+        map_s2c_slice = map_s2c_slice[valid_s2c]
+        map_s2c_t = map_s2c_t[valid_s2c]
+        map_s2c_err = map_s2c_err[valid_s2c]
+    if sagittal_keys.size == 0:
+        raise ValueError("No valid sagittal rows left after NaN sanitization.")
+
+    np.savez_compressed(
+        s2c_path,
+        source_axis="sagittal",
+        target_axis="coronal",
+        source_slice_keys=sagittal_keys,
+        target_slice_idx=map_s2c_slice,
+        target_t=map_s2c_t,
+        residual_vox=map_s2c_err,
+        t_grid=t_grid.astype(np.float32),
+        i_window=np.asarray([int(i_window)], dtype=np.int32),
+        k_window=np.asarray([int(k_window)], dtype=np.int32),
+    )
+
+    map_c2s_slice = np.full((coronal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+    map_c2s_t = np.full((coronal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+    map_c2s_err = np.full((coronal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+    for row, slice_i in enumerate(coronal_keys.tolist()):
+        if row % 16 == 0 or row == (coronal_keys.size - 1):
+            print(f"[lut] c2s rows {row + 1}/{coronal_keys.size}")
+        cols = coronal[int(slice_i)]
+        for col, t_val in enumerate(t_grid.tolist()):
+            j = float(_interp(cols.t, cols.y, float(t_val)))
+            k = float(_interp(cols.t, cols.x, float(t_val)))
+            k_idx, t_s, err = _p3_to_sagittal(
+                ijk=(float(slice_i), j, k),
+                sagittal=sagittal,
+                sagittal_keys=sagittal_keys,
+                k_window=int(k_window),
+            )
+            map_c2s_slice[row, col] = float(k_idx)
+            map_c2s_t[row, col] = float(t_s)
+            map_c2s_err[row, col] = float(err)
+
+    valid_c2s = np.ones((coronal_keys.size,), dtype=bool)
+    for row in range(coronal_keys.size):
+        map_c2s_slice[row] = _fill_nan_series(map_c2s_slice[row]).astype(np.float32, copy=False)
+        map_c2s_t[row] = _fill_nan_series(map_c2s_t[row]).astype(np.float32, copy=False)
+        map_c2s_err[row] = _fill_nan_series(map_c2s_err[row]).astype(np.float32, copy=False)
+        if not (
+            np.isfinite(map_c2s_slice[row]).all()
+            and np.isfinite(map_c2s_t[row]).all()
+            and np.isfinite(map_c2s_err[row]).all()
+        ):
+            valid_c2s[row] = False
+    if not np.all(valid_c2s):
+        dropped = int(np.sum(~valid_c2s))
+        print(f"[lut] c2s dropping invalid rows={dropped}")
+        coronal_keys = coronal_keys[valid_c2s]
+        map_c2s_slice = map_c2s_slice[valid_c2s]
+        map_c2s_t = map_c2s_t[valid_c2s]
+        map_c2s_err = map_c2s_err[valid_c2s]
+    if coronal_keys.size == 0:
+        raise ValueError("No valid coronal rows left after NaN sanitization.")
+
+    np.savez_compressed(
+        c2s_path,
+        source_axis="coronal",
+        target_axis="sagittal",
+        source_slice_keys=coronal_keys,
+        target_slice_idx=map_c2s_slice,
+        target_t=map_c2s_t,
+        residual_vox=map_c2s_err,
+        t_grid=t_grid.astype(np.float32),
+        i_window=np.asarray([int(i_window)], dtype=np.int32),
+        k_window=np.asarray([int(k_window)], dtype=np.int32),
+    )
+    dt = time.perf_counter() - t0
+    print(f"[lut] 2D chart LUTs done: elapsed_s={dt:.1f}")
+    return s2c_path, c2s_path
+
+
+def _interp_row_with_nans(*, t_grid: np.ndarray, row: np.ndarray, t: float) -> float:
+    finite = np.isfinite(row)
+    if not np.any(finite):
+        return float("nan")
+    t_clip = float(np.clip(float(t), 0.0, 1.0))
+    return float(np.interp(t_clip, t_grid[finite], row[finite]))
+
+
+def transform_with_lut(
+    *,
+    outdir: Path,
+    source_axis: Literal["coronal", "sagittal"],
+    source_slice: int,
+    t: float,
+    r01: float,
+    n_t: int = 1024,
+    i_window: int = 2,
+    k_window: int = 2,
+    rebuild_lut: bool = False,
+) -> InvertedAxisCoordinate:
+    s2c_path, c2s_path = build_transition_lut_2d(
+        outdir=outdir,
+        n_t=int(n_t),
+        i_window=int(i_window),
+        k_window=int(k_window),
+        overwrite=bool(rebuild_lut),
+    )
+    lut_path = c2s_path if source_axis == "coronal" else s2c_path
+    lut = np.load(lut_path)
+
+    source_keys = np.asarray(lut["source_slice_keys"], dtype=np.int32)
+    t_grid = np.asarray(lut["t_grid"], dtype=np.float64)
+    target_slice = np.asarray(lut["target_slice_idx"], dtype=np.float64)
+    target_t = np.asarray(lut["target_t"], dtype=np.float64)
+    residual = np.asarray(lut["residual_vox"], dtype=np.float64)
+
+    row = int(np.argmin(np.abs(source_keys - int(source_slice))))
+    slice_float = _interp_row_with_nans(t_grid=t_grid, row=target_slice[row], t=float(t))
+    t_out = _interp_row_with_nans(t_grid=t_grid, row=target_t[row], t=float(t))
+    residual_out = _interp_row_with_nans(t_grid=t_grid, row=residual[row], t=float(t))
+    if not np.isfinite(slice_float) or not np.isfinite(t_out):
+        raise ValueError(
+            f"LUT lookup failed for source_axis={source_axis}, slice={source_slice}, t={t:.6f}. "
+            "Try increasing --lut-nt or --lut-window."
+        )
+
+    target_axis: Literal["coronal", "sagittal"] = "sagittal" if source_axis == "coronal" else "coronal"
+    return InvertedAxisCoordinate(
+        axis=target_axis,
+        slice_index=int(np.rint(slice_float)),
+        t=float(np.clip(t_out, 0.0, 1.0)),
+        r01=float(np.clip(float(r01), 0.0, 1.0)),
+        residual_vox=float(residual_out) if np.isfinite(residual_out) else float("nan"),
+    )
+
+
+def _build_ijk_segment_lut_for_axis(
+    *,
+    outdir: Path,
+    axis: Literal["coronal", "sagittal"],
+    n_t: int,
+    overwrite: bool,
+) -> Path:
+    if axis == "coronal":
+        path = outdir / "chart_map_coronal_ijk_from_tr.npz"
+    else:
+        path = outdir / "chart_map_sagittal_ijk_from_tr.npz"
+
+    if not overwrite and path.exists():
+        try:
+            d = np.load(path)
+            if int(np.asarray(d["t_grid"]).shape[0]) == int(n_t):
+                return path
+        except (KeyError, ValueError):
+            pass
+
+    edt = load_halfway_edt_crop(outdir)
+    if axis == "coronal":
+        cols = load_coronal_midline_columns(outdir / "coronal_midline_columns.csv")
+        slice_keys_all = np.asarray(sorted(cols.keys()), dtype=np.int32)
+    else:
+        cols = load_sagittal_midline_columns(outdir / "sagittal_midline_columns.csv")
+        slice_keys_all = np.asarray(sorted(cols.keys()), dtype=np.int32)
+    slice_keys = np.intersect1d(slice_keys_all, _nonzero_include_slice_keys(outdir, axis=axis), assume_unique=False)
+
+    if slice_keys.size == 0:
+        raise ValueError(f"Cannot build {axis} ijk LUT: no slice keys.")
+    t0 = time.perf_counter()
+    print(f"[lut] building ijk segment LUT axis={axis} rows={slice_keys.size} n_t={int(n_t)}")
+
+    t_grid = np.linspace(0.0, 1.0, int(n_t), dtype=np.float64)
+    low_ijk = np.full((slice_keys.size, t_grid.size, 3), np.nan, dtype=np.float32)
+    high_ijk = np.full((slice_keys.size, t_grid.size, 3), np.nan, dtype=np.float32)
+
+    for row, s in enumerate(slice_keys.tolist()):
+        if row % 16 == 0 or row == (slice_keys.size - 1):
+            print(f"[lut] {axis} ijk rows {row + 1}/{slice_keys.size}")
+        c = cols[int(s)]
+        for col, t_val in enumerate(t_grid.tolist()):
+            vent_y = float(_interp(c.t, c.vent_y, float(t_val)))
+            vent_x = float(_interp(c.t, c.vent_x, float(t_val)))
+            pia_y = float(_interp(c.t, c.pia_y, float(t_val)))
+            pia_x = float(_interp(c.t, c.pia_x, float(t_val)))
+            if not np.isfinite([vent_y, vent_x, pia_y, pia_x]).all():
+                continue
+
+            if axis == "coronal":
+                vent = (float(s), vent_y, vent_x)
+                pia = (float(s), pia_y, pia_x)
+            else:
+                vent = (vent_y, vent_x, float(s))
+                pia = (pia_y, pia_x, float(s))
+
+            try:
+                r_vent = float(_r01_at_ijk(edt, vent))
+                r_pia = float(_r01_at_ijk(edt, pia))
+            except ValueError:
+                continue
+            if not np.isfinite(r_vent) or not np.isfinite(r_pia):
+                continue
+
+            if r_vent <= r_pia:
+                lo, hi = vent, pia
+            else:
+                lo, hi = pia, vent
+            low_ijk[row, col] = np.asarray(lo, dtype=np.float32)
+            high_ijk[row, col] = np.asarray(hi, dtype=np.float32)
+
+    valid_rows = np.ones((slice_keys.size,), dtype=bool)
+    for row in range(slice_keys.size):
+        for dim in range(3):
+            low_ijk[row, :, dim] = _fill_nan_series(low_ijk[row, :, dim]).astype(np.float32, copy=False)
+            high_ijk[row, :, dim] = _fill_nan_series(high_ijk[row, :, dim]).astype(np.float32, copy=False)
+        if not (np.isfinite(low_ijk[row]).all() and np.isfinite(high_ijk[row]).all()):
+            valid_rows[row] = False
+    if not np.all(valid_rows):
+        dropped = int(np.sum(~valid_rows))
+        print(f"[lut] {axis} ijk dropping invalid rows={dropped}")
+        slice_keys = slice_keys[valid_rows]
+        low_ijk = low_ijk[valid_rows]
+        high_ijk = high_ijk[valid_rows]
+    if slice_keys.size == 0:
+        raise ValueError(f"No valid rows left for axis={axis} after NaN sanitization.")
+
+    np.savez_compressed(
+        path,
+        source_axis=axis,
+        source_slice_keys=slice_keys,
+        t_grid=t_grid.astype(np.float32),
+        low_ijk=low_ijk,
+        high_ijk=high_ijk,
+    )
+    dt = time.perf_counter() - t0
+    print(f"[lut] ijk segment LUT done axis={axis}: elapsed_s={dt:.1f}")
+    return path
+
+
+def build_ijk_segment_luts(
+    *,
+    outdir: Path,
+    n_t: int = 1024,
+    overwrite: bool = False,
+) -> tuple[Path, Path]:
+    if n_t < 2:
+        raise ValueError("n_t must be >= 2.")
+    coronal = _build_ijk_segment_lut_for_axis(outdir=outdir, axis="coronal", n_t=int(n_t), overwrite=bool(overwrite))
+    sagittal = _build_ijk_segment_lut_for_axis(outdir=outdir, axis="sagittal", n_t=int(n_t), overwrite=bool(overwrite))
+    return coronal, sagittal
+
+
+def ijk_from_axis_tr_with_lut(
+    *,
+    outdir: Path,
+    axis: Literal["coronal", "sagittal"],
+    slice_index: int,
+    t: float,
+    r01: float,
+    n_t: int = 1024,
+    rebuild_lut: bool = False,
+) -> tuple[tuple[float, float, float], int]:
+    coronal_path, sagittal_path = build_ijk_segment_luts(outdir=outdir, n_t=int(n_t), overwrite=bool(rebuild_lut))
+    path = coronal_path if axis == "coronal" else sagittal_path
+    d = np.load(path)
+
+    source_slice_keys = np.asarray(d["source_slice_keys"], dtype=np.int32)
+    t_grid = np.asarray(d["t_grid"], dtype=np.float64)
+    low_ijk = np.asarray(d["low_ijk"], dtype=np.float64)
+    high_ijk = np.asarray(d["high_ijk"], dtype=np.float64)
+
+    row = int(np.argmin(np.abs(source_slice_keys - int(slice_index))))
+    lo = np.asarray(
+        [_interp_row_with_nans(t_grid=t_grid, row=low_ijk[row, :, dim], t=float(t)) for dim in range(3)],
+        dtype=np.float64,
+    )
+    hi = np.asarray(
+        [_interp_row_with_nans(t_grid=t_grid, row=high_ijk[row, :, dim], t=float(t)) for dim in range(3)],
+        dtype=np.float64,
+    )
+    if not np.isfinite(lo).all() or not np.isfinite(hi).all():
+        raise ValueError(
+            f"IJK LUT lookup failed for axis={axis}, slice={slice_index}, t={float(t):.6f}. "
+            "Try increasing --lut-nt."
+        )
+
+    r = float(np.clip(float(r01), 0.0, 1.0))
+    q = lo + r * (hi - lo)
+    return (float(q[0]), float(q[1]), float(q[2])), int(source_slice_keys[row])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="EDT query (slice_i|slice_k, t, r01) -> CCF ijk/um using *midline_columns.csv")
     parser.add_argument("--outdir", type=Path, default=Path("ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d"))
@@ -432,49 +1295,51 @@ def main() -> None:
     parser.add_argument("--slice", type=int, required=True)
     parser.add_argument("--t", type=float, required=True, help="along-midline coordinate in [0,1] on the chosen slice")
     parser.add_argument("--r01", type=float, required=True, help="depth coordinate in [0,1] (0=inner/vent, 1=pia)")
-    parser.add_argument("--tol-r01", type=float, default=2.0e-4)
-    parser.add_argument("--max-iters", type=int, default=60)
     parser.add_argument("--transform-to", choices=["coronal", "sagittal"], default=None)
+    parser.add_argument("--lut-nt", type=int, default=1024, help="Number of t bins for 2D sagittal<->coronal LUT.")
+    parser.add_argument("--lut-window", type=int, default=2, help="Candidate slice window (in voxels) used while building LUT.")
+    parser.add_argument("--rebuild-lut", action="store_true", help="Force rebuilding LUT files before transform lookup.")
+    parser.add_argument("--build-lut-only", action="store_true", help="Build LUT files and exit.")
+    parser.add_argument(
+        "--rebuild-ijk-lut",
+        action="store_true",
+        help="Force rebuilding (axis,slice,t,r01)->ijk segment LUTs before query lookup.",
+    )
+    parser.add_argument("--build-ijk-lut-only", action="store_true", help="Build ijk segment LUTs and exit.")
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
-    edt = load_halfway_edt_crop(outdir)
-    if args.axis == "coronal":
-        cols = load_coronal_midline_columns(outdir / "coronal_midline_columns.csv")
-        slice_i = int(args.slice)
-        if slice_i not in cols:
-            slice_i = _nearest_key(sorted(cols.keys()), slice_i)
-        c = cols[slice_i]
-        vent_y = _interp(c.t, c.vent_y, float(args.t))
-        vent_x = _interp(c.t, c.vent_x, float(args.t))
-        pia_y = _interp(c.t, c.pia_y, float(args.t))
-        pia_x = _interp(c.t, c.pia_x, float(args.t))
-        ijk = invert_r01_along_segment(
-            edt,
-            vent_ijk=(float(c.slice_i), float(vent_y), float(vent_x)),
-            pia_ijk=(float(c.slice_i), float(pia_y), float(pia_x)),
-            r01_target=float(args.r01),
-            max_iters=int(args.max_iters),
-            tol_r01=float(args.tol_r01),
+    if args.build_ijk_lut_only:
+        coronal_path, sagittal_path = build_ijk_segment_luts(
+            outdir=outdir,
+            n_t=int(args.lut_nt),
+            overwrite=bool(args.rebuild_ijk_lut),
         )
-    else:
-        cols = load_sagittal_midline_columns(outdir / "sagittal_midline_columns.csv")
-        slice_k = int(args.slice)
-        if slice_k not in cols:
-            slice_k = _nearest_key(sorted(cols.keys()), slice_k)
-        c = cols[slice_k]
-        vent_y = _interp(c.t, c.vent_y, float(args.t))
-        vent_x = _interp(c.t, c.vent_x, float(args.t))
-        pia_y = _interp(c.t, c.pia_y, float(args.t))
-        pia_x = _interp(c.t, c.pia_x, float(args.t))
-        ijk = invert_r01_along_segment(
-            edt,
-            vent_ijk=(float(vent_y), float(vent_x), float(c.slice_k)),
-            pia_ijk=(float(pia_y), float(pia_x), float(c.slice_k)),
-            r01_target=float(args.r01),
-            max_iters=int(args.max_iters),
-            tol_r01=float(args.tol_r01),
+        print(f"ijk_lut_coronal={coronal_path}")
+        print(f"ijk_lut_sagittal={sagittal_path}")
+        return
+
+    if args.build_lut_only:
+        s2c_path, c2s_path = build_transition_lut_2d(
+            outdir=outdir,
+            n_t=int(args.lut_nt),
+            i_window=int(args.lut_window),
+            k_window=int(args.lut_window),
+            overwrite=bool(args.rebuild_lut),
         )
+        print(f"lut_sagittal_to_coronal={s2c_path}")
+        print(f"lut_coronal_to_sagittal={c2s_path}")
+        return
+
+    ijk, source_slice_used = ijk_from_axis_tr_with_lut(
+        outdir=outdir,
+        axis=args.axis,
+        slice_index=int(args.slice),
+        t=float(args.t),
+        r01=float(args.r01),
+        n_t=int(args.lut_nt),
+        rebuild_lut=bool(args.rebuild_ijk_lut),
+    )
 
     print(f"ijk_vox={ijk!r}")
 
@@ -491,15 +1356,33 @@ def main() -> None:
         if args.transform_to == args.axis:
             raise ValueError("--transform-to must differ from --axis.")
         if args.transform_to == "coronal":
-            coronal = load_coronal_midline_columns(outdir / "coronal_midline_columns.csv")
-            inv = invert_coronal_from_ijk(coronal, ijk=ijk, edt=edt)
+            inv = transform_with_lut(
+                outdir=outdir,
+                source_axis=args.axis,
+                source_slice=int(source_slice_used),
+                t=float(args.t),
+                r01=float(args.r01),
+                n_t=int(args.lut_nt),
+                i_window=int(args.lut_window),
+                k_window=int(args.lut_window),
+                rebuild_lut=bool(args.rebuild_lut),
+            )
             print(
                 "transformed_coronal="
                 f"{{slice_i:{inv.slice_index}, t:{inv.t:.6f}, r01:{inv.r01:.6f}, residual_vox:{inv.residual_vox:.4f}}}"
             )
         else:
-            sagittal = load_sagittal_midline_columns(outdir / "sagittal_midline_columns.csv")
-            inv = invert_sagittal_from_ijk(sagittal, ijk=ijk, edt=edt)
+            inv = transform_with_lut(
+                outdir=outdir,
+                source_axis=args.axis,
+                source_slice=int(source_slice_used),
+                t=float(args.t),
+                r01=float(args.r01),
+                n_t=int(args.lut_nt),
+                i_window=int(args.lut_window),
+                k_window=int(args.lut_window),
+                rebuild_lut=bool(args.rebuild_lut),
+            )
             print(
                 "transformed_sagittal="
                 f"{{slice_k:{inv.slice_index}, t:{inv.t:.6f}, r01:{inv.r01:.6f}, residual_vox:{inv.residual_vox:.4f}}}"

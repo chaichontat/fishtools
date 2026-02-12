@@ -47,6 +47,8 @@ MASK_COLOR = "#2ca02c"
 MASK_ALPHA = 0.18
 BOUNDARY_ALPHA = 0.85
 SLIDER_DEBOUNCE_MS = 40
+MANUAL_CONNECT_CORONAL_PATH_TEMPLATE = "manual_coronal_midcurve_override_slice{slice_i}_yx.npy"
+MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE = "manual_sagittal_midcurve_override_slice{slice_k}_yx.npy"
 
 SHOW_R_OVERLAY = True
 R_CLIP_UM = 800.0
@@ -83,6 +85,31 @@ def _masked_u_slice(u2: np.ndarray, mask2: np.ndarray) -> np.ndarray:
     mask2 = mask2.astype(bool, copy=False)
     out = np.full(u2.shape, np.nan, dtype=np.float32)
     out[mask2] = u2[mask2]
+    return out
+
+
+def _load_manual_override_paths(outdir: Path, *, axis: str) -> dict[int, np.ndarray]:
+    if axis == "coronal":
+        prefix = "manual_coronal_midcurve_override_slice"
+        pattern = MANUAL_CONNECT_CORONAL_PATH_TEMPLATE.format(slice_i="*")
+    elif axis == "sagittal":
+        prefix = "manual_sagittal_midcurve_override_slice"
+        pattern = MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE.format(slice_k="*")
+    else:
+        raise ValueError(f"Unsupported axis={axis!r}")
+
+    out: dict[int, np.ndarray] = {}
+    for path in sorted(outdir.glob(pattern)):
+        stem = path.stem
+        if not stem.startswith(prefix):
+            continue
+        tail = stem[len(prefix) :]
+        if not tail.isdigit():
+            continue
+        arr = np.load(path).astype(np.float32, copy=False)
+        if arr.ndim != 2 or arr.shape[1] != 2 or arr.shape[0] < 2:
+            continue
+        out[int(tail)] = arr
     return out
 
 
@@ -224,6 +251,12 @@ if reference_3d.shape != cortex_3d.shape or cortex_3d.shape != u_3d.shape:
     )
 
 vmin, vmax = _robust_vmin_vmax(reference_3d)
+manual_coronal_paths = _load_manual_override_paths(OUTDIR, axis="coronal")
+manual_sagittal_paths = _load_manual_override_paths(OUTDIR, axis="sagittal")
+if manual_coronal_paths:
+    print(f"Loaded {len(manual_coronal_paths)} coronal manual override paths from {OUTDIR}")
+if manual_sagittal_paths:
+    print(f"Loaded {len(manual_sagittal_paths)} sagittal manual override paths from {OUTDIR}")
 
 
 # %% [markdown]
@@ -307,7 +340,20 @@ def view_coronal_overlay(*, show: bool = True) -> None:
         if midline_include_3d is not None:
             contour_mask = contour_mask & midline_include_3d[i, :, :]
         u2 = _masked_u_slice(u_3d[i, :, :], contour_mask)
-        if np.isfinite(u2).any():
+        manual_path_yx = manual_coronal_paths.get(int(i))
+        if manual_path_yx is not None and manual_path_yx.shape[0] >= 2:
+            # Manual path arrays are stored as (y, x); LineCollection expects (x, y).
+            manual_path_xy = manual_path_yx[:, [1, 0]].astype(np.float32, copy=False)
+            curve_lc = _plot_parametrized_curve(
+                ax,
+                [manual_path_xy],
+                cmap=U_CURVE_T_CMAP,
+                norm=curve_norm,
+                linewidth=1.2,
+                alpha=BOUNDARY_ALPHA,
+                zorder=3,
+            )
+        elif np.isfinite(u2).any():
             cont = ax.contour(
                 u2,
                 levels=[float(CONTOUR_LEVEL)],
@@ -464,7 +510,20 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
         if midline_include_3d is not None:
             contour_mask = contour_mask & midline_include_3d[:, :, k]
         u2 = _masked_u_slice(u_3d[:, :, k], contour_mask)
-        if np.isfinite(u2).any():
+        manual_path_ij = manual_sagittal_paths.get(int(k))
+        if manual_path_ij is not None and manual_path_ij.shape[0] >= 2:
+            # Manual path arrays are stored as (i, j); LineCollection expects (x=j, y=i).
+            manual_path_xy = manual_path_ij[:, [1, 0]].astype(np.float32, copy=False)
+            curve_lc = _plot_parametrized_curve(
+                ax,
+                [manual_path_xy],
+                cmap=U_CURVE_T_CMAP,
+                norm=curve_norm,
+                linewidth=1.0,
+                alpha=BOUNDARY_ALPHA,
+                zorder=3,
+            )
+        elif np.isfinite(u2).any():
             cont = ax.contour(
                 u2,
                 levels=[float(CONTOUR_LEVEL)],
