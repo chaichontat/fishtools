@@ -20,6 +20,7 @@ import scipy.sparse as sp
 from IPython import get_ipython
 from matplotlib.widgets import Button
 
+from fishtools.ccf.princurve import fit_anchor_curve, project_to_polyline_arclength
 from fishtools.io.workspace import Workspace
 
 # Use widget backend for VS Code interactive mode
@@ -27,8 +28,8 @@ ip = get_ipython()
 if ip is not None:
     ip.run_line_magic("matplotlib", "widget")
 
-folders = sorted(Path("/working").glob("2025*Jax*"))
-FOLDER = folders[-1]
+folders = sorted(Path("~/nvme").expanduser().glob("2025*Jax*"))
+FOLDER = folders[1]
 j = 0
 # %% [markdown]
 # ## Config (EDIT THESE)
@@ -81,7 +82,8 @@ print(
 for roi_name in sorted(missing_subrois_by_roi):
     missing_subrois = ", ".join(sorted(missing_subrois_by_roi[roi_name]))
     print(f"  - {roi_name}: {missing_subrois}")
-ROI = ws.rois[-1]
+
+ROI =ws.rois[j]
 j += 1
 
 INPUT_H5AD = Path(
@@ -122,6 +124,12 @@ COLOR_GENE_CLIP_Q = (0.01, 0.99)
 
 # Job index (incremented in the plotting cell below)
 i = 0
+
+# Signed-r review settings (used by the review cell near the bottom).
+REVIEW_CURVE_N_DENSE = 5_000
+REVIEW_ANCHOR_SMOOTHING = 0.5
+REVIEW_PLOT_MAX_POINTS = 100_000
+REVIEW_R_SIGN_ENDPOINT_EXTRAPOLATION = 0.1
 
 if not INPUT_H5AD.exists():
     raise FileNotFoundError(INPUT_H5AD)
@@ -472,6 +480,7 @@ def pick_anchors(
             "roi_obs_key": ROI_OBS_KEY if roi_value is not None else None,
             "roi_value": roi_value,
             "n_obs": int(adata_in.n_obs),
+            "reverse_r_sign": False,
             "anchors": [asdict(a) for a in anchors],
             # Backward-compat fields for older scripts:
             "start": asdict(anchors[0]),
@@ -567,6 +576,143 @@ def load_existing_anchors(path: Path, *, cell_ids_in_view: set[str]) -> list[Anc
         out.append(Anchor(cell_id=cid, x=0.0, y=0.0, index=-1))
     return out
 
+
+def _extract_anchor_ids_from_payload(payload: dict[str, object]) -> list[str]:
+    raw = payload.get("anchors")
+    if isinstance(raw, list) and raw:
+        out: list[str] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("cell_id")
+            if isinstance(cid, str) and cid != "":
+                out.append(cid)
+        if len(out) >= 2:
+            return out
+
+    start = payload.get("start")
+    end = payload.get("end")
+    out2: list[str] = []
+    for item in (start, end):
+        if not isinstance(item, dict):
+            continue
+        cid = item.get("cell_id")
+        if isinstance(cid, str) and cid != "":
+            out2.append(cid)
+    return out2
+
+
+def review_signed_r_plot(
+    *,
+    adata_in: ad.AnnData,
+    out_json: Path,
+    n_dense: int,
+    smoothing: float,
+    max_points: int,
+) -> None:
+    if not out_json.exists():
+        print(f"Missing anchors JSON: {out_json}")
+        return
+
+    payload = json.loads(out_json.read_text())
+    reverse_r_sign = payload.get("reverse_r_sign")
+    if reverse_r_sign is None:
+        reverse_r_sign = False
+        payload["reverse_r_sign"] = False
+        out_json.write_text(json.dumps(payload, indent=2) + "\n")
+    elif not isinstance(reverse_r_sign, bool):
+        raise ValueError(f"Invalid reverse_r_sign in anchors JSON (expected bool): {out_json}")
+    anchor_ids = _extract_anchor_ids_from_payload(payload)
+    if len(anchor_ids) < 2:
+        raise ValueError(f"Need at least 2 anchors in JSON to review signed r: {out_json}")
+
+    xy = np.asarray(adata_in.obsm["spatial"], dtype=float)
+    if xy.ndim != 2 or xy.shape[1] < 2:
+        raise ValueError(f"Unexpected spatial shape: {xy.shape}")
+    xy = xy[:, :2]
+    cell_ids = adata_in.obs_names.astype(str).to_numpy()
+    cell_to_index = {cid: i for i, cid in enumerate(cell_ids)}
+    missing = [cid for cid in anchor_ids if cid not in cell_to_index]
+    if missing:
+        raise ValueError(f"Anchors are missing in current view: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+
+    anchor_idx = np.asarray([cell_to_index[cid] for cid in anchor_ids], dtype=int)
+    anchor_xy = xy[anchor_idx, :]
+    curve = fit_anchor_curve(anchor_xy=anchor_xy, n_dense=int(n_dense), smoothing=float(smoothing))
+    _t, r_signed, _proj = project_to_polyline_arclength(
+        xy=xy,
+        line=curve,
+        k=50,
+        endpoint_extrapolation=float(REVIEW_R_SIGN_ENDPOINT_EXTRAPOLATION),
+    )
+    if reverse_r_sign:
+        r_signed = -np.asarray(r_signed, dtype=float)
+
+    rng = np.random.default_rng(0)
+    plot_idx = np.arange(xy.shape[0])
+    if plot_idx.size > int(max_points):
+        plot_idx = rng.choice(plot_idx, size=int(max_points), replace=False)
+
+    finite_abs = np.abs(r_signed[np.isfinite(r_signed)])
+    lim = float(np.quantile(finite_abs, 0.99)) if finite_abs.size else 1.0
+    if not np.isfinite(lim) or lim <= 0:
+        lim = 1.0
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    sc = ax.scatter(
+        xy[plot_idx, 0],
+        xy[plot_idx, 1],
+        c=r_signed[plot_idx],
+        s=POINT_SIZE,
+        alpha=POINT_ALPHA,
+        cmap="coolwarm",
+        vmin=-lim,
+        vmax=lim,
+        linewidths=0,
+        zorder=2,
+    )
+    ax.plot(curve[:, 0], curve[:, 1], color="black", linewidth=1.5, zorder=3)
+    ax.scatter(anchor_xy[:, 0], anchor_xy[:, 1], c="yellow", s=30, edgecolors="black", linewidths=0.5, zorder=4)
+    ax.scatter([anchor_xy[0, 0]], [anchor_xy[0, 1]], c="lime", s=70, edgecolors="black", linewidths=0.5, zorder=5)
+    ax.scatter([anchor_xy[-1, 0]], [anchor_xy[-1, 1]], c="red", s=70, edgecolors="black", linewidths=0.5, zorder=5)
+    ax.set_title("Signed r review (coolwarm): green=start, red=end")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    fig.colorbar(sc, ax=ax, label="signed r")
+    print(f"Rendered signed-r review plot (reverse_r_sign={reverse_r_sign}).")
+    plt.show()
+
+
+def apply_signed_r_review_decision(*, out_json: Path, answer: str | None = None) -> None:
+    if not out_json.exists():
+        print(f"Missing anchors JSON: {out_json}")
+        return
+    payload = json.loads(out_json.read_text())
+
+    if answer is None:
+        cur = payload.get("reverse_r_sign", False)
+        if not isinstance(cur, bool):
+            raise ValueError(f"Invalid reverse_r_sign in anchors JSON (expected bool): {out_json}")
+        answer = input(f"reverse_r_sign is {cur}. Set to True/False? [y/n/Enter=keep]: ")
+    ans = str(answer).strip().lower()
+    if ans == "":
+        reverse = payload.get("reverse_r_sign", False)
+    elif ans in {"y", "yes"}:
+        reverse = True
+    elif ans in {"n", "no"}:
+        reverse = False
+    else:
+        print(f"Unrecognized answer {answer!r}; keeping existing reverse_r_sign.")
+        reverse = payload.get("reverse_r_sign", False)
+    if not isinstance(reverse, bool):
+        reverse = False
+    payload["reverse_r_sign"] = reverse
+    print(f"Recorded reverse_r_sign={reverse} (anchor order unchanged).")
+
+    out_json.write_text(json.dumps(payload, indent=2) + "\n")
+    print("Updated:", out_json)
+
 # %% [markdown]
 # ## Run next job (re-run this cell)
 #
@@ -583,6 +729,7 @@ else:
     if initial:
         print(f"Loaded existing anchors: n={len(initial)} from {out_json}")
     pick_anchors(
+
         adata_in=adata_roi,
         adata_context=adata,
         out_json=out_json,
@@ -592,12 +739,35 @@ else:
     )
     i += 1
 
-    if i < len(jobs):
-        raise RuntimeError("Re-run this cell to process the next job.")
-# %% [markdown]
-# ## Next
-#
-# After saving, you’ll have `OUT_JSON` (or `*.{roi}.anchors.json` when splitting ROIs) with the chosen `cell_id`s.
-# You can then use those anchors to orient/rescale princurve `t` downstream.
+
+
+# %%
+REVIEW_JOB_INDEX = max(0, i - 1)
+
+if not jobs:
+    print("No jobs available for review.")
+elif REVIEW_JOB_INDEX >= len(jobs):
+    print(f"Review job index out of range: {REVIEW_JOB_INDEX} (n_jobs={len(jobs)})")
+else:
+    roi_value, adata_roi, out_json = jobs[REVIEW_JOB_INDEX]
+    print(f"Reviewing: roi={roi_value} n_obs={int(adata_roi.n_obs)} json={out_json}")
+    review_signed_r_plot(
+        adata_in=adata_roi,
+        out_json=out_json,
+        n_dense=REVIEW_CURVE_N_DENSE,
+        smoothing=REVIEW_ANCHOR_SMOOTHING,
+        max_points=REVIEW_PLOT_MAX_POINTS,
+    )
+    print("Next: run the decision cell to save reverse_r_sign=true/false.")
+#%%
+
+if not jobs:
+    print("No jobs available for decision.")
+elif REVIEW_JOB_INDEX >= len(jobs):
+    print(f"Review job index out of range: {REVIEW_JOB_INDEX} (n_jobs={len(jobs)})")
+else:
+    roi_value, adata_roi, out_json = jobs[REVIEW_JOB_INDEX]
+    print(f"Saving decision: roi={roi_value} n_obs={int(adata_roi.n_obs)} json={out_json}")
+    apply_signed_r_review_decision(out_json=out_json)
 
 # %%

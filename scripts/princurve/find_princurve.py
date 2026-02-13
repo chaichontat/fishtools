@@ -14,19 +14,31 @@ import matplotlib.pyplot as plt
 import numpy as np
 from patsy import dmatrix
 from scipy import sparse
-from scipy.interpolate import CubicSpline, RBFInterpolator, splprep, splev
+from scipy.interpolate import CubicSpline, RBFInterpolator
 from scipy.ndimage import distance_transform_edt
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
+from fishtools.ccf.princurve import (
+    fit_anchor_curve as shared_fit_anchor_curve,
+    project_to_polyline_arclength as shared_project_to_polyline_arclength,
+    signed_distance_to_polyline as shared_signed_distance_to_polyline,
+)
 from fishtools.io.workspace import Workspace
+
+ANCHOR_R_SIGN_ENDPOINT_EXTRAPOLATION = 0.1
+R_UM_SOURCE_UM_PER_PX = 0.216
+R_UM_BIN_COUNT = 1024
+R_UM_ROLL_HALF_WINDOW = 24
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
             "Compute principal-curve coordinates for an .h5ad.\n\n"
-            "Default: fit + project in Python.\n"
+            "Default: anchor-driven fit + project in Python.\n"
+            "For fitting, anchors are required via --anchors-json/--anchors-subroi "
+            "or a single inferable anchors JSON next to the input .h5ad.\n"
             "If --curvefit is provided, apply a precomputed CSV instead."
         )
     )
@@ -61,7 +73,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Path to anchors JSON produced by scripts/pick_curve_anchors.py "
-            "(curve is built directly from anchors; first/last anchors define endpoints)."
+            "(curve is built directly from anchors; first/last anchors define endpoints). "
+            "Required for fitting unless a single anchors JSON can be inferred."
         ),
     )
     p.add_argument(
@@ -82,10 +95,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--anchor-smoothing",
         type=float,
-        default=2.0,
+        default=0.5,
         help=(
-            "Smoothing strength for anchor-only curve construction (default: 2.0). "
-            "0.0 means interpolate anchors exactly."
+            "Smoothing strength for anchor-only curve construction (default: 0.5). "
+            "0.0 means interpolate anchors exactly; larger values increasingly limit curvature."
         ),
     )
     p.add_argument(
@@ -195,6 +208,7 @@ def read_curvefit(path: Path) -> dict[str, dict[str, float]]:
 
 def load_anchors(path: Path) -> list[str]:
     data = json.loads(path.read_text())
+    _ = load_anchor_reverse_r_sign_from_payload(data=data, path=path)
 
     anchors = data.get("anchors")
     if isinstance(anchors, list) and anchors:
@@ -226,6 +240,25 @@ def load_anchors(path: Path) -> list[str]:
     if start_id == end_id:
         raise SystemExit(f"Anchors JSON start and end are the same cell_id: {start_id}")
     return [start_id, end_id]
+
+
+def load_anchor_reverse_r_sign_from_payload(*, data: dict[str, Any], path: Path) -> bool:
+    reverse_r_sign = data.get("reverse_r_sign", False)
+    if not isinstance(reverse_r_sign, bool):
+        raise SystemExit(f"Invalid anchors JSON (reverse_r_sign must be boolean): {path}")
+    return bool(reverse_r_sign)
+
+
+def load_anchor_reverse_r_sign(path: Path) -> bool:
+    data = json.loads(path.read_text())
+    return load_anchor_reverse_r_sign_from_payload(data=data, path=path)
+
+
+def apply_anchor_r_direction(r_signed: np.ndarray, *, reverse: bool) -> np.ndarray:
+    arr = np.asarray(r_signed, dtype=float)
+    if reverse:
+        return -arr
+    return arr
 
 
 def apply_anchor_transform(
@@ -298,6 +331,72 @@ def rcoord_scale_q(x: np.ndarray, *, quantile: float = 0.99) -> float:
     if not np.isfinite(q) or q <= 0:
         return 1.0
     return q
+
+
+def _fill_nan_1d(x: np.ndarray) -> np.ndarray:
+    y = np.asarray(x, dtype=float).copy()
+    idx = np.arange(y.size, dtype=float)
+    ok = np.isfinite(y)
+    if not np.any(ok):
+        raise ValueError("Cannot fill NaNs: array has no finite values.")
+    if np.count_nonzero(ok) == 1:
+        y[:] = y[ok][0]
+        return y
+    y[~ok] = np.interp(idx[~ok], idx[ok], y[ok])
+    return y
+
+
+def _rolling_nan_min(x: np.ndarray, half_window: int) -> np.ndarray:
+    y = np.asarray(x, dtype=float)
+    out = np.full((y.size,), np.nan, dtype=float)
+    for i in range(y.size):
+        lo = max(0, i - int(half_window))
+        hi = min(y.size, i + int(half_window) + 1)
+        w = y[lo:hi]
+        ok = np.isfinite(w)
+        if not np.any(ok):
+            continue
+        out[i] = float(np.nanmin(w))
+    return _fill_nan_1d(out)
+
+
+def compute_r_um_from_t_all(
+    *,
+    t_all: np.ndarray,
+    r: np.ndarray,
+    n_bins: int = R_UM_BIN_COUNT,
+    roll_half_window: int = R_UM_ROLL_HALF_WINDOW,
+    source_um_per_px: float = R_UM_SOURCE_UM_PER_PX,
+) -> np.ndarray:
+    """Convert principal `r` (px) into microns using rolling floor over `t_all`."""
+    t = np.asarray(t_all, dtype=float)
+    r_signed = np.asarray(r, dtype=float)
+    if t.shape != r_signed.shape:
+        raise ValueError("t_all and r must have the same shape.")
+    if t.ndim != 1:
+        raise ValueError("t_all and r must be 1D.")
+    if int(n_bins) < 2:
+        raise ValueError("n_bins must be >= 2.")
+    if int(roll_half_window) < 0:
+        raise ValueError("roll_half_window must be >= 0.")
+
+    out = np.full(t.shape, np.nan, dtype=float)
+    keep = np.isfinite(t) & np.isfinite(r_signed)
+    if not np.any(keep):
+        return out
+
+    t_keep = t[keep]
+    r_keep = r_signed[keep]
+    bin_idx = np.minimum((t_keep * float(n_bins - 1)).astype(np.int32), int(n_bins - 1))
+    r_bin_min = np.full((n_bins,), np.inf, dtype=float)
+    np.minimum.at(r_bin_min, bin_idx, r_keep)
+    r_bin_min[~np.isfinite(r_bin_min)] = np.nan
+
+    r_floor_bin = _rolling_nan_min(r_bin_min, half_window=roll_half_window)
+    t_bins = np.linspace(0.0, 1.0, num=int(n_bins), dtype=float)
+    r_floor = np.interp(t_keep, t_bins, r_floor_bin)
+    out[keep] = (r_keep - r_floor) * float(source_um_per_px)
+    return out
 
 
 def fit_constrained_spline(
@@ -596,61 +695,14 @@ def project_to_polyline_arclength(
     xy: np.ndarray,
     line: np.ndarray,
     k: int = 50,
+    endpoint_extrapolation: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    pts = np.asarray(xy, dtype=float)[:, :2]
-    poly = np.asarray(line, dtype=float)[:, :2]
-    if poly.shape[0] < 2:
-        raise SystemExit("Polyline must have at least 2 points.")
-
-    seg_a = poly[:-1]
-    seg_b = poly[1:]
-    seg_v = seg_b - seg_a
-    seg_len = np.linalg.norm(seg_v, axis=1)
-    ok = seg_len > 1e-12
-    seg_a = seg_a[ok]
-    seg_v = seg_v[ok]
-    seg_len = seg_len[ok]
-    if seg_len.size == 0:
-        raise SystemExit("Degenerate polyline (all segments have zero length).")
-
-    mid = seg_a + 0.5 * seg_v
-    tree = cKDTree(mid)
-    kk = int(min(max(1, k), seg_a.shape[0]))
-    _, cand = tree.query(pts, k=kk)
-    if kk == 1:
-        cand = cand[:, None]
-
-    best_d2 = np.full((pts.shape[0],), np.inf, dtype=float)
-    best_proj = np.zeros((pts.shape[0], 2), dtype=float)
-    best_seg = np.zeros((pts.shape[0],), dtype=int)
-    best_tau = np.zeros((pts.shape[0],), dtype=float)
-
-    for j in range(kk):
-        si = cand[:, j].astype(int)
-        a = seg_a[si]
-        v = seg_v[si]
-        vv = np.sum(v * v, axis=1)
-        w = pts - a
-        tau = np.clip(np.sum(w * v, axis=1) / vv, 0.0, 1.0)
-        proj = a + tau[:, None] * v
-        d2 = np.sum((pts - proj) ** 2, axis=1)
-        better = d2 < best_d2
-        best_d2[better] = d2[better]
-        best_proj[better] = proj[better]
-        best_seg[better] = si[better]
-        best_tau[better] = tau[better]
-
-    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
-    lam = cum[best_seg] + best_tau * seg_len[best_seg]
-    total = float(cum[-1])
-    t = lam / total if total > 0 else np.zeros_like(lam)
-
-    tan = seg_v[best_seg]
-    res = pts - best_proj
-    cross = tan[:, 0] * res[:, 1] - tan[:, 1] * res[:, 0]
-    sign = np.where(cross >= 0, 1.0, -1.0)
-    r_signed = sign * np.sqrt(best_d2)
-    return t.astype(float), r_signed.astype(float), best_proj.astype(float)
+    return shared_project_to_polyline_arclength(
+        xy=xy,
+        line=line,
+        k=int(k),
+        endpoint_extrapolation=float(endpoint_extrapolation),
+    )
 
 
 def assign_t_via_edt_to_anchor_curve(
@@ -1001,6 +1053,7 @@ def apply_anchor_constraints_to_curvefit_projection(
     anchor_t_smooth_sigma_scale: float = 1.0,
     n_dense: int = 5000,
     clamp_endpoints: bool = True,
+    r_sign_endpoint_extrapolation: float = ANCHOR_R_SIGN_ENDPOINT_EXTRAPOLATION,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     xy_arr = np.asarray(xy, dtype=float)[:, :2]
     idx = np.asarray(anchor_indices, dtype=int)
@@ -1012,7 +1065,11 @@ def apply_anchor_constraints_to_curvefit_projection(
     anchor_xy = xy_arr[idx, :2].astype(float, copy=False)
     line = fit_anchor_curve(anchor_xy=anchor_xy, n_dense=int(n_dense), smoothing=float(anchor_smoothing))
 
-    _t_proj, r_signed, proj_new = project_to_polyline_arclength(xy=xy_arr, line=line)
+    _t_proj, r_signed, proj_new = project_to_polyline_arclength(
+        xy=xy_arr,
+        line=line,
+        endpoint_extrapolation=float(r_sign_endpoint_extrapolation),
+    )
     t_new = assign_t_via_edt_to_anchor_curve(xy=xy_arr, line=line)
     if anchor_t_smooth:
         anchor_t_target, _, _ = project_to_polyline_arclength(xy=anchor_xy, line=line)
@@ -1366,9 +1423,17 @@ def write_anchor_qc_png(
     plt.close(fig)
 
 
-def signed_distance_to_polyline(*, xy: np.ndarray, line: np.ndarray) -> np.ndarray:
-    _, r_signed, _ = project_to_polyline_arclength(xy=xy, line=line)
-    return r_signed
+def signed_distance_to_polyline(
+    *,
+    xy: np.ndarray,
+    line: np.ndarray,
+    endpoint_extrapolation: float = 0.0,
+) -> np.ndarray:
+    return shared_signed_distance_to_polyline(
+        xy=xy,
+        line=line,
+        endpoint_extrapolation=float(endpoint_extrapolation),
+    )
 
 
 def resolve_workspace_input_path(ws: Workspace, roi: str) -> Path:
@@ -1408,24 +1473,58 @@ def resolve_workspace_rois(ws: Workspace, roi: str | None) -> list[str]:
     return ws.resolve_rois(None)
 
 
-def infer_t_endpoints_json(*, ws: Workspace, roi: str) -> Path | None:
+def infer_t_endpoints_json(
+    *,
+    ws: Workspace,
+    roi: str,
+    subroi: str | None = None,
+) -> Path | None:
     roi_clean = str(roi).strip()
     roi_dir = ws.ccf_transforms(roi_clean)
     filename = "similarity_plus_syn_qc_zoom_masked_with_user_mask_t_axis_endpoints.json"
-    preferred = roi_dir / "landmark_syn_mi" / filename
-    if preferred.exists():
-        return preferred
+    candidates = sorted({roi_dir / "landmark_syn_mi" / filename, *roi_dir.glob(f"*/{filename}")})
+    candidates = [p for p in candidates if p.is_file()]
 
-    candidates = sorted(p for p in roi_dir.glob(f"*/{filename}") if p.is_file())
+    subroi_clean = str(subroi).strip() if subroi is not None else ""
+    if subroi_clean:
+        direct_candidates = [
+            roi_dir / subroi_clean / filename,
+            roi_dir / "landmark_syn_mi" / subroi_clean / filename,
+        ]
+        for preferred in direct_candidates:
+            if preferred.is_file():
+                return preferred
+
+        def _matches_subroi(path: Path) -> bool:
+            return any(parent.name == subroi_clean for parent in path.parents)
+
+        subroi_candidates = [p for p in candidates if _matches_subroi(p)]
+        if len(subroi_candidates) == 1:
+            return subroi_candidates[0]
+        if len(subroi_candidates) > 1:
+            subroi_sorted = sorted(subroi_candidates, key=lambda p: (float(p.stat().st_mtime), str(p)))
+            chosen = subroi_sorted[-1]
+            print(
+                "Note: found multiple t-endpoints JSON candidates for subROI="
+                f"{subroi_clean!r}; using latest modified file: {chosen}"
+            )
+            return chosen
+
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
-        names = "\n".join([f"  - {p}" for p in candidates])
-        raise SystemExit(
-            "Found multiple t-endpoints JSON candidates; please keep a single run directory under ROI:\n"
-            f"{names}"
-        )
+        candidates_sorted = sorted(candidates, key=lambda p: (float(p.stat().st_mtime), str(p)))
+        chosen = candidates_sorted[-1]
+        print("Note: found multiple t-endpoints JSON candidates; " f"using latest modified file: {chosen}")
+        return chosen
     return None
+
+
+def load_t_axis_endpoints_json_payload(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Invalid t-endpoints JSON (expected object): {path}")
+    return payload
 
 
 def _parse_optional_float(value: object) -> float | None:
@@ -1441,9 +1540,7 @@ def _parse_optional_float(value: object) -> float | None:
 
 
 def load_t_intervals_by_mask_name(path: Path) -> dict[str, tuple[float, float]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise SystemExit(f"Invalid t-endpoints JSON (expected object): {path}")
+    payload = load_t_axis_endpoints_json_payload(path)
 
     masks = payload.get("masks")
     if not isinstance(masks, list):
@@ -1474,7 +1571,7 @@ def load_t_intervals_by_mask_name(path: Path) -> dict[str, tuple[float, float]]:
     return by_name
 
 
-def compute_global_t_from_local(
+def compute_t_all_from_local(
     *,
     t_local: np.ndarray,
     mask_names: np.ndarray,
@@ -1492,10 +1589,144 @@ def compute_global_t_from_local(
         interval = intervals_by_name.get(str(name))
         if interval is None:
             continue
-        start, end = interval
-        ti_clip = float(np.clip(float(ti), 0.0, 1.0))
-        out[i] = float(start) + ti_clip * float(end - start)
+        a0_all, a1_all = interval
+        u_local_reversed = 1.0 - float(ti)
+        out[i] = float(a0_all) + u_local_reversed * float(a1_all - a0_all)
     return out
+
+
+def infer_neomeso_t_all_span(*, intervals_by_name: dict[str, tuple[float, float]]) -> tuple[float, float] | None:
+    if not intervals_by_name:
+        return None
+    starts: list[float] = []
+    ends: list[float] = []
+    for lo, hi in intervals_by_name.values():
+        starts.append(float(lo))
+        ends.append(float(hi))
+    n0_all = float(np.min(np.asarray(starts, dtype=float)))
+    n1_all = float(np.max(np.asarray(ends, dtype=float)))
+    if not np.isfinite(n0_all) or not np.isfinite(n1_all):
+        return None
+    if (n1_all - n0_all) <= 1.0e-9:
+        return None
+    return n0_all, n1_all
+
+
+def compute_t_neomeso_from_t_all(
+    *,
+    t_all: np.ndarray,
+    neomeso_t_all_span: tuple[float, float],
+) -> np.ndarray:
+    t_all_arr = np.asarray(t_all, dtype=float)
+    n0_all = float(neomeso_t_all_span[0])
+    n1_all = float(neomeso_t_all_span[1])
+    den = float(n1_all - n0_all)
+    if not np.isfinite(den) or den <= 1.0e-9:
+        raise SystemExit(f"Invalid neocortex+mesocortex t_all span: ({n0_all}, {n1_all})")
+
+    out = np.full((t_all_arr.shape[0],), np.nan, dtype=float)
+    finite = np.isfinite(t_all_arr)
+    out[finite] = (t_all_arr[finite] - n0_all) / den
+    return out
+
+
+def compute_t_neomeso_from_local(
+    *,
+    t_local: np.ndarray,
+    mask_names: np.ndarray,
+    intervals_by_name: dict[str, tuple[float, float]],
+) -> np.ndarray:
+    t_all = compute_t_all_from_local(
+        t_local=t_local,
+        mask_names=mask_names,
+        intervals_by_name=intervals_by_name,
+    )
+    neomeso_span = infer_neomeso_t_all_span(intervals_by_name=intervals_by_name)
+    if neomeso_span is None:
+        return np.full((np.asarray(t_local, dtype=float).shape[0],), np.nan, dtype=float)
+    out = compute_t_neomeso_from_t_all(
+        t_all=t_all,
+        neomeso_t_all_span=neomeso_span,
+    )
+    return out
+
+
+def filter_to_assigned_cells(
+    *,
+    adata: ad.AnnData,
+    t: np.ndarray,
+    r: np.ndarray,
+    proj: np.ndarray,
+    t_neomeso: np.ndarray,
+    r_signed_store: np.ndarray | None,
+    anchor_ids: list[str] | None,
+    anchor_indices: list[int] | None,
+    anchor_meta: dict[str, Any] | None,
+) -> tuple[
+    ad.AnnData,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray | None,
+    list[int] | None,
+    dict[str, Any] | None,
+]:
+    t_arr = np.asarray(t, dtype=float)
+    r_arr = np.asarray(r, dtype=float)
+    proj_arr = np.asarray(proj, dtype=float)
+    t_neomeso_arr = np.asarray(t_neomeso, dtype=float)
+    n = int(t_arr.shape[0])
+    if r_arr.shape != (n,):
+        raise SystemExit("Internal error: r length mismatch while filtering assigned cells.")
+    if t_neomeso_arr.shape != (n,):
+        raise SystemExit("Internal error: t_neomeso length mismatch while filtering assigned cells.")
+    if proj_arr.shape[0] != n or proj_arr.shape[1] < 2:
+        raise SystemExit("Internal error: proj shape mismatch while filtering assigned cells.")
+    if adata.n_obs != n:
+        raise SystemExit(f"Internal error: adata rows ({adata.n_obs}) do not match principal rows ({n}).")
+
+    keep = np.isfinite(t_arr) & np.isfinite(r_arr) & np.isfinite(proj_arr[:, :2]).all(axis=1)
+    if r_signed_store is not None:
+        rs = np.asarray(r_signed_store, dtype=float)
+        if rs.shape != (n,):
+            raise SystemExit("Internal error: principal_r_signed length mismatch while filtering assigned cells.")
+        keep &= np.isfinite(rs)
+    else:
+        rs = None
+
+    n_keep = int(np.count_nonzero(keep))
+    if n_keep == 0:
+        raise SystemExit("No cells with assigned principal coordinates to save.")
+    if n_keep == n:
+        return adata, t_arr, r_arr, proj_arr, t_neomeso_arr, rs, anchor_indices, anchor_meta
+
+    print(f"Filtering output to cells with assigned principal coords: kept {n_keep}/{n}.")
+    adata_out = adata[keep].copy()
+    t_out = t_arr[keep]
+    r_out = r_arr[keep]
+    proj_out = proj_arr[keep, :2]
+    t_neomeso_out = t_neomeso_arr[keep]
+    rs_out = rs[keep] if rs is not None else None
+
+    anchor_indices_out = anchor_indices
+    anchor_meta_out = dict(anchor_meta) if anchor_meta is not None else None
+    if anchor_ids is not None:
+        obs_names = adata_out.obs_names.astype(str).to_numpy()
+        anchor_indices_out = []
+        for cid in anchor_ids:
+            m = np.where(obs_names == str(cid))[0]
+            if m.size != 1:
+                raise SystemExit(
+                    "Internal error: anchor cell was filtered out or duplicated after assigned-cell filtering: "
+                    f"{cid}"
+                )
+            anchor_indices_out.append(int(m[0]))
+        if anchor_meta_out is not None:
+            anchor_meta_out["start_index"] = int(anchor_indices_out[0])
+            anchor_meta_out["end_index"] = int(anchor_indices_out[-1])
+
+    return adata_out, t_out, r_out, proj_out, t_neomeso_out, rs_out, anchor_indices_out, anchor_meta_out
 
 
 def infer_anchors_json(
@@ -1578,42 +1809,12 @@ def include_anchor_indices_in_fit_mask(*, fit_mask: np.ndarray, anchor_indices: 
 
 
 def fit_anchor_curve(*, anchor_xy: np.ndarray, n_dense: int, smoothing: float) -> np.ndarray:
-    points = np.asarray(anchor_xy, dtype=float)
-    if points.ndim != 2 or points.shape[1] < 2:
-        raise SystemExit(f"Unexpected anchor shape: {points.shape}")
-    points = points[:, :2]
-    if points.shape[0] < 2:
-        raise SystemExit("Need at least 2 anchors to build curve.")
-    if smoothing < 0:
-        raise SystemExit("--anchor-smoothing must be >= 0.")
-
-    if points.shape[0] >= 2:
-        d = np.linalg.norm(np.diff(points, axis=0), axis=1)
-        keep = np.concatenate([[True], d > 1e-12])
-        points = points[keep]
-    if points.shape[0] < 2:
-        raise SystemExit("Anchors are degenerate (all identical after deduplication).")
-
-    if smoothing <= 0:
-        _u_dense, curve, _deriv, _ = fit_constrained_spline(points, n_dense=int(n_dense))
-        return curve
-
-    seg = np.sqrt(np.sum(np.diff(points, axis=0) ** 2, axis=1))
-    s = np.concatenate([[0.0], np.cumsum(seg)])
-    u = np.linspace(0.0, 1.0, points.shape[0]) if float(s[-1]) == 0 else s / float(s[-1])
-
-    k = min(3, points.shape[0] - 1)
-    if k < 1:
-        raise SystemExit("Not enough anchors to fit a spline.")
-    smooth_s = float(smoothing) * float(points.shape[0])
-    tck, _ = splprep([points[:, 0], points[:, 1]], u=u, s=smooth_s, k=k)
-
-    u_dense = np.linspace(0.0, 1.0, int(max(2, n_dense)))
-    x_dense, y_dense = splev(u_dense, tck)
-    curve = np.column_stack([np.asarray(x_dense, float), np.asarray(y_dense, float)])
-    curve[0, :] = points[0, :]
-    curve[-1, :] = points[-1, :]
-    return curve
+    return shared_fit_anchor_curve(
+        anchor_xy=anchor_xy,
+        n_dense=int(n_dense),
+        smoothing=float(smoothing),
+        fit_constrained_spline_fn=fit_constrained_spline,
+    )
 
 
 def _run_single(
@@ -1687,7 +1888,9 @@ def _run_single(
     curve_xy_for_qc: np.ndarray | None = None
     r_signed_store: np.ndarray | None = None
     r_scale_info: dict[str, Any] | None = None
-    anchor_ids: list[str] | None = load_anchors(Path(args.anchors_json)) if args.anchors_json is not None else None
+    anchor_path = Path(args.anchors_json) if args.anchors_json is not None else None
+    anchor_ids: list[str] | None = load_anchors(anchor_path) if anchor_path is not None else None
+    anchor_reverse_r_sign = load_anchor_reverse_r_sign(anchor_path) if anchor_path is not None else False
     anchor_indices: list[int] | None = None
     anchor_roi_value: str | None = None
     if anchor_ids is not None:
@@ -1708,8 +1911,10 @@ def _run_single(
             anchor_roi_value = str(uniq[0])
     else:
         raise SystemExit(
-            "Anchor-driven mode requires anchors JSON. "
-            "Provide --anchors-json (or ensure one is inferable next to the input)."
+            "No anchors JSON available for fitting. "
+            "Provide --anchors-json (or --anchors-subroi), or keep a single inferable "
+            "anchors JSON next to the input .h5ad. "
+            "If you only want apply mode, use --curvefit."
         )
 
     if args.curvefit is None:
@@ -1829,7 +2034,11 @@ def _run_single(
                 _u_dense, curve_for_proj, _deriv, _ = fit_constrained_spline(curve_pts, n_dense=n_dense)
                 curve_xy_for_qc = curve_for_proj
 
-            _t_proj_used, r_signed_used, proj_used = project_to_polyline_arclength(xy=xy_used, line=curve_for_proj)
+            _t_proj_used, r_signed_used, proj_used = project_to_polyline_arclength(
+                xy=xy_used,
+                line=curve_for_proj,
+                endpoint_extrapolation=ANCHOR_R_SIGN_ENDPOINT_EXTRAPOLATION,
+            )
             t_used = assign_t_via_edt_to_anchor_curve(xy=xy_used, line=curve_for_proj)
             anchor_t_mode = "edt_nearest_wall_spatial"
             if args.anchor_t_smooth:
@@ -1852,6 +2061,7 @@ def _run_single(
             t_used[int(required_idx[-1])] = 1.0
             r_signed_used[int(required_idx[0])] = 0.0
             r_signed_used[int(required_idx[-1])] = 0.0
+            r_signed_used = apply_anchor_r_direction(r_signed_used, reverse=anchor_reverse_r_sign)
             proj_used[int(required_idx[0]), :2] = xy_used[int(required_idx[0]), :2]
             proj_used[int(required_idx[-1]), :2] = xy_used[int(required_idx[-1]), :2]
 
@@ -1867,6 +2077,7 @@ def _run_single(
             r_scale_info = {
                 "mode": "signed_normal_distance",
                 "t_mode": anchor_t_mode,
+                "reverse_r_sign": bool(anchor_reverse_r_sign),
                 "subset": {"obs_key": "ccf_adjusted", "obs_value": anchor_roi_value, "n_used": int(used_idx.size)},
             }
 
@@ -1915,10 +2126,12 @@ def _run_single(
                 anchor_t_smooth_sigma_scale=float(args.anchor_t_smooth_sigma_scale),
                 n_dense=5_000,
             )
+            r_ = apply_anchor_r_direction(r_, reverse=anchor_reverse_r_sign)
             r_signed_store = np.asarray(r_, dtype=float).copy()
             r_scale_info = {
                 "mode": "signed_normal_distance",
                 "t_mode": "knn_screened_harmonic_spatial" if args.anchor_t_smooth else "edt_nearest_wall_spatial",
+                "reverse_r_sign": bool(anchor_reverse_r_sign),
                 "source": "curvefit_anchored",
             }
 
@@ -1940,48 +2153,108 @@ def _run_single(
             "end_index": int(end_matches[0]),
             "mode": "anchor_endpoints",
             "anchor_count": int(len(anchor_ids)),
+            "reverse_r_sign": bool(anchor_reverse_r_sign),
         }
         print(
             "Anchors applied:",
             f"start={start_id}",
             f"end={end_id}",
             "mode=anchor_endpoints",
+            f"reverse_r_sign={anchor_reverse_r_sign}",
             f"count={len(anchor_ids)}",
         )
 
-    t_global = np.full((t.shape[0],), np.nan, dtype=float)
-    t_global_meta: dict[str, Any] | None = None
+    t_neomeso = np.full((t.shape[0],), np.nan, dtype=float)
+    intervals_by_name_for_mapping: dict[str, tuple[float, float]] | None = None
+    t_endpoints_payload: dict[str, Any] | None = None
+    t_neomeso_meta: dict[str, Any] | None = None
     if ws_for_t_endpoints is not None and roi_for_t_endpoints is not None:
-        endpoints_json = infer_t_endpoints_json(ws=ws_for_t_endpoints, roi=roi_for_t_endpoints)
+        endpoint_subroi = (
+            str(args.subset_obs_value).strip()
+            if args.subset_obs_key == roi_obs_key and args.subset_obs_value is not None
+            else None
+        )
+        if endpoint_subroi is None and args.anchors_json is not None:
+            inferred_subroi = infer_anchor_subroi_from_path(in_path=in_path, anchor_path=Path(args.anchors_json))
+            endpoint_subroi = inferred_subroi
+        endpoints_json = infer_t_endpoints_json(
+            ws=ws_for_t_endpoints,
+            roi=roi_for_t_endpoints,
+            subroi=endpoint_subroi if endpoint_subroi != "" else None,
+        )
         if endpoints_json is None:
             print(
                 "Note: t-endpoints JSON not found under workspace ROI output; "
-                "leaving obs['t_global'] as NaN."
+                "leaving obs['t_all'] and obs['t_neomeso'] as NaN."
             )
-            t_global_meta = {"source": None, "status": "missing_json"}
-        elif "ccf_adjusted" not in adata.obs.columns:
-            print("Note: obs['ccf_adjusted'] is missing; leaving obs['t_global'] as NaN.")
-            t_global_meta = {"source": str(endpoints_json), "status": "missing_ccf_adjusted"}
+            t_neomeso_meta = {"source": None, "status": "missing_json"}
         else:
-            intervals = load_t_intervals_by_mask_name(endpoints_json)
-            if not intervals:
-                print("Note: no valid begin/end entries found in t-endpoints JSON; leaving obs['t_global'] as NaN.")
-                t_global_meta = {"source": str(endpoints_json), "status": "empty_intervals"}
+            t_endpoints_payload = load_t_axis_endpoints_json_payload(endpoints_json)
+            if "ccf_adjusted" not in adata.obs.columns:
+                print("Note: obs['ccf_adjusted'] is missing; leaving obs['t_all'] and obs['t_neomeso'] as NaN.")
+                t_neomeso_meta = {"source": str(endpoints_json), "status": "missing_ccf_adjusted"}
             else:
-                mask_names = adata.obs["ccf_adjusted"].astype(str).to_numpy()
-                t_global = compute_global_t_from_local(
-                    t_local=t,
-                    mask_names=mask_names,
-                    intervals_by_name=intervals,
-                )
-                t_global_meta = {
-                    "source": str(endpoints_json),
-                    "status": "applied",
-                    "mask_key": "ccf_adjusted",
-                    "interval_count": int(len(intervals)),
-                }
+                intervals = load_t_intervals_by_mask_name(endpoints_json)
+                if not intervals:
+                    print(
+                        "Note: no valid begin/end entries found in t-endpoints JSON; "
+                        "leaving obs['t_all'] and obs['t_neomeso'] as NaN."
+                    )
+                    t_neomeso_meta = {"source": str(endpoints_json), "status": "empty_intervals"}
+                else:
+                    t_neomeso_meta = {
+                        "source": str(endpoints_json),
+                        "status": "ready",
+                        "mask_key": "ccf_adjusted",
+                        "interval_count": int(len(intervals)),
+                    }
+                    intervals_by_name_for_mapping = intervals
 
-    adata.obs["t_global"] = t_global
+    adata, t, r_, proj, t_neomeso, r_signed_store, anchor_indices, anchor_meta = filter_to_assigned_cells(
+        adata=adata,
+        t=t,
+        r=r_,
+        proj=proj,
+        t_neomeso=t_neomeso,
+        r_signed_store=r_signed_store,
+        anchor_ids=anchor_ids,
+        anchor_indices=anchor_indices,
+        anchor_meta=anchor_meta,
+    )
+    t_local = np.asarray(t, dtype=float)
+    t_all = np.full((t_local.shape[0],), np.nan, dtype=float)
+    t_neomeso = np.full((t_local.shape[0],), np.nan, dtype=float)
+    if intervals_by_name_for_mapping is not None and "ccf_adjusted" in adata.obs.columns:
+        mask_names = adata.obs["ccf_adjusted"].astype(str).to_numpy()
+        t_all = compute_t_all_from_local(
+            t_local=t_local,
+            mask_names=mask_names,
+            intervals_by_name=intervals_by_name_for_mapping,
+        )
+        neomeso_t_all_span = infer_neomeso_t_all_span(intervals_by_name=intervals_by_name_for_mapping)
+        if neomeso_t_all_span is None:
+            t_neomeso_meta = dict(t_neomeso_meta or {})
+            t_neomeso_meta["status"] = "invalid_neomeso_span"
+        else:
+            t_neomeso = compute_t_neomeso_from_t_all(
+                t_all=t_all,
+                neomeso_t_all_span=neomeso_t_all_span,
+            )
+            t_neomeso_meta = dict(t_neomeso_meta or {})
+            t_neomeso_meta["status"] = "applied"
+            t_neomeso_meta["neomeso_t_all_span"] = [float(neomeso_t_all_span[0]), float(neomeso_t_all_span[1])]
+    xy = np.asarray(adata.obsm["spatial"], dtype=float)
+    if xy.ndim != 2 or xy.shape[1] < 2:
+        raise SystemExit("Internal error: filtered adata is missing valid obsm['spatial'].")
+    xy = xy[:, :2]
+    obs_names = adata.obs_names.astype(str).to_numpy()
+    if rois_to_process is not None and roi_obs_key in adata.obs.columns:
+        roi_values = adata.obs[roi_obs_key].astype(str).to_numpy()
+
+    adata.obs["t_all"] = t_all
+    adata.obs["t_neomeso"] = t_neomeso
+    adata.obs["t_local"] = t_local
+    adata.obs["r_um"] = compute_r_um_from_t_all(t_all=t_all, r=r_)
     adata.obsm["principal"] = np.column_stack([t, r_]).astype(float, copy=False)
     adata.obsm["principal_curve_proj_xy"] = proj
     if r_signed_store is not None:
@@ -1994,8 +2267,20 @@ def _run_single(
         fit_meta["rois"] = list(rois_to_process)
     if r_scale_info is not None:
         fit_meta["r_scale"] = r_scale_info
-    if t_global_meta is not None:
-        fit_meta["t_global"] = t_global_meta
+    fit_meta["t_names"] = {
+        "t_local": "obsm['principal'][:,0] (slice-local anchored curve coordinate)",
+        "t_all": "A0_all + (1 - t_local) * (A1_all - A0_all), where A*_all are per-mask global anchor endpoints",
+        "t_neomeso": "(t_all - N0_all) / (N1_all - N0_all), where [N0_all, N1_all] is the global neo+meso span",
+    }
+    if t_neomeso_meta is not None:
+        fit_meta["t_neomeso"] = t_neomeso_meta
+    if t_endpoints_payload is not None:
+        # AnnData can't reliably write nested list-of-dicts into .uns (h5py vlen string conversion).
+        # Store the raw payload as JSON text instead.
+        uns["t_axis_endpoints"] = json.dumps(
+            t_endpoints_payload,
+            sort_keys=True,
+        )
     uns["principal_curve_fit"] = fit_meta
     if anchor_meta is not None:
         uns["principal_anchors"] = anchor_meta
@@ -2076,7 +2361,12 @@ def _run_single(
             end_proj = proj[int(anchor_meta["end_index"]), :2].astype(float, copy=True)
             line = curve_polyline_from_proj(t=t, proj_xy=proj, start_proj=start_proj, end_proj=end_proj)
 
-        r_signed = signed_distance_to_polyline(xy=xy, line=line)
+        r_signed = signed_distance_to_polyline(
+            xy=xy,
+            line=line,
+            endpoint_extrapolation=ANCHOR_R_SIGN_ENDPOINT_EXTRAPOLATION,
+        )
+        r_signed = apply_anchor_r_direction(r_signed, reverse=anchor_reverse_r_sign)
         lim = float(np.quantile(np.abs(r_signed[np.isfinite(r_signed)]), 0.99)) if r_signed.size else 1.0
         if not np.isfinite(lim) or lim <= 0:
             lim = 1.0
@@ -2125,60 +2415,69 @@ def main() -> None:
         rois = resolve_workspace_rois(ws, args.roi)
         if not rois:
             raise SystemExit(f"No ROIs found in workspace: {ws.path}")
+        batch_mode = args.roi is None
 
         for roi in rois:
             print(f"Processing ROI: {roi}")
-            in_path = resolve_workspace_input_path(ws, roi)
-            out_path = in_path.with_name(f"{in_path.stem}.princurve.h5ad")
-            candidates = (
-                list_anchor_json_candidates(in_path=in_path)
-                if args.anchors_json is None and args.anchors_subroi is None
-                else []
-            )
-            if len(candidates) > 1:
-                print(
-                    f"Found {len(candidates)} anchors JSON files for {in_path.name}; "
-                    "running each in anchored mode (no unanchored fallback)."
+            try:
+                in_path = resolve_workspace_input_path(ws, roi)
+                out_path = in_path.with_name(f"{in_path.stem}.princurve.h5ad")
+                candidates = (
+                    list_anchor_json_candidates(in_path=in_path)
+                    if args.anchors_json is None and args.anchors_subroi is None
+                    else []
                 )
-                used_suffixes: set[str] = set()
-                for i, anchor_path in enumerate(candidates):
-                    run_args = argparse.Namespace(**vars(args))
-                    run_args.anchors_json = str(anchor_path)
-                    subroi = infer_anchor_subroi_from_path(in_path=in_path, anchor_path=anchor_path)
-                    if (
-                        subroi is not None
-                        and run_args.subset_obs_key is None
-                        and run_args.subset_obs_value is None
-                    ):
-                        run_args.subset_obs_key = "ccf_adjusted"
-                        run_args.subset_obs_value = subroi
-
-                    suffix = subroi if subroi is not None else f"anchors{i + 1}"
-                    base_suffix = suffix
-                    j = 2
-                    while suffix in used_suffixes:
-                        suffix = f"{base_suffix}_{j}"
-                        j += 1
-                    used_suffixes.add(suffix)
-                    out_path_multi = in_path.with_name(f"{in_path.stem}.{suffix}.princurve.h5ad")
-                    print(f"Processing anchors file: {anchor_path.name}")
-                    _run_single(
-                        args=run_args,
-                        in_path=in_path,
-                        out_path=out_path_multi,
-                        ws_for_t_endpoints=ws,
-                        roi_for_t_endpoints=roi,
+                if len(candidates) > 1:
+                    print(
+                        f"Found {len(candidates)} anchors JSON files for {in_path.name}; "
+                        "running each in anchored mode (no unanchored fallback)."
                     )
-                continue
+                    used_suffixes: set[str] = set()
+                    for i, anchor_path in enumerate(candidates):
+                        run_args = argparse.Namespace(**vars(args))
+                        run_args.anchors_json = str(anchor_path)
+                        subroi = infer_anchor_subroi_from_path(in_path=in_path, anchor_path=anchor_path)
+                        if (
+                            subroi is not None
+                            and run_args.subset_obs_key is None
+                            and run_args.subset_obs_value is None
+                        ):
+                            run_args.subset_obs_key = "ccf_adjusted"
+                            run_args.subset_obs_value = subroi
 
-            run_args = argparse.Namespace(**vars(args))
-            _run_single(
-                args=run_args,
-                in_path=in_path,
-                out_path=out_path,
-                ws_for_t_endpoints=ws,
-                roi_for_t_endpoints=roi,
-            )
+                        suffix = subroi if subroi is not None else f"anchors{i + 1}"
+                        base_suffix = suffix
+                        j = 2
+                        while suffix in used_suffixes:
+                            suffix = f"{base_suffix}_{j}"
+                            j += 1
+                        used_suffixes.add(suffix)
+                        out_path_multi = in_path.with_name(f"{in_path.stem}.{suffix}.princurve.h5ad")
+                        print(f"Processing anchors file: {anchor_path.name}")
+                        _run_single(
+                            args=run_args,
+                            in_path=in_path,
+                            out_path=out_path_multi,
+                            ws_for_t_endpoints=ws,
+                            roi_for_t_endpoints=roi,
+                        )
+                    continue
+
+                run_args = argparse.Namespace(**vars(args))
+                _run_single(
+                    args=run_args,
+                    in_path=in_path,
+                    out_path=out_path,
+                    ws_for_t_endpoints=ws,
+                    roi_for_t_endpoints=roi,
+                )
+            except KeyboardInterrupt:
+                raise
+            except BaseException as exc:
+                if batch_mode:
+                    print(f"Warning: skipping ROI {roi} due to error: {exc}")
+                    continue
+                raise
         return
 
     if args.input is None or args.output is None:
