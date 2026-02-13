@@ -136,19 +136,27 @@ def _write_synthetic_midline_outdir(outdir: Path) -> None:
     k0, k1 = 8, 31
     mask[i0 : i1 + 1, j0 : j1 + 1, k0 : k1 + 1] = True
 
+    # A non-trivial (curved) u=0.5 mid-surface: the 0.5 contour in each slice is a
+    # "wavy" curve rather than a straight line. This avoids a degenerate plane
+    # intersection where cross-axis mapping becomes almost affine.
     u = np.zeros(shape, dtype=np.float32)
     span_i = float(i1 - i0)
     span_j = float(j1 - j0)
     span_k = float(k1 - k0)
-    for i in range(shape[0]):
-        for j in range(shape[1]):
-            for k in range(shape[2]):
+    two_pi = float(2.0 * np.pi)
+    for i in range(i0, i1 + 1):
+        fi = (float(i) - float(i0)) / span_i
+        for k in range(k0, k1 + 1):
+            fk = (float(k) - float(k0)) / span_k
+            # Move the u=0.5 contour up/down in j as a smooth function of (i,k).
+            j_center = (float(j0) + 0.5 * span_j) + 0.18 * span_j * np.sin(two_pi * fi) + 0.12 * span_j * np.cos(
+                two_pi * fk
+            )
+            for j in range(j0, j1 + 1):
                 if not mask[i, j, k]:
                     continue
-                val_i = (float(i) - float(i0)) / span_i
-                val_j = (float(j) - float(j0)) / span_j
-                val_k = (float(k) - float(k0)) / span_k
-                u[i, j, k] = (val_i + val_j + val_k) / 3.0
+                val = 0.5 + (float(j) - float(j_center)) / span_j
+                u[i, j, k] = float(np.clip(val, 0.0, 1.0))
 
     np.save(outdir / "halfway_u_3d_ds.npy", u)
     np.save(outdir / "cortex_mask_fit_3d_ds.npy", mask.astype(np.bool_))
@@ -179,9 +187,9 @@ def test_coronal_to_sagittal_transform_yields_constant_ap_midline(tmp_path: Path
             source_slice=int(slice_i),
             t=float(t),
             r01=0.5,
-            n_t=128,
-            i_window=2,
-            k_window=2,
+            n_t=256,
+            i_window=3,
+            k_window=3,
             rebuild_lut=bool(idx == 0),
         )
         c = coronal[int(slice_i)]
@@ -205,7 +213,7 @@ def test_coronal_to_sagittal_transform_yields_constant_ap_midline(tmp_path: Path
         errs.append(float(np.linalg.norm(p_cor - p_sag)))
         target_i.append(float(p_sag[0]))
 
-    assert float(np.percentile(np.asarray(errs, dtype=np.float64), 95)) <= 0.5
+    assert float(np.percentile(np.asarray(errs, dtype=np.float64), 95)) <= 1.0
     assert float(np.ptp(np.asarray(target_i, dtype=np.float64))) <= 1.0
 
 
@@ -233,9 +241,9 @@ def test_sagittal_to_coronal_transform_yields_constant_ml_midline(tmp_path: Path
             source_slice=int(slice_k),
             t=float(t),
             r01=0.5,
-            n_t=128,
-            i_window=2,
-            k_window=2,
+            n_t=256,
+            i_window=3,
+            k_window=3,
             rebuild_lut=bool(idx == 0),
         )
         s = sagittal[int(slice_k)]
@@ -261,5 +269,88 @@ def test_sagittal_to_coronal_transform_yields_constant_ml_midline(tmp_path: Path
         coronal_slices.append(int(inv.slice_index))
 
     assert len(set(coronal_slices)) >= 3
-    assert float(np.percentile(np.asarray(errs, dtype=np.float64), 95)) <= 1.0
+    assert float(np.percentile(np.asarray(errs, dtype=np.float64), 95)) <= 2.5
     assert float(np.ptp(np.asarray(target_k, dtype=np.float64))) <= 1.5
+
+
+def _t_at_k_on_coronal_midline(*, t: np.ndarray, k_vals: np.ndarray, k_target: float) -> float:
+    """Return a coronal midline t where the curve's k crosses k_target.
+
+    Works on the polyline order (increasing t). If multiple crossings exist,
+    returns the first one in increasing t. If no crossing exists, falls back
+    to the nearest point.
+    """
+    tt = np.asarray(t, dtype=np.float64).reshape(-1)
+    kk = np.asarray(k_vals, dtype=np.float64).reshape(-1)
+    if tt.size != kk.size or tt.size < 2:
+        raise ValueError("Need t and k arrays with the same length >= 2.")
+    if not np.all(np.diff(tt) >= 0):
+        order = np.argsort(tt)
+        tt = tt[order]
+        kk = kk[order]
+    d = kk - float(k_target)
+    finite = np.isfinite(d) & np.isfinite(tt)
+    if int(np.count_nonzero(finite)) < 2:
+        return float("nan")
+    tt = tt[finite]
+    d = d[finite]
+    kk = kk[finite]
+
+    hit = np.where(np.isclose(d, 0.0, atol=1.0e-9))[0]
+    if hit.size:
+        return float(tt[int(hit[0])])
+    sign = np.sign(d)
+    flips = np.where(sign[:-1] * sign[1:] < 0.0)[0]
+    if flips.size:
+        idx = int(flips[0])
+        k0 = float(kk[idx])
+        k1 = float(kk[idx + 1])
+        if abs(k1 - k0) <= 1.0e-12:
+            return float(tt[idx])
+        frac = (float(k_target) - k0) / (k1 - k0)
+        return float(tt[idx] + frac * (tt[idx + 1] - tt[idx]))
+
+    idx = int(np.argmin(np.abs(d)))
+    return float(tt[idx])
+
+
+def test_sagittal_to_coronal_t_matches_coronal_k_intersection(tmp_path: Path) -> None:
+    coords = _load_coords_module()
+    outdir = tmp_path / "out"
+    outdir.mkdir(parents=True, exist_ok=True)
+    _write_synthetic_midline_outdir(outdir)
+
+    coronal = coords.load_coronal_midline_columns(outdir / "coronal_midline_columns.csv")
+    sagittal = coords.load_sagittal_midline_columns(outdir / "sagittal_midline_columns.csv")
+    assert coronal
+    assert sagittal
+
+    slice_k = sorted(sagittal.keys())[len(sagittal) // 2]
+    s = sagittal[int(slice_k)]
+    ts = np.linspace(0.1, 0.9, 11, dtype=np.float64)
+
+    t_errs: list[float] = []
+    i_errs: list[float] = []
+    for idx, t in enumerate(ts.tolist()):
+        inv = coords.transform_with_lut(
+            outdir=outdir,
+            source_axis="sagittal",
+            source_slice=int(slice_k),
+            t=float(t),
+            r01=0.5,
+            n_t=192,
+            i_window=2,
+            k_window=2,
+            rebuild_lut=bool(idx == 0),
+        )
+        c = coronal[int(inv.slice_index)]
+        # Geometric intersection: the same 3D point must have k==slice_k on the coronal midline.
+        t_k = _t_at_k_on_coronal_midline(t=c.t, k_vals=c.x, k_target=float(slice_k))
+        t_errs.append(float(abs(float(inv.t) - float(t_k))))
+
+        # Slice consistency: sagittal midline's y coordinate is i.
+        i_geo = float(coords._interp(s.t, s.y, float(t)))
+        i_errs.append(float(abs(float(inv.slice_index_float) - i_geo)))
+
+    assert float(np.percentile(np.asarray(t_errs, dtype=np.float64), 95)) <= 0.07
+    assert float(np.percentile(np.asarray(i_errs, dtype=np.float64), 95)) <= 0.8
