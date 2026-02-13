@@ -556,6 +556,10 @@ def _bbox_slices(mask: np.ndarray, *, pad: int) -> tuple[slice, slice, slice]:
 
 
 def _curve_t_parameter(path_yx: np.ndarray) -> np.ndarray:
+    """Slice-local normalized arc-length parameter along a u=0.5 path.
+
+    This `t` is `t_all`: a per-slice full-path coordinate on the representative curve.
+    """
     path = np.asarray(path_yx, dtype=np.float64)
     if path.ndim != 2 or path.shape[1] != 2 or path.shape[0] < 2:
         return np.zeros((0,), dtype=np.float64)
@@ -568,6 +572,11 @@ def _curve_t_parameter(path_yx: np.ndarray) -> np.ndarray:
 
 
 def _curve_overlap_t_ranges(path_yx: np.ndarray, overlap_mask_yx: np.ndarray) -> list[tuple[float, float, int, int]]:
+    """Return overlap intervals in slice-local `_curve_t_parameter` coordinates.
+
+    Output `t_start/t_end` are in `t_all` (slice-local normalized full-path arc length).
+    These are written to `*_neocortex_mesocortex_overlap_t_ranges.csv`.
+    """
     path = np.asarray(path_yx, dtype=np.float64)
     overlap_mask = np.asarray(overlap_mask_yx, dtype=bool)
     if path.ndim != 2 or path.shape[1] != 2 or path.shape[0] < 2:
@@ -610,11 +619,10 @@ def _write_overlap_t_ranges_csv(
     rows: list[tuple[int, float, float, int, int, str]],
 ) -> None:
     with out_csv.open("w", encoding="utf-8") as f:
-        f.write(f"{slice_label},t_start,t_end,n_overlap_points,n_path_points,path_source\n")
+        f.write(f"{slice_label},t_start_all,t_end_all,n_overlap_points,n_path_points,path_source\n")
         for slice_idx, t0, t1, n_overlap, n_path, source in rows:
             f.write(
-                f"{int(slice_idx)},{float(t0):.8f},{float(t1):.8f},"
-                f"{int(n_overlap)},{int(n_path)},{source}\n"
+                f"{int(slice_idx)},{float(t0):.8f},{float(t1):.8f},{int(n_overlap)},{int(n_path)},{source}\n"
             )
 
 

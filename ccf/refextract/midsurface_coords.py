@@ -8,6 +8,7 @@ from typing import Literal
 
 import numpy as np
 from scipy.ndimage import map_coordinates
+from scipy.spatial import cKDTree
 from skimage.measure import find_contours
 
 MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (
@@ -51,6 +52,12 @@ SAGITTAL_T_SMOOTH_N_T = 257
 SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS: tuple[int, ...] = (173, 174, 175)
 CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES = 9
 SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES = 9
+JOINT_T_ANCHOR_SHARED_WEIGHT = 0.2
+JOINT_XY_SHARED_J_WEIGHT = 0.1
+IJK_LUT_KNN_K = 24
+IJK_LUT_KNN_SIGMA_SLICE = 2.0
+IJK_LUT_KNN_SIGMA_T = 0.05
+IJK_LUT_KNN_WEIGHT_EPS = 1e-12
 
 
 @dataclass(frozen=True)
@@ -60,6 +67,10 @@ class CoronalMidlineColumns:
     Coordinates are in the coronal plane (y/x) for a fixed slice_i:
     - (y, x) is a point on the midline curve (u≈0.5 sheet intersection)
     - (vent_y, vent_x) and (pia_y, pia_x) are boundary intersection points along a local normal
+
+    The `t` column here is `t_all` used by `midsurface_coords.py`:
+    - It is the full-path along-midline coordinate on that slice.
+    - It is normalized arc length on the representative curve (`t_all ∈ [0,1]`).
 
     Given r01 in [0,1] (0=ventricular/inner, 1=pial), the point in voxel coordinates is:
         p_yx = vent_yx + r01 * (pia_yx - vent_yx)
@@ -78,6 +89,8 @@ class CoronalMidlineColumns:
 
 
 def load_coronal_midline_columns(csv_path: Path) -> dict[int, CoronalMidlineColumns]:
+    if csv_path.exists():
+        return _load_coronal_midline_columns_csv(csv_path)
     return _build_coronal_midline_columns_from_halfway_u(csv_path.parent)
 
 
@@ -86,6 +99,24 @@ def _interp(t_grid: np.ndarray, values: np.ndarray, t: float) -> float:
     if not np.isfinite(t):
         raise ValueError("t must be finite.")
     return float(np.interp(t, t_grid, values))
+
+
+def _column_t_affine_bounds(t_values: np.ndarray) -> tuple[float, float]:
+    t_arr = np.asarray(t_values, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(t_arr)
+    if int(np.count_nonzero(finite)) < 2:
+        raise ValueError("Column t must contain at least 2 finite values.")
+    t_min = float(np.min(t_arr[finite]))
+    t_max = float(np.max(t_arr[finite]))
+    den = t_max - t_min
+    if not np.isfinite(den) or den <= 1.0e-9:
+        raise ValueError(f"Column t has invalid affine span: min={t_min}, max={t_max}.")
+    return t_min, t_max
+
+
+def _column_t_to_t_all(*, t: float, t_values: np.ndarray) -> float:
+    t_min, t_max = _column_t_affine_bounds(t_values)
+    return float((float(t) - t_min) / (t_max - t_min))
 
 
 def _fill_nan_series(values: np.ndarray) -> np.ndarray:
@@ -98,6 +129,27 @@ def _fill_nan_series(values: np.ndarray) -> np.ndarray:
     idx = np.arange(x.size, dtype=np.float64)
     out = x.copy()
     out[~finite] = np.interp(idx[~finite], idx[finite], x[finite])
+    return out
+
+
+def _fill_nan_series_interior(values: np.ndarray) -> np.ndarray:
+    """Fill interior NaN gaps while keeping out-of-support edges as NaN."""
+    x = np.asarray(values, dtype=np.float64)
+    if x.ndim != 1:
+        raise ValueError(f"Expected 1D series, got shape={x.shape}.")
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return x.copy()
+
+    idx = np.arange(x.size, dtype=np.float64)
+    out = x.copy()
+    out[~finite] = np.interp(idx[~finite], idx[finite], x[finite])
+    first = int(np.flatnonzero(finite)[0])
+    last = int(np.flatnonzero(finite)[-1])
+    if first > 0:
+        out[:first] = np.nan
+    if last < (x.size - 1):
+        out[last + 1 :] = np.nan
     return out
 
 
@@ -292,7 +344,120 @@ def _smooth_sagittal_midline_xy_across_slices(
     return out
 
 
+def _smooth_shared_j_coordinate_across_axes(
+    coronal_columns: dict[int, CoronalMidlineColumns],
+    sagittal_columns: dict[int, SagittalMidlineColumns],
+    *,
+    window_slices: int,
+    n_t: int,
+    sagittal_exclude_slice_keys: set[int] | None = None,
+    shared_weight: float = JOINT_XY_SHARED_J_WEIGHT,
+) -> tuple[dict[int, CoronalMidlineColumns], dict[int, SagittalMidlineColumns]]:
+    if window_slices <= 1 or (not coronal_columns and not sagittal_columns):
+        return coronal_columns, sagittal_columns
+    if window_slices % 2 == 0:
+        raise ValueError(f"window_slices must be odd, got {window_slices}.")
+    if n_t < 8:
+        raise ValueError(f"n_t must be >= 8, got {n_t}.")
+    w = float(shared_weight)
+    if not (0.0 <= w <= 1.0):
+        raise ValueError(f"shared_weight must be in [0,1], got {w}.")
+    if w <= 0.0:
+        return coronal_columns, sagittal_columns
+
+    coronal_keys = sorted(coronal_columns.keys())
+    sagittal_keys = sorted(sagittal_columns.keys())
+    n_rows = len(coronal_keys) + len(sagittal_keys)
+    if n_rows < 3:
+        return coronal_columns, sagittal_columns
+
+    excluded = set() if sagittal_exclude_slice_keys is None else {int(k) for k in sagittal_exclude_slice_keys}
+    t_grid = np.linspace(0.0, 1.0, int(n_t), dtype=np.float64)
+    pooled_rows: list[np.ndarray] = []
+    for slice_i in coronal_keys:
+        c = coronal_columns[int(slice_i)]
+        row = _interp_series_on_t_grid(t=c.t, values=c.y, t_grid=t_grid)
+        if int(np.count_nonzero(np.isfinite(row))) >= 8:
+            pooled_rows.append(row)
+    for slice_k in sagittal_keys:
+        c = sagittal_columns[int(slice_k)]
+        if int(slice_k) in excluded:
+            continue
+        row = _interp_series_on_t_grid(t=c.t, values=c.x, t_grid=t_grid)
+        if int(np.count_nonzero(np.isfinite(row))) >= 8:
+            pooled_rows.append(row)
+
+    if len(pooled_rows) < 3:
+        return coronal_columns, sagittal_columns
+
+    pooled = np.asarray(pooled_rows, dtype=np.float64)
+    shared_j = np.nanmedian(pooled, axis=0)
+    finite = np.isfinite(shared_j)
+    if int(np.count_nonzero(finite)) < 2:
+        return coronal_columns, sagittal_columns
+    if not np.all(finite):
+        shared_j = _fill_nan_series(shared_j)
+    if not np.isfinite(shared_j).all():
+        return coronal_columns, sagittal_columns
+
+    coronal_out: dict[int, CoronalMidlineColumns] = {}
+    sagittal_out: dict[int, SagittalMidlineColumns] = {}
+    for key in coronal_keys:
+        c = coronal_columns[int(key)]
+        shared_on_t = _interp_series_on_t_grid(t=t_grid, values=shared_j, t_grid=c.t)
+        if np.isfinite(shared_on_t).all():
+            y_new = (1.0 - w) * np.asarray(c.y, dtype=np.float64) + w * shared_on_t
+        else:
+            y_new = np.array(c.y, dtype=np.float64, copy=True)
+        coronal_out[int(key)] = CoronalMidlineColumns(
+            slice_i=int(c.slice_i),
+            t=np.array(c.t, dtype=np.float64, copy=True),
+            y=y_new,
+            x=np.array(c.x, dtype=np.float64, copy=True),
+            vent_y=np.array(c.vent_y, dtype=np.float64, copy=True),
+            vent_x=np.array(c.vent_x, dtype=np.float64, copy=True),
+            pia_y=np.array(c.pia_y, dtype=np.float64, copy=True),
+            pia_x=np.array(c.pia_x, dtype=np.float64, copy=True),
+            thickness_um=np.array(c.thickness_um, dtype=np.float64, copy=True),
+        )
+    for key in sagittal_keys:
+        c = sagittal_columns[int(key)]
+        if int(key) in excluded:
+            sagittal_out[int(key)] = SagittalMidlineColumns(
+                slice_k=int(c.slice_k),
+                t=np.array(c.t, dtype=np.float64, copy=True),
+                y=np.array(c.y, dtype=np.float64, copy=True),
+                x=np.array(c.x, dtype=np.float64, copy=True),
+                vent_y=np.array(c.vent_y, dtype=np.float64, copy=True),
+                vent_x=np.array(c.vent_x, dtype=np.float64, copy=True),
+                pia_y=np.array(c.pia_y, dtype=np.float64, copy=True),
+                pia_x=np.array(c.pia_x, dtype=np.float64, copy=True),
+                thickness_um=np.array(c.thickness_um, dtype=np.float64, copy=True),
+            )
+            continue
+        shared_on_t = _interp_series_on_t_grid(t=t_grid, values=shared_j, t_grid=c.t)
+        if np.isfinite(shared_on_t).all():
+            x_new = (1.0 - w) * np.asarray(c.x, dtype=np.float64) + w * shared_on_t
+        else:
+            x_new = np.array(c.x, dtype=np.float64, copy=True)
+        sagittal_out[int(key)] = SagittalMidlineColumns(
+            slice_k=int(c.slice_k),
+            t=np.array(c.t, dtype=np.float64, copy=True),
+            y=np.array(c.y, dtype=np.float64, copy=True),
+            x=x_new,
+            vent_y=np.array(c.vent_y, dtype=np.float64, copy=True),
+            vent_x=np.array(c.vent_x, dtype=np.float64, copy=True),
+            pia_y=np.array(c.pia_y, dtype=np.float64, copy=True),
+            pia_x=np.array(c.pia_x, dtype=np.float64, copy=True),
+            thickness_um=np.array(c.thickness_um, dtype=np.float64, copy=True),
+        )
+
+    return coronal_out, sagittal_out
+
+
 def load_sagittal_midline_columns(csv_path: Path) -> dict[int, SagittalMidlineColumns]:
+    if csv_path.exists():
+        return _load_sagittal_midline_columns_csv(csv_path)
     return _build_sagittal_midline_columns_from_halfway_u(csv_path.parent)
 
 
@@ -461,6 +626,97 @@ def _smooth_t_anchor_ranges_by_slice(
     return out
 
 
+def _is_valid_t_anchor_range(t0: float, t1: float) -> bool:
+    return bool(np.isfinite(float(t0)) and np.isfinite(float(t1)) and (float(t1) - float(t0)) > 1.0e-9)
+
+
+def _smooth_t_anchor_ranges_joint(
+    *,
+    coronal_raw_anchors: dict[int, tuple[float, float]],
+    sagittal_raw_anchors: dict[int, tuple[float, float]],
+    coronal_window_slices: int,
+    sagittal_window_slices: int,
+    sagittal_exclude_slice_keys: set[int] | None = None,
+    shared_weight: float = JOINT_T_ANCHOR_SHARED_WEIGHT,
+) -> tuple[dict[int, tuple[float, float]], dict[int, tuple[float, float]], tuple[float, float] | None]:
+    """Jointly smooth coronal/sagittal anchor ranges with partial pooling.
+
+    The first stage preserves existing behavior (axis-local sliding smoothing). The second stage
+    introduces coupling by shrinking both axes toward a shared robust center estimated from all
+    non-excluded smoothed ranges. This avoids assuming direct slice-index correspondence across axes.
+    """
+
+    w = float(shared_weight)
+    if not (0.0 <= w <= 1.0):
+        raise ValueError(f"shared_weight must be in [0,1], got {w}.")
+
+    excluded_sagittal = set() if sagittal_exclude_slice_keys is None else {int(k) for k in sagittal_exclude_slice_keys}
+    coronal_smoothed = _smooth_t_anchor_ranges_by_slice(
+        coronal_raw_anchors,
+        window_slices=int(coronal_window_slices),
+        exclude_slice_keys=None,
+    )
+    sagittal_smoothed = _smooth_t_anchor_ranges_by_slice(
+        sagittal_raw_anchors,
+        window_slices=int(sagittal_window_slices),
+        exclude_slice_keys=excluded_sagittal,
+    )
+
+    if w <= 0.0:
+        return coronal_smoothed, sagittal_smoothed, None
+
+    pooled_t0: list[float] = []
+    pooled_t1: list[float] = []
+    for t0, t1 in coronal_smoothed.values():
+        if _is_valid_t_anchor_range(float(t0), float(t1)):
+            pooled_t0.append(float(t0))
+            pooled_t1.append(float(t1))
+    for key, (t0, t1) in sagittal_smoothed.items():
+        if int(key) in excluded_sagittal:
+            continue
+        if _is_valid_t_anchor_range(float(t0), float(t1)):
+            pooled_t0.append(float(t0))
+            pooled_t1.append(float(t1))
+
+    shared_anchor: tuple[float, float] | None = None
+    if pooled_t0:
+        cand_t0 = float(np.median(np.asarray(pooled_t0, dtype=np.float64)))
+        cand_t1 = float(np.median(np.asarray(pooled_t1, dtype=np.float64)))
+        if _is_valid_t_anchor_range(cand_t0, cand_t1):
+            shared_anchor = (cand_t0, cand_t1)
+
+    if shared_anchor is None:
+        return coronal_smoothed, sagittal_smoothed, None
+
+    def _blend_with_shared(
+        smoothed: dict[int, tuple[float, float]],
+        raw: dict[int, tuple[float, float]],
+        *,
+        excluded: set[int] | None,
+    ) -> dict[int, tuple[float, float]]:
+        out: dict[int, tuple[float, float]] = {}
+        excluded_keys = set() if excluded is None else {int(k) for k in excluded}
+        for key, (s_t0, s_t1) in smoothed.items():
+            raw_t0, raw_t1 = raw[int(key)]
+            if int(key) in excluded_keys:
+                out[int(key)] = (float(raw_t0), float(raw_t1))
+                continue
+            if not _is_valid_t_anchor_range(float(s_t0), float(s_t1)):
+                out[int(key)] = (float(raw_t0), float(raw_t1))
+                continue
+            b_t0 = (1.0 - w) * float(s_t0) + w * float(shared_anchor[0])
+            b_t1 = (1.0 - w) * float(s_t1) + w * float(shared_anchor[1])
+            if _is_valid_t_anchor_range(b_t0, b_t1):
+                out[int(key)] = (float(b_t0), float(b_t1))
+            else:
+                out[int(key)] = (float(raw_t0), float(raw_t1))
+        return out
+
+    coronal_joint = _blend_with_shared(coronal_smoothed, coronal_raw_anchors, excluded=None)
+    sagittal_joint = _blend_with_shared(sagittal_smoothed, sagittal_raw_anchors, excluded=excluded_sagittal)
+    return coronal_joint, sagittal_joint, shared_anchor
+
+
 def _dedupe_consecutive_points(path_yx: np.ndarray) -> np.ndarray:
     if path_yx.ndim != 2 or path_yx.shape[1] != 2:
         raise ValueError(f"Expected path shape (N,2), got {path_yx.shape}.")
@@ -596,29 +852,13 @@ def _build_slice_columns(
     mask_yx: np.ndarray,
     res_y_um: float,
     res_x_um: float,
-    overlap_mask_yx: np.ndarray | None = None,
-    t_anchor_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build midline columns for one slice.
+
+    Notes on `t`:
+    - `t` is `t_all`: normalized arc length along the full u=0.5 curve on this slice.
+    """
     y, x, t = _normalized_arc_t_for_path(path_yx)
-    if t_anchor_range is not None:
-        t0 = float(t_anchor_range[0])
-        t1 = float(t_anchor_range[1])
-        den = t1 - t0
-        if np.isfinite(den) and den > 1.0e-9:
-            t = ((t - t0) / den).astype(np.float64, copy=False)
-    elif overlap_mask_yx is not None:
-        overlap_mask = np.asarray(overlap_mask_yx, dtype=bool)
-        if overlap_mask.shape != mask_yx.shape:
-            raise ValueError(
-                f"Slice {slice_index}: overlap mask shape mismatch: {overlap_mask.shape} vs {mask_yx.shape}."
-            )
-        t_anchor = _t_anchor_range_from_overlap(y=y, x=x, t=t, overlap_mask_yx=overlap_mask)
-        if t_anchor is not None:
-            t0 = float(t_anchor[0])
-            t1 = float(t_anchor[1])
-            den = t1 - t0
-            if np.isfinite(den) and den > 1.0e-9:
-                t = ((t - t0) / den).astype(np.float64, copy=False)
 
     dt = np.gradient(t)
     dy = np.gradient(y)
@@ -727,6 +967,30 @@ def _save_coronal_midline_columns_csv(csv_path: Path, columns: dict[int, Coronal
     )
 
 
+def _load_coronal_midline_columns_csv(csv_path: Path) -> dict[int, CoronalMidlineColumns]:
+    table = np.loadtxt(csv_path, delimiter=",", skiprows=1, ndmin=2)
+    if table.ndim != 2 or table.shape[1] != 9:
+        raise ValueError(f"Unexpected coronal columns CSV shape in {csv_path}: {table.shape}")
+    keys = np.asarray(np.rint(table[:, 0]), dtype=np.int32)
+    out: dict[int, CoronalMidlineColumns] = {}
+    for key in sorted(np.unique(keys).tolist()):
+        rows = table[keys == int(key)]
+        order = np.argsort(rows[:, 1])
+        rows = rows[order]
+        out[int(key)] = CoronalMidlineColumns(
+            slice_i=int(key),
+            t=np.asarray(rows[:, 1], dtype=np.float64),
+            y=np.asarray(rows[:, 2], dtype=np.float64),
+            x=np.asarray(rows[:, 3], dtype=np.float64),
+            vent_y=np.asarray(rows[:, 4], dtype=np.float64),
+            vent_x=np.asarray(rows[:, 5], dtype=np.float64),
+            pia_y=np.asarray(rows[:, 6], dtype=np.float64),
+            pia_x=np.asarray(rows[:, 7], dtype=np.float64),
+            thickness_um=np.asarray(rows[:, 8], dtype=np.float64),
+        )
+    return out
+
+
 def _save_sagittal_midline_columns_csv(csv_path: Path, columns: dict[int, SagittalMidlineColumns]) -> None:
     rows: list[np.ndarray] = []
     for slice_k in sorted(columns.keys()):
@@ -742,6 +1006,127 @@ def _save_sagittal_midline_columns_csv(csv_path: Path, columns: dict[int, Sagitt
         header="slice_k,t,y,x,vent_y,vent_x,pia_y,pia_x,thickness_um",
         comments="",
     )
+
+
+def _load_sagittal_midline_columns_csv(csv_path: Path) -> dict[int, SagittalMidlineColumns]:
+    table = np.loadtxt(csv_path, delimiter=",", skiprows=1, ndmin=2)
+    if table.ndim != 2 or table.shape[1] != 9:
+        raise ValueError(f"Unexpected sagittal columns CSV shape in {csv_path}: {table.shape}")
+    keys = np.asarray(np.rint(table[:, 0]), dtype=np.int32)
+    out: dict[int, SagittalMidlineColumns] = {}
+    for key in sorted(np.unique(keys).tolist()):
+        rows = table[keys == int(key)]
+        order = np.argsort(rows[:, 1])
+        rows = rows[order]
+        out[int(key)] = SagittalMidlineColumns(
+            slice_k=int(key),
+            t=np.asarray(rows[:, 1], dtype=np.float64),
+            y=np.asarray(rows[:, 2], dtype=np.float64),
+            x=np.asarray(rows[:, 3], dtype=np.float64),
+            vent_y=np.asarray(rows[:, 4], dtype=np.float64),
+            vent_x=np.asarray(rows[:, 5], dtype=np.float64),
+            pia_y=np.asarray(rows[:, 6], dtype=np.float64),
+            pia_x=np.asarray(rows[:, 7], dtype=np.float64),
+            thickness_um=np.asarray(rows[:, 8], dtype=np.float64),
+        )
+    return out
+
+
+def _collect_prepared_paths_and_raw_t_anchor_ranges(
+    *,
+    axis: Literal["coronal", "sagittal"],
+    outdir: Path,
+    u_3d: np.ndarray,
+    mask_3d: np.ndarray,
+    include_3d: np.ndarray,
+    overlay_3d: np.ndarray,
+) -> tuple[dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]], dict[int, tuple[float, float]]]:
+    prepared: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    raw_anchor_ranges: dict[int, tuple[float, float]] = {}
+    if axis == "coronal":
+        for slice_i in range(u_3d.shape[0]):
+            mask_yx = (mask_3d[slice_i, :, :] & include_3d[slice_i, :, :]).astype(bool, copy=False)
+            if not np.any(mask_yx):
+                continue
+            path = _load_manual_coronal_override_path(outdir, slice_i=int(slice_i))
+            if path is None:
+                path = _extract_largest_midline_contour(u_3d[slice_i, :, :], mask_yx)
+            if path is None:
+                continue
+            overlap_yx = overlay_3d[slice_i, :, :]
+            prepared[int(slice_i)] = (
+                np.asarray(path, dtype=np.float64),
+                np.asarray(mask_yx, dtype=bool),
+                np.asarray(overlap_yx, dtype=bool),
+            )
+            anchor = _raw_t_anchor_range_for_path(path, overlap_yx)
+            if anchor is not None:
+                raw_anchor_ranges[int(slice_i)] = (float(anchor[0]), float(anchor[1]))
+        return prepared, raw_anchor_ranges
+
+    for slice_k in range(u_3d.shape[2]):
+        mask_yx = (mask_3d[:, :, slice_k] & include_3d[:, :, slice_k]).astype(bool, copy=False)
+        if not np.any(mask_yx):
+            continue
+        path = _load_manual_sagittal_override_path(outdir, slice_k=int(slice_k))
+        if path is None:
+            path = _extract_largest_midline_contour(u_3d[:, :, slice_k], mask_yx)
+        if path is None:
+            continue
+        overlap_yx = overlay_3d[:, :, slice_k]
+        prepared[int(slice_k)] = (
+            np.asarray(path, dtype=np.float64),
+            np.asarray(mask_yx, dtype=bool),
+            np.asarray(overlap_yx, dtype=bool),
+        )
+        anchor = _raw_t_anchor_range_for_path(path, overlap_yx)
+        if anchor is not None:
+            raw_anchor_ranges[int(slice_k)] = (float(anchor[0]), float(anchor[1]))
+    return prepared, raw_anchor_ranges
+
+
+def _build_path_only_coronal_columns_from_prepared(
+    prepared: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]],
+) -> dict[int, CoronalMidlineColumns]:
+    out: dict[int, CoronalMidlineColumns] = {}
+    for slice_i in sorted(prepared.keys()):
+        path_yx, _mask_yx, _overlap_yx = prepared[int(slice_i)]
+        y, x, t = _normalized_arc_t_for_path(path_yx)
+        nan_arr = np.full_like(t, np.nan, dtype=np.float64)
+        out[int(slice_i)] = CoronalMidlineColumns(
+            slice_i=int(slice_i),
+            t=np.asarray(t, dtype=np.float64),
+            y=np.asarray(y, dtype=np.float64),
+            x=np.asarray(x, dtype=np.float64),
+            vent_y=np.array(nan_arr, dtype=np.float64, copy=True),
+            vent_x=np.array(nan_arr, dtype=np.float64, copy=True),
+            pia_y=np.array(nan_arr, dtype=np.float64, copy=True),
+            pia_x=np.array(nan_arr, dtype=np.float64, copy=True),
+            thickness_um=np.array(nan_arr, dtype=np.float64, copy=True),
+        )
+    return out
+
+
+def _build_path_only_sagittal_columns_from_prepared(
+    prepared: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]],
+) -> dict[int, SagittalMidlineColumns]:
+    out: dict[int, SagittalMidlineColumns] = {}
+    for slice_k in sorted(prepared.keys()):
+        path_yx, _mask_yx, _overlap_yx = prepared[int(slice_k)]
+        y, x, t = _normalized_arc_t_for_path(path_yx)
+        nan_arr = np.full_like(t, np.nan, dtype=np.float64)
+        out[int(slice_k)] = SagittalMidlineColumns(
+            slice_k=int(slice_k),
+            t=np.asarray(t, dtype=np.float64),
+            y=np.asarray(y, dtype=np.float64),
+            x=np.asarray(x, dtype=np.float64),
+            vent_y=np.array(nan_arr, dtype=np.float64, copy=True),
+            vent_x=np.array(nan_arr, dtype=np.float64, copy=True),
+            pia_y=np.array(nan_arr, dtype=np.float64, copy=True),
+            pia_x=np.array(nan_arr, dtype=np.float64, copy=True),
+            thickness_um=np.array(nan_arr, dtype=np.float64, copy=True),
+        )
+    return out
 
 
 def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, CoronalMidlineColumns]:
@@ -783,22 +1168,31 @@ def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Cor
             "Expected u=0.5 contours inside the cortex include-mask."
         )
 
-    anchor_ranges = _smooth_t_anchor_ranges_by_slice(
-        raw_anchor_ranges,
-        window_slices=int(CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES),
-        exclude_slice_keys=None,
+    sagittal_prepared, sagittal_raw_anchor_ranges = _collect_prepared_paths_and_raw_t_anchor_ranges(
+        axis="sagittal",
+        outdir=outdir,
+        u_3d=u_3d,
+        mask_3d=mask_3d,
+        include_3d=include_3d,
+        overlay_3d=overlay_3d,
+    )
+    anchor_ranges, _sagittal_anchor_ranges_joint, shared_anchor = _smooth_t_anchor_ranges_joint(
+        coronal_raw_anchors=raw_anchor_ranges,
+        sagittal_raw_anchors=sagittal_raw_anchor_ranges,
+        coronal_window_slices=int(CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES),
+        sagittal_window_slices=int(SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES),
+        sagittal_exclude_slice_keys={int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS},
+        shared_weight=float(JOINT_T_ANCHOR_SHARED_WEIGHT),
     )
     out: dict[int, CoronalMidlineColumns] = {}
     for slice_i in sorted(prepared.keys()):
-        path_yx, mask_yx, overlap_yx = prepared[int(slice_i)]
+        path_yx, mask_yx, _overlap_yx = prepared[int(slice_i)]
         t, y, x, vent_yx, pia_yx, thickness_um = _build_slice_columns(
             slice_index=int(slice_i),
             path_yx=path_yx,
             mask_yx=mask_yx,
             res_y_um=res_j_um,
             res_x_um=res_k_um,
-            overlap_mask_yx=overlap_yx,
-            t_anchor_range=anchor_ranges.get(int(slice_i)),
         )
         out[int(slice_i)] = CoronalMidlineColumns(
             slice_i=int(slice_i),
@@ -812,10 +1206,14 @@ def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Cor
             thickness_um=thickness_um,
         )
 
+    shared_label = "none" if shared_anchor is None else f"({float(shared_anchor[0]):.4f},{float(shared_anchor[1]):.4f})"
     print(
-        f"[midline] coronal t-anchor smoothing: "
-        f"raw={len(raw_anchor_ranges)} smoothed={len(anchor_ranges)} "
-        f"window={int(CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES)}"
+        f"[midline] coronal overlap-anchor stats (diagnostic only; t_all is not remapped): "
+        f"raw_coronal={len(raw_anchor_ranges)} raw_sagittal={len(sagittal_raw_anchor_ranges)} "
+        f"smoothed_coronal={len(anchor_ranges)} "
+        f"window_coronal={int(CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES)} "
+        f"window_sagittal={int(SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES)} "
+        f"shared_weight={float(JOINT_T_ANCHOR_SHARED_WEIGHT):.2f} shared={shared_label}"
     )
     if int(CORONAL_T_SMOOTH_WINDOW_SLICES) > 1:
         out = _smooth_coronal_midline_xy_across_slices(
@@ -826,6 +1224,24 @@ def _build_coronal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Cor
         print(
             f"[midline] coronal cross-slice smoothing applied: "
             f"window={int(CORONAL_T_SMOOTH_WINDOW_SLICES)} n_t={int(CORONAL_T_SMOOTH_N_T)}"
+        )
+    joint_window = int(max(int(CORONAL_T_SMOOTH_WINDOW_SLICES), int(SAGITTAL_T_SMOOTH_WINDOW_SLICES)))
+    joint_n_t = int(max(int(CORONAL_T_SMOOTH_N_T), int(SAGITTAL_T_SMOOTH_N_T)))
+    if joint_window > 1 and float(JOINT_XY_SHARED_J_WEIGHT) > 0.0 and sagittal_prepared:
+        sagittal_path_columns = _build_path_only_sagittal_columns_from_prepared(sagittal_prepared)
+        out, _ = _smooth_shared_j_coordinate_across_axes(
+            coronal_columns=out,
+            sagittal_columns=sagittal_path_columns,
+            window_slices=joint_window,
+            n_t=joint_n_t,
+            sagittal_exclude_slice_keys={int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS},
+            shared_weight=float(JOINT_XY_SHARED_J_WEIGHT),
+        )
+        print(
+            f"[midline] coronal cross-axis shared-j smoothing applied: "
+            f"window={joint_window} n_t={joint_n_t} "
+            f"peer_rows={len(sagittal_path_columns)} "
+            f"weight={float(JOINT_XY_SHARED_J_WEIGHT):.2f}"
         )
     _save_coronal_midline_columns_csv(outdir / "coronal_midline_columns.csv", out)
     dt = time.perf_counter() - t0
@@ -872,22 +1288,31 @@ def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Sa
             "Expected u=0.5 contours inside the cortex include-mask."
         )
 
-    anchor_ranges = _smooth_t_anchor_ranges_by_slice(
-        raw_anchor_ranges,
-        window_slices=int(SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES),
-        exclude_slice_keys={int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS},
+    coronal_prepared, coronal_raw_anchor_ranges = _collect_prepared_paths_and_raw_t_anchor_ranges(
+        axis="coronal",
+        outdir=outdir,
+        u_3d=u_3d,
+        mask_3d=mask_3d,
+        include_3d=include_3d,
+        overlay_3d=overlay_3d,
+    )
+    _coronal_anchor_ranges_joint, anchor_ranges, shared_anchor = _smooth_t_anchor_ranges_joint(
+        coronal_raw_anchors=coronal_raw_anchor_ranges,
+        sagittal_raw_anchors=raw_anchor_ranges,
+        coronal_window_slices=int(CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES),
+        sagittal_window_slices=int(SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES),
+        sagittal_exclude_slice_keys={int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS},
+        shared_weight=float(JOINT_T_ANCHOR_SHARED_WEIGHT),
     )
     out: dict[int, SagittalMidlineColumns] = {}
     for slice_k in sorted(prepared.keys()):
-        path_yx, mask_yx, overlap_yx = prepared[int(slice_k)]
+        path_yx, mask_yx, _overlap_yx = prepared[int(slice_k)]
         t, y, x, vent_yx, pia_yx, thickness_um = _build_slice_columns(
             slice_index=int(slice_k),
             path_yx=path_yx,
             mask_yx=mask_yx,
             res_y_um=res_i_um,
             res_x_um=res_j_um,
-            overlap_mask_yx=overlap_yx,
-            t_anchor_range=anchor_ranges.get(int(slice_k)),
         )
         out[int(slice_k)] = SagittalMidlineColumns(
             slice_k=int(slice_k),
@@ -901,11 +1326,15 @@ def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Sa
             thickness_um=thickness_um,
         )
 
+    shared_label = "none" if shared_anchor is None else f"({float(shared_anchor[0]):.4f},{float(shared_anchor[1]):.4f})"
     print(
-        f"[midline] sagittal t-anchor smoothing: "
-        f"raw={len(raw_anchor_ranges)} smoothed={len(anchor_ranges)} "
-        f"window={int(SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES)} "
-        f"exclude={tuple(int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS)}"
+        f"[midline] sagittal overlap-anchor stats (diagnostic only; t_all is not remapped): "
+        f"raw_sagittal={len(raw_anchor_ranges)} raw_coronal={len(coronal_raw_anchor_ranges)} "
+        f"smoothed_sagittal={len(anchor_ranges)} "
+        f"window_sagittal={int(SAGITTAL_T_ANCHOR_SMOOTH_WINDOW_SLICES)} "
+        f"window_coronal={int(CORONAL_T_ANCHOR_SMOOTH_WINDOW_SLICES)} "
+        f"exclude={tuple(int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS)} "
+        f"shared_weight={float(JOINT_T_ANCHOR_SHARED_WEIGHT):.2f} shared={shared_label}"
     )
     if int(SAGITTAL_T_SMOOTH_WINDOW_SLICES) > 1:
         out = _smooth_sagittal_midline_xy_across_slices(
@@ -918,6 +1347,24 @@ def _build_sagittal_midline_columns_from_halfway_u(outdir: Path) -> dict[int, Sa
             f"[midline] sagittal cross-slice smoothing applied: "
             f"window={int(SAGITTAL_T_SMOOTH_WINDOW_SLICES)} n_t={int(SAGITTAL_T_SMOOTH_N_T)} "
             f"exclude={tuple(int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS)}"
+        )
+    joint_window = int(max(int(CORONAL_T_SMOOTH_WINDOW_SLICES), int(SAGITTAL_T_SMOOTH_WINDOW_SLICES)))
+    joint_n_t = int(max(int(CORONAL_T_SMOOTH_N_T), int(SAGITTAL_T_SMOOTH_N_T)))
+    if joint_window > 1 and float(JOINT_XY_SHARED_J_WEIGHT) > 0.0 and coronal_prepared:
+        coronal_path_columns = _build_path_only_coronal_columns_from_prepared(coronal_prepared)
+        _, out = _smooth_shared_j_coordinate_across_axes(
+            coronal_columns=coronal_path_columns,
+            sagittal_columns=out,
+            window_slices=joint_window,
+            n_t=joint_n_t,
+            sagittal_exclude_slice_keys={int(k) for k in SAGITTAL_T_SMOOTH_EXCLUDE_SLICE_KS},
+            shared_weight=float(JOINT_XY_SHARED_J_WEIGHT),
+        )
+        print(
+            f"[midline] sagittal cross-axis shared-j smoothing applied: "
+            f"window={joint_window} n_t={joint_n_t} "
+            f"peer_rows={len(coronal_path_columns)} "
+            f"weight={float(JOINT_XY_SHARED_J_WEIGHT):.2f}"
         )
     _save_sagittal_midline_columns_csv(outdir / "sagittal_midline_columns.csv", out)
     dt = time.perf_counter() - t0
@@ -1261,7 +1708,7 @@ def _project_t_on_polyline(*, y: np.ndarray, x: np.ndarray, t: np.ndarray, qy: f
     t0 = float(t[m])
     t1 = float(t[m + 1])
     t_proj = t0 + float(alpha[m]) * (t1 - t0)
-    return float(np.clip(t_proj, 0.0, 1.0)), float(d2[m])
+    return float(t_proj), float(d2[m])
 
 
 def _p3_to_sagittal(
@@ -1345,6 +1792,8 @@ def build_transition_lut_2d(
             s2c_kw = int(np.asarray(s2c["k_window"]).reshape(-1)[0])
             c2s_iw = int(np.asarray(c2s["i_window"]).reshape(-1)[0])
             c2s_kw = int(np.asarray(c2s["k_window"]).reshape(-1)[0])
+            s2c_t_domain = str(np.asarray(s2c["t_domain"]).reshape(-1)[0])
+            c2s_t_domain = str(np.asarray(c2s["t_domain"]).reshape(-1)[0])
             if (
                 s2c_nt == int(n_t)
                 and c2s_nt == int(n_t)
@@ -1352,6 +1801,8 @@ def build_transition_lut_2d(
                 and c2s_iw == int(i_window)
                 and s2c_kw == int(k_window)
                 and c2s_kw == int(k_window)
+                and s2c_t_domain == "t_all"
+                and c2s_t_domain == "t_all"
             ):
                 return s2c_path, c2s_path
         except (KeyError, ValueError, IndexError):
@@ -1381,9 +1832,15 @@ def build_transition_lut_2d(
         if row % 16 == 0 or row == (sagittal_keys.size - 1):
             print(f"[lut] s2c rows {row + 1}/{sagittal_keys.size}")
         cols = sagittal[int(slice_k)]
+        try:
+            src_t_min, src_t_max = _column_t_affine_bounds(cols.t)
+        except ValueError:
+            continue
+        src_t_den = src_t_max - src_t_min
         for col, t_val in enumerate(t_grid.tolist()):
-            i = float(_interp(cols.t, cols.y, float(t_val)))
-            j = float(_interp(cols.t, cols.x, float(t_val)))
+            t_col = float(src_t_min + float(t_val) * src_t_den)
+            i = float(_interp(cols.t, cols.y, t_col))
+            j = float(_interp(cols.t, cols.x, t_col))
             i_idx, t_c, err = _p3_to_coronal(
                 ijk=(i, j, float(slice_k)),
                 coronal=coronal,
@@ -1391,7 +1848,10 @@ def build_transition_lut_2d(
                 i_window=int(i_window),
             )
             map_s2c_slice[row, col] = float(i_idx)
-            map_s2c_t[row, col] = float(t_c)
+            try:
+                map_s2c_t[row, col] = float(_column_t_to_t_all(t=float(t_c), t_values=coronal[int(i_idx)].t))
+            except ValueError:
+                continue
             map_s2c_err[row, col] = float(err)
 
     valid_s2c = np.ones((sagittal_keys.size,), dtype=bool)
@@ -1424,6 +1884,7 @@ def build_transition_lut_2d(
         target_t=map_s2c_t,
         residual_vox=map_s2c_err,
         t_grid=t_grid.astype(np.float32),
+        t_domain=np.asarray(["t_all"]),
         i_window=np.asarray([int(i_window)], dtype=np.int32),
         k_window=np.asarray([int(k_window)], dtype=np.int32),
     )
@@ -1435,9 +1896,15 @@ def build_transition_lut_2d(
         if row % 16 == 0 or row == (coronal_keys.size - 1):
             print(f"[lut] c2s rows {row + 1}/{coronal_keys.size}")
         cols = coronal[int(slice_i)]
+        try:
+            src_t_min, src_t_max = _column_t_affine_bounds(cols.t)
+        except ValueError:
+            continue
+        src_t_den = src_t_max - src_t_min
         for col, t_val in enumerate(t_grid.tolist()):
-            j = float(_interp(cols.t, cols.y, float(t_val)))
-            k = float(_interp(cols.t, cols.x, float(t_val)))
+            t_col = float(src_t_min + float(t_val) * src_t_den)
+            j = float(_interp(cols.t, cols.y, t_col))
+            k = float(_interp(cols.t, cols.x, t_col))
             k_idx, t_s, err = _p3_to_sagittal(
                 ijk=(float(slice_i), j, k),
                 sagittal=sagittal,
@@ -1445,7 +1912,10 @@ def build_transition_lut_2d(
                 k_window=int(k_window),
             )
             map_c2s_slice[row, col] = float(k_idx)
-            map_c2s_t[row, col] = float(t_s)
+            try:
+                map_c2s_t[row, col] = float(_column_t_to_t_all(t=float(t_s), t_values=sagittal[int(k_idx)].t))
+            except ValueError:
+                continue
             map_c2s_err[row, col] = float(err)
 
     valid_c2s = np.ones((coronal_keys.size,), dtype=bool)
@@ -1478,6 +1948,7 @@ def build_transition_lut_2d(
         target_t=map_c2s_t,
         residual_vox=map_c2s_err,
         t_grid=t_grid.astype(np.float32),
+        t_domain=np.asarray(["t_all"]),
         i_window=np.asarray([int(i_window)], dtype=np.int32),
         k_window=np.asarray([int(k_window)], dtype=np.int32),
     )
@@ -1536,7 +2007,7 @@ def transform_with_lut(
     return InvertedAxisCoordinate(
         axis=target_axis,
         slice_index=int(np.rint(slice_float)),
-        t=float(np.clip(t_out, 0.0, 1.0)),
+        t=float(t_out),
         r01=float(np.clip(float(r01), 0.0, 1.0)),
         residual_vox=float(residual_out) if np.isfinite(residual_out) else float("nan"),
     )
@@ -1557,9 +2028,10 @@ def _build_ijk_segment_lut_for_axis(
     if not overwrite and path.exists():
         try:
             d = np.load(path)
-            if int(np.asarray(d["t_grid"]).shape[0]) == int(n_t):
+            t_domain = str(np.asarray(d["t_domain"]).reshape(-1)[0])
+            if int(np.asarray(d["t_grid"]).shape[0]) == int(n_t) and t_domain == "t_all":
                 return path
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, IndexError):
             pass
 
     edt = load_halfway_edt_crop(outdir)
@@ -1584,11 +2056,17 @@ def _build_ijk_segment_lut_for_axis(
         if row % 16 == 0 or row == (slice_keys.size - 1):
             print(f"[lut] {axis} ijk rows {row + 1}/{slice_keys.size}")
         c = cols[int(s)]
+        try:
+            src_t_min, src_t_max = _column_t_affine_bounds(c.t)
+        except ValueError:
+            continue
+        src_t_den = src_t_max - src_t_min
         for col, t_val in enumerate(t_grid.tolist()):
-            vent_y = float(_interp(c.t, c.vent_y, float(t_val)))
-            vent_x = float(_interp(c.t, c.vent_x, float(t_val)))
-            pia_y = float(_interp(c.t, c.pia_y, float(t_val)))
-            pia_x = float(_interp(c.t, c.pia_x, float(t_val)))
+            t_col = float(src_t_min + float(t_val) * src_t_den)
+            vent_y = float(_interp(c.t, c.vent_y, t_col))
+            vent_x = float(_interp(c.t, c.vent_x, t_col))
+            pia_y = float(_interp(c.t, c.pia_y, t_col))
+            pia_x = float(_interp(c.t, c.pia_x, t_col))
             if not np.isfinite([vent_y, vent_x, pia_y, pia_x]).all():
                 continue
 
@@ -1617,9 +2095,10 @@ def _build_ijk_segment_lut_for_axis(
     valid_rows = np.ones((slice_keys.size,), dtype=bool)
     for row in range(slice_keys.size):
         for dim in range(3):
-            low_ijk[row, :, dim] = _fill_nan_series(low_ijk[row, :, dim]).astype(np.float32, copy=False)
-            high_ijk[row, :, dim] = _fill_nan_series(high_ijk[row, :, dim]).astype(np.float32, copy=False)
-        if not (np.isfinite(low_ijk[row]).all() and np.isfinite(high_ijk[row]).all()):
+            low_ijk[row, :, dim] = _fill_nan_series_interior(low_ijk[row, :, dim]).astype(np.float32, copy=False)
+            high_ijk[row, :, dim] = _fill_nan_series_interior(high_ijk[row, :, dim]).astype(np.float32, copy=False)
+        finite_pairs = np.isfinite(low_ijk[row]).all(axis=1) & np.isfinite(high_ijk[row]).all(axis=1)
+        if int(np.count_nonzero(finite_pairs)) == 0:
             valid_rows[row] = False
     if not np.all(valid_rows):
         dropped = int(np.sum(~valid_rows))
@@ -1635,6 +2114,7 @@ def _build_ijk_segment_lut_for_axis(
         source_axis=axis,
         source_slice_keys=slice_keys,
         t_grid=t_grid.astype(np.float32),
+        t_domain=np.asarray(["t_all"]),
         low_ijk=low_ijk,
         high_ijk=high_ijk,
     )
@@ -1656,6 +2136,93 @@ def build_ijk_segment_luts(
     return coronal, sagittal
 
 
+def _lookup_ijk_from_lut_knn(
+    *,
+    source_slice_keys: np.ndarray,
+    t_grid: np.ndarray,
+    low_ijk: np.ndarray,
+    high_ijk: np.ndarray,
+    slice_index: int | float,
+    t: float | np.ndarray,
+    k: int = IJK_LUT_KNN_K,
+    sigma_slice: float = IJK_LUT_KNN_SIGMA_SLICE,
+    sigma_t: float = IJK_LUT_KNN_SIGMA_T,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Kernel-regress low/high ijk from LUT samples in (slice, t) space."""
+    source_slice = np.asarray(source_slice_keys, dtype=np.int32)
+    t_lut = np.asarray(t_grid, dtype=np.float64)
+    low = np.asarray(low_ijk, dtype=np.float64)
+    high = np.asarray(high_ijk, dtype=np.float64)
+    t_query = np.asarray(t, dtype=np.float64).reshape(-1)
+    if source_slice.ndim != 1 or t_lut.ndim != 1:
+        raise ValueError("source_slice_keys and t_grid must be 1D.")
+    if low.shape != high.shape:
+        raise ValueError(f"low_ijk and high_ijk shape mismatch: {low.shape} vs {high.shape}.")
+    if low.shape != (source_slice.size, t_lut.size, 3):
+        raise ValueError(
+            "LUT arrays must have shape (n_slices, n_t, 3): "
+            f"expected ({source_slice.size}, {t_lut.size}, 3), got {low.shape}."
+        )
+    if t_query.ndim != 1:
+        raise ValueError("t query must be scalar or 1D array.")
+    if not np.isfinite(t_query).all():
+        raise ValueError("t query contains non-finite values.")
+    sigma_slice_f = float(sigma_slice)
+    sigma_t_f = float(sigma_t)
+    if sigma_slice_f <= 0.0 or sigma_t_f <= 0.0:
+        raise ValueError(f"sigma_slice and sigma_t must be > 0. Got {sigma_slice_f}, {sigma_t_f}.")
+
+    slice_flat_full = np.repeat(source_slice.astype(np.float64), t_lut.size)
+    t_flat_full = np.tile(t_lut.astype(np.float64), source_slice.size)
+    low_flat_full = low.reshape(-1, 3)
+    high_flat_full = high.reshape(-1, 3)
+    valid = np.isfinite(low_flat_full).all(axis=1) & np.isfinite(high_flat_full).all(axis=1)
+    if not np.any(valid):
+        raise ValueError("LUT contains no finite low/high ijk samples.")
+
+    slice_flat = slice_flat_full[valid]
+    t_flat = t_flat_full[valid]
+    low_flat = low_flat_full[valid]
+    high_flat = high_flat_full[valid]
+
+    pts = np.column_stack([slice_flat / sigma_slice_f, t_flat / sigma_t_f])
+    tree = cKDTree(pts)
+
+    query_slice = np.full_like(t_query, float(slice_index), dtype=np.float64)
+    query_t = np.clip(t_query, 0.0, 1.0)
+    q = np.column_stack([query_slice / sigma_slice_f, query_t / sigma_t_f])
+
+    k_eff = int(min(max(1, int(k)), pts.shape[0]))
+    dists, neigh = tree.query(q, k=k_eff)
+    if k_eff == 1:
+        dists = np.asarray(dists, dtype=np.float64)[:, None]
+        neigh = np.asarray(neigh, dtype=np.int64)[:, None]
+    else:
+        dists = np.asarray(dists, dtype=np.float64)
+        neigh = np.asarray(neigh, dtype=np.int64)
+
+    dist2 = np.square(dists)
+    dist2 -= np.min(dist2, axis=1, keepdims=True)
+    weights = np.exp(-0.5 * dist2)
+    den = np.sum(weights, axis=1, keepdims=True)
+    bad = (~np.isfinite(den[:, 0])) | (den[:, 0] <= float(IJK_LUT_KNN_WEIGHT_EPS))
+    if np.any(bad):
+        weights[bad] = 0.0
+        weights[bad, 0] = 1.0
+        den = np.sum(weights, axis=1, keepdims=True)
+
+    lo = np.sum(weights[:, :, None] * low_flat[neigh], axis=1) / den
+    hi = np.sum(weights[:, :, None] * high_flat[neigh], axis=1) / den
+
+    degenerate = np.linalg.norm(hi - lo, axis=1) <= 1.0e-9
+    if np.any(degenerate):
+        lo[degenerate] = low_flat[neigh[degenerate, 0]]
+        hi[degenerate] = high_flat[neigh[degenerate, 0]]
+
+    source_slice_used = np.rint(slice_flat[neigh[:, 0]]).astype(np.int32, copy=False)
+    return lo.astype(np.float64, copy=False), hi.astype(np.float64, copy=False), source_slice_used
+
+
 def ijk_from_axis_tr_with_lut(
     *,
     outdir: Path,
@@ -1675,15 +2242,16 @@ def ijk_from_axis_tr_with_lut(
     low_ijk = np.asarray(d["low_ijk"], dtype=np.float64)
     high_ijk = np.asarray(d["high_ijk"], dtype=np.float64)
 
-    row = int(np.argmin(np.abs(source_slice_keys - int(slice_index))))
-    lo = np.asarray(
-        [_interp_row_with_nans(t_grid=t_grid, row=low_ijk[row, :, dim], t=float(t)) for dim in range(3)],
-        dtype=np.float64,
+    lo_batch, hi_batch, source_slice_used_batch = _lookup_ijk_from_lut_knn(
+        source_slice_keys=source_slice_keys,
+        t_grid=t_grid,
+        low_ijk=low_ijk,
+        high_ijk=high_ijk,
+        slice_index=int(slice_index),
+        t=float(t),
     )
-    hi = np.asarray(
-        [_interp_row_with_nans(t_grid=t_grid, row=high_ijk[row, :, dim], t=float(t)) for dim in range(3)],
-        dtype=np.float64,
-    )
+    lo = np.asarray(lo_batch[0], dtype=np.float64)
+    hi = np.asarray(hi_batch[0], dtype=np.float64)
     if not np.isfinite(lo).all() or not np.isfinite(hi).all():
         raise ValueError(
             f"IJK LUT lookup failed for axis={axis}, slice={slice_index}, t={float(t):.6f}. "
@@ -1692,16 +2260,21 @@ def ijk_from_axis_tr_with_lut(
 
     r = float(np.clip(float(r01), 0.0, 1.0))
     q = lo + r * (hi - lo)
-    return (float(q[0]), float(q[1]), float(q[2])), int(source_slice_keys[row])
+    return (float(q[0]), float(q[1]), float(q[2])), int(source_slice_used_batch[0])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="EDT query (slice_i|slice_k, t, r01) -> CCF ijk/um using *midline_columns.csv")
     parser.add_argument("--outdir", type=Path, default=Path("ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d"))
     parser.add_argument("--axis", choices=["coronal", "sagittal"], default="coronal")
-    parser.add_argument("--slice", type=int, required=True)
-    parser.add_argument("--t", type=float, required=True, help="along-midline coordinate in [0,1] on the chosen slice")
-    parser.add_argument("--r01", type=float, required=True, help="depth coordinate in [0,1] (0=inner/vent, 1=pia)")
+    parser.add_argument("--slice", type=int, default=None)
+    parser.add_argument(
+        "--t",
+        type=float,
+        default=None,
+        help="along-midline t_all on the chosen slice (normalized full-path arc length, typically in [0,1])",
+    )
+    parser.add_argument("--r01", type=float, default=None, help="depth coordinate in [0,1] (0=inner/vent, 1=pia)")
     parser.add_argument("--transform-to", choices=["coronal", "sagittal"], default=None)
     parser.add_argument("--lut-nt", type=int, default=1024, help="Number of t bins for 2D sagittal<->coronal LUT.")
     parser.add_argument("--lut-window", type=int, default=2, help="Candidate slice window (in voxels) used while building LUT.")
@@ -1716,6 +2289,19 @@ def main() -> None:
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
+
+    query_mode = not bool(args.build_lut_only) and not bool(args.build_ijk_lut_only)
+    if query_mode:
+        missing: list[str] = []
+        if args.slice is None:
+            missing.append("--slice")
+        if args.t is None:
+            missing.append("--t")
+        if args.r01 is None:
+            missing.append("--r01")
+        if missing:
+            parser.error(f"the following arguments are required for query mode: {', '.join(missing)}")
+
     if args.build_ijk_lut_only:
         coronal_path, sagittal_path = build_ijk_segment_luts(
             outdir=outdir,

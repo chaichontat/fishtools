@@ -21,6 +21,7 @@ from IPython import get_ipython
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 from matplotlib.widgets import Slider
+from scipy.ndimage import distance_transform_edt
 
 # Optional: VS Code interactive Matplotlib backend
 ip = get_ipython()
@@ -47,14 +48,18 @@ U_CURVE_T_CMAP = "viridis"
 MASK_COLOR = "#2ca02c"
 MASK_ALPHA = 0.18
 OVERLAY_NEO_MESO_COLOR = "#ff0000"
-OVERLAY_NEO_MESO_ALPHA = 0.5
+OVERLAY_NEO_MESO_ALPHA = 0.0
 BOUNDARY_ALPHA = 0.85
 SLIDER_DEBOUNCE_MS = 40
 MANUAL_CONNECT_CORONAL_PATH_TEMPLATE = "manual_coronal_midcurve_override_slice{slice_i}_yx.npy"
 MANUAL_CONNECT_SAGITTAL_PATH_TEMPLATE = "manual_sagittal_midcurve_override_slice{slice_k}_yx.npy"
 
-SHOW_R_OVERLAY = True
+SHOW_R_OVERLAY = False
 R_CLIP_UM = 800.0
+
+SHOW_T_FIELD = True
+T_FIELD_ALPHA = 0.45
+T_FIELD_CMAP = "viridis"
 
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
@@ -96,6 +101,77 @@ def _binary_overlay_slice(mask2: np.ndarray) -> np.ndarray:
     m = np.asarray(mask2, dtype=bool)
     out = np.full(m.shape, np.nan, dtype=np.float32)
     out[m] = 1.0
+    return out
+
+
+def _normalized_arc_t_for_path_xy(path_xy: np.ndarray) -> np.ndarray:
+    pts = np.asarray(path_xy, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        raise ValueError(f"Expected path_xy shape (N,2), got {pts.shape}.")
+    if not np.isfinite(pts).all():
+        raise ValueError("path_xy must be finite.")
+    d = np.diff(pts, axis=0)
+    seg = np.sqrt(np.sum(d * d, axis=1))
+    s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(seg, dtype=np.float64)])
+    total = float(s[-1])
+    if not np.isfinite(total) or total <= 0.0:
+        return np.linspace(0.0, 1.0, pts.shape[0], dtype=np.float32)
+    return (s / total).astype(np.float32, copy=False)
+
+
+def _t_field_from_path(*, mask_yx: np.ndarray, path_xy: np.ndarray, t_vertices: np.ndarray) -> np.ndarray:
+    """Rasterize (path_xy, t_vertices) and diffuse nearest-path t across mask_yx."""
+    mask = np.asarray(mask_yx, dtype=bool)
+    h, w = mask.shape
+    pts = np.asarray(path_xy, dtype=np.float64)
+    t = np.asarray(t_vertices, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+        raise ValueError(f"Expected path_xy shape (N,2), got {pts.shape}.")
+    if t.ndim != 1 or t.shape[0] != pts.shape[0]:
+        raise ValueError(f"Expected t_vertices shape ({pts.shape[0]},), got {t.shape}.")
+    finite = np.isfinite(pts[:, 0]) & np.isfinite(pts[:, 1]) & np.isfinite(t)
+    if int(np.count_nonzero(finite)) < 2:
+        out = np.full((h, w), np.nan, dtype=np.float32)
+        out[~mask] = np.nan
+        return out
+    pts = pts[finite]
+    t = t[finite]
+
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    ts: list[np.ndarray] = []
+    for i in range(int(pts.shape[0]) - 1):
+        x0, y0 = float(pts[i, 0]), float(pts[i, 1])
+        x1, y1 = float(pts[i + 1, 0]), float(pts[i + 1, 1])
+        t0, t1 = float(t[i]), float(t[i + 1])
+        n = int(np.ceil(max(abs(x1 - x0), abs(y1 - y0), 1.0))) + 1
+        xs.append(np.linspace(x0, x1, n, dtype=np.float64))
+        ys.append(np.linspace(y0, y1, n, dtype=np.float64))
+        ts.append(np.linspace(t0, t1, n, dtype=np.float64))
+
+    x = np.concatenate(xs) if xs else pts[:, 0]
+    y = np.concatenate(ys) if ys else pts[:, 1]
+    tv = np.concatenate(ts) if ts else t
+    xi = np.clip(np.rint(x).astype(np.int64, copy=False), 0, w - 1)
+    yi = np.clip(np.rint(y).astype(np.int64, copy=False), 0, h - 1)
+    flat = yi * w + xi
+
+    uniq, inv = np.unique(flat, return_inverse=True)
+    sums = np.bincount(inv, weights=tv, minlength=int(uniq.size)).astype(np.float64, copy=False)
+    counts = np.bincount(inv, minlength=int(uniq.size)).astype(np.float64, copy=False)
+    mean_t = np.divide(sums, counts, out=np.full_like(sums, np.nan, dtype=np.float64), where=counts > 0.0)
+
+    seed_t = np.full((h, w), np.nan, dtype=np.float32)
+    seed_t[(uniq // w).astype(np.int64, copy=False), (uniq % w).astype(np.int64, copy=False)] = mean_t.astype(np.float32, copy=False)
+    seed_mask = np.isfinite(seed_t)
+    if int(np.count_nonzero(seed_mask)) < 2:
+        out = np.full((h, w), np.nan, dtype=np.float32)
+        out[~mask] = np.nan
+        return out
+
+    _, (iy, ix) = distance_transform_edt(~seed_mask, return_indices=True)
+    out = seed_t[iy, ix].astype(np.float32, copy=False)
+    out[~mask] = np.nan
     return out
 
 
@@ -262,13 +338,28 @@ def _t_extent_on_path_t_for_mask(path_xy: np.ndarray, t_vertices: np.ndarray, ma
 
 
 def _load_overlap_t_ranges_csv(path: Path, *, slice_label: str) -> dict[int, list[tuple[float, float]]]:
+    """Load slice-local overlap ranges (`t_all`) from `*_overlap_t_ranges.csv`."""
     out: dict[int, list[tuple[float, float]]] = {}
     if not path.exists():
         return out
     with path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        has_t_all = ("t_start_all" in fieldnames) and ("t_end_all" in fieldnames)
+        has_t = ("t_start" in fieldnames) and ("t_end" in fieldnames)
+        if has_t_all:
+            t_start_key = "t_start_all"
+            t_end_key = "t_end_all"
+        elif has_t:
+            t_start_key = "t_start"
+            t_end_key = "t_end"
+        else:
+            raise ValueError(
+                f"{path} must contain either ('t_start_all', 't_end_all') or ('t_start', 't_end'). "
+                "Regenerate artifacts with midsurface_neocortex_mesocortex_allocortex_ccf_3d.py."
+            )
         for row in reader:
-            if slice_label not in row or "t_start" not in row or "t_end" not in row:
+            if slice_label not in row or t_start_key not in row or t_end_key not in row:
                 continue
             raw_slice = row[slice_label]
             if raw_slice is None:
@@ -277,8 +368,8 @@ def _load_overlap_t_ranges_csv(path: Path, *, slice_label: str) -> dict[int, lis
             if not np.isfinite(slice_val):
                 continue
             slice_idx = int(np.rint(slice_val))
-            t0 = float(row["t_start"])
-            t1 = float(row["t_end"])
+            t0 = float(row[t_start_key])
+            t1 = float(row[t_end_key])
             if not np.isfinite(t0) or not np.isfinite(t1):
                 continue
             out.setdefault(slice_idx, []).append((t0, t1))
@@ -488,6 +579,7 @@ def view_coronal_overlay(*, show: bool = True) -> None:
 
     fig, ax = plt.subplots(figsize=(7.7, 7.7))
     plt.subplots_adjust(bottom=0.14)
+    t_field_cache: dict[int, np.ndarray] = {}
 
     img = ax.imshow(
         reference_3d[cur_i, :, :],
@@ -517,6 +609,7 @@ def view_coronal_overlay(*, show: bool = True) -> None:
             zorder=2.2,
         )
         overlay_im.cmap.set_bad(alpha=0.0)
+    t_im = None
     r_im = None
     if bool(SHOW_R_OVERLAY):
         cmap_r = plt.get_cmap("coolwarm").copy()
@@ -540,7 +633,19 @@ def view_coronal_overlay(*, show: bool = True) -> None:
     curve_norm = Normalize(vmin=float(coronal_t_vmin), vmax=float(coronal_t_vmax))
     curve_sm = plt.cm.ScalarMappable(norm=curve_norm, cmap=U_CURVE_T_CMAP)
     curve_sm.set_array(np.array([curve_norm.vmin, curve_norm.vmax], dtype=np.float32))
-    fig.colorbar(curve_sm, ax=ax, fraction=0.046, pad=0.02, label="midline t")
+    fig.colorbar(curve_sm, ax=ax, fraction=0.046, pad=0.02, label="t_all")
+    if bool(SHOW_T_FIELD):
+        cmap_t = plt.get_cmap(T_FIELD_CMAP).copy()
+        cmap_t.set_bad(alpha=0.0)
+        t_im = ax.imshow(
+            np.full_like(reference_3d[cur_i, :, :], np.nan, dtype=np.float32),
+            cmap=cmap_t,
+            norm=curve_norm,
+            interpolation="nearest",
+            origin="upper",
+            alpha=float(T_FIELD_ALPHA),
+            zorder=2.35,
+        )
 
     ax.set_xlabel("k (x)")
     ax.set_ylabel("j (y)")
@@ -641,6 +746,20 @@ def view_coronal_overlay(*, show: bool = True) -> None:
         else:
             curve_lc = None
 
+        if t_im is not None:
+            t2 = t_field_cache.get(int(i))
+            if t2 is None:
+                if active_path_xy is not None and active_path_xy.shape[0] >= 2:
+                    if active_path_t is not None and active_path_t.shape[0] == active_path_xy.shape[0]:
+                        t_vertices = active_path_t
+                    else:
+                        t_vertices = _normalized_arc_t_for_path_xy(active_path_xy)
+                    t2 = _t_field_from_path(mask_yx=cortex_3d[i, :, :], path_xy=active_path_xy, t_vertices=t_vertices)
+                else:
+                    t2 = np.full_like(reference_3d[i, :, :], np.nan, dtype=np.float32)
+                t_field_cache[int(i)] = t2
+            t_im.set_data(t2)
+
         t_path_data = coronal_midline_paths.get(int(i))
         if t_path_data is not None:
             t_path_xy, t_path_vals = t_path_data
@@ -724,6 +843,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
 
     fig, ax = plt.subplots(figsize=(7.7, 7.7))
     plt.subplots_adjust(bottom=0.14)
+    t_field_cache: dict[int, np.ndarray] = {}
 
     img = ax.imshow(
         reference_3d[:, :, cur_k],
@@ -756,6 +876,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
             zorder=2.2,
         )
         overlay_im.cmap.set_bad(alpha=0.0)
+    t_im = None
     r_im = None
     if bool(SHOW_R_OVERLAY):
         cmap_r = plt.get_cmap("coolwarm").copy()
@@ -780,7 +901,20 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
     curve_norm = Normalize(vmin=float(sagittal_t_vmin), vmax=float(sagittal_t_vmax))
     curve_sm = plt.cm.ScalarMappable(norm=curve_norm, cmap=U_CURVE_T_CMAP)
     curve_sm.set_array(np.array([curve_norm.vmin, curve_norm.vmax], dtype=np.float32))
-    fig.colorbar(curve_sm, ax=ax, fraction=0.046, pad=0.02, label="midline t")
+    fig.colorbar(curve_sm, ax=ax, fraction=0.046, pad=0.02, label="t_all")
+    if bool(SHOW_T_FIELD):
+        cmap_t = plt.get_cmap(T_FIELD_CMAP).copy()
+        cmap_t.set_bad(alpha=0.0)
+        t_im = ax.imshow(
+            np.full_like(reference_3d[:, :, cur_k], np.nan, dtype=np.float32),
+            cmap=cmap_t,
+            norm=curve_norm,
+            interpolation="nearest",
+            origin="upper",
+            aspect="auto",
+            alpha=float(T_FIELD_ALPHA),
+            zorder=2.35,
+        )
 
     ax.set_xlabel("j (y)")
     ax.set_ylabel("i (coronal slice)")
@@ -880,6 +1014,20 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
             curve_source = "u05"
         else:
             curve_lc = None
+
+        if t_im is not None:
+            t2 = t_field_cache.get(int(k))
+            if t2 is None:
+                if active_path_xy is not None and active_path_xy.shape[0] >= 2:
+                    if active_path_t is not None and active_path_t.shape[0] == active_path_xy.shape[0]:
+                        t_vertices = active_path_t
+                    else:
+                        t_vertices = _normalized_arc_t_for_path_xy(active_path_xy)
+                    t2 = _t_field_from_path(mask_yx=cortex_3d[:, :, k], path_xy=active_path_xy, t_vertices=t_vertices)
+                else:
+                    t2 = np.full_like(reference_3d[:, :, k], np.nan, dtype=np.float32)
+                t_field_cache[int(k)] = t2
+            t_im.set_data(t2)
 
         t_path_data = sagittal_midline_paths.get(int(k))
         if t_path_data is not None:
