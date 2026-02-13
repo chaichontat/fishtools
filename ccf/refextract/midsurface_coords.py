@@ -1528,6 +1528,7 @@ def invert_r01_along_segment(
 class InvertedAxisCoordinate:
     axis: Literal["coronal", "sagittal"]
     slice_index: int
+    slice_index_float: float
     t: float
     r01: float
     residual_vox: float
@@ -1651,7 +1652,14 @@ def invert_coronal_from_ijk(
 
     r01 = float(np.clip(float(_r01_at_ijk(edt, ijk)), 0.0, 1.0))
     t_opt, residual = _optimize_t_fixed_r01_coronal(c=c, ijk_target=ijk, r01_target=r01, edt=edt)
-    return InvertedAxisCoordinate(axis="coronal", slice_index=int(slice_i), t=float(t_opt), r01=r01, residual_vox=float(residual))
+    return InvertedAxisCoordinate(
+        axis="coronal",
+        slice_index=int(slice_i),
+        slice_index_float=float(slice_i),
+        t=float(t_opt),
+        r01=r01,
+        residual_vox=float(residual),
+    )
 
 
 def invert_sagittal_from_ijk(
@@ -1668,7 +1676,14 @@ def invert_sagittal_from_ijk(
 
     r01 = float(np.clip(float(_r01_at_ijk(edt, ijk)), 0.0, 1.0))
     t_opt, residual = _optimize_t_fixed_r01_sagittal(c=c, ijk_target=ijk, r01_target=r01, edt=edt)
-    return InvertedAxisCoordinate(axis="sagittal", slice_index=int(slice_k), t=float(t_opt), r01=r01, residual_vox=float(residual))
+    return InvertedAxisCoordinate(
+        axis="sagittal",
+        slice_index=int(slice_k),
+        slice_index_float=float(slice_k),
+        t=float(t_opt),
+        r01=r01,
+        residual_vox=float(residual),
+    )
 
 
 def _nearest_existing(sorted_keys: np.ndarray, key: int) -> int:
@@ -1739,6 +1754,67 @@ def _p3_to_sagittal(
     return int(best_slice), float(best_t), float(np.sqrt(best_d2)) if best_d2 is not None else float("nan")
 
 
+def _softmin_weights(d2: np.ndarray, *, sigma: float) -> np.ndarray:
+    d2 = np.asarray(d2, dtype=np.float64).reshape(-1)
+    sigma = float(sigma)
+    if d2.size == 0:
+        raise ValueError("d2 must be non-empty.")
+    if not np.isfinite(d2).all():
+        raise ValueError("d2 must be finite.")
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError(f"sigma must be >0, got {sigma}.")
+
+    d2_shift = d2 - float(np.min(d2))
+    w = np.exp(-0.5 * d2_shift / (sigma * sigma)).astype(np.float64, copy=False)
+    s = float(np.sum(w))
+    if not np.isfinite(s) or s <= 0.0:
+        out = np.zeros_like(w)
+        out[int(np.argmin(d2))] = 1.0
+        return out
+    return (w / s).astype(np.float64, copy=False)
+
+
+def _p3_to_sagittal_continuous(
+    *,
+    ijk: tuple[float, float, float],
+    sagittal: dict[int, SagittalMidlineColumns],
+    sagittal_keys: np.ndarray,
+    k_window: int,
+    sigma_slice: float,
+) -> tuple[float, float, float]:
+    i = float(ijk[0])
+    j = float(ijk[1])
+    k = float(ijk[2])
+    k_center = int(np.rint(k))
+
+    cand = sorted({_nearest_existing(sagittal_keys, int(k_center + dk)) for dk in range(-int(k_window), int(k_window) + 1)})
+    slices: list[float] = []
+    t_all: list[float] = []
+    d2s: list[float] = []
+
+    for k_idx in cand:
+        cols = sagittal[int(k_idx)]
+        t_proj, d2_plane = _project_t_on_polyline(y=cols.y, x=cols.x, t=cols.t, qy=i, qx=j)
+        d2 = float(d2_plane + (k - float(k_idx)) ** 2)
+        try:
+            t_norm = float(_column_t_to_t_all(t=float(t_proj), t_values=cols.t))
+        except ValueError:
+            continue
+        slices.append(float(k_idx))
+        t_all.append(float(np.clip(t_norm, 0.0, 1.0)))
+        d2s.append(d2)
+
+    if not d2s:
+        return float(k_center), 0.5, float("nan")
+
+    d2_arr = np.asarray(d2s, dtype=np.float64)
+    w = _softmin_weights(d2_arr, sigma=float(sigma_slice))
+    slice_float = float(np.dot(w, np.asarray(slices, dtype=np.float64)))
+    t_out = float(np.dot(w, np.asarray(t_all, dtype=np.float64)))
+    residual = float(np.sqrt(float(np.min(d2_arr))))
+    return float(slice_float), float(t_out), float(residual)
+
+
 def _p3_to_coronal(
     *,
     ijk: tuple[float, float, float],
@@ -1765,6 +1841,47 @@ def _p3_to_coronal(
             best_t = float(t_proj)
 
     return int(best_slice), float(best_t), float(np.sqrt(best_d2)) if best_d2 is not None else float("nan")
+
+
+def _p3_to_coronal_continuous(
+    *,
+    ijk: tuple[float, float, float],
+    coronal: dict[int, CoronalMidlineColumns],
+    coronal_keys: np.ndarray,
+    i_window: int,
+    sigma_slice: float,
+) -> tuple[float, float, float]:
+    i = float(ijk[0])
+    j = float(ijk[1])
+    k = float(ijk[2])
+    i_center = int(np.rint(i))
+
+    cand = sorted({_nearest_existing(coronal_keys, int(i_center + di)) for di in range(-int(i_window), int(i_window) + 1)})
+    slices: list[float] = []
+    t_all: list[float] = []
+    d2s: list[float] = []
+
+    for i_idx in cand:
+        cols = coronal[int(i_idx)]
+        t_proj, d2_plane = _project_t_on_polyline(y=cols.y, x=cols.x, t=cols.t, qy=j, qx=k)
+        d2 = float(d2_plane + (i - float(i_idx)) ** 2)
+        try:
+            t_norm = float(_column_t_to_t_all(t=float(t_proj), t_values=cols.t))
+        except ValueError:
+            continue
+        slices.append(float(i_idx))
+        t_all.append(float(np.clip(t_norm, 0.0, 1.0)))
+        d2s.append(d2)
+
+    if not d2s:
+        return float(i_center), 0.5, float("nan")
+
+    d2_arr = np.asarray(d2s, dtype=np.float64)
+    w = _softmin_weights(d2_arr, sigma=float(sigma_slice))
+    slice_float = float(np.dot(w, np.asarray(slices, dtype=np.float64)))
+    t_out = float(np.dot(w, np.asarray(t_all, dtype=np.float64)))
+    residual = float(np.sqrt(float(np.min(d2_arr))))
+    return float(slice_float), float(t_out), float(residual)
 
 
 def build_transition_lut_2d(
@@ -1841,17 +1958,15 @@ def build_transition_lut_2d(
             t_col = float(src_t_min + float(t_val) * src_t_den)
             i = float(_interp(cols.t, cols.y, t_col))
             j = float(_interp(cols.t, cols.x, t_col))
-            i_idx, t_c, err = _p3_to_coronal(
+            i_float, t_c_all, err = _p3_to_coronal_continuous(
                 ijk=(i, j, float(slice_k)),
                 coronal=coronal,
                 coronal_keys=coronal_keys,
                 i_window=int(i_window),
+                sigma_slice=1.0,
             )
-            map_s2c_slice[row, col] = float(i_idx)
-            try:
-                map_s2c_t[row, col] = float(_column_t_to_t_all(t=float(t_c), t_values=coronal[int(i_idx)].t))
-            except ValueError:
-                continue
+            map_s2c_slice[row, col] = float(i_float)
+            map_s2c_t[row, col] = float(t_c_all)
             map_s2c_err[row, col] = float(err)
 
     valid_s2c = np.ones((sagittal_keys.size,), dtype=bool)
@@ -1905,17 +2020,15 @@ def build_transition_lut_2d(
             t_col = float(src_t_min + float(t_val) * src_t_den)
             j = float(_interp(cols.t, cols.y, t_col))
             k = float(_interp(cols.t, cols.x, t_col))
-            k_idx, t_s, err = _p3_to_sagittal(
+            k_float, t_s_all, err = _p3_to_sagittal_continuous(
                 ijk=(float(slice_i), j, k),
                 sagittal=sagittal,
                 sagittal_keys=sagittal_keys,
                 k_window=int(k_window),
+                sigma_slice=1.0,
             )
-            map_c2s_slice[row, col] = float(k_idx)
-            try:
-                map_c2s_t[row, col] = float(_column_t_to_t_all(t=float(t_s), t_values=sagittal[int(k_idx)].t))
-            except ValueError:
-                continue
+            map_c2s_slice[row, col] = float(k_float)
+            map_c2s_t[row, col] = float(t_s_all)
             map_c2s_err[row, col] = float(err)
 
     valid_c2s = np.ones((coronal_keys.size,), dtype=bool)
@@ -2006,7 +2119,8 @@ def transform_with_lut(
     target_axis: Literal["coronal", "sagittal"] = "sagittal" if source_axis == "coronal" else "coronal"
     return InvertedAxisCoordinate(
         axis=target_axis,
-        slice_index=int(np.rint(slice_float)),
+        slice_index=int(np.rint(float(slice_float))),
+        slice_index_float=float(slice_float),
         t=float(t_out),
         r01=float(np.clip(float(r01), 0.0, 1.0)),
         residual_vox=float(residual_out) if np.isfinite(residual_out) else float("nan"),
@@ -2362,7 +2476,8 @@ def main() -> None:
             )
             print(
                 "transformed_coronal="
-                f"{{slice_i:{inv.slice_index}, t:{inv.t:.6f}, r01:{inv.r01:.6f}, residual_vox:{inv.residual_vox:.4f}}}"
+                f"{{slice_i:{inv.slice_index}, slice_i_float:{inv.slice_index_float:.4f}, "
+                f"t:{inv.t:.6f}, r01:{inv.r01:.6f}, residual_vox:{inv.residual_vox:.4f}}}"
             )
         else:
             inv = transform_with_lut(
@@ -2378,7 +2493,8 @@ def main() -> None:
             )
             print(
                 "transformed_sagittal="
-                f"{{slice_k:{inv.slice_index}, t:{inv.t:.6f}, r01:{inv.r01:.6f}, residual_vox:{inv.residual_vox:.4f}}}"
+                f"{{slice_k:{inv.slice_index}, slice_k_float:{inv.slice_index_float:.4f}, "
+                f"t:{inv.t:.6f}, r01:{inv.r01:.6f}, residual_vox:{inv.residual_vox:.4f}}}"
             )
 
 
