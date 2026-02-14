@@ -47,7 +47,7 @@ def test_compute_ap_ml_um_from_refextract_coronal_and_sagittal(tmp_path: Path) -
 
     source_slice_keys = np.asarray([20], dtype=np.int32)
     t_grid = np.asarray([0.0, 0.5, 1.0], dtype=np.float64)
-    target_slice_idx = np.asarray([[10.0, 11.0, 12.0]], dtype=np.float64)
+    target_slice_idx = np.asarray([[9.0, 11.0, 13.0]], dtype=np.float64)
     target_t = np.asarray([[0.0, 0.5, 1.0]], dtype=np.float64)
     np.savez(
         outdir / "chart_map_sagittal_to_coronal_t2d.npz",
@@ -73,6 +73,20 @@ def test_compute_ap_ml_um_from_refextract_coronal_and_sagittal(tmp_path: Path) -
     assert np.allclose(cor[:, 0], np.asarray([100.0, 100.0, 100.0]))
     assert np.allclose(cor[:, 1], np.asarray([-5.0, 0.0, 5.0]))
 
+    cor_oob = compute(
+        lut_outdir=outdir,
+        axis="coronal",
+        atlas_slice_idx=9,
+        t_all=t_all,
+        ref_slice_i=11,
+        ref_t=0.5,
+        n_t=33,
+        dtw_band_frac=0.2,
+    )
+    assert cor_oob.shape == (3, 2)
+    assert np.allclose(cor_oob[:, 0], np.asarray([-100.0, -100.0, -100.0]))
+    assert np.allclose(cor_oob[:, 1], np.asarray([-5.0, 0.0, 5.0]))
+
     sag = compute(
         lut_outdir=outdir,
         axis="sagittal",
@@ -84,7 +98,7 @@ def test_compute_ap_ml_um_from_refextract_coronal_and_sagittal(tmp_path: Path) -
         dtw_band_frac=0.2,
     )
     assert sag.shape == (3, 2)
-    assert np.allclose(sag[:, 0], np.asarray([0.0, 100.0, 200.0]))
+    assert np.allclose(sag[:, 0], np.asarray([-100.0, 100.0, 300.0]))
     assert np.allclose(sag[:, 1], np.asarray([-5.0, 0.0, 5.0]))
 
 
@@ -94,4 +108,3 @@ def test_compute_ap_ml_um_from_refextract_raises_on_missing_artifacts(tmp_path: 
 
     with pytest.raises(FileNotFoundError, match="Missing required refextract artifacts"):
         compute(lut_outdir=tmp_path, axis="coronal", atlas_slice_idx=1, t_all=np.asarray([0.5], dtype=np.float64))
-

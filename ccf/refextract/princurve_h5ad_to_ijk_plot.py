@@ -380,8 +380,7 @@ def _ap_um_for_slice_float(slice_keys: np.ndarray, ap_um: np.ndarray, slice_i_fl
         order = np.argsort(keys)
         keys = keys[order]
         vals = vals[order]
-    s_clip = np.clip(s, float(keys[0]), float(keys[-1]))
-    return _interp_with_linear_extrapolation(x=keys, y=vals, xq=s_clip).astype(np.float64, copy=False)
+    return _interp_with_linear_extrapolation(x=keys, y=vals, xq=s).astype(np.float64, copy=False)
 
 
 @dataclass(frozen=True)
@@ -1651,7 +1650,6 @@ if PLOT_FLATTENED_AP_ML:
             raise ValueError(f"Unsupported axis={axis!r}")
 
         cor_slice_f = np.asarray(cor_slice_f, dtype=np.float64).reshape(-1)
-        cor_slice_f = np.clip(cor_slice_f, float(anchor_keys_i[0]), float(anchor_keys_i[-1]))
 
         ap_um = _ap_um_for_slice_float(ap_slice_keys, ap_um_vals, cor_slice_f)
         t0 = _interp_with_linear_extrapolation(x=anchor_keys_i, y=anchor_t0, xq=cor_slice_f)

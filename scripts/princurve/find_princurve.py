@@ -2243,7 +2243,6 @@ def compute_ap_ml_um_from_refextract(
         cor_t = t
     else:
         cor_slice_f, cor_t = _map_sagittal_to_coronal_t2d(s2c=ctx.s2c, slice_k=int(atlas_slice_idx), t_s=t)
-    cor_slice_f = np.clip(cor_slice_f, float(ctx.anchor_keys_i[0]), float(ctx.anchor_keys_i[-1]))
 
     ap_um = _interp_with_linear_extrapolation(
         x=ctx.ap_slice_keys.astype(np.float64),

@@ -490,6 +490,7 @@ def main() -> None:
             "and setting per-step AP spacing to the median 3D displacement of corresponding points."
         )
     )
+    # Slice ranges used in this repo (inclusive; DS=1): coronal slice_i 161-305.
     p.add_argument(
         "--outdir",
         type=Path,
@@ -515,8 +516,8 @@ def main() -> None:
         default=2.5,
         help="Drop adjacent pairs whose (p95 distance / p50 distance) exceeds this threshold (filled by smoothing).",
     )
-    p.add_argument("--slice-i-min", type=int, default=None, help="Minimum coronal slice_i to include (inclusive).")
-    p.add_argument("--slice-i-max", type=int, default=None, help="Maximum coronal slice_i to include (inclusive).")
+    p.add_argument("--slice-i-min", type=int, default=161, help="Minimum coronal slice_i to include (inclusive).")
+    p.add_argument("--slice-i-max", type=int, default=305, help="Maximum coronal slice_i to include (inclusive).")
     p.add_argument(
         "--res-ijk-um",
         type=float,

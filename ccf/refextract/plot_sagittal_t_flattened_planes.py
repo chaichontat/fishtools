@@ -171,6 +171,26 @@ def _path_to_monotone_index_map(path: list[tuple[int, int]], *, n: int) -> np.nd
     return out.astype(np.int32, copy=False)
 
 
+def _invert_monotone_index_map_to_fractional_idx(*, idx_map: np.ndarray, ref_idx: int) -> float:
+    m = np.asarray(idx_map, dtype=np.int32).reshape(-1)
+    n = int(m.size)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return 0.0
+    if not np.all(np.diff(m.astype(np.int64, copy=False)) >= 0):
+        m = np.maximum.accumulate(m)
+
+    starts = np.concatenate([[0], np.where(m[1:] != m[:-1])[0] + 1]).astype(np.int32, copy=False)
+    ends = np.concatenate([starts[1:], [n]]).astype(np.int32, copy=False)
+    ref_vals = m[starts].astype(np.float64, copy=False)
+    mid = (starts.astype(np.float64) + (ends.astype(np.float64) - 1.0)) / 2.0
+    if ref_vals.size == 1:
+        return float(mid[0])
+    target = float(np.clip(int(ref_idx), float(ref_vals[0]), float(ref_vals[-1])))
+    return float(np.interp(target, ref_vals, mid))
+
+
 def _load_midline_paths_csv(path: Path, *, slice_label: str) -> dict[int, tuple[np.ndarray, np.ndarray]]:
     out: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     grouped: dict[int, list[tuple[float, float, float]]] = {}
@@ -265,8 +285,8 @@ def _build_ml_anchor_for_coronal_slices(
             raise ValueError(f"DTW failed for slice {int(s)}; increase band_frac.")
 
         idx_map = _path_to_monotone_index_map(path, n=int(n_t))  # current index -> ref index
-        origin_idx = int(np.argmin(np.abs(idx_map.astype(np.int32) - int(ref_idx))))
-        t0_by_slice[int(s)] = float(origin_idx) / float(n_t - 1)
+        origin_idx_f = _invert_monotone_index_map_to_fractional_idx(idx_map=idx_map, ref_idx=int(ref_idx))
+        t0_by_slice[int(s)] = float(origin_idx_f) / float(n_t - 1)
         len_by_slice[int(s)] = float(total_len_um)
     return t0_by_slice, len_by_slice
 
@@ -509,7 +529,6 @@ def main() -> None:
 
     for k in use_ks:
         cor_slice_f, cor_t = _map_sagittal_to_coronal_t2d(s2c=s2c, slice_k=int(k), t_s=t_s)
-        cor_slice_f = np.clip(cor_slice_f, float(anchor_keys_i[0]), float(anchor_keys_i[-1]))
         ap_um = _interp_with_linear_extrapolation(
             x=ap_slice_keys.astype(np.float64), y=ap_um_vals, xq=cor_slice_f
         ).astype(np.float64, copy=False)
@@ -562,20 +581,24 @@ def main() -> None:
     ax.set_xlabel("ML (um; anchored arclength along coronal t)")
     ax.set_ylabel("AP (um; optimized from strip matching)")
 
-    ap_min = float(np.nanmin(ap_um_vals))
-    ap_max = float(np.nanmax(ap_um_vals))
     if not np.all(np.diff(ap_um_vals) >= 0.0):
         raise ValueError("ap_um axis must be monotone increasing to create a slice_i secondary axis.")
 
     def _ap_um_to_slice_i(y: np.ndarray) -> np.ndarray:
         yy = np.asarray(y, dtype=np.float64)
-        y_clip = np.clip(yy, ap_min, ap_max)
-        return np.interp(y_clip, ap_um_vals, ap_slice_keys.astype(np.float64))
+        return _interp_with_linear_extrapolation(
+            x=ap_um_vals.astype(np.float64, copy=False),
+            y=ap_slice_keys.astype(np.float64, copy=False),
+            xq=yy,
+        )
 
     def _slice_i_to_ap_um(s: np.ndarray) -> np.ndarray:
         ss = np.asarray(s, dtype=np.float64)
-        s_clip = np.clip(ss, float(ap_slice_keys[0]), float(ap_slice_keys[-1]))
-        return np.interp(s_clip, ap_slice_keys.astype(np.float64), ap_um_vals)
+        return _interp_with_linear_extrapolation(
+            x=ap_slice_keys.astype(np.float64, copy=False),
+            y=ap_um_vals.astype(np.float64, copy=False),
+            xq=ss,
+        )
 
     secax = ax.secondary_yaxis("right", functions=(_ap_um_to_slice_i, _slice_i_to_ap_um))
     secax.set_ylabel("coronal slice_i")
