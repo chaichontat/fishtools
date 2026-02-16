@@ -1107,3 +1107,5 @@ if SHOW_FIGURES:
 
 # %%
 print(f"Viewer notebook loaded. Artifacts: {OUTDIR}")
+
+# %%

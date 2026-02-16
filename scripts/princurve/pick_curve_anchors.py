@@ -28,9 +28,10 @@ ip = get_ipython()
 if ip is not None:
     ip.run_line_magic("matplotlib", "widget")
 
-folders = sorted(Path("~/nvme").expanduser().glob("2025*Jax*"))
-FOLDER = folders[1]
-j = 0
+folders = sorted(Path("/working").expanduser().glob("2025*Jax*"))
+FOLDER = [f for f in folders if f.name.startswith("20251201")][0]
+print(FOLDER)
+j = 9
 # %% [markdown]
 # ## Config (EDIT THESE)
 
@@ -129,7 +130,7 @@ i = 0
 REVIEW_CURVE_N_DENSE = 5_000
 REVIEW_ANCHOR_SMOOTHING = 0.5
 REVIEW_PLOT_MAX_POINTS = 100_000
-REVIEW_R_SIGN_ENDPOINT_EXTRAPOLATION = 0.1
+REVIEW_R_SIGN_ENDPOINT_EXTRAPOLATION = 0.25
 
 if not INPUT_H5AD.exists():
     raise FileNotFoundError(INPUT_H5AD)
@@ -302,6 +303,21 @@ def pick_anchors(
 
     xlim_roi = ax.get_xlim()
     ylim_roi = ax.get_ylim()
+    xspan = float(xlim_roi[1] - xlim_roi[0])
+    yspan = float(ylim_roi[1] - ylim_roi[0])
+    if np.isfinite(xspan) and np.isfinite(yspan) and xspan > 0 and yspan > 0:
+        cx = 0.5 * float(xlim_roi[0] + xlim_roi[1])
+        cy = 0.5 * float(ylim_roi[0] + ylim_roi[1])
+        half_x = 0.5 * xspan
+        half_y = 0.5 * yspan
+        if xspan <= yspan:
+            half_x *= 1.5
+        if yspan <= xspan:
+            half_y *= 1.5
+        xlim_roi = (cx - half_x, cx + half_x)
+        ylim_roi = (cy - half_y, cy + half_y)
+        ax.set_xlim(xlim_roi)
+        ax.set_ylim(ylim_roi)
 
     if (
         roi_value is not None
@@ -468,6 +484,14 @@ def pick_anchors(
         print("Undo:", removed)
         refresh()
 
+    def on_reverse(_event) -> None:
+        if not anchors:
+            print("No anchors to reverse.")
+            return
+        anchors.reverse()
+        print("Reversed anchors.")
+        refresh()
+
     def on_save(_event) -> None:
         if len(anchors) < 2:
             print("Pick at least 2 anchors before saving.")
@@ -498,22 +522,31 @@ def pick_anchors(
     fig.canvas.mpl_connect("key_release_event", on_key_release)
     fig.canvas.mpl_connect("button_press_event", on_click)
 
-    ax_mode = fig.add_axes([0.56, 0.01, 0.1, 0.06])
-    ax_undo = fig.add_axes([0.67, 0.01, 0.1, 0.06])
-    ax_reset = fig.add_axes([0.78, 0.01, 0.1, 0.06])
-    ax_save = fig.add_axes([0.89, 0.01, 0.1, 0.06])
+    ax_mode = fig.add_axes([0.52, 0.01, 0.09, 0.06])
+    ax_undo = fig.add_axes([0.616, 0.01, 0.09, 0.06])
+    ax_reverse = fig.add_axes([0.712, 0.01, 0.09, 0.06])
+    ax_reset = fig.add_axes([0.808, 0.01, 0.09, 0.06])
+    ax_save = fig.add_axes([0.904, 0.01, 0.09, 0.06])
     btn_mode = Button(ax_mode, "Mode: append")
     btn_undo = Button(ax_undo, "Undo")
+    btn_reverse = Button(ax_reverse, "Reverse")
     btn_reset = Button(ax_reset, "Reset")
     btn_save = Button(ax_save, "Save")
     btn_mode.on_clicked(on_toggle_mode)
     btn_undo.on_clicked(on_undo)
+    btn_reverse.on_clicked(on_reverse)
     btn_reset.on_clicked(on_reset)
     btn_save.on_clicked(on_save)
 
     # In `%matplotlib widget` (VS Code/Jupyter), `plt.show()` is non-blocking.
     # Keep widget objects alive so the buttons keep working after this function returns.
-    fig._pick_curve_anchors_handles = (btn_mode, btn_undo, btn_reset, btn_save)  # type: ignore[attr-defined]
+    fig._pick_curve_anchors_handles = (  # type: ignore[attr-defined]
+        btn_mode,
+        btn_undo,
+        btn_reverse,
+        btn_reset,
+        btn_save,
+    )
 
     refresh()
     plt.show()

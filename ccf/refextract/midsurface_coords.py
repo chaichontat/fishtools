@@ -1726,6 +1726,87 @@ def _project_t_on_polyline(*, y: np.ndarray, x: np.ndarray, t: np.ndarray, qy: f
     return float(t_proj), float(d2[m])
 
 
+def _project_t_on_polyline_prefer_dorsal(
+    *,
+    y: np.ndarray,
+    x: np.ndarray,
+    t: np.ndarray,
+    qy: float,
+    qx: float,
+) -> tuple[float, float]:
+    """Nearest-point projection with dorsal seam-tie disambiguation.
+
+    Only applies the dorsal preference when the nearest projection is ambiguous in a
+    *seam-like* way: multiple near-equal minima whose implied `t_all` span is large
+    (wrap across the cutpoint). Otherwise behaves like `_project_t_on_polyline`.
+    """
+    y = y.astype(np.float64, copy=False)
+    x = x.astype(np.float64, copy=False)
+    t = t.astype(np.float64, copy=False)
+    if y.ndim != 1 or x.ndim != 1 or t.ndim != 1 or y.size != x.size or y.size != t.size:
+        raise ValueError(f"Polyline arrays must be 1D and same length, got {y.shape} {x.shape} {t.shape}.")
+    if y.size < 2:
+        raise ValueError("Polyline must contain at least 2 points.")
+
+    p = np.column_stack([y, x])
+    p0 = p[:-1]
+    p1 = p[1:]
+    v = p1 - p0
+    q = np.asarray([float(qy), float(qx)], dtype=np.float64).reshape(1, 2)
+    w = q - p0
+
+    vv = np.sum(v * v, axis=1)
+    vv = np.where(vv > 0.0, vv, 1.0)
+    alpha = np.clip(np.sum(w * v, axis=1) / vv, 0.0, 1.0)
+    proj = p0 + v * alpha[:, None]
+    d2 = np.sum((proj - q) ** 2, axis=1)
+    if d2.size == 0:
+        raise ValueError("Polyline must contain at least one segment.")
+
+    m0 = int(np.argmin(d2))
+    d2_min = float(d2[m0])
+    # Use a looser near-min envelope, but only *act* on it when it looks like a seam wrap in t_all.
+    abs_tol = 1.0e-4
+    rel_tol = 1.0e-2
+    tol = float(abs_tol + rel_tol * max(1.0, d2_min))
+    near = np.flatnonzero(d2 <= (d2_min + tol))
+    if near.size < 2:
+        t0 = float(t[m0])
+        t1 = float(t[m0 + 1])
+        t_proj = t0 + float(alpha[m0]) * (t1 - t0)
+        return float(t_proj), float(d2_min)
+
+    # Compute projected t for each near candidate segment.
+    t0s = t[near]
+    t1s = t[near + 1]
+    a = alpha[near]
+    t_proj_all = t0s + a * (t1s - t0s)
+
+    # Detect seam-wrap ambiguity in normalized t_all space (large span).
+    t_min = float(np.min(t))
+    t_max = float(np.max(t))
+    den = float(t_max - t_min)
+    if not np.isfinite(den) or den <= 1.0e-12:
+        t0 = float(t[m0])
+        t1 = float(t[m0 + 1])
+        t_proj = t0 + float(alpha[m0]) * (t1 - t0)
+        return float(t_proj), float(d2_min)
+    t_norm = (t_proj_all - t_min) / den
+    if float(np.max(t_norm) - np.min(t_norm)) <= 0.5:
+        t0 = float(t[m0])
+        t1 = float(t[m0 + 1])
+        t_proj = t0 + float(alpha[m0]) * (t1 - t0)
+        return float(t_proj), float(d2_min)
+
+    # Seam-like tie: choose dorsal-most projected point among near candidates.
+    y_proj = proj[near, 0]
+    dorsal_idx = int(near[int(np.argmax(y_proj))])
+    t0 = float(t[dorsal_idx])
+    t1 = float(t[dorsal_idx + 1])
+    t_proj = t0 + float(alpha[dorsal_idx]) * (t1 - t0)
+    return float(t_proj), float(d2[dorsal_idx])
+
+
 def _p3_to_sagittal(
     *,
     ijk: tuple[float, float, float],
@@ -1833,7 +1914,7 @@ def _p3_to_coronal(
     best_t = 0.5
     for i_idx in cand:
         cols = coronal[int(i_idx)]
-        t_proj, d2_plane = _project_t_on_polyline(y=cols.y, x=cols.x, t=cols.t, qy=j, qx=k)
+        t_proj, d2_plane = _project_t_on_polyline_prefer_dorsal(y=cols.y, x=cols.x, t=cols.t, qy=j, qx=k)
         d2 = float(d2_plane + (i - float(i_idx)) ** 2)
         if best_d2 is None or d2 < best_d2:
             best_d2 = d2
@@ -1863,7 +1944,7 @@ def _p3_to_coronal_continuous(
 
     for i_idx in cand:
         cols = coronal[int(i_idx)]
-        t_proj, d2_plane = _project_t_on_polyline(y=cols.y, x=cols.x, t=cols.t, qy=j, qx=k)
+        t_proj, d2_plane = _project_t_on_polyline_prefer_dorsal(y=cols.y, x=cols.x, t=cols.t, qy=j, qx=k)
         d2 = float(d2_plane + (i - float(i_idx)) ** 2)
         try:
             t_norm = float(_column_t_to_t_all(t=float(t_proj), t_values=cols.t))
@@ -1891,6 +1972,9 @@ def build_transition_lut_2d(
     i_window: int = 2,
     k_window: int = 2,
     overwrite: bool = False,
+    res_ijk_um: tuple[float, float, float] | None = None,
+    coronal_slice_min: int | None = None,
+    coronal_slice_max: int | None = None,
 ) -> tuple[Path, Path]:
     if n_t < 2:
         raise ValueError("n_t must be >= 2.")
@@ -1911,6 +1995,20 @@ def build_transition_lut_2d(
             c2s_kw = int(np.asarray(c2s["k_window"]).reshape(-1)[0])
             s2c_t_domain = str(np.asarray(s2c["t_domain"]).reshape(-1)[0])
             c2s_t_domain = str(np.asarray(c2s["t_domain"]).reshape(-1)[0])
+            s2c_cmin_raw = int(np.asarray(s2c["coronal_slice_min"]).reshape(-1)[0]) if "coronal_slice_min" in s2c else -1
+            s2c_cmax_raw = int(np.asarray(s2c["coronal_slice_max"]).reshape(-1)[0]) if "coronal_slice_max" in s2c else -1
+            c2s_cmin_raw = int(np.asarray(c2s["coronal_slice_min"]).reshape(-1)[0]) if "coronal_slice_min" in c2s else -1
+            c2s_cmax_raw = int(np.asarray(c2s["coronal_slice_max"]).reshape(-1)[0]) if "coronal_slice_max" in c2s else -1
+
+            s2c_cmin = None if int(s2c_cmin_raw) < 0 else int(s2c_cmin_raw)
+            s2c_cmax = None if int(s2c_cmax_raw) < 0 else int(s2c_cmax_raw)
+            c2s_cmin = None if int(c2s_cmin_raw) < 0 else int(c2s_cmin_raw)
+            c2s_cmax = None if int(c2s_cmax_raw) < 0 else int(c2s_cmax_raw)
+            if "extend_coronal_from_sagittal" in s2c or "extend_coronal_from_sagittal" in c2s:
+                # Older, experimental LUTs included a coronal-extension knob.
+                # Treat those caches as incompatible so the LUT is rebuilt.
+                print("[lut] cache invalid: LUTs include deprecated extend_coronal_from_sagittal; rebuilding")
+                raise ValueError("Deprecated LUT cache format.")
             if (
                 s2c_nt == int(n_t)
                 and c2s_nt == int(n_t)
@@ -1920,6 +2018,10 @@ def build_transition_lut_2d(
                 and c2s_kw == int(k_window)
                 and s2c_t_domain == "t_all"
                 and c2s_t_domain == "t_all"
+                and s2c_cmin == (None if coronal_slice_min is None else int(coronal_slice_min))
+                and s2c_cmax == (None if coronal_slice_max is None else int(coronal_slice_max))
+                and c2s_cmin == (None if coronal_slice_min is None else int(coronal_slice_min))
+                and c2s_cmax == (None if coronal_slice_max is None else int(coronal_slice_max))
             ):
                 return s2c_path, c2s_path
         except (KeyError, ValueError, IndexError):
@@ -1927,12 +2029,18 @@ def build_transition_lut_2d(
 
     coronal = load_coronal_midline_columns(outdir / "coronal_midline_columns.csv")
     sagittal = load_sagittal_midline_columns(outdir / "sagittal_midline_columns.csv")
-    coronal_keys_all = np.asarray(sorted(coronal.keys()), dtype=np.int32)
-    sagittal_keys_all = np.asarray(sorted(sagittal.keys()), dtype=np.int32)
     coronal_nonzero = _nonzero_include_slice_keys(outdir, axis="coronal")
     sagittal_nonzero = _nonzero_include_slice_keys(outdir, axis="sagittal")
-    coronal_keys = np.intersect1d(coronal_keys_all, coronal_nonzero, assume_unique=False)
+
+    coronal_keys_all = np.asarray(sorted(coronal.keys()), dtype=np.int32)
+    sagittal_keys_all = np.asarray(sorted(sagittal.keys()), dtype=np.int32)
     sagittal_keys = np.intersect1d(sagittal_keys_all, sagittal_nonzero, assume_unique=False)
+
+    coronal_keys = np.intersect1d(coronal_keys_all, coronal_nonzero, assume_unique=False)
+    if coronal_slice_min is not None:
+        coronal_keys = coronal_keys[coronal_keys >= int(coronal_slice_min)]
+    if coronal_slice_max is not None:
+        coronal_keys = coronal_keys[coronal_keys <= int(coronal_slice_max)]
     if coronal_keys.size == 0 or sagittal_keys.size == 0:
         raise ValueError("Cannot build LUT with empty coronal or sagittal columns.")
     t0 = time.perf_counter()
@@ -1945,6 +2053,7 @@ def build_transition_lut_2d(
     map_s2c_slice = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
     map_s2c_t = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
     map_s2c_err = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+
     for row, slice_k in enumerate(sagittal_keys.tolist()):
         if row % 16 == 0 or row == (sagittal_keys.size - 1):
             print(f"[lut] s2c rows {row + 1}/{sagittal_keys.size}")
@@ -2000,6 +2109,8 @@ def build_transition_lut_2d(
         residual_vox=map_s2c_err,
         t_grid=t_grid.astype(np.float32),
         t_domain=np.asarray(["t_all"]),
+        coronal_slice_min=np.asarray([int(coronal_slice_min) if coronal_slice_min is not None else -1], dtype=np.int32),
+        coronal_slice_max=np.asarray([int(coronal_slice_max) if coronal_slice_max is not None else -1], dtype=np.int32),
         i_window=np.asarray([int(i_window)], dtype=np.int32),
         k_window=np.asarray([int(k_window)], dtype=np.int32),
     )
@@ -2062,6 +2173,8 @@ def build_transition_lut_2d(
         residual_vox=map_c2s_err,
         t_grid=t_grid.astype(np.float32),
         t_domain=np.asarray(["t_all"]),
+        coronal_slice_min=np.asarray([int(coronal_slice_min) if coronal_slice_min is not None else -1], dtype=np.int32),
+        coronal_slice_max=np.asarray([int(coronal_slice_max) if coronal_slice_max is not None else -1], dtype=np.int32),
         i_window=np.asarray([int(i_window)], dtype=np.int32),
         k_window=np.asarray([int(k_window)], dtype=np.int32),
     )
@@ -2089,6 +2202,8 @@ def transform_with_lut(
     i_window: int = 2,
     k_window: int = 2,
     rebuild_lut: bool = False,
+    coronal_slice_min: int | None = None,
+    coronal_slice_max: int | None = None,
 ) -> InvertedAxisCoordinate:
     s2c_path, c2s_path = build_transition_lut_2d(
         outdir=outdir,
@@ -2096,6 +2211,8 @@ def transform_with_lut(
         i_window=int(i_window),
         k_window=int(k_window),
         overwrite=bool(rebuild_lut),
+        coronal_slice_min=coronal_slice_min,
+        coronal_slice_max=coronal_slice_max,
     )
     lut_path = c2s_path if source_axis == "coronal" else s2c_path
     lut = np.load(lut_path)
@@ -2392,6 +2509,26 @@ def main() -> None:
     parser.add_argument("--transform-to", choices=["coronal", "sagittal"], default=None)
     parser.add_argument("--lut-nt", type=int, default=1024, help="Number of t bins for 2D sagittal<->coronal LUT.")
     parser.add_argument("--lut-window", type=int, default=2, help="Candidate slice window (in voxels) used while building LUT.")
+    parser.add_argument(
+        "--lut-coronal-slice-min",
+        type=int,
+        default=None,
+        help="If set, restrict LUT coronal slice_i candidates to >= this value.",
+    )
+    parser.add_argument(
+        "--lut-coronal-slice-max",
+        type=int,
+        default=None,
+        help="If set, restrict LUT coronal slice_i candidates to <= this value.",
+    )
+    parser.add_argument(
+        "--res-ijk-um",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("RI", "RJ", "RK"),
+        help="Unused (kept for backwards compatibility).",
+    )
     parser.add_argument("--rebuild-lut", action="store_true", help="Force rebuilding LUT files before transform lookup.")
     parser.add_argument("--build-lut-only", action="store_true", help="Build LUT files and exit.")
     parser.add_argument(
@@ -2427,12 +2564,16 @@ def main() -> None:
         return
 
     if args.build_lut_only:
+        res_ijk_um = None if args.res_ijk_um is None else (float(args.res_ijk_um[0]), float(args.res_ijk_um[1]), float(args.res_ijk_um[2]))
         s2c_path, c2s_path = build_transition_lut_2d(
             outdir=outdir,
             n_t=int(args.lut_nt),
             i_window=int(args.lut_window),
             k_window=int(args.lut_window),
             overwrite=bool(args.rebuild_lut),
+            res_ijk_um=res_ijk_um,
+            coronal_slice_min=args.lut_coronal_slice_min,
+            coronal_slice_max=args.lut_coronal_slice_max,
         )
         print(f"lut_sagittal_to_coronal={s2c_path}")
         print(f"lut_coronal_to_sagittal={c2s_path}")
@@ -2473,6 +2614,8 @@ def main() -> None:
                 i_window=int(args.lut_window),
                 k_window=int(args.lut_window),
                 rebuild_lut=bool(args.rebuild_lut),
+                coronal_slice_min=args.lut_coronal_slice_min,
+                coronal_slice_max=args.lut_coronal_slice_max,
             )
             print(
                 "transformed_coronal="
@@ -2490,6 +2633,8 @@ def main() -> None:
                 i_window=int(args.lut_window),
                 k_window=int(args.lut_window),
                 rebuild_lut=bool(args.rebuild_lut),
+                coronal_slice_min=args.lut_coronal_slice_min,
+                coronal_slice_max=args.lut_coronal_slice_max,
             )
             print(
                 "transformed_sagittal="

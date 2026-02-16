@@ -3,6 +3,7 @@
 import argparse
 import csv
 from dataclasses import dataclass
+import functools
 import json
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ from fishtools.ccf.princurve import (
 )
 from fishtools.io.workspace import Workspace
 
-ANCHOR_R_SIGN_ENDPOINT_EXTRAPOLATION = 0.1
+ANCHOR_R_SIGN_ENDPOINT_EXTRAPOLATION = 0.25
 R_UM_SOURCE_UM_PER_PX = 0.216
 R_UM_BIN_COUNT = 1024
 R_UM_ROLL_HALF_WINDOW = 24
@@ -1807,6 +1808,214 @@ def infer_anchor_subroi_from_path(*, in_path: Path, anchor_path: Path) -> str | 
     return subroi if subroi != "" else None
 
 
+def infer_threshold_subroi(*, args: argparse.Namespace, in_path: Path) -> str | None:
+    if args.subset_obs_key == "ccf_adjusted" and args.subset_obs_value is not None:
+        subroi = str(args.subset_obs_value).strip()
+        return subroi if subroi != "" else None
+    if args.anchors_subroi is not None:
+        subroi = str(args.anchors_subroi).strip()
+        return subroi if subroi != "" else None
+    if args.anchors_json is not None:
+        return infer_anchor_subroi_from_path(in_path=in_path, anchor_path=Path(args.anchors_json))
+    inferred = infer_unique_ccf_adjusted_subroi_from_h5ad(in_path)
+    if inferred is not None:
+        return inferred
+    return None
+
+
+def list_threshold_json_candidates(*, in_path: Path) -> list[Path]:
+    return sorted(p for p in in_path.parent.glob(f"{in_path.stem}*.brdu_edu_thresholds.json") if p.is_file())
+
+
+@functools.lru_cache(maxsize=256)
+def _infer_unique_ccf_adjusted_subroi_from_h5ad_cached(path: str) -> str | None:
+    in_path = Path(path)
+    adata = ad.read_h5ad(in_path, backed="r")
+    try:
+        if "ccf_adjusted" not in adata.obs.columns:
+            return None
+        vals = adata.obs["ccf_adjusted"].astype(str).to_numpy()
+        uniq = sorted(set(vals.tolist()) - {"", "nan", "none", "NaN", "None"})
+        if len(uniq) == 1:
+            out = str(uniq[0]).strip()
+            return out if out != "" else None
+        return None
+    finally:
+        if getattr(adata, "isbacked", False) and getattr(adata, "file", None) is not None:
+            adata.file.close()
+
+
+def infer_unique_ccf_adjusted_subroi_from_h5ad(in_path: Path) -> str | None:
+    if in_path.suffix != ".h5ad":
+        return None
+    return _infer_unique_ccf_adjusted_subroi_from_h5ad_cached(str(in_path))
+
+
+def infer_threshold_subroi_from_path(*, in_path: Path, threshold_path: Path) -> str | None:
+    name = threshold_path.name
+    stem = in_path.stem
+    prefix = f"{stem}."
+    suffix = ".brdu_edu_thresholds.json"
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        return None
+    subroi = name[len(prefix) : -len(suffix)].strip()
+    return subroi if subroi != "" else None
+
+
+def infer_threshold_subrois_for_split(*, in_path: Path) -> list[str]:
+    subrois: set[str] = set()
+    for candidate in list_threshold_json_candidates(in_path=in_path):
+        subroi = infer_threshold_subroi_from_path(in_path=in_path, threshold_path=candidate)
+        if subroi is None:
+            continue
+        subrois.add(subroi)
+    return sorted(subrois)
+
+
+def output_path_with_subroi(*, out_path: Path, subroi: str) -> Path:
+    if out_path.name.endswith(f".{subroi}.princurve.h5ad"):
+        return out_path
+    name = out_path.name
+    if name.endswith(".princurve.h5ad"):
+        base = name[: -len(".princurve.h5ad")]
+        if base.endswith(f".{subroi}"):
+            return out_path
+        return out_path.with_name(f"{base}.{subroi}.princurve.h5ad")
+    if out_path.suffix:
+        return out_path.with_name(f"{out_path.stem}.{subroi}{out_path.suffix}")
+    return out_path.with_name(f"{name}.{subroi}")
+
+
+def infer_output_subroi(*, args: argparse.Namespace, in_path: Path) -> str | None:
+    explicit = infer_threshold_subroi(args=args, in_path=in_path)
+    if explicit is not None:
+        return explicit
+
+    if args.anchors_json is None and args.anchors_subroi is None:
+        anchor_candidates = list_anchor_json_candidates(in_path=in_path)
+        if len(anchor_candidates) == 1:
+            inferred = infer_anchor_subroi_from_path(in_path=in_path, anchor_path=anchor_candidates[0])
+            if inferred is not None:
+                return inferred
+
+    threshold_subrois = infer_threshold_subrois_for_split(in_path=in_path)
+    if len(threshold_subrois) == 1:
+        return threshold_subrois[0]
+    return None
+
+
+def require_output_subroi(*, args: argparse.Namespace, in_path: Path) -> str:
+    subroi = infer_output_subroi(args=args, in_path=in_path)
+    if subroi is not None:
+        return subroi
+    threshold_subrois = infer_threshold_subrois_for_split(in_path=in_path)
+    raise SystemExit(
+        "Could not infer subROI for output naming for "
+        f"{in_path.name}. Refusing to write an unsuffixed '.princurve.h5ad'. "
+        "Provide --subset-obs-key ccf_adjusted --subset-obs-value <subroi>, "
+        "or use subROI-suffixed anchors/thresholds JSON next to the input "
+        f"(threshold subROIs detected: {threshold_subrois})."
+    )
+
+
+def resolve_brdu_edu_thresholds_json(*, in_path: Path, subroi: str | None) -> Path:
+    base = in_path.with_suffix("")
+    candidates = list_threshold_json_candidates(in_path=in_path)
+    subroi_clean = str(subroi).strip() if subroi is not None else ""
+
+    if subroi_clean:
+        preferred = in_path.parent / f"{base.name}.{subroi_clean}.brdu_edu_thresholds.json"
+        if preferred.exists():
+            return preferred
+
+        matches = [p for p in candidates if p.name.endswith(f".{subroi_clean}.brdu_edu_thresholds.json")]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            names = "\n".join([f"  - {p}" for p in matches])
+            raise SystemExit(
+                "Multiple BrdU/EdU thresholds JSON files matched "
+                f"subROI={subroi_clean!r} for {in_path.name}:\n{names}"
+            )
+        if len(candidates) == 1:
+            return candidates[0]
+        names = "\n".join([f"  - {p}" for p in candidates]) if candidates else "  (none found)"
+        raise SystemExit(
+            "Missing BrdU/EdU thresholds JSON for "
+            f"{in_path.name} subROI={subroi_clean!r}. Expected "
+            f"{preferred.name} or a unique candidate. Found:\n{names}"
+        )
+
+    preferred_default = in_path.parent / f"{base.name}.brdu_edu_thresholds.json"
+    if preferred_default.exists():
+        return preferred_default
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if len(candidates) == 0:
+        raise SystemExit(
+            "Missing BrdU/EdU thresholds JSON for "
+            f"{in_path.name}. Expected {preferred_default.name} next to the input."
+        )
+
+    names = "\n".join([f"  - {p}" for p in candidates])
+    raise SystemExit(
+        "Ambiguous BrdU/EdU thresholds JSON for "
+        f"{in_path.name}. Found multiple candidates:\n{names}"
+    )
+
+
+def load_brdu_edu_thresholds(path: Path) -> tuple[float, float]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Invalid BrdU/EdU thresholds JSON (expected object): {path}")
+    thresholds = payload.get("thresholds")
+    if not isinstance(thresholds, dict):
+        raise SystemExit(f"Invalid BrdU/EdU thresholds JSON (missing object 'thresholds'): {path}")
+
+    brdu_threshold = _parse_optional_float(thresholds.get("log_brdu_mean"))
+    edu_threshold = _parse_optional_float(thresholds.get("log_edu_mean"))
+    if brdu_threshold is None or edu_threshold is None:
+        raise SystemExit(
+            "Invalid BrdU/EdU thresholds JSON (thresholds.log_brdu_mean and "
+            f"thresholds.log_edu_mean must be finite numbers): {path}"
+        )
+    return float(brdu_threshold), float(edu_threshold)
+
+
+def ensure_log_brdu_edu_mean(adata: ad.AnnData) -> None:
+    def _minmax_0_65535(values: np.ndarray) -> np.ndarray:
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            return np.zeros_like(values, dtype=float)
+        p1 = float(np.percentile(values[finite], 10.0))
+        clipped = values.copy()
+        clipped[finite & (clipped < p1)] = p1
+        lo = float(np.min(clipped[finite]))
+        hi = float(np.max(clipped[finite]))
+        if hi <= lo:
+            out = np.zeros_like(values, dtype=float)
+            out[~finite] = np.nan
+            return out
+        out = (clipped - lo) / (hi - lo) * 65535.0
+        out[~finite] = np.nan
+        return np.clip(out, 0.0, 65535.0)
+
+    for marker in ("brdu", "edu"):
+        mean_col = f"{marker}_mean"
+        log_col = f"log_{marker}_mean"
+        if mean_col in adata.obs.columns:
+            scaled = _minmax_0_65535(adata.obs[mean_col].to_numpy(dtype=float))
+            adata.obs[log_col] = np.log1p(scaled)
+            continue
+        if log_col not in adata.obs.columns:
+            raise SystemExit(
+                "Missing required obs columns for BrdU/EdU thresholding: "
+                f"expected `{mean_col}` to compute `{log_col}`."
+            )
+
+
 def include_anchor_indices_in_fit_mask(*, fit_mask: np.ndarray, anchor_indices: list[int] | None) -> np.ndarray:
     out = np.asarray(fit_mask, dtype=bool).copy()
     if anchor_indices is None:
@@ -1855,21 +2064,42 @@ def _interp_with_linear_extrapolation(*, x: np.ndarray, y: np.ndarray, xq: np.nd
     return out
 
 
+def _interp_with_nan_outside(*, x: np.ndarray, y: np.ndarray, xq: np.ndarray) -> np.ndarray:
+    xv = np.asarray(x, dtype=np.float64).reshape(-1)
+    yv = np.asarray(y, dtype=np.float64).reshape(-1)
+    xqv = np.asarray(xq, dtype=np.float64).reshape(-1)
+    if xv.size != yv.size or xv.size < 2:
+        raise ValueError("Need x and y arrays with the same length >= 2.")
+    if not np.all(np.diff(xv) > 0.0):
+        order = np.argsort(xv)
+        xv = xv[order]
+        yv = yv[order]
+    return np.interp(xqv, xv, yv, left=np.nan, right=np.nan).astype(np.float64, copy=False)
+
+
 @dataclass(frozen=True)
 class S2CLut:
     source_slice_keys: np.ndarray
     t_grid: np.ndarray
     target_slice_idx: np.ndarray
     target_t: np.ndarray
+    coronal_slice_min: int | None = None
+    coronal_slice_max: int | None = None
 
 
 def _load_s2c_t2d(npz_path: Path) -> S2CLut:
     d = np.load(npz_path)
+    cmin_raw = int(np.asarray(d["coronal_slice_min"]).reshape(-1)[0]) if "coronal_slice_min" in d else -1
+    cmax_raw = int(np.asarray(d["coronal_slice_max"]).reshape(-1)[0]) if "coronal_slice_max" in d else -1
+    cmin = None if int(cmin_raw) < 0 else int(cmin_raw)
+    cmax = None if int(cmax_raw) < 0 else int(cmax_raw)
     return S2CLut(
         source_slice_keys=np.asarray(d["source_slice_keys"], dtype=np.int32),
         t_grid=np.asarray(d["t_grid"], dtype=np.float64),
         target_slice_idx=np.asarray(d["target_slice_idx"], dtype=np.float64),
         target_t=np.asarray(d["target_t"], dtype=np.float64),
+        coronal_slice_min=cmin,
+        coronal_slice_max=cmax,
     )
 
 
@@ -1877,6 +2107,10 @@ def _map_sagittal_to_coronal_t2d(*, s2c: S2CLut, slice_k: int, t_s: np.ndarray) 
     keys = np.asarray(s2c.source_slice_keys, dtype=np.int32).reshape(-1)
     if keys.size == 0:
         raise ValueError("Empty source_slice_keys in sagittal->coronal LUT.")
+    if int(slice_k) < int(np.min(keys)) or int(slice_k) > int(np.max(keys)):
+        t = np.asarray(t_s, dtype=np.float64).reshape(-1)
+        out_nan = np.full(t.shape, np.nan, dtype=np.float64)
+        return out_nan, out_nan
     row = int(np.argmin(np.abs(keys.astype(np.float64) - float(slice_k))))
     t_grid = np.asarray(s2c.t_grid, dtype=np.float64).reshape(-1)
     t = np.asarray(t_s, dtype=np.float64).reshape(-1)
@@ -1887,6 +2121,14 @@ def _map_sagittal_to_coronal_t2d(*, s2c: S2CLut, slice_k: int, t_s: np.ndarray) 
         raise ValueError("Unexpected sagittal->coronal LUT row shape.")
     out_slice = np.interp(t_clip, t_grid, slice_row).astype(np.float64, copy=False)
     out_t = np.interp(t_clip, t_grid, t_row).astype(np.float64, copy=False)
+    if s2c.coronal_slice_min is not None:
+        bad = out_slice < float(s2c.coronal_slice_min)
+        out_slice = np.where(bad, np.nan, out_slice)
+        out_t = np.where(bad, np.nan, out_t)
+    if s2c.coronal_slice_max is not None:
+        bad = out_slice > float(s2c.coronal_slice_max)
+        out_slice = np.where(bad, np.nan, out_slice)
+        out_t = np.where(bad, np.nan, out_t)
     return out_slice, out_t
 
 
@@ -2244,13 +2486,13 @@ def compute_ap_ml_um_from_refextract(
     else:
         cor_slice_f, cor_t = _map_sagittal_to_coronal_t2d(s2c=ctx.s2c, slice_k=int(atlas_slice_idx), t_s=t)
 
-    ap_um = _interp_with_linear_extrapolation(
+    ap_um = _interp_with_nan_outside(
         x=ctx.ap_slice_keys.astype(np.float64),
         y=ctx.ap_um_vals,
         xq=cor_slice_f,
     ).astype(np.float64, copy=False)
-    t0 = _interp_with_linear_extrapolation(x=ctx.anchor_keys_i, y=ctx.anchor_t0, xq=cor_slice_f)
-    length = _interp_with_linear_extrapolation(x=ctx.anchor_keys_i, y=ctx.anchor_len, xq=cor_slice_f)
+    t0 = _interp_with_nan_outside(x=ctx.anchor_keys_i, y=ctx.anchor_t0, xq=cor_slice_f)
+    length = _interp_with_nan_outside(x=ctx.anchor_keys_i, y=ctx.anchor_len, xq=cor_slice_f)
     ml_um = (np.asarray(cor_t, dtype=np.float64) - t0) * length
     return np.column_stack([ap_um, ml_um]).astype(np.float64, copy=False)
 
@@ -2293,6 +2535,11 @@ def _run_single(
     if args.anchors_json is None and resolved_anchors_json is not None:
         print(f"Using inferred anchors JSON: {resolved_anchors_json}")
     args.anchors_json = resolved_anchors_json
+
+    threshold_subroi = infer_threshold_subroi(args=args, in_path=in_path)
+    thresholds_json = resolve_brdu_edu_thresholds_json(in_path=in_path, subroi=threshold_subroi)
+    threshold_log_brdu, threshold_log_edu = load_brdu_edu_thresholds(thresholds_json)
+    print(f"Using BrdU/EdU thresholds JSON: {thresholds_json}")
 
     adata = ad.read_h5ad(in_path)
     if (args.subset_obs_key is None) != (args.subset_obs_value is None):
@@ -2704,6 +2951,12 @@ def _run_single(
     if rois_to_process is not None and roi_obs_key in adata.obs.columns:
         roi_values = adata.obs[roi_obs_key].astype(str).to_numpy()
 
+    ensure_log_brdu_edu_mean(adata)
+    log_brdu = adata.obs["log_brdu_mean"].to_numpy(dtype=float)
+    log_edu = adata.obs["log_edu_mean"].to_numpy(dtype=float)
+    adata.obs["brdu_pos"] = (log_brdu >= float(threshold_log_brdu)).astype(bool)
+    adata.obs["edu_pos"] = (log_edu >= float(threshold_log_edu)).astype(bool)
+
     adata.obs["t_all"] = t_all
     adata.obs["t_neomeso"] = t_neomeso
     adata.obs["t_local"] = t_local
@@ -2724,6 +2977,12 @@ def _run_single(
         "t_local": "obsm['principal'][:,0] (slice-local anchored curve coordinate)",
         "t_all": "A0_all + (1 - t_local) * (A1_all - A0_all), where A*_all are per-mask global anchor endpoints",
         "t_neomeso": "(t_all - N0_all) / (N1_all - N0_all), where [N0_all, N1_all] is the global neo+meso span",
+    }
+    fit_meta["brdu_edu_thresholds"] = {
+        "source": str(thresholds_json),
+        "subroi": threshold_subroi,
+        "log_brdu_mean": float(threshold_log_brdu),
+        "log_edu_mean": float(threshold_log_edu),
     }
     if t_neomeso_meta is not None:
         fit_meta["t_neomeso"] = t_neomeso_meta
@@ -2916,11 +3175,32 @@ def main() -> None:
                         f"Found {len(candidates)} anchors JSON files for {in_path.name}; "
                         "running each in anchored mode (no unanchored fallback)."
                     )
+                    threshold_subrois = infer_threshold_subrois_for_split(in_path=in_path)
+                    if len(threshold_subrois) > 1:
+                        print(
+                            f"Detected split thresholds for {in_path.name}: {threshold_subrois}; "
+                            "using only anchors files with matching subROI suffixes."
+                        )
                     used_suffixes: set[str] = set()
+                    n_processed = 0
                     for i, anchor_path in enumerate(candidates):
                         run_args = argparse.Namespace(**vars(args))
                         run_args.anchors_json = str(anchor_path)
                         subroi = infer_anchor_subroi_from_path(in_path=in_path, anchor_path=anchor_path)
+                        if subroi is None and len(threshold_subrois) == 1:
+                            subroi = threshold_subrois[0]
+                        if len(threshold_subrois) > 1 and subroi is None:
+                            print(
+                                "Skipping anchors file without subROI suffix because thresholds "
+                                f"are split by subROI: {anchor_path.name}"
+                            )
+                            continue
+                        if len(threshold_subrois) > 1 and subroi is not None and subroi not in threshold_subrois:
+                            print(
+                                "Skipping anchors file with subROI not present in thresholds split: "
+                                f"{anchor_path.name}"
+                            )
+                            continue
                         if (
                             subroi is not None
                             and run_args.subset_obs_key is None
@@ -2929,7 +3209,13 @@ def main() -> None:
                             run_args.subset_obs_key = "ccf_adjusted"
                             run_args.subset_obs_value = subroi
 
-                        suffix = subroi if subroi is not None else f"anchors{i + 1}"
+                        if subroi is None:
+                            raise SystemExit(
+                                "Could not infer subROI for multi-anchors output naming for "
+                                f"{anchor_path.name} (input={in_path.name}). "
+                                "Refusing to write an unsuffixed '.princurve.h5ad'."
+                            )
+                        suffix = subroi
                         base_suffix = suffix
                         j = 2
                         while suffix in used_suffixes:
@@ -2945,13 +3231,48 @@ def main() -> None:
                             ws_for_t_endpoints=ws,
                             roi_for_t_endpoints=roi,
                         )
+                        n_processed += 1
+                    if n_processed == 0:
+                        raise SystemExit(
+                            "No anchors JSON candidates remained after subROI filtering for "
+                            f"{in_path.name}. Anchors candidates: {[p.name for p in candidates]}; "
+                            f"threshold subROIs: {threshold_subrois}"
+                        )
                     continue
 
+                if (
+                    args.subset_obs_key is None
+                    and args.subset_obs_value is None
+                    and args.anchors_json is None
+                    and args.anchors_subroi is None
+                ):
+                    threshold_subrois = infer_threshold_subrois_for_split(in_path=in_path)
+                    if len(threshold_subrois) > 1:
+                        print(
+                            f"Found {len(threshold_subrois)} thresholds JSON files for {in_path.name}; "
+                            "running once per subROI."
+                        )
+                        for subroi in threshold_subrois:
+                            run_args = argparse.Namespace(**vars(args))
+                            run_args.subset_obs_key = "ccf_adjusted"
+                            run_args.subset_obs_value = subroi
+                            out_path_subroi = output_path_with_subroi(out_path=out_path, subroi=subroi)
+                            _run_single(
+                                args=run_args,
+                                in_path=in_path,
+                                out_path=out_path_subroi,
+                                ws_for_t_endpoints=ws,
+                                roi_for_t_endpoints=roi,
+                            )
+                        continue
+
                 run_args = argparse.Namespace(**vars(args))
+                output_subroi = require_output_subroi(args=run_args, in_path=in_path)
+                out_path_single = output_path_with_subroi(out_path=out_path, subroi=output_subroi)
                 _run_single(
                     args=run_args,
                     in_path=in_path,
-                    out_path=out_path,
+                    out_path=out_path_single,
                     ws_for_t_endpoints=ws,
                     roi_for_t_endpoints=roi,
                 )
@@ -2967,11 +3288,41 @@ def main() -> None:
     if args.input is None or args.output is None:
         raise SystemExit("Provide either WORKSPACE [ROI] or --input/--output.")
 
+    in_path = Path(args.input)
+    out_path = Path(args.output)
+    if (
+        args.subset_obs_key is None
+        and args.subset_obs_value is None
+        and args.anchors_json is None
+        and args.anchors_subroi is None
+    ):
+        threshold_subrois = infer_threshold_subrois_for_split(in_path=in_path)
+        if len(threshold_subrois) > 1:
+            print(
+                f"Found {len(threshold_subrois)} thresholds JSON files for {in_path.name}; "
+                "running once per subROI."
+            )
+            for subroi in threshold_subrois:
+                run_args = argparse.Namespace(**vars(args))
+                run_args.subset_obs_key = "ccf_adjusted"
+                run_args.subset_obs_value = subroi
+                out_path_subroi = output_path_with_subroi(out_path=out_path, subroi=subroi)
+                _run_single(
+                    args=run_args,
+                    in_path=in_path,
+                    out_path=out_path_subroi,
+                    ws_for_t_endpoints=None,
+                    roi_for_t_endpoints=None,
+                )
+            return
+
     run_args = argparse.Namespace(**vars(args))
+    output_subroi = require_output_subroi(args=run_args, in_path=in_path)
+    out_path_single = output_path_with_subroi(out_path=out_path, subroi=output_subroi)
     _run_single(
         args=run_args,
-        in_path=Path(args.input),
-        out_path=Path(args.output),
+        in_path=in_path,
+        out_path=out_path_single,
         ws_for_t_endpoints=None,
         roi_for_t_endpoints=None,
     )

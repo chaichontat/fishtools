@@ -22,6 +22,156 @@ def _load_midsurface_coords_module():
     return module
 
 
+def compute_ap_ml_support_mask_native_grid(
+    *,
+    outdir: Path,
+    slice_i_min: int,
+    slice_i_max: int,
+    n_t: int,
+    n_ml: int,
+    ref_t: float,
+    band_frac: float,
+    res_ijk_um: tuple[float, float, float] | None,
+    restrict_t_neomeso: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute an AP/ML grid and a boolean support mask from refextract midsurface artifacts.
+
+    Returns:
+      - ap_grid: (N_ap,) AP (um) centers (ordered by AP)
+      - ml_grid: (N_ml,) ML (um) centers (anchored arclength along per-slice t)
+      - support_mask: (N_ap, N_ml) True where the refextract surface is defined
+    """
+    outdir = Path(outdir)
+    mod = _load_midsurface_coords_module()
+    coronal = mod.load_coronal_midline_columns(outdir / "coronal_midline_columns.csv")
+    if not coronal:
+        raise ValueError(f"No coronal midline columns found under {outdir}")
+
+    _res_i_um, res_j_um, res_k_um = _load_resolution_ds_ijk_um(outdir, res_ijk_um=res_ijk_um)
+
+    ap_npz = outdir / "ap_axis_um_from_strips.npz"
+    ap = np.load(ap_npz)
+    slice_keys = np.asarray(ap["slice_keys"], dtype=np.int32).reshape(-1)
+    ap_um = np.asarray(ap["ap_um"], dtype=np.float64).reshape(-1)
+    if slice_keys.size != ap_um.size:
+        raise ValueError(f"slice_keys/ap_um size mismatch in {ap_npz}")
+    ap_by_slice = {int(s): float(v) for s, v in zip(slice_keys.tolist(), ap_um.tolist(), strict=True)}
+
+    keys = [
+        k
+        for k in sorted(coronal.keys())
+        if int(slice_i_min) <= int(k) <= int(slice_i_max) and int(k) in ap_by_slice
+    ]
+    if len(keys) < 2:
+        raise ValueError("Not enough coronal slices after filtering by slice range and AP axis.")
+
+    t_ranges: dict[int, list[tuple[float, float]]] = {}
+    if restrict_t_neomeso:
+        t_ranges_path = outdir / "coronal_neocortex_mesocortex_overlap_t_ranges.csv"
+        t_ranges = _load_overlap_t_ranges_csv(t_ranges_path, slice_label="slice_i")
+        if not t_ranges:
+            raise FileNotFoundError(f"No overlap t ranges found in {t_ranges_path}")
+
+    ref_t = float(ref_t)
+    if not np.isfinite(ref_t) or not (0.0 <= ref_t <= 1.0):
+        raise ValueError(f"ref_t must be in [0,1], got {ref_t}")
+
+    ap_grid = np.asarray([ap_by_slice[int(k)] for k in keys], dtype=np.float64)
+    order = np.argsort(ap_grid)
+    keys = [keys[i] for i in order.tolist()]
+    ap_grid = ap_grid[order]
+
+    t_grid = np.linspace(0.0, 1.0, int(n_t), dtype=np.float64)
+    thickness_t = np.full((len(keys), t_grid.size), np.nan, dtype=np.float64)
+    ml_um_signed_at_t = np.full((len(keys), t_grid.size), np.nan, dtype=np.float64)
+
+    ref_slice_i = int(np.median(np.asarray(keys, dtype=np.int32)))
+    if ref_slice_i not in keys:
+        keys_arr = np.asarray(keys, dtype=np.int32)
+        ref_slice_i = int(keys_arr[int(np.argmin(np.abs(keys_arr - int(ref_slice_i))))])
+
+    ref_cols = coronal[int(ref_slice_i)]
+    ref_y_rs, ref_x_rs, _ref_len_um = _resample_polyline_um(
+        y=ref_cols.y,
+        x=ref_cols.x,
+        res_y_um=float(res_j_um),
+        res_x_um=float(res_k_um),
+        n=int(n_t),
+    )
+    ref_pts2_um_center = _center_2d(np.column_stack([ref_y_rs * float(res_j_um), ref_x_rs * float(res_k_um)]))
+    ref_idx = int(np.clip(int(np.rint(ref_t * float(n_t - 1))), 0, int(n_t - 1)))
+    band = int(max(4, int(round(float(band_frac) * float(n_t)))))
+
+    for row, k in enumerate(keys):
+        c = coronal[int(k)]
+        thickness_t[row] = mod._interp_series_on_t_grid(t=c.t, values=c.thickness_um, t_grid=t_grid)
+
+        y_rs, x_rs, total_len_um = _resample_polyline_um(
+            y=c.y,
+            x=c.x,
+            res_y_um=float(res_j_um),
+            res_x_um=float(res_k_um),
+            n=int(n_t),
+        )
+        pts2_um = np.column_stack([y_rs * float(res_j_um), x_rs * float(res_k_um)]).astype(np.float64, copy=False)
+        pts2_center = _center_2d(pts2_um)
+        fwd = float(np.nanmean(np.sum((pts2_center - ref_pts2_um_center) ** 2, axis=1)))
+        rev_center = _center_2d(pts2_um[::-1])
+        rev = float(np.nanmean(np.sum((rev_center - ref_pts2_um_center) ** 2, axis=1)))
+        if rev < fwd:
+            pts2_center = rev_center
+
+        band_try = int(band)
+        for _ in range(3):
+            try:
+                path = _dtw_banded_path(pts2_center, ref_pts2_um_center, band=band_try)
+                break
+            except ValueError:
+                band_try = int(min(int(n_t - 1), int(round(band_try * 1.75)) + 1))
+        else:
+            raise ValueError(f"DTW failed for slice {int(k)} vs ref slice {int(ref_slice_i)}; increase band_frac.")
+
+        idx_map = _path_to_monotone_index_map(path, n=int(n_t))
+        origin_idx_f = _invert_monotone_index_map_to_fractional_idx(idx_map=idx_map, ref_idx=int(ref_idx))
+        origin_t0 = float(origin_idx_f) / float(int(n_t) - 1)
+        origin_um = float(origin_t0) * float(total_len_um)
+        ml_um_signed_at_t[row] = (t_grid * float(total_len_um)) - origin_um
+
+        if restrict_t_neomeso:
+            ranges = t_ranges.get(int(k), [])
+            if not ranges:
+                thickness_t[row, :] = np.nan
+                ml_um_signed_at_t[row, :] = np.nan
+            else:
+                keep = np.zeros(t_grid.shape, dtype=bool)
+                for t0, t1 in ranges:
+                    t0f = float(np.clip(t0, 0.0, 1.0))
+                    t1f = float(np.clip(t1, 0.0, 1.0))
+                    if t1f < t0f:
+                        t0f, t1f = t1f, t0f
+                    if (t1f - t0f) <= 1.0e-9:
+                        continue
+                    keep |= (t_grid >= t0f) & (t_grid <= t1f)
+                thickness_t[row, ~keep] = np.nan
+                ml_um_signed_at_t[row, ~keep] = np.nan
+
+    ml_min = float(np.nanmin(ml_um_signed_at_t))
+    ml_max = float(np.nanmax(ml_um_signed_at_t))
+    if not np.isfinite(ml_min) or not np.isfinite(ml_max) or not (ml_max > ml_min):
+        raise ValueError(f"Invalid ML range computed from refextract: [{ml_min}, {ml_max}]")
+
+    ml_grid = np.linspace(ml_min, ml_max, int(n_ml), dtype=np.float64)
+    thickness = np.full((len(keys), ml_grid.size), np.nan, dtype=np.float64)
+    for row in range(len(keys)):
+        if restrict_t_neomeso:
+            thickness[row] = _interp_series_on_grid_piecewise(x=ml_um_signed_at_t[row], y=thickness_t[row], x_grid=ml_grid)
+        else:
+            thickness[row] = _interp_series_on_grid(x=ml_um_signed_at_t[row], y=thickness_t[row], x_grid=ml_grid)
+
+    support_mask = np.isfinite(thickness)
+    return ap_grid.astype(np.float64, copy=False), ml_grid.astype(np.float64, copy=False), support_mask.astype(bool, copy=False)
+
+
 def _edges_from_centers(x: np.ndarray) -> np.ndarray:
     """Convert monotone centers to edges for pcolormesh."""
     xc = np.asarray(x, dtype=np.float64).reshape(-1)
@@ -351,6 +501,379 @@ def _load_overlap_t_ranges_csv(path: Path, *, slice_label: str) -> dict[int, lis
     return out
 
 
+def _load_s2c_t2d(npz_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    d = np.load(npz_path)
+    source_slice_keys = np.asarray(d["source_slice_keys"], dtype=np.int32).reshape(-1)
+    t_grid = np.asarray(d["t_grid"], dtype=np.float64).reshape(-1)
+    target_slice_idx = np.asarray(d["target_slice_idx"], dtype=np.float64)
+    target_t = np.asarray(d["target_t"], dtype=np.float64)
+    return source_slice_keys, t_grid, target_slice_idx, target_t
+
+
+def _map_sagittal_to_coronal_t2d(
+    *,
+    source_slice_keys: np.ndarray,
+    lut_t_grid: np.ndarray,
+    target_slice_idx: np.ndarray,
+    target_t: np.ndarray,
+    slice_k: int,
+    t_s: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    keys = np.asarray(source_slice_keys, dtype=np.int32).reshape(-1)
+    if keys.size == 0:
+        raise ValueError("Empty source_slice_keys in sagittal->coronal LUT.")
+    row = int(np.argmin(np.abs(keys.astype(np.float64) - float(slice_k))))
+    t_grid = np.asarray(lut_t_grid, dtype=np.float64).reshape(-1)
+    t = np.asarray(t_s, dtype=np.float64).reshape(-1)
+    t_clip = np.clip(t, 0.0, 1.0)
+    slice_row = np.asarray(target_slice_idx[row], dtype=np.float64).reshape(-1)
+    t_row = np.asarray(target_t[row], dtype=np.float64).reshape(-1)
+    if slice_row.size != t_grid.size or t_row.size != t_grid.size:
+        raise ValueError("Unexpected sagittal->coronal LUT row shape.")
+    out_slice = np.interp(t_clip, t_grid, slice_row).astype(np.float64, copy=False)
+    out_t = np.interp(t_clip, t_grid, t_row).astype(np.float64, copy=False)
+    return out_slice, out_t
+
+
+def _compute_sagittal_overlay_curves(
+    *,
+    outdir: Path,
+    ap_slice_keys: np.ndarray,
+    ap_um: np.ndarray,
+    coronal_slice_keys: list[int],
+    t_grid: np.ndarray,
+    ml_um_signed_at_t: np.ndarray,
+    k_step: int,
+    n_sample: int,
+    restrict_t_neomeso: bool,
+) -> tuple[list[tuple[int, np.ndarray, np.ndarray]], tuple[int, int]]:
+    s2c_path = outdir / "chart_map_sagittal_to_coronal_t2d.npz"
+    if not s2c_path.exists():
+        raise FileNotFoundError(f"Missing {s2c_path}. Build chart LUTs first with midsurface_coords.py.")
+
+    source_slice_keys, lut_t_grid, target_slice_idx, target_t = _load_s2c_t2d(s2c_path)
+    if source_slice_keys.size == 0:
+        raise ValueError("No sagittal source_slice_keys in sagittal->coronal LUT.")
+
+    k_step = int(k_step)
+    if k_step <= 0:
+        raise ValueError(f"k_step must be > 0, got {k_step}")
+
+    k_supported_min = int(np.min(source_slice_keys))
+    k_supported_max = int(np.max(source_slice_keys))
+    requested = list(range(int(k_supported_min), int(k_supported_max) + 1, int(k_step)))
+    use_ks = sorted(
+        {
+            int(source_slice_keys[int(np.argmin(np.abs(source_slice_keys.astype(np.float64) - float(k))))])
+            for k in requested
+        }
+    )
+
+    coronal_keys = np.asarray(coronal_slice_keys, dtype=np.float64)
+    ap_keys = np.asarray(ap_slice_keys, dtype=np.float64).reshape(-1)
+    ap_vals = np.asarray(ap_um, dtype=np.float64).reshape(-1)
+    t_s = np.linspace(0.0, 1.0, int(n_sample), dtype=np.float64)
+
+    curves: list[tuple[int, np.ndarray, np.ndarray]] = []
+    for k in use_ks:
+        cor_slice_f, cor_t = _map_sagittal_to_coronal_t2d(
+            source_slice_keys=source_slice_keys,
+            lut_t_grid=lut_t_grid,
+            target_slice_idx=target_slice_idx,
+            target_t=target_t,
+            slice_k=int(k),
+            t_s=t_s,
+        )
+        ap_curve = _interp_series_on_grid(x=ap_keys, y=ap_vals, x_grid=cor_slice_f)
+        row_idx = np.argmin(np.abs(coronal_keys[:, None] - cor_slice_f[None, :]), axis=0)
+        ml_curve = np.full_like(cor_t, np.nan, dtype=np.float64)
+        for ridx in np.unique(row_idx).tolist():
+            ridx_i = int(ridx)
+            mask = row_idx == ridx_i
+            ml_row = ml_um_signed_at_t[ridx_i]
+            interp_fn = _interp_series_on_grid_piecewise if restrict_t_neomeso else _interp_series_on_grid
+            ml_curve[mask] = interp_fn(x=t_grid, y=ml_row, x_grid=cor_t[mask])
+
+        keep = np.isfinite(ap_curve) & np.isfinite(ml_curve)
+        if int(np.count_nonzero(keep)) >= 2:
+            ml_plot = np.where(keep, ml_curve, np.nan)
+            ap_plot = np.where(keep, ap_curve, np.nan)
+            curves.append((int(k), ml_plot, ap_plot))
+
+    return curves, (k_supported_min, k_supported_max)
+
+
+def _write_s2c_ml_vs_sagittal_t_per_coronal_slice(
+    *,
+    outdir: Path,
+    coronal_slice_keys: list[int],
+    t_grid: np.ndarray,
+    ml_um_signed_at_t: np.ndarray,
+    k_step: int,
+    n_sample: int,
+    restrict_t_neomeso: bool,
+    slice_i_min: int,
+    slice_i_max: int,
+    ml_min_um: float,
+    ml_max_um: float,
+    out_prefix: str,
+) -> list[Path]:
+    import matplotlib.pyplot as plt
+
+    s2c_path = outdir / "chart_map_sagittal_to_coronal_t2d.npz"
+    if not s2c_path.exists():
+        raise FileNotFoundError(f"Missing {s2c_path}. Build chart LUTs first with midsurface_coords.py.")
+
+    source_slice_keys, lut_t_grid, target_slice_idx, target_t = _load_s2c_t2d(s2c_path)
+    if source_slice_keys.size == 0:
+        raise ValueError("No sagittal source_slice_keys in sagittal->coronal LUT.")
+
+    k_step = int(k_step)
+    if k_step <= 0:
+        raise ValueError(f"k_step must be > 0, got {k_step}")
+
+    k_supported_min = int(np.min(source_slice_keys))
+    k_supported_max = int(np.max(source_slice_keys))
+    requested = list(range(int(k_supported_min), int(k_supported_max) + 1, int(k_step)))
+    use_ks = sorted(
+        {
+            int(source_slice_keys[int(np.argmin(np.abs(source_slice_keys.astype(np.float64) - float(k))))])
+            for k in requested
+        }
+    )
+
+    coronal_keys = np.asarray(coronal_slice_keys, dtype=np.float64)
+    t_s = np.linspace(0.0, 1.0, int(n_sample), dtype=np.float64)
+
+    slice_i_min = int(slice_i_min)
+    slice_i_max = int(slice_i_max)
+    if slice_i_max < slice_i_min:
+        raise ValueError(f"slice_i_max must be >= slice_i_min, got {slice_i_min}..{slice_i_max}")
+    ml_min_um = float(ml_min_um)
+    ml_max_um = float(ml_max_um)
+    if not np.isfinite(ml_min_um) or not np.isfinite(ml_max_um) or not (ml_max_um > ml_min_um):
+        raise ValueError(f"Invalid ML filter range (um): [{ml_min_um}, {ml_max_um}]")
+
+    interp_fn = _interp_series_on_grid_piecewise if restrict_t_neomeso else _interp_series_on_grid
+
+    curves_by_k: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for k in use_ks:
+        cor_slice_f, cor_t = _map_sagittal_to_coronal_t2d(
+            source_slice_keys=source_slice_keys,
+            lut_t_grid=lut_t_grid,
+            target_slice_idx=target_slice_idx,
+            target_t=target_t,
+            slice_k=int(k),
+            t_s=t_s,
+        )
+        row_idx = np.argmin(np.abs(coronal_keys[:, None] - cor_slice_f[None, :]), axis=0)
+        ml_curve = np.full_like(cor_t, np.nan, dtype=np.float64)
+        for ridx in np.unique(row_idx).tolist():
+            ridx_i = int(ridx)
+            mask = row_idx == ridx_i
+            ml_row = ml_um_signed_at_t[ridx_i]
+            ml_curve[mask] = interp_fn(x=t_grid, y=ml_row, x_grid=cor_t[mask])
+
+        slice_i_point = np.asarray([int(coronal_slice_keys[int(r)]) for r in row_idx.tolist()], dtype=np.int32)
+        keep = (
+            np.isfinite(t_s)
+            & np.isfinite(ml_curve)
+            & (slice_i_point >= int(slice_i_min))
+            & (slice_i_point <= int(slice_i_max))
+            & (ml_curve >= float(ml_min_um))
+            & (ml_curve <= float(ml_max_um))
+        )
+        if not np.any(keep):
+            continue
+        curves_by_k[int(k)] = (slice_i_point, np.where(keep, ml_curve, np.nan))
+
+    out_paths: list[Path] = []
+    if not curves_by_k:
+        return out_paths
+
+    k_arr = np.asarray(sorted(curves_by_k.keys()), dtype=np.int32)
+    k_min = int(np.min(k_arr))
+    k_max = int(np.max(k_arr))
+    if k_min == k_max:
+        norm = plt.Normalize(float(k_min) - 0.5, float(k_max) + 0.5)
+    else:
+        norm = plt.Normalize(float(k_min), float(k_max))
+    cmap = plt.get_cmap("turbo")
+
+    for slice_i in range(int(slice_i_min), int(slice_i_max) + 1):
+        fig, ax = plt.subplots(figsize=(8.6, 3.6), dpi=170)
+        n_plotted = 0
+        for k in k_arr.tolist():
+            slice_i_point, ml_curve = curves_by_k[int(k)]
+            y_full = ml_curve
+            if int(np.count_nonzero(np.isfinite(y_full))) < 2:
+                continue
+            color = cmap(norm(float(k)))
+
+            # Draw the full (filtered) curve faintly so interpolation/continuity is visible,
+            # then highlight the segment(s) that land on this specific coronal slice.
+            ax.plot(t_s, y_full, color="#bdbdbd", linewidth=0.9, alpha=0.18, zorder=1)
+
+            y_sel = np.where(slice_i_point == int(slice_i), y_full, np.nan)
+            if int(np.count_nonzero(np.isfinite(y_sel))) < 2:
+                continue
+            ax.plot(t_s, y_sel, color=color, linewidth=1.05, alpha=0.9, zorder=2)
+            n_plotted += 1
+
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        cb = fig.colorbar(sm, ax=ax, shrink=0.92, pad=0.02)
+        cb.set_label("sagittal slice_k")
+
+        ax.set_title(
+            f"S2C overlay: ML vs sagittal t | slice_i={int(slice_i)} | "
+            f"{float(ml_min_um):.0f}<=ML<= {float(ml_max_um):.0f} um | curves={int(n_plotted)}"
+        )
+
+        ax.set_xlabel("sagittal t (t_s; 0..1)")
+        ax.set_ylabel("ML (um; anchored)")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(float(ml_min_um), float(ml_max_um))
+        ax.grid(True, linewidth=0.5, alpha=0.25)
+        out_path = outdir / f"{out_prefix}_s2c_ml_vs_ts_slice{int(slice_i)}_ml{int(round(ml_min_um))}to{int(round(ml_max_um))}_kstep{int(k_step)}.png"
+        fig.tight_layout()
+        fig.savefig(out_path)
+        plt.close(fig)
+        out_paths.append(out_path)
+
+    return out_paths
+
+
+def _write_s2c_ml_vs_sagittal_t_window(
+    *,
+    outdir: Path,
+    coronal_slice_keys: list[int],
+    t_grid: np.ndarray,
+    ml_um_signed_at_t: np.ndarray,
+    k_step: int,
+    n_sample: int,
+    restrict_t_neomeso: bool,
+    slice_i_min: int,
+    slice_i_max: int,
+    ml_min_um: float,
+    ml_max_um: float,
+    out_prefix: str,
+) -> Path | None:
+    import matplotlib.pyplot as plt
+
+    s2c_path = outdir / "chart_map_sagittal_to_coronal_t2d.npz"
+    if not s2c_path.exists():
+        raise FileNotFoundError(f"Missing {s2c_path}. Build chart LUTs first with midsurface_coords.py.")
+
+    source_slice_keys, lut_t_grid, target_slice_idx, target_t = _load_s2c_t2d(s2c_path)
+    if source_slice_keys.size == 0:
+        raise ValueError("No sagittal source_slice_keys in sagittal->coronal LUT.")
+
+    k_step = int(k_step)
+    if k_step <= 0:
+        raise ValueError(f"k_step must be > 0, got {k_step}")
+
+    k_supported_min = int(np.min(source_slice_keys))
+    k_supported_max = int(np.max(source_slice_keys))
+    requested = list(range(int(k_supported_min), int(k_supported_max) + 1, int(k_step)))
+    use_ks = sorted(
+        {
+            int(source_slice_keys[int(np.argmin(np.abs(source_slice_keys.astype(np.float64) - float(k))))])
+            for k in requested
+        }
+    )
+
+    coronal_keys = np.asarray(coronal_slice_keys, dtype=np.float64)
+    t_s = np.linspace(0.0, 1.0, int(n_sample), dtype=np.float64)
+
+    slice_i_min = int(slice_i_min)
+    slice_i_max = int(slice_i_max)
+    if slice_i_max < slice_i_min:
+        raise ValueError(f"slice_i_max must be >= slice_i_min, got {slice_i_min}..{slice_i_max}")
+    ml_min_um = float(ml_min_um)
+    ml_max_um = float(ml_max_um)
+    if not np.isfinite(ml_min_um) or not np.isfinite(ml_max_um) or not (ml_max_um > ml_min_um):
+        raise ValueError(f"Invalid ML filter range (um): [{ml_min_um}, {ml_max_um}]")
+
+    interp_fn = _interp_series_on_grid_piecewise if restrict_t_neomeso else _interp_series_on_grid
+
+    curves_by_k: dict[int, np.ndarray] = {}
+    for k in use_ks:
+        cor_slice_f, cor_t = _map_sagittal_to_coronal_t2d(
+            source_slice_keys=source_slice_keys,
+            lut_t_grid=lut_t_grid,
+            target_slice_idx=target_slice_idx,
+            target_t=target_t,
+            slice_k=int(k),
+            t_s=t_s,
+        )
+        row_idx = np.argmin(np.abs(coronal_keys[:, None] - cor_slice_f[None, :]), axis=0)
+        ml_curve = np.full_like(cor_t, np.nan, dtype=np.float64)
+        for ridx in np.unique(row_idx).tolist():
+            ridx_i = int(ridx)
+            mask = row_idx == ridx_i
+            ml_row = ml_um_signed_at_t[ridx_i]
+            ml_curve[mask] = interp_fn(x=t_grid, y=ml_row, x_grid=cor_t[mask])
+
+        slice_i_point = np.asarray([int(coronal_slice_keys[int(r)]) for r in row_idx.tolist()], dtype=np.int32)
+        keep = (
+            np.isfinite(t_s)
+            & np.isfinite(ml_curve)
+            & (slice_i_point >= int(slice_i_min))
+            & (slice_i_point <= int(slice_i_max))
+            & (ml_curve >= float(ml_min_um))
+            & (ml_curve <= float(ml_max_um))
+        )
+        if int(np.count_nonzero(keep)) < 2:
+            continue
+        curves_by_k[int(k)] = np.where(keep, ml_curve, np.nan)
+
+    if not curves_by_k:
+        return None
+
+    k_arr = np.asarray(sorted(curves_by_k.keys()), dtype=np.int32)
+    k_min = int(np.min(k_arr))
+    k_max = int(np.max(k_arr))
+    if k_min == k_max:
+        norm = plt.Normalize(float(k_min) - 0.5, float(k_max) + 0.5)
+    else:
+        norm = plt.Normalize(float(k_min), float(k_max))
+    cmap = plt.get_cmap("turbo")
+
+    fig, ax = plt.subplots(figsize=(8.6, 3.6), dpi=170)
+    n_plotted = 0
+    for k in k_arr.tolist():
+        y = curves_by_k[int(k)]
+        if int(np.count_nonzero(np.isfinite(y))) < 2:
+            continue
+        ax.plot(t_s, y, color=cmap(norm(float(k))), linewidth=1.05, alpha=0.9)
+        n_plotted += 1
+
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cb = fig.colorbar(sm, ax=ax, shrink=0.92, pad=0.02)
+    cb.set_label("sagittal slice_k")
+
+    ax.set_title(
+        f"S2C overlay: ML vs sagittal t | slice_i={int(slice_i_min)}..{int(slice_i_max)} | "
+        f"{float(ml_min_um):.0f}<=ML<= {float(ml_max_um):.0f} um | curves={int(n_plotted)}"
+    )
+    ax.set_xlabel("sagittal t (t_s; 0..1)")
+    ax.set_ylabel("ML (um; anchored)")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(float(ml_min_um), float(ml_max_um))
+    ax.grid(True, linewidth=0.5, alpha=0.25)
+
+    out_path = (
+        outdir
+        / f"{out_prefix}_s2c_ml_vs_ts_slice{int(slice_i_min)}to{int(slice_i_max)}_ml{int(round(ml_min_um))}to{int(round(ml_max_um))}_kstep{int(k_step)}.png"
+    )
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
 def _write_heatmaps(
     *,
     outdir: Path,
@@ -368,6 +891,14 @@ def _write_heatmaps(
     out_prefix: str,
     restrict_t_neomeso: bool,
     t_neomeso_csv: Path | None,
+    overlay_sagittal_k_step: int,
+    overlay_sagittal_n_sample: int,
+    write_s2c_ml_vs_sagittal_t_per_slice: bool,
+    write_s2c_ml_vs_sagittal_t_window: bool,
+    s2c_disp_slice_i_min: int,
+    s2c_disp_slice_i_max: int,
+    s2c_disp_ml_min_um: float,
+    s2c_disp_ml_max_um: float,
 ) -> list[Path]:
     import matplotlib.pyplot as plt
 
@@ -519,12 +1050,41 @@ def _write_heatmaps(
         else:
             thickness[row] = _interp_series_on_grid(x=ml_um_signed_at_t[row], y=thickness_t[row], x_grid=ml_grid)
     valid = np.isfinite(thickness).astype(np.float64)
+    sagittal_curves: list[tuple[int, np.ndarray, np.ndarray]] = []
+    supported_k_range = (0, 0)
+    if int(overlay_sagittal_k_step) > 0:
+        sagittal_curves, supported_k_range = _compute_sagittal_overlay_curves(
+            outdir=outdir,
+            ap_slice_keys=slice_keys,
+            ap_um=ap_um,
+            coronal_slice_keys=keys,
+            t_grid=t_grid,
+            ml_um_signed_at_t=ml_um_signed_at_t,
+            k_step=int(overlay_sagittal_k_step),
+            n_sample=int(overlay_sagittal_n_sample),
+            restrict_t_neomeso=bool(restrict_t_neomeso),
+        )
 
     out_paths: list[Path] = []
     title_suffix = (
         f"coronal slices {int(slice_i_min)}-{int(slice_i_max)} (n={len(keys)}), n_t={int(n_t)}, "
         f"ref_slice_i={int(ref_slice_i)}, ref_t={float(ref_t):.3f}"
     )
+    if int(overlay_sagittal_k_step) > 0 or bool(write_s2c_ml_vs_sagittal_t_per_slice) or bool(write_s2c_ml_vs_sagittal_t_window):
+        s2c_path = outdir / "chart_map_sagittal_to_coronal_t2d.npz"
+        if s2c_path.exists():
+            d = np.load(s2c_path)
+            cmin_raw = int(np.asarray(d["coronal_slice_min"]).reshape(-1)[0]) if "coronal_slice_min" in d else -1
+            cmax_raw = int(np.asarray(d["coronal_slice_max"]).reshape(-1)[0]) if "coronal_slice_max" in d else -1
+            cmin = None if int(cmin_raw) < 0 else int(cmin_raw)
+            cmax = None if int(cmax_raw) < 0 else int(cmax_raw)
+            if cmin is not None or cmax is not None:
+                parts: list[str] = []
+                if cmin is not None:
+                    parts.append(f">={int(cmin)}")
+                if cmax is not None:
+                    parts.append(f"<={int(cmax)}")
+                title_suffix = title_suffix + f" | LUT coronal slice_i {''.join(parts)}"
     if restrict_t_neomeso:
         title_suffix = title_suffix + " | t restricted to neocortex+mesocortex overlap"
 
@@ -533,6 +1093,7 @@ def _write_heatmaps(
     m = ax.pcolormesh(x_edges, y_edges, thickness, shading="auto", cmap="viridis")
     ax.set_xlabel("mediolateral (um; arclength along t, anchored)")
     ax.set_ylabel("AP (um; optimized)")
+    ax.set_aspect("equal", adjustable="box")
     ax.set_title(f"Thickness heatmap ({title_suffix})")
     ax.grid(False)
     cb = fig.colorbar(m, ax=ax, shrink=0.95, pad=0.02)
@@ -548,6 +1109,7 @@ def _write_heatmaps(
     m = ax.pcolormesh(x_edges, y_edges, valid, shading="auto", cmap="gray_r", vmin=0.0, vmax=1.0)
     ax.set_xlabel("mediolateral (um; arclength along t, anchored)")
     ax.set_ylabel("AP (um; optimized)")
+    ax.set_aspect("equal", adjustable="box")
     ax.set_title(f"Coverage heatmap ({title_suffix})")
     ax.grid(False)
     cb = fig.colorbar(m, ax=ax, shrink=0.95, pad=0.02)
@@ -557,6 +1119,31 @@ def _write_heatmaps(
     fig.savefig(p2)
     plt.close(fig)
     out_paths.append(p2)
+
+    if sagittal_curves:
+        fig, ax = plt.subplots(figsize=(9.0, 4.0), dpi=160)
+        m = ax.pcolormesh(x_edges, y_edges, valid, shading="auto", cmap="gray_r", vmin=0.0, vmax=1.0)
+        cmap_k = plt.get_cmap("turbo")
+        n_curves = len(sagittal_curves)
+        for idx, (_k, ml_curve, ap_curve) in enumerate(sagittal_curves):
+            frac = float(idx) / float(max(1, n_curves - 1))
+            ax.plot(ml_curve, ap_curve, color=cmap_k(frac), linewidth=0.9, alpha=0.9)
+
+        ax.set_xlabel("mediolateral (um; arclength along t, anchored)")
+        ax.set_ylabel("AP (um; optimized)")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(
+            f"Coverage + sagittal curves ({title_suffix}) | "
+            f"k={int(supported_k_range[0])}..{int(supported_k_range[1])} step={int(overlay_sagittal_k_step)}"
+        )
+        ax.grid(False)
+        cb = fig.colorbar(m, ax=ax, shrink=0.95, pad=0.02)
+        cb.set_label("finite(thickness_um)")
+        p2_overlay = outdir / f"{out_prefix}_ml_um_anchored_coverage_heatmap_sagittal_step{int(overlay_sagittal_k_step)}.png"
+        fig.tight_layout()
+        fig.savefig(p2_overlay)
+        plt.close(fig)
+        out_paths.append(p2_overlay)
 
     # ML length vs AP (range visualization).
     fig, ax = plt.subplots(figsize=(8.0, 3.0), dpi=160)
@@ -571,6 +1158,46 @@ def _write_heatmaps(
     fig.savefig(p3)
     plt.close(fig)
     out_paths.append(p3)
+
+    if bool(write_s2c_ml_vs_sagittal_t_per_slice):
+        if int(overlay_sagittal_k_step) <= 0:
+            raise ValueError("--write-s2c-ml-vs-sagittal-t-per-slice requires --overlay-sagittal-k-step > 0")
+        out_paths.extend(
+            _write_s2c_ml_vs_sagittal_t_per_coronal_slice(
+                outdir=outdir,
+                coronal_slice_keys=keys,
+                t_grid=t_grid,
+                ml_um_signed_at_t=ml_um_signed_at_t,
+                k_step=int(overlay_sagittal_k_step),
+                n_sample=int(overlay_sagittal_n_sample),
+                restrict_t_neomeso=bool(restrict_t_neomeso),
+                slice_i_min=int(s2c_disp_slice_i_min),
+                slice_i_max=int(s2c_disp_slice_i_max),
+                ml_min_um=float(s2c_disp_ml_min_um),
+                ml_max_um=float(s2c_disp_ml_max_um),
+                out_prefix=str(out_prefix),
+            )
+        )
+
+    if bool(write_s2c_ml_vs_sagittal_t_window):
+        if int(overlay_sagittal_k_step) <= 0:
+            raise ValueError("--write-s2c-ml-vs-sagittal-t-window requires --overlay-sagittal-k-step > 0")
+        pth = _write_s2c_ml_vs_sagittal_t_window(
+            outdir=outdir,
+            coronal_slice_keys=keys,
+            t_grid=t_grid,
+            ml_um_signed_at_t=ml_um_signed_at_t,
+            k_step=int(overlay_sagittal_k_step),
+            n_sample=int(overlay_sagittal_n_sample),
+            restrict_t_neomeso=bool(restrict_t_neomeso),
+            slice_i_min=int(s2c_disp_slice_i_min),
+            slice_i_max=int(s2c_disp_slice_i_max),
+            ml_min_um=float(s2c_disp_ml_min_um),
+            ml_max_um=float(s2c_disp_ml_max_um),
+            out_prefix=str(out_prefix),
+        )
+        if pth is not None:
+            out_paths.append(pth)
 
     return out_paths
 
@@ -643,6 +1270,50 @@ def main() -> None:
         default="ap_ml",
         help="Output filename prefix written under outdir (e.g. ap_ml_ml_um_thickness_heatmap.png).",
     )
+    p.add_argument(
+        "--overlay-sagittal-k-step",
+        type=int,
+        default=0,
+        help="If >0, also write a coverage plot with sagittal curves overlaid every k-step in the LUT-supported k range.",
+    )
+    p.add_argument(
+        "--overlay-sagittal-n-sample",
+        type=int,
+        default=401,
+        help="Number of t samples per sagittal curve when overlaying sagittal slices.",
+    )
+    p.add_argument(
+        "--write-s2c-ml-vs-sagittal-t-per-slice",
+        action="store_true",
+        help=(
+            "Also write per-coronal-slice diagnostics plotting ML(um) vs sagittal t for the sagittal->coronal (s2c) LUT overlay "
+            "(requires --overlay-sagittal-k-step > 0)."
+        ),
+    )
+    p.add_argument(
+        "--write-s2c-ml-vs-sagittal-t-window",
+        action="store_true",
+        help=(
+            "Also write a single diagnostic plot of ML(um) vs sagittal t for each sagittal slice_k, "
+            "filtered to the coronal slice window set by --s2c-disp-slice-i-min/max and ML window set by --s2c-disp-ml-min/max "
+            "(requires --overlay-sagittal-k-step > 0)."
+        ),
+    )
+    p.add_argument(
+        "--write-s2c-displacement-per-slice",
+        action="store_true",
+        dest="write_s2c_ml_vs_sagittal_t_per_slice",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument("--s2c-disp-slice-i-min", type=int, default=161, help="Minimum coronal slice_i for s2c displacement plots.")
+    p.add_argument(
+        "--s2c-disp-slice-i-max",
+        type=int,
+        default=174,
+        help="Maximum coronal slice_i for s2c debug plots (e.g. 174 means 'before 175').",
+    )
+    p.add_argument("--s2c-disp-ml-min-um", type=float, default=0.0, help="Minimum ML (um) to include in s2c debug plots.")
+    p.add_argument("--s2c-disp-ml-max-um", type=float, default=750.0, help="Maximum ML (um) to include in s2c debug plots.")
     args = p.parse_args()
 
     outdir = args.outdir
@@ -667,6 +1338,14 @@ def main() -> None:
         out_prefix=str(args.out_prefix),
         restrict_t_neomeso=bool(args.restrict_t_neomeso),
         t_neomeso_csv=args.t_neomeso_csv,
+        overlay_sagittal_k_step=int(args.overlay_sagittal_k_step),
+        overlay_sagittal_n_sample=int(args.overlay_sagittal_n_sample),
+        write_s2c_ml_vs_sagittal_t_per_slice=bool(args.write_s2c_ml_vs_sagittal_t_per_slice),
+        write_s2c_ml_vs_sagittal_t_window=bool(args.write_s2c_ml_vs_sagittal_t_window),
+        s2c_disp_slice_i_min=int(args.s2c_disp_slice_i_min),
+        s2c_disp_slice_i_max=int(args.s2c_disp_slice_i_max),
+        s2c_disp_ml_min_um=float(args.s2c_disp_ml_min_um),
+        s2c_disp_ml_max_um=float(args.s2c_disp_ml_max_um),
     )
     for pth in out_paths:
         print(f"Wrote: {pth}")

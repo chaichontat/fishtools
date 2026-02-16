@@ -84,8 +84,8 @@ def test_compute_ap_ml_um_from_refextract_coronal_and_sagittal(tmp_path: Path) -
         dtw_band_frac=0.2,
     )
     assert cor_oob.shape == (3, 2)
-    assert np.allclose(cor_oob[:, 0], np.asarray([-100.0, -100.0, -100.0]))
-    assert np.allclose(cor_oob[:, 1], np.asarray([-5.0, 0.0, 5.0]))
+    assert np.isnan(cor_oob[:, 0]).all()
+    assert np.isnan(cor_oob[:, 1]).all()
 
     sag = compute(
         lut_outdir=outdir,
@@ -98,8 +98,9 @@ def test_compute_ap_ml_um_from_refextract_coronal_and_sagittal(tmp_path: Path) -
         dtw_band_frac=0.2,
     )
     assert sag.shape == (3, 2)
-    assert np.allclose(sag[:, 0], np.asarray([-100.0, 100.0, 300.0]))
-    assert np.allclose(sag[:, 1], np.asarray([-5.0, 0.0, 5.0]))
+    assert np.isnan(sag[0, :]).all()
+    assert np.allclose(sag[1, :], np.asarray([100.0, 0.0]))
+    assert np.isnan(sag[2, :]).all()
 
 
 def test_compute_ap_ml_um_from_refextract_raises_on_missing_artifacts(tmp_path: Path) -> None:
