@@ -108,11 +108,12 @@ fit_gene_gam <- function(
   edu_pos = NULL,
   batch = NULL,
   animal = NULL,
+  use_theta = TRUE,
   shrinkage_basis = c("shrink", "standard"),
   k_r = 5,
   k_theta = 8,
-  k_uv = 30,
-  k_uvr = 15,
+  k_uv = 15,
+  k_uvr = 10,
   k_r_uvr = 5,
   k_rtheta = c(5, 8),
   gamma = 2.5,
@@ -124,13 +125,13 @@ fit_gene_gam <- function(
   if (length(y) != length(sf) || length(y) != length(r_um) || length(y) != length(theta) || length(y) != length(AP_um) || length(y) != length(ML_um)) {
     stop("y, sf, r_um, theta, AP_um, ML_um must have the same length.")
   }
+  if (!is.logical(use_theta) || length(use_theta) != 1) stop("use_theta must be TRUE/FALSE.")
   if (!is.numeric(y)) stop("y must be numeric.")
   if (any(!is.finite(y))) stop("y must be finite (no NA/Inf).")
   if (any(y < 0)) stop("y must be non-negative (counts).")
   if (!is.numeric(sf)) stop("sf must be numeric.")
   if (any(!is.finite(sf)) || any(sf <= 0)) stop("sf must be finite and > 0.")
-  mean_log_sf <- mean(log(sf))
-  if (!is.finite(mean_log_sf)) stop("mean(log(sf)) must be finite.")
+  # Size factor is treated as a fixed offset; we do not estimate an additional log(sf) slope.
   if (!is.numeric(r_um)) stop("r_um must be numeric.")
   if (any(!is.finite(r_um))) stop("r_um must be finite (no NA/Inf).")
   theta <- wrap_theta(theta)
@@ -142,7 +143,6 @@ fit_gene_gam <- function(
   bs_r <- if (shrinkage_basis == "shrink") "cs" else "cr"
 
   df <- data.frame(y = y, sf = sf, r_um = r_um, theta = theta, AP_um = AP_um, ML_um = ML_um)
-  df$log_sf_c <- log(sf) - mean_log_sf
   has_pos <- FALSE
   if (!is.null(brdu_pos) || !is.null(edu_pos)) {
     if (is.null(brdu_pos) || is.null(edu_pos)) stop("Provide both brdu_pos and edu_pos, or neither.")
@@ -165,23 +165,23 @@ fit_gene_gam <- function(
     df$animal <- as.factor(animal)
     has_animal <- TRUE
   }
-  knots <- list(theta = c(0, 2 * pi))
+  knots <- if (isTRUE(use_theta)) list(theta = c(0, 2 * pi)) else list()
 
-  base_terms <- "offset(log(sf)) + log_sf_c"
+  base_terms <- "offset(log(sf))"
   if (isTRUE(has_animal)) base_terms <- paste(base_terms, "+ animal")
   if (isTRUE(has_batch)) {
     if (isTRUE(has_animal)) {
-      base_terms <- paste(base_terms, "+ s(batch, bs = 're') + log_sf_c:batch")
+      base_terms <- paste(base_terms, "+ s(batch, bs = 're')")
     } else {
-      base_terms <- paste(base_terms, "+ batch + log_sf_c:batch")
+      base_terms <- paste(base_terms, "+ batch")
     }
   }
   smooth_terms <- paste0(
-    " + s(theta, bs = 'cc', k = k_theta)",
+    if (!isTRUE(use_theta)) "" else " + s(theta, bs = 'cc', k = k_theta)",
     sprintf(" + s(AP_um, ML_um, bs = '%s', k = k_uv)", bs_uv),
     sprintf(" + s(r_um, bs = '%s', k = k_r)", bs_r),
     sprintf(" + ti(AP_um, ML_um, r_um, d = c(2, 1), bs = c('%s', '%s'), k = c(k_uvr, k_r_uvr))", bs_uv, bs_r),
-    sprintf(" + ti(r_um, theta, bs = c('%s', 'cc'), k = k_rtheta)", bs_r)
+    if (!isTRUE(use_theta)) "" else sprintf(" + ti(r_um, theta, bs = c('%s', 'cc'), k = k_rtheta)", bs_r)
   )
   pos_terms <- if (!has_pos) "" else " + brdu_pos + edu_pos + brdu_pos:edu_pos"
   rhs <- paste0(base_terms, pos_terms, smooth_terms)
@@ -206,11 +206,9 @@ fit_gene_gam <- function(
       discrete = isTRUE(bam_discrete),
       nthreads = as.integer(bam_nthreads)
     )
-    fit$mean_log_sf <- mean_log_sf
     fit
   } else {
     fit <- gam(formula, data = df, family = nb(), method = method, knots = knots, select = TRUE, gamma = gamma)
-    fit$mean_log_sf <- mean_log_sf
     fit
   }
 }
@@ -225,19 +223,10 @@ effect_sizes_from_fit <- function(
   batch_ref = NULL,
   has_animal = FALSE,
   animal_ref = NULL,
+  use_theta = TRUE,
   sf_ref = 1.0,
   n_theta = 64
 ) {
-  mean_log_sf <- NA_real_
-  if ("mean_log_sf" %in% names(fit)) {
-    mean_log_sf <- as.numeric(fit$mean_log_sf)
-  } else if ("model" %in% names(fit) && ("sf" %in% names(fit$model))) {
-    mean_log_sf <- mean(log(as.numeric(fit$model$sf)))
-  }
-  if (!is.finite(mean_log_sf)) {
-    stop("Fit is missing mean_log_sf (required for log_sf_c). Refit with updated scripts/gam/inm_gam.R.")
-  }
-
   r_q <- as.numeric(quantile(r_um, probs = c(0.1, 0.9), names = FALSE))
   r_lo <- r_q[[1]]
   r_hi <- r_q[[2]]
@@ -276,6 +265,8 @@ effect_sizes_from_fit <- function(
     nd
   }
 
+  if (!is.logical(use_theta) || length(use_theta) != 1) stop("use_theta must be TRUE/FALSE.")
+
   shrink_soft <- function(fit, se) {
     fit <- as.matrix(fit)
     se <- as.matrix(se)
@@ -313,13 +304,13 @@ effect_sizes_from_fit <- function(
   }
 
   amp_at_r <- function(r0) {
+    if (!isTRUE(use_theta)) return(NA_real_)
     nd <- data.frame(
       r_um = rep(r0, length(theta_grid)),
       theta = theta_grid,
       AP_um = ap_ref,
       ML_um = ml_ref,
-      sf = sf_ref,
-      log_sf_c = log(sf_ref) - mean_log_sf
+      sf = sf_ref
     )
     nd <- add_pos(nd)
     pred_terms <- predict(fit, newdata = nd, type = "terms", se.fit = TRUE)
@@ -332,15 +323,14 @@ effect_sizes_from_fit <- function(
   cycle_amp_mid <- amp_at_r(r_mid)
   cycle_amp_lo <- amp_at_r(r_lo)
   cycle_amp_hi <- amp_at_r(r_hi)
-  gating_index <- cycle_amp_hi - cycle_amp_lo
+  gating_index <- if (!isTRUE(use_theta)) NA_real_ else (cycle_amp_hi - cycle_amp_lo)
 
   nd_grad <- data.frame(
     r_um = c(r_lo, r_hi),
     theta = c(0, 0),
     AP_um = ap_ref,
     ML_um = ml_ref,
-    sf = sf_ref,
-    log_sf_c = log(sf_ref) - mean_log_sf
+    sf = sf_ref
   )
   nd_grad <- add_pos(nd_grad)
   pred_terms_grad <- predict(fit, newdata = nd_grad, type = "terms", se.fit = TRUE)
@@ -356,10 +346,14 @@ effect_sizes_from_fit <- function(
 }
 
 extract_component_pvals <- function(fit) {
+  log_p_min <- log(.Machine$double.xmin)
   empty_pvals <- list(
     p_spatial = NA_real_, p_cycle = NA_real_, p_interaction = NA_real_,
     p_apml = NA_real_, p_apml_r_um = NA_real_,
-    p_brdu_pos = NA_real_, p_edu_pos = NA_real_, p_brdu_edu = NA_real_
+    p_brdu_pos = NA_real_, p_edu_pos = NA_real_, p_brdu_edu = NA_real_,
+    log_p_spatial = NA_real_, log_p_cycle = NA_real_, log_p_interaction = NA_real_,
+    log_p_apml = NA_real_, log_p_apml_r_um = NA_real_,
+    log_p_brdu_pos = NA_real_, log_p_edu_pos = NA_real_, log_p_brdu_edu = NA_real_
   )
   sum_fit <- summary(fit)
   st <- sum_fit$s.table
@@ -372,21 +366,65 @@ extract_component_pvals <- function(fit) {
   p_col <- if ("p-value" %in% colnames(st)) "p-value" else NA_character_
   if (is.na(p_col)) return(empty_pvals)
 
+  clamp_logp <- function(lp) {
+    if (!is.finite(lp)) {
+      if (is.infinite(lp) && lp < 0) return(log_p_min)
+      return(NA_real_)
+    }
+    if (lp > 0) return(0.0)
+    lp
+  }
+
   clamp_p <- function(p) {
     if (!is.finite(p)) return(NA_real_)
-    if (p < 0) return(0.0)
+    if (p <= 0) return(.Machine$double.xmin)
     if (p > 1) return(1.0)
     p
   }
 
-  pick_p <- function(regex, label) {
-    idx <- which(grepl(regex, rn_compact, perl = TRUE))
-    if (length(idx) == 0) return(NA_real_)
-    if (length(idx) > 1) warning(sprintf("Multiple smooth terms matched %s; using first.", label))
-    clamp_p(as.numeric(st[idx[[1]], p_col]))
+  p_from_logp <- function(lp) {
+    lp <- clamp_logp(lp)
+    if (!is.finite(lp)) return(NA_real_)
+    if (lp < log_p_min) return(.Machine$double.xmin)
+    exp(lp)
   }
 
-  pick_p_param <- function(name) {
+  smooth_logp <- function(idx) {
+    idx <- as.integer(idx)
+    if (!is.finite(idx) || idx < 1 || idx > nrow(st)) return(NA_real_)
+    if ("F" %in% colnames(st)) {
+      fval <- as.numeric(st[idx, "F"])
+      df1 <- as.numeric(st[idx, "Ref.df"])
+      df2 <- as.numeric(fit$df.residual)
+      if (!is.finite(fval) || !is.finite(df1) || df1 <= 0 || !is.finite(df2) || df2 <= 0) return(NA_real_)
+      clamp_logp(pf(fval, df1 = df1, df2 = df2, lower.tail = FALSE, log.p = TRUE))
+    } else if ("Chi.sq" %in% colnames(st)) {
+      chi <- as.numeric(st[idx, "Chi.sq"])
+      df_col <- if ("Ref.df" %in% colnames(st)) "Ref.df" else if ("edf" %in% colnames(st)) "edf" else NA_character_
+      if (is.na(df_col)) return(NA_real_)
+      dfv <- as.numeric(st[idx, df_col])
+      if (!is.finite(chi) || !is.finite(dfv) || dfv <= 0) return(NA_real_)
+      clamp_logp(pchisq(chi, df = dfv, lower.tail = FALSE, log.p = TRUE))
+    } else {
+      NA_real_
+    }
+  }
+
+  pick_smooth <- function(regex, label) {
+    idx <- which(grepl(regex, rn_compact, perl = TRUE))
+    if (length(idx) == 0) return(list(p = NA_real_, log_p = NA_real_))
+    if (length(idx) > 1) warning(sprintf("Multiple smooth terms matched %s; using first.", label))
+    idx <- idx[[1]]
+    p0 <- as.numeric(st[idx, p_col])
+    if (is.finite(p0) && p0 > 0) {
+      lp <- clamp_logp(log(p0))
+      return(list(p = clamp_p(p0), log_p = lp))
+    }
+    lp <- smooth_logp(idx)
+    list(p = p_from_logp(lp), log_p = lp)
+  }
+
+  pick_param <- function(name) {
     # Prefer summary table, but fall back to a Wald p-value from coef+Vp
     # (some stripped/edge fits can produce NaN p-values in summary()).
     p0 <- NA_real_
@@ -403,37 +441,56 @@ extract_component_pvals <- function(fit) {
         p0 <- as.numeric(pt[name, col])
       }
     }
-    if (is.finite(p0)) return(clamp_p(p0))
+    if (is.finite(p0) && p0 > 0) return(list(p = clamp_p(p0), log_p = clamp_logp(log(p0))))
 
     b <- fit$coefficients
-    if (is.null(b) || !(name %in% names(b))) return(NA_real_)
+    if (is.null(b) || !(name %in% names(b))) return(list(p = NA_real_, log_p = NA_real_))
     V <- fit$Vp
-    if (is.null(V) || !is.matrix(V) || nrow(V) != length(b) || ncol(V) != length(b)) return(NA_real_)
+    if (is.null(V) || !is.matrix(V) || nrow(V) != length(b) || ncol(V) != length(b)) return(list(p = NA_real_, log_p = NA_real_))
     se <- sqrt(diag(V))
-    if (any(!is.finite(se))) return(NA_real_)
+    if (any(!is.finite(se))) return(list(p = NA_real_, log_p = NA_real_))
     names(se) <- names(b)
-    if (!(name %in% names(se))) return(NA_real_)
+    if (!(name %in% names(se))) return(list(p = NA_real_, log_p = NA_real_))
     tval <- as.numeric(b[[name]] / se[[name]])
-    if (!is.finite(tval)) return(NA_real_)
+    if (!is.finite(tval)) return(list(p = NA_real_, log_p = NA_real_))
     df <- fit$df.residual
-    if (is.null(df) || !is.finite(df) || df <= 0) {
-      clamp_p(2 * pnorm(abs(tval), lower.tail = FALSE))
+    log_tail <- if (is.null(df) || !is.finite(df) || df <= 0) {
+      pnorm(abs(tval), lower.tail = FALSE, log.p = TRUE)
     } else {
-      clamp_p(2 * pt(abs(tval), df = df, lower.tail = FALSE))
+      pt(abs(tval), df = df, lower.tail = FALSE, log.p = TRUE)
     }
+    log_p <- clamp_logp(log(2) + log_tail)
+    list(p = p_from_logp(log_p), log_p = log_p)
   }
 
+  sp <- pick_smooth("^s\\(r_um\\)$", "s(r_um)")
+  cy <- pick_smooth("^s\\(theta\\)$", "s(theta)")
+  it <- pick_smooth("^ti\\(r_um,theta\\)$", "ti(r_um,theta)")
+  ap <- pick_smooth("^s\\(AP_um,ML_um\\)$", "s(AP_um,ML_um)")
+  ap3 <- pick_smooth("^ti\\((?=.*AP_um)(?=.*ML_um)(?=.*r_um).+\\)$", "ti(AP_um,ML_um,r_um)")
+  br <- pick_param("brdu_pos")
+  ed <- pick_param("edu_pos")
+  be <- pick_param("brdu_pos:edu_pos")
+
   list(
-    p_spatial = pick_p("^s\\(r_um\\)$", "s(r_um)"),
-    p_cycle = pick_p("^s\\(theta\\)$", "s(theta)"),
-    p_interaction = pick_p("^ti\\(r_um,theta\\)$", "ti(r_um,theta)"),
-    p_apml = pick_p("^s\\(AP_um,ML_um\\)$", "s(AP_um,ML_um)"),
+    p_spatial = sp$p,
+    p_cycle = cy$p,
+    p_interaction = it$p,
+    p_apml = ap$p,
     # mgcv may reorder tensor interaction term labels (e.g. "ti(r_um,AP_um,ML_um)").
     # Use lookaheads so we match any ti() term containing all three variables, regardless of order.
-    p_apml_r_um = pick_p("^ti\\((?=.*AP_um)(?=.*ML_um)(?=.*r_um).+\\)$", "ti(AP_um,ML_um,r_um)"),
-    p_brdu_pos = clamp_p(pick_p_param("brdu_pos")),
-    p_edu_pos = clamp_p(pick_p_param("edu_pos")),
-    p_brdu_edu = clamp_p(pick_p_param("brdu_pos:edu_pos"))
+    p_apml_r_um = ap3$p,
+    p_brdu_pos = br$p,
+    p_edu_pos = ed$p,
+    p_brdu_edu = be$p,
+    log_p_spatial = sp$log_p,
+    log_p_cycle = cy$log_p,
+    log_p_interaction = it$log_p,
+    log_p_apml = ap$log_p,
+    log_p_apml_r_um = ap3$log_p,
+    log_p_brdu_pos = br$log_p,
+    log_p_edu_pos = ed$log_p,
+    log_p_brdu_edu = be$log_p
   )
 }
 
@@ -450,7 +507,7 @@ fit_panel <- function(
   k_r = 5,
   k_theta = 8,
   k_uv = 30,
-  k_uvr = 15,
+  k_uvr = 10,
   k_r_uvr = 5,
   k_rtheta = c(5, 8),
   gamma = 2.5,

@@ -21,11 +21,25 @@ read_panel_tsv <- function(in_dir) {
   if (!all(c("cell_id", "x", "theta", "s") %in% names(cells))) {
     stop("cells.tsv must contain: cell_id, x, theta, s")
   }
+  if (!all(c("r_um", "AP_um", "ML_um") %in% names(cells))) {
+    stop("cells.tsv must contain: r_um, AP_um, ML_um")
+  }
   if (!("cell_id" %in% names(counts_df))) stop("counts.tsv must contain cell_id.")
 
   counts_df <- counts_df[match(cells$cell_id, counts_df$cell_id), , drop = FALSE]
   counts_mat <- as.matrix(counts_df[, setdiff(names(counts_df), "cell_id"), drop = FALSE])
   storage.mode(counts_mat) <- "numeric"
+
+  # Hard filter requested: keep only shallow cells.
+  r_um_all <- as.numeric(cells$r_um)
+  if (any(!is.finite(r_um_all))) stop("cells$r_um must be finite.")
+  R_UM_MAX <- 300
+  keep <- r_um_all < R_UM_MAX
+  if (sum(keep) <= 0) stop(sprintf("r_um < %d filter removed all cells.", R_UM_MAX))
+  if (sum(keep) < length(keep)) {
+    cells <- cells[keep, , drop = FALSE]
+    counts_mat <- counts_mat[keep, , drop = FALSE]
+  }
 
   list(cells = cells, counts = counts_mat, fit_results = fit_results, truth = truth)
 }
@@ -83,9 +97,9 @@ plot_pvals <- function(out_png, fit_results, truth) {
     abline(h = 2, col = "#d62728", lty = 2) # ~ p=0.01
   }
 
-  bxp(safe_log10p(df$p_spatial), "Spatial: s(r)")
+  bxp(safe_log10p(df$p_spatial), "Spatial: s(r_um)")
   bxp(safe_log10p(df$p_cycle), "Cycle: s(theta)")
-  bxp(safe_log10p(df$p_interaction), "Interaction: ti(r,theta)")
+  bxp(safe_log10p(df$p_interaction), "Interaction: ti(r_um,theta)")
 }
 
 pick_representative_genes <- function(fit_results, truth) {
@@ -107,14 +121,22 @@ pick_representative_genes <- function(fit_results, truth) {
   )
 }
 
-plot_gene_surface <- function(out_png, gene, y, s, r, theta) {
-  fit <- fit_gene_gam(y = y, sf = s, r = r, theta = theta)
+plot_gene_surface <- function(out_png, gene, y, s, r_um, theta, AP_um, ML_um) {
+  fit <- fit_gene_gam(y = y, sf = s, r_um = r_um, theta = theta, AP_um = AP_um, ML_um = ML_um)
 
-  r_seq <- as.numeric(quantile(r, probs = seq(0.02, 0.98, length.out = 60)))
+  r_seq <- as.numeric(quantile(r_um, probs = seq(0.02, 0.98, length.out = 60)))
   theta_seq <- seq(0, 2 * pi, length.out = 90)
 
-  grid <- expand.grid(r = r_seq, theta = theta_seq)
+  ap_ref <- as.numeric(median(AP_um))
+  ml_ref <- as.numeric(median(ML_um))
+  grid <- expand.grid(r_um = r_seq, theta = theta_seq)
+  grid$AP_um <- ap_ref
+  grid$ML_um <- ml_ref
   grid$sf <- median(s)
+  if (!("mean_log_sf" %in% names(fit)) || !is.finite(as.numeric(fit$mean_log_sf))) {
+    stop("fit is missing mean_log_sf (required for log_sf_c). Refit with updated scripts/gam/inm_gam.R.")
+  }
+  grid$log_sf_c <- log(grid$sf) - as.numeric(fit$mean_log_sf)
 
   mu <- as.numeric(predict(fit, newdata = grid, type = "response"))
   z <- matrix(mu, nrow = length(r_seq), ncol = length(theta_seq), byrow = FALSE)
@@ -128,7 +150,7 @@ plot_gene_surface <- function(out_png, gene, y, s, r, theta) {
     x = r_seq,
     y = theta_seq,
     z = z_plot,
-    xlab = "r = x - m(theta)",
+    xlab = "r_um",
     ylab = "theta (radians)",
     main = sprintf("Fitted surface: %s (log10(mu+1))", gene),
     col = hcl.colors(64, "YlOrRd", rev = FALSE)
@@ -150,7 +172,7 @@ panel <- read_panel_tsv(in_dir)
 cells <- panel$cells
 
 coupling <- fit_inm_coupling_gam(x = cells$x, theta = cells$theta, k_theta = 8)
-r <- coupling$r_hat
+r_um <- as.numeric(cells$r_um)
 
 plot_coupling(
   out_png = file.path(out_dir, "coupling.png"),
@@ -180,8 +202,10 @@ if (!is.null(panel$fit_results)) {
         gene = gene,
         y = panel$counts[, idx],
         s = cells$s,
-        r = r,
-        theta = cells$theta
+        r_um = r_um,
+        theta = cells$theta,
+        AP_um = as.numeric(cells$AP_um),
+        ML_um = as.numeric(cells$ML_um)
       )
     }
   }

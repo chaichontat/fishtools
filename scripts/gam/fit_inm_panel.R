@@ -1,7 +1,5 @@
 #!/usr/bin/env Rscript
 
-source("scripts/gam/inm_gam.R")
-
 read_panel_tsv <- function(in_dir) {
   cells <- read.delim(file.path(in_dir, "cells.tsv"), stringsAsFactors = FALSE, check.names = FALSE)
   counts_df <- read.delim(file.path(in_dir, "counts.tsv"), stringsAsFactors = FALSE, check.names = FALSE)
@@ -26,8 +24,12 @@ read_panel_tsv <- function(in_dir) {
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 1) {
-  cat("Usage: Rscript scripts/gam/fit_inm_panel.R IN_DIR [OUT_TSV] [--no-pos] [--threads N] [--basis shrink|standard] [--priority-genes CSV] [--no-diagnostics] [--diagnostics] [--diagnostics-all] [--diagnostics-p P]\n")
-  cat("  --threads N controls gene-parallelism (N genes fit concurrently); per-gene mgcv threading is forced to 1.\n")
+  cat("Usage: Rscript scripts/gam/fit_inm_panel.R IN_DIR [OUT_TSV] [--no-pos] [--no-theta] [--threads N] [--omp-threads N] [--basis shrink|standard] [--k-uv N] [--r-um-max UM] [--no-r-um-filter] [--priority-genes CSV] [--no-diagnostics] [--diagnostics] [--diagnostics-all] [--diagnostics-p P]\n")
+  cat("  --threads N controls gene-parallelism (N genes fit concurrently; default: 1); per-gene mgcv threading is forced to 1.\n")
+  cat("  --omp-threads N controls OMP_NUM_THREADS (default: 8).\n")
+  cat("  --k-uv N controls the AP/ML smooth basis dimension k for s(AP_um, ML_um) (default: 15).\n")
+  cat("  --r-um-max UM filters cells to r_um < UM (default: 300). Use --no-r-um-filter to disable.\n")
+  cat("  --no-theta removes theta smooth terms (s(theta) and ti(r_um,theta)).\n")
   cat("  Diagnostics are written by default (per gene); use --no-diagnostics to disable.\n")
   quit(status = 2)
 }
@@ -38,8 +40,13 @@ fit_error_path <- if (grepl("\\.tsv$", out_tsv)) sub("\\.tsv$", ".errors.tsv", o
 opts <- if (length(args) >= 3) args[3:length(args)] else character(0)
 parse_opts <- function(opts) {
   disable_pos <- FALSE
+  use_theta <- TRUE
   threads <- 1L
-  basis <- "shrink"
+  omp_threads <- 8L
+  basis <- "standard"
+  k_uv <- 15L
+  r_um_max <- 300.0
+  disable_r_um_filter <- FALSE
   priority_genes <- c("Eomes", "Nr2f2")
   diagnostics <- TRUE
   diagnostics_all <- TRUE
@@ -49,6 +56,16 @@ parse_opts <- function(opts) {
     opt <- opts[[i]]
     if (opt == "--no-pos") {
       disable_pos <- TRUE
+      i <- i + 1L
+      next
+    }
+    if (opt == "--no-theta") {
+      use_theta <- FALSE
+      i <- i + 1L
+      next
+    }
+    if (opt == "--no-r-um-filter") {
+      disable_r_um_filter <- TRUE
       i <- i + 1L
       next
     }
@@ -66,11 +83,35 @@ parse_opts <- function(opts) {
       i <- i + 2L
       next
     }
+    if (opt == "--omp-threads") {
+      if (i == length(opts)) stop("--omp-threads requires an integer value.")
+      val <- suppressWarnings(as.integer(opts[[i + 1L]]))
+      if (!is.finite(val) || is.na(val) || val < 1) stop("--omp-threads must be an integer >= 1.")
+      omp_threads <- val
+      i <- i + 2L
+      next
+    }
     if (opt == "--basis") {
       if (i == length(opts)) stop("--basis requires a value: shrink|standard.")
       val <- as.character(opts[[i + 1L]])
       if (!(val %in% c("shrink", "standard"))) stop("--basis must be one of: shrink, standard.")
       basis <- val
+      i <- i + 2L
+      next
+    }
+    if (opt == "--k-uv") {
+      if (i == length(opts)) stop("--k-uv requires an integer value.")
+      val <- suppressWarnings(as.integer(opts[[i + 1L]]))
+      if (!is.finite(val) || is.na(val) || val < 4) stop("--k-uv must be an integer >= 4.")
+      k_uv <- val
+      i <- i + 2L
+      next
+    }
+    if (opt == "--r-um-max") {
+      if (i == length(opts)) stop("--r-um-max requires a numeric value.")
+      val <- suppressWarnings(as.numeric(opts[[i + 1L]]))
+      if (!is.finite(val) || is.na(val) || val <= 0) stop("--r-um-max must be a finite number > 0.")
+      r_um_max <- val
       i <- i + 2L
       next
     }
@@ -110,8 +151,13 @@ parse_opts <- function(opts) {
   }
   list(
     disable_pos = disable_pos,
+    use_theta = use_theta,
     threads = threads,
+    omp_threads = omp_threads,
     basis = basis,
+    k_uv = k_uv,
+    r_um_max = r_um_max,
+    disable_r_um_filter = disable_r_um_filter,
     priority_genes = priority_genes,
     diagnostics = diagnostics,
     diagnostics_all = diagnostics_all,
@@ -121,12 +167,22 @@ parse_opts <- function(opts) {
 
 parsed <- parse_opts(opts)
 disable_pos <- parsed$disable_pos
+use_theta <- parsed$use_theta
 threads <- parsed$threads
+omp_threads <- parsed$omp_threads
 basis <- parsed$basis
+k_uv <- parsed$k_uv
+r_um_max <- parsed$r_um_max
+disable_r_um_filter <- parsed$disable_r_um_filter
 priority_genes <- parsed$priority_genes
 diagnostics <- parsed$diagnostics
 diagnostics_all <- parsed$diagnostics_all
 diagnostics_p <- parsed$diagnostics_p
+
+Sys.setenv(OMP_NUM_THREADS = as.character(as.integer(omp_threads)))
+cat(sprintf("Setting OMP_NUM_THREADS=%d\n", as.integer(omp_threads)))
+
+source("scripts/gam/inm_gam.R")
 
 panel <- read_panel_tsv(in_dir)
 
@@ -135,20 +191,23 @@ panel <- read_panel_tsv(in_dir)
 	if (!all(c("r_um", "AP_um", "ML_um") %in% names(cells))) {
 	  stop("cells.tsv must contain: r_um, AP_um, ML_um (in addition to cell_id, x, theta, s)")
 	}
-  # Hard filter requested: keep only shallow cells.
 	  r_um_all <- as.numeric(cells$r_um)
 	  if (any(!is.finite(r_um_all))) stop("cells$r_um must be finite.")
-	  R_UM_MAX <- 300
-	  GAM_GAMMA <- 2.5
-	  keep <- r_um_all < R_UM_MAX
-	  n_keep <- sum(keep)
-	  if (!is.finite(n_keep) || n_keep <= 0) stop(sprintf("r_um < %d filter removed all cells.", R_UM_MAX))
-  if (n_keep < length(keep)) {
-    cat(sprintf("Filtering cells: keeping %d/%d with r_um < %d\n", n_keep, length(keep), R_UM_MAX))
-    cells <- cells[keep, , drop = FALSE]
-    panel$counts <- panel$counts[keep, , drop = FALSE]
-    panel$cells <- cells
-  }
+  GAM_GAMMA <- 2.5
+    R_UM_MAX_USED <- if (isTRUE(disable_r_um_filter)) Inf else as.numeric(r_um_max)
+    if (isTRUE(disable_r_um_filter)) {
+      cat("r_um filter disabled: using all cells (subject to finite AP/ML filtering)\n")
+    } else {
+	    keep <- r_um_all < R_UM_MAX_USED
+	    n_keep <- sum(keep)
+	    if (!is.finite(n_keep) || n_keep <= 0) stop(sprintf("r_um < %g filter removed all cells.", R_UM_MAX_USED))
+      if (n_keep < length(keep)) {
+        cat(sprintf("Filtering cells: keeping %d/%d with r_um < %g\n", n_keep, length(keep), R_UM_MAX_USED))
+        cells <- cells[keep, , drop = FALSE]
+        panel$counts <- panel$counts[keep, , drop = FALSE]
+        panel$cells <- cells
+      }
+    }
   # Additional hard filter: drop rows with non-finite AP/ML coordinates.
   ap_um_all <- as.numeric(cells$AP_um)
   ml_um_all <- as.numeric(cells$ML_um)
@@ -350,6 +409,8 @@ done <- character(0)
       "r_um_max",
 	    "p_spatial", "p_cycle", "p_interaction", "p_apml", "p_apml_r_um",
 	    "p_brdu_pos", "p_edu_pos", "p_brdu_edu",
+      "log_p_spatial", "log_p_cycle", "log_p_interaction", "log_p_apml", "log_p_apml_r_um",
+      "log_p_brdu_pos", "log_p_edu_pos", "log_p_brdu_edu",
 	    "cycle_amp_link", "spatial_grad_link", "gating_index_link"
 	  )
 	  if (!identical(names(existing), expected_cols)) {
@@ -366,6 +427,8 @@ if (threads > 1 && .Platform$OS.type != "unix") {
   stop("--threads > 1 requires a Unix-like OS (forking).")
 }
 cat(sprintf("Total genes=%d; remaining_rows=%d; threads=%d; basis=%s\n", length(genes), remaining_rows, threads, basis))
+cat(sprintf("AP/ML smooth basis dimension: k_uv=%d\n", as.integer(k_uv)))
+cat(sprintf("Theta terms enabled: %s\n", if (isTRUE(use_theta)) "yes" else "no"))
 
 write_fit_error <- function(gene, msg) {
   err_row <- data.frame(gene = gene, error = msg, stringsAsFactors = FALSE)
@@ -390,7 +453,7 @@ na_row <- function(gene) {
   data.frame(
     gene = gene,
     inm_r2 = coupling$r2,
-    r_um_max = R_UM_MAX,
+    r_um_max = R_UM_MAX_USED,
     p_spatial = NA_real_,
     p_cycle = NA_real_,
     p_interaction = NA_real_,
@@ -399,6 +462,14 @@ na_row <- function(gene) {
     p_brdu_pos = NA_real_,
     p_edu_pos = NA_real_,
     p_brdu_edu = NA_real_,
+    log_p_spatial = NA_real_,
+    log_p_cycle = NA_real_,
+    log_p_interaction = NA_real_,
+    log_p_apml = NA_real_,
+    log_p_apml_r_um = NA_real_,
+    log_p_brdu_pos = NA_real_,
+    log_p_edu_pos = NA_real_,
+    log_p_brdu_edu = NA_real_,
     cycle_amp_link = NA_real_,
     spatial_grad_link = NA_real_,
     gating_index_link = NA_real_,
@@ -587,7 +658,9 @@ fit_one <- function(task) {
         edu_pos = edu_pos,
         batch = batch_model,
         animal = animal,
+        use_theta = use_theta,
         shrinkage_basis = basis,
+        k_uv = as.integer(k_uv),
         bam_nthreads = 1,
         gamma = GAM_GAMMA
       )
@@ -610,7 +683,8 @@ fit_one <- function(task) {
     has_batch = !is.null(batch_model),
     batch_ref = batch_ref_model,
     has_animal = !is.null(animal),
-    animal_ref = animal_ref
+    animal_ref = animal_ref,
+    use_theta = use_theta
   )
 
   diag_written <- NULL
@@ -653,7 +727,7 @@ fit_one <- function(task) {
   row <- data.frame(
     gene = gene,
     inm_r2 = coupling$r2,
-    r_um_max = R_UM_MAX,
+    r_um_max = R_UM_MAX_USED,
     p_spatial = pv$p_spatial,
     p_cycle = pv$p_cycle,
     p_interaction = pv$p_interaction,
@@ -662,6 +736,14 @@ fit_one <- function(task) {
     p_brdu_pos = pv$p_brdu_pos,
     p_edu_pos = pv$p_edu_pos,
     p_brdu_edu = pv$p_brdu_edu,
+    log_p_spatial = pv$log_p_spatial,
+    log_p_cycle = pv$log_p_cycle,
+    log_p_interaction = pv$log_p_interaction,
+    log_p_apml = pv$log_p_apml,
+    log_p_apml_r_um = pv$log_p_apml_r_um,
+    log_p_brdu_pos = pv$log_p_brdu_pos,
+    log_p_edu_pos = pv$log_p_edu_pos,
+    log_p_brdu_edu = pv$log_p_brdu_edu,
     cycle_amp_link = es$cycle_amp_link,
     spatial_grad_link = es$spatial_grad_link,
     gating_index_link = es$gating_index_link,
