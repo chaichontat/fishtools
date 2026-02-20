@@ -1170,7 +1170,7 @@ def save_ap_ml_mapping_figure(
         center_y = float(legend_pos.y0) + float(legend_pos.height) * float(frac_y)
         panel_y0 = float(np.clip(center_y - 0.5 * panel_h, 0.0, 1.0 - panel_h))
         ax = fig.add_axes([panel_x0, panel_y0, panel_w, panel_h])
-        ax.imshow(img2, cmap="gray", interpolation="nearest", origin="upper", vmin=0.0, vmax=1.0, alpha=0.8)
+        ax.imshow(np.clip(img2 + 0.10, 0.0, 1.0), cmap="gray", interpolation="nearest", origin="upper", vmin=0.0, vmax=1.0)
         neomeso_im = ax.imshow(
             neomeso2,
             cmap=cmap_neomeso,
@@ -1330,10 +1330,11 @@ def save_ap_ml_mapping_figure_sagittal(
     if not panels_show:
         raise ValueError("No sagittal panels selected for display.")
     panels_show.sort(key=lambda p: float(p.ap0_um), reverse=True)
+    if len(panels_show) >= 2:
+        panels_show[0], panels_show[1] = panels_show[1], panels_show[0]
 
-    fig_w_in = 8.4
-    # Keep AP/ML 2D axis size exactly matched to coronal figure geometry.
-    axes_w_frac = 0.58
+    fig_w_in = 9.6
+    axes_w_frac = 0.64
     axes_h_frac = 0.88
     coronal_panel_scale = 1.5
     target_panel_h_in = 1.85
@@ -1448,13 +1449,17 @@ def save_ap_ml_mapping_figure_sagittal(
     legend_pos = ax0.get_position()
     legend_pos_orig = ax0.get_position(original=True)
     n_show = int(len(panels_show))
-    panel_gap = 0.006
     panel_total_w = float(legend_pos_orig.width)
-    panel_scale = 1.9
-    panel_w_base = (panel_total_w - float(max(0, n_show - 1)) * panel_gap) / float(max(1, n_show))
-    panel_w = float(panel_w_base) * float(panel_scale)
+    panel_scale = 1.0
+    panel_w_in = 1.15
+    panel_w = float(panel_w_in / fig_w_in)
+    if n_show > 1:
+        center_step = float(max(0.0, panel_total_w - panel_w)) / float(n_show - 1)
+    else:
+        center_step = 0.0
     panel_h = (panel_h_in / fig_h_in) * float(panel_scale)
-    panel_y0 = float(max(0.005, float(legend_pos.y0) - panel_h + 0.006))
+    panel_axis_gap = 0.06
+    panel_y0 = float(max(0.005, float(legend_pos.y0) - panel_h - panel_axis_gap))
     if panel_w <= 0.03:
         raise ValueError("Figure layout too narrow for horizontal sagittal panels; reduce panel count.")
 
@@ -1463,19 +1468,28 @@ def save_ap_ml_mapping_figure_sagittal(
     # Draw right panels first so left panels are rendered on top.
     for idx_panel in range(n_show - 1, -1, -1):
         p = panels_show[idx_panel]
-        center_x = float(legend_pos_orig.x0) + float(idx_panel) * (panel_w_base + panel_gap) + 0.5 * float(panel_w_base)
+        center_x = float(legend_pos_orig.x0) + 0.5 * float(panel_w) + float(idx_panel) * float(center_step)
         panel_x0 = center_x - 0.5 * float(panel_w)
         axp = fig.add_axes([panel_x0, panel_y0, panel_w, panel_h])
         img2_rot = np.rot90(np.asarray(p.img2), k=-1)
         neomeso2_rot = np.rot90(np.asarray(p.neomeso2), k=-1)
         h_orig, _w_orig = int(np.asarray(p.img2).shape[0]), int(np.asarray(p.img2).shape[1])
         w_rot = int(img2_rot.shape[1])
-        crop_frac = 0.55 if idx_panel >= int(max(0, n_show - 2)) else 0.50
+        if idx_panel == int(n_show - 1):
+            crop_frac = 0.70
+        elif idx_panel == 3:
+            crop_frac = 0.58
+        elif idx_panel >= int(max(0, n_show - 2)):
+            crop_frac = 0.55
+        else:
+            crop_frac = 0.50
         crop_x0 = int(np.floor(float(crop_frac) * float(w_rot)))
         img2_rot = img2_rot[:, crop_x0:]
         neomeso2_rot = neomeso2_rot[:, crop_x0:]
 
-        axp.imshow(img2_rot, cmap="gray", interpolation="nearest", origin="upper", vmin=0.0, vmax=1.0, alpha=0.8)
+        axp.imshow(
+            np.clip(img2_rot + 0.10, 0.0, 1.0), cmap="gray", interpolation="nearest", origin="upper", vmin=0.0, vmax=1.0
+        )
         neomeso_im = axp.imshow(
             neomeso2_rot,
             cmap=cmap_neomeso,
@@ -1607,6 +1621,528 @@ def save_ap_ml_mapping_figure_sagittal(
     plt.close(fig)
 
 
+def save_ap_ml_mapping_figure_combined(
+    *,
+    out_png: Path,
+    data: SurfaceMappingData,
+    b_const: float,
+    outdir: Path,
+    ap_hline_step_um: float,
+    atlas_name: str,
+    brainglobe_config_dir: Path,
+    sagittal_k_step: int,
+    sagittal_n_sample: int,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt  # noqa: E402
+    from matplotlib.collections import LineCollection  # noqa: E402
+    from matplotlib.patches import ConnectionPatch  # noqa: E402
+
+    legend_rgb = _build_legend_rgb(ap_range_um=data.ap_range_um, ml_range_um=data.ml_range_um, b_const=float(b_const))
+    support_mask = _build_legend_range_mask(
+        data=data,
+        row_mask=data.support_mask_tall,
+        n_ap=int(legend_rgb.shape[1]),
+        n_ml=int(legend_rgb.shape[0]),
+    )
+    neomeso_mask = _build_legend_range_mask(
+        data=data,
+        row_mask=data.neomeso_mask_tall,
+        n_ap=int(legend_rgb.shape[1]),
+        n_ml=int(legend_rgb.shape[0]),
+    )
+    neomeso_mask = neomeso_mask & support_mask
+    legend_display = np.ones_like(legend_rgb, dtype=np.float64)
+    legend_display[support_mask] = legend_rgb[support_mask]
+
+    ap_lines = _ap_hline_values(ap_range_um=data.ap_range_um, step_um=float(ap_hline_step_um))
+    if ap_lines.size > 1:
+        ap_lines = ap_lines[1:]
+
+    coronal_panels = _prepare_coronal_slice_panels(
+        outdir=Path(outdir),
+        data=data,
+        ap_lines_um=ap_lines,
+        atlas_name=str(atlas_name),
+        brainglobe_config_dir=Path(brainglobe_config_dir),
+    )
+
+    panels_all = _prepare_sagittal_slice_panels(
+        outdir=Path(outdir),
+        data=data,
+        atlas_name=str(atlas_name),
+        brainglobe_config_dir=Path(brainglobe_config_dir),
+        sagittal_k_step=int(sagittal_k_step),
+        sagittal_n_sample=int(sagittal_n_sample),
+    )
+    if not panels_all:
+        raise ValueError("No sagittal panels available.")
+
+    ks_arr = np.asarray([p.slice_k for p in panels_all], dtype=np.int32)
+    ap0_arr = np.asarray([p.ap0_um for p in panels_all], dtype=np.float64)
+    selected_ks: list[int] = []
+    used: set[int] = set()
+    for ap_t in np.asarray(ap_lines, dtype=np.float64).tolist():
+        d = np.abs(ap0_arr - float(ap_t))
+        order = np.argsort(d)
+        picked = None
+        for oi in order.tolist():
+            k = int(ks_arr[int(oi)])
+            if k not in used:
+                picked = k
+                break
+        if picked is not None:
+            used.add(int(picked))
+            selected_ks.append(int(picked))
+    panels_show = [p for p in panels_all if int(p.slice_k) in set(selected_ks)]
+    if not panels_show:
+        raise ValueError("No sagittal panels selected for display.")
+    panels_show.sort(key=lambda p: float(p.ap0_um), reverse=True)
+    if len(panels_show) >= 2:
+        panels_show[0], panels_show[1] = panels_show[1], panels_show[0]
+
+    fig_w_in = 9.6
+    axes_w_frac = 0.64
+    axes_h_frac = 0.88
+    coronal_panel_scale = 1.5
+    target_panel_h_in = 1.85
+    if ap_lines.size >= 2:
+        step_um = float(np.nanmedian(np.diff(ap_lines.astype(np.float64, copy=False))))
+        frac = float(step_um) / (float(data.ap_range_um[1]) - float(data.ap_range_um[0]))
+        panel_h_frac = float(axes_h_frac) * float(frac) * 0.98
+    else:
+        panel_h_frac = float(axes_h_frac) * 0.12
+    panel_h_frac = float(np.clip(panel_h_frac, 0.055, 0.22)) * float(coronal_panel_scale)
+    fig_h_coronal_in = float(target_panel_h_in) / float(panel_h_frac)
+    fig_h_coronal_in = float(max(fig_h_coronal_in, fig_w_in * (axes_w_frac / axes_h_frac) * 0.35))
+    axis_h_in = float(fig_h_coronal_in) * float(axes_h_frac)
+    top_margin_in = float(fig_h_coronal_in) * (1.0 - (0.08 + float(axes_h_frac)))
+    panel_y0_in = 0.20
+    panel_h_in = 2.28
+    bottom_band_in = panel_y0_in + panel_h_in + 0.15
+    fig_h_in = bottom_band_in + axis_h_in + top_margin_in
+
+    ax0_y0 = bottom_band_in / fig_h_in
+    ax0_h_frac = axis_h_in / fig_h_in
+    fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=200)
+    ax0 = fig.add_axes([0.08, ax0_y0, axes_w_frac, ax0_h_frac])
+
+    ap_min, ap_max = data.ap_range_um
+    ml_min, ml_max = data.ml_range_um
+    ml_supported = np.asarray(data.ml_um_at_t, dtype=np.float64)[np.asarray(data.support_mask_tall, dtype=bool)]
+    ml_supported = ml_supported[np.isfinite(ml_supported)]
+    if ml_supported.size == 0:
+        raise ValueError("No supported (t_all) ML values; cannot set legend x-limits.")
+    ml_xlim_min = float(np.min(ml_supported))
+    ml_xlim_max = float(np.max(ml_supported))
+    pad = 0.03 * float(ml_xlim_max - ml_xlim_min) if ml_xlim_max > ml_xlim_min else 100.0
+    ml_xlim_min -= pad
+    ml_xlim_max += pad
+    ml_xlim_min = float(min(ml_xlim_min, 0.0))
+    ml_xlim_max = float(max(ml_xlim_max, 0.0))
+
+    legend_display_t = np.transpose(legend_display, (1, 0, 2))
+    ax0.imshow(
+        legend_display_t,
+        origin="lower",
+        extent=[ml_min, ml_max, ap_min, ap_max],
+        aspect="auto",
+        alpha=0.65,
+    )
+    support_overlay = np.transpose(support_mask)
+    neomeso_overlay = np.full((legend_rgb.shape[1], legend_rgb.shape[0]), np.nan, dtype=np.float64)
+    neomeso_overlay[support_overlay] = 0.0
+    neomeso_overlay[np.transpose(neomeso_mask)] = 1.0
+    neomeso_im = ax0.imshow(
+        neomeso_overlay,
+        origin="lower",
+        extent=[ml_min, ml_max, ap_min, ap_max],
+        aspect="auto",
+        cmap="gray",
+        alpha=0.35,
+        vmin=0.0,
+        vmax=1.0,
+    )
+    neomeso_im.cmap.set_bad(alpha=0.0)
+    ax0.axvline(0.0, color="#000000", linestyle=":", linewidth=0.9, alpha=0.9)
+    for ap in ap_lines.tolist():
+        ax0.axhline(float(ap), color="#000000", linestyle=":", linewidth=0.9, alpha=0.9)
+
+    ap_vals = np.asarray(data.ap_um_by_slice, dtype=np.float64)
+    for ap in ap_lines.tolist():
+        idx = int(np.argmin(np.abs(ap_vals - float(ap))))
+        ml_row = np.asarray(data.ml_um_at_t[idx], dtype=np.float64)
+        neo_row = np.asarray(data.neomeso_mask_tall[idx], dtype=bool)
+        valid = np.isfinite(ml_row) & neo_row
+        if not np.any(valid):
+            continue
+        run = valid.astype(np.int8, copy=False)
+        starts = np.flatnonzero(np.diff(np.concatenate([[0], run])) == 1)
+        ends = np.flatnonzero(np.diff(np.concatenate([run, [0]])) == -1) + 1
+        for s, e in zip(starts.tolist(), ends.tolist(), strict=True):
+            if int(e) - int(s) < 2:
+                continue
+            x0 = float(np.nanmin(ml_row[int(s) : int(e)]))
+            x1 = float(np.nanmax(ml_row[int(s) : int(e)]))
+            if np.isfinite(x0) and np.isfinite(x1) and x1 > x0:
+                ax0.hlines(float(ap), x0, x1, colors="#ffff00", linewidth=2.0, alpha=0.95)
+
+    for p in panels_all:
+        x = np.asarray(p.ml_curve, dtype=np.float64)
+        y = np.asarray(p.ap_curve, dtype=np.float64)
+        neo = np.asarray(p.neomeso_curve, dtype=bool)
+        finite = np.isfinite(x) & np.isfinite(y)
+        if int(np.count_nonzero(finite)) < 2:
+            continue
+        xy = np.column_stack([x[finite], y[finite]]).astype(np.float64, copy=False)
+        seg = np.stack([xy[:-1], xy[1:]], axis=1)
+        ax0.add_collection(
+            LineCollection(
+                seg,
+                colors=[(1.0, 1.0, 0.0, 0.5)],
+                linewidths=1.2,
+                zorder=6,
+            )
+        )
+        neo_f = neo[finite]
+        if neo_f.size >= 2:
+            neo_seg = neo_f[:-1] & neo_f[1:]
+            if np.any(neo_seg):
+                ax0.add_collection(
+                    LineCollection(
+                        seg[neo_seg],
+                        colors=[(1.0, 1.0, 0.0, 0.95)],
+                        linewidths=2.0,
+                        zorder=7,
+                    )
+                )
+
+    ax0.set_xlabel("ML (um)", fontsize=16)
+    ax0.set_ylabel("AP (um)", fontsize=16)
+    ax0.set_xlim(ml_xlim_min, ml_xlim_max)
+    ax0.set_ylim(float(ap_max), float(ap_min))
+    ax0.set_yticks(ap_lines.tolist())
+    ax0.tick_params(axis="both", labelsize=16)
+    ax0.set_aspect("equal", adjustable="box")
+    ax0.set_anchor("W")
+    for spine in ax0.spines.values():
+        spine.set_visible(False)
+
+    cmap_neomeso = plt.cm.colors.ListedColormap(["#ff00ff"])
+    fig.canvas.draw()
+    legend_pos = ax0.get_position()
+    legend_pos_orig = ax0.get_position(original=True)
+
+    coronal_panel_scale = 1.5
+    panel_x0_base = float(legend_pos.x1) - 0.008
+    panel_x_gap = 0.02
+    if ap_lines.size >= 2:
+        step_um = float(np.nanmedian(np.diff(ap_lines.astype(np.float64, copy=False))))
+        frac = float(step_um) / (float(ap_max) - float(ap_min))
+        panel_h = float(legend_pos_orig.height) * frac * 0.98
+    else:
+        panel_h = float(legend_pos_orig.height) * 0.12
+    panel_h = float(np.clip(panel_h, 0.055, 0.22))
+    panel_h = float(panel_h * coronal_panel_scale)
+    if not coronal_panels:
+        raise ValueError("No coronal panels available.")
+    cor_img_ref = np.asarray(coronal_panels[0][2], dtype=np.float32)
+    if cor_img_ref.ndim != 2:
+        raise ValueError(f"Expected 2D coronal panel image, got shape={cor_img_ref.shape}")
+    cor_h_px = int(cor_img_ref.shape[0])
+    cor_w_px = int(cor_img_ref.shape[1])
+    panel_h_in_cor = float(panel_h) * float(fig_h_in)
+    if panel_h_in_cor <= 1.0e-9:
+        raise ValueError(f"Invalid coronal panel height (in): {panel_h_in_cor}")
+    # Shared physical scale across coronal/sagittal panels (20um isotropic voxels).
+    panel_um_per_in = (float(cor_h_px) * 20.0) / panel_h_in_cor
+    panel_w_in_cor = (float(cor_w_px) * 20.0) / float(panel_um_per_in)
+    panel_w = float(panel_w_in_cor / float(fig_w_in))
+    panel_x0 = float(panel_x0_base + panel_x_gap)
+    if panel_w <= 0.05:
+        raise ValueError("Figure layout too narrow for coronal panel column; increase figure width.")
+
+    coronal_panel_axes: list[tuple[float, "plt.Axes"]] = []
+    y0, y1 = (float(ax0.get_ylim()[0]), float(ax0.get_ylim()[1]))
+    denom = float(y0 - y1)
+    if not np.isfinite(denom) or abs(denom) < 1.0e-9:
+        raise ValueError(f"Invalid ax0 ylim after aspect set: {ax0.get_ylim()}")
+    for panel in coronal_panels:
+        ap_um, slice_i, img2, _cortex2, neomeso2, midline_xy = panel
+        frac_y = (float(y0) - float(ap_um)) / denom
+        center_y = float(legend_pos.y0) + float(legend_pos.height) * float(frac_y)
+        panel_y0 = float(np.clip(center_y - 0.5 * panel_h, 0.0, 1.0 - panel_h))
+        ax = fig.add_axes([panel_x0, panel_y0, panel_w, panel_h])
+        ax.imshow(np.clip(img2 + 0.10, 0.0, 1.0), cmap="gray", interpolation="nearest", origin="upper", vmin=0.0, vmax=1.0)
+        neomeso_im = ax.imshow(
+            neomeso2,
+            cmap=cmap_neomeso,
+            interpolation="nearest",
+            alpha=0.25,
+            origin="upper",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        neomeso_im.cmap.set_bad(alpha=0.0)
+        if midline_xy.ndim == 2 and midline_xy.shape[0] >= 2 and midline_xy.shape[1] == 2:
+            finite = np.isfinite(midline_xy[:, 0]) & np.isfinite(midline_xy[:, 1])
+            if int(np.count_nonzero(finite)) >= 2:
+                xy = midline_xy[finite]
+                seg = np.stack([xy[:-1], xy[1:]], axis=1)
+                lc_all = LineCollection(
+                    seg,
+                    colors=[(1.0, 1.0, 0.0, 0.5)],
+                    linewidths=1.4,
+                    zorder=5,
+                )
+                ax.add_collection(lc_all)
+                seg_mid = 0.5 * (seg[:, 0, :] + seg[:, 1, :])
+                h2, w2 = int(neomeso2.shape[0]), int(neomeso2.shape[1])
+                mx = np.clip(np.rint(seg_mid[:, 0]).astype(np.int64, copy=False), 0, w2 - 1)
+                my = np.clip(np.rint(seg_mid[:, 1]).astype(np.int64, copy=False), 0, h2 - 1)
+                neo_seg = np.isfinite(neomeso2[my, mx]) & (neomeso2[my, mx] > 0.5)
+                if np.any(neo_seg):
+                    lc_neo = LineCollection(
+                        seg[neo_seg],
+                        colors=[(1.0, 1.0, 0.0, 0.95)],
+                        linewidths=2.2,
+                        zorder=6,
+                    )
+                    ax.add_collection(lc_neo)
+
+                idxs = np.flatnonzero(np.asarray(data.slice_keys, dtype=np.int32) == int(slice_i))
+                if idxs.size == 1:
+                    idx = int(idxs[0])
+                    mid_idx = int(np.nanargmin(np.abs(np.asarray(data.ml_um_at_t[idx], dtype=np.float64))))
+                    if 0 <= mid_idx < int(midline_xy.shape[0]) and np.isfinite(midline_xy[mid_idx]).all():
+                        ax.plot(
+                            [float(midline_xy[mid_idx, 0])],
+                            [float(midline_xy[mid_idx, 1])],
+                            marker="o",
+                            markersize=5.0,
+                            color="#0000ff",
+                            alpha=0.95,
+                            markeredgecolor="#ffffff",
+                            markeredgewidth=0.8,
+                            zorder=10,
+                        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_axis_off()
+        ax.text(
+            0.02,
+            0.06,
+            f"AP {ap_um:.0f}um (i={slice_i})",
+            transform=ax.transAxes,
+            fontsize=7,
+            color="w",
+            ha="left",
+            va="bottom",
+        )
+        coronal_panel_axes.append((float(ap_um), ax))
+
+    x_anchor = float(ax0.get_xlim()[1])
+    for ap_um, axp in coronal_panel_axes:
+        fig.add_artist(
+            ConnectionPatch(
+                xyA=(x_anchor, float(ap_um)),
+                coordsA=ax0.transData,
+                xyB=(0.0, 0.5),
+                coordsB=axp.transAxes,
+                arrowstyle="-",
+                linestyle=":",
+                linewidth=1.0,
+                color="#000000",
+                alpha=0.65,
+                zorder=30,
+                clip_on=False,
+            )
+        )
+
+    n_show = int(len(panels_show))
+    panel_total_w = float(legend_pos_orig.width)
+    panel_scale = 1.0
+    panel_meta: dict[int, tuple[float, float, int, np.ndarray, np.ndarray]] = {}
+    panel_w_max = 0.0
+    panel_h_max = 0.0
+    for idx_panel in range(n_show):
+        p = panels_show[idx_panel]
+        img2_rot = np.rot90(np.asarray(p.img2), k=-1)
+        neomeso2_rot = np.rot90(np.asarray(p.neomeso2), k=-1)
+        w_rot = int(img2_rot.shape[1])
+        if idx_panel == int(n_show - 1):
+            crop_frac = 0.70
+        elif idx_panel == 3:
+            crop_frac = 0.58
+        elif idx_panel >= int(max(0, n_show - 2)):
+            crop_frac = 0.55
+        else:
+            crop_frac = 0.50
+        crop_x0 = int(np.floor(float(crop_frac) * float(w_rot)))
+        img2_crop = img2_rot[:, crop_x0:]
+        neomeso2_crop = neomeso2_rot[:, crop_x0:]
+        h_px = int(img2_crop.shape[0])
+        w_px = int(img2_crop.shape[1])
+        panel_h_i = float(((float(h_px) * 20.0) / float(panel_um_per_in)) / float(fig_h_in)) * float(panel_scale)
+        panel_w_i = float(((float(w_px) * 20.0) / float(panel_um_per_in)) / float(fig_w_in)) * float(panel_scale)
+        panel_meta[idx_panel] = (panel_w_i, panel_h_i, crop_x0, img2_crop, neomeso2_crop)
+        panel_w_max = float(max(panel_w_max, panel_w_i))
+        panel_h_max = float(max(panel_h_max, panel_h_i))
+    if panel_w_max <= 0.03:
+        raise ValueError("Figure layout too narrow for horizontal sagittal panels; reduce panel count.")
+    panel_axis_gap = 0.06
+    panel_y0 = float(max(0.005, float(legend_pos.y0) - panel_h_max - panel_axis_gap))
+    if n_show > 1:
+        center_x0 = float(legend_pos_orig.x0) + 0.5 * float(panel_w_max)
+        center_x1 = float(legend_pos_orig.x0) + float(panel_total_w) - 0.5 * float(panel_w_max)
+        center_step = float(center_x1 - center_x0) / float(n_show - 1)
+    else:
+        center_x0 = float(legend_pos_orig.x0) + 0.5 * float(panel_w_max)
+        center_step = 0.0
+
+    sagittal_panel_axes: list[tuple[SagittalPanel, "plt.Axes"]] = []
+    for idx_panel in range(n_show - 1, -1, -1):
+        p = panels_show[idx_panel]
+        panel_w, panel_h, crop_x0, img2_rot, neomeso2_rot = panel_meta[idx_panel]
+        center_x = float(center_x0) + float(idx_panel) * float(center_step)
+        panel_x0 = float(center_x) - 0.5 * float(panel_w)
+        axp = fig.add_axes([panel_x0, panel_y0, panel_w, panel_h])
+        h_orig, _w_orig = int(np.asarray(p.img2).shape[0]), int(np.asarray(p.img2).shape[1])
+
+        axp.imshow(
+            np.clip(img2_rot + 0.10, 0.0, 1.0), cmap="gray", interpolation="nearest", origin="upper", vmin=0.0, vmax=1.0
+        )
+        neomeso_im = axp.imshow(
+            neomeso2_rot,
+            cmap=cmap_neomeso,
+            interpolation="nearest",
+            alpha=0.25,
+            origin="upper",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        neomeso_im.cmap.set_bad(alpha=0.0)
+
+        xy = np.asarray(p.midline_xy_local, dtype=np.float64)
+        if xy.ndim == 2 and xy.shape[0] >= 2 and xy.shape[1] == 2:
+            finite = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
+            if int(np.count_nonzero(finite)) >= 2:
+                xyp_raw = xy[finite]
+                xyp = np.empty_like(xyp_raw)
+                xyp[:, 0] = (float(h_orig) - 1.0) - xyp_raw[:, 1]
+                xyp[:, 1] = xyp_raw[:, 0]
+                xyp[:, 0] -= float(crop_x0)
+                seg = np.stack([xyp[:-1], xyp[1:]], axis=1)
+                axp.add_collection(
+                    LineCollection(
+                        seg,
+                        colors=[(1.0, 1.0, 0.0, 0.5)],
+                        linewidths=1.4,
+                        zorder=5,
+                    )
+                )
+                seg_mid = 0.5 * (seg[:, 0, :] + seg[:, 1, :])
+                h2, w2 = int(neomeso2_rot.shape[0]), int(neomeso2_rot.shape[1])
+                mx = np.clip(np.rint(seg_mid[:, 0]).astype(np.int64, copy=False), 0, w2 - 1)
+                my = np.clip(np.rint(seg_mid[:, 1]).astype(np.int64, copy=False), 0, h2 - 1)
+                neo_seg = np.isfinite(neomeso2_rot[my, mx]) & (neomeso2_rot[my, mx] > 0.5)
+                if np.any(neo_seg):
+                    axp.add_collection(
+                        LineCollection(
+                            seg[neo_seg],
+                            colors=[(1.0, 1.0, 0.0, 0.95)],
+                            linewidths=2.2,
+                            zorder=6,
+                        )
+                    )
+
+        if p.dot_xy_local is not None:
+            dot_x = (float(h_orig) - 1.0) - float(p.dot_xy_local[1])
+            dot_y = float(p.dot_xy_local[0])
+            dot_x -= float(crop_x0)
+            axp.plot(
+                [dot_x],
+                [dot_y],
+                marker="o",
+                markersize=5.0,
+                color="#0000ff",
+                alpha=0.95,
+                markeredgecolor="#ffffff",
+                markeredgewidth=0.8,
+                zorder=10,
+            )
+
+        axp.set_xticks([])
+        axp.set_yticks([])
+        axp.set_axis_off()
+        axp.text(
+            0.02,
+            0.06,
+            f"k={int(p.slice_k)}",
+            transform=axp.transAxes,
+            fontsize=7,
+            color="w",
+            ha="left",
+            va="bottom",
+        )
+        sagittal_panel_axes.append((p, axp))
+
+    ap_anchor_um = 3000.0
+    for p, axp in sagittal_panel_axes:
+        x = np.asarray(p.ml_curve, dtype=np.float64)
+        y = np.asarray(p.ap_curve, dtype=np.float64)
+        finite = np.isfinite(x) & np.isfinite(y)
+        if int(np.count_nonzero(finite)) < 2:
+            continue
+        xf = x[finite]
+        yf = y[finite]
+
+        x_anchor = None
+        y_anchor = None
+        crossings = (yf[:-1] - ap_anchor_um) * (yf[1:] - ap_anchor_um) <= 0.0
+        if np.any(crossings):
+            x_hits: list[float] = []
+            for i in np.flatnonzero(crossings).tolist():
+                y0 = float(yf[int(i)])
+                y1 = float(yf[int(i + 1)])
+                x0 = float(xf[int(i)])
+                x1 = float(xf[int(i + 1)])
+                if abs(y1 - y0) < 1.0e-9:
+                    x_hits.append(0.5 * (x0 + x1))
+                else:
+                    t = (ap_anchor_um - y0) / (y1 - y0)
+                    x_hits.append(x0 + t * (x1 - x0))
+            if x_hits:
+                x_arr = np.asarray(x_hits, dtype=np.float64)
+                x_anchor = float(x_arr[int(np.argmin(np.abs(x_arr)))])
+                y_anchor = float(ap_anchor_um)
+        if x_anchor is None or y_anchor is None:
+            idx = int(np.argmin(np.abs(yf - ap_anchor_um)))
+            x_anchor = float(xf[idx])
+            y_anchor = float(yf[idx])
+
+        fig.add_artist(
+            ConnectionPatch(
+                xyA=(x_anchor, y_anchor),
+                coordsA=ax0.transData,
+                xyB=(0.5, 1.0),
+                coordsB=axp.transAxes,
+                arrowstyle="-",
+                linestyle=":",
+                linewidth=1.0,
+                color="#000000",
+                alpha=0.65,
+                zorder=30,
+                clip_on=False,
+            )
+        )
+
+    fig.savefig(out_png, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Render AP/ML bivariate gradient and compare with coronal atlas panels (brain-cropped)."
@@ -1649,6 +2185,22 @@ def main() -> None:
         help="Also write sagittal view figure (sagittal slices map to curved lines in AP/ML space).",
     )
     p.add_argument(
+        "--write-coronal",
+        action="store_true",
+        help="Also write coronal-only view figure.",
+    )
+    p.add_argument(
+        "--output-combined",
+        type=Path,
+        default=None,
+        help="Output PNG path for combined coronal-right + sagittal-bottom view.",
+    )
+    p.add_argument(
+        "--write-combined",
+        action="store_true",
+        help="Also write a combined figure (shared AP/ML axis with coronal panels on right and sagittal panels on bottom).",
+    )
+    p.add_argument(
         "--ap-hline-step-um",
         type=float,
         default=750.0,
@@ -1671,14 +2223,29 @@ def main() -> None:
     args = p.parse_args()
 
     outdir = Path(args.outdir)
-    out_png = args.output if args.output is not None else (outdir / "ap_ml_mapping_surface.png")
+    write_coronal = bool(args.write_coronal)
+    write_sagittal = bool(args.write_sagittal)
+    write_combined = bool(args.write_combined)
+    if not (write_coronal or write_sagittal or write_combined):
+        write_combined = True
+
+    out_png = (args.output if args.output is not None else (outdir / "ap_ml_mapping_surface.png")) if write_coronal else None
     out_png_sag = (
         (
             args.output_sagittal
             if args.output_sagittal is not None
             else (outdir / f"ap_ml_mapping_surface_sagittal_step{int(args.sagittal_k_step)}.png")
         )
-        if bool(args.write_sagittal)
+        if write_sagittal
+        else None
+    )
+    out_png_combined = (
+        (
+            args.output_combined
+            if args.output_combined is not None
+            else (outdir / f"ap_ml_mapping_surface_combined_step{int(args.sagittal_k_step)}.png")
+        )
+        if write_combined
         else None
     )
     res_ijk_um = (float(args.res_ijk_um[0]), float(args.res_ijk_um[1]), float(args.res_ijk_um[2]))
@@ -1693,17 +2260,18 @@ def main() -> None:
         b_const=float(args.b_const),
         res_ijk_um=res_ijk_um,
     )
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    save_ap_ml_mapping_figure(
-        out_png=out_png,
-        data=data,
-        b_const=float(args.b_const),
-        outdir=outdir,
-        ap_hline_step_um=float(args.ap_hline_step_um),
-        atlas_name=str(args.atlas_name),
-        brainglobe_config_dir=Path(args.brainglobe_config_dir),
-    )
-    print(f"Wrote: {out_png}")
+    if out_png is not None:
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        save_ap_ml_mapping_figure(
+            out_png=out_png,
+            data=data,
+            b_const=float(args.b_const),
+            outdir=outdir,
+            ap_hline_step_um=float(args.ap_hline_step_um),
+            atlas_name=str(args.atlas_name),
+            brainglobe_config_dir=Path(args.brainglobe_config_dir),
+        )
+        print(f"Wrote: {out_png}")
     if out_png_sag is not None:
         out_png_sag.parent.mkdir(parents=True, exist_ok=True)
         save_ap_ml_mapping_figure_sagittal(
@@ -1718,6 +2286,20 @@ def main() -> None:
             sagittal_n_sample=int(args.sagittal_n_sample),
         )
         print(f"Wrote: {out_png_sag}")
+    if out_png_combined is not None:
+        out_png_combined.parent.mkdir(parents=True, exist_ok=True)
+        save_ap_ml_mapping_figure_combined(
+            out_png=out_png_combined,
+            data=data,
+            b_const=float(args.b_const),
+            outdir=outdir,
+            ap_hline_step_um=float(args.ap_hline_step_um),
+            atlas_name=str(args.atlas_name),
+            brainglobe_config_dir=Path(args.brainglobe_config_dir),
+            sagittal_k_step=int(args.sagittal_k_step),
+            sagittal_n_sample=int(args.sagittal_n_sample),
+        )
+        print(f"Wrote: {out_png_combined}")
     print(
         f"Slices={int(data.slice_keys.size)} n_t={int(data.t_grid.size)} "
         f"support={int(np.count_nonzero(data.support_mask_tall))}/{int(data.support_mask_tall.size)} "

@@ -236,6 +236,34 @@ CONDA_NO_PLUGINS=true conda run -n seq python ccf/refextract/midsurface_coords.p
 CONDA_NO_PLUGINS=true conda run -n seq python ccf/refextract/midsurface_coords.py --axis sagittal --slice 180 --t 0.25 --r01 0.8 --transform-to coronal
 ```
 
+### Three.js unfolding viewer (export + build)
+
+Export unfolding assets (writes `manifest.json` and binary arrays under `threejs_unfold/`):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python ccf/refextract/export_unfold_threejs_assets.py \
+  --outdir ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d \
+  --output-dir ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d/threejs_unfold
+```
+
+Build and run the viewer:
+
+```bash
+cd ccf/refextract/threejs_unfold_viewer
+npm install
+npm run build
+npm run dev
+```
+
+Open the viewer with the exported assets path:
+
+```text
+http://localhost:5173/?assets=../../out/refextract/midsurface_neocortex_mesocortex_allocortex_3d/threejs_unfold
+```
+
+If you get a JSON parse error that starts with `<!doctype html>`, the assets URL is wrong and Vite returned `index.html`
+instead of `manifest.json`. Use the URL above, or an absolute `/@fs/.../threejs_unfold` path.
+
 Notes:
 
 - In `*midline_columns.csv`, **`t` is `t_all`**: normalized along-midline arc-length on the full representative path (`[0,1]`; not the volumetric depth field `halfway_u_3d_ds.npy`).

@@ -584,21 +584,31 @@ def main() -> None:
     if not np.all(np.diff(ap_um_vals) >= 0.0):
         raise ValueError("ap_um axis must be monotone increasing to create a slice_i secondary axis.")
 
-    def _ap_um_to_slice_i(y: np.ndarray) -> np.ndarray:
+    def _ap_um_to_slice_i(y: np.ndarray) -> np.ndarray | float:
         yy = np.asarray(y, dtype=np.float64)
-        return _interp_with_linear_extrapolation(
+        scalar = yy.ndim == 0
+        out = _interp_with_linear_extrapolation(
             x=ap_um_vals.astype(np.float64, copy=False),
             y=ap_slice_keys.astype(np.float64, copy=False),
             xq=yy,
         )
+        out = out.reshape(yy.shape)
+        if scalar:
+            return float(out)
+        return out
 
-    def _slice_i_to_ap_um(s: np.ndarray) -> np.ndarray:
+    def _slice_i_to_ap_um(s: np.ndarray) -> np.ndarray | float:
         ss = np.asarray(s, dtype=np.float64)
-        return _interp_with_linear_extrapolation(
+        scalar = ss.ndim == 0
+        out = _interp_with_linear_extrapolation(
             x=ap_slice_keys.astype(np.float64, copy=False),
             y=ap_um_vals.astype(np.float64, copy=False),
             xq=ss,
         )
+        out = out.reshape(ss.shape)
+        if scalar:
+            return float(out)
+        return out
 
     secax = ax.secondary_yaxis("right", functions=(_ap_um_to_slice_i, _slice_i_to_ap_um))
     secax.set_ylabel("coronal slice_i")
