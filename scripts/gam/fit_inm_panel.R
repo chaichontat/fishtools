@@ -1,6 +1,6 @@
 #!/usr/bin/env Rscript
 
-read_panel_tsv <- function(in_dir) {
+read_panel_tsv <- function(in_dir, require_theta = TRUE) {
   cells <- read.delim(file.path(in_dir, "cells.tsv"), stringsAsFactors = FALSE, check.names = FALSE)
   counts_df <- read.delim(file.path(in_dir, "counts.tsv"), stringsAsFactors = FALSE, check.names = FALSE)
   truth_path <- file.path(in_dir, "truth.tsv")
@@ -10,8 +10,10 @@ read_panel_tsv <- function(in_dir) {
     NULL
   }
 
-  if (!all(c("cell_id", "x", "theta", "s") %in% names(cells))) {
-    stop("cells.tsv must contain: cell_id, x, theta, s")
+  required_cols <- c("cell_id", "x", "s")
+  if (isTRUE(require_theta)) required_cols <- c(required_cols, "theta")
+  if (!all(required_cols %in% names(cells))) {
+    stop(sprintf("cells.tsv must contain: %s", paste(required_cols, collapse = ", ")))
   }
   if (!("cell_id" %in% names(counts_df))) stop("counts.tsv must contain cell_id.")
 
@@ -184,12 +186,12 @@ cat(sprintf("Setting OMP_NUM_THREADS=%d\n", as.integer(omp_threads)))
 
 source("scripts/gam/inm_gam.R")
 
-panel <- read_panel_tsv(in_dir)
+panel <- read_panel_tsv(in_dir, require_theta = isTRUE(use_theta))
 
 	cells <- panel$cells
 	if (!is.numeric(cells$s) || any(!is.finite(cells$s)) || any(cells$s <= 0)) stop("cells$s must be numeric, finite, and > 0.")
 	if (!all(c("r_um", "AP_um", "ML_um") %in% names(cells))) {
-	  stop("cells.tsv must contain: r_um, AP_um, ML_um (in addition to cell_id, x, theta, s)")
+	  stop("cells.tsv must contain: r_um, AP_um, ML_um (in addition to cell_id, x, s, and theta when theta terms are enabled)")
 	}
 	  r_um_all <- as.numeric(cells$r_um)
 	  if (any(!is.finite(r_um_all))) stop("cells$r_um must be finite.")
@@ -331,9 +333,17 @@ if ("batch" %in% names(cells)) {
 batch_model <- batch
 batch_ref_model <- batch_ref
 
-	# Resumable fitting: append per-gene results to OUT_TSV and skip genes already present.
-	coupling_group <- if (!is.null(animal)) animal else batch
-	coupling <- fit_inm_coupling_gam(x = cells$x, theta = cells$theta, k_theta = 8, group = coupling_group)
+  theta_model <- if ("theta" %in% names(cells)) as.numeric(cells$theta) else rep(0.0, nrow(cells))
+  if (any(!is.finite(theta_model))) stop("cells$theta must be finite when present.")
+  coupling_r2 <- NA_real_
+  if (isTRUE(use_theta)) {
+	  # Resumable fitting: append per-gene results to OUT_TSV and skip genes already present.
+	  coupling_group <- if (!is.null(animal)) animal else batch
+	  coupling <- fit_inm_coupling_gam(x = cells$x, theta = theta_model, k_theta = 8, group = coupling_group)
+    coupling_r2 <- coupling$r2
+  } else {
+    cat("Theta disabled via --no-theta: skipping coupling fit and setting inm_r2=NA\n")
+  }
 	r_um <- as.numeric(cells$r_um)
 	AP_um <- as.numeric(cells$AP_um)
 	ML_um <- as.numeric(cells$ML_um)
@@ -452,7 +462,7 @@ write_fit_row <- function(row) {
 na_row <- function(gene) {
   data.frame(
     gene = gene,
-    inm_r2 = coupling$r2,
+    inm_r2 = coupling_r2,
     r_um_max = R_UM_MAX_USED,
     p_spatial = NA_real_,
     p_cycle = NA_real_,
@@ -651,7 +661,7 @@ fit_one <- function(task) {
         y = y,
         sf = cells$s,
         r_um = r_um,
-        theta = cells$theta,
+        theta = theta_model,
         AP_um = AP_um,
         ML_um = ML_um,
         brdu_pos = brdu_pos,
@@ -726,7 +736,7 @@ fit_one <- function(task) {
 
   row <- data.frame(
     gene = gene,
-    inm_r2 = coupling$r2,
+    inm_r2 = coupling_r2,
     r_um_max = R_UM_MAX_USED,
     p_spatial = pv$p_spatial,
     p_cycle = pv$p_cycle,
