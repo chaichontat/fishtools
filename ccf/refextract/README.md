@@ -62,12 +62,28 @@ For `(axis, slice, t, r01)` coordinates used by `midsurface_coords.py`:
 
 - `axis`: `coronal` or `sagittal`.
 - `slice`: the **reference atlas** slice index on that axis (voxel coordinates).
+- Slice ranges used in this repo (inclusive; DS=1): coronal `slice_i` 174-298, sagittal `slice_k` 161-235.
 - `t` (aka `t_all`): per-slice **full-path** coordinate on the representative `u=0.5` midline curve (`[0,1]`, normalized
   arc-length along that slice’s curve).
 - `r01`: per-point depth coordinate (`0` inner/ventricular, `1` pial).
 
 Coronal and sagittal charts share the same underlying 3D mid-surface embedding; `--transform-to` uses cached LUTs and
 reports residuals from discrete sampling.
+
+Atlas voxel indexing convention (`ijk`):
+
+- All atlas volumes are numpy arrays indexed as `vol[i, j, k]` (axis0, axis1, axis2). This repo uses `i/j/k` to mean those
+  three voxel indices.
+- For DevCCF E15.5 `kim_dev_mouse_e15-5_lsfm_20um`, BrainGlobe metadata specifies `orientation="asr"` (Anterior, Superior,
+  Right). In practical anatomical terms:
+  - `i` increases posterior → anterior (AP axis).
+  - `j` increases ventral/inferior → dorsal/superior (DV axis).
+  - `k` increases left → right (ML axis).
+- Slice planes used throughout `ccf/refextract`:
+  - **Coronal**: `slice_i` means fixed `i` (axis0). In-plane coordinates are `(j, k)` and when written/plotted as
+    image-like coordinates we use `(y=j, x=k)`.
+  - **Sagittal**: `slice_k` means fixed `k` (axis2). In-plane coordinates are `(i, j)` and when written/plotted as
+    image-like coordinates we use `(y=i, x=j)`.
 
 3) **Signed radial coordinate (microns)**:
 
@@ -114,6 +130,42 @@ reference slice should not be compared to a numeric `t` from a different slice a
 - `t_local`: the **sample** per-slice principal-curve coordinate. This is the coordinate users interact with when
   drawing/curating the curve; `t_local=0` and `t_local=1` correspond to the chosen anchor endpoints on that slice.
   Values between anchors are typically in `[0,1]`, but `t_local` can be `<0` or `>1` when extrapolated.
+
+## 2D coordinates for statistical modeling (AP/ML)
+
+Flattening a curved 2D manifold into a 2D chart without distortion is not possible in general. The approach here is to define
+a **stable, physically meaningful 2D coordinate system** on the reference midsurface that is good enough for modeling:
+
+- **AP axis (`ap_um`)**: a 1D coordinate in microns across coronal slices, optimized so that one AP step approximates the
+  typical 3D displacement of corresponding midline points between adjacent slices ("strip linking").
+- **ML axis (`ml_um`)**: a 1D coordinate in microns along each slice's midline, defined as arclength along the `t_all` curve,
+  but **anchored** so `ml_um=0` corresponds to the same anatomical location across slices.
+
+Key design decisions:
+
+- Keep `t_all` unchanged (slice-local, normalized arclength). All existing LUTs and transforms keep using `t_all`.
+- Derive `ap_um` by matching adjacent coronal slice midlines (DTW on centered in-plane coordinates), then setting
+  `Δap_um(slice_i→slice_{i+1}) := median_t ||P_i(t) - P_{i+1}(t')||` in 3D um, and finally `ap_um := cumsum(Δap_um)`.
+  This makes AP spacing reflect how far the midsurface actually moves in 3D, rather than raw voxel index.
+- Derive `ml_um` as signed arclength along the midline on each slice: `ml_um(t) = s_um(t) - s0_um(slice_i)`.
+  The offset `s0_um(slice_i)` is computed by aligning each slice midline to a **fixed reference slice** (constant AP)
+  and choosing the point that corresponds to a fixed `ref_t` on that reference slice.
+- Map sagittal points into this chart via the existing cross-axis LUT: sag `(slice_k, t_s, r01)` → cor `(slice_i, t_c, r01)`
+  using `midsurface_coords.py` LUTs, then compute `ap_um(slice_i)` and `ml_um(slice_i, t_c)`.
+
+Scripts / artifacts:
+
+- Build optimized AP axis (coronal): `ccf/refextract/optimize_ap_axis_from_strips.py`
+  - Writes: `ap_axis_um_from_strips.npz`, `ap_axis_um_from_strips_qc.csv`, and optional QC plots under the outdir.
+- Plot AP/ML heatmaps (coronal): `ccf/refextract/plot_ap_ml_heatmap.py`
+  - Writes anchored heatmaps like `ap_ml_ml_um_anchored_thickness_heatmap.png`.
+
+Notes:
+
+- These coordinates are intended for modeling and visualization, not for exact metric computations on the surface. When you
+  need accurate distances/areas, use 3D/mesh-space measurements and treat `(ap_um, ml_um)` as a chart.
+- `resolution_ds_ijk_um.npy` is the preferred source of voxel size (um/voxel) for `DS`. If it is missing, pass
+  `--res-ijk-um RI RJ RK` to the scripts (for this atlas with `DS=1`, it is typically `20 20 20`).
 
 Mapping `t_local -> t_all`:
 
@@ -191,7 +243,6 @@ Notes:
 - Query-to-`ijk` conversion uses cached per-axis segment LUTs on `(slice,t)` and linear interpolation by normalized local depth `r01`.
 - LUT lookup is required for query-time conversion (no automatic exact-EDT fallback).
 - `--transform-to` uses cached LUTs on `(slice,t)` and carries `r01` through as the shared depth coordinate.
-- `--transform-to` reports `residual_vox`, the LUT fitting residual in voxel units.
 
 ### Testing
 

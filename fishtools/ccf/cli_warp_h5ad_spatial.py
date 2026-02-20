@@ -462,6 +462,9 @@ def main(  # noqa: PLR0913
                 click.echo(f"[{roi_resolved}] Skipping: {msg}")
                 skipped_missing_h5ad += 1
                 continue
+            if process_all_rois and str(msg).startswith("Refusing to overwrite existing output(s):"):
+                click.echo(f"[{roi_resolved}] Warning: output already exists, skipping. {msg}")
+                continue
             raise click.ClickException(f"ROI {roi_resolved!r}: {msg}") from exc
         except Exception as exc:
             raise click.ClickException(f"ROI {roi_resolved!r}: {exc}") from exc
