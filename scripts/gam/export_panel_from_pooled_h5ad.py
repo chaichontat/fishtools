@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 
-MIN_GENE_EXPR_FRAC = 0.001  # >0.1% cells expressing
+MIN_GENE_EXPR_FRAC = 0.005  # >0.5% cells expressing
 
 
 def _as_dense_f32(x) -> np.ndarray:
