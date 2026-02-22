@@ -26,9 +26,9 @@ read_panel_tsv <- function(in_dir, require_theta = TRUE) {
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 1) {
-  cat("Usage: Rscript scripts/gam/fit_inm_panel.R IN_DIR [OUT_TSV] [--no-pos] [--no-theta] [--threads N] [--omp-threads N] [--basis shrink|standard] [--k-uv N] [--priority-genes CSV] [--heartbeat-sec N] [--no-diagnostics] [--diagnostics] [--diagnostics-all] [--diagnostics-p P]\n")
-  cat("  --threads N controls gene-parallelism (N genes fit concurrently; default: 1); per-gene mgcv threading is forced to 1.\n")
-  cat("  --omp-threads N controls OMP_NUM_THREADS (default: 8).\n")
+  cat("Usage: Rscript scripts/gam/fit_inm_panel.R IN_DIR [OUT_TSV] [--no-pos] [--no-theta] [--threads N] [--bam-threads N] [--basis shrink|standard] [--k-uv N] [--priority-genes CSV] [--heartbeat-sec N] [--no-diagnostics] [--diagnostics] [--diagnostics-all] [--diagnostics-p P]\n")
+  cat("  --threads N controls gene-parallelism (N genes fit concurrently; default: 1).\n")
+  cat("  --bam-threads N controls per-gene mgcv::bam(nthreads) (default: 1).\n")
   cat("  --k-uv N controls the AP/ML smooth basis dimension k for s(AP_um, ML_um) (default: 15).\n")
   cat("  --heartbeat-sec N emits periodic 'still running' logs while a chunk is fitting (default: 60).\n")
   cat("  --no-theta removes theta smooth terms (s(theta) and ti(r_um,theta)).\n")
@@ -44,7 +44,7 @@ parse_opts <- function(opts) {
   disable_pos <- FALSE
   use_theta <- TRUE
   threads <- 1L
-  omp_threads <- 8L
+  bam_threads <- 1L
   basis <- "standard"
   k_uv <- 15L
   priority_genes <- c("Eomes", "Nr2f2")
@@ -79,11 +79,11 @@ parse_opts <- function(opts) {
       i <- i + 2L
       next
     }
-    if (opt == "--omp-threads") {
-      if (i == length(opts)) stop("--omp-threads requires an integer value.")
+    if (opt == "--bam-threads") {
+      if (i == length(opts)) stop("--bam-threads requires an integer value.")
       val <- suppressWarnings(as.integer(opts[[i + 1L]]))
-      if (!is.finite(val) || is.na(val) || val < 1) stop("--omp-threads must be an integer >= 1.")
-      omp_threads <- val
+      if (!is.finite(val) || is.na(val) || val < 1) stop("--bam-threads must be an integer >= 1.")
+      bam_threads <- val
       i <- i + 2L
       next
     }
@@ -149,7 +149,7 @@ parse_opts <- function(opts) {
     disable_pos = disable_pos,
     use_theta = use_theta,
     threads = threads,
-    omp_threads = omp_threads,
+    bam_threads = bam_threads,
     basis = basis,
     k_uv = k_uv,
     priority_genes = priority_genes,
@@ -164,7 +164,7 @@ parsed <- parse_opts(opts)
 disable_pos <- parsed$disable_pos
 use_theta <- parsed$use_theta
 threads <- parsed$threads
-omp_threads <- parsed$omp_threads
+bam_threads <- parsed$bam_threads
 basis <- parsed$basis
 k_uv <- parsed$k_uv
 priority_genes <- parsed$priority_genes
@@ -172,9 +172,6 @@ heartbeat_sec <- parsed$heartbeat_sec
 diagnostics <- parsed$diagnostics
 diagnostics_all <- parsed$diagnostics_all
 diagnostics_p <- parsed$diagnostics_p
-
-Sys.setenv(OMP_NUM_THREADS = as.character(as.integer(omp_threads)))
-cat(sprintf("Setting OMP_NUM_THREADS=%d\n", as.integer(omp_threads)))
 
 source("scripts/gam/inm_gam.R")
 
@@ -390,7 +387,14 @@ remaining_rows <- sum(!(genes %in% done))
 if (threads > 1 && .Platform$OS.type != "unix") {
   stop("--threads > 1 requires a Unix-like OS (forking).")
 }
-cat(sprintf("Total genes=%d; remaining_rows=%d; threads=%d; basis=%s\n", length(genes), remaining_rows, threads, basis))
+cat(sprintf(
+  "Total genes=%d; remaining_rows=%d; threads=%d; bam_threads=%d; basis=%s\n",
+  length(genes),
+  remaining_rows,
+  threads,
+  bam_threads,
+  basis
+))
 cat(sprintf("AP/ML smooth basis dimension: k_uv=%d\n", as.integer(k_uv)))
 cat(sprintf("Theta terms enabled: %s\n", if (isTRUE(use_theta)) "yes" else "no"))
 cat(sprintf("Heartbeat interval: %ds (set --heartbeat-sec 0 to disable)\n", as.integer(heartbeat_sec)))
@@ -627,7 +631,7 @@ fit_one <- function(task) {
         use_theta = use_theta,
         shrinkage_basis = basis,
         k_uv = as.integer(k_uv),
-        bam_nthreads = 1,
+        bam_nthreads = as.integer(bam_threads),
         gamma = GAM_GAMMA
       )
     },

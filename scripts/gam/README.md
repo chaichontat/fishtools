@@ -53,7 +53,8 @@ This sets `p_cycle`, `p_interaction` (and their `log_p_*`) to `NA`, and `cycle_a
 
 ### Parallelism (`--threads`)
 
-`fit_inm_panel.R` parallelizes **across genes**. `--threads N` means “fit up to N genes concurrently”, while each per-gene `mgcv::bam()` call is forced to use **1 thread** (to avoid oversubscription when fitting multiple genes at once).
+`fit_inm_panel.R` parallelizes **across genes**. `--threads N` means “fit up to N genes concurrently”.
+Use `--bam-threads M` to set per-gene `mgcv::bam(nthreads = M)` (default `1`).
 
 ### Basis choice (`--basis`)
 
