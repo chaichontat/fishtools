@@ -8,12 +8,40 @@ from pathlib import Path
 import numpy as np
 
 
+MIN_GENE_EXPR_FRAC = 0.001  # >0.1% cells expressing
+
+
 def _as_dense_f32(x) -> np.ndarray:
     import scipy.sparse as sp
 
     if sp.issparse(x):
         x = x.toarray()
     return np.asarray(x, dtype=np.float32)
+
+
+def _filter_genes_by_expr_fraction(*, counts: np.ndarray, genes: list[str], min_frac: float) -> tuple[np.ndarray, list[str], int]:
+    if counts.ndim != 2:
+        raise ValueError(f"counts must be 2D, got shape={counts.shape}")
+    n_cells = int(counts.shape[0])
+    if n_cells <= 0:
+        raise ValueError("counts must have at least one row")
+    if int(counts.shape[1]) != int(len(genes)):
+        raise ValueError(f"counts columns != len(genes): {counts.shape[1]} != {len(genes)}")
+    if not np.isfinite(min_frac) or float(min_frac) < 0:
+        raise ValueError(f"min_frac must be finite and >=0, got {min_frac}")
+
+    nnz = np.count_nonzero(counts > 0, axis=0).astype(np.int64, copy=False)
+    frac = nnz.astype(np.float64) / float(n_cells)
+    keep = frac > float(min_frac)
+    n_before = int(len(genes))
+    n_keep = int(np.sum(keep))
+    if n_keep <= 0:
+        raise ValueError(f"no genes remain after expression filter: frac_expressing > {min_frac} (n_cells={n_cells})")
+    if n_keep == n_before:
+        return counts, genes, n_before
+    counts_f = counts[:, keep]
+    genes_f = [g for g, k in zip(genes, keep, strict=True) if bool(k)]
+    return counts_f, genes_f, n_before
 
 
 def calc_rmaxnorm_strict(t: np.ndarray, r: np.ndarray, *, n_grid: int) -> np.ndarray:
@@ -471,6 +499,15 @@ def main() -> int:
         if float(np.nanmin(counts)) < 0:
             raise ValueError("counts matrix has negative values")
 
+        counts, genes, n_genes_before_expr = _filter_genes_by_expr_fraction(
+            counts=counts, genes=genes, min_frac=MIN_GENE_EXPR_FRAC
+        )
+        if len(genes) != n_genes_before_expr:
+            print(
+                f"Gene expression filter: kept {len(genes)}/{n_genes_before_expr} genes with frac_expressing > {MIN_GENE_EXPR_FRAC:g}",
+                flush=True,
+            )
+
         s_source = "sum(selected genes)"
         if "total_counts" in adata.obs.columns:
             s = adata.obs.iloc[idx]["total_counts"].to_numpy(dtype=np.float64, copy=False)
@@ -568,6 +605,8 @@ def main() -> int:
             "tr_filter_overrides": {"t_min": t_min_overrides, "t_max": t_max_overrides},
             "per_source_filter": per_source_filter,
             "genes": genes,
+            "gene_expr_min_frac": float(MIN_GENE_EXPR_FRAC),
+            "n_genes_before_expr_filter": int(n_genes_before_expr),
             "counts_dtype": counts_dtype,
             "max_abs_frac_from_integer": max_abs_frac,
             "x_note": "x is r / r_max(t) (strict binned upper-envelope interpolation), computed per source",
