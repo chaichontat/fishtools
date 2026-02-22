@@ -168,10 +168,11 @@ fit_gene_gam <- function(
   knots <- if (isTRUE(use_theta)) list(theta = c(0, 2 * pi)) else list()
 
   base_terms <- "offset(log(sf))"
-  if (isTRUE(has_animal)) base_terms <- paste(base_terms, "+ animal")
+  if (isTRUE(has_animal)) base_terms <- paste(base_terms, "+ s(animal, bs = 're')")
   if (isTRUE(has_batch)) {
     if (isTRUE(has_animal)) {
-      base_terms <- paste(base_terms, "+ s(batch, bs = 're')")
+      df$ab <- interaction(df$animal, df$batch, drop = TRUE)
+      base_terms <- paste(base_terms, "+ s(ab, bs = 're')")
     } else {
       base_terms <- paste(base_terms, "+ batch")
     }
@@ -261,6 +262,11 @@ effect_sizes_from_fit <- function(
     if (isTRUE(has_animal) && !is.null(animal_ref)) {
       lev <- get_factor_levels(fit, "animal")
       nd$animal <- if (is.null(lev)) animal_ref else factor(rep(animal_ref, nrow(nd)), levels = lev)
+    }
+    if (isTRUE(has_batch) && isTRUE(has_animal) && !is.null(batch_ref) && !is.null(animal_ref)) {
+      lev <- get_factor_levels(fit, "ab")
+      ab0 <- interaction(nd$animal, nd$batch, drop = TRUE)
+      nd$ab <- if (is.null(lev)) ab0 else factor(as.character(ab0), levels = lev)
     }
     nd
   }

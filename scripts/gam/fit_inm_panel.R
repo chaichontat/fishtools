@@ -251,29 +251,12 @@ write_qbh <- function(out_tsv) {
   invisible(q_path)
 }
 
-batch <- NULL
-batch_ref <- NULL
-batch_col <- NULL
-if ("batch" %in% names(cells)) {
-  b0 <- as.factor(cells$batch)
-  if (nlevels(b0) > 1) {
-    batch <- b0
-    batch_col <- "batch"
-  }
+if (!("batch" %in% names(cells))) {
+  stop("cells.tsv must contain a 'batch' column for the batch correction model.")
 }
-if (is.null(batch) && "source" %in% names(cells)) {
-  b0 <- as.factor(cells$source)
-  if (nlevels(b0) > 1) {
-    batch <- b0
-    batch_col <- "source"
-  }
-}
-if (!is.null(batch) && !is.null(batch_col)) {
-  batch_ref <- levels(batch)[[1]]
-  cat(sprintf("Using batch term from cells$%s (n_levels=%d; ref=%s)\n", batch_col, nlevels(batch), batch_ref))
-} else if ("batch" %in% names(cells) || "source" %in% names(cells)) {
-  cat("Batch column present but has one level; not using batch term.\n")
-}
+batch <- as.factor(cells$batch)
+batch_ref <- levels(batch)[[1]]
+cat(sprintf("Using batch factor from cells$batch (n_levels=%d; ref=%s)\n", nlevels(batch), batch_ref))
 
 extract_animal_from_dataset <- function(x) {
   s <- as.character(x)
@@ -282,30 +265,24 @@ extract_animal_from_dataset <- function(x) {
   out
 }
 
-animal <- NULL
 animal_ref <- NULL
-if ("batch" %in% names(cells)) {
+if ("animal" %in% names(cells)) {
+  animal <- as.factor(cells$animal)
+  if (any(is.na(animal))) stop("cells$animal must not contain NA.")
+  animal_ref <- levels(animal)[[1]]
+  cat(sprintf("Using animal factor from cells$animal (n_levels=%d; ref=%s)\n", nlevels(animal), animal_ref))
+} else {
   a0 <- extract_animal_from_dataset(cells$batch)
   if (any(is.na(a0) | !nzchar(a0))) {
     bad <- unique(cells$batch[is.na(a0) | !nzchar(a0)])
-    cat(
-      sprintf(
-        "Could not parse animal (JaxA*) from cells$batch for dataset(s): %s. Not using animal term.\n",
-        paste(bad, collapse = ",")
-      )
-    )
-    a0 <- NULL
+    stop(sprintf(
+      "Could not parse animal (JaxA*) from cells$batch for dataset(s): %s.",
+      paste(bad, collapse = ",")
+    ))
   }
-  if (!is.null(a0)) {
-    a0 <- as.factor(a0)
-    if (nlevels(a0) > 1) {
-      animal <- a0
-      animal_ref <- levels(animal)[[1]]
-      cat(sprintf("Using animal term parsed from cells$batch (n_levels=%d; ref=%s)\n", nlevels(animal), animal_ref))
-    } else {
-      cat("Animal parsed from cells$batch has one level; not using animal term.\n")
-    }
-  }
+  animal <- as.factor(a0)
+  animal_ref <- levels(animal)[[1]]
+  cat(sprintf("Using animal factor parsed from cells$batch (n_levels=%d; ref=%s)\n", nlevels(animal), animal_ref))
 }
 
 batch_model <- batch
