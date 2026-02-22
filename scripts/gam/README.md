@@ -3,12 +3,22 @@
 This folder contains a minimal, coupling-aware model for ventricular-zone INM data:
 
 1. Fit the INM coupling curve `m(theta)` via a cyclic GAM: `x ~ s(theta, bs="cc")`.
-2. Residualize depth as `r = x - m(theta)` to separate non-INM spatial variation.
-3. Fit per-gene negative-binomial GAMs with `mgcv`:
-   - `s(r)` (non-INM spatial / differentiation component)
+2. Fit per-gene negative-binomial GAMs with `mgcv`, using:
    - `s(theta, bs="cc")` (cyclic cell-cycle component)
-   - `ti(r, theta, bs=c("tp","cc"))` (niche gating / interaction)
+   - `s(r_um, bs="cs")` (depth component with shrinkage; `r_um` comes from principal-curve `r` in microns)
+   - `s(AP_um, ML_um, bs="ts")` (planar spatial component with shrinkage)
+   - `ti(AP_um, ML_um, r_um, d=c(2,1), bs=c("ts","cs"))` (3D spatial interaction with shrinkage)
+   - `ti(r_um, theta, bs=c("cs","cc"))` (depth × cycle interaction; shrinkage in `r_um`)
    - optional `batch` (parametric factor) for pooled multi-dataset panels
+   - optional `--no-theta` mode to remove `s(theta)` and `ti(r_um,theta)` (spatial-only per-gene model)
+
+Run commands from repo root (`/home/chaichontat/fishtools2`). In this repo we typically use:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq <command>
+```
+
+for both Python and R entry points (e.g. `python ...` or `Rscript ...`).
 
 ## Generate Synthetic Test Data
 
@@ -17,7 +27,7 @@ Rscript scripts/gam/simulate_inm_panel.R /tmp/inm_synth 1
 ```
 
 Outputs:
-- `/tmp/inm_synth/cells.tsv` (`cell_id`, `x`, `theta`, `s`)
+- `/tmp/inm_synth/cells.tsv` (`cell_id`, `x`, `r_um`, `AP_um`, `ML_um`, `theta`, `s`)
 - `/tmp/inm_synth/counts.tsv` (`cell_id` + gene columns)
 - `/tmp/inm_synth/truth.tsv` (gene labels: null/cycle/spatial/interaction)
 
@@ -27,18 +37,80 @@ Outputs:
 Rscript scripts/gam/fit_inm_panel.R /tmp/inm_synth
 ```
 
-Writes `/tmp/inm_synth/fit_results.tsv` with per-gene p-values for `s(r)`, `s(theta)`, and `ti(r,theta)`. If the output TSV already exists, the script resumes and only fits missing genes.
+Writes `/tmp/inm_synth/fit_results.tsv` with per-gene p-values for `s(r_um)`, `s(theta)`, `ti(r_um,theta)`, plus spatial `AP_um/ML_um` terms. If the output TSV already exists, the script resumes and only fits missing genes.
 
 It also saves per-gene `mgcv` fit objects to `fits_rds/` next to the output TSV (one `.rds` per gene), so you can inspect coefficients and basis via `coef(fit)` and `predict(fit, type="lpmatrix")`.
+
+### Spatial-only fits (`--no-theta`)
+
+To drop the theta terms from the per-gene NB GAM (removes `s(theta)` and `ti(r_um,theta)`), use:
+
+```bash
+Rscript scripts/gam/fit_inm_panel.R <panel_dir> <out_tsv> --no-theta
+```
+
+This sets `p_cycle`, `p_interaction` (and their `log_p_*`) to `NA`, and `cycle_amp_link`/`gating_index_link` to `NA` in the fit-results TSV.
+
+### Parallelism (`--threads`)
+
+`fit_inm_panel.R` parallelizes **across genes**. `--threads N` means “fit up to N genes concurrently”, while each per-gene `mgcv::bam()` call is forced to use **1 thread** (to avoid oversubscription when fitting multiple genes at once).
+
+### Basis choice (`--basis`)
+
+By default we use standard bases for the large smooth terms:
+- `bs='tp'` for `s(AP_um,ML_um)` and the AP/ML part of the tensor interaction
+- `bs='cr'` for `s(r_um)` and the `r_um` parts of the tensor interactions
+
+Default behavior:
+
+```bash
+Rscript scripts/gam/fit_inm_panel.R <panel_dir> <out_tsv> --basis standard
+```
+
+If you explicitly want shrinkage bases:
+
+```bash
+Rscript scripts/gam/fit_inm_panel.R <panel_dir> <out_tsv> --basis shrink
+```
+
+**Note:** `--basis shrink` (`ts/cs`) is usually slower than `--basis standard` (`tp/cr`) because there are more smoothing/penalty parameters to optimize.
+
+### Variant Without EdU/BrdU Positivity Covariates
+
+If `cells.tsv` contains `brdu_pos`/`edu_pos` you can explicitly disable those covariates and fit the same smooth decomposition without them:
+
+```bash
+Rscript scripts/gam/fit_inm_panel.R <panel_dir> <out_tsv> --no-pos
+```
+
+### Optional per-gene diagnostics (`--diagnostics`)
+
+By default, `fit_inm_panel.R` writes mgcv diagnostics during fitting (per-gene `summary()`, `gam.check()`, `k.check()`, EDF table, concurvity table).
+
+To disable diagnostics:
+
+```bash
+Rscript scripts/gam/fit_inm_panel.R <panel_dir> <out_tsv> --no-diagnostics
+```
+
+To explicitly enable (and optionally restrict to “hits”), use:
+
+```bash
+Rscript scripts/gam/fit_inm_panel.R <panel_dir> <out_tsv> --no-pos --diagnostics
+```
+
+With `--diagnostics`, diagnostics are written only for “hits” where `min(p_spatial, p_cycle, p_interaction) <= 0.05`. Use `--diagnostics-p 0.01` to tighten, or `--diagnostics-all` to write diagnostics for every fitted gene.
 
 ## Where `cells.tsv` Comes From (and Cell Filtering)
 
 The R GAM fitter/plotter read a simple "panel" directory with:
-- `cells.tsv`: must contain `cell_id`, `x`, `theta`, `s`
+- `cells.tsv`: must contain `cell_id`, `x`, `r_um`, `AP_um`, `ML_um`, `theta`, `s`
 - `counts.tsv`: `cell_id` + one column per gene (counts)
 - optional `truth.tsv` (synthetic labels)
 
-Cell filtering is entirely upstream: `fit_inm_panel.R` uses *all rows* in `cells.tsv`, and subsets/reorders `counts.tsv` to match `cells.tsv` via `cell_id`.
+`fit_inm_panel.R` subsets/reorders `counts.tsv` to match `cells.tsv` via `cell_id`.
+
+`fit_inm_panel.R` does not apply an additional in-script `r_um` cutoff.
 
 ### Optional EdU/BrdU positivity covariates
 
@@ -53,7 +125,7 @@ If you pool cells from multiple datasets/ROIs into one panel directory, you can 
 If `cells.tsv` contains a `source` column, the fitter uses it as a `batch` factor:
 - `... + batch + ...`
 
-Additionally, when `batch` is available the INM coupling curve `m(theta)` is fit *per batch* (so residual depth `r = x - m_hat(theta)` is batch-specific).
+Additionally, when `batch` is available the INM coupling curve `m(theta)` is fit *per batch* (diagnostic only).
 
 For real data, `brdu_pos`/`edu_pos` are typically computed from `obs.brdu_mean`/`obs.edu_mean` as:
 - `log_brdu_mean = log1p(brdu_mean)`
@@ -79,12 +151,153 @@ It writes:
 For real datasets we start from a principal-curve annotated AnnData like:
 - `/home/chaichontat/fishtools2/working/20251230_JaxA4_Sag6/analysis/output/ccf-transforms/4/4.syn.annotated.princurve.h5ad`
 
-This file is produced by `scripts/princurve/find_princurve.py` and contains `obsm['principal']` (columns: `t`, `r`) and sometimes `obsm['principal_r_signed']`.
+Naming convention for these inputs:
+- `*.x.princurve.h5ad` means the file contains multiple sub-ROIs.
+- When selecting files to fit, include all principal-curve files that **do not** end with `bad` (e.g. keep `*.cortex.princurve.h5ad`, skip `*.cortexbad.princurve.h5ad`).
+
+This file is produced by `scripts/princurve/find_princurve.py` and contains:
+- `obs['t_local']`: local principal-curve coordinate (`obsm['principal'][:, 0]`)
+- `obs['t_all']`: whole-ribbon coordinate (`1 - t_local`)
+- `obs['t_neomeso']`: neocortex+mesocortex masked coordinate from per-mask endpoint intervals
+- `obsm['principal']` (columns: `t`, `r`) where `t == t_local`
+- optional `obsm['principal_r_signed']`
 
 For downstream (t, r) work in this folder we typically export a TSV from that `.princurve.h5ad`:
 - `scripts/gam/plot_princurve_cortex.py` writes `cells_tr.tsv` (e.g. `cell_id`, `t`, `r`, plus selected `obs` columns; it can also infer `theta` via tricycle projection).
 
-There isn’t a built-in h5ad → `cells.tsv` writer in `scripts/gam/` yet; to run the R GAM on real data you need to prepare a panel directory in the `cells.tsv`/`counts.tsv` format (and do any filtering when generating those files).
+To build GAM-ready `cells.tsv`/`counts.tsv` directly from principal-curve `.h5ad`, use:
+- `scripts/gam/export_panel_from_princurve_h5ad.py` (single dataset)
+- `scripts/gam/export_panel_from_princurve_h5ad_multi.py` (pooled multi-dataset)
+- `scripts/gam/export_panel_from_pooled_h5ad.py` (single pooled h5ad that already contains multiple datasets/ROIs)
+
+### Recommended Export + Run (single dataset)
+
+1) Optional coordinate export (`cells_tr.tsv`) for quick QC of principal-curve coordinates:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_princurve_cortex.py \
+  <input.princurve.h5ad> \
+  --out <coord_out_dir> \
+  --region-col ccf_adjusted --region cortex \
+  --t-min 0.1 --t-max 0.75 --r-min 0.6 \
+  --infer-theta-tricycle
+```
+
+2) Export GAM panel files (`cells.tsv`, `counts.tsv`, `panel_meta.json`):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/export_panel_from_princurve_h5ad.py \
+  <input.princurve.h5ad> \
+  --out-dir <panel_dir> \
+  --region-col ccf_adjusted --region cortex \
+  --t-min 0.1 --t-max 0.75 --r-min 0.6 \
+  --genes all
+```
+
+3) Fit and check GAM:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/fit_inm_panel.R <panel_dir>
+CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/check_gam_diagnostics.R <panel_dir>
+```
+
+### Recommended Export + Run (single pooled h5ad, e.g. `~/nvme/wip.h5ad`)
+
+This variant is for one large pooled AnnData that already contains per-cell `dataset`/`roi` metadata and tricycle angle in `obs.tricycle`.
+It writes GAM-ready `cells.tsv`/`counts.tsv` with:
+- `source = <dataset>.<roi>`
+- `batch = <dataset>`
+- unique `cell_id` values (safe even if obs names are duplicated)
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/export_panel_from_pooled_h5ad.py \
+  /home/chaichontat/nvme/wip.h5ad \
+  --out-dir <panel_dir> \
+  --region-col ccf_adjusted --region cortex,cortex2 \
+  --dataset-col dataset --roi-col roi \
+  --theta-col tricycle \
+  --counts-layer raw \
+  --t-min 0.1 --t-max 0.75 --r-min 0.6 \
+  --genes all
+```
+
+Then fit:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/fit_inm_panel.R <panel_dir> <out_tsv> --no-pos
+```
+
+If you want positivity covariates in `cells.tsv`, pass thresholds during export:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/export_panel_from_pooled_h5ad.py \
+  /home/chaichontat/nvme/wip.h5ad \
+  --out-dir <panel_dir> \
+  --log-brdu-threshold <thr_log_brdu> \
+  --log-edu-threshold <thr_log_edu>
+```
+
+### Cycle OT transition fit on pooled h5ad
+
+For a direct, non-GAM view of radial transport across tricycle phase, fit an
+entropic OT transition model between adjacent `theta` bins:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/fit_cycle_ot_transition.py \
+  /home/chaichontat/nvme/wip.h5ad \
+  --out-dir scripts/_out/gam_cycle_ot_wip \
+  --r-col r_um --theta-col tricycle \
+  --r-min-um 0 --r-max-um 300 \
+  --n-theta-bins 72 --n-r-bins 120
+```
+
+Writes:
+- `model.npz` (theta/r binning, histogram, and per-theta transition kernels)
+- `summary.tsv` (fit parameters + sanity checks such as max row-stochasticity deviation)
+- `hist_r_theta.png` (cell composition in `r_um × theta`)
+- `drift_heatmap.png` (`E[r_next - r_current]` by `theta` and current `r`)
+- `mean_drift_by_theta.png` (occupancy-weighted mean drift per theta bin)
+
+### Composition heatmaps: x vs r_um (including BrdU/EdU state facets)
+
+To quickly visualize cell composition as a 2D histogram in `r_um` vs an x-axis column
+(typically tricycle theta), use:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_tricycle/plot_theta_by_rum.py \
+  /home/chaichontat/nvme/wip.h5ad \
+  --out-dir /tmp/plot_theta_by_rum \
+  --r-col r_um --r-min 0 --r-max 300 \
+  --theta-col tricycle \
+  --dataset-col dataset \
+  --basename theta_by_rum_lt300
+```
+
+Notes:
+- If `--theta-col` is `tricycle` or `theta`, values are treated as an angle (wrapped to `[0, 2pi)`)
+  and the x-axis uses `0, pi/2, pi, 3pi/2, 2pi` ticks.
+- Otherwise the x-axis is treated as a generic numeric column (no wrapping, auto-ranged),
+  e.g. `--theta-col log_edu_mean` or `--theta-col log_brdu_mean`.
+
+Outputs four PNGs under `--out-dir`:
+- `<basename>_heatmap.png`
+- `<basename>_ranked_heatmap.png`
+- `<basename>_heatmap_faceted.png`
+- `<basename>_ranked_heatmap_faceted.png`
+
+#### Facet by BrdU/EdU state (none, brdu_only, edu_only, dual)
+
+If your AnnData has boolean `obs.brdu_pos` and `obs.edu_pos`, you can facet the panels
+by their 4-state combination (instead of `--dataset-col`):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_tricycle/plot_theta_by_rum.py \
+  /home/chaichontat/nvme/wip.h5ad \
+  --out-dir /tmp/plot_theta_by_rum \
+  --facet-brdu-edu --brdu-col brdu_pos --edu-col edu_pos \
+  --theta-col tricycle --r-col r_um --r-min 0 --r-max 300 \
+  --basename theta_by_rum_brdu_edu_state_lt300
+```
 
 ### Multi-dataset panels
 
@@ -100,6 +313,30 @@ CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/export_panel_from_prin
 ```
 
 This keeps `cells.tsv`/`counts.tsv` in the same format expected by `fit_inm_panel.R` (and includes a `source` column for provenance).
+
+After export, run the pooled fit:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/fit_inm_panel.R <panel_dir>
+```
+
+For the Sag6+Sag5 pooled panel used in this repo, use Sag5-specific filtering/flip settings:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/export_panel_from_princurve_h5ad_multi.py \
+  /home/chaichontat/fishtools2/working/20251230_JaxA4_Sag6/analysis/output/ccf-transforms/4/4.syn.annotated.princurve.h5ad \
+  /home/chaichontat/fishtools2/working/20251229_JaxA4_Sag5/analysis/output/ccf-transforms/3/3.syn.annotated.princurve.h5ad \
+  --out-dir /home/chaichontat/fishtools2/working/20251230_JaxA4_Sag6/analysis/output/ccf-transforms/4/gam_panel_allgenes_trfilt_rmaxnorm_pos_sag6_4_plus_sag5_3_sag5t02_flipx \
+  --region-col ccf_adjusted --region cortex \
+  --t-min 0.1 --t-max 0.75 --r-min 0.6 \
+  --t-min-override "3.syn.annotated=0.2" \
+  --flip-x-for "3.syn.annotated" \
+  --genes all
+```
+
+This applies the same rules used for pooled GAM fitting:
+- Sag6: `t in [0.1, 0.75]`, `x = r / r_max(t)`, keep `x > 0.6`
+- Sag5: `t in [0.2, 0.75]`, `x = 1 - (r / r_max(t))`, keep `x > 0.6`
 
 #### “Highest r is 1” normalization (rmaxnorm)
 
@@ -121,6 +358,172 @@ Writes:
 - `coupling.png` (x vs theta + fitted `m(theta)` and residual diagnostics)
 - `pvals.png` (-log10 p-value summaries per component; uses `truth.tsv` if present)
 - `surface_<gene>.png` for representative cycle/spatial/interaction genes (if `fit_results.tsv` exists)
+
+### Python plotting for significant genes
+
+To render per-gene fitted plots in Python/matplotlib (including AP/ML fitted heatmaps):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_significant_gams.py <panel_dir> [alpha] [out_dir]
+```
+
+Implementation notes: `scripts/gam/PLOTTING.md`.
+
+Outputs per significant gene under `<out_dir>` (default: `<panel_dir>/plots_gam_significant_py`):
+- `fit_ap_ml.png` (fitted mean on an `AP_um × ML_um` grid at fixed `r_um=0`, `theta=0`)
+- `fit_r.png` / `fit_theta.png` when the corresponding component p-values are significant
+- `fit_r_theta.png` when `p_interaction < alpha`
+
+#### Interpreting `fit_ap_ml.png` (biologist-friendly)
+
+By default `fit_ap_ml.png` uses `--apml-surface effect`, which plots the spatial smooth contribution
+`s(AP_um,ML_um) + ti(AP_um,ML_um,r0)` on the **link scale** (additive in the linear predictor).
+
+For NB/Poisson-style models with a log link, you can interpret this as a **relative enrichment/depletion** map:
+differences correspond to log fold-changes in expected counts (holding other covariates at reference values).
+
+To present this as a fold-change map with ratio units (e.g. “0.25× … 4×”):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_significant_gams.py <panel_dir> [alpha] [out_dir] \
+  --apml-surface effect --link-ratio --link-ratio-range 0.25 4
+```
+
+This keeps the same underlying link-scale effect, but labels the colorbar in **× fold-change** units for readability.
+
+Native-projection surface renders (`*_native_proj.png`) are written without axes and include a 500 μm scale bar for slides.
+
+By default, plotting also gates interaction plots by per-gene EDF (skips interactions that are penalized away with `edf ~ 0`).
+This requires a `diagnostics_summary.tsv` written next to the fit-results TSV. Generate it with:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/summarize_gam_diagnostics.py <diagnostics_dir> --out <fit_results_dir>/diagnostics_summary.tsv
+```
+
+Disable EDF gating with `--no-gate-by-edf`.
+
+### Cluster montages (native projection, shared colorbar)
+
+If you clustered AP/ML patterns (e.g. `cluster_apml_top200_patterns_k8/summary.tsv`), you can render **per-cluster** native-projection plots
+and write **montage pages with one shared colorbar** (no raster copy/crop) using:
+
+```bash
+OUT=_out/gam_runs/gam_all_neurons_20260220_144747
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_cluster_example_surfaces.py \
+  ${OUT}/cluster_apml_top200_patterns_k8 \
+  --fits-dir ${OUT}/fits_rds__fit_results \
+  --panel-dir ${OUT}/panel \
+  --render native_proj \
+  --n-per-cluster 0 \
+  --montage-cols 3
+```
+
+Notes:
+- `--n-per-cluster 0` means **plot all genes** in each cluster (not just representatives).
+- Output defaults to `${cluster_dir}/cluster_examples_native_proj/` for `--render native_proj` and overwrites/updates that folder.
+- Montages are written as `${out_dir}/cluster_XX/montage_fit_ap_ml_native_proj.png` and paginated as
+  `${out_dir}/cluster_XX/montage_fit_ap_ml_native_proj__page_###.png` when a cluster has more genes than fit on one page.
+- Projection defaults match the “native_ik” view: `elev=-10`, `azim=-110`, `roll=180`, `latlon=true`, `graticule=ijk`.
+
+## Diagnostics (Coupling, Concurvity, EDF)
+
+To validate the fits on real data:
+
+1. `m_hat(theta)` and `r = x - m_hat(theta)` vs `theta` (coupling diagnostics; not used directly in the per-gene model)
+2. `concurvity()` on a representative gene model (numerical stability / identifiability)
+3. EDF sanity check (EDF near `k` is a warning sign that you are fitting noise)
+
+Run:
+
+```bash
+Rscript scripts/gam/check_gam_diagnostics.R <panel_dir> [GENE] [OUT_DIR]
+```
+
+## Ordinal pulse-stage GAM (BrdU/EdU)
+
+If `cells.tsv` includes `brdu_pos` and `edu_pos` (0/1), you can fit an ordered-categorical ordinal GAM for the three “in-window” pulse stages:
+
+- 1 = BrdU+ / EdU−
+- 2 = BrdU+ / EdU+
+- 3 = BrdU− / EdU+
+
+Cells with (BrdU−, EdU−) are dropped for this model.
+
+```bash
+Rscript scripts/gam/fit_pulse_stage_ocat.R <panel_dir> [out_dir]
+```
+
+Outputs (in `out_dir`, default = `<panel_dir>`):
+- `pulse_ocat_predictions.tsv` (per-cell `eta` and `p(stage=k)` for `fit0/fit1/fit2`)
+- `pulse_ocat_cutpoints.tsv` (fitted cutpoints in latent-score space)
+- `pulse_ocat_fit*.gam.rds` (saved `mgcv` fits)
+
+Writes under `OUT_DIR`:
+- `coupling_diagnostics.png`
+- `concurvity.tsv` (long format: `kind,row,col,value`)
+- `edf.tsv` (with `warn_edf_near_refdf`)
+
+### How To Interpret QC Outputs
+
+These checks are specifically about whether the coupling diagnostics and the per-gene smooth decomposition are behaving as intended.
+
+#### `coupling_diagnostics.png`
+
+This figure has four panels:
+
+1. **Coupling fit (x vs theta):** scatter of `x` vs `theta` with the fitted `m_hat(theta)`.
+   - Expect a smooth periodic trend, not a jagged curve that tracks noise.
+   - If `cells.tsv` has `source` and you pool datasets, `m_hat(theta)` is fit per batch; strong between-batch differences are a sign you should not force one shared coupling curve.
+2. **Residual depth histogram:** distribution of `r = x - m_hat(theta)`; look for pathologies (spikes, heavy tails) that can destabilize NB fits.
+3. **Residual vs theta:** scatter of `r` vs `theta`.
+  - You want *no obvious periodic banding*. Strong residual cyclicity can indicate that depth/cycle structure is not being cleanly separated in the downstream model.
+4. **Residual QQ-plot:** a coarse check for extreme outliers; heavy tails are common in real data, but very strong tails can cause per-gene failures.
+
+In addition to the plot, the script prints:
+- `corr(r, cos(theta))` and `corr(r, sin(theta))` (should be near 0)
+- `Residual cyclicity check: gam(r ~ s(theta)) p=...`
+  - Treat this as a *diagnostic* only. With large `n`, very small p-values can occur for tiny effects; use it alongside the residual-vs-theta plot.
+
+#### `concurvity.tsv`
+
+`mgcv::concurvity()` measures how well each smooth term can be explained by the others (smooth-term collinearity).
+
+- Values near `1` mean the decomposition across smooth terms (e.g. `s(r_um)`, `s(theta)`, `s(AP_um,ML_um)`, `ti(AP_um,ML_um,r_um)`, `ti(r_um,theta)`) is numerically unstable.
+- As a rule of thumb: `>0.9` is a warning; `>0.99` means component p-values are often not trustworthy.
+- If concurvity is high:
+  1. Reduce flexibility (lower interaction `k` first, then marginal `k` values).
+  2. Re-check that `theta` is wrapped and that pooled datasets use per-batch coupling (`source`).
+  3. Verify dataset-specific transforms (e.g. Sag5 `x` flip) were applied consistently upstream.
+
+#### `edf.tsv`
+
+`edf.tsv` reports `edf` and `Ref.df` per smooth term from `summary(fit)$s.table`, plus:
+- `edf_over_refdf`
+- `warn_edf_near_refdf` (flag when EDF is close to the basis limit)
+
+If a term repeatedly has EDF very close to its basis limit, it is a strong hint that `k_*` is too large or the model is trying to fit noise. Prefer lowering `k_int` before lowering the marginal `k` values.
+
+### Interpreting Per-Gene Outputs
+
+`fit_results.tsv` contains both component p-values and simple effect sizes on the *link* (log) scale:
+
+- `p_spatial`, `p_cycle`, `p_interaction`: evidence that `s(r_um)`, `s(theta)`, or `ti(r_um,theta)` is non-zero.
+- `p_apml`: evidence that `s(AP_um,ML_um)` is non-zero.
+- `p_apml_r_um`: evidence that `ti(AP_um,ML_um,r_um)` is non-zero.
+  - With large `n`, p-values can be extremely small for tiny effects; they are best used for ranking, not for deciding “biology labels” alone.
+- `cycle_amp_link`: `max_theta(eta_hat) - min_theta(eta_hat)` at a representative `r`.
+- `spatial_grad_link`: `eta_hat(r_hi) - eta_hat(r_lo)` at fixed `theta`.
+- `gating_index_link`: `(cycle amplitude at r_hi) - (cycle amplitude at r_lo)`.
+
+Because these are on the link scale, `exp(effect_size)` is a rough multiplicative change in expected counts (holding offset and covariates fixed).
+
+#### Note: tiny negative p-values
+
+In some `mgcv` builds, extremely small smooth-term p-values can appear as tiny negative numbers due to numerical roundoff. This repo clamps p-values to `[0,1]` when extracting them from fits; for any legacy output files you can repair them with:
+
+```bash
+Rscript scripts/gam/clamp_fit_results_pvals.R <fit_results.tsv>
+```
 
 ## Smoke Test
 

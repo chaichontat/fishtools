@@ -26,11 +26,10 @@ read_panel_tsv <- function(in_dir, require_theta = TRUE) {
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 1) {
-  cat("Usage: Rscript scripts/gam/fit_inm_panel.R IN_DIR [OUT_TSV] [--no-pos] [--no-theta] [--threads N] [--omp-threads N] [--basis shrink|standard] [--k-uv N] [--r-um-max UM] [--no-r-um-filter] [--priority-genes CSV] [--no-diagnostics] [--diagnostics] [--diagnostics-all] [--diagnostics-p P]\n")
+  cat("Usage: Rscript scripts/gam/fit_inm_panel.R IN_DIR [OUT_TSV] [--no-pos] [--no-theta] [--threads N] [--omp-threads N] [--basis shrink|standard] [--k-uv N] [--priority-genes CSV] [--no-diagnostics] [--diagnostics] [--diagnostics-all] [--diagnostics-p P]\n")
   cat("  --threads N controls gene-parallelism (N genes fit concurrently; default: 1); per-gene mgcv threading is forced to 1.\n")
   cat("  --omp-threads N controls OMP_NUM_THREADS (default: 8).\n")
   cat("  --k-uv N controls the AP/ML smooth basis dimension k for s(AP_um, ML_um) (default: 15).\n")
-  cat("  --r-um-max UM filters cells to r_um < UM (default: 300). Use --no-r-um-filter to disable.\n")
   cat("  --no-theta removes theta smooth terms (s(theta) and ti(r_um,theta)).\n")
   cat("  Diagnostics are written by default (per gene); use --no-diagnostics to disable.\n")
   quit(status = 2)
@@ -47,8 +46,6 @@ parse_opts <- function(opts) {
   omp_threads <- 8L
   basis <- "standard"
   k_uv <- 15L
-  r_um_max <- 300.0
-  disable_r_um_filter <- FALSE
   priority_genes <- c("Eomes", "Nr2f2")
   diagnostics <- TRUE
   diagnostics_all <- TRUE
@@ -63,11 +60,6 @@ parse_opts <- function(opts) {
     }
     if (opt == "--no-theta") {
       use_theta <- FALSE
-      i <- i + 1L
-      next
-    }
-    if (opt == "--no-r-um-filter") {
-      disable_r_um_filter <- TRUE
       i <- i + 1L
       next
     }
@@ -106,14 +98,6 @@ parse_opts <- function(opts) {
       val <- suppressWarnings(as.integer(opts[[i + 1L]]))
       if (!is.finite(val) || is.na(val) || val < 4) stop("--k-uv must be an integer >= 4.")
       k_uv <- val
-      i <- i + 2L
-      next
-    }
-    if (opt == "--r-um-max") {
-      if (i == length(opts)) stop("--r-um-max requires a numeric value.")
-      val <- suppressWarnings(as.numeric(opts[[i + 1L]]))
-      if (!is.finite(val) || is.na(val) || val <= 0) stop("--r-um-max must be a finite number > 0.")
-      r_um_max <- val
       i <- i + 2L
       next
     }
@@ -158,8 +142,6 @@ parse_opts <- function(opts) {
     omp_threads = omp_threads,
     basis = basis,
     k_uv = k_uv,
-    r_um_max = r_um_max,
-    disable_r_um_filter = disable_r_um_filter,
     priority_genes = priority_genes,
     diagnostics = diagnostics,
     diagnostics_all = diagnostics_all,
@@ -174,8 +156,6 @@ threads <- parsed$threads
 omp_threads <- parsed$omp_threads
 basis <- parsed$basis
 k_uv <- parsed$k_uv
-r_um_max <- parsed$r_um_max
-disable_r_um_filter <- parsed$disable_r_um_filter
 priority_genes <- parsed$priority_genes
 diagnostics <- parsed$diagnostics
 diagnostics_all <- parsed$diagnostics_all
@@ -190,26 +170,12 @@ panel <- read_panel_tsv(in_dir, require_theta = isTRUE(use_theta))
 
 	cells <- panel$cells
 	if (!is.numeric(cells$s) || any(!is.finite(cells$s)) || any(cells$s <= 0)) stop("cells$s must be numeric, finite, and > 0.")
-	if (!all(c("r_um", "AP_um", "ML_um") %in% names(cells))) {
+	  if (!all(c("r_um", "AP_um", "ML_um") %in% names(cells))) {
 	  stop("cells.tsv must contain: r_um, AP_um, ML_um (in addition to cell_id, x, s, and theta when theta terms are enabled)")
 	}
-	  r_um_all <- as.numeric(cells$r_um)
-	  if (any(!is.finite(r_um_all))) stop("cells$r_um must be finite.")
+  r_um_all <- as.numeric(cells$r_um)
+  if (any(!is.finite(r_um_all))) stop("cells$r_um must be finite.")
   GAM_GAMMA <- 2.5
-    R_UM_MAX_USED <- if (isTRUE(disable_r_um_filter)) Inf else as.numeric(r_um_max)
-    if (isTRUE(disable_r_um_filter)) {
-      cat("r_um filter disabled: using all cells (subject to finite AP/ML filtering)\n")
-    } else {
-	    keep <- r_um_all < R_UM_MAX_USED
-	    n_keep <- sum(keep)
-	    if (!is.finite(n_keep) || n_keep <= 0) stop(sprintf("r_um < %g filter removed all cells.", R_UM_MAX_USED))
-      if (n_keep < length(keep)) {
-        cat(sprintf("Filtering cells: keeping %d/%d with r_um < %g\n", n_keep, length(keep), R_UM_MAX_USED))
-        cells <- cells[keep, , drop = FALSE]
-        panel$counts <- panel$counts[keep, , drop = FALSE]
-        panel$cells <- cells
-      }
-    }
   # Additional hard filter: drop rows with non-finite AP/ML coordinates.
   ap_um_all <- as.numeric(cells$AP_um)
   ml_um_all <- as.numeric(cells$ML_um)
@@ -414,12 +380,11 @@ done <- character(0)
   if (!("gene" %in% names(existing))) {
     stop("Cannot resume: existing OUT_TSV is missing a 'gene' column.")
   }
-	  expected_cols <- c(
-	    "gene", "inm_r2",
-      "r_um_max",
-	    "p_spatial", "p_cycle", "p_interaction", "p_apml", "p_apml_r_um",
-	    "p_brdu_pos", "p_edu_pos", "p_brdu_edu",
-      "log_p_spatial", "log_p_cycle", "log_p_interaction", "log_p_apml", "log_p_apml_r_um",
+		  expected_cols <- c(
+		    "gene", "inm_r2",
+		    "p_spatial", "p_cycle", "p_interaction", "p_apml", "p_apml_r_um",
+		    "p_brdu_pos", "p_edu_pos", "p_brdu_edu",
+	      "log_p_spatial", "log_p_cycle", "log_p_interaction", "log_p_apml", "log_p_apml_r_um",
       "log_p_brdu_pos", "log_p_edu_pos", "log_p_brdu_edu",
 	    "cycle_amp_link", "spatial_grad_link", "gating_index_link"
 	  )
@@ -463,7 +428,6 @@ na_row <- function(gene) {
   data.frame(
     gene = gene,
     inm_r2 = coupling_r2,
-    r_um_max = R_UM_MAX_USED,
     p_spatial = NA_real_,
     p_cycle = NA_real_,
     p_interaction = NA_real_,
@@ -737,7 +701,6 @@ fit_one <- function(task) {
   row <- data.frame(
     gene = gene,
     inm_r2 = coupling_r2,
-    r_um_max = R_UM_MAX_USED,
     p_spatial = pv$p_spatial,
     p_cycle = pv$p_cycle,
     p_interaction = pv$p_interaction,
