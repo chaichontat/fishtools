@@ -26,10 +26,11 @@ read_panel_tsv <- function(in_dir, require_theta = TRUE) {
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) < 1) {
-  cat("Usage: Rscript scripts/gam/fit_inm_panel.R IN_DIR [OUT_TSV] [--no-pos] [--no-theta] [--threads N] [--omp-threads N] [--basis shrink|standard] [--k-uv N] [--priority-genes CSV] [--no-diagnostics] [--diagnostics] [--diagnostics-all] [--diagnostics-p P]\n")
+  cat("Usage: Rscript scripts/gam/fit_inm_panel.R IN_DIR [OUT_TSV] [--no-pos] [--no-theta] [--threads N] [--omp-threads N] [--basis shrink|standard] [--k-uv N] [--priority-genes CSV] [--heartbeat-sec N] [--no-diagnostics] [--diagnostics] [--diagnostics-all] [--diagnostics-p P]\n")
   cat("  --threads N controls gene-parallelism (N genes fit concurrently; default: 1); per-gene mgcv threading is forced to 1.\n")
   cat("  --omp-threads N controls OMP_NUM_THREADS (default: 8).\n")
   cat("  --k-uv N controls the AP/ML smooth basis dimension k for s(AP_um, ML_um) (default: 15).\n")
+  cat("  --heartbeat-sec N emits periodic 'still running' logs while a chunk is fitting (default: 60).\n")
   cat("  --no-theta removes theta smooth terms (s(theta) and ti(r_um,theta)).\n")
   cat("  Diagnostics are written by default (per gene); use --no-diagnostics to disable.\n")
   quit(status = 2)
@@ -47,6 +48,7 @@ parse_opts <- function(opts) {
   basis <- "standard"
   k_uv <- 15L
   priority_genes <- c("Eomes", "Nr2f2")
+  heartbeat_sec <- 60L
   diagnostics <- TRUE
   diagnostics_all <- TRUE
   diagnostics_p <- 0.05
@@ -111,6 +113,14 @@ parse_opts <- function(opts) {
       i <- i + 2L
       next
     }
+    if (opt == "--heartbeat-sec") {
+      if (i == length(opts)) stop("--heartbeat-sec requires an integer value.")
+      val <- suppressWarnings(as.integer(opts[[i + 1L]]))
+      if (!is.finite(val) || is.na(val) || val < 0) stop("--heartbeat-sec must be an integer >= 0.")
+      heartbeat_sec <- val
+      i <- i + 2L
+      next
+    }
     if (opt == "--diagnostics") {
       diagnostics <- TRUE
       diagnostics_all <- FALSE
@@ -143,6 +153,7 @@ parse_opts <- function(opts) {
     basis = basis,
     k_uv = k_uv,
     priority_genes = priority_genes,
+    heartbeat_sec = heartbeat_sec,
     diagnostics = diagnostics,
     diagnostics_all = diagnostics_all,
     diagnostics_p = diagnostics_p
@@ -157,6 +168,7 @@ omp_threads <- parsed$omp_threads
 basis <- parsed$basis
 k_uv <- parsed$k_uv
 priority_genes <- parsed$priority_genes
+heartbeat_sec <- parsed$heartbeat_sec
 diagnostics <- parsed$diagnostics
 diagnostics_all <- parsed$diagnostics_all
 diagnostics_p <- parsed$diagnostics_p
@@ -404,6 +416,7 @@ if (threads > 1 && .Platform$OS.type != "unix") {
 cat(sprintf("Total genes=%d; remaining_rows=%d; threads=%d; basis=%s\n", length(genes), remaining_rows, threads, basis))
 cat(sprintf("AP/ML smooth basis dimension: k_uv=%d\n", as.integer(k_uv)))
 cat(sprintf("Theta terms enabled: %s\n", if (isTRUE(use_theta)) "yes" else "no"))
+cat(sprintf("Heartbeat interval: %ds (set --heartbeat-sec 0 to disable)\n", as.integer(heartbeat_sec)))
 
 write_fit_error <- function(gene, msg) {
   err_row <- data.frame(gene = gene, error = msg, stringsAsFactors = FALSE)
@@ -608,6 +621,8 @@ fit_one <- function(task) {
   diag_path <- task$diag_path
   already_done <- task$already_done
   write_row <- !already_done
+  cat(sprintf("[%d/%d] start %s\n", j, length(genes), gene))
+  flush.console()
 
   y <- counts[, j]
   if (!is.numeric(y) || any(!is.finite(y)) || any(y < 0)) {
@@ -737,18 +752,55 @@ fit_one <- function(task) {
   )
 }
 
+start_heartbeat <- function(label, heartbeat_sec) {
+  if (.Platform$OS.type != "unix") return(NULL)
+  sec <- as.integer(heartbeat_sec)
+  if (!is.finite(sec) || is.na(sec) || sec <= 0) return(NULL)
+  parallel::mcparallel({
+    repeat {
+      Sys.sleep(sec)
+      cat(sprintf(
+        "[%s] heartbeat: still running %s\n",
+        format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"),
+        label
+      ))
+      flush.console()
+    }
+  }, silent = FALSE)
+}
+
+stop_heartbeat <- function(job) {
+  if (is.null(job)) return(invisible(NULL))
+  pid <- job$pid
+  if (!is.null(pid) && is.numeric(pid) && is.finite(pid) && pid > 0) {
+    try(tools::pskill(pid), silent = TRUE)
+  }
+  try(parallel::mccollect(job, wait = FALSE), silent = TRUE)
+  invisible(NULL)
+}
+
 chunk_size <- max(1L, as.integer(threads))
 for (i0 in seq(1L, length(tasks), by = chunk_size)) {
   i1 <- min(length(tasks), i0 + chunk_size - 1L)
   chunk <- tasks[i0:i1]
   cat(sprintf("Chunk %d-%d / %d\n", i0, i1, length(tasks)))
+  chunk_genes <- vapply(chunk, function(t) as.character(t$gene), character(1))
+  cat(sprintf("  genes: %s\n", paste(chunk_genes, collapse = ",")))
   flush.console()
 
-  if (threads <= 1) {
-    results <- lapply(chunk, fit_one)
-  } else {
-    results <- parallel::mclapply(chunk, fit_one, mc.cores = min(threads, length(chunk)))
-  }
+  hb <- start_heartbeat(sprintf("chunk %d-%d / %d", i0, i1, length(tasks)), heartbeat_sec)
+  results <- tryCatch(
+    {
+      if (threads <= 1) {
+        lapply(chunk, fit_one)
+      } else {
+        parallel::mclapply(chunk, fit_one, mc.cores = min(threads, length(chunk)))
+      }
+    },
+    finally = {
+      stop_heartbeat(hb)
+    }
+  )
 
   for (res in results) {
     if (!is.null(res$err)) {
