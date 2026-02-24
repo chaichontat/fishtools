@@ -98,6 +98,8 @@ else:
 obs = adata_in.obs.iloc[cell_pos].copy()
 var = adata_in.var.copy()
 adata_counts = sc.AnnData(X=X_sub, obs=obs, var=var)
+if "X_umap" in adata_in.obsm:
+    adata_counts.obsm["X_umap"] = np.asarray(adata_in.obsm["X_umap"][cell_pos, :])
 adata_counts.obs_names_make_unique()
 adata_counts.var_names_make_unique()
 print(
