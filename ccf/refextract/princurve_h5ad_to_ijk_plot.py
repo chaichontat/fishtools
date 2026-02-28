@@ -1,7 +1,7 @@
 # %% [markdown]
 # # Principal-Curve h5ad -> CCF ijk (LUT) + 3D plot
 #
-# This workflow converts two `.syn.annotated.princurve.h5ad` files into CCF `ijk` coordinates
+# This workflow converts `.syn.annotated*.princurve.h5ad` files into CCF `ijk` coordinates
 # using midsurface LUTs and plots both datasets in one 3D scatter.
 #
 # Run cells sequentially. Artifacts are written under `OUTDIR`.
@@ -28,33 +28,30 @@ from skimage.measure import find_contours
 
 INPUT_H5ADS: list[Path] = [
     Path(
-        "/home/chaichontat/fishtools2/working/20250929_JaxA3_Coro4/analysis/output/ccf-transforms/2/2.syn.annotated.princurve.h5ad"
+        "/fast2/cs_outputs/working/20250929_JaxA3_Coro4/analysis/output/ccf-transforms/2/2.syn.annotated.cortex.princurve.h5ad"
     ),
     Path(
-        "/home/chaichontat/fishtools2/working/20250929_JaxA3_Coro4/analysis/output/ccf-transforms/3/3.syn.annotated.princurve.h5ad"
+        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/1/1.syn.annotated.cortex.princurve.h5ad"
     ),
     Path(
-        "/home/chaichontat/fishtools2/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/1/1.syn.annotated.princurve.h5ad"
+        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/2/2.syn.annotated.cortex.princurve.h5ad"
     ),
     Path(
-        "/home/chaichontat/fishtools2/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/2/2.syn.annotated.princurve.h5ad"
+        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/3/3.syn.annotated.cortex.princurve.h5ad"
     ),
     Path(
-        "/home/chaichontat/fishtools2/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/3/3.syn.annotated.princurve.h5ad"
+        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/4/4.syn.annotated.cortex.princurve.h5ad"
     ),
     Path(
-        "/home/chaichontat/fishtools2/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/4/4.syn.annotated.princurve.h5ad"
+        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/5/5.syn.annotated.cortex.princurve.h5ad"
     ),
     Path(
-        "/home/chaichontat/fishtools2/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/5/5.syn.annotated.princurve.h5ad"
-    ),
-    Path(
-        "/home/chaichontat/fishtools2/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/6/6.syn.annotated.princurve.h5ad"
+        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/6/6.syn.annotated.cortex.princurve.h5ad"
     ),
 ]
 
 LUT_OUTDIR = Path(
-    "/home/chaichontat/fishtools2/ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d"
+    "/fast2/cs_outputs/fishtools2/ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d"
 )
 LUT_NT = 1024
 
@@ -68,9 +65,11 @@ T_LOOKUP_MODE = "t_all"  # {"t_all", "t_local_to_t_all"}
 MAX_PLOT_POINTS_PER_DATASET = 80_000
 PLOT_ALPHA = 0.08
 PLOT_SIZE = 1.0
+PLOT_JITTER_BASE_PX = 0.08
+PLOT_JITTER_MAX_PX = 1.0
 SEED = 0
 
-OUTDIR = Path("/home/chaichontat/fishtools2/results/refextract/princurve_h5ad_ijk_plot")
+OUTDIR = Path("/fast2/cs_outputs/fishtools2/results/refextract/princurve_h5ad_ijk_plot")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 T_TICKS = tuple(float(v) for v in np.linspace(0.0, 1.0, 21))
 
@@ -1173,10 +1172,15 @@ def _build_plot_payload(
         data = np.load(Path(str(info["out_npz"])))
         ijk = np.asarray(data["ijk"], dtype=np.float64)
         r_signed = np.asarray(data["r_signed"], dtype=np.float64)
+        r_um = np.asarray(data["r_um"], dtype=np.float64)
         t_lookup = np.asarray(data["t_lookup"], dtype=np.float64)
         if r_signed.shape[0] != ijk.shape[0]:
             raise ValueError(
                 f"Mismatched ijk/r_signed rows for {info['out_npz']}: {ijk.shape[0]} vs {r_signed.shape[0]}."
+            )
+        if r_um.shape[0] != ijk.shape[0]:
+            raise ValueError(
+                f"Mismatched ijk/r_um rows for {info['out_npz']}: {ijk.shape[0]} vs {r_um.shape[0]}."
             )
         if t_lookup.shape[0] != ijk.shape[0]:
             raise ValueError(
@@ -1186,11 +1190,23 @@ def _build_plot_payload(
             pick = rng_in.choice(ijk.shape[0], size=int(MAX_PLOT_POINTS_PER_DATASET), replace=False)
             ijk_plot = ijk[pick]
             r_signed_plot = r_signed[pick]
+            r_um_plot = r_um[pick]
             t_lookup_plot = t_lookup[pick]
         else:
             ijk_plot = ijk
             r_signed_plot = r_signed
+            r_um_plot = r_um
             t_lookup_plot = t_lookup
+        r_um_plot = np.clip(np.asarray(r_um_plot, dtype=np.float64), 0.0, np.inf)
+        r_hi = float(np.nanpercentile(r_um_plot, 99.0))
+        if not np.isfinite(r_hi) or r_hi <= 1.0e-12:
+            raise ValueError(f"Invalid r_um distribution for jitter in {info['out_npz']}.")
+        r_norm = np.clip(r_um_plot / r_hi, 0.0, 1.0)
+        jitter_sigma = float(PLOT_JITTER_BASE_PX) + (
+            float(PLOT_JITTER_MAX_PX) - float(PLOT_JITTER_BASE_PX)
+        ) * r_norm
+        jitter = rng_in.normal(loc=0.0, scale=1.0, size=ijk_plot.shape).astype(np.float64, copy=False)
+        ijk_plot = ijk_plot + jitter * jitter_sigma[:, None]
         payload.append((info, ijk_plot, r_signed_plot, colors[idx % len(colors)], t_lookup_plot))
     if not payload:
         raise ValueError("No plotting payload generated; results list is empty.")
