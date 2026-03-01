@@ -94,12 +94,28 @@ def fit_anchor_curve(
     # In normalized space, treat smoothing as ~0.1 * anchor-spacing RMS residual per point.
     smooth_sigma = 0.1 * float(smoothing)
     smooth_s = float(points.shape[0]) * float(smooth_sigma**2)
-    tck, _ = splprep([points_norm[:, 0], points_norm[:, 1]], u=u, s=smooth_s, k=k)
+    # `splprep` smoothing does not strictly interpolate endpoints. Historically we snapped
+    # dense endpoints to the first/last anchors after evaluation, but that can create a
+    # large first/last segment (a gradient spike) when smoothing pulls the spline away
+    # from the endpoint. To keep endpoints exact without introducing a discontinuity,
+    # we (1) up-weight endpoints in the fit and (2) apply a continuous endpoint
+    # correction that linearly interpolates the endpoint residual along the curve.
+    w = np.ones((points_norm.shape[0],), dtype=float)
+    if w.size >= 2:
+        w[0] = 100.0
+        w[-1] = 100.0
+    tck, _ = splprep([points_norm[:, 0], points_norm[:, 1]], u=u, s=smooth_s, k=k, w=w)
 
     u_dense = np.linspace(0.0, 1.0, int(max(2, n_dense)))
     x_dense_norm, y_dense_norm = splev(u_dense, tck)
     curve_norm = np.column_stack([np.asarray(x_dense_norm, float), np.asarray(y_dense_norm, float)])
     curve = curve_norm * spacing + origin[None, :]
+
+    # Continuous endpoint correction: enforce exact endpoints without a sharp jump.
+    d0 = points[0, :] - curve[0, :]
+    d1 = points[-1, :] - curve[-1, :]
+    delta = (1.0 - u_dense)[:, None] * d0[None, :] + u_dense[:, None] * d1[None, :]
+    curve = curve + delta
     curve[0, :] = points[0, :]
     curve[-1, :] = points[-1, :]
     return curve

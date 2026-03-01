@@ -11,6 +11,8 @@ from scipy.ndimage import map_coordinates
 from scipy.spatial import cKDTree
 from skimage.measure import find_contours
 
+from fishtools.ccf.princurve import fit_anchor_curve
+
 MANUAL_CONNECT_CORONAL_SLICE_IS: tuple[int, ...] = (
     183,
     184,
@@ -58,6 +60,16 @@ IJK_LUT_KNN_K = 24
 IJK_LUT_KNN_SIGMA_SLICE = 2.0
 IJK_LUT_KNN_SIGMA_T = 0.05
 IJK_LUT_KNN_WEIGHT_EPS = 1e-12
+
+# In-slice midline smoothing: use an anchor-driven spline similar to
+# `scripts/princurve/pick_curve_anchors.py` (via `fit_anchor_curve`).
+MIDLINE_INSLICE_ANCHOR_DT = 0.05
+MIDLINE_INSLICE_ANCHOR_SMOOTHING = 0.25
+MIDLINE_INSLICE_N_DENSE = 257
+
+# In-slice smoothing for LUT boundary curves (low/high) along t.
+LUT_BOUNDARY_ANCHOR_DT = 0.05
+LUT_BOUNDARY_ANCHOR_SMOOTHING = 0.25
 
 
 @dataclass(frozen=True)
@@ -461,6 +473,149 @@ def load_sagittal_midline_columns(csv_path: Path) -> dict[int, SagittalMidlineCo
     return _build_sagittal_midline_columns_from_halfway_u(csv_path.parent)
 
 
+def nearest_midline_slice_key(
+    *,
+    columns_by_slice: dict[int, CoronalMidlineColumns] | dict[int, SagittalMidlineColumns],
+    atlas_slice_idx: int,
+) -> int:
+    """Return nearest available midline-column slice key for a requested atlas slice."""
+    keys = np.asarray(sorted(int(k) for k in columns_by_slice.keys()), dtype=np.int32)
+    if keys.size == 0:
+        raise ValueError("columns_by_slice is empty.")
+    idx = int(np.argmin(np.abs(keys.astype(np.float64) - float(atlas_slice_idx))))
+    return int(keys[idx])
+
+
+def evaluate_midline_normal_bundle(
+    *,
+    columns: CoronalMidlineColumns | SagittalMidlineColumns,
+    axis: Literal["coronal", "sagittal"],
+    t_query: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate midline points and +pia-oriented unit normals for queried `t`.
+
+    Returns `(mid_ijk, normal_unit_ijk)`, both shaped `(N, 3)`:
+    - `mid_ijk[n]` is the midline point at `t_query[n]` in atlas voxel coordinates.
+    - `normal_unit_ijk[n]` is a unit vector in the slice plane, oriented so positive
+      displacement points toward the pial side.
+    """
+    tq = np.asarray(t_query, dtype=np.float64).reshape(-1)
+    if tq.ndim != 1:
+        raise ValueError(f"Expected 1D t_query, got shape={tq.shape}.")
+    if tq.size == 0:
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64)
+
+    t = np.asarray(columns.t, dtype=np.float64).reshape(-1)
+    y = np.asarray(columns.y, dtype=np.float64).reshape(-1)
+    x = np.asarray(columns.x, dtype=np.float64).reshape(-1)
+    vent_y = np.asarray(columns.vent_y, dtype=np.float64).reshape(-1)
+    vent_x = np.asarray(columns.vent_x, dtype=np.float64).reshape(-1)
+    pia_y = np.asarray(columns.pia_y, dtype=np.float64).reshape(-1)
+    pia_x = np.asarray(columns.pia_x, dtype=np.float64).reshape(-1)
+    if not (t.size == y.size == x.size == vent_y.size == vent_x.size == pia_y.size == pia_x.size):
+        raise ValueError("Midline column arrays have mismatched lengths.")
+
+    finite = (
+        np.isfinite(t)
+        & np.isfinite(y)
+        & np.isfinite(x)
+        & np.isfinite(vent_y)
+        & np.isfinite(vent_x)
+        & np.isfinite(pia_y)
+        & np.isfinite(pia_x)
+    )
+    if int(np.count_nonzero(finite)) < 4:
+        raise ValueError("Need at least 4 finite midline support points.")
+
+    t_f = t[finite]
+    y_f = y[finite]
+    x_f = x[finite]
+    vent_y_f = vent_y[finite]
+    vent_x_f = vent_x[finite]
+    pia_y_f = pia_y[finite]
+    pia_x_f = pia_x[finite]
+
+    order = np.argsort(t_f)
+    t_s = t_f[order]
+    y_s = y_f[order]
+    x_s = x_f[order]
+    vent_y_s = vent_y_f[order]
+    vent_x_s = vent_x_f[order]
+    pia_y_s = pia_y_f[order]
+    pia_x_s = pia_x_f[order]
+
+    t_u, keep_idx = np.unique(t_s, return_index=True)
+    if t_u.size < 4:
+        raise ValueError("Need at least 4 unique finite t values in midline columns.")
+    y_u = y_s[keep_idx]
+    x_u = x_s[keep_idx]
+    vent_y_u = vent_y_s[keep_idx]
+    vent_x_u = vent_x_s[keep_idx]
+    pia_y_u = pia_y_s[keep_idx]
+    pia_x_u = pia_x_s[keep_idx]
+
+    t_clip = np.clip(tq, float(t_u[0]), float(t_u[-1]))
+    y_q = np.interp(t_clip, t_u, y_u).astype(np.float64, copy=False)
+    x_q = np.interp(t_clip, t_u, x_u).astype(np.float64, copy=False)
+    vent_y_q = np.interp(t_clip, t_u, vent_y_u).astype(np.float64, copy=False)
+    vent_x_q = np.interp(t_clip, t_u, vent_x_u).astype(np.float64, copy=False)
+    pia_y_q = np.interp(t_clip, t_u, pia_y_u).astype(np.float64, copy=False)
+    pia_x_q = np.interp(t_clip, t_u, pia_x_u).astype(np.float64, copy=False)
+
+    dy_dt_u = np.gradient(y_u, t_u, edge_order=1).astype(np.float64, copy=False)
+    dx_dt_u = np.gradient(x_u, t_u, edge_order=1).astype(np.float64, copy=False)
+    dy_dt_q = np.interp(t_clip, t_u, dy_dt_u).astype(np.float64, copy=False)
+    dx_dt_q = np.interp(t_clip, t_u, dx_dt_u).astype(np.float64, copy=False)
+
+    # Plane coordinates: coronal=(k,j)=(x,y), sagittal=(j,i)=(x,y).
+    tan_plane = np.column_stack([dx_dt_q, dy_dt_q]).astype(np.float64, copy=False)
+    # +90 deg rotation in the local plane.
+    n_plane = np.column_stack([-tan_plane[:, 1], tan_plane[:, 0]]).astype(np.float64, copy=False)
+
+    pia_mid_plane = np.column_stack([pia_x_q - x_q, pia_y_q - y_q]).astype(np.float64, copy=False)
+    dot = np.sum(n_plane * pia_mid_plane, axis=1)
+
+    # Fallback sign cue when pia-mid is degenerate: use pia-vent direction.
+    bad_dot = ~np.isfinite(dot) | (np.abs(dot) <= 1.0e-9)
+    if np.any(bad_dot):
+        pia_vent_plane = np.column_stack([pia_x_q - vent_x_q, pia_y_q - vent_y_q]).astype(np.float64, copy=False)
+        dot_fallback = np.sum(n_plane * pia_vent_plane, axis=1)
+        dot = np.where(bad_dot, dot_fallback, dot)
+    flip = np.isfinite(dot) & (dot < 0.0)
+    n_plane[flip] *= -1.0
+
+    n_norm = np.linalg.norm(n_plane, axis=1)
+    valid_n = np.isfinite(n_norm) & (n_norm > 1.0e-12)
+    if not np.any(valid_n):
+        raise ValueError("Degenerate normals in midline bundle evaluation.")
+    n_plane[valid_n] /= n_norm[valid_n, None]
+    if np.any(~valid_n):
+        good = np.flatnonzero(valid_n).astype(np.float64, copy=False)
+        bad = np.flatnonzero(~valid_n).astype(np.float64, copy=False)
+        n_plane[~valid_n, 0] = np.interp(bad, good, n_plane[valid_n, 0]).astype(np.float64, copy=False)
+        n_plane[~valid_n, 1] = np.interp(bad, good, n_plane[valid_n, 1]).astype(np.float64, copy=False)
+        n_norm2 = np.linalg.norm(n_plane, axis=1)
+        n_plane /= np.maximum(n_norm2[:, None], 1.0e-12)
+
+    mid_ijk = np.empty((tq.size, 3), dtype=np.float64)
+    normal_ijk = np.zeros((tq.size, 3), dtype=np.float64)
+    if axis == "coronal":
+        mid_ijk[:, 0] = float(columns.slice_i)
+        mid_ijk[:, 1] = y_q
+        mid_ijk[:, 2] = x_q
+        # plane=(k,j) -> ijk=(0,j,k)
+        normal_ijk[:, 1] = n_plane[:, 1]
+        normal_ijk[:, 2] = n_plane[:, 0]
+    else:
+        mid_ijk[:, 0] = y_q
+        mid_ijk[:, 1] = x_q
+        mid_ijk[:, 2] = float(columns.slice_k)
+        # plane=(j,i) -> ijk=(i,j,0)
+        normal_ijk[:, 0] = n_plane[:, 1]
+        normal_ijk[:, 1] = n_plane[:, 0]
+    return mid_ijk.astype(np.float64, copy=False), normal_ijk.astype(np.float64, copy=False)
+
+
 def _load_halfway_u_and_masks(outdir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     u_path = outdir / "halfway_u_3d_ds.npy"
     if not u_path.exists():
@@ -544,6 +699,156 @@ def _normalized_arc_t_for_path(path_yx: np.ndarray) -> tuple[np.ndarray, np.ndar
         raise ValueError("Path had invalid arc-length.")
     t = (s / total).astype(np.float64, copy=False)
     return y, x, t
+
+
+def _reject_midline_anchor_outliers(anchor_yx: np.ndarray) -> np.ndarray:
+    """Reject isolated anchor spikes before spline fitting (robust, single-pass).
+
+    Always keeps endpoints; returns the input unchanged if it cannot compute a robust threshold.
+    """
+    pts = np.asarray(anchor_yx, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError(f"Expected anchor_yx shape (N,2), got {pts.shape}.")
+    if pts.shape[0] < 5:
+        return pts
+
+    p = pts[1:-1]
+    a = pts[:-2]
+    b = pts[2:]
+    v = b - a
+    vv = np.sum(v * v, axis=1)
+    vv = np.where(vv > 1.0e-12, vv, 1.0)
+    tau = np.clip(np.sum((p - a) * v, axis=1) / vv, 0.0, 1.0)
+    proj = a + tau[:, None] * v
+    dist = np.linalg.norm(p - proj, axis=1)
+    finite = np.isfinite(dist)
+    if int(np.count_nonzero(finite)) < 3:
+        return pts
+
+    med = float(np.median(dist[finite]))
+    mad = float(np.median(np.abs(dist[finite] - med)))
+    if not np.isfinite(med) or not np.isfinite(mad) or mad <= 1.0e-12:
+        return pts
+
+    thr = float(med + (8.0 * mad))
+    keep = np.ones((pts.shape[0],), dtype=bool)
+    keep[1:-1] = dist <= thr
+    keep[0] = True
+    keep[-1] = True
+    if int(np.count_nonzero(keep)) < 2:
+        return pts
+    return pts[keep]
+
+
+def _smooth_lut_boundary_curve_in_plane(
+    *,
+    curve_ijk: np.ndarray,
+    t_grid: np.ndarray,
+    axis: Literal["coronal", "sagittal"],
+) -> np.ndarray:
+    """Smooth one LUT boundary curve (low or high) along t, in the slice plane.
+
+    This uses the same anchor-spline machinery as midline smoothing (`fit_anchor_curve`),
+    but applied to the (plane) coordinates of the boundary curve while keeping the slice
+    index coordinate fixed.
+    """
+    curve = np.asarray(curve_ijk, dtype=np.float64)
+    tg = np.asarray(t_grid, dtype=np.float64).reshape(-1)
+    if curve.ndim != 2 or curve.shape[1] != 3:
+        raise ValueError(f"Expected curve_ijk shape (N,3), got {curve.shape}.")
+    if tg.shape[0] != curve.shape[0]:
+        raise ValueError(f"t_grid/curve length mismatch: {tg.shape[0]} vs {curve.shape[0]}.")
+
+    finite = np.isfinite(curve).all(axis=1) & np.isfinite(tg)
+    if int(np.count_nonzero(finite)) < 8:
+        return curve
+
+    t = tg[finite]
+    t0 = float(np.min(t))
+    t1 = float(np.max(t))
+    den = t1 - t0
+    if not np.isfinite(den) or den <= 1.0e-9:
+        return curve
+    u = (t - t0) / den
+
+    if axis == "coronal":
+        # plane (x,y) = (k,j)
+        xy = np.column_stack([curve[finite, 2], curve[finite, 1]]).astype(np.float64, copy=False)
+    else:
+        # plane (x,y) = (j,i)
+        xy = np.column_stack([curve[finite, 1], curve[finite, 0]]).astype(np.float64, copy=False)
+
+    dt = float(LUT_BOUNDARY_ANCHOR_DT)
+    if dt <= 0.0 or dt >= 1.0:
+        raise ValueError(f"LUT_BOUNDARY_ANCHOR_DT must be in (0,1), got {dt}.")
+    n_anchor = int(max(2, np.rint(1.0 / dt) + 1))
+    u_anchor = np.linspace(0.0, 1.0, int(n_anchor), dtype=np.float64)
+    x_anchor = np.interp(u_anchor, u, xy[:, 0]).astype(np.float64, copy=False)
+    y_anchor = np.interp(u_anchor, u, xy[:, 1]).astype(np.float64, copy=False)
+    anchor_xy = np.column_stack([x_anchor, y_anchor]).astype(np.float64, copy=False)
+    anchor_xy = _reject_midline_anchor_outliers(anchor_xy)
+
+    curve_xy = fit_anchor_curve(
+        anchor_xy=anchor_xy,
+        n_dense=int(xy.shape[0]),
+        smoothing=float(LUT_BOUNDARY_ANCHOR_SMOOTHING),
+    )
+    # `fit_anchor_curve` samples uniformly in its internal spline parameter, which can
+    # bunch points and create near-zero steps when we interpret the output as a
+    # t-parameterized curve. Reparameterize by in-plane arclength so each LUT row is
+    # indexed by normalized arclength (consistent with t_grid semantics).
+    seg = np.linalg.norm(np.diff(curve_xy, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    if np.isfinite(total) and total > 1.0e-12:
+        u_curve = cum / total
+        u_target = np.linspace(0.0, 1.0, int(curve_xy.shape[0]), dtype=np.float64)
+        x_u = np.interp(u_target, u_curve, curve_xy[:, 0]).astype(np.float64, copy=False)
+        y_u = np.interp(u_target, u_curve, curve_xy[:, 1]).astype(np.float64, copy=False)
+        curve_xy = np.column_stack([x_u, y_u]).astype(np.float64, copy=False)
+        curve_xy[0, :] = anchor_xy[0, :]
+        curve_xy[-1, :] = anchor_xy[-1, :]
+
+    out = curve.copy()
+    if axis == "coronal":
+        out[finite, 1] = curve_xy[:, 1]  # j
+        out[finite, 2] = curve_xy[:, 0]  # k
+    else:
+        out[finite, 0] = curve_xy[:, 1]  # i
+        out[finite, 1] = curve_xy[:, 0]  # j
+    return out
+
+
+def _smooth_midline_path_anchor_spline(path_yx: np.ndarray) -> np.ndarray:
+    """Smooth + reparameterize a midline polyline via an anchor spline.
+
+    This reduces high-frequency contour jitter before computing normals and vent/pia
+    intersections in `_build_slice_columns`.
+    """
+    dt = float(MIDLINE_INSLICE_ANCHOR_DT)
+    smoothing = float(MIDLINE_INSLICE_ANCHOR_SMOOTHING)
+    n_dense = int(MIDLINE_INSLICE_N_DENSE)
+    if dt <= 0.0 or dt >= 1.0:
+        raise ValueError(f"MIDLINE_INSLICE_ANCHOR_DT must be in (0,1), got {dt}.")
+    if smoothing < 0.0:
+        raise ValueError(f"MIDLINE_INSLICE_ANCHOR_SMOOTHING must be >= 0, got {smoothing}.")
+    if n_dense < 2:
+        raise ValueError(f"MIDLINE_INSLICE_N_DENSE must be >= 2, got {n_dense}.")
+
+    y, x, t = _normalized_arc_t_for_path(path_yx)
+    n_anchor = int(max(2, np.rint(1.0 / dt) + 1))
+    t_anchor = np.linspace(0.0, 1.0, n_anchor, dtype=np.float64)
+    y_anchor = np.interp(t_anchor, t, y).astype(np.float64, copy=False)
+    x_anchor = np.interp(t_anchor, t, x).astype(np.float64, copy=False)
+    anchor_yx = np.column_stack([y_anchor, x_anchor]).astype(np.float64, copy=False)
+    anchor_yx = _reject_midline_anchor_outliers(anchor_yx)
+
+    try:
+        curve_yx = fit_anchor_curve(anchor_xy=anchor_yx, n_dense=int(n_dense), smoothing=float(smoothing))
+    except SystemExit as e:
+        # `fit_anchor_curve` is written for scripts and raises SystemExit on invalid inputs.
+        raise ValueError(f"Midline anchor spline failed: {e}") from None
+    return np.asarray(curve_yx, dtype=np.float64)
 
 
 def _t_anchor_range_from_overlap(
@@ -858,7 +1163,8 @@ def _build_slice_columns(
     Notes on `t`:
     - `t` is `t_all`: normalized arc length along the full u=0.5 curve on this slice.
     """
-    y, x, t = _normalized_arc_t_for_path(path_yx)
+    path_smooth = _smooth_midline_path_anchor_spline(path_yx)
+    y, x, t = _normalized_arc_t_for_path(path_smooth)
 
     dt = np.gradient(t)
     dy = np.gradient(y)
@@ -2308,26 +2614,162 @@ def _build_ijk_segment_lut_for_axis(
                 vent = (vent_y, vent_x, float(s))
                 pia = (pia_y, pia_x, float(s))
 
+            # Use EDT-derived r01 only as an ordering hint when it is available.
+            # Do NOT drop the column when r01 is non-finite; it is common for the EDT
+            # fields to be undefined outside the mask used during their construction.
+            r_vent = float("nan")
+            r_pia = float("nan")
             try:
                 r_vent = float(_r01_at_ijk(edt, vent))
                 r_pia = float(_r01_at_ijk(edt, pia))
             except ValueError:
-                continue
-            if not np.isfinite(r_vent) or not np.isfinite(r_pia):
-                continue
+                pass
 
-            if r_vent <= r_pia:
-                lo, hi = vent, pia
-            else:
+            if np.isfinite(r_vent) and np.isfinite(r_pia) and r_vent > r_pia:
                 lo, hi = pia, vent
+            else:
+                lo, hi = vent, pia
             low_ijk[row, col] = np.asarray(lo, dtype=np.float32)
             high_ijk[row, col] = np.asarray(hi, dtype=np.float32)
 
     valid_rows = np.ones((slice_keys.size,), dtype=bool)
     for row in range(slice_keys.size):
+        # If the radial direction flips sign between adjacent t samples, remove a small
+        # neighborhood around the flip and interpolate across it. This enforces
+        # continuity of the low->high direction without attempting to resolve
+        # non-injectivity (adjacent segment intersections can still occur).
+        #
+        # The user-requested behavior is to drop a +/- 0.01 window in t around each flip.
+        drop_radius_t = 0.01
+        half_window = int(np.ceil(float(drop_radius_t) * float(max(1, t_grid.size - 1))))
+        if half_window > 0:
+            finite_pairs_pre = np.isfinite(low_ijk[row]).all(axis=1) & np.isfinite(high_ijk[row]).all(axis=1)
+            if int(np.count_nonzero(finite_pairs_pre)) >= 2:
+                drop = np.zeros((t_grid.size,), dtype=bool)
+
+                # 1) Radial-direction sign flips.
+                vec = high_ijk[row] - low_ijk[row]
+                norms = np.linalg.norm(vec, axis=1)
+                unit = vec / np.maximum(norms[:, None], 1.0e-12)
+                dot = np.sum(unit[:-1] * unit[1:], axis=1)
+                flip_idx = np.flatnonzero(np.isfinite(dot) & (dot < 0.0))
+                for i in flip_idx.tolist():
+                    i = int(i)
+                    start = max(0, i - half_window)
+                    # dot[i] is between i and i+1, so include i+1.
+                    end = min(t_grid.size, (i + 1) + half_window + 1)
+                    drop[start:end] = True
+
+                # 2) Large midline jumps (both low and high shift together), which can
+                # create visible discontinuities even when the radial direction stays continuous.
+                mid = 0.5 * (low_ijk[row] + high_ijk[row])
+                step = np.linalg.norm(np.diff(mid, axis=0), axis=1)
+                finite_step = np.isfinite(step)
+                if np.any(finite_step):
+                    med = float(np.median(step[finite_step]))
+                    if np.isfinite(med) and med > 1.0e-12:
+                        jump_idx = np.flatnonzero(finite_step & (step > (5.0 * med)))
+                        for i in jump_idx.tolist():
+                            i = int(i)
+                            start = max(0, i - half_window)
+                            end = min(t_grid.size, (i + 1) + half_window + 1)
+                            drop[start:end] = True
+
+                # 3) Boundary tangent reversals (a local U-turn on the low or high boundary curve).
+                # These can happen even when the radial direction stays continuous, and they show up
+                # as obvious kinks in the (t,r)->ijk chart. Drop a small neighborhood and interpolate.
+                turn_dot_thresh = -0.5  # >120 deg turn
+                eps = 1.0e-6
+
+                def _mark_boundary_turn_reversals(curve_ijk: np.ndarray) -> None:
+                    if axis == "coronal":
+                        # plane (x,y) = (k,j)
+                        xy = curve_ijk[:, [2, 1]].astype(np.float64, copy=False)
+                    else:
+                        # plane (x,y) = (j,i)
+                        xy = curve_ijk[:, [1, 0]].astype(np.float64, copy=False)
+                    finite_xy = np.isfinite(xy).all(axis=1)
+                    if int(np.count_nonzero(finite_xy)) < 3:
+                        return
+
+                    seg = xy[1:] - xy[:-1]
+                    seg_norm = np.linalg.norm(seg, axis=1)
+                    seg_ok = finite_xy[:-1] & finite_xy[1:] & np.isfinite(seg_norm) & (seg_norm > eps)
+                    if int(np.count_nonzero(seg_ok)) < 2:
+                        return
+                    seg_unit = seg / np.maximum(seg_norm[:, None], 1.0e-12)
+                    dot2 = np.sum(seg_unit[:-1] * seg_unit[1:], axis=1)
+                    kink = np.flatnonzero(seg_ok[:-1] & seg_ok[1:] & np.isfinite(dot2) & (dot2 < turn_dot_thresh))
+                    for i in kink.tolist():
+                        # dot2[i] is between seg i and i+1, so the vertex is at point i+1.
+                        v = int(i) + 1
+                        start = max(0, v - half_window)
+                        end = min(t_grid.size, v + half_window + 1)
+                        drop[start:end] = True
+
+                _mark_boundary_turn_reversals(low_ijk[row])
+                _mark_boundary_turn_reversals(high_ijk[row])
+
+                if np.any(drop):
+                    low_ijk[row, drop] = np.nan
+                    high_ijk[row, drop] = np.nan
+
         for dim in range(3):
             low_ijk[row, :, dim] = _fill_nan_series_interior(low_ijk[row, :, dim]).astype(np.float32, copy=False)
             high_ijk[row, :, dim] = _fill_nan_series_interior(high_ijk[row, :, dim]).astype(np.float32, copy=False)
+
+        # Smooth boundary curves along t in the slice plane (reduces jagged low/high).
+        low_ijk[row] = _smooth_lut_boundary_curve_in_plane(curve_ijk=low_ijk[row], t_grid=t_grid, axis=axis).astype(
+            np.float32, copy=False
+        )
+        high_ijk[row] = _smooth_lut_boundary_curve_in_plane(curve_ijk=high_ijk[row], t_grid=t_grid, axis=axis).astype(
+            np.float32, copy=False
+        )
+
+        # Post-smoothing cleanup: occasionally the low boundary can locally U-turn even when
+        # the radial direction stays continuous. This breaks the chart geometry (visible kinks).
+        # Drop a small neighborhood around such turns and re-smooth once.
+        if half_window > 0:
+            turn_dot_thresh = -0.5  # >120 deg turn in-plane
+            eps = 1.0e-6
+
+            def _turn_drop_mask(curve_ijk: np.ndarray) -> np.ndarray:
+                if axis == "coronal":
+                    xy = curve_ijk[:, [2, 1]].astype(np.float64, copy=False)  # (k,j)
+                else:
+                    xy = curve_ijk[:, [1, 0]].astype(np.float64, copy=False)  # (j,i)
+                finite_xy = np.isfinite(xy).all(axis=1)
+                if int(np.count_nonzero(finite_xy)) < 3:
+                    return np.zeros((t_grid.size,), dtype=bool)
+
+                seg = xy[1:] - xy[:-1]
+                seg_norm = np.linalg.norm(seg, axis=1)
+                seg_ok = finite_xy[:-1] & finite_xy[1:] & np.isfinite(seg_norm) & (seg_norm > eps)
+                if int(np.count_nonzero(seg_ok)) < 2:
+                    return np.zeros((t_grid.size,), dtype=bool)
+                seg_unit = seg / np.maximum(seg_norm[:, None], 1.0e-12)
+                dot2 = np.sum(seg_unit[:-1] * seg_unit[1:], axis=1)
+                kink = np.flatnonzero(seg_ok[:-1] & seg_ok[1:] & np.isfinite(dot2) & (dot2 < turn_dot_thresh))
+                if kink.size == 0:
+                    return np.zeros((t_grid.size,), dtype=bool)
+
+                out = np.zeros((t_grid.size,), dtype=bool)
+                for i in kink.tolist():
+                    v = int(i) + 1  # vertex index
+                    start = max(0, v - half_window)
+                    end = min(t_grid.size, v + half_window + 1)
+                    out[start:end] = True
+                return out
+
+            low_drop2 = _turn_drop_mask(low_ijk[row])
+            if np.any(low_drop2):
+                low_ijk[row, low_drop2] = np.nan
+                for dim in range(3):
+                    low_ijk[row, :, dim] = _fill_nan_series_interior(low_ijk[row, :, dim]).astype(np.float32, copy=False)
+                low_ijk[row] = _smooth_lut_boundary_curve_in_plane(
+                    curve_ijk=low_ijk[row], t_grid=t_grid, axis=axis
+                ).astype(np.float32, copy=False)
+
         finite_pairs = np.isfinite(low_ijk[row]).all(axis=1) & np.isfinite(high_ijk[row]).all(axis=1)
         if int(np.count_nonzero(finite_pairs)) == 0:
             valid_rows[row] = False

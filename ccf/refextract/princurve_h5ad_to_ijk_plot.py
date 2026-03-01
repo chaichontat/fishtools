@@ -14,53 +14,63 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import anndata as ad
 import matplotlib.pyplot as plt
 import numpy as np
+from ccf.refextract.midsurface_coords import (
+    evaluate_midline_normal_bundle,
+    load_coronal_midline_columns,
+    load_sagittal_midline_columns,
+    nearest_midline_slice_key,
+)
+from fishtools.ccf.princurve import fit_anchor_curve, project_to_polyline_arclength
+from fishtools.utils.io import Workspace
 from scipy.interpolate import CubicSpline
 from skimage.measure import find_contours
 
 # %%
 # === EDIT THESE ===
 
-INPUT_H5ADS: list[Path] = [
-    Path(
-        "/fast2/cs_outputs/working/20250929_JaxA3_Coro4/analysis/output/ccf-transforms/2/2.syn.annotated.cortex.princurve.h5ad"
-    ),
-    Path(
-        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/1/1.syn.annotated.cortex.princurve.h5ad"
-    ),
-    Path(
-        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/2/2.syn.annotated.cortex.princurve.h5ad"
-    ),
-    Path(
-        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/3/3.syn.annotated.cortex.princurve.h5ad"
-    ),
-    Path(
-        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/4/4.syn.annotated.cortex.princurve.h5ad"
-    ),
-    Path(
-        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/5/5.syn.annotated.cortex.princurve.h5ad"
-    ),
-    Path(
-        "/fast2/cs_outputs/working/20251024_JaxA1_Sag7/analysis/output/ccf-transforms/6/6.syn.annotated.cortex.princurve.h5ad"
-    ),
+WORKSPACES: list[Path] = [
+    Path("/home/chaichontat/nvme/20251005_JaxA3_Coro2"),
+    Path("/home/chaichontat/nvme/20251015_JaxA2_Sag7"),
+    Path("/working/20250929_JaxA3_Coro4"),
+    Path("/working/20251001_JaxA3_Coro11"),
+    Path("/working/20251024_JaxA1_Sag7"),
+    Path("/working/20251026_JaxA1_Sag6"),
+    Path("/working/20251117_JaxA6_Coro5"),
+    Path("/working/20251122_JaxA6_Coro2"),
+    Path("/working/20251125_JaxA6_Coro8"),
+    Path("/working/20251201_JaxA6_Coro6"),
+    Path("/working/20251213_JaxA6_Coro4"),
+    Path("/working/20251224_JaxA4_Sag1"),
+    Path("/working/20251225_JaxA4_Sag2"),
+    Path("/working/20251227_JaxA4_Sag3"),
+    Path("/working/20251228_JaxA4_Sag4"),
+    Path("/working/20251229_JaxA4_Sag5"),
+    Path("/working/20251230_JaxA4_Sag6"),
 ]
 
 LUT_OUTDIR = Path(
-    "/fast2/cs_outputs/fishtools2/ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d"
+    "/home/chaichontat/fishtools2/ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d"
 )
 LUT_NT = 1024
 
 R_BIN_COUNT = 1024
-R_ROLL_HALF_WINDOW = 24
+# Smaller window tracks local thickness changes more tightly (less smoothing).
+R_ROLL_HALF_WINDOW = 12
 R_SOURCE_UM_PER_PX = 0.216
 R_TARGET_UM_PER_PX = 20.0
 
 T_LOOKUP_MODE = "t_all"  # {"t_all", "t_local_to_t_all"}
+IJK_MAPPING_MODE = "midline_normal"  # {"lut", "midline_normal"}
+REVERSE_SAMPLE_TO_REFERENCE_T = False
+RENDER_T_AS_ONE_MINUS_T = REVERSE_SAMPLE_TO_REFERENCE_T
+REUSE_PHASE1_FROM_NPZ = False
 
 MAX_PLOT_POINTS_PER_DATASET = 80_000
 PLOT_ALPHA = 0.08
@@ -68,10 +78,15 @@ PLOT_SIZE = 1.0
 PLOT_JITTER_BASE_PX = 0.08
 PLOT_JITTER_MAX_PX = 1.0
 SEED = 0
+REVIEW_CURVE_N_DENSE = 5_000
+REVIEW_ANCHOR_SMOOTHING = 0.5
+REVIEW_R_SIGN_ENDPOINT_EXTRAPOLATION = 0.25
+REVIEW_PANEL_ALPHA = 0.35
+REVIEW_PANEL_SIZE = 2.0
 
-OUTDIR = Path("/fast2/cs_outputs/fishtools2/results/refextract/princurve_h5ad_ijk_plot")
+OUTDIR = Path("/home/chaichontat/fishtools2/results/refextract/princurve_h5ad_ijk_plot")
 OUTDIR.mkdir(parents=True, exist_ok=True)
-T_TICKS = tuple(float(v) for v in np.linspace(0.0, 1.0, 21))
+T_TICKS = tuple(float(v) for v in np.linspace(0.0, 1.0, 11))
 
 # Flattened AP/ML plotting (for statistical modeling charts)
 PLOT_FLATTENED_AP_ML = True
@@ -91,10 +106,25 @@ print(f"LUT_OUTDIR={LUT_OUTDIR}")
 print(f"OUTDIR={OUTDIR}")
 print(f"LUT_NT={LUT_NT}, R_BIN_COUNT={R_BIN_COUNT}, R_ROLL_HALF_WINDOW={R_ROLL_HALF_WINDOW}")
 print(f"T_LOOKUP_MODE={T_LOOKUP_MODE}")
+print(f"IJK_MAPPING_MODE={IJK_MAPPING_MODE}")
 print(f"FLAT_SAGITTAL_ML_MODE={FLAT_SAGITTAL_ML_MODE}")
 print(
     f"R_SCALE_PX={R_SOURCE_UM_PER_PX / R_TARGET_UM_PER_PX:.8f} ({R_SOURCE_UM_PER_PX}um/px -> {R_TARGET_UM_PER_PX}um/px)"
 )
+
+
+def iter_syn_annotated_h5ads(workspaces: Iterable[Path | str]) -> Iterator[Path]:
+    """Yield per-ROI principal-curve files under each workspace CCF transforms directory."""
+    for workspace in workspaces:
+        ws = Workspace(Path(workspace))
+        ccf_dir = ws.ccf_transforms()
+        if not ccf_dir.exists():
+            print(f"Skipping missing CCF transforms directory: {ccf_dir}")
+            continue
+        for h5ad in sorted(ccf_dir.glob("*/*.princurve.h5ad")):
+            if h5ad.name.endswith("bad.princurve.h5ad"):
+                continue
+            yield h5ad
 
 # %% [markdown]
 # ## Phase 0: Helpers (LUT load, rolling normalization, vectorized lookup)
@@ -812,6 +842,48 @@ def _slice_t_support(lut: AxisLut, atlas_slice_idx: int) -> tuple[float, float, 
     return float(np.min(t_valid)), float(np.max(t_valid)), source_slice_used
 
 
+def _slice_t_support_midline(
+    *,
+    columns_by_slice: dict[int, object],
+    atlas_slice_idx: int,
+) -> tuple[float, float, int]:
+    source_slice_used = int(nearest_midline_slice_key(columns_by_slice=columns_by_slice, atlas_slice_idx=atlas_slice_idx))
+    cols = columns_by_slice[int(source_slice_used)]
+    t_vals = np.asarray(getattr(cols, "t"), dtype=np.float64).reshape(-1)
+    finite = np.isfinite(t_vals)
+    if int(np.count_nonzero(finite)) < 2:
+        raise ValueError(f"Midline slice={source_slice_used} has insufficient finite t support.")
+    return float(np.min(t_vals[finite])), float(np.max(t_vals[finite])), source_slice_used
+
+
+def _lookup_ijk_batch_midline_normal_slice_locked(
+    *,
+    axis: AXIS,
+    columns_by_slice: dict[int, object],
+    atlas_slice_idx: int,
+    t_lookup: np.ndarray,
+    r_um: np.ndarray,
+) -> tuple[np.ndarray, int]:
+    """Lookup on nearest midline slice using +pia oriented local normals."""
+    t = np.asarray(t_lookup, dtype=np.float64)
+    r = np.asarray(r_um, dtype=np.float64)
+    if t.shape != r.shape:
+        raise ValueError("t_lookup and r_um must have the same shape.")
+    if t.ndim != 1:
+        raise ValueError("t_lookup and r_um must be 1D.")
+    if axis not in {"coronal", "sagittal"}:
+        raise ValueError(f"Unsupported axis={axis!r} for midline-normal lookup.")
+
+    source_slice_used = int(nearest_midline_slice_key(columns_by_slice=columns_by_slice, atlas_slice_idx=atlas_slice_idx))
+    cols = columns_by_slice[int(source_slice_used)]
+    mid_ijk, normal_ijk = evaluate_midline_normal_bundle(columns=cols, axis=axis, t_query=t)
+    r_px_target = r / float(R_TARGET_UM_PER_PX)
+    ijk = mid_ijk + r_px_target[:, None] * normal_ijk
+    if not np.isfinite(ijk).all():
+        raise ValueError("Non-finite values produced during midline-normal IJK lookup.")
+    return ijk.astype(np.float64, copy=False), source_slice_used
+
+
 def _p1_landmarks_path_from_h5ad(h5ad_path: Path) -> Path:
     return h5ad_path.with_name("p1_landmarks.json")
 
@@ -933,16 +1005,26 @@ def _resolve_t_lookup_for_lut(t_fields: TFields) -> tuple[np.ndarray, np.ndarray
     - `t_lookup_lut`: values in LUT `t_all` domain.
     - `t_lookup_name`: source coordinate label for reporting.
     """
+    def _sample_to_reference_t(t_values: np.ndarray) -> np.ndarray:
+        t_arr = np.asarray(t_values, dtype=np.float64)
+        if bool(REVERSE_SAMPLE_TO_REFERENCE_T):
+            return (1.0 - t_arr).astype(np.float64, copy=False)
+        return t_arr.astype(np.float64, copy=False)
+
     mode = str(T_LOOKUP_MODE).strip().lower()
     if mode == "t_all":
-        return t_fields.t_all, t_fields.t_all, "t_all"
+        t_lut = _sample_to_reference_t(t_fields.t_all)
+        name = "t_all_rev" if bool(REVERSE_SAMPLE_TO_REFERENCE_T) else "t_all"
+        return t_fields.t_all, t_lut, name
     if mode == "t_local_to_t_all":
         local_to_all_affine = TTypeConverter.fit_local_to_all_affine(
             t_local=t_fields.t_local,
             t_all=t_fields.t_all,
         )
         converter = TTypeConverter(local_to_all_affine=local_to_all_affine)
-        return t_fields.t_local, converter.t_local_to_t_all(t_fields.t_local), "t_local"
+        t_lut = _sample_to_reference_t(converter.t_local_to_t_all(t_fields.t_local))
+        name = "t_local_rev" if bool(REVERSE_SAMPLE_TO_REFERENCE_T) else "t_local"
+        return t_fields.t_local, t_lut, name
     raise ValueError(
         f"Unsupported T_LOOKUP_MODE={T_LOOKUP_MODE!r}; expected one of {{'t_all', 't_local_to_t_all'}}."
     )
@@ -1161,6 +1243,186 @@ def _plot_t_ticks_with_labels(
             )
 
 
+def _render_t_values(t_vals: np.ndarray) -> np.ndarray:
+    t_arr = np.asarray(t_vals, dtype=np.float64)
+    if bool(RENDER_T_AS_ONE_MINUS_T):
+        return (1.0 - t_arr).astype(np.float64, copy=False)
+    return t_arr.astype(np.float64, copy=False)
+
+
+def _extract_anchor_ids_from_payload(payload: dict[str, object]) -> list[str]:
+    raw = payload.get("anchors")
+    if isinstance(raw, list) and raw:
+        out: list[str] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            cid = item.get("cell_id")
+            if isinstance(cid, str) and cid != "":
+                out.append(cid)
+        if len(out) >= 2:
+            return out
+
+    start = payload.get("start")
+    end = payload.get("end")
+    out2: list[str] = []
+    for item in (start, end):
+        if not isinstance(item, dict):
+            continue
+        cid = item.get("cell_id")
+        if isinstance(cid, str) and cid != "":
+            out2.append(cid)
+    return out2
+
+
+def _anchor_json_path_for_h5ad(h5ad_path: Path) -> Path | None:
+    stem = str(h5ad_path.stem)
+    base_stem = stem[: -len(".princurve")] if stem.endswith(".princurve") else stem
+
+    primary_candidates = [
+        h5ad_path.with_name(f"{base_stem}.anchors.json"),
+        h5ad_path.with_name(f"{stem}.anchors.json"),
+    ]
+    for cand in primary_candidates:
+        if cand.exists():
+            return cand
+
+    glob_patterns = [f"{base_stem}*.anchors.json"]
+    if base_stem != stem:
+        glob_patterns.append(f"{stem}*.anchors.json")
+
+    candidates: list[Path] = []
+    for pattern in glob_patterns:
+        candidates.extend(sorted(h5ad_path.parent.glob(pattern)))
+    uniq_candidates = sorted(set(candidates))
+    if len(uniq_candidates) == 1:
+        return uniq_candidates[0]
+    return None
+
+
+def _load_review_panel_data(
+    *,
+    h5ad_path: Path,
+    keep_idx: np.ndarray,
+    fallback_r_signed: np.ndarray,
+    sample_idx_keep: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str | None]:
+    """Load review-space points and signed-r using pick_curve_anchors logic when anchors exist."""
+    adata = ad.read_h5ad(h5ad_path, backed="r")
+    try:
+        if "spatial" not in adata.obsm:
+            raise ValueError(f"Missing obsm['spatial'] in {h5ad_path}.")
+        xy_full = np.asarray(adata.obsm["spatial"], dtype=np.float64)
+        if xy_full.ndim != 2 or xy_full.shape[1] < 2:
+            raise ValueError(f"Unexpected spatial shape in {h5ad_path}: {xy_full.shape}.")
+        xy_full = xy_full[:, :2]
+        cell_ids = adata.obs_names.astype(str).to_numpy()
+    finally:
+        if getattr(adata, "isbacked", False) and getattr(adata, "file", None) is not None:
+            adata.file.close()
+
+    keep = np.asarray(keep_idx, dtype=np.int64).reshape(-1)
+    if keep.size == 0:
+        raise ValueError(f"Empty keep_idx in {h5ad_path}.")
+    if int(np.min(keep)) < 0 or int(np.max(keep)) >= int(xy_full.shape[0]):
+        raise ValueError(
+            f"keep_idx out of bounds for {h5ad_path}: min={int(np.min(keep))}, "
+            f"max={int(np.max(keep))}, n_obs={xy_full.shape[0]}."
+        )
+
+    sample_idx = np.asarray(sample_idx_keep, dtype=np.int64).reshape(-1)
+    if sample_idx.size == 0:
+        raise ValueError(f"Empty sample_idx_keep in {h5ad_path}.")
+    if int(np.min(sample_idx)) < 0 or int(np.max(sample_idx)) >= int(keep.shape[0]):
+        raise ValueError(
+            f"sample_idx_keep out of bounds for {h5ad_path}: min={int(np.min(sample_idx))}, "
+            f"max={int(np.max(sample_idx))}, n_keep={keep.shape[0]}."
+        )
+
+    r_fallback_full = np.asarray(fallback_r_signed, dtype=np.float64).reshape(-1)
+    if r_fallback_full.shape[0] != keep.shape[0]:
+        raise ValueError(
+            f"fallback_r_signed/keep_idx size mismatch for {h5ad_path}: {r_fallback_full.shape[0]} vs {keep.shape[0]}."
+        )
+    r_fallback = np.asarray(r_fallback_full[sample_idx], dtype=np.float64)
+
+    xy_keep = xy_full[keep]
+    xy_plot = np.asarray(xy_keep[sample_idx], dtype=np.float64)
+    r_keep = r_fallback.copy()
+    curve_xy = np.empty((0, 2), dtype=np.float64)
+    anchor_xy = np.empty((0, 2), dtype=np.float64)
+
+    anchor_path = _anchor_json_path_for_h5ad(h5ad_path)
+    if anchor_path is None:
+        return xy_plot, r_keep, curve_xy, anchor_xy, "missing anchors json"
+
+    payload = json.loads(anchor_path.read_text())
+    anchor_ids = _extract_anchor_ids_from_payload(payload)
+    if len(anchor_ids) < 2:
+        return xy_plot, r_keep, curve_xy, anchor_xy, "anchors json has fewer than 2 anchors"
+
+    cell_to_index = {cid: i for i, cid in enumerate(cell_ids)}
+    missing_ids = [cid for cid in anchor_ids if cid not in cell_to_index]
+    if missing_ids:
+        return (
+            xy_plot,
+            r_keep,
+            curve_xy,
+            anchor_xy,
+            f"anchors missing in h5ad: {len(missing_ids)}",
+        )
+
+    anchor_idx = np.asarray([cell_to_index[cid] for cid in anchor_ids], dtype=np.int64)
+    anchor_xy = xy_full[anchor_idx]
+    curve_xy = fit_anchor_curve(
+        anchor_xy=anchor_xy,
+        n_dense=int(REVIEW_CURVE_N_DENSE),
+        smoothing=float(REVIEW_ANCHOR_SMOOTHING),
+    )
+    _t, r_sampled, _proj = project_to_polyline_arclength(
+        xy=xy_plot,
+        line=curve_xy,
+        k=50,
+        endpoint_extrapolation=float(REVIEW_R_SIGN_ENDPOINT_EXTRAPOLATION),
+    )
+    reverse_r_sign = payload.get("reverse_r_sign")
+    if reverse_r_sign is None:
+        reverse = False
+    elif isinstance(reverse_r_sign, bool):
+        reverse = bool(reverse_r_sign)
+    else:
+        raise ValueError(f"Invalid reverse_r_sign in {anchor_path}: expected bool, got {type(reverse_r_sign).__name__}.")
+    if reverse:
+        r_sampled = -np.asarray(r_sampled, dtype=np.float64)
+    else:
+        r_sampled = np.asarray(r_sampled, dtype=np.float64)
+
+    r_keep = r_sampled
+    bad = ~np.isfinite(r_keep)
+    if np.any(bad):
+        r_keep[bad] = r_fallback[bad]
+    return xy_plot, r_keep, curve_xy, anchor_xy, None
+
+
+def _native_plane_xy_from_ijk(axis: AXIS, ijk: np.ndarray) -> tuple[np.ndarray, np.ndarray, str, str]:
+    ijk_arr = np.asarray(ijk, dtype=np.float64)
+    if ijk_arr.ndim != 2 or ijk_arr.shape[1] != 3:
+        raise ValueError(f"Expected ijk shape (N,3), got {ijk_arr.shape}.")
+    if axis == "sagittal":
+        return ijk_arr[:, 0], ijk_arr[:, 1], "i", "j"
+    if axis == "coronal":
+        return ijk_arr[:, 1], ijk_arr[:, 2], "j", "k"
+    raise ValueError(f"Unsupported axis={axis!r}")
+
+
+def _info_display_name(info: dict[str, object]) -> str:
+    base = str(info["name"])
+    dataset = str(info.get("dataset_name", "")).strip()
+    if dataset == "":
+        return base
+    return f"{dataset}/{base}"
+
+
 def _build_plot_payload(
     *,
     results_in: list[dict[str, object]],
@@ -1222,8 +1484,9 @@ def _plot_cells_ijk_mpl3d(
     ax = fig.add_subplot(111, projection="3d")
 
     for info, ijk_plot, _r_signed_plot, color, _t_lookup_plot in plot_payload:
+        disp = _info_display_name(info)
         label = (
-            f"{info['name']} ({info['axis']}, slice={info['atlas_slice_idx']}, "
+            f"{disp} ({info['axis']}, slice={info['atlas_slice_idx']}, "
             f"used={info['source_slice_used']}, n={ijk_plot.shape[0]})"
         )
         ax.scatter(
@@ -1270,8 +1533,9 @@ def _plot_cells_ijk_projections(
 
     scatter_for_colorbar = None
     for info, ijk_plot, r_signed_plot, color, _t_lookup_plot in plot_payload:
+        disp = _info_display_name(info)
         label = (
-            f"{info['name']} ({info['axis']}, slice={info['atlas_slice_idx']}, "
+            f"{disp} ({info['axis']}, slice={info['atlas_slice_idx']}, "
             f"used={info['source_slice_used']}, n={ijk_plot.shape[0]})"
         )
         scatter_for_colorbar = ax_ij.scatter(
@@ -1406,13 +1670,14 @@ def _plot_cells_ijk_projections(
 
         t_ticks_pos = tuple(float(tt) for tt in T_TICKS)
         label_prefix = "t="
+        t_curve_render = _render_t_values(t_all_curve)
         # Only draw t ticks on the curve's native plane; other projections can be degenerate/misleading.
         if axis == "sagittal":
             _plot_t_ticks_with_labels(
                 ax=ax_ij,
                 x=curve_ijk[:, 0],
                 y=curve_ijk[:, 1],
-                t_vals=t_all_curve,
+                t_vals=t_curve_render,
                 t_ticks=t_ticks_pos,
                 color=color,
                 label_prefix=label_prefix,
@@ -1425,7 +1690,7 @@ def _plot_cells_ijk_projections(
                 ax=ax_jk,
                 x=curve_ijk[:, 1],
                 y=curve_ijk[:, 2],
-                t_vals=t_all_curve,
+                t_vals=t_curve_render,
                 t_ticks=t_ticks_pos,
                 color=color,
                 label_prefix=label_prefix,
@@ -1457,14 +1722,503 @@ def _plot_cells_ijk_projections(
     print(f"Wrote: {out_path}")
 
 
+def _plot_cells_ijk_per_roi_axes(
+    *,
+    plot_payload: list[tuple[dict[str, object], np.ndarray, np.ndarray, str, np.ndarray]],
+    out_path: Path,
+) -> None:
+    n_items = len(plot_payload)
+    if n_items == 0:
+        raise ValueError("No plot payload available for per-ROI axes figure.")
+    ncols = int(min(8, max(3, int(np.ceil(np.sqrt(n_items))))))
+    nrows = int(np.ceil(n_items / ncols))
+    fig, axs = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(3.2 * ncols, 3.2 * nrows),
+        squeeze=False,
+        sharex=True,
+        sharey=True,
+    )
+    axes = axs.ravel()
+
+    all_r_signed = np.concatenate([r_signed_plot for _, _, r_signed_plot, _, _t in plot_payload], axis=0)
+    if all_r_signed.size == 0 or not np.isfinite(all_r_signed).any():
+        raise ValueError("No finite r_signed values available for per-ROI coloring.")
+    r_vmin = float(np.nanmin(all_r_signed))
+    r_vmax = float(np.nanmax(all_r_signed))
+    if abs(r_vmax - r_vmin) <= 1.0e-12:
+        r_vmax = r_vmin + 1.0
+
+    x_mins: list[float] = []
+    x_maxs: list[float] = []
+    y_mins: list[float] = []
+    y_maxs: list[float] = []
+    scatter_for_colorbar = None
+    for ax, (info, ijk_plot, r_signed_plot, _color, _t_lookup_plot) in zip(axes, plot_payload, strict=False):
+        axis = str(info["axis"])
+        if axis == "sagittal":
+            x = ijk_plot[:, 0]
+            y = ijk_plot[:, 1]
+            x_label, y_label = "i", "j"
+        elif axis == "coronal":
+            x = ijk_plot[:, 1]
+            y = ijk_plot[:, 2]
+            x_label, y_label = "j", "k"
+        else:
+            raise ValueError(f"Unsupported axis={axis!r}")
+        x_mins.append(float(np.min(x)))
+        x_maxs.append(float(np.max(x)))
+        y_mins.append(float(np.min(y)))
+        y_maxs.append(float(np.max(y)))
+        scatter_for_colorbar = ax.scatter(
+            x,
+            y,
+            s=float(PLOT_SIZE),
+            alpha=float(PLOT_ALPHA),
+            c=r_signed_plot,
+            cmap="coolwarm",
+            vmin=r_vmin,
+            vmax=r_vmax,
+            linewidths=0.0,
+        )
+        ax.set_aspect("equal", adjustable="box")
+        ax.invert_yaxis()
+        ax.set_title(
+            f"{_info_display_name(info)}\n{axis} slice={int(info['atlas_slice_idx'])}",
+            fontsize=8,
+        )
+        ax.set_xlabel(x_label)
+        ax.set_ylabel(y_label)
+
+    if scatter_for_colorbar is None:
+        raise ValueError("Failed to create per-ROI scatter for colorbar.")
+    for ax in axes[n_items:]:
+        ax.axis("off")
+
+    x_min = float(np.min(np.asarray(x_mins, dtype=np.float64)))
+    x_max = float(np.max(np.asarray(x_maxs, dtype=np.float64)))
+    y_min = float(np.min(np.asarray(y_mins, dtype=np.float64)))
+    y_max = float(np.max(np.asarray(y_maxs, dtype=np.float64)))
+    if x_max <= x_min:
+        x_max = x_min + 1.0
+    if y_max <= y_min:
+        y_max = y_min + 1.0
+    for ax in axes[:n_items]:
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_max, y_min)
+
+    fig.suptitle("Per-ROI native-plane projections (shared scale)", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    print(f"Wrote: {out_path}")
+
+
+def _plot_review_and_native_per_roi_axes_4col(
+    *,
+    results_in: list[dict[str, object]],
+    lut_outdir: Path,
+    out_path: Path,
+    rng_in: np.random.Generator,
+) -> None:
+    """Plot per-ROI paired panels: review-space + transformed native-plane in a shared 4-column grid."""
+    if not results_in:
+        raise ValueError("No results available for review/native paired plotting.")
+
+    coronal_midline_paths = _load_midline_paths_csv(
+        lut_outdir / "coronal_midline_columns.csv", slice_label="slice_i"
+    )
+    sagittal_midline_paths = _load_midline_paths_csv(
+        lut_outdir / "sagittal_midline_columns.csv", slice_label="slice_k"
+    )
+
+    panels: list[dict[str, object]] = []
+    for info in results_in:
+        out_npz = Path(str(info["out_npz"]))
+        data = np.load(out_npz)
+        ijk = np.asarray(data["ijk"], dtype=np.float64)
+        r_native = np.asarray(data["r_signed"], dtype=np.float64).reshape(-1)
+        keep_idx = np.asarray(data["keep_idx"], dtype=np.int64).reshape(-1)
+        if ijk.ndim != 2 or ijk.shape[1] != 3:
+            raise ValueError(f"Unexpected ijk shape in {out_npz}: {ijk.shape}.")
+        if r_native.shape[0] != ijk.shape[0]:
+            raise ValueError(f"r_signed/ijk mismatch in {out_npz}: {r_native.shape[0]} vs {ijk.shape[0]}.")
+        if keep_idx.shape[0] != ijk.shape[0]:
+            raise ValueError(f"keep_idx/ijk mismatch in {out_npz}: {keep_idx.shape[0]} vs {ijk.shape[0]}.")
+
+        h5ad_raw = np.asarray(data["h5ad_path"]).reshape(-1)[0]
+        h5ad_path = Path(str(h5ad_raw))
+
+        n_pts = ijk.shape[0]
+        if n_pts > int(MAX_PLOT_POINTS_PER_DATASET):
+            pick = rng_in.choice(n_pts, size=int(MAX_PLOT_POINTS_PER_DATASET), replace=False)
+        else:
+            pick = np.arange(n_pts, dtype=np.int64)
+
+        ijk_plot = ijk[pick]
+        review_xy_plot, r_plot, review_curve_xy, anchor_xy, review_warning = _load_review_panel_data(
+            h5ad_path=h5ad_path,
+            keep_idx=keep_idx,
+            fallback_r_signed=r_native,
+            sample_idx_keep=pick,
+        )
+
+        axis = str(info["axis"])
+        atlas_slice_idx = int(info["atlas_slice_idx"])
+        native_x, native_y, native_x_label, native_y_label = _native_plane_xy_from_ijk(axis=axis, ijk=ijk_plot)
+        native_xy_plot = np.column_stack([native_x, native_y]).astype(np.float64, copy=False)
+
+        curve_ijk_t = _curve_ijk_from_midline_csv(
+            axis=axis,
+            atlas_slice_idx=atlas_slice_idx,
+            coronal_paths=coronal_midline_paths,
+            sagittal_paths=sagittal_midline_paths,
+        )
+        if curve_ijk_t is None:
+            native_curve_xy = np.empty((0, 2), dtype=np.float64)
+            native_curve_t = np.empty((0,), dtype=np.float64)
+        else:
+            curve_ijk, t_curve = curve_ijk_t
+            if axis == "sagittal":
+                native_curve_xy = np.column_stack([curve_ijk[:, 0], curve_ijk[:, 1]]).astype(np.float64, copy=False)
+            elif axis == "coronal":
+                native_curve_xy = np.column_stack([curve_ijk[:, 1], curve_ijk[:, 2]]).astype(np.float64, copy=False)
+            else:
+                raise ValueError(f"Unsupported axis={axis!r}.")
+            native_curve_t = np.asarray(t_curve, dtype=np.float64)
+
+        panels.append(
+            {
+                "info": info,
+                "review_xy_plot": review_xy_plot,
+                "r_plot": r_plot,
+                "review_curve_xy": review_curve_xy,
+                "anchor_xy": anchor_xy,
+                "review_warning": review_warning,
+                "native_xy_plot": native_xy_plot,
+                "native_curve_xy": native_curve_xy,
+                "native_curve_t": native_curve_t,
+                "native_x_label": native_x_label,
+                "native_y_label": native_y_label,
+            }
+        )
+
+    review_xy_parts: list[np.ndarray] = []
+    native_xy_parts: list[np.ndarray] = []
+    for panel in panels:
+        review_xy_parts.append(np.asarray(panel["review_xy_plot"], dtype=np.float64))
+        review_curve_xy = np.asarray(panel["review_curve_xy"], dtype=np.float64)
+        if review_curve_xy.ndim == 2 and review_curve_xy.shape[0] >= 2:
+            review_xy_parts.append(review_curve_xy)
+        anchor_xy = np.asarray(panel["anchor_xy"], dtype=np.float64)
+        if anchor_xy.ndim == 2 and anchor_xy.shape[0] >= 1:
+            review_xy_parts.append(anchor_xy)
+
+        native_xy_parts.append(np.asarray(panel["native_xy_plot"], dtype=np.float64))
+        native_curve_xy = np.asarray(panel["native_curve_xy"], dtype=np.float64)
+        if native_curve_xy.ndim == 2 and native_curve_xy.shape[0] >= 2:
+            native_xy_parts.append(native_curve_xy)
+
+    review_xy_all = np.vstack(review_xy_parts)
+    native_xy_all = np.vstack(native_xy_parts)
+    if review_xy_all.size == 0 or native_xy_all.size == 0:
+        raise ValueError("No review/native points available for paired plotting.")
+
+    review_x_min = float(np.nanmin(review_xy_all[:, 0]))
+    review_x_max = float(np.nanmax(review_xy_all[:, 0]))
+    review_y_min = float(np.nanmin(review_xy_all[:, 1]))
+    review_y_max = float(np.nanmax(review_xy_all[:, 1]))
+    native_x_min = float(np.nanmin(native_xy_all[:, 0]))
+    native_x_max = float(np.nanmax(native_xy_all[:, 0]))
+    native_y_min = float(np.nanmin(native_xy_all[:, 1]))
+    native_y_max = float(np.nanmax(native_xy_all[:, 1]))
+    if review_x_max <= review_x_min:
+        review_x_max = review_x_min + 1.0
+    if review_y_max <= review_y_min:
+        review_y_max = review_y_min + 1.0
+    if native_x_max <= native_x_min:
+        native_x_max = native_x_min + 1.0
+    if native_y_max <= native_y_min:
+        native_y_max = native_y_min + 1.0
+    native_x_span = float(max(native_x_max - native_x_min, 1.0))
+    native_y_span = float(max(native_y_max - native_y_min, 1.0))
+
+    r_all = np.concatenate([np.asarray(p["r_plot"], dtype=np.float64) for p in panels], axis=0)
+    finite_abs = np.abs(r_all[np.isfinite(r_all)])
+    r_lim = float(np.quantile(finite_abs, 0.99)) if finite_abs.size else 1.0
+    if not np.isfinite(r_lim) or r_lim <= 0.0:
+        r_lim = 1.0
+
+    n_items = len(panels)
+    nrows = int(np.ceil(n_items / 2))
+    fig, axs = plt.subplots(
+        nrows,
+        4,
+        figsize=(16.0, 3.8 * nrows),
+        squeeze=False,
+    )
+
+    used_axes: set[tuple[int, int]] = set()
+    for idx, panel in enumerate(panels):
+        row = int(idx // 2)
+        review_col = int((idx % 2) * 2)
+        native_col = review_col + 1
+        used_axes.add((row, review_col))
+        used_axes.add((row, native_col))
+
+        info = panel["info"]
+        review_xy_plot = np.asarray(panel["review_xy_plot"], dtype=np.float64)
+        native_xy_plot = np.asarray(panel["native_xy_plot"], dtype=np.float64)
+        r_plot = np.asarray(panel["r_plot"], dtype=np.float64)
+        review_curve_xy = np.asarray(panel["review_curve_xy"], dtype=np.float64)
+        anchor_xy = np.asarray(panel["anchor_xy"], dtype=np.float64)
+        native_curve_xy = np.asarray(panel["native_curve_xy"], dtype=np.float64)
+        native_curve_t = np.asarray(panel["native_curve_t"], dtype=np.float64)
+        native_x_label = str(panel["native_x_label"])
+        native_y_label = str(panel["native_y_label"])
+        review_warning = panel["review_warning"]
+
+        ax_review = axs[row, review_col]
+        ax_native = axs[row, native_col]
+
+        ax_review.scatter(
+            review_xy_plot[:, 0],
+            review_xy_plot[:, 1],
+            c=r_plot,
+            s=float(REVIEW_PANEL_SIZE),
+            alpha=float(REVIEW_PANEL_ALPHA),
+            cmap="coolwarm",
+            vmin=-r_lim,
+            vmax=r_lim,
+            linewidths=0.0,
+            zorder=2,
+        )
+        if review_curve_xy.shape[0] >= 2:
+            ax_review.plot(review_curve_xy[:, 0], review_curve_xy[:, 1], color="black", linewidth=1.3, zorder=3)
+        if anchor_xy.shape[0] >= 1:
+            ax_review.scatter(
+                anchor_xy[:, 0],
+                anchor_xy[:, 1],
+                c="yellow",
+                s=24.0,
+                edgecolors="black",
+                linewidths=0.4,
+                zorder=4,
+            )
+            ax_review.scatter(
+                [anchor_xy[0, 0]],
+                [anchor_xy[0, 1]],
+                c="lime",
+                s=40.0,
+                edgecolors="black",
+                linewidths=0.5,
+                zorder=5,
+            )
+            ax_review.scatter(
+                [anchor_xy[-1, 0]],
+                [anchor_xy[-1, 1]],
+                c="red",
+                s=40.0,
+                edgecolors="black",
+                linewidths=0.5,
+                zorder=5,
+            )
+        if isinstance(review_warning, str):
+            ax_review.text(
+                0.01,
+                0.99,
+                review_warning,
+                transform=ax_review.transAxes,
+                ha="left",
+                va="top",
+                fontsize=7,
+                bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8},
+            )
+
+        ax_review.set_xlim(review_x_min, review_x_max)
+        ax_review.set_ylim(review_y_min, review_y_max)
+        ax_review.set_aspect("equal", adjustable="box")
+        ax_review.set_xlabel("x")
+        ax_review.set_ylabel("y")
+        ax_review.set_title(
+            f"{_info_display_name(info)} review\n{info['axis']} slice={int(info['atlas_slice_idx'])}",
+            fontsize=8,
+        )
+
+        ax_native.scatter(
+            native_xy_plot[:, 0],
+            native_xy_plot[:, 1],
+            s=float(PLOT_SIZE),
+            alpha=float(PLOT_ALPHA),
+            c=r_plot,
+            cmap="coolwarm",
+            vmin=-r_lim,
+            vmax=r_lim,
+            linewidths=0.0,
+            zorder=2,
+        )
+        if native_curve_xy.shape[0] >= 2:
+            native_curve_t_render = _render_t_values(native_curve_t)
+            ax_native.plot(
+                native_curve_xy[:, 0],
+                native_curve_xy[:, 1],
+                color="black",
+                linewidth=1.3,
+                alpha=0.95,
+                zorder=4,
+            )
+            _plot_t_ticks_with_labels(
+                ax=ax_native,
+                x=native_curve_xy[:, 0],
+                y=native_curve_xy[:, 1],
+                t_vals=native_curve_t_render,
+                t_ticks=T_TICKS,
+                color="black",
+                label_prefix="t=",
+                xspan=native_x_span,
+                yspan=native_y_span,
+                show_labels=True,
+            )
+        ax_native.set_xlim(native_x_min, native_x_max)
+        ax_native.set_ylim(native_y_max, native_y_min)
+        ax_native.set_aspect("equal", adjustable="box")
+        ax_native.set_xlabel(native_x_label)
+        ax_native.set_ylabel(native_y_label)
+        ax_native.set_title(
+            f"{_info_display_name(info)} native\n{info['axis']} slice={int(info['atlas_slice_idx'])}",
+            fontsize=8,
+        )
+
+    for row in range(nrows):
+        for col in range(4):
+            if (row, col) not in used_axes:
+                axs[row, col].axis("off")
+
+    fig.suptitle("Per-ROI paired panels: review-space and transformed native-plane", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    print(f"Wrote: {out_path}")
+
+
+def _load_cached_phase1_summary(
+    *,
+    out_npz: Path,
+    in_h5ad: Path,
+    axis: AXIS,
+    atlas_slice_idx: int,
+    dataset_name: str,
+) -> dict[str, object] | None:
+    d = np.load(out_npz)
+    required = {
+        "h5ad_path",
+        "axis",
+        "atlas_slice_idx",
+        "source_slice_used",
+        "n_outside_support",
+        "support_slice_used",
+        "t_support_lo",
+        "t_support_hi",
+        "t_lookup_mode",
+        "t_lookup_name",
+        "t_lookup",
+        "t_all",
+        "t_local",
+        "t_neomeso",
+        "r_signed",
+        "r_um",
+        "n_total",
+    }
+    if not required.issubset(set(d.files)):
+        return None
+
+    cached_h5ad = Path(str(np.asarray(d["h5ad_path"]).reshape(-1)[0]))
+    cached_axis = str(np.asarray(d["axis"]).reshape(-1)[0])
+    cached_slice = int(np.asarray(d["atlas_slice_idx"]).reshape(-1)[0])
+    if "ijk_mapping_mode" in d.files:
+        cached_mapping_mode = str(np.asarray(d["ijk_mapping_mode"]).reshape(-1)[0]).strip().lower()
+    else:
+        cached_mapping_mode = "lut"
+    expected_mapping_mode = str(IJK_MAPPING_MODE).strip().lower()
+    if cached_h5ad != in_h5ad or cached_axis != axis or cached_slice != int(atlas_slice_idx):
+        return None
+    if cached_mapping_mode != expected_mapping_mode:
+        return None
+
+    t_lookup = np.asarray(d["t_lookup"], dtype=np.float64).reshape(-1)
+    t_all = np.asarray(d["t_all"], dtype=np.float64).reshape(-1)
+    t_local = np.asarray(d["t_local"], dtype=np.float64).reshape(-1)
+    t_neomeso = np.asarray(d["t_neomeso"], dtype=np.float64).reshape(-1)
+    r_signed = np.asarray(d["r_signed"], dtype=np.float64).reshape(-1)
+    r_um = np.asarray(d["r_um"], dtype=np.float64).reshape(-1)
+    if not (
+        t_lookup.shape == t_all.shape == t_local.shape == t_neomeso.shape == r_signed.shape == r_um.shape
+    ):
+        return None
+
+    n_kept = int(t_lookup.shape[0])
+    if n_kept == 0:
+        return None
+    n_outside = int(np.asarray(d["n_outside_support"]).reshape(-1)[0])
+    outside_frac = float(n_outside / max(1, n_kept))
+
+    t_all_min, t_all_max = _finite_minmax(t_all)
+    t_local_min, t_local_max = _finite_minmax(t_local)
+    t_neomeso_min, t_neomeso_max = _finite_minmax(t_neomeso)
+
+    return {
+        "name": in_h5ad.stem,
+        "dataset_name": str(dataset_name),
+        "axis": axis,
+        "atlas_slice_idx": int(atlas_slice_idx),
+        "source_slice_used": int(np.asarray(d["source_slice_used"]).reshape(-1)[0]),
+        "n_outside_support": n_outside,
+        "outside_support_frac": outside_frac,
+        "support_slice_used": int(np.asarray(d["support_slice_used"]).reshape(-1)[0]),
+        "t_support_lo": float(np.asarray(d["t_support_lo"]).reshape(-1)[0]),
+        "t_support_hi": float(np.asarray(d["t_support_hi"]).reshape(-1)[0]),
+        "lookup_method": f"slice_locked_{cached_mapping_mode}",
+        "ijk_mapping_mode": str(cached_mapping_mode),
+        "t_lookup_mode": str(np.asarray(d["t_lookup_mode"]).reshape(-1)[0]),
+        "t_lookup_name": str(np.asarray(d["t_lookup_name"]).reshape(-1)[0]),
+        "n_total": int(np.asarray(d["n_total"]).reshape(-1)[0]),
+        "n_kept": n_kept,
+        "t_lookup_min": float(np.min(t_lookup)),
+        "t_lookup_max": float(np.max(t_lookup)),
+        "t_all_min": t_all_min,
+        "t_all_max": t_all_max,
+        "t_local_min": t_local_min,
+        "t_local_max": t_local_max,
+        "t_neomeso_min": t_neomeso_min,
+        "t_neomeso_max": t_neomeso_max,
+        "r_signed_min": float(np.min(r_signed)),
+        "r_signed_max": float(np.max(r_signed)),
+        "r_um_min": float(np.min(r_um)),
+        "r_um_max": float(np.max(r_um)),
+        "out_npz": str(out_npz),
+    }
+
+
 LUTS: dict[AXIS, AxisLut] = {
     "coronal": _load_axis_lut(LUT_OUTDIR, "coronal"),
     "sagittal": _load_axis_lut(LUT_OUTDIR, "sagittal"),
+}
+if str(IJK_MAPPING_MODE).strip().lower() not in {"lut", "midline_normal"}:
+    raise ValueError(f"Unsupported IJK_MAPPING_MODE={IJK_MAPPING_MODE!r}; expected {{'lut', 'midline_normal'}}.")
+MIDLINE_COLUMNS: dict[AXIS, dict[int, object]] = {
+    "coronal": load_coronal_midline_columns(LUT_OUTDIR / "coronal_midline_columns.csv"),
+    "sagittal": load_sagittal_midline_columns(LUT_OUTDIR / "sagittal_midline_columns.csv"),
 }
 print(
     "Loaded LUTs:",
     f"coronal_rows={LUTS['coronal'].source_slice_keys.size}",
     f"sagittal_rows={LUTS['sagittal'].source_slice_keys.size}",
+)
+print(
+    "Loaded midline columns:",
+    f"coronal_rows={len(MIDLINE_COLUMNS['coronal'])}",
+    f"sagittal_rows={len(MIDLINE_COLUMNS['sagittal'])}",
 )
 
 # %% [markdown]
@@ -1473,11 +2227,42 @@ print(
 # %%
 rng = np.random.default_rng(SEED)
 results: list[dict[str, object]] = []
+input_h5ads = list(iter_syn_annotated_h5ads(WORKSPACES))
+if not input_h5ads:
+    workspace_lines = "\n".join(f"  - {ws}" for ws in WORKSPACES)
+    raise FileNotFoundError(
+        "No principal-curve h5ad files found via workspace discovery. "
+        "Expected matches at <workspace>/analysis/output/ccf-transforms/*/*.princurve.h5ad "
+        "(excluding *bad.princurve.h5ad).\n"
+        f"Workspaces searched:\n{workspace_lines}"
+    )
+print(f"Discovered {len(input_h5ads)} principal-curve h5ad files across {len(WORKSPACES)} workspaces.")
+mapping_mode_tag = str(IJK_MAPPING_MODE).strip().lower()
 
-for in_h5ad in INPUT_H5ADS:
+for in_h5ad in input_h5ads:
     axis, atlas_slice_idx = _read_axis_and_slice(in_h5ad)
+    dataset_name = in_h5ad.parents[4].name if len(in_h5ad.parents) >= 5 else in_h5ad.parent.name
+    out_npz = OUTDIR / f"{in_h5ad.stem}.{axis}.slice{int(atlas_slice_idx)}.ijk_from_{mapping_mode_tag}.npz"
     print(f"\nProcessing: {in_h5ad.name}")
     print(f"  axis={axis}, atlas_slice_idx={atlas_slice_idx}")
+    if bool(REUSE_PHASE1_FROM_NPZ) and out_npz.exists():
+        cached = _load_cached_phase1_summary(
+            out_npz=out_npz,
+            in_h5ad=in_h5ad,
+            axis=axis,
+            atlas_slice_idx=int(atlas_slice_idx),
+            dataset_name=str(dataset_name),
+        )
+        if cached is not None:
+            results.append(cached)
+            print(
+                f"  reused={cached['n_kept']}/{cached['n_total']}",
+                f"t_lookup({cached['t_lookup_name']})=[{cached['t_lookup_min']:.4f},{cached['t_lookup_max']:.4f}]",
+                f"support_t=[{cached['t_support_lo']:.4f},{cached['t_support_hi']:.4f}]",
+                f"outside_support={cached['n_outside_support']} ({cached['outside_support_frac']:.3%})",
+                f"source_slice_used={cached['source_slice_used']}",
+            )
+            continue
 
     adata = ad.read_h5ad(in_h5ad, backed="r")
     if "principal_r_signed" not in adata.obsm:
@@ -1486,18 +2271,31 @@ for in_h5ad in INPUT_H5ADS:
     t_fields_all = _resolve_t_fields(adata)
     t_lookup_raw_all, t_lookup_lut_all, t_lookup_name = _resolve_t_lookup_for_lut(t_fields_all)
     r_signed_all = np.asarray(adata.obsm["principal_r_signed"], dtype=np.float64).reshape(-1)
-    finite = np.isfinite(t_lookup_lut_all) & np.isfinite(r_signed_all)
+    if "t_neomeso" not in adata.obs.columns:
+        raise ValueError(f"Missing obs['t_neomeso'] in {in_h5ad}")
+    t_neomeso_all = np.asarray(adata.obs["t_neomeso"].to_numpy(dtype=np.float64, copy=False), dtype=np.float64)
+    in_neomeso = np.isfinite(t_neomeso_all) & (t_neomeso_all >= 0.0) & (t_neomeso_all <= 1.0)
+    finite = np.isfinite(t_lookup_lut_all) & np.isfinite(r_signed_all) & in_neomeso
     keep_idx = np.flatnonzero(finite)
     if keep_idx.size == 0:
-        raise ValueError(f"No finite (t_lookup_mode={T_LOOKUP_MODE}, principal_r_signed) rows in {in_h5ad}")
+        raise ValueError(
+            f"No rows in t_neomeso range (0..1) with finite "
+            f"(t_lookup_mode={T_LOOKUP_MODE}, principal_r_signed) in {in_h5ad}"
+        )
 
     t_lookup_raw = np.asarray(t_lookup_raw_all[keep_idx], dtype=np.float64)
     t_lookup = np.asarray(t_lookup_lut_all[keep_idx], dtype=np.float64)
     t_all = np.asarray(t_fields_all.t_all[keep_idx], dtype=np.float64)
     t_local = np.asarray(t_fields_all.t_local[keep_idx], dtype=np.float64)
+    t_neomeso = np.asarray(t_neomeso_all[keep_idx], dtype=np.float64)
     r_signed = r_signed_all[keep_idx]
 
-    t_support_lo, t_support_hi, nearest_slice_for_support = _slice_t_support(LUTS[axis], int(atlas_slice_idx))
+    if mapping_mode_tag == "lut":
+        t_support_lo, t_support_hi, nearest_slice_for_support = _slice_t_support(LUTS[axis], int(atlas_slice_idx))
+    else:
+        t_support_lo, t_support_hi, nearest_slice_for_support = _slice_t_support_midline(
+            columns_by_slice=MIDLINE_COLUMNS[axis], atlas_slice_idx=int(atlas_slice_idx)
+        )
 
     r_um, r_floor, r_ceil = _compute_signed_r_um(
         t_lookup=t_lookup,
@@ -1509,20 +2307,28 @@ for in_h5ad in INPUT_H5ADS:
     n_outside_support = int(np.count_nonzero(outside_support_mask))
     outside_support_frac = float(n_outside_support / max(1, int(t_lookup.size)))
 
-    ijk, source_slice_used = _lookup_ijk_batch_slice_locked(
-        lut=LUTS[axis],
-        atlas_slice_idx=int(atlas_slice_idx),
-        t_lookup=t_lookup,
-        r_um=r_um,
-    )
+    if mapping_mode_tag == "lut":
+        ijk, source_slice_used = _lookup_ijk_batch_slice_locked(
+            lut=LUTS[axis],
+            atlas_slice_idx=int(atlas_slice_idx),
+            t_lookup=t_lookup,
+            r_um=r_um,
+        )
+    else:
+        ijk, source_slice_used = _lookup_ijk_batch_midline_normal_slice_locked(
+            axis=axis,
+            columns_by_slice=MIDLINE_COLUMNS[axis],
+            atlas_slice_idx=int(atlas_slice_idx),
+            t_lookup=t_lookup,
+            r_um=r_um,
+        )
 
-    # Avoid collisions when different datasets share the same stem (e.g. coronal 2 vs sagittal 2).
-    out_npz = OUTDIR / f"{in_h5ad.stem}.{axis}.slice{int(atlas_slice_idx)}.ijk_from_lut.npz"
     np.savez_compressed(
         out_npz,
         h5ad_path=str(in_h5ad),
         axis=axis,
         atlas_slice_idx=np.int32(atlas_slice_idx),
+        ijk_mapping_mode=str(mapping_mode_tag),
         source_slice_used=np.int32(source_slice_used),
         n_outside_support=np.int32(n_outside_support),
         support_slice_used=np.int32(nearest_slice_for_support),
@@ -1535,6 +2341,8 @@ for in_h5ad in INPUT_H5ADS:
         t_lookup=t_lookup.astype(np.float32),
         t_all=t_all.astype(np.float32),
         t_local=t_local.astype(np.float32),
+        t_neomeso=t_neomeso.astype(np.float32),
+        n_total=np.int32(adata.n_obs),
         r_signed=r_signed.astype(np.float32),
         r_floor=r_floor.astype(np.float32),
         r_ceil=r_ceil.astype(np.float32),
@@ -1544,8 +2352,10 @@ for in_h5ad in INPUT_H5ADS:
 
     t_all_min, t_all_max = _finite_minmax(t_all)
     t_local_min, t_local_max = _finite_minmax(t_local)
+    t_neomeso_min, t_neomeso_max = _finite_minmax(t_neomeso)
     summary = {
         "name": in_h5ad.stem,
+        "dataset_name": str(dataset_name),
         "axis": axis,
         "atlas_slice_idx": int(atlas_slice_idx),
         "source_slice_used": int(source_slice_used),
@@ -1554,7 +2364,8 @@ for in_h5ad in INPUT_H5ADS:
         "support_slice_used": int(nearest_slice_for_support),
         "t_support_lo": float(t_support_lo),
         "t_support_hi": float(t_support_hi),
-        "lookup_method": "slice_locked",
+        "lookup_method": f"slice_locked_{mapping_mode_tag}",
+        "ijk_mapping_mode": str(mapping_mode_tag),
         "t_lookup_mode": str(T_LOOKUP_MODE),
         "t_lookup_name": str(t_lookup_name),
         "n_total": int(adata.n_obs),
@@ -1565,6 +2376,8 @@ for in_h5ad in INPUT_H5ADS:
         "t_all_max": t_all_max,
         "t_local_min": t_local_min,
         "t_local_max": t_local_max,
+        "t_neomeso_min": t_neomeso_min,
+        "t_neomeso_max": t_neomeso_max,
         "r_signed_min": float(np.min(r_signed)),
         "r_signed_max": float(np.max(r_signed)),
         "r_um_min": float(np.min(r_um)),
@@ -1578,8 +2391,10 @@ for in_h5ad in INPUT_H5ADS:
         f"support_t=[{summary['t_support_lo']:.4f},{summary['t_support_hi']:.4f}]",
         f"t_all=[{summary['t_all_min']:.4f},{summary['t_all_max']:.4f}]",
         f"t_local=[{summary['t_local_min']:.4f},{summary['t_local_max']:.4f}]",
+        f"t_neomeso=[{summary['t_neomeso_min']:.4f},{summary['t_neomeso_max']:.4f}]",
         f"r_um=[{summary['r_um_min']:.4f},{summary['r_um_max']:.4f}]",
         f"outside_support={summary['n_outside_support']} ({summary['outside_support_frac']:.3%})",
+        f"mapping={mapping_mode_tag}",
         f"source_slice_used={source_slice_used}",
     )
     adata.file.close()
@@ -1606,6 +2421,18 @@ _plot_cells_ijk_projections(
     plot_payload=plot_payload,
     lut_outdir=LUT_OUTDIR,
     out_path=OUTDIR / "cells_ijk_projections_2d_with_atlas_sections.png",
+)
+
+_plot_cells_ijk_per_roi_axes(
+    plot_payload=plot_payload,
+    out_path=OUTDIR / "cells_ijk_per_roi_axes.png",
+)
+
+_plot_review_and_native_per_roi_axes_4col(
+    results_in=results,
+    lut_outdir=LUT_OUTDIR,
+    out_path=OUTDIR / "cells_review_native_per_roi_axes_4col.png",
+    rng_in=rng,
 )
 
 # %% [markdown]
@@ -1707,7 +2534,7 @@ if PLOT_FLATTENED_AP_ML:
     for info, pts, t_vals in flat_payload:
         if pts.shape[0] == 0:
             continue
-        label = f"{info['name']} ({info['axis']}, slice={info['atlas_slice_idx']})"
+        label = f"{_info_display_name(info)} ({info['axis']}, slice={info['atlas_slice_idx']})"
         scatter_for_colorbar = ax.scatter(
             pts[:, 0],
             pts[:, 1],

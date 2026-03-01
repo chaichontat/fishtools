@@ -54,7 +54,7 @@ This sets `p_cycle`, `p_interaction` (and their `log_p_*`) to `NA`, and `cycle_a
 ### Parallelism (`--threads`)
 
 `fit_inm_panel.R` parallelizes **across genes**. `--threads N` means “fit up to N genes concurrently”.
-Use `--bam-threads M` to set per-gene `mgcv::bam(nthreads = M)` (default `1`).
+By default each per-gene `mgcv::bam()` uses **1 thread** (to avoid oversubscription); use `--bam-threads M` to set `mgcv::bam(nthreads = M)`.
 
 ### Basis choice (`--basis`)
 
@@ -369,7 +369,6 @@ CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_significant_gams.
 ```
 
 Implementation notes: `scripts/gam/PLOTTING.md`.
-
 Outputs per significant gene under `<out_dir>` (default: `<panel_dir>/plots_gam_significant_py`):
 - `fit_ap_ml.png` (fitted mean on an `AP_um × ML_um` grid at fixed `r_um=0`, `theta=0`)
 - `fit_r.png` / `fit_theta.png` when the corresponding component p-values are significant

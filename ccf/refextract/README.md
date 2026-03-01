@@ -95,6 +95,24 @@ We also save thickness-like magnitude:
 
 `thickness_um(x) = d_pial(x) + d_inner(x)`
 
+## Principal-Curve `(t, r_signed) -> ijk` policy (always use midline-normal)
+
+For principal-curve exports/debugging, the default and required mapping policy is:
+
+- Use the smoothed midline as the base curve at each `t`.
+- Use the +pia-oriented in-slice normal as the radial direction.
+- Do **not** use `low_ijk/high_ijk` boundary vectors as the primary radial direction in this flow.
+
+Applied mapping:
+
+`ijk(t, r_um) = midline_ijk(t) + (r_um / R_TARGET_UM_PER_PX) * normal_pia_unit(t)`
+
+Implementation points:
+
+- `ccf/refextract/princurve_h5ad_to_ijk_plot.py`: keep `IJK_MAPPING_MODE = "midline_normal"`.
+- `ccf/refextract/debug_tr_to_ijk_plot.py`: use `--mapping-mode midline-normal` (this is the default).
+- `ccf/refextract/batch_debug_tr_to_ijk_center_grid.py`: use `--mapping-mode midline-normal` (this is the default).
+
 ### Mid-surface extraction
 
 We extract the mid-surface as:
@@ -260,6 +278,10 @@ Open the viewer with the exported assets path:
 ```text
 http://localhost:5173/?assets=../../out/refextract/midsurface_neocortex_mesocortex_allocortex_3d/threejs_unfold
 ```
+
+The control panel includes a `Ray trace` toggle. Enabling it pauses playback and switches to progressive
+GPU path tracing; moving the camera or changing unfold progress resets sample accumulation. Direction labels and
+the AP/ML overlays remain visible as a raster overlay while path tracing runs.
 
 If you get a JSON parse error that starts with `<!doctype html>`, the assets URL is wrong and Vite returned `index.html`
 instead of `manifest.json`. Use the URL above, or an absolute `/@fs/.../threejs_unfold` path.
