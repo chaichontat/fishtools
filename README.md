@@ -20,6 +20,66 @@ You can install `mamba` using `conda`:
 conda install mamba -c conda-forge
 ```
 
+## INM-Aware GAM (scripts/gam)
+
+This repo includes a small R/mgcv workflow for INM-aware gene modeling in `scripts/gam/`:
+
+1. Estimate an INM coupling curve `m(theta)` with a cyclic GAM: `x ~ s(theta, bs="cc")`.
+2. Compute residual depth `r = x - m(theta)`.
+3. Per gene fit a negative-binomial GAM with size-factor offset and smooth terms:
+   - `offset(log(sf))`
+   - `s(r)` (spatial / differentiation)
+   - `s(theta, bs="cc")` (cell-cycle)
+   - `ti(r, theta, bs=c("tp","cc"))` (gating interaction; used with marginals to avoid identifiability pathologies)
+   - optional `batch` factor for pooled multi-dataset panels
+
+Entry points and diagnostics are documented in `scripts/gam/README.md` (including `check_gam_diagnostics.R` which writes `m_hat(theta)`/`r` plots, `concurvity.tsv`, and `edf.tsv`).
+
+## BrdU/EdU regression (scripts/brdu_regression)
+
+### CNMF Usage_6 → BrdU+ retention (BrdU+EdU+ / BrdU+) model
+
+This workflow fits a matched (stratum fixed-effect) grouped-binomial GLM on **BrdU+ cells only** to estimate:
+
+- `f_hat = P(EdU+ | BrdU+)` as a function of **Usage_6** (binned into global quantiles)
+- companions: `1/f_hat` and `T_S/Δt ≈ 1/(1−f_hat)` (standard convention)
+
+Run the model:
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/usage6_brdue_fraction_model.py \
+  --outdir scripts/_out/usage6_run \
+  --include-leiden 7 8 10 \
+  --pool-leiden \
+  --write-by-unit
+```
+
+- `--include-leiden`: which Leiden clusters to include from `~/nvme/all_progenitors.h5ad`
+- `--pool-leiden`: pools the included Leidens into one curve per animal, while still stratifying by `dataset×theta_bin×leiden`
+- `--write-by-unit`: writes `usage6_by_unit.csv` with unit = `dataset×roi×ccf_adjusted` (used for weighted error bars)
+
+Outputs in `--outdir`:
+
+- `usage6_by_animal.csv`: per-animal curves (used for gray per-animal lines)
+- `usage6_by_unit.csv` (when `--write-by-unit`): per-unit predictions + weights for error bars
+- `usage6_meta.csv`: simple across-animal summaries
+- `run.log`: progress + parameters
+
+Plot results:
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/plot_usage6_brdue_fraction_model.py \
+  --indir scripts/_out/usage6_run
+```
+
+This writes:
+
+- `usage6_f_hat.png`
+- `usage6_inv_f_hat.png`
+- `usage6_Ts_over_dt.png`
+
+If `usage6_by_unit.csv` exists, plots use **dataset×roi×ccf_adjusted-weighted** 95% CIs (and per-animal weighted error bars).
+
 ## Compression
 
 - `fishtools compress` is a command-line interface (CLI) tool that converts TIFF, JP2, and DAX image files to JPEG XL (JXL) files.
