@@ -393,6 +393,60 @@ This keeps the same underlying link-scale effect, but labels the colorbar in **�
 
 Native-projection surface renders (`*_native_proj.png`) are written without axes and include a 500 μm scale bar for slides.
 
+Command used for the current `gam_all_neurons` AP/MLR native triptych render (`r_min`, `r_med`, `r_p90`):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_significant_gams.py \
+  _out/gam_runs/gam_all_neurons/panel \
+  0.05 \
+  _out/gam_runs/gam_all_neurons/plots_significant_apmlr_amp0p2_v4_masked \
+  --fit-results _out/gam_runs/gam_all_neurons/fit_results.tsv \
+  --fits-dir _out/gam_runs/gam_all_neurons/fits_rds__fit_results \
+  --genes-file _out/gam_runs/gam_all_neurons/apml_amp0p2_genes.txt \
+  --plot-apmlr-interaction \
+  --plot-apml-native-proj \
+  --only fit_ap_ml__r_min_med_max_native_proj.png \
+  --apml-mu-scale log \
+  --apml-mu-vmin -8.0 \
+  --apml-mu-vmax -4.0
+```
+
+Commands to plot AP/ML fitted `mu` (same run):
+
+```bash
+# AP/ML heatmap on native AP_um x ML_um grid
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_significant_gams.py \
+  _out/gam_runs/gam_all_neurons/panel \
+  0.05 \
+  _out/gam_runs/gam_all_neurons/plots_significant_apmlr_amp0p2_v4_masked \
+  --fit-results _out/gam_runs/gam_all_neurons/fit_results.tsv \
+  --fits-dir _out/gam_runs/gam_all_neurons/fits_rds__fit_results \
+  --genes-file _out/gam_runs/gam_all_neurons/apml_amp0p2_genes.txt \
+  --plot-apmlr-interaction \
+  --only fit_ap_ml.png \
+  --apml-surface mu \
+  --shrink none \
+  --apml-mu-scale log \
+  --apml-mu-vmin -8.0 \
+  --apml-mu-vmax -4.0
+
+# Native projection version of AP/ML fitted mu
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_significant_gams.py \
+  _out/gam_runs/gam_all_neurons/panel \
+  0.05 \
+  _out/gam_runs/gam_all_neurons/plots_significant_apmlr_amp0p2_v4_masked \
+  --fit-results _out/gam_runs/gam_all_neurons/fit_results.tsv \
+  --fits-dir _out/gam_runs/gam_all_neurons/fits_rds__fit_results \
+  --genes-file _out/gam_runs/gam_all_neurons/apml_amp0p2_genes.txt \
+  --plot-apml-native-proj \
+  --only fit_ap_ml_native_proj.png \
+  --apml-surface mu \
+  --shrink none \
+  --apml-mu-scale log \
+  --apml-mu-vmin -8.0 \
+  --apml-mu-vmax -4.0
+```
+
 By default, plotting also gates interaction plots by per-gene EDF (skips interactions that are penalized away with `edf ~ 0`).
 This requires a `diagnostics_summary.tsv` written next to the fit-results TSV. Generate it with:
 
@@ -402,28 +456,106 @@ CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/summarize_gam_diagnost
 
 Disable EDF gating with `--no-gate-by-edf`.
 
-### Cluster montages (native projection, shared colorbar)
+### AP/ML clustering workflow (k selection → clustering → plotting)
 
-If you clustered AP/ML patterns (e.g. `cluster_apml_top200_patterns_k8/summary.tsv`), you can render **per-cluster** native-projection plots
-and write **montage pages with one shared colorbar** (no raster copy/crop) using:
+Use this when you want native-projection cluster plots with one shared colorbar per montage page.
+All commands below assume the run root is in `OUT`.
 
 ```bash
-OUT=_out/gam_runs/gam_all_neurons_20260220_144747
-CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_cluster_example_surfaces.py \
-  ${OUT}/cluster_apml_top200_patterns_k8 \
-  --fits-dir ${OUT}/fits_rds__fit_results \
-  --panel-dir ${OUT}/panel \
-  --render native_proj \
-  --n-per-cluster 0 \
-  --montage-cols 3
+OUT=_out/gam_runs/gam_all_excit_r300_leiden4
+PANEL=${OUT}/panel
+CLUSTER_DIR=${OUT}/cluster_apml_top80_tneomeso_cuml_pca
 ```
 
+0) Generate per-gene predicted-`μ` means (required by `--min-log-mean-mu` and expression sorting):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_mu_distribution.py \
+  ${PANEL} \
+  --fits-dir ${OUT}/fits_rds__fit_results \
+  --fit-results ${OUT}/fit_results.tsv \
+  --jobs 32 \
+  --restrict-t-neomeso
+```
+
+1) Build AP/ML clustering surfaces (all genes passing filters) into the `cuml_pca` folder:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/cluster_apml_patterns.py \
+  ${PANEL} \
+  --fit-results ${OUT}/fit_results.tsv \
+  --fits-dir ${OUT}/fits_rds__fit_results \
+  --out-dir ${CLUSTER_DIR} \
+  --top-n 0 \
+  --rank-by p_apml \
+  --max-q-apml 1e-10 \
+  --min-amplitude 0.2 \
+  --mu-mean-tsv ${OUT}/mu_mean_by_gene.tsv \
+  --min-log-mean-mu -7.0 \
+  --restrict-t-neomeso
+```
+
+2) Determine candidate `k` (isolated outputs; does not write `summary_clustered_k*.tsv`):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/optimize_cluster_k.py \
+  ${CLUSTER_DIR} \
+  --k-min 4 --k-max 12 --pc-k 20
+```
+
+This writes only under `${CLUSTER_DIR}/k_optimization/`, including:
+- `k_sweep_metrics.tsv`
+- `recommendation.tsv`
+- `k_metrics.png`
+- `k_overall_score.png`
+- `labels_by_k/labels_k*.tsv`
+
+3) Run final clustering at the selected `k` (for clustered summaries/diagnostic cluster plots):
+
+```bash
+K=6
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/cluster_surfaces_cuml.py \
+  --mode apml \
+  --surfaces ${CLUSTER_DIR}/surfaces.npz \
+  --fit-results ${OUT}/fit_results.tsv \
+  --out-dir ${CLUSTER_DIR} \
+  --k ${K} \
+  --pc-k 20
+```
+
+4) Plot per-cluster native-projection montages (all genes, sorted high→low expression):
+
+```bash
+K=6
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_cluster_example_surfaces.py \
+  ${CLUSTER_DIR} \
+  --summary ${CLUSTER_DIR}/k_optimization/labels_by_k/labels_k${K}.tsv \
+  --cluster-col cluster_k${K} \
+  --fits-dir ${OUT}/fits_rds__fit_results \
+  --panel-dir ${PANEL} \
+  --n-per-cluster 0 \
+  --cluster-jobs 1 \
+  --sort-by-expression \
+  --mu-mean-tsv ${OUT}/mu_mean_by_gene.tsv \
+  --native-proj-apml-surface mu \
+  --native-proj-out-suffix _mu \
+  --native-proj-mu-vmin -8.0 \
+  --native-proj-mu-vmax -4.0 \
+  --native-proj-elev-deg -10 \
+  --native-proj-azim-deg -110 \
+  --force
+```
+
+Plot output:
+- `${CLUSTER_DIR}/cluster_examples_native_proj/cluster_XX/montage_fit_ap_ml_native_proj_mu*.png`
+- `${CLUSTER_DIR}/cluster_examples_native_proj/index.tsv`
+
 Notes:
-- `--n-per-cluster 0` means **plot all genes** in each cluster (not just representatives).
-- Output defaults to `${cluster_dir}/cluster_examples_native_proj/` for `--render native_proj` and overwrites/updates that folder.
-- Montages are written as `${out_dir}/cluster_XX/montage_fit_ap_ml_native_proj.png` and paginated as
-  `${out_dir}/cluster_XX/montage_fit_ap_ml_native_proj__page_###.png` when a cluster has more genes than fit on one page.
-- Projection defaults match the “native_ik” view: `elev=-10`, `azim=-110`, `roll=180`, `latlon=true`, `graticule=ijk`.
+- Native projection defaults are `elev=-10`, `azim=-110`, `roll=180`, `latlon=true`, `graticule=ijk`.
+- `--n-per-cluster 0` plots all genes in each cluster.
+- Gene order within each cluster is expression high→low by `mu_mean_by_gene.tsv` (`log_mean_mu`).
+- `--force` overwrites existing per-gene and montage PNGs.
+- Parallelism is at the cluster level (`--cluster-jobs`): montage rendering requires `plot_significant_gams.py --max-workers=1`.
 
 ## Diagnostics (Coupling, Concurvity, EDF)
 
@@ -530,3 +662,62 @@ Rscript scripts/gam/clamp_fit_results_pvals.R <fit_results.tsv>
 ```bash
 Rscript scripts/gam/synthetic_smoke_test.R
 ```
+
+## Simplex Topic Model (Logistic-Normal / ALR)
+
+This mode is for modeling **topic loadings** (e.g. cNMF `Usage_*`) as a composition that must sum to `1`.
+It fits Gaussian `bam()` models on ALR coordinates `log(u_k/u_ref)` and reconstructs per-topic loadings with a softmax so outputs are always on the simplex.
+
+Inputs:
+- `${PANEL}/cells.tsv` with at least: `cell_id`, `r_um`, `AP_um`, `ML_um`, `batch` (and `theta` unless you pass `--no-theta`).
+  - `r_um`, `AP_um`, `ML_um` must be finite for all rows used in the fit.
+  - If `cells.tsv` does not contain an explicit `animal` column, the fitter will parse it from `batch` using a `JaxA\\d+` regex (and will error if it cannot).
+- A `usage_norm.*.tsv` where the first column is the cell id (must match `cells.tsv:cell_id`) and the remaining columns include `Usage_1..Usage_K` (values in `[0,1]`).
+
+Fit:
+
+```bash
+PANEL=_out/gam_panel__cnmf_topics_k9_dt0.1__rg_sweep__20260303
+USAGE=_out/cnmf_all_progenitors/usage_norm.k9.dt0.1.tsv
+
+CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/fit_inm_simplex_panel.R \
+  ${PANEL} \
+  --usage-tsv ${USAGE} \
+  --eps 1e-4 \
+  --alr-ref auto \
+  --r-max 400 \
+  --threads 6 \
+  --bam-threads 1 \
+  --basis standard \
+  --k-uv 15
+```
+
+Plot native projection:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_simplex_native_proj.py \
+  ${PANEL} \
+  --exclude-random-effects \
+  --out-dir ${PANEL}/plots_native_proj_simplex_u \
+  --latlon \
+  --graticule ijk \
+  --elev-deg -10 \
+  --azim-deg -110 \
+  --roll-deg 180
+```
+
+Plot outputs:
+- Native projection (one PNG per program + montage): `${PANEL}/plots_native_proj_simplex_u/`
+- 2D slices (one PNG per program, with `AP_um×r_um` and `ML_um×r_um` panels): `${PANEL}/plots_apmlr_simplex_u/`
+  - By default, the `r` axis is capped at the fitted `r_max` recorded in `simplex_meta.json` (to avoid showing extrapolation past the fitted range).
+
+Notes:
+- `--r-max` filters the input cells to `r_um <= r_max` *before fitting* (useful if coverage is poor at high `r`).
+- `--exclude-random-effects` subtracts `s(animal)` and `s(ab)` from the ALR link predictions before simplex inversion.
+  - Use this when you want a population-level spatial pattern instead of conditioning on a single reference `animal`/`ab` level.
+- Optional: pass `--label-tsv PATH` to name topics in plot titles. The TSV must contain `program` and either `curated_label` or `label`.
+
+Outputs under `${PANEL}`:
+- `fit_results.simplex.tsv`
+- `simplex_meta.json`
+- `fits_rds__fit_results_simplex/ALR_P*_vs_P*.gam.rds`
