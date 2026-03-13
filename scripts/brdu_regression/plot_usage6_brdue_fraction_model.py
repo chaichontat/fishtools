@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 from pathlib import Path
 
 import matplotlib
@@ -28,7 +27,27 @@ def _savefig(path: Path) -> None:
     plt.close()
 
 
-def _weighted_ci_normal(x: np.ndarray, w: np.ndarray) -> tuple[float, float, float]:
+def _weighted_quantile(x: np.ndarray, w: np.ndarray, q: float) -> float:
+    x = np.asarray(x, dtype=float).reshape(-1)
+    w = np.asarray(w, dtype=float).reshape(-1)
+    if not (0.0 <= float(q) <= 1.0):
+        raise ValueError("q must be in [0,1]")
+    ok = np.isfinite(x) & np.isfinite(w) & (w > 0)
+    x = x[ok]
+    w = w[ok]
+    if x.size == 0:
+        return float("nan")
+    order = np.argsort(x, kind="mergesort")
+    x = x[order]
+    w = w[order]
+    cw = np.cumsum(w)
+    cutoff = float(q) * float(cw[-1])
+    j = int(np.searchsorted(cw, cutoff, side="left"))
+    j = max(0, min(j, int(x.size) - 1))
+    return float(x[j])
+
+
+def _weighted_band(x: np.ndarray, w: np.ndarray) -> tuple[float, float, float]:
     x = np.asarray(x, dtype=float).reshape(-1)
     w = np.asarray(w, dtype=float).reshape(-1)
     ok = np.isfinite(x) & np.isfinite(w) & (w > 0)
@@ -37,16 +56,10 @@ def _weighted_ci_normal(x: np.ndarray, w: np.ndarray) -> tuple[float, float, flo
     if x.size == 0:
         return float("nan"), float("nan"), float("nan")
 
-    w_sum = float(np.sum(w))
-    mean = float(np.sum(w * x) / w_sum)
-    var = float(np.sum(w * (x - mean) ** 2) / w_sum)
-    w2 = float(np.sum(w * w))
-    n_eff = (w_sum * w_sum) / w2 if w2 > 0 else float("nan")
-    se = math.sqrt(var / n_eff) if np.isfinite(n_eff) and n_eff > 1 else float("nan")
-    if not np.isfinite(se):
-        return mean, float("nan"), float("nan")
-    z = 1.96
-    return mean, float(mean - z * se), float(mean + z * se)
+    med = _weighted_quantile(x, w, 0.5)
+    lo = _weighted_quantile(x, w, 0.1)
+    hi = _weighted_quantile(x, w, 0.9)
+    return float(med), float(lo), float(hi)
 
 
 def _plot_grid(
@@ -55,6 +68,7 @@ def _plot_grid(
     by_unit: pd.DataFrame | None,
     value_col: str,
     weight_col: str | None,
+    min_unit_trials: int,
     ylabel: str,
     out_png: Path,
     title_prefix: str,
@@ -101,14 +115,41 @@ def _plot_grid(
                 raise ValueError("by_unit provided but weight_col is None")
             if weight_col not in du.columns:
                 raise ValueError(f"by_unit missing weight_col={weight_col!r} for plot {out_png.name}")
+            b1_trial_col = "eff_n_b1_bin_total" if "eff_n_b1_bin_total" in du.columns else "n_b1_bin_total"
+            if b1_trial_col not in du.columns or "n_all_bin_total" not in du.columns:
+                raise ValueError(
+                    "by_unit missing required columns for min-trials filtering: "
+                    "n_b1_bin_total/eff_n_b1_bin_total and/or n_all_bin_total"
+                )
             du[weight_col] = du[weight_col].astype(float)
             du["animal"] = du["animal"].astype(str)
             du[value_col] = du[value_col].astype(float)
+            du[b1_trial_col] = pd.to_numeric(du[b1_trial_col], errors="raise").astype(float)
+            du["n_all_bin_total"] = pd.to_numeric(du["n_all_bin_total"], errors="raise").astype(int)
+
+            min_trials = int(min_unit_trials)
+            if min_trials < 0:
+                raise ValueError("min_unit_trials must be >= 0")
+            if min_trials > 0:
+                if value_col in {"f_hat", "inv_f_hat", "ts_over_dt", "ts_minutes"}:
+                    du = du.loc[du[b1_trial_col] >= min_trials].copy()
+                elif value_col in {"pE_hat"}:
+                    du = du.loc[du["n_all_bin_total"] >= min_trials].copy()
+                elif value_col in {"tc_over_dt", "tc_minutes"}:
+                    du = du.loc[(du["n_all_bin_total"] >= min_trials) & (du[b1_trial_col] >= min_trials)].copy()
+                else:
+                    raise ValueError(f"Unexpected value_col={value_col!r} for min-trials filtering.")
+                if du.empty:
+                    raise ValueError(
+                        f"All unit×bin rows dropped for leiden={leiden!r} after min-trials filtering "
+                        f"(value_col={value_col!r}, min_trials={min_trials})."
+                    )
 
             animals = sorted(du["animal"].unique().tolist())
             cmap = plt.get_cmap("tab10")
 
-            # Per-animal weighted error bars (unit = dataset×roi×ccf_adjusted; weights = BrdU+ cells per unit).
+            # Per-animal weighted bands across units (unit = dataset×roi×ccf_adjusted).
+            # NOTE: these are NOT confidence intervals; they summarize between-unit heterogeneity.
             for a_idx, animal in enumerate(animals):
                 da = du.loc[du["animal"] == animal]
                 xs: list[int] = []
@@ -117,7 +158,7 @@ def _plot_grid(
                 yhi: list[float] = []
                 for t in sorted(da["usage_bin"].unique().tolist()):
                     dt = da.loc[da["usage_bin"] == t]
-                    m, lo, hi = _weighted_ci_normal(
+                    m, lo, hi = _weighted_band(
                         dt[value_col].to_numpy(float),
                         dt[weight_col].to_numpy(float),
                     )
@@ -136,17 +177,17 @@ def _plot_grid(
                     linewidth=1.0,
                     alpha=0.7,
                     capsize=2,
-                    label=str(animal),
+                    label=f"{animal} (10–90%)",
                 )
 
-            # Pooled weighted mean+CI across all units (across all animals).
+            # Pooled weighted median and unit-heterogeneity band across all units (across all animals).
             xs: list[int] = []
             ys: list[float] = []
             ylo: list[float] = []
             yhi: list[float] = []
             for t in sorted(du["usage_bin"].unique().tolist()):
                 dt = du.loc[du["usage_bin"] == t]
-                m, lo, hi = _weighted_ci_normal(dt[value_col].to_numpy(float), dt[weight_col].to_numpy(float))
+                m, lo, hi = _weighted_band(dt[value_col].to_numpy(float), dt[weight_col].to_numpy(float))
                 xs.append(int(t))
                 ys.append(float(m))
                 ylo.append(float(lo))
@@ -160,7 +201,7 @@ def _plot_grid(
                 color="#2b8cbe",
                 linewidth=2.5,
                 capsize=3,
-                label="pooled",
+                label="pooled (10–90% units; not CI)",
             )
             ax.legend(loc="best", fontsize=8, frameon=False)
         else:
@@ -210,6 +251,15 @@ def main() -> None:
         default=None,
         help="If set, also write Ts/Tc plots in minutes (e.g. 90 for a 90 min pulse lag).",
     )
+    p.add_argument(
+        "--min-unit-trials",
+        type=int,
+        default=20,
+        help=(
+            "When usage6_by_unit.csv is present, treat unit×bin rows with very low/zero underlying trials as missing "
+            "for plotting."
+        ),
+    )
     args = p.parse_args()
 
     indir: Path = args.indir
@@ -223,6 +273,7 @@ def main() -> None:
         by_unit=by_unit,
         value_col="f_hat",
         weight_col="unit_weight_b1" if by_unit is not None else None,
+        min_unit_trials=int(args.min_unit_trials),
         ylabel="f_hat = P(EdU+ | BrdU+)",
         out_png=indir / "usage6_f_hat.png",
         title_prefix="BrdU+ retention vs Usage_6",
@@ -232,6 +283,7 @@ def main() -> None:
         by_unit=by_unit,
         value_col="inv_f_hat",
         weight_col="unit_weight_b1" if by_unit is not None else None,
+        min_unit_trials=int(args.min_unit_trials),
         ylabel="1 / f_hat",
         out_png=indir / "usage6_inv_f_hat.png",
         title_prefix="BrdU+EdU+ / BrdU+ inverse fraction vs Usage_6",
@@ -254,6 +306,7 @@ def main() -> None:
         by_unit=by_unit,
         value_col="ts_over_dt",
         weight_col="unit_weight_b1" if by_unit is not None else None,
+        min_unit_trials=int(args.min_unit_trials),
         ylabel="T_S / Δt ≈ 1 / (1 − f_hat)",
         out_png=indir / "usage6_Ts_over_dt.png",
         title_prefix="S-phase time (dimensionless) vs Usage_6",
@@ -269,6 +322,7 @@ def main() -> None:
             by_unit=by_unit,
             value_col="pE_hat",
             weight_col="unit_weight_all" if by_unit is not None else None,
+            min_unit_trials=int(args.min_unit_trials),
             ylabel="pE_hat = P(EdU+)",
             out_png=indir / "usage6_pE_hat.png",
             title_prefix="EdU labeling index vs Usage_6",
@@ -281,9 +335,10 @@ def main() -> None:
             by_unit=by_unit,
             value_col="tc_over_dt",
             weight_col="unit_weight_all" if by_unit is not None else None,
-            ylabel="T_C / Δt ≈ (T_S/Δt) / P(EdU+)",
+            min_unit_trials=int(args.min_unit_trials),
+            ylabel="T_C proxy / Δt ≈ (T_S/Δt) / P(EdU+)  (GF-sensitive)",
             out_png=indir / "usage6_Tc_over_dt.png",
-            title_prefix="Cell-cycle time (dimensionless) vs Usage_6",
+            title_prefix="Cell-cycle time proxy (dimensionless) vs Usage_6",
         )
         print(f"Wrote: {indir / 'usage6_Tc_over_dt.png'}")
 
@@ -304,6 +359,7 @@ def main() -> None:
                 by_unit=by_unit_ts_min,
                 value_col="ts_minutes",
                 weight_col="unit_weight_b1" if by_unit_ts_min is not None else None,
+                min_unit_trials=int(args.min_unit_trials),
                 ylabel="T_S (minutes) = (T_S/Δt) × Δt",
                 out_png=indir / "usage6_Ts_minutes.png",
                 title_prefix=f"S-phase time vs Usage_6 (Δt={dt_min:g} min)",
@@ -322,9 +378,10 @@ def main() -> None:
                 by_unit=by_unit_tc_min,
                 value_col="tc_minutes",
                 weight_col="unit_weight_all" if by_unit_tc_min is not None else None,
-                ylabel="T_C (minutes) = (T_C/Δt) × Δt",
+                min_unit_trials=int(args.min_unit_trials),
+                ylabel="T_C proxy (minutes) = (T_C proxy/Δt) × Δt  (GF-sensitive)",
                 out_png=indir / "usage6_Tc_minutes.png",
-                title_prefix=f"Cell-cycle time vs Usage_6 (Δt={dt_min:g} min)",
+                title_prefix=f"Cell-cycle time proxy vs Usage_6 (Δt={dt_min:g} min)",
             )
             print(f"Wrote: {indir / 'usage6_Tc_minutes.png'}")
 

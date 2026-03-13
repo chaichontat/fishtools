@@ -619,6 +619,7 @@ def _write_syn_zoom_overlay_with_user_mask(
     t_axis_endpoint_markers: list[dict[str, object]],
     reflect_t_axis_midline: bool,
     out_png: Path,
+    axis3_out_png: Path | None,
     title: str,
 ) -> None:
     fixed = np.asarray(fixed_yx, dtype=np.float32)
@@ -688,10 +689,63 @@ def _write_syn_zoom_overlay_with_user_mask(
     axes[1].imshow(m, cmap="gray", interpolation="nearest", resample=False)
     axes[1].set_title("Warped moving")
     axes[1].axis("off")
-    axes[2].imshow(overlay, interpolation="nearest", resample=False)
-    axes[2].set_title("Overlay + user ROI mask")
-    axes[2].axis("off")
+    _draw_syn_overlay_axis3(
+        ax=axes[2],
+        fig=fig,
+        overlay_rgb=overlay,
+        user_mask_yx=user,
+        fixed_shape_yx=fixed.shape,
+        crop_lo_yx=lo,
+        t_axis_overlay=t_axis_overlay,
+        t_axis_endpoint_markers=t_axis_endpoint_markers,
+        reflect_t_axis_midline=reflect_t_axis_midline,
+        panel_title="Overlay + user ROI mask",
+    )
 
+    fig.suptitle(title)
+    plt.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_png, dpi=220)
+    plt.close(fig)
+    if axis3_out_png is not None:
+        fig_axis3, ax_axis3 = plt.subplots(1, 1, figsize=(fig_w_in / 3.0, fig_h_in))
+        _draw_syn_overlay_axis3(
+            ax=ax_axis3,
+            fig=fig_axis3,
+            overlay_rgb=overlay,
+            user_mask_yx=user,
+            fixed_shape_yx=fixed.shape,
+            crop_lo_yx=lo,
+            t_axis_overlay=t_axis_overlay,
+            t_axis_endpoint_markers=t_axis_endpoint_markers,
+            reflect_t_axis_midline=reflect_t_axis_midline,
+            panel_title="Overlay + user ROI mask (axis 3)",
+        )
+        fig_axis3.suptitle(title)
+        plt.tight_layout()
+        axis3_out_png.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(axis3_out_png, dpi=220)
+        plt.close(fig_axis3)
+
+
+def _draw_syn_overlay_axis3(
+    *,
+    ax: object,
+    fig: object,
+    overlay_rgb: np.ndarray,
+    user_mask_yx: np.ndarray,
+    fixed_shape_yx: tuple[int, int],
+    crop_lo_yx: np.ndarray,
+    t_axis_overlay: TAxisOverlay | None,
+    t_axis_endpoint_markers: list[dict[str, object]],
+    reflect_t_axis_midline: bool,
+    panel_title: str,
+) -> None:
+    ax.imshow(overlay_rgb, interpolation="nearest", resample=False)
+    ax.set_title(panel_title)
+    ax.axis("off")
+
+    user = np.asarray(user_mask_yx, dtype=bool)
     user_alpha = np.where(user, 0.24, 0.0).astype(np.float32)
     user_rgba = np.stack(
         [
@@ -702,152 +756,146 @@ def _write_syn_zoom_overlay_with_user_mask(
         ],
         axis=-1,
     )
-    axes[2].imshow(user_rgba, interpolation="nearest", resample=False)
-    axes[2].contour(user.astype(np.uint8), levels=[0.5], colors=["#ffd54f"], linewidths=0.8, alpha=0.95)
+    ax.imshow(user_rgba, interpolation="nearest", resample=False)
+    ax.contour(user.astype(np.uint8), levels=[0.5], colors=["#ffd54f"], linewidths=0.8, alpha=0.95)
 
-    if t_axis_overlay is not None:
-        ax = axes[2]
-        line_t = np.asarray(t_axis_overlay.line_t, dtype=np.float64)
-        norm = Normalize(vmin=0.0, vmax=1.0)
-        xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
-        minor_ticks_xy = np.asarray(t_axis_overlay.minor_tick_xy, dtype=np.float64)
-        minor_ticks_t = np.asarray(t_axis_overlay.minor_tick_t, dtype=np.float64)
-        ticks_xy = np.asarray(t_axis_overlay.tick_xy, dtype=np.float64)
-        ticks_t = np.asarray(t_axis_overlay.tick_t, dtype=np.float64)
-        overlays = [(xy, minor_ticks_xy, ticks_xy, True)]
-        if reflect_t_axis_midline:
-            mirrored_xy = xy.copy()
-            mirrored_xy[:, 0] = (float(fixed.shape[1]) - 1.0) - mirrored_xy[:, 0]
-            mirrored_minor = minor_ticks_xy.copy()
-            mirrored_minor[:, 0] = (float(fixed.shape[1]) - 1.0) - mirrored_minor[:, 0]
-            mirrored_ticks = ticks_xy.copy()
-            mirrored_ticks[:, 0] = (float(fixed.shape[1]) - 1.0) - mirrored_ticks[:, 0]
-            overlays.append((mirrored_xy, mirrored_minor, mirrored_ticks, False))
+    if t_axis_overlay is None:
+        return
 
-        colorbar_added = False
-        for line_xy, line_minor_xy, line_ticks_xy, draw_labels in overlays:
-            if line_xy.shape[0] >= 2 and line_t.shape[0] == line_xy.shape[0]:
-                xy_local = line_xy.copy()
-                xy_local[:, 0] -= float(lo[1])
-                xy_local[:, 1] -= float(lo[0])
-                segments = np.stack([xy_local[:-1], xy_local[1:]], axis=1)
-                segment_t = 0.5 * (line_t[:-1] + line_t[1:])
-                valid_segments = np.isfinite(segments).all(axis=(1, 2)) & np.isfinite(segment_t)
-                if np.any(valid_segments):
-                    line = LineCollection(
-                        segments[valid_segments],
-                        cmap=T_AXIS_T_CMAP,
-                        norm=norm,
-                        linewidths=2.0,
-                        alpha=0.85,
-                        zorder=10,
-                        antialiased=True,
-                    )
-                    line.set_array(np.clip(segment_t[valid_segments], 0.0, 1.0))
-                    ax.add_collection(line)
-                    if not colorbar_added:
-                        cbar = fig.colorbar(line, ax=ax, fraction=0.046, pad=0.02)
-                        cbar.set_label("u-curve t")
-                        colorbar_added = True
+    line_t = np.asarray(t_axis_overlay.line_t, dtype=np.float64)
+    norm = Normalize(vmin=0.0, vmax=1.0)
+    xy = np.asarray(t_axis_overlay.line_xy, dtype=np.float64)
+    minor_ticks_xy = np.asarray(t_axis_overlay.minor_tick_xy, dtype=np.float64)
+    minor_ticks_t = np.asarray(t_axis_overlay.minor_tick_t, dtype=np.float64)
+    ticks_xy = np.asarray(t_axis_overlay.tick_xy, dtype=np.float64)
+    ticks_t = np.asarray(t_axis_overlay.tick_t, dtype=np.float64)
+    overlays = [(xy, minor_ticks_xy, ticks_xy, True)]
+    if reflect_t_axis_midline:
+        mirrored_xy = xy.copy()
+        mirrored_xy[:, 0] = (float(fixed_shape_yx[1]) - 1.0) - mirrored_xy[:, 0]
+        mirrored_minor = minor_ticks_xy.copy()
+        mirrored_minor[:, 0] = (float(fixed_shape_yx[1]) - 1.0) - mirrored_minor[:, 0]
+        mirrored_ticks = ticks_xy.copy()
+        mirrored_ticks[:, 0] = (float(fixed_shape_yx[1]) - 1.0) - mirrored_ticks[:, 0]
+        overlays.append((mirrored_xy, mirrored_minor, mirrored_ticks, False))
 
-            if line_minor_xy.size:
-                line_minor_local = line_minor_xy.copy()
-                line_minor_local[:, 0] -= float(lo[1])
-                line_minor_local[:, 1] -= float(lo[0])
-                clipped_minor_t = np.clip(minor_ticks_t, 0.0, 1.0)
-                ax.scatter(
-                    line_minor_local[:, 0],
-                    line_minor_local[:, 1],
-                    s=8,
-                    c=clipped_minor_t,
+    colorbar_added = False
+    for line_xy, line_minor_xy, line_ticks_xy, draw_labels in overlays:
+        if line_xy.shape[0] >= 2 and line_t.shape[0] == line_xy.shape[0]:
+            xy_local = line_xy.copy()
+            xy_local[:, 0] -= float(crop_lo_yx[1])
+            xy_local[:, 1] -= float(crop_lo_yx[0])
+            segments = np.stack([xy_local[:-1], xy_local[1:]], axis=1)
+            segment_t = 0.5 * (line_t[:-1] + line_t[1:])
+            valid_segments = np.isfinite(segments).all(axis=(1, 2)) & np.isfinite(segment_t)
+            if np.any(valid_segments):
+                line = LineCollection(
+                    segments[valid_segments],
                     cmap=T_AXIS_T_CMAP,
                     norm=norm,
-                    marker="o",
-                    linewidths=0.0,
-                    alpha=0.9,
-                    zorder=10.5,
+                    linewidths=2.0,
+                    alpha=0.85,
+                    zorder=10,
+                    antialiased=True,
                 )
+                line.set_array(np.clip(segment_t[valid_segments], 0.0, 1.0))
+                ax.add_collection(line)
+                if not colorbar_added:
+                    cbar = fig.colorbar(line, ax=ax, fraction=0.046, pad=0.02)
+                    cbar.set_label("u-curve t")
+                    colorbar_added = True
 
-            if line_ticks_xy.size:
-                line_ticks_local = line_ticks_xy.copy()
-                line_ticks_local[:, 0] -= float(lo[1])
-                line_ticks_local[:, 1] -= float(lo[0])
-                clipped_ticks_t = np.clip(ticks_t, 0.0, 1.0)
-                ax.scatter(
-                    line_ticks_local[:, 0],
-                    line_ticks_local[:, 1],
-                    s=18,
-                    c=clipped_ticks_t,
-                    cmap=T_AXIS_T_CMAP,
-                    norm=norm,
-                    marker="o",
-                    linewidths=0.0,
-                    alpha=0.95,
-                    zorder=11,
-                )
-                if draw_labels:
-                    for (x, y), label in zip(line_ticks_local.tolist(), t_axis_overlay.tick_labels, strict=False):
-                        ax.text(
-                            float(x) + 4.0,
-                            float(y) - 4.0,
-                            str(label),
-                            color="white",
-                            fontsize=7,
-                            bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.45, "pad": 1.4},
-                            zorder=12,
-                        )
+        if line_minor_xy.size:
+            line_minor_local = line_minor_xy.copy()
+            line_minor_local[:, 0] -= float(crop_lo_yx[1])
+            line_minor_local[:, 1] -= float(crop_lo_yx[0])
+            clipped_minor_t = np.clip(minor_ticks_t, 0.0, 1.0)
+            ax.scatter(
+                line_minor_local[:, 0],
+                line_minor_local[:, 1],
+                s=8,
+                c=clipped_minor_t,
+                cmap=T_AXIS_T_CMAP,
+                norm=norm,
+                marker="o",
+                linewidths=0.0,
+                alpha=0.9,
+                zorder=10.5,
+            )
 
-        if t_axis_endpoint_markers:
-            for marker in t_axis_endpoint_markers:
-                mask_name = str(marker.get("mask_name", "mask"))
-                for endpoint_key, endpoint_label in (("begin", "start"), ("end", "end")):
-                    xy = marker.get(f"{endpoint_key}_xy")
-                    t_val = marker.get(f"{endpoint_key}_t")
-                    if not isinstance(xy, np.ndarray):
-                        continue
-                    if not isinstance(t_val, (float, int)):
-                        continue
-                    xy_local = np.asarray(xy, dtype=np.float64).copy()
-                    if xy_local.shape != (2,):
-                        continue
-                    xy_local[0] -= float(lo[1])
-                    xy_local[1] -= float(lo[0])
-                    color = plt.get_cmap(T_AXIS_T_CMAP)(float(np.clip(float(t_val), 0.0, 1.0)))
-                    ax.scatter(
-                        [xy_local[0]],
-                        [xy_local[1]],
-                        s=70,
-                        c=["black"],
-                        marker="x",
-                        linewidths=2.2,
-                        alpha=0.95,
-                        zorder=13,
-                    )
-                    ax.scatter(
-                        [xy_local[0]],
-                        [xy_local[1]],
-                        s=46,
-                        c=[color],
-                        marker="x",
-                        linewidths=1.7,
-                        alpha=0.95,
-                        zorder=14,
-                    )
+        if line_ticks_xy.size:
+            line_ticks_local = line_ticks_xy.copy()
+            line_ticks_local[:, 0] -= float(crop_lo_yx[1])
+            line_ticks_local[:, 1] -= float(crop_lo_yx[0])
+            clipped_ticks_t = np.clip(ticks_t, 0.0, 1.0)
+            ax.scatter(
+                line_ticks_local[:, 0],
+                line_ticks_local[:, 1],
+                s=18,
+                c=clipped_ticks_t,
+                cmap=T_AXIS_T_CMAP,
+                norm=norm,
+                marker="o",
+                linewidths=0.0,
+                alpha=0.95,
+                zorder=11,
+            )
+            if draw_labels:
+                for (x, y), label in zip(line_ticks_local.tolist(), t_axis_overlay.tick_labels, strict=False):
                     ax.text(
-                        float(xy_local[0]) + 4.0,
-                        float(xy_local[1]) + 4.0,
-                        f"{mask_name} {endpoint_label}",
+                        float(x) + 4.0,
+                        float(y) - 4.0,
+                        str(label),
                         color="white",
-                        fontsize=6,
-                        bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.45, "pad": 1.2},
-                        zorder=15,
+                        fontsize=7,
+                        bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.45, "pad": 1.4},
+                        zorder=12,
                     )
 
-    fig.suptitle(title)
-    plt.tight_layout()
-    out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_png, dpi=220)
-    plt.close(fig)
+    if not t_axis_endpoint_markers:
+        return
+    for marker in t_axis_endpoint_markers:
+        mask_name = str(marker.get("mask_name", "mask"))
+        for endpoint_key, endpoint_label in (("begin", "start"), ("end", "end")):
+            xy_marker = marker.get(f"{endpoint_key}_xy")
+            t_val = marker.get(f"{endpoint_key}_t")
+            if not isinstance(t_val, (float, int)):
+                continue
+            xy_local = np.asarray(xy_marker, dtype=np.float64).copy()
+            if xy_local.shape != (2,):
+                continue
+            xy_local[0] -= float(crop_lo_yx[1])
+            xy_local[1] -= float(crop_lo_yx[0])
+            color = plt.get_cmap(T_AXIS_T_CMAP)(float(np.clip(float(t_val), 0.0, 1.0)))
+            ax.scatter(
+                [xy_local[0]],
+                [xy_local[1]],
+                s=70,
+                c=["black"],
+                marker="x",
+                linewidths=2.2,
+                alpha=0.95,
+                zorder=13,
+            )
+            ax.scatter(
+                [xy_local[0]],
+                [xy_local[1]],
+                s=46,
+                c=[color],
+                marker="x",
+                linewidths=1.7,
+                alpha=0.95,
+                zorder=14,
+            )
+            ax.text(
+                float(xy_local[0]) + 4.0,
+                float(xy_local[1]) + 4.0,
+                f"{mask_name} {endpoint_label}",
+                color="white",
+                fontsize=6,
+                bbox={"facecolor": "black", "edgecolor": "none", "alpha": 0.45, "pad": 1.2},
+                zorder=15,
+            )
 
 
 def _write_ccf_user_mask_overlay_png(
@@ -858,6 +906,7 @@ def _write_ccf_user_mask_overlay_png(
     roi_path: Path,
     imagej_target_spacing_um: float,
     overwrite: bool,
+    keep_t_mask: bool = False,
 ) -> dict[str, Path] | None:
     run_dir = ws.ccf_transforms(roi) / str(run_dirname)
     summary_path = run_dir / "similarity_plus_syn_summary.json"
@@ -886,10 +935,38 @@ def _write_ccf_user_mask_overlay_png(
     qc_zoom_masked_png = path_from_summary("qc_zoom_masked_png", "similarity_plus_syn_qc_zoom_masked.png")
 
     out_png = qc_zoom_masked_png.with_name("similarity_plus_syn_qc_zoom_masked_with_user_mask.png")
+    out_axis3_png = qc_zoom_masked_png.with_name("similarity_plus_syn_qc_zoom_masked_with_user_mask_axis3.png")
     out_json = qc_zoom_masked_png.with_name("similarity_plus_syn_qc_zoom_masked_with_user_mask_t_axis_endpoints.json")
-    skip_overlay_write = bool(out_png.exists() and not overwrite)
+    skip_overlay_write = bool(out_png.exists() and out_axis3_png.exists() and not overwrite)
     if skip_overlay_write and out_json.exists() and not overwrite:
         return None
+
+    preserve_saved_t_mask = bool(out_json.exists() and (keep_t_mask or not overwrite))
+    saved_endpoints_by_mask: dict[tuple[int, str], dict[str, object]] = {}
+    if preserve_saved_t_mask:
+        saved_payload = _load_json_object(out_json)
+        masks_payload = saved_payload.get("masks")
+        if isinstance(masks_payload, list):
+            for entry in masks_payload:
+                if not isinstance(entry, dict):
+                    continue
+                mask_index_raw = entry.get("mask_index")
+                mask_name_raw = entry.get("mask_name")
+                if isinstance(mask_index_raw, int) and isinstance(mask_name_raw, str):
+                    saved_endpoints_by_mask[(int(mask_index_raw), str(mask_name_raw))] = cast(dict[str, object], entry)
+
+    def _saved_t_range_for_mask(entry: dict[str, object] | None) -> tuple[float, float] | None:
+        if entry is None:
+            return None
+        begin_raw = entry.get("begin")
+        end_raw = entry.get("end")
+        if not isinstance(begin_raw, (int, float)) or not isinstance(end_raw, (int, float)):
+            return None
+        begin = float(begin_raw)
+        end = float(end_raw)
+        if not np.isfinite(begin) or not np.isfinite(end) or begin > end:
+            return None
+        return begin, end
 
     for required_path in (fixed_nifti, warped_after_nifti):
         if not required_path.exists():
@@ -949,6 +1026,7 @@ def _write_ccf_user_mask_overlay_png(
     )
 
     for mask_index, mask_name, fixed_mask_single in warped_masks_fixed:
+        saved_row = saved_endpoints_by_mask.get((int(mask_index), str(mask_name)))
         row: dict[str, object] = {
             "mask_index": int(mask_index),
             "mask_name": str(mask_name),
@@ -986,11 +1064,16 @@ def _write_ccf_user_mask_overlay_png(
             mirrored=t_axis_overlay_mirrored_mask,
             mask_yx=fixed_mask_single,
         )
-        t_range = (
-            _t_axis_range_for_mask(t_axis_overlay=selected_overlay, mask_yx=fixed_mask_single)
-            if selected_overlay is not None
-            else None
-        )
+        selected_side_from_saved = saved_row.get("selected_side") if saved_row is not None else None
+        if selected_side_from_saved == "primary" and t_axis_overlay_primary_mask is not None:
+            selected_overlay = t_axis_overlay_primary_mask
+            selected_side = "primary"
+        elif selected_side_from_saved == "mirrored" and t_axis_overlay_mirrored_mask is not None:
+            selected_overlay = t_axis_overlay_mirrored_mask
+            selected_side = "mirrored"
+        t_range = _saved_t_range_for_mask(saved_row)
+        if t_range is None and selected_overlay is not None:
+            t_range = _t_axis_range_for_mask(t_axis_overlay=selected_overlay, mask_yx=fixed_mask_single)
         row["selected_side"] = selected_side
         if t_range is not None:
             row["has_overlap_with_t_axis"] = True
@@ -1024,9 +1107,11 @@ def _write_ccf_user_mask_overlay_png(
             t_axis_endpoint_markers=t_axis_endpoint_markers,
             reflect_t_axis_midline=str(atlas_plane).lower() == "coronal",
             out_png=out_png,
+            axis3_out_png=out_axis3_png,
             title=f"SyN(MI) zoom (masked) + user ROI | roi={roi}",
         )
         written["overlay_png"] = out_png
+        written["overlay_axis3_png"] = out_axis3_png
 
     endpoints_payload: dict[str, object] = {
         "roi": str(roi),
@@ -1036,9 +1121,10 @@ def _write_ccf_user_mask_overlay_png(
     }
     if t_axis_overlay is None:
         endpoints_payload["reason"] = "t_axis_overlay_unavailable"
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(endpoints_payload, indent=2), encoding="utf-8")
-    written["t_axis_endpoints_json"] = out_json
+    if not preserve_saved_t_mask and (overwrite or not out_json.exists()):
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+        out_json.write_text(json.dumps(endpoints_payload, indent=2), encoding="utf-8")
+        written["t_axis_endpoints_json"] = out_json
     return written
 
 
@@ -1736,6 +1822,12 @@ def _mask_from_imagej_roi(
     help="Skip ROIs that are missing the warped input h5ad under ccf-transforms/<roi>/.",
 )
 @click.option("--overwrite/--no-overwrite", default=False, show_default=True, help="Overwrite output_h5ad if it exists.")
+@click.option(
+    "--keep-t-mask/--no-keep-t-mask",
+    default=False,
+    show_default=True,
+    help="Preserve existing t-axis endpoints JSON begin/end values, even when --overwrite is set.",
+)
 @click.option("--qc-plot/--no-qc-plot", default=True, show_default=True, help="Write a QC PNG overlay plot.")
 @click.option(
     "--qc-plot-png",
@@ -1790,6 +1882,7 @@ def main(  # noqa: PLR0913
     roi_col: str,
     skip_missing: bool,
     overwrite: bool,
+    keep_t_mask: bool,
     qc_plot: bool,
     qc_plot_png: Path | None,
     debug: bool,
@@ -1813,262 +1906,287 @@ def main(  # noqa: PLR0913
         raise click.BadParameter("--ccf-adjusted-col must be non-empty.")
 
     for roi_resolved in resolved_rois:
-        input_h5ad_candidate = _input_h5ad_candidate(ws, roi=str(roi_resolved), h5ad_name=h5ad_name)
-        if not input_h5ad_candidate.exists():
-            if skip_missing:
-                click.echo(f"Skipping roi={roi_resolved!r} (missing warped h5ad): {input_h5ad_candidate}")
-                continue
-            input_h5ad = _resolve_input_h5ad(ws, roi=str(roi_resolved), h5ad_name=h5ad_name)
-        else:
-            input_h5ad = input_h5ad_candidate
-        roi_resolved, output_h5ad, plot_png_default = _default_outputs(
-            ws,
-            roi=str(roi_resolved),
-            input_h5ad=input_h5ad,
-            out_name=out_name,
-        )
-        plot_png = qc_plot_png if qc_plot_png is not None else plot_png_default
-
-        output_h5ad.parent.mkdir(parents=True, exist_ok=True)
-        if not overwrite:
-            existing: list[Path] = []
-            if output_h5ad.exists():
-                existing.append(output_h5ad)
-            if qc_plot and plot_png.exists():
-                existing.append(plot_png)
-            if existing:
-                click.echo(
-                    "Skipping (output already exists; pass --overwrite to replace): " + ", ".join(str(p) for p in existing)
-                )
-                continue
-
         try:
-            setup_cli_logging(
-                workspace,
-                component="ccf.filter_h5ad_ccf",
-                file=f"filter-h5ad-ccf-{roi_resolved}",
-                debug=debug,
-                extra={"roi": str(roi_resolved)},
-            )
-        except PermissionError as exc:
-            click.echo(
-                f"Warning: cannot write logs under {workspace}/analysis/logs (permission denied); continuing without file logging. ({exc})",
-                err=True,
-            )
-
-        adata = ad.read_h5ad(input_h5ad)
-        n_total = int(adata.n_obs)
-
-        roi_mask: np.ndarray | None = None
-        adata_work = adata
-        if filter_roi:
-            if roi_col not in adata.obs.columns:
-                raise click.ClickException(f"Missing obs column {roi_col!r} in {input_h5ad}.")
-            roi_mask = (adata.obs[roi_col].astype(str) == str(roi_resolved)).to_numpy()
-            adata_work = adata[roi_mask].copy()
-            click.echo(
-                f"Scoped ROI for selection: {adata_work.n_obs}/{n_total} obs (roi_col={roi_col!r}, roi={roi_resolved!r})"
-            )
-
-        order_t = cast(SpatialOrder, str(spatial_order).lower())
-        qc_units: str
-        qc_coords: np.ndarray
-        title: str
-
-        roi_path: Path | None = None
-        mask_edit_dir = ws.ccf_transforms(str(roi_resolved)) / str(run_dirname) / "mask_edit"
-        if not ignore_imagej_roi:
-            if imagej_roi_path is not None:
-                roi_path = imagej_roi_path
-            elif imagej_roi:
-                if mask_edit_dir.exists():
-                    roi_path = _find_imagej_roi_file(mask_edit_dir)
-                if roi_path is None:
-                    msg = f"--imagej-roi was requested but no ROI was found under {mask_edit_dir}."
-                    if is_batch:
-                        click.echo(f"Warning: {msg} Falling back to --term filtering for roi={roi_resolved!r}.", err=True)
-                    else:
-                        raise click.ClickException(msg)
-
-        imagej_labels: np.ndarray | None = None
-        if roi_path is not None:
-            click.echo(f"Using ImageJ ROI override: {roi_path}")
-            imagej_space_t = cast(InputSpace, str(imagej_input_space).lower())
-            imagej_units_t = cast(CoordUnits, str(imagej_input_units).lower())
-            mask, qc_coords, imagej_labels = _mask_from_imagej_roi(
-                ws=ws,
-                roi=str(roi_resolved),
-                adata=adata_work,
-                roi_path=roi_path,
-                coords_key=str(imagej_coords_key),
-                input_space=imagej_space_t,
-                input_units=imagej_units_t,
-                spatial_order=order_t,
-                stitch_codebook=str(stitch_codebook),
-                target_spacing_um=float(imagej_target_spacing_um),
-            )
-            qc_units = "thumb_px"
-            title = (
-                f"ImageJ ROI selection overlay | selected={int(mask.sum())}/{int(adata_work.n_obs)} | roi={roi_resolved!r}"
-            )
-        else:
-            if not terms:
-                raise click.ClickException(
-                    "At least one --term is required unless an ImageJ ROI is available (or enabled via --imagej-roi/--imagej-roi-path)."
-                )
-
-            coords_units_t = cast(CoordUnits, str(coords_units).lower())
-            coords_space_t = cast(CoordSpace, str(coords_space).lower())
-            _ensure_ccf_obsm(
-                adata_work,
-                input_h5ad=input_h5ad,
-                ccf_obsm_key=ccf_obsm_key,
-                coords_key=coords_key,
-                coords_units=coords_units_t,
-                coords_space=coords_space_t,
-                spatial_order=order_t,
-                roi=str(roi_resolved),
-                workspace=workspace,
-            )
-
-            kind_t = cast(CCFTermKind, str(kind).lower())
-            match_t = cast(MatchMode, str(match).lower())
-            combine_t = cast(CombineMode, str(combine).lower())
-
-            n_work = int(adata_work.n_obs)
-            term_masks: list[np.ndarray] = []
-            term_labels = np.empty(n_work, dtype=object)
-            term_labels[:] = ""
-            if combine_t == "all":
-                for t in terms:
-                    term_masks.append(
-                        _mask_for_term(adata_work, str(t), kind=kind_t, match=match_t, obsm_key=ccf_obsm_key)
-                    )
-                mask = np.ones(n_work, dtype=bool) if term_masks else np.zeros(n_work, dtype=bool)
-                for m in term_masks:
-                    mask &= m
-                if term_masks:
-                    joined = "|".join(str(t) for t in terms)
-                    term_labels[mask] = joined
+            input_h5ad_candidate = _input_h5ad_candidate(ws, roi=str(roi_resolved), h5ad_name=h5ad_name)
+            if not input_h5ad_candidate.exists():
+                if skip_missing:
+                    click.echo(f"Skipping roi={roi_resolved!r} (missing warped h5ad): {input_h5ad_candidate}")
+                    continue
+                input_h5ad = _resolve_input_h5ad(ws, roi=str(roi_resolved), h5ad_name=h5ad_name)
             else:
-                for t in terms:
-                    m = _mask_for_term(adata_work, str(t), kind=kind_t, match=match_t, obsm_key=ccf_obsm_key)
-                    term_masks.append(m)
-                    new = m & (term_labels == "")
-                    if np.any(new):
-                        term_labels[new] = str(t)
-                mask = np.zeros(n_work, dtype=bool)
-                for m in term_masks:
-                    mask |= m
-
-            dilate = float(dilate_um)
-            if dilate > 0:
-                if coords_key not in adata_work.obsm:
-                    raise click.ClickException(
-                        f"Missing adata.obsm[{coords_key!r}] in {input_h5ad} (needed for --dilate-um)."
-                    )
-                coords = np.asarray(adata_work.obsm[coords_key])
-                if coords.ndim != 2 or coords.shape[1] != 2:
-                    raise click.ClickException(
-                        f"Expected obsm[{coords_key!r}] to have shape (N,2), got {coords.shape}."
-                    )
-                if order_t == "yx":
-                    coords = coords[:, ::-1]
-
-                spacing_um = coords_spacing_um
-                if coords_units_t == "px" and spacing_um is None:
-                    ccf_meta = adata_work.uns.get("ccf", {})
-                    ccf_atlas_meta = adata_work.uns.get("ccf_atlas", {})
-                    if isinstance(ccf_meta, dict) and "atlas_voxel_um" in ccf_meta:
-                        spacing_um = float(ccf_meta["atlas_voxel_um"])
-                    elif isinstance(ccf_atlas_meta, dict) and "atlas_voxel_um" in ccf_atlas_meta:
-                        spacing_um = float(ccf_atlas_meta["atlas_voxel_um"])
-                coords_um = _coords_to_um(coords, units=coords_units_t, spacing_um=spacing_um)
-                mask = _dilate_mask_by_radius_um(coords_um, base_mask=mask, radius_um=dilate)
-                if term_masks:
-                    joined = "|".join(str(t) for t in terms)
-                    new = mask & (term_labels == "")
-                    if np.any(new):
-                        term_labels[new] = joined
-
-            if coords_key not in adata_work.obsm:
-                raise click.ClickException(f"Missing adata.obsm[{coords_key!r}] in {input_h5ad} (needed for QC plot).")
-            qc_coords = np.asarray(adata_work.obsm[coords_key])
-            if qc_coords.ndim != 2 or qc_coords.shape[1] != 2:
-                raise click.ClickException(f"Expected obsm[{coords_key!r}] to have shape (N,2), got {qc_coords.shape}.")
-            if order_t == "yx":
-                qc_coords = qc_coords[:, ::-1]
-
-            qc_units = str(coords_units_t)
-            title = (
-                f"CCF selection overlay | selected={int(mask.sum())}/{int(adata_work.n_obs)} | "
-                f"match={match_t}, combine={combine_t}, invert={invert}, dilate_um={float(dilate_um)}"
+                input_h5ad = input_h5ad_candidate
+            roi_resolved, output_h5ad, plot_png_default = _default_outputs(
+                ws,
+                roi=str(roi_resolved),
+                input_h5ad=input_h5ad,
+                out_name=out_name,
             )
-
-        if invert:
-            mask = ~mask
-
-        labels = imagej_labels if imagej_labels is not None else term_labels
-        if invert:
-            criteria = roi_path.name if roi_path is not None else "|".join(str(t) for t in terms)
-            invert_label = f"not({criteria})"
-            labels = np.where(mask, np.where(labels != "", labels, invert_label), "")
-        else:
-            labels = np.where(mask, labels, "")
-
-        labels_full = np.empty(n_total, dtype=object)
-        labels_full[:] = ""
-        if roi_mask is not None:
-            labels_full[roi_mask] = labels
-        else:
-            labels_full = labels
-
-        if qc_plot:
-            _write_qc_mask_overlay_plot(
-                coords_xy=qc_coords,
-                keep_mask=mask,
-                output_png=plot_png,
-                title=title,
-                units=qc_units,
-            )
-            click.echo(f"Wrote QC plot: {plot_png}")
-
-        if roi_path is not None:
+            plot_png = qc_plot_png if qc_plot_png is not None else plot_png_default
+    
+            output_h5ad.parent.mkdir(parents=True, exist_ok=True)
+            if not overwrite:
+                existing: list[Path] = []
+                if output_h5ad.exists():
+                    existing.append(output_h5ad)
+                if qc_plot and plot_png.exists():
+                    existing.append(plot_png)
+                if existing:
+                    click.echo(
+                        "Skipping (output already exists; pass --overwrite to replace): " + ", ".join(str(p) for p in existing)
+                    )
+                    continue
+    
             try:
-                user_overlay_outputs = _write_ccf_user_mask_overlay_png(
-                    ws=ws,
-                    roi=str(roi_resolved),
-                    run_dirname=str(run_dirname),
-                    roi_path=roi_path,
-                    imagej_target_spacing_um=float(imagej_target_spacing_um),
-                    overwrite=bool(overwrite),
+                setup_cli_logging(
+                    workspace,
+                    component="ccf.filter_h5ad_ccf",
+                    file=f"filter-h5ad-ccf-{roi_resolved}",
+                    debug=debug,
+                    extra={"roi": str(roi_resolved)},
                 )
-            except (FileNotFoundError, KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
+            except PermissionError as exc:
                 click.echo(
-                    f"Warning: skipping CCF user-mask overlay for roi={roi_resolved!r}: {exc}",
+                    f"Warning: cannot write logs under {workspace}/analysis/logs (permission denied); continuing without file logging. ({exc})",
                     err=True,
                 )
+    
+            adata = ad.read_h5ad(input_h5ad)
+            n_total = int(adata.n_obs)
+    
+            roi_mask: np.ndarray | None = None
+            adata_work = adata
+            if filter_roi:
+                if roi_col not in adata.obs.columns:
+                    raise click.ClickException(f"Missing obs column {roi_col!r} in {input_h5ad}.")
+                roi_mask = (adata.obs[roi_col].astype(str) == str(roi_resolved)).to_numpy()
+                adata_work = adata[roi_mask].copy()
+                click.echo(
+                    f"Scoped ROI for selection: {adata_work.n_obs}/{n_total} obs (roi_col={roi_col!r}, roi={roi_resolved!r})"
+                )
+    
+            order_t = cast(SpatialOrder, str(spatial_order).lower())
+            qc_units: str
+            qc_coords: np.ndarray
+            title: str
+    
+            roi_path: Path | None = None
+            mask_edit_dir = ws.ccf_transforms(str(roi_resolved)) / str(run_dirname) / "mask_edit"
+            if not ignore_imagej_roi:
+                if imagej_roi_path is not None:
+                    roi_path = imagej_roi_path
+                elif imagej_roi:
+                    if mask_edit_dir.exists():
+                        roi_path = _find_imagej_roi_file(mask_edit_dir)
+                    if roi_path is None:
+                        msg = f"--imagej-roi was requested but no ROI was found under {mask_edit_dir}."
+                        if is_batch:
+                            click.echo(f"Warning: {msg} Falling back to --term filtering for roi={roi_resolved!r}.", err=True)
+                        else:
+                            raise click.ClickException(msg)
+    
+            imagej_labels: np.ndarray | None = None
+            if roi_path is not None:
+                click.echo(f"Using ImageJ ROI override: {roi_path}")
+                imagej_space_t = cast(InputSpace, str(imagej_input_space).lower())
+                imagej_units_t = cast(CoordUnits, str(imagej_input_units).lower())
+                mask, qc_coords, imagej_labels = _mask_from_imagej_roi(
+                    ws=ws,
+                    roi=str(roi_resolved),
+                    adata=adata_work,
+                    roi_path=roi_path,
+                    coords_key=str(imagej_coords_key),
+                    input_space=imagej_space_t,
+                    input_units=imagej_units_t,
+                    spatial_order=order_t,
+                    stitch_codebook=str(stitch_codebook),
+                    target_spacing_um=float(imagej_target_spacing_um),
+                )
+                qc_units = "thumb_px"
+                title = (
+                    f"ImageJ ROI selection overlay | selected={int(mask.sum())}/{int(adata_work.n_obs)} | roi={roi_resolved!r}"
+                )
             else:
-                if user_overlay_outputs is not None:
-                    overlay_png = user_overlay_outputs.get("overlay_png")
-                    if overlay_png is not None:
-                        click.echo(f"Wrote CCF user-mask overlay: {overlay_png}")
-                    t_axis_json = user_overlay_outputs.get("t_axis_endpoints_json")
-                    if t_axis_json is not None:
-                        click.echo(f"Wrote CCF t-axis endpoints JSON: {t_axis_json}")
-
-        out = adata.copy()
-        out.obs[ccf_col] = pd.Series([""] * n_total, index=out.obs_names)
-        out.obs[ccf_adjusted_col] = pd.Series([""] * n_total, index=out.obs_names)
-        if imagej_labels is not None:
-            out.obs[ccf_adjusted_col] = pd.Series(labels_full, index=out.obs_names)
-        else:
-            out.obs[ccf_col] = pd.Series(labels_full, index=out.obs_names)
-        out.write_h5ad(output_h5ad)
-        n_labeled = int(np.sum(labels_full != ""))
-        target_col = ccf_adjusted_col if imagej_labels is not None else ccf_col
-        click.echo(f"Wrote: {output_h5ad} (annotated {n_labeled}/{out.n_obs} obs in {target_col!r})")
-
+                if not terms:
+                    raise click.ClickException(
+                        "At least one --term is required unless an ImageJ ROI is available (or enabled via --imagej-roi/--imagej-roi-path)."
+                    )
+    
+                coords_units_t = cast(CoordUnits, str(coords_units).lower())
+                coords_space_t = cast(CoordSpace, str(coords_space).lower())
+                _ensure_ccf_obsm(
+                    adata_work,
+                    input_h5ad=input_h5ad,
+                    ccf_obsm_key=ccf_obsm_key,
+                    coords_key=coords_key,
+                    coords_units=coords_units_t,
+                    coords_space=coords_space_t,
+                    spatial_order=order_t,
+                    roi=str(roi_resolved),
+                    workspace=workspace,
+                )
+    
+                kind_t = cast(CCFTermKind, str(kind).lower())
+                match_t = cast(MatchMode, str(match).lower())
+                combine_t = cast(CombineMode, str(combine).lower())
+    
+                n_work = int(adata_work.n_obs)
+                term_masks: list[np.ndarray] = []
+                term_labels = np.empty(n_work, dtype=object)
+                term_labels[:] = ""
+                if combine_t == "all":
+                    for t in terms:
+                        term_masks.append(
+                            _mask_for_term(adata_work, str(t), kind=kind_t, match=match_t, obsm_key=ccf_obsm_key)
+                        )
+                    mask = np.ones(n_work, dtype=bool) if term_masks else np.zeros(n_work, dtype=bool)
+                    for m in term_masks:
+                        mask &= m
+                    if term_masks:
+                        joined = "|".join(str(t) for t in terms)
+                        term_labels[mask] = joined
+                else:
+                    for t in terms:
+                        m = _mask_for_term(adata_work, str(t), kind=kind_t, match=match_t, obsm_key=ccf_obsm_key)
+                        term_masks.append(m)
+                        new = m & (term_labels == "")
+                        if np.any(new):
+                            term_labels[new] = str(t)
+                    mask = np.zeros(n_work, dtype=bool)
+                    for m in term_masks:
+                        mask |= m
+    
+                dilate = float(dilate_um)
+                if dilate > 0:
+                    if coords_key not in adata_work.obsm:
+                        raise click.ClickException(
+                            f"Missing adata.obsm[{coords_key!r}] in {input_h5ad} (needed for --dilate-um)."
+                        )
+                    coords = np.asarray(adata_work.obsm[coords_key])
+                    if coords.ndim != 2 or coords.shape[1] != 2:
+                        raise click.ClickException(
+                            f"Expected obsm[{coords_key!r}] to have shape (N,2), got {coords.shape}."
+                        )
+                    if order_t == "yx":
+                        coords = coords[:, ::-1]
+    
+                    spacing_um = coords_spacing_um
+                    if coords_units_t == "px" and spacing_um is None:
+                        ccf_meta = adata_work.uns.get("ccf", {})
+                        ccf_atlas_meta = adata_work.uns.get("ccf_atlas", {})
+                        if isinstance(ccf_meta, dict) and "atlas_voxel_um" in ccf_meta:
+                            spacing_um = float(ccf_meta["atlas_voxel_um"])
+                        elif isinstance(ccf_atlas_meta, dict) and "atlas_voxel_um" in ccf_atlas_meta:
+                            spacing_um = float(ccf_atlas_meta["atlas_voxel_um"])
+                    coords_um = _coords_to_um(coords, units=coords_units_t, spacing_um=spacing_um)
+                    mask = _dilate_mask_by_radius_um(coords_um, base_mask=mask, radius_um=dilate)
+                    if term_masks:
+                        joined = "|".join(str(t) for t in terms)
+                        new = mask & (term_labels == "")
+                        if np.any(new):
+                            term_labels[new] = joined
+    
+                if coords_key not in adata_work.obsm:
+                    raise click.ClickException(f"Missing adata.obsm[{coords_key!r}] in {input_h5ad} (needed for QC plot).")
+                qc_coords = np.asarray(adata_work.obsm[coords_key])
+                if qc_coords.ndim != 2 or qc_coords.shape[1] != 2:
+                    raise click.ClickException(f"Expected obsm[{coords_key!r}] to have shape (N,2), got {qc_coords.shape}.")
+                if order_t == "yx":
+                    qc_coords = qc_coords[:, ::-1]
+    
+                qc_units = str(coords_units_t)
+                title = (
+                    f"CCF selection overlay | selected={int(mask.sum())}/{int(adata_work.n_obs)} | "
+                    f"match={match_t}, combine={combine_t}, invert={invert}, dilate_um={float(dilate_um)}"
+                )
+    
+            if invert:
+                mask = ~mask
+    
+            labels = imagej_labels if imagej_labels is not None else term_labels
+            if invert:
+                criteria = roi_path.name if roi_path is not None else "|".join(str(t) for t in terms)
+                invert_label = f"not({criteria})"
+                labels = np.where(mask, np.where(labels != "", labels, invert_label), "")
+            else:
+                labels = np.where(mask, labels, "")
+    
+            labels_full = np.empty(n_total, dtype=object)
+            labels_full[:] = ""
+            if roi_mask is not None:
+                labels_full[roi_mask] = labels
+            else:
+                labels_full = labels
+    
+            if qc_plot:
+                _write_qc_mask_overlay_plot(
+                    coords_xy=qc_coords,
+                    keep_mask=mask,
+                    output_png=plot_png,
+                    title=title,
+                    units=qc_units,
+                )
+                click.echo(f"Wrote QC plot: {plot_png}")
+    
+            t_axis_endpoints_payload: dict[str, object] | None = None
+            if roi_path is not None:
+                t_axis_json_path: Path | None = None
+                try:
+                    user_overlay_outputs = _write_ccf_user_mask_overlay_png(
+                        ws=ws,
+                        roi=str(roi_resolved),
+                        run_dirname=str(run_dirname),
+                        roi_path=roi_path,
+                        imagej_target_spacing_um=float(imagej_target_spacing_um),
+                        overwrite=bool(overwrite),
+                        keep_t_mask=bool(keep_t_mask),
+                    )
+                except (FileNotFoundError, KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
+                    click.echo(
+                        f"Warning: skipping CCF user-mask overlay for roi={roi_resolved!r}: {exc}",
+                        err=True,
+                    )
+                else:
+                    if user_overlay_outputs is not None:
+                        overlay_png = user_overlay_outputs.get("overlay_png")
+                        if overlay_png is not None:
+                            click.echo(f"Wrote CCF user-mask overlay: {overlay_png}")
+                        t_axis_json = user_overlay_outputs.get("t_axis_endpoints_json")
+                        if t_axis_json is not None:
+                            t_axis_json_path = Path(t_axis_json)
+                            click.echo(f"Wrote CCF t-axis endpoints JSON: {t_axis_json}")
+                if t_axis_json_path is None:
+                    candidate = (
+                        ws.ccf_transforms(str(roi_resolved))
+                        / str(run_dirname)
+                        / "similarity_plus_syn_qc_zoom_masked_with_user_mask_t_axis_endpoints.json"
+                    )
+                    if candidate.exists():
+                        t_axis_json_path = candidate
+                if t_axis_json_path is not None and t_axis_json_path.exists():
+                    t_axis_endpoints_payload = _load_json_object(t_axis_json_path)
+    
+            out = adata.copy()
+            out.obs[ccf_col] = pd.Series([""] * n_total, index=out.obs_names)
+            out.obs[ccf_adjusted_col] = pd.Series([""] * n_total, index=out.obs_names)
+            if imagej_labels is not None:
+                out.obs[ccf_adjusted_col] = pd.Series(labels_full, index=out.obs_names)
+            else:
+                out.obs[ccf_col] = pd.Series(labels_full, index=out.obs_names)
+            if t_axis_endpoints_payload is not None:
+                payload_for_uns = dict(t_axis_endpoints_payload)
+                payload_for_uns.pop("masks", None)
+                out.uns["t_all_mapping"] = payload_for_uns
+            out.write_h5ad(output_h5ad)
+            n_labeled = int(np.sum(labels_full != ""))
+            target_col = ccf_adjusted_col if imagej_labels is not None else ccf_col
+            click.echo(f"Wrote: {output_h5ad} (annotated {n_labeled}/{out.n_obs} obs in {target_col!r})")
+    
+    
+        except Exception as exc:
+            if is_batch:
+                click.echo(f"Warning: error processing roi={roi_resolved!r}: {exc}", err=True)
+                continue
+            raise
 
 if __name__ == "__main__":
     main()

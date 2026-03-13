@@ -103,6 +103,145 @@ def test_compute_ap_ml_um_from_refextract_coronal_and_sagittal(tmp_path: Path) -
     assert np.isnan(sag[2, :]).all()
 
 
+def test_compute_ap_ml_um_from_refextract_sagittal_oob_slice_is_nan(tmp_path: Path) -> None:
+    module = _load_find_princurve_module()
+    compute = getattr(module, "compute_ap_ml_um_from_refextract")
+
+    outdir = tmp_path / "lut"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    slice_keys = np.asarray([10, 11, 12], dtype=np.int32)
+    ap_um = np.asarray([0.0, 100.0, 200.0], dtype=np.float64)
+    np.savez(outdir / "ap_axis_um_from_strips.npz", slice_keys=slice_keys, ap_um=ap_um)
+
+    np.save(outdir / "resolution_ds_ijk_um.npy", np.asarray([20.0, 1.0, 1.0], dtype=np.float64))
+    _write_coronal_midline_csv(outdir / "coronal_midline_columns.csv", slice_is=[10, 11, 12])
+
+    source_slice_keys = np.asarray([20], dtype=np.int32)
+    t_grid = np.asarray([0.0, 0.5, 1.0], dtype=np.float64)
+    target_slice_idx = np.asarray([[11.0, 11.0, 11.0]], dtype=np.float64)
+    target_t = np.asarray([[0.0, 0.5, 1.0]], dtype=np.float64)
+    np.savez(
+        outdir / "chart_map_sagittal_to_coronal_t2d.npz",
+        source_slice_keys=source_slice_keys,
+        t_grid=t_grid,
+        target_slice_idx=target_slice_idx,
+        target_t=target_t,
+    )
+
+    t_all = np.asarray([0.25, 0.5, 0.75], dtype=np.float64)
+    sag = compute(lut_outdir=outdir, axis="sagittal", atlas_slice_idx=21, t_all=t_all, ref_slice_i=11, ref_t=0.5)
+    assert sag.shape == (3, 2)
+    assert np.isnan(sag[:, 0]).all()
+    assert np.isnan(sag[:, 1]).all()
+
+
+def test_compute_ap_ml_um_from_refextract_respects_lut_coronal_support(tmp_path: Path) -> None:
+    module = _load_find_princurve_module()
+    compute = getattr(module, "compute_ap_ml_um_from_refextract")
+
+    outdir = tmp_path / "lut"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Make AP axis + anchors cover slices 9..13, so LUT support gating is observable.
+    slice_keys = np.asarray([9, 10, 11, 12, 13], dtype=np.int32)
+    ap_um = np.asarray([0.0, 100.0, 200.0, 300.0, 400.0], dtype=np.float64)
+    np.savez(outdir / "ap_axis_um_from_strips.npz", slice_keys=slice_keys, ap_um=ap_um)
+
+    np.save(outdir / "resolution_ds_ijk_um.npy", np.asarray([20.0, 1.0, 1.0], dtype=np.float64))
+    _write_coronal_midline_csv(outdir / "coronal_midline_columns.csv", slice_is=[9, 10, 11, 12, 13])
+
+    source_slice_keys = np.asarray([20], dtype=np.int32)
+    t_grid = np.asarray([0.0, 0.5, 1.0], dtype=np.float64)
+    target_slice_idx = np.asarray([[9.0, 11.0, 13.0]], dtype=np.float64)
+    target_t = np.asarray([[0.0, 0.5, 1.0]], dtype=np.float64)
+    np.savez(
+        outdir / "chart_map_sagittal_to_coronal_t2d.npz",
+        source_slice_keys=source_slice_keys,
+        t_grid=t_grid,
+        target_slice_idx=target_slice_idx,
+        target_t=target_t,
+        coronal_slice_min=np.asarray([10], dtype=np.int32),
+        coronal_slice_max=np.asarray([12], dtype=np.int32),
+    )
+
+    t_all = np.asarray([0.0, 0.5, 1.0], dtype=np.float64)
+    sag = compute(lut_outdir=outdir, axis="sagittal", atlas_slice_idx=20, t_all=t_all, ref_slice_i=11, ref_t=0.5)
+    assert sag.shape == (3, 2)
+    assert np.isnan(sag[0, :]).all()
+    assert np.allclose(sag[1, :], np.asarray([200.0, 0.0]))
+    assert np.isnan(sag[2, :]).all()
+
+
+def test_compute_ap_ml_um_from_refextract_sagittal_oob_t_is_nan(tmp_path: Path) -> None:
+    module = _load_find_princurve_module()
+    compute = getattr(module, "compute_ap_ml_um_from_refextract")
+
+    outdir = tmp_path / "lut"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    slice_keys = np.asarray([10, 11, 12], dtype=np.int32)
+    ap_um = np.asarray([0.0, 100.0, 200.0], dtype=np.float64)
+    np.savez(outdir / "ap_axis_um_from_strips.npz", slice_keys=slice_keys, ap_um=ap_um)
+
+    np.save(outdir / "resolution_ds_ijk_um.npy", np.asarray([20.0, 1.0, 1.0], dtype=np.float64))
+    _write_coronal_midline_csv(outdir / "coronal_midline_columns.csv", slice_is=[10, 11, 12])
+
+    source_slice_keys = np.asarray([20], dtype=np.int32)
+    t_grid = np.asarray([0.0, 0.5, 1.0], dtype=np.float64)
+    target_slice_idx = np.asarray([[11.0, 11.0, 11.0]], dtype=np.float64)
+    target_t = np.asarray([[0.0, 0.5, 1.0]], dtype=np.float64)
+    np.savez(
+        outdir / "chart_map_sagittal_to_coronal_t2d.npz",
+        source_slice_keys=source_slice_keys,
+        t_grid=t_grid,
+        target_slice_idx=target_slice_idx,
+        target_t=target_t,
+    )
+
+    t_all = np.asarray([-0.10, 0.25, 1.10], dtype=np.float64)
+    sag = compute(lut_outdir=outdir, axis="sagittal", atlas_slice_idx=20, t_all=t_all, ref_slice_i=11, ref_t=0.5)
+    assert sag.shape == (3, 2)
+    assert np.isnan(sag[0, :]).all()
+    assert np.isfinite(sag[1, :]).all()
+    assert np.isnan(sag[2, :]).all()
+
+
+def test_compute_ap_ml_um_from_refextract_sagittal_boundary_slice_is_nan(tmp_path: Path) -> None:
+    module = _load_find_princurve_module()
+    compute = getattr(module, "compute_ap_ml_um_from_refextract")
+
+    outdir = tmp_path / "lut"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    slice_keys = np.asarray([10, 11, 12], dtype=np.int32)
+    ap_um = np.asarray([0.0, 100.0, 200.0], dtype=np.float64)
+    np.savez(outdir / "ap_axis_um_from_strips.npz", slice_keys=slice_keys, ap_um=ap_um)
+
+    np.save(outdir / "resolution_ds_ijk_um.npy", np.asarray([20.0, 1.0, 1.0], dtype=np.float64))
+    _write_coronal_midline_csv(outdir / "coronal_midline_columns.csv", slice_is=[10, 11, 12])
+
+    source_slice_keys = np.asarray([20], dtype=np.int32)
+    t_grid = np.asarray([0.0, 0.5, 1.0], dtype=np.float64)
+    target_slice_idx = np.asarray([[10.0, 11.0, 10.0]], dtype=np.float64)
+    target_t = np.asarray([[0.0, 0.5, 1.0]], dtype=np.float64)
+    np.savez(
+        outdir / "chart_map_sagittal_to_coronal_t2d.npz",
+        source_slice_keys=source_slice_keys,
+        t_grid=t_grid,
+        target_slice_idx=target_slice_idx,
+        target_t=target_t,
+        coronal_slice_min=np.asarray([10], dtype=np.int32),
+    )
+
+    t_all = np.asarray([0.0, 0.5, 1.0], dtype=np.float64)
+    sag = compute(lut_outdir=outdir, axis="sagittal", atlas_slice_idx=20, t_all=t_all, ref_slice_i=11, ref_t=0.5)
+    assert sag.shape == (3, 2)
+    assert np.isnan(sag[0, :]).all()
+    assert np.isfinite(sag[1, :]).all()
+    assert np.isnan(sag[2, :]).all()
+
+
 def test_compute_ap_ml_um_from_refextract_raises_on_missing_artifacts(tmp_path: Path) -> None:
     module = _load_find_princurve_module()
     compute = getattr(module, "compute_ap_ml_um_from_refextract")

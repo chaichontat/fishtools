@@ -55,6 +55,8 @@ CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/usage6_brd
   --write-by-unit
 ```
 
+- Calling/threshold sensitivity: by default the script uses `adata.obs["brdu_pos"]` / `adata.obs["edu_pos"]`. To re-threshold from intensity columns, pass e.g. `--brdu-threshold 0.2 --edu-threshold 0.2` (defaults use `brdu_mean` / `edu_mean`).
+
 - `--include-leiden`: which Leiden clusters to include from `~/nvme/all_progenitors.h5ad`
 - `--pool-leiden`: pools the included Leidens into one curve per animal, while still stratifying by `dataset×theta_bin×leiden`
 - `--write-by-unit`: writes `usage6_by_unit.csv` with unit = `dataset×roi×ccf_adjusted` (used for weighted error bars)
@@ -64,6 +66,7 @@ Outputs in `--outdir`:
 - `usage6_by_animal.csv`: per-animal curves (used for gray per-animal lines)
 - `usage6_by_unit.csv` (when `--write-by-unit`): per-unit predictions + weights for error bars
 - `usage6_meta.csv`: simple across-animal summaries
+- `call_audit_by_dataset.csv`: per-dataset BrdU/EdU prevalence in the analysis subset (useful for threshold drift diagnostics)
 - `run.log`: progress + parameters
 
 Plot results:
@@ -81,7 +84,7 @@ This writes:
 - `usage6_pE_hat.png` (if present in inputs)
 - `usage6_Tc_over_dt.png` (if present in inputs)
 
-If `usage6_by_unit.csv` exists, plots use **dataset×roi×ccf_adjusted-weighted** 95% CIs (and per-animal weighted error bars).
+If `usage6_by_unit.csv` exists, plots use **dataset×roi×ccf_adjusted-weighted** unit heterogeneity bands (weighted median with 10–90% bands; not confidence intervals), plus per-animal bands. For robustness, low-support unit×bin rows can be treated as missing via `--min-unit-trials` (default 20).
 
 If you want hour/minute-scaled `T_S`/`T_C`, pass the pulse lag (e.g. 90 minutes):
 
@@ -117,6 +120,29 @@ CONDA_NO_PLUGINS=true conda run -n seq python scripts/mclust_label_image_smooth.
 ```
 
 This overwrites the outputs in `/tmp/mclust_label_demo_point_roi3_less_smooth`.
+
+Fit a hierarchical linear model across animals (unit = `dataset×roi×ccf_adjusted`):
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/hierarchical_usage6_mixedlm.py \
+  --indir scripts/_out/usage6_run \
+  --outcome tc_over_dt
+```
+
+For unit-level uncertainty, a block bootstrap is available via `--bootstrap-units-within-animal N`, and low-support unit×bin rows can be dropped via `--min-trials-b1` / `--min-trials-all`.
+
+By default this treats animal as a random effect (MixedLM) and writes `hier_mixedlm_summary.txt` and `hier_mixedlm_fixed_effects.csv` into `--indir` (or `--outdir` if provided).
+
+To treat animal as a fixed effect (recommended when you want explicit per-animal offsets), add `--animal-fixed`:
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/hierarchical_usage6_mixedlm.py \
+  --indir scripts/_out/usage6_run \
+  --outcome tc_over_dt \
+  --animal-fixed
+```
+
+This writes `hier_animal_fixed_summary.txt`, `hier_animal_fixed_coefs.csv`, and `hier_animal_fixed_pred_curve_by_animal.csv`.
 
 ## Compression
 

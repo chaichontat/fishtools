@@ -45,6 +45,7 @@ def _robust_clim(
 class AtlasSliceIdxPicker:
     fig: Figure
     slider: Slider
+    save_button: Button | None
     z_min: int
     z_max: int
 
@@ -63,6 +64,7 @@ def pick_atlas_slice_idx(
     initial_idx: int = 0,
     z_min_idx: int = 0,
     z_max_idx: int | None = None,
+    on_save: Callable[[int], None] | None = None,
 ) -> AtlasSliceIdxPicker:
     """Create an interactive atlas Z-slice picker.
 
@@ -124,10 +126,21 @@ def pick_atlas_slice_idx(
 
     slider.on_changed(_update)
 
+    save_button: Button | None = None
+    if on_save is not None:
+        ax_save = plt.axes([0.78, 0.08, 0.15, 0.04])
+        save_button = Button(ax_save, "Save")
+
+        def _save(*_args: object) -> None:
+            z = int(np.clip(int(round(float(slider.val))), z_min, z_max))
+            on_save(z)
+
+        save_button.on_clicked(_save)
+
     _update()
 
     plt.show()
-    return AtlasSliceIdxPicker(fig=fig, slider=slider, z_min=z_min, z_max=z_max)
+    return AtlasSliceIdxPicker(fig=fig, slider=slider, save_button=save_button, z_min=z_min, z_max=z_max)
 
 
 @dataclass(frozen=True, slots=True)

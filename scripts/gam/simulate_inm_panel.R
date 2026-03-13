@@ -28,6 +28,10 @@ simulate_inm_panel <- function(
   # Size factors; kept modest to yield sparse-ish counts.
   s <- rlnorm(n_cells, meanlog = log(1500), sdlog = 0.25)
 
+  # Additional covariates matching real panels.
+  AP_um <- runif(n_cells, min = 0, max = 2000)
+  ML_um <- runif(n_cells, min = 0, max = 2000)
+
   make_gene <- function(kind, idx) {
     gene <- paste0(kind, "_", idx)
 
@@ -66,6 +70,9 @@ simulate_inm_panel <- function(
   cells <- data.frame(
     cell_id = seq_len(n_cells),
     x = x,
+    r_um = r_true,
+    AP_um = AP_um,
+    ML_um = ML_um,
     theta = theta,
     s = s,
     stringsAsFactors = FALSE

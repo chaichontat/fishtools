@@ -1,10 +1,8 @@
 # %%
 import json
-from collections import deque
 from pathlib import Path
 
 import polars as pl
-import pyfastx
 from Bio import Restriction, Seq
 from loguru import logger
 
@@ -13,24 +11,24 @@ from fishtools import SAMFrame, gen_fasta, rc
 from fishtools.mkprobes.starmap.starmap import test_splint_padlock
 from fishtools.mkprobes.utils.sequtils import is_subsequence
 from fishtools.utils.pretty_print import printc
-
-hfs = pl.read_csv("data/headerfooter.csv")
+DATA_PATH = Path("/working/fishtools/data")
+hfs = pl.read_csv(DATA_PATH / "headerfooter.csv")
 t7promoter = "TAATACGACTCACTATAGGG"
-bits = pl.read_csv("data/readout_ref_filtered.csv")
+bits = pl.read_csv(DATA_PATH / "readout_ref_filtered.csv")
 bits = dict(zip(bits["seq"], bits["id"]))
 # %%
-manifest = json.loads(Path("2025-05/manifest.json").read_text())
+manifest = json.loads(Path(DATA_PATH.parent / "2025-05/manifest.json").read_text())
 idx = 4
 species = manifest[idx]["species"]
 # %%
 species = "mouse"
 # %%
 try:
-    ds = Dataset(f"data/{species}")
+    ds = Dataset(DATA_PATH / species)
 except (FileNotFoundError, FileExistsError):
     logger.warning(f"Could not find {species}.")
 
-ss = Path(f"2025-05/generated/{manifest[idx]['name']}_final.txt").read_text().splitlines()
+ss = Path(DATA_PATH.parent / f"2025-05/generated/{manifest[idx]['name']}_final.txt").read_text().splitlines()
 assert manifest[idx]["bcidx"] == idx
 # %%
 
@@ -106,13 +104,14 @@ pad = process(
 mode = "txome" if species in {"human", "mouse"} else "genome"
 df = SAMFrame.from_bowtie(
     gen_fasta(
-        # forward handle of splint, last 17 bases of splint are ligation handles
-        # first 9 bases of pad are ligation handle
+        # `sp` and `pad` are the post-digest functional products.
+        # - splint: drop 10 nt 5' padding, drop 14 nt 3' junction (= "ca" + 6 nt + 6 nt)
+        # - padlock: drop 3 nt header-tail + first 6 nt used for splint-padlock complementarity
         [sp[10:-14], pad[9:27]],
         # [sp[3 : -(2 + 8 + 6)], pad[8:29]],
         names=["splint", "padlock"],
     ).getvalue(),
-    f"data/{species}/{mode}",
+    DATA_PATH / species / mode,
     seed_length=12,
     threshold=16,
     n_return=-1,

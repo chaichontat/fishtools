@@ -121,6 +121,72 @@ def test_segment_thumbnail_includes_highpass_when_present(tmp_path: Path) -> Non
     assert (thumb_dir / "thumbnail_highpass_z000.png").exists()
 
 
+def test_segment_thumbnail_zs_selects_explicit_planes(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path)
+    _write_fused(ws, roi="roi", codebook="cb1", name="fused.zarr", shape=(5, 4, 4, 1))
+
+    runner = CliRunner()
+    out_dir = tmp_path / "thumb_zs"
+    res = runner.invoke(
+        segment_app,
+        [
+            "thumbnail",
+            str(ws),
+            "roi",
+            "--codebook",
+            "cb1",
+            "--z-stride",
+            "1",
+            "--z-range",
+            "0:5",
+            "--zs",
+            "1, 4",
+            "--downsample",
+            "1",
+            "--output-dir",
+            str(out_dir),
+        ],
+        prog_name="segment",
+    )
+    assert res.exit_code == 0, res.output
+
+    thumb_dir = out_dir / "roi+cb1"
+    assert not (thumb_dir / "thumbnail_z000.png").exists()
+    assert (thumb_dir / "thumbnail_z001.png").exists()
+    assert not (thumb_dir / "thumbnail_z002.png").exists()
+    assert not (thumb_dir / "thumbnail_z003.png").exists()
+    assert (thumb_dir / "thumbnail_z004.png").exists()
+
+
+def test_segment_thumbnail_zs_rejects_out_of_range(tmp_path: Path) -> None:
+    ws = _make_workspace(tmp_path)
+    _write_fused(ws, roi="roi", codebook="cb1", name="fused.zarr", shape=(2, 4, 4, 1))
+
+    runner = CliRunner()
+    res = runner.invoke(
+        segment_app,
+        [
+            "thumbnail",
+            str(ws),
+            "roi",
+            "--codebook",
+            "cb1",
+            "--zs",
+            "2",
+            "--downsample",
+            "1",
+            "--output-dir",
+            str(tmp_path / "thumb_zs_oob"),
+        ],
+        prog_name="segment",
+    )
+    assert res.exit_code != 0
+    msg = res.output
+    if res.exception is not None:
+        msg += str(res.exception)
+    assert "Invalid --zs" in msg
+
+
 def test_segment_thumbnail_random_percentile_normalization(tmp_path: Path) -> None:
     from PIL import Image
 
@@ -445,6 +511,36 @@ def test_segment_thumbnail_applies_ccf_pose_after_downsample(tmp_path: Path) -> 
 
     assert np.array_equal(base_pose, expected_base)
     assert np.array_equal(overlay_pose, expected_overlay)
+
+    out_pose_disabled = tmp_path / "thumb_pose_disabled"
+    res_pose_disabled = runner.invoke(
+        segment_app,
+        [
+            "thumbnail",
+            str(ws_path),
+            roi,
+            "--codebook",
+            codebook,
+            "--seg-codebook",
+            seg_codebook,
+            "--segmentation-name",
+            "masks.zarr",
+            "--z-range",
+            "0:1",
+            "--downsample",
+            "2",
+            "--no-ccf-rotate",
+            "--output-dir",
+            str(out_pose_disabled),
+        ],
+        prog_name="segment",
+    )
+    assert res_pose_disabled.exit_code == 0, res_pose_disabled.output
+
+    base_pose_disabled = np.asarray(Image.open(out_pose_disabled / f"{roi}+{codebook}" / "thumbnail_z000.png"))
+    overlay_pose_disabled = np.asarray(Image.open(out_pose_disabled / f"{roi}+{codebook}" / "thumbnail_mask_z000.png"))
+    assert np.array_equal(base_pose_disabled, base_no_pose)
+    assert np.array_equal(overlay_pose_disabled, overlay_no_pose)
 
 
 def test_segment_thumbnail_percentiles_cache_is_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

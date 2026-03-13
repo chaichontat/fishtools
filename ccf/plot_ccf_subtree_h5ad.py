@@ -86,7 +86,10 @@ def _mask_inside_fraction(coords_xy: np.ndarray, mask_yx: np.ndarray) -> float:
     type=click.Path(exists=True, dir_okay=False, readable=True, resolve_path=True, path_type=Path),
     default=None,
     show_default=False,
-    help="Optional metrics JSON from ccf/ants_warp_h5ad_spatial.py (used to locate atlas image + brain mask).",
+    help=(
+        "Optional metrics JSON from ccf-warp-h5ad-spatial "
+        "(<output_h5ad>.metrics.json; used to locate atlas image + brain mask)."
+    ),
 )
 @click.option(
     "--fixed-nifti",

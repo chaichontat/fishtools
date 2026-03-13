@@ -1333,6 +1333,12 @@ def extract_single_command(
     help="Z range as start:end (e.g., 0:50). Empty start/end is allowed (e.g., :50, 10:).",
 )
 @click.option(
+    "--zs",
+    "zs_spec",
+    default=None,
+    help="Comma-separated 0-based Z indices to render (overrides --z-stride/--z-range). Example: --zs 0,5,10",
+)
+@click.option(
     "--downsample",
     type=click.IntRange(min=1),
     default=None,
@@ -1370,6 +1376,19 @@ def extract_single_command(
     show_default=True,
     help="Boundary RGB triplet like '0,255,0' (only used when --seg-codebook is set).",
 )
+@click.option(
+    "--spots",
+    "spots_codebook",
+    default=None,
+    metavar="CODEBOOK",
+    help="Overlay detected spots from analysis/output/parquets (ROI+CODEBOOK parquet) on thumbnails.",
+)
+@click.option(
+    "--ccf-rotate/--no-ccf-rotate",
+    default=True,
+    show_default=True,
+    help="Rotate/flip thumbnails using CCF transforms when available.",
+)
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def thumbnail_command(
     path: Path,
@@ -1378,6 +1397,7 @@ def thumbnail_command(
     segmentation_name: str,
     z_stride: int | None,
     z_range: str | None,
+    zs_spec: str | None,
     downsample: int | None,
     channels: str | None,
     thumbnail_options: Path | None,
@@ -1385,6 +1405,8 @@ def thumbnail_command(
     codebook: str,
     include_n4: bool,
     boundary_color: str,
+    spots_codebook: str | None,
+    ccf_rotate: bool,
 ) -> None:
     """Generate RGB PNG thumbnails from stitched fused.zarr volumes."""
     import numpy as np
@@ -1441,10 +1463,51 @@ def thumbnail_command(
         if not mask_path.exists():
             raise click.ClickException(f"ROI '{roi}': segmentation zarr not found at {mask_path}")
 
-    try:
-        pose = _try_read_thumbnail_pose(ws, roi, LandmarkRegistrationOutputs=LandmarkRegistrationOutputs)
-    except (OSError, ValueError) as exc:
-        raise click.ClickException(f"Failed to read CCF pose transform for ROI '{roi}': {exc}") from exc
+    spots_parquet_path: Path | None = None
+    if spots_codebook is not None:
+        spots_parquet_path = ws.spots_parquet(roi, spots_codebook, must_exist=True)
+
+    pose: tuple[float, bool] | None = None
+    if ccf_rotate:
+        try:
+            pose = _try_read_thumbnail_pose(ws, roi, LandmarkRegistrationOutputs=LandmarkRegistrationOutputs)
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"Failed to read CCF pose transform for ROI '{roi}': {exc}") from exc
+
+    def _spot_marker_radius(*, n_spots: int, xy_downsample: int) -> int:
+        # Inspired by `spots plotall` scatter sizing: bigger markers for sparse plots,
+        # but capped so dense plots don't turn into solid blobs.
+        xy = max(1, int(xy_downsample))
+        n = max(1, int(n_spots))
+        r_res = int(np.ceil(2.0 / float(np.sqrt(xy))))
+        r_den = int(np.ceil(float(np.sqrt(200.0 / float(n)))))
+        return int(np.clip(max(r_res, r_den), 1, 3))
+
+    def _overlay_spots_rgb(rgb: np.ndarray, *, rows: np.ndarray, cols: np.ndarray, radius: int) -> None:
+        color = np.asarray([255, 0, 0], dtype=np.uint8)
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError(f"Expected RGB image shaped (Y,X,3), got shape={rgb.shape}")
+
+        in_bounds = (rows >= 0) & (cols >= 0) & (rows < int(rgb.shape[0])) & (cols < int(rgb.shape[1]))
+        if not np.any(in_bounds):
+            return
+        rows = rows[in_bounds]
+        cols = cols[in_bounds]
+
+        r = max(1, int(radius))
+        for dy in range(-r, r + 1):
+            rr = rows + dy
+            in_y = (rr >= 0) & (rr < int(rgb.shape[0]))
+            if not np.any(in_y):
+                continue
+            rr = rr[in_y]
+            cc0 = cols[in_y]
+            for dx in range(-r, r + 1):
+                cc = cc0 + dx
+                in_x = (cc >= 0) & (cc < int(rgb.shape[1]))
+                if not np.any(in_x):
+                    continue
+                rgb[rr[in_x], cc[in_x]] = color
 
     def _process_zarr(*, zarr_path: Path, prefix: str) -> None:
         if not zarr_path.exists():
@@ -1464,7 +1527,7 @@ def thumbnail_command(
         zs, _, _, cs = z_array.shape
         channel_names = _read_channel_names_from_zarr_array(z_array)
         selected_channels = _resolve_thumbnail_channels(
-            channels_spec=channels_spec, channel_names=channel_names, channmel_count=int(cs)
+            channels_spec=channels_spec, channel_names=channel_names, channel_count=int(cs)
         )
         preview_c = len(selected_channels)
         if preview_c <= 0:
@@ -1490,6 +1553,24 @@ def thumbnail_command(
                     f"ROI '{roi}': XY mismatch between {zarr_path} (YX={z_array.shape[1:3]}) and "
                     f"{mask_path} (YX={mask_arr.shape[1:3]})."
                 )
+
+        if zs_spec is not None:
+            z_indices = _parse_thumbnail_zs(zs_spec, zs=int(zs))
+            if not z_indices:
+                logger.warning(f"Skipping ROI '{roi}': --zs resolved to no Z-planes.")
+                return
+        else:
+            start = z_start if z_start is not None else 0
+            end = z_end if z_end is not None else zs
+            start = max(0, start)
+            end = min(zs, end)
+            if start >= end:
+                logger.warning(f"Skipping ROI '{roi}': no Z-planes to process in range [{start}, {end}).")
+                return
+            z_indices = list(range(start, end, thumb_options.z_stride))
+            if not z_indices:
+                logger.warning(f"Skipping ROI '{roi}': no Z-planes to process in range [{start}, {end}).")
+                return
 
         low, high = (1.0, 99.9)
         if thumb_options.percentiles is not None:
@@ -1562,18 +1643,59 @@ def thumbnail_command(
 
         lowhigh = np.stack([lowhigh_by_channel[ch_idx] for ch_idx in selected_channels], axis=0).astype(np.float64)
 
-        start = z_start if z_start is not None else 0
-        end = z_end if z_end is not None else zs
-        start = max(0, start)
-        end = min(zs, end)
-        if start >= end:
-            logger.warning(f"Skipping ROI '{roi}': no Z-planes to process in range [{start}, {end}).")
-            return
+        spots_xy_by_z: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        if spots_parquet_path is not None:
+            import polars as pl
 
-        z_indices = list(range(start, end, thumb_options.z_stride))
-        if not z_indices:
-            logger.warning(f"Skipping ROI '{roi}': no Z-planes to process in range [{start}, {end}).")
-            return
+            try:
+                tileconfig = ws.tileconfig(roi)
+            except FileNotFoundError as exc:
+                raise click.ClickException(
+                    f"ROI '{roi}': TileConfiguration.registered.txt is required for --spots overlay ({exc})."
+                ) from exc
+
+            schema = pl.scan_parquet(spots_parquet_path).collect_schema()
+            if "y" in schema and "x" in schema:
+                x_col = "x"
+                y_col = "y"
+            elif "y_" in schema and "x_" in schema:
+                x_col = "x_"
+                y_col = "y_"
+            else:
+                raise click.ClickException(
+                    f"Spots parquet {spots_parquet_path} for ROI '{roi}' is missing required coordinates (x/y or x_/y_)."
+                )
+            if "z" not in schema:
+                raise click.ClickException(f"Spots parquet {spots_parquet_path} for ROI '{roi}' is missing column 'z'.")
+
+            tc_ds = tileconfig.downsample(int(thumb_options.xy_downsample))
+            x_offset = float(tc_ds.df["x"].min())
+            y_offset = float(tc_ds.df["y"].min())
+
+            zs_needed = sorted(set(z_indices))
+            z_min = float(zs_needed[0]) - 0.5
+            z_max = float(zs_needed[-1]) + 0.5
+            df = (
+                pl.scan_parquet(spots_parquet_path)
+                .select(
+                    x=pl.col(x_col).cast(pl.Float64),
+                    y=pl.col(y_col).cast(pl.Float64),
+                    z=pl.col("z").cast(pl.Float64),
+                )
+                .filter(pl.col("z").is_between(z_min, z_max, closed="both"))
+                .with_columns(z_idx=(pl.col("z") + 0.5).floor().cast(pl.Int64))
+                .filter(pl.col("z_idx").is_in(zs_needed))
+                .collect()
+            )
+
+            if df.height:
+                for z_idx, df_z in df.partition_by("z_idx", as_dict=True).items():
+                    z_key = int(z_idx[0]) if isinstance(z_idx, tuple) else int(z_idx)
+                    x = df_z.get_column("x").to_numpy() / float(thumb_options.xy_downsample) - x_offset
+                    y = df_z.get_column("y").to_numpy() / float(thumb_options.xy_downsample) - y_offset
+                    cols = np.floor(x + 0.5).astype(np.int64)
+                    rows = np.floor(y + 0.5).astype(np.int64)
+                    spots_xy_by_z[z_key] = (rows, cols)
 
         thumbnail_dir.mkdir(parents=True, exist_ok=True)
         from PIL import Image
@@ -1588,7 +1710,16 @@ def thumbnail_command(
                 thumbnail_data = z_array[i, :, :, selected_channels]
                 base_raw = thumbnail_rgb(thumbnail_data, options=thumb_options, lowhigh=lowhigh)
 
-                base = _apply_thumbnail_pose(base_raw, pose=pose, ndimage_rotate=ndimage_rotate) if pose else base_raw
+                base_to_save = base_raw
+                spots_xy = spots_xy_by_z.get(i)
+                if spots_xy is not None:
+                    rows, cols = spots_xy
+                    if rows.size and cols.size:
+                        radius = _spot_marker_radius(n_spots=int(rows.size), xy_downsample=int(thumb_options.xy_downsample))
+                        base_to_save = base_raw.copy()
+                        _overlay_spots_rgb(base_to_save, rows=rows, cols=cols, radius=radius)
+
+                base = _apply_thumbnail_pose(base_to_save, pose=pose, ndimage_rotate=ndimage_rotate) if pose else base_to_save
                 Image.fromarray(base, mode="RGB").save(thumbnail_path)
                 logger.debug(f"Saved thumbnail for Z-plane {i} to {thumbnail_path}")
 
@@ -1597,6 +1728,14 @@ def thumbnail_command(
                     boundaries = find_boundaries(mask_slice, mode="outer")
                     overlay_raw = base_raw.copy()
                     overlay_raw[boundaries] = boundary_rgb
+                    if spots_xy is not None:
+                        rows, cols = spots_xy
+                        if rows.size and cols.size:
+                            radius = _spot_marker_radius(
+                                n_spots=int(rows.size),
+                                xy_downsample=int(thumb_options.xy_downsample),
+                            )
+                            _overlay_spots_rgb(overlay_raw, rows=rows, cols=cols, radius=radius)
                     overlay = (
                         _apply_thumbnail_pose(overlay_raw, pose=pose, ndimage_rotate=ndimage_rotate) if pose else overlay_raw
                     )
@@ -1625,6 +1764,37 @@ def _parse_rgb_triplet(val: str) -> tuple[int, int, int]:
         if x < 0 or x > 255:
             raise click.BadParameter("--boundary-color values must be in [0, 255].")
     return (r, g, b)
+
+
+def _parse_thumbnail_zs(val: str, *, zs: int) -> list[int]:
+    if zs <= 0:
+        raise click.ClickException("Invalid --zs: Z dimension must be positive.")
+
+    raw = val.strip()
+    if not raw:
+        raise click.ClickException("Invalid --zs: must not be empty.")
+
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        raise click.ClickException("Invalid --zs: must not be empty.")
+
+    seen: set[int] = set()
+    out: list[int] = []
+    for part in parts:
+        try:
+            idx = int(part)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid --zs: z index {part!r} is not an integer.") from exc
+        if idx < 0:
+            raise click.ClickException("Invalid --zs: indices must be >= 0.")
+        if idx >= zs:
+            raise click.ClickException(f"Invalid --zs: index {idx} out of range for Z={zs}.")
+        if idx in seen:
+            continue
+        seen.add(idx)
+        out.append(idx)
+
+    return out
 
 
 def _normalize_channel_names(names: object) -> list[str] | None:

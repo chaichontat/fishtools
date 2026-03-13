@@ -15,6 +15,9 @@ import csv
 import os
 from pathlib import Path
 
+import matplotlib
+matplotlib.rcParams.update(matplotlib.rcParamsDefault)
+
 import matplotlib.pyplot as plt
 import numpy as np
 from IPython import get_ipython

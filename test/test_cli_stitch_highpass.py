@@ -52,10 +52,6 @@ def test_stitch_highpass_writes_fused_highpassed_uint16(tmp_path: Path) -> None:
             "2",
             "--anisotropy",
             "2",
-            "--perc-lo",
-            "1",
-            "--perc-hi",
-            "99.999",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -67,7 +63,13 @@ def test_stitch_highpass_writes_fused_highpassed_uint16(tmp_path: Path) -> None:
     assert out.dtype == np.uint16
     assert out.attrs["axes"] == "ZYXC"
     assert "highpass" in out.attrs
-    assert float(out.attrs["highpass"]["quantization"]["percentile_lo"]) == 1.0
-    assert float(out.attrs["highpass"]["quantization"]["percentile_hi"]) == 99.999
+    assert out.attrs["highpass"]["quantization"]["mode"] == "round_uint16"
+    assert out.attrs["highpass"]["quantization"]["clamp"] == [0, 65535]
     assert int(out[:].max()) > 0
+    assert int(out[0, 16, 16, 0]) > 10_000
+    assert int(out[1, 10, 22, 1]) > 10_000
+
+    # The background is smooth; interior (away from edges) should mostly be near zero after high-pass.
+    interior = np.asarray(out[:, 8:-8, 8:-8, :], dtype=np.uint16)
+    assert int(np.quantile(interior, 0.99)) < 500
     assert (stitch_dir / "thumbnails" / "thumbnail_highpass_z000.png").exists()

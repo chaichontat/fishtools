@@ -898,12 +898,11 @@ Let `primary_cb` be the first `--codebook` provided and
 
 - If a single ROI is selected:
 
-  - Inside the segmentation Zarr directory:
+  - In `ws.output`:
 
     ```text
-    <workspace>/analysis/deconv/stitch--{roi}+{seg_cb}/{segmentation_name}/
-      polygons+{cb_token}.parquet
-      {cb_token}.h5ad
+    <workspace>/analysis/output/polygons+{roi}+{cb_token}+{seg_stem}.parquet
+    <workspace>/analysis/output/h5ads/{roi}.h5ad
     ```
 
   - `polygons+{cb_token}.parquet`:
@@ -917,14 +916,7 @@ Let `primary_cb` be the first `--codebook` provided and
       - `obsm["spatial"]`: XY coordinates (for spatial plotting).
       - QC metrics and filtered genes/cells.
 
-- If multiple ROIs:
-
-  - In `ws.output`:
-
-    ```text
-    <workspace>/analysis/output/polygons+{cb_token}+{seg_stem}.parquet
-    <workspace>/analysis/output/all+{cb_token}+{seg_stem}.h5ad
-    ```
+- If multiple ROIs, the command writes one `.h5ad` (and one per-cell parquet) per ROI under the same directories above.
 
 **Integration**
 

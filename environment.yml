@@ -10,18 +10,20 @@ dependencies:
   - bowtie2
   - click
   - colorama
-  - cupy
   - htslib
   - imagecodecs
   - kmer-jellyfish
   - levenshtein
   - loguru
   - matplotlib
-  - numpy<2
+  - numpy
   - opencv
   - pandas
   - pip
   - pip:
+      - --pre
+      - -f https://pip.cupy.dev/pre
+      - cupy-cuda12x>=14.0.0a1
       - basicpy
       - biopython
       - cmocean

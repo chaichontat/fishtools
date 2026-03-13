@@ -64,6 +64,7 @@ class CCFStatus:
     imagej_roi: StageStatus = field(default_factory=StageStatus)
     warp_h5ad: StageStatus = field(default_factory=StageStatus)
     filter_h5ad: StageStatus = field(default_factory=StageStatus)
+    princurve_h5ad: StageStatus = field(default_factory=StageStatus)
 
 
 _TILE_TIF_RE = re.compile(r".+-\d{4}\.tif$")
@@ -515,6 +516,14 @@ def check_ccf_filter_h5ad(ws: Workspace, roi: str, run_dirname: str) -> StageSta
     return StageStatus(complete=True, count=len(annotated), last_modified=_last_modified(annotated))
 
 
+def check_ccf_princurve_h5ad(ws: Workspace, roi: str) -> StageStatus:
+    root = ws.ccf_transforms(roi)
+    princurve = list(root.glob("*.princurve.h5ad"))
+    if not princurve:
+        return StageStatus()
+    return StageStatus(complete=True, count=len(princurve), last_modified=_last_modified(princurve))
+
+
 def mark_stale_stages(status: ROIStatus) -> None:
     # Dependency graph:
     # raw → deconv → register → stitch_register → stitch_fuse → stitch_combine → n4 → segment → postproc
@@ -556,6 +565,7 @@ def mark_stale_ccf(status: CCFStatus) -> None:
         (status.imagej_roi, [status.tileconfig]),
         (status.warp_h5ad, [status.h5ad, status.ants]),
         (status.filter_h5ad, [status.warp_h5ad, status.imagej_roi]),
+        (status.princurve_h5ad, [status.filter_h5ad]),
     ]
 
     for stage, upstreams in dependencies:
@@ -602,6 +612,7 @@ def get_ccf_status(ws: Workspace, roi: str, run_dirname: str) -> CCFStatus:
         imagej_roi=check_ccf_imagej_roi(ws, roi, run_dirname),
         warp_h5ad=check_ccf_warp_h5ad(ws, roi),
         filter_h5ad=check_ccf_filter_h5ad(ws, roi, run_dirname),
+        princurve_h5ad=check_ccf_princurve_h5ad(ws, roi),
     )
     mark_stale_ccf(status)
     return status
@@ -683,6 +694,7 @@ def render_ccf_table(ws: Workspace, rois: list[str], *, run_dirname: str, verbos
     table.add_column("ImageJ", justify="center")
     table.add_column("Warp", justify="center")
     table.add_column("Filter", justify="center")
+    table.add_column("Princurve", justify="center")
 
     for roi in rois:
         status = get_ccf_status(ws, roi, run_dirname)
@@ -695,6 +707,7 @@ def render_ccf_table(ws: Workspace, rois: list[str], *, run_dirname: str, verbos
             status.imagej_roi.to_cell(verbose),
             status.warp_h5ad.to_cell(verbose),
             status.filter_h5ad.to_cell(verbose),
+            status.princurve_h5ad.to_cell(verbose),
         )
 
     return table
@@ -748,6 +761,7 @@ def ccf_status_to_dict(ws: Workspace, rois: list[str], *, run_dirname: str) -> d
             "imagej_roi": _stage_dict(status.imagej_roi),
             "warp_h5ad": _stage_dict(status.warp_h5ad),
             "filter_h5ad": _stage_dict(status.filter_h5ad),
+            "princurve_h5ad": _stage_dict(status.princurve_h5ad),
         }
     result["rois"] = rois_payload
     return result

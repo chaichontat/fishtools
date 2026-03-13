@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import anndata as ad
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.sparse as sp
@@ -23,15 +24,16 @@ from matplotlib.widgets import Button
 from fishtools.ccf.princurve import fit_anchor_curve, project_to_polyline_arclength
 from fishtools.io.workspace import Workspace
 
+matplotlib.rcdefaults()
 # Use widget backend for VS Code interactive mode
 ip = get_ipython()
 if ip is not None:
     ip.run_line_magic("matplotlib", "widget")
 
 folders = sorted(Path("/working").expanduser().glob("2025*Jax*"))
-FOLDER = [f for f in folders if f.name.startswith("20251201")][0]
+FOLDER = [f for f in folders if f.name.startswith("20251225")][0]
 print(FOLDER)
-j = 9
+j = 0
 # %% [markdown]
 # ## Config (EDIT THESE)
 
@@ -64,17 +66,9 @@ for roi_name, files in roi_to_annotated.items():
             continue
 
         stem = h5ad.stem
-        if len(subrois) == 1:
-            subroi = str(subrois[0])
-            ok = (h5ad.parent / f"{stem}.anchors.json").exists() or (
-                h5ad.parent / f"{stem}.{subroi}.anchors.json"
-            ).exists()
-            if not ok:
-                missing_subrois_by_roi.setdefault(roi_name, set()).add(subroi)
-        else:
-            for subroi in subrois:
-                if not (h5ad.parent / f"{stem}.{subroi}.anchors.json").exists():
-                    missing_subrois_by_roi.setdefault(roi_name, set()).add(str(subroi))
+        for subroi in subrois:
+            if not (h5ad.parent / f"{stem}.{subroi}.anchors.json").exists():
+                missing_subrois_by_roi.setdefault(roi_name, set()).add(str(subroi))
 
 print(
     "ROIs with .annotated.h5ad but missing curve anchors (by subROI):",
@@ -99,7 +93,11 @@ SUBSET_OBS_VALUE: str | None = None  # e.g. "cortex"
 OUTDIR = INPUT_H5AD.parent
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
-OUT_JSON = OUTDIR / f"{INPUT_H5AD.stem}.anchors.json"
+def anchors_json_path(*, subroi: str) -> Path:
+    subroi_clean = str(subroi).strip()
+    if subroi_clean == "":
+        raise ValueError("subroi must be non-empty for anchors JSON path.")
+    return OUTDIR / f"{INPUT_H5AD.stem}.{subroi_clean}.anchors.json"
 
 # If the input contains multiple ROI values in `ROI_OBS_KEY`, run the click UI once per value.
 ROI_OBS_KEY = "ccf_adjusted"
@@ -131,6 +129,12 @@ REVIEW_CURVE_N_DENSE = 5_000
 REVIEW_ANCHOR_SMOOTHING = 0.5
 REVIEW_PLOT_MAX_POINTS = 100_000
 REVIEW_R_SIGN_ENDPOINT_EXTRAPOLATION = 0.25
+SHOW_LUT_CONTINUITY_WARNINGS = True
+LUT_QC_REPORT_PATH = Path(
+    "/home/chaichontat/fishtools2/ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d/lut_discontinuity_qc.json"
+)
+LUT_WARN_JUMP_THR = 0.2
+LUT_WARN_N_JUMPS = 2
 
 if not INPUT_H5AD.exists():
     raise FileNotFoundError(INPUT_H5AD)
@@ -554,7 +558,9 @@ def pick_anchors(
 
 jobs: list[tuple[str | None, ad.AnnData, Path]] = []
 if SUBSET_OBS_KEY is not None:
-    jobs = [(None, adata, OUT_JSON)]
+    assert SUBSET_OBS_VALUE is not None
+    subroi = str(SUBSET_OBS_VALUE).strip()
+    jobs = [(subroi, adata, anchors_json_path(subroi=subroi))]
 elif ROI_OBS_KEY in adata.obs.columns:
     roi_series = adata.obs[ROI_OBS_KEY].astype(str)
     roi_unique = [
@@ -562,13 +568,12 @@ elif ROI_OBS_KEY in adata.obs.columns:
     ]
     roi_present = sorted(roi_unique) if ROI_VALUES is None else [roi for roi in ROI_VALUES if roi in set(roi_unique)]
     if roi_present:
-        multi = len(roi_present) > 1
         for roi in roi_present:
-            out_json = OUTDIR / f"{INPUT_H5AD.stem}.{roi}.anchors.json" if multi else OUT_JSON
+            out_json = anchors_json_path(subroi=roi)
             jobs.append((roi, adata[roi_series == roi].copy(), out_json))
 
 if not jobs:
-    jobs = [(None, adata, OUT_JSON)]
+    jobs = [("all", adata, anchors_json_path(subroi="all"))]
 
 print("Loaded:")
 print("  n_obs:", adata.n_obs)
@@ -633,6 +638,52 @@ def _extract_anchor_ids_from_payload(payload: dict[str, object]) -> list[str]:
         if isinstance(cid, str) and cid != "":
             out2.append(cid)
     return out2
+
+
+def _extract_lut_row_qc_for_input(payload: dict[str, object]) -> dict[str, object] | None:
+    if not SHOW_LUT_CONTINUITY_WARNINGS:
+        return None
+    report_path = Path(LUT_QC_REPORT_PATH)
+    if not report_path.exists():
+        return None
+    input_h5ad = payload.get("input_h5ad")
+    if not isinstance(input_h5ad, str) or input_h5ad.strip() == "":
+        return None
+    p1_path = Path(input_h5ad).with_name("p1_landmarks.json")
+    if not p1_path.exists():
+        return None
+    try:
+        p1 = json.loads(p1_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    axis = str(p1.get("atlas_plane", "")).strip().lower()
+    if axis not in {"coronal", "sagittal"}:
+        return None
+    try:
+        atlas_slice_idx = int(p1["atlas_slice_idx"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    try:
+        qc = json.loads(report_path.read_text())
+    except json.JSONDecodeError:
+        return None
+    maps = qc.get("maps")
+    if not isinstance(maps, dict):
+        return None
+    map_key = "coronal_to_sagittal" if axis == "coronal" else "sagittal_to_coronal"
+    rows_obj = maps.get(map_key, {})
+    if not isinstance(rows_obj, dict):
+        return None
+    rows = rows_obj.get("rows")
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if int(row.get("source_slice", -1)) == atlas_slice_idx:
+            return row
+    return None
 
 
 def review_signed_r_plot(
@@ -712,6 +763,34 @@ def review_signed_r_plot(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_aspect("equal")
+
+    lut_row = _extract_lut_row_qc_for_input(payload)
+    if isinstance(lut_row, dict):
+        after = lut_row.get("after")
+        if isinstance(after, dict):
+            max_abs_dt = float(after.get("max_abs_dt", float("nan")))
+            n_jump_ge_0p2 = int(after.get("n_jump_ge_0p2", 0))
+            status = "WARN" if (
+                np.isfinite(max_abs_dt)
+                and max_abs_dt >= float(LUT_WARN_JUMP_THR)
+                and n_jump_ge_0p2 >= int(LUT_WARN_N_JUMPS)
+            ) else "OK"
+            txt = (
+                f"LUT continuity: {status}\n"
+                f"max|dt|={max_abs_dt:.3f}\n"
+                f"n(|dt|>=0.2)={n_jump_ge_0p2}"
+            )
+            ax.text(
+                0.01,
+                0.99,
+                txt,
+                transform=ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=9,
+                bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "black", "linewidth": 0.5},
+            )
+
     fig.colorbar(sc, ax=ax, label="signed r")
     print(f"Rendered signed-r review plot (reverse_r_sign={reverse_r_sign}).")
     plt.show()

@@ -228,8 +228,12 @@ def filter_leiden(adata: ad.AnnData, keep: Sequence[int | str]) -> ad.AnnData:
     return adata[adata.obs["leiden"].isin(keep)]
 
 
-def run_tricycle(adata: ad.AnnData, trc: pd.DataFrame) -> ad.AnnData:
-    """Project AnnData onto tricycle cell-cycle embeddings."""
+def run_tricycle(adata: ad.AnnData, trc: pd.DataFrame, *, batch_key: str | None = None, layer: str | None = None) -> ad.AnnData:
+    """Project AnnData onto tricycle cell-cycle embeddings.
+
+    If ``batch_key`` is provided, gene-wise mean centering is performed within
+    each batch in ``adata.obs[batch_key]`` before projection.
+    """
 
     import scipy.sparse as sp
 
@@ -242,14 +246,31 @@ def run_tricycle(adata: ad.AnnData, trc: pd.DataFrame) -> ad.AnnData:
         .reindex(shared)
         .reset_index()[["pc1.rot", "pc2.rot"]]
     )
-    x = adata[:, shared].X
+    if layer is not None:
+        x = adata[:, shared].layers[layer]
+    else:
+        x = adata[:, shared].X
+
     if sp.issparse(x):
         x = x.toarray()
     else:
         x = np.asarray(x)
 
     x = x.astype(np.float32, copy=False)
-    x_centered = x - np.mean(x, axis=0, keepdims=True)
+    if batch_key is None:
+        x_centered = x - np.mean(x, axis=0, keepdims=True)
+    else:
+        if batch_key not in adata.obs.columns:
+            raise KeyError(f"obs.{batch_key} not found")
+        batch = adata.obs[batch_key]
+        if batch.isna().any():
+            raise ValueError(f"obs.{batch_key} contains missing values")
+        batch_values = batch.astype(str).to_numpy()
+        x_centered = np.empty_like(x)
+        for value in np.unique(batch_values):
+            sel = batch_values == value
+            x_sel = x[sel]
+            x_centered[sel] = x_sel - np.mean(x_sel, axis=0, keepdims=True)
     pls = x_centered @ loadings.to_numpy(dtype=np.float32)
 
     adata.obsm["tricycle"] = pls

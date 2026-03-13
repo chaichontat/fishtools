@@ -63,8 +63,10 @@ fishtools = "fishtools.cli:main"
 mkprobes = "fishtools.mkprobes.cli:main"
 preprocess = "fishtools.preprocess.cli:main"
 segment = "fishtools.segment:main"
-qserver = "fishtools.queuing.server:main"
-qclient = "fishtools.queuing.client:main"
+ccf = "fishtools.ccf.cli:main"
+ccf-warp-h5ad-spatial = "fishtools.ccf.cli_warp_h5ad_spatial:main"
+ccf-filter-h5ad-ccf = "fishtools.ccf.cli_filter_h5ad_ccf:main"
+ccf-export-mask-edit-pack = "fishtools.ccf.cli_export_mask_edit_pack:main"
 bigrun3 = "fishtools.orchestrator.bigrun3:cli"
 trt-build = "cellpose.contrib.cellposetrt.trt_build:main"
 slurmdash = "fishtools.slurm_dashboard:main"
@@ -111,6 +113,7 @@ src_paths = ["fishtools"]
 
 [tool.pytest.ini_options]
 # addopts = "--cov=fishtools --cov-report=html --cov-report=xml"
+testpaths = ["test", "fishtools"]
 log_cli = true
 # log_cli_level = "DEBUG"
 minversion = "7.0"

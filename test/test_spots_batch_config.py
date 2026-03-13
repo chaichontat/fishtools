@@ -48,6 +48,7 @@ def test_spots_batch_forwards_config_to_run(monkeypatch: pytest.MonkeyPatch, tmp
         stagger=0.0,
         stagger_jitter=0.0,
         field_correct=False,
+        norm_field_correction=None,
     )
 
     assert len(calls) == 1
@@ -55,6 +56,61 @@ def test_spots_batch_forwards_config_to_run(monkeypatch: pytest.MonkeyPatch, tmp
     assert isinstance(args, list)
     assert "--config" in args
     assert cfg.as_posix() in args
+
+
+def test_spots_batch_forwards_norm_field_correction(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "workspace.DONE").write_text("ok\n", encoding="utf-8")
+    reg_dir = tmp_path / "analysis/deconv/registered--roiA+cb"
+    reg_dir.mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(reg_dir / "reg-0000.tif", np.zeros((1, 1, 4, 4), dtype=np.uint16))
+
+    cb = tmp_path / "cb.json"
+    cb.write_text("{}", encoding="utf-8")
+
+    cfg = tmp_path / "project.json"
+    cfg.write_text("{}", encoding="utf-8")
+
+    # Minimal stand-in for decoded_norm_field_correction output directory.
+    correction_dir = tmp_path / "norm_field"
+    correction_dir.mkdir()
+    (correction_dir / "run_config.json").write_text(
+        json.dumps({"tile_geom": {"full_w": 4, "full_h": 4}, "grid_w": 2, "grid_h": 2}),
+        encoding="utf-8",
+    )
+    tifffile.imwrite(correction_dir / "gain.tif", np.ones((2, 2), dtype=np.float32))
+
+    calls: list[dict[str, object]] = []
+
+    def fake_batch(paths: list[Path], mode: str, args: list[str], **kwargs: object) -> None:
+        calls.append({"paths": paths, "mode": mode, "args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(align_prod, "_batch", fake_batch)
+
+    align_prod.batch.callback(
+        path=tmp_path,
+        roi="roiA",
+        codebook_path=cb,
+        threads=1,
+        overwrite=False,
+        overwrite_stale=False,
+        simple=False,
+        split=False,
+        since=None,
+        delete_corrupted=False,
+        local_opt=False,
+        blank=None,
+        json_config=cfg,
+        stagger=0.0,
+        stagger_jitter=0.0,
+        field_correct=False,
+        norm_field_correction=correction_dir,
+    )
+
+    assert len(calls) == 1
+    args = calls[0]["args"]
+    assert isinstance(args, list)
+    assert "--norm-field-correction" in args
+    assert correction_dir.as_posix() in args
 
 
 def test_spots_run_uses_spot_decode_from_config(tmp_path: Path) -> None:

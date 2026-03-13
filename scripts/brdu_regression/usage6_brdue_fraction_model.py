@@ -33,6 +33,14 @@ def _animal_from_dataset(dataset: str) -> str:
     return s[0].upper() + s[1:]
 
 
+def _normalize_animal_label(animal: str) -> str:
+    m = re.fullmatch(r"\s*(jaxa\d+)\s*", str(animal), flags=re.IGNORECASE)
+    if m is None:
+        raise ValueError(f"Invalid animal label {animal!r}; expected values like 'JaxA2'.")
+    s = m.group(1)
+    return s[0].upper() + s[1:]
+
+
 def _stable_hash_u64(dataset: np.ndarray, obs_name: np.ndarray) -> np.ndarray:
     ds = dataset.astype(str)
     on = obs_name.astype(str)
@@ -41,6 +49,158 @@ def _stable_hash_u64(dataset: np.ndarray, obs_name: np.ndarray) -> np.ndarray:
         copy=False,
     )
     return pd.util.hash_pandas_object(s, index=False).to_numpy(np.uint64, copy=False)
+
+
+def _load_threshold_map_from_uns(
+    *,
+    uns: dict[str, object],
+    uns_key: str = "brdu_edu_thresholds_by_dataset_roi_ccf_adjusted",
+) -> dict[tuple[str, str, str], tuple[float, float]]:
+    raw = uns.get(str(uns_key))
+    if raw is None:
+        raise KeyError(f"Missing adata.uns[{uns_key!r}] with per-unit thresholds.")
+    if not isinstance(raw, dict):
+        raise ValueError(f"adata.uns[{uns_key!r}] must be a nested dict.")
+
+    out: dict[tuple[str, str, str], tuple[float, float]] = {}
+    for dataset, roi_map in raw.items():
+        if not isinstance(roi_map, dict):
+            raise ValueError(f"adata.uns[{uns_key!r}][{dataset!r}] must be a dict.")
+        for roi, ccf_map in roi_map.items():
+            if not isinstance(ccf_map, dict):
+                raise ValueError(f"adata.uns[{uns_key!r}][{dataset!r}][{roi!r}] must be a dict.")
+            for ccf, thr in ccf_map.items():
+                if not isinstance(thr, dict):
+                    raise ValueError(
+                        f"adata.uns[{uns_key!r}][{dataset!r}][{roi!r}][{ccf!r}] must be a dict."
+                    )
+                brdu_thr = thr.get("log_brdu_mean")
+                edu_thr = thr.get("log_edu_mean")
+                if brdu_thr is None or edu_thr is None:
+                    raise ValueError(
+                        f"Missing log_brdu_mean/log_edu_mean for "
+                        f"adata.uns[{uns_key!r}][{dataset!r}][{roi!r}][{ccf!r}]"
+                    )
+                b = float(brdu_thr)
+                e = float(edu_thr)
+                if not (math.isfinite(b) and math.isfinite(e)):
+                    raise ValueError(
+                        f"Non-finite threshold values for "
+                        f"adata.uns[{uns_key!r}][{dataset!r}][{roi!r}][{ccf!r}]"
+                    )
+                key = (str(dataset), str(roi), str(ccf))
+                if key in out:
+                    raise ValueError(f"Duplicate threshold key in uns map: {key}")
+                out[key] = (b, e)
+    return out
+
+
+def _load_threshold_delta_map_from_csv(
+    *,
+    path: pathlib.Path,
+) -> dict[tuple[str, str, str], tuple[float, float]]:
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    df = pd.read_csv(path)
+    df.columns = [str(c).lstrip("\ufeff").strip() for c in df.columns]
+    required = {"dataset", "roi", "ccf_adjusted", "delta_log_brdu", "delta_log_edu"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"{path} missing required columns: {sorted(missing)}")
+
+    dataset = df["dataset"].astype(str)
+    roi = df["roi"].astype(str)
+    ccf = df["ccf_adjusted"].astype(str)
+    d_b = pd.to_numeric(df["delta_log_brdu"], errors="raise").to_numpy(dtype=np.float64, copy=False)
+    d_e = pd.to_numeric(df["delta_log_edu"], errors="raise").to_numpy(dtype=np.float64, copy=False)
+    if np.any(~np.isfinite(d_b)) or np.any(~np.isfinite(d_e)):
+        raise ValueError(f"{path} contains non-finite delta_log_brdu/delta_log_edu values.")
+
+    out: dict[tuple[str, str, str], tuple[float, float]] = {}
+    for i, key in enumerate(zip(dataset.tolist(), roi.tolist(), ccf.tolist(), strict=True)):
+        if key in out:
+            raise ValueError(f"{path} contains duplicate threshold-delta key: {key}")
+        out[key] = (float(d_b[i]), float(d_e[i]))
+    return out
+
+
+def _soft_logistic_probabilities(
+    x: np.ndarray,
+    threshold: np.ndarray,
+    *,
+    span: float,
+    p_hi: float,
+) -> np.ndarray:
+    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    thr_arr = np.asarray(threshold, dtype=np.float64).reshape(-1)
+    if x_arr.shape != thr_arr.shape:
+        raise ValueError("x and threshold must have the same shape.")
+    if not np.all(np.isfinite(x_arr)) or not np.all(np.isfinite(thr_arr)):
+        raise ValueError("x and threshold must be finite.")
+    if not (0.5 < float(p_hi) < 1.0):
+        raise ValueError("p_hi must be in (0.5, 1.0).")
+    if not (float(span) > 0.0):
+        raise ValueError("span must be > 0.")
+    from scipy.special import expit
+
+    soft_k = math.log(float(p_hi) / (1.0 - float(p_hi))) / float(span)
+    return expit(soft_k * (x_arr - thr_arr)).astype(np.float64, copy=False)
+
+
+def _kish_effective_sample_size(weight_sum: np.ndarray, weight_sq_sum: np.ndarray) -> np.ndarray:
+    weight_sum_arr = np.asarray(weight_sum, dtype=np.float64)
+    weight_sq_sum_arr = np.asarray(weight_sq_sum, dtype=np.float64)
+    if weight_sum_arr.shape != weight_sq_sum_arr.shape:
+        raise ValueError("weight_sum and weight_sq_sum must have the same shape.")
+    if np.any(~np.isfinite(weight_sum_arr)) or np.any(~np.isfinite(weight_sq_sum_arr)):
+        raise ValueError("Kish effective sample size requires finite inputs.")
+    if np.any(weight_sum_arr < 0.0) or np.any(weight_sq_sum_arr < 0.0):
+        raise ValueError("Kish effective sample size requires non-negative inputs.")
+
+    out = np.full(weight_sum_arr.shape, np.nan, dtype=np.float64)
+    ok = (weight_sum_arr > 0.0) & (weight_sq_sum_arr > 0.0)
+    out[ok] = (weight_sum_arr[ok] ** 2) / weight_sq_sum_arr[ok]
+    bad = (weight_sum_arr > 0.0) & ~(weight_sq_sum_arr > 0.0)
+    if np.any(bad):
+        raise ValueError("Positive weight_sum requires positive weight_sq_sum.")
+    return out
+
+
+def _renormalize_usage_excluding(
+    usage: np.ndarray,
+    excluded: np.ndarray,
+    *,
+    excluded_cols: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    usage_arr = np.asarray(usage, dtype=np.float64).reshape(-1)
+    ex = np.asarray(excluded, dtype=np.float64)
+    if ex.ndim != 2:
+        raise ValueError("excluded must be a 2D array.")
+    if ex.shape[0] != usage_arr.shape[0]:
+        raise ValueError("usage and excluded must have the same number of rows.")
+    if ex.shape[1] != len(excluded_cols):
+        raise ValueError("excluded column count must match excluded_cols length.")
+    if np.any(~np.isfinite(usage_arr)) or np.any(~np.isfinite(ex)):
+        raise ValueError("Usage renormalization requires finite usage and excluded program values.")
+
+    denom = 1.0 - np.sum(ex, axis=1, dtype=np.float64)
+    bad = ~np.isfinite(denom) | (denom <= 0.0)
+    if np.any(bad):
+        idx = np.flatnonzero(bad)[:5]
+        preview = [
+            {
+                "row": int(i),
+                "usage": float(usage_arr[i]),
+                "denom": float(denom[i]) if np.isfinite(denom[i]) else float("nan"),
+                "excluded_sum": float(np.sum(ex[i, :], dtype=np.float64)),
+            }
+            for i in idx.tolist()
+        ]
+        raise ValueError(
+            "Usage renormalization denominator must be finite and > 0 for all rows. "
+            f"excluded_cols={excluded_cols!r} n_bad={int(np.sum(bad))}; first_bad_rows={preview}"
+        )
+    return (usage_arr / denom).astype(np.float64, copy=False), denom.astype(np.float64, copy=False)
 
 
 def _compute_tricycle_theta(adata, *, trc: pd.DataFrame, dataset: np.ndarray, row_idx: np.ndarray | None = None) -> np.ndarray:
@@ -359,7 +519,100 @@ def main() -> None:
         default=pathlib.Path("~/nvme/cnmf_all_progenitors/usage_norm.k9.dt0.1.parquet"),
     )
     ap.add_argument("--usage-col", type=str, default="Usage_6")
+    ap.add_argument(
+        "--usage-renorm-exclude-cols",
+        type=str,
+        nargs="*",
+        default=[],
+        help=(
+            "Optional program columns to exclude from denominator when using usage weights. "
+            "If set, usage becomes usage_col / (1 - sum(excluded_cols)) row-wise."
+        ),
+    )
+    ap.add_argument(
+        "--brdu-col",
+        type=str,
+        default="brdu_pos",
+        help="Column in adata.obs containing the BrdU binary call (0/1 or bool). Ignored if --brdu-threshold is set.",
+    )
+    ap.add_argument(
+        "--edu-col",
+        type=str,
+        default="edu_pos",
+        help="Column in adata.obs containing the EdU binary call (0/1 or bool). Ignored if --edu-threshold is set.",
+    )
+    ap.add_argument(
+        "--brdu-intensity-col",
+        type=str,
+        default="brdu_mean",
+        help="Column in adata.obs containing a BrdU intensity to threshold if --brdu-threshold is set.",
+    )
+    ap.add_argument(
+        "--edu-intensity-col",
+        type=str,
+        default="edu_mean",
+        help="Column in adata.obs containing an EdU intensity to threshold if --edu-threshold is set.",
+    )
+    ap.add_argument(
+        "--brdu-threshold",
+        type=float,
+        default=None,
+        help="If set, define BrdU+ as (obs[brdu_intensity_col] >= threshold) instead of using --brdu-col.",
+    )
+    ap.add_argument(
+        "--edu-threshold",
+        type=float,
+        default=None,
+        help="If set, define EdU+ as (obs[edu_intensity_col] >= threshold) instead of using --edu-col.",
+    )
+    ap.add_argument("--pulse-call-mode", type=str, choices=["hard", "soft_logistic"], default="hard")
+    ap.add_argument(
+        "--soft-log-brdu-col",
+        type=str,
+        default="log_brdu_mean",
+        help="BrdU log-intensity column used for soft logistic calls (soft mode only).",
+    )
+    ap.add_argument(
+        "--soft-log-edu-col",
+        type=str,
+        default="log_edu_mean",
+        help="EdU log-intensity column used for soft logistic calls (soft mode only).",
+    )
+    ap.add_argument(
+        "--soft-span",
+        type=float,
+        default=1.0,
+        help="Distance from threshold where p reaches soft-p-hi (and 1-soft-p-hi on the lower side).",
+    )
+    ap.add_argument(
+        "--soft-p-hi",
+        type=float,
+        default=0.99,
+        help="Target probability at threshold+soft-span in soft logistic mode.",
+    )
+    ap.add_argument(
+        "--soft-threshold-uns-key",
+        type=str,
+        default="brdu_edu_thresholds_by_dataset_roi_ccf_adjusted",
+        help="adata.uns key containing per-unit thresholds for soft logistic mode.",
+    )
+    ap.add_argument(
+        "--soft-threshold-delta-csv",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Optional CSV with columns dataset,roi,ccf_adjusted,delta_log_brdu,delta_log_edu; "
+            "applied as shifted thresholds thr'=thr+delta in soft logistic mode."
+        ),
+    )
     ap.add_argument("--include-leiden", type=str, nargs="+", default=["7", "8", "9", "10"])
+    ap.add_argument(
+        "--exclude-animals",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Optional animal IDs to exclude from analysis (e.g., JaxA2).",
+    )
     ap.add_argument(
         "--pool-leiden",
         action="store_true",
@@ -376,6 +629,11 @@ def main() -> None:
     ap.add_argument("--theta-bin-mode", type=str, choices=["quantile", "angle"], default="quantile")
     ap.add_argument("--theta-bins", type=int, default=12)
     ap.add_argument("--usage-bins", type=int, default=10)
+    ap.add_argument(
+        "--no-residualize-usage-theta",
+        action="store_true",
+        help="If set, do not residualize Usage against sin/cos(theta) before binning.",
+    )
     ap.add_argument("--outdir", type=pathlib.Path, required=True)
     args = ap.parse_args()
 
@@ -398,17 +656,51 @@ def main() -> None:
     log(f"PID={os.getpid()} writing logs to {outdir/'run.log'}")
     log(f"argv={shlex.join(sys.argv)}")
 
+    def _binary_call_from_obs(
+        *,
+        obs: pd.DataFrame,
+        mask: np.ndarray,
+        col: str,
+        intensity_col: str,
+        threshold: float | None,
+        name: str,
+    ) -> np.ndarray:
+        if threshold is None:
+            if col not in obs.columns:
+                raise ValueError(f"adata.obs missing required column for {name}: {col!r}")
+            s = obs.loc[mask, col]
+            if pd.api.types.is_bool_dtype(s):
+                if bool(pd.isna(s).any()):
+                    raise ValueError(f"{name} column {col!r} contains NA; expected a fully-defined binary call.")
+                return s.astype(bool).to_numpy(dtype=np.int8, copy=False)
+            x = pd.to_numeric(s, errors="raise").to_numpy(dtype=np.int64, copy=False)
+            u = np.unique(x)
+            if not np.all(np.isin(u, [0, 1])):
+                raise ValueError(f"{name} column {col!r} must be binary (0/1 or bool), got unique={u[:10]!r}")
+            return x.astype(np.int8, copy=False)
+
+        if intensity_col not in obs.columns:
+            raise ValueError(f"adata.obs missing required intensity column for {name}: {intensity_col!r}")
+        v = pd.to_numeric(obs.loc[mask, intensity_col], errors="raise").to_numpy(dtype=np.float64, copy=False)
+        if not np.all(np.isfinite(v)):
+            raise ValueError(f"{name} intensity column {intensity_col!r} contains non-finite values in analysis subset.")
+        return (v >= float(threshold)).astype(np.int8, copy=False)
+
     leiden_keep = {str(x) for x in args.include_leiden}
+    exclude_animals = {_normalize_animal_label(x) for x in args.exclude_animals if str(x).strip()}
     usage_col = str(args.usage_col).strip()
     if not usage_col:
         raise ValueError("Empty --usage-col")
+    usage_renorm_exclude_cols = [str(c).strip() for c in args.usage_renorm_exclude_cols if str(c).strip()]
+    if usage_col in usage_renorm_exclude_cols:
+        raise ValueError("--usage-renorm-exclude-cols must not include --usage-col itself.")
 
     log("Loading h5ad (backed='r')...")
     adata = ad.read_h5ad(args.h5ad.expanduser(), backed="r")
     obs = adata.obs
     if "dataset" not in obs.columns:
         raise ValueError("adata.obs must contain 'dataset'.")
-    for col in ["brdu_pos", "edu_pos", "leiden"]:
+    for col in ["leiden", "roi", "ccf_adjusted"]:
         if col not in obs.columns:
             raise ValueError(f"adata.obs missing required column: {col!r}")
 
@@ -417,28 +709,234 @@ def main() -> None:
     if not bool(np.any(m_lei)):
         raise ValueError(f"No cells found for leiden in {sorted(leiden_keep)}")
 
-    row_idx = np.flatnonzero(m_lei).astype(np.int64, copy=False)
+    # Exclude known-bad units (poor staining).
+    ds_all = obs["dataset"].astype(str)
+    roi_all = obs["roi"].astype(str)
+    m_excl_animal = np.zeros(obs.shape[0], dtype=bool)
+    if exclude_animals:
+        idx_lei = np.flatnonzero(m_lei)
+        ds_lei = ds_all.iloc[idx_lei].to_numpy(dtype=object, copy=False)
+        animals_lei = np.array([_animal_from_dataset(d) for d in ds_lei.tolist()], dtype=object)
+        present_animals = set(animals_lei.tolist())
+        missing_animals = sorted(exclude_animals - present_animals)
+        if missing_animals:
+            raise ValueError(
+                f"--exclude-animals contains values absent from selected leiden subset: {missing_animals}"
+            )
+        m_excl_animal_lei = np.isin(animals_lei, sorted(exclude_animals))
+        m_excl_animal[idx_lei] = m_excl_animal_lei
+        log(
+            f"Excluding animals in selected leiden subset: {sorted(exclude_animals)}; "
+            f"n_excluded={int(np.sum(m_excl_animal_lei))}"
+        )
+    m_excl = ds_all.str.contains("20251005", regex=False) & roi_all.isin(["1", "3"])
+    n_excl = int(np.sum(m_lei & m_excl.to_numpy()))
+    if n_excl > 0:
+        log(f"Excluding poor-stain cells: dataset contains '20251005' and roi in {{1,3}}; n_excluded={n_excl}")
+    m = m_lei & (~m_excl.to_numpy()) & (~m_excl_animal)
+    if not bool(np.any(m)):
+        raise ValueError(
+            "All cells were excluded after applying poor-stain and animal exclusion filters."
+        )
+
+    row_idx = np.flatnonzero(m).astype(np.int64, copy=False)
     obs_name_raw = adata.obs_names.to_numpy(dtype=object, copy=False)
     obs_name = obs_name_raw[row_idx]
-    dataset = obs.loc[m_lei, "dataset"].astype(str).to_numpy().astype(object)
-    roi = obs.loc[m_lei, "roi"].astype(str).to_numpy().astype(object)
-    ccf_adjusted = obs.loc[m_lei, "ccf_adjusted"].astype(str).to_numpy().astype(object)
-    leiden_orig = obs.loc[m_lei, "leiden"].astype(str).to_numpy().astype(object)
+    dataset = obs.loc[m, "dataset"].astype(str).to_numpy().astype(object)
+    roi = obs.loc[m, "roi"].astype(str).to_numpy().astype(object)
+    ccf_adjusted = obs.loc[m, "ccf_adjusted"].astype(str).to_numpy().astype(object)
+    leiden_orig = obs.loc[m, "leiden"].astype(str).to_numpy().astype(object)
     if bool(args.pool_leiden):
         leiden = np.full(leiden_orig.shape[0], "_pooled", dtype=object)
     else:
         leiden = leiden_orig
-    B = obs.loc[m_lei, "brdu_pos"].to_numpy().astype(int, copy=False)
-    E = obs.loc[m_lei, "edu_pos"].to_numpy().astype(int, copy=False)
+    B_hard = _binary_call_from_obs(
+        obs=obs,
+        mask=m,
+        col=str(args.brdu_col),
+        intensity_col=str(args.brdu_intensity_col),
+        threshold=args.brdu_threshold,
+        name="BrdU call",
+    )
+    E_hard = _binary_call_from_obs(
+        obs=obs,
+        mask=m,
+        col=str(args.edu_col),
+        intensity_col=str(args.edu_intensity_col),
+        threshold=args.edu_threshold,
+        name="EdU call",
+    )
+    b_soft = B_hard.astype(np.float64, copy=False)
+    e_soft = E_hard.astype(np.float64, copy=False)
+    pi_11 = b_soft * e_soft
+    pulse_mode = str(args.pulse_call_mode)
+    if pulse_mode == "soft_logistic":
+        if args.brdu_threshold is not None or args.edu_threshold is not None:
+            raise ValueError("Soft logistic mode does not support --brdu-threshold / --edu-threshold.")
+        if not (0.5 < float(args.soft_p_hi) < 1.0):
+            raise ValueError("--soft-p-hi must be in (0.5, 1.0).")
+        if not (float(args.soft_span) > 0.0):
+            raise ValueError("--soft-span must be > 0.")
+        for col in [str(args.soft_log_brdu_col), str(args.soft_log_edu_col)]:
+            if col not in obs.columns:
+                raise ValueError(f"Soft logistic mode missing required obs column: {col!r}")
+
+        uns_key = str(args.soft_threshold_uns_key)
+        threshold_map = _load_threshold_map_from_uns(uns=dict(adata.uns), uns_key=uns_key)
+        log(f"Soft logistic: loaded threshold units from adata.uns[{uns_key!r}] n_units={len(threshold_map)}")
+        threshold_delta_map: dict[tuple[str, str, str], tuple[float, float]] | None = None
+        if args.soft_threshold_delta_csv is not None:
+            delta_csv = args.soft_threshold_delta_csv.expanduser()
+            threshold_delta_map = _load_threshold_delta_map_from_csv(path=delta_csv)
+            log(
+                f"Soft logistic: loaded threshold deltas from {delta_csv} "
+                f"n_units={len(threshold_delta_map)}"
+            )
+
+        brdu_thr = np.full(row_idx.shape[0], np.nan, dtype=np.float64)
+        edu_thr = np.full(row_idx.shape[0], np.nan, dtype=np.float64)
+        brdu_delta = np.zeros(row_idx.shape[0], dtype=np.float64)
+        edu_delta = np.zeros(row_idx.shape[0], dtype=np.float64)
+        used_units: set[tuple[str, str, str]] = set()
+        for i, key in enumerate(zip(dataset.tolist(), roi.tolist(), ccf_adjusted.tolist(), strict=True)):
+            key3 = (str(key[0]), str(key[1]), str(key[2]))
+            value = threshold_map.get(key3)
+            if value is None:
+                raise KeyError(f"No adata.uns threshold match for unit={key}")
+            d_b = 0.0
+            d_e = 0.0
+            if threshold_delta_map is not None:
+                delta_value = threshold_delta_map.get(key3)
+                if delta_value is None:
+                    raise KeyError(f"No adata.uns threshold-delta match for unit={key}")
+                d_b = float(delta_value[0])
+                d_e = float(delta_value[1])
+            brdu_delta[i] = d_b
+            edu_delta[i] = d_e
+            brdu_thr[i] = value[0] + d_b
+            edu_thr[i] = value[1] + d_e
+            used_units.add(key3)
+        if np.any(~np.isfinite(brdu_thr)) or np.any(~np.isfinite(edu_thr)):
+            raise ValueError("Non-finite thresholds found after mapping in soft logistic mode.")
+        if threshold_delta_map is not None:
+            extra_units = len(set(threshold_delta_map) - used_units)
+            log(
+                "Soft logistic threshold delta summary: "
+                f"delta_brdu[min/med/max]={float(np.min(brdu_delta)):.4f}/{float(np.median(brdu_delta)):.4f}/{float(np.max(brdu_delta)):.4f} "
+                f"delta_edu[min/med/max]={float(np.min(edu_delta)):.4f}/{float(np.median(edu_delta)):.4f}/{float(np.max(edu_delta)):.4f} "
+                f"thr_brdu[min/med/max]={float(np.min(brdu_thr)):.4f}/{float(np.median(brdu_thr)):.4f}/{float(np.max(brdu_thr)):.4f} "
+                f"thr_edu[min/med/max]={float(np.min(edu_thr)):.4f}/{float(np.median(edu_thr)):.4f}/{float(np.max(edu_thr)):.4f} "
+                f"extra_delta_units_not_used={extra_units}"
+            )
+
+        log_brdu = pd.to_numeric(obs.loc[m, str(args.soft_log_brdu_col)], errors="raise").to_numpy(dtype=np.float64, copy=False)
+        log_edu = pd.to_numeric(obs.loc[m, str(args.soft_log_edu_col)], errors="raise").to_numpy(dtype=np.float64, copy=False)
+        valid_soft = np.isfinite(log_brdu) & np.isfinite(log_edu)
+        n_drop_soft = int(np.sum(~valid_soft))
+        if n_drop_soft > 0:
+            bad_idx = np.flatnonzero(~valid_soft)[:5]
+            preview = [
+                (
+                    str(dataset[i]),
+                    str(roi[i]),
+                    str(ccf_adjusted[i]),
+                    str(obs_name[i]),
+                    float(log_brdu[i]) if np.isfinite(log_brdu[i]) else float("nan"),
+                    float(log_edu[i]) if np.isfinite(log_edu[i]) else float("nan"),
+                )
+                for i in bad_idx.tolist()
+            ]
+            raise ValueError(
+                "Soft logistic mode requires finite log BrdU/EdU intensity values. "
+                f"Found n_bad={n_drop_soft}; first_bad_rows={preview}"
+            )
+
+        b_soft = _soft_logistic_probabilities(
+            log_brdu,
+            brdu_thr,
+            span=float(args.soft_span),
+            p_hi=float(args.soft_p_hi),
+        )
+        e_soft = _soft_logistic_probabilities(
+            log_edu,
+            edu_thr,
+            span=float(args.soft_span),
+            p_hi=float(args.soft_p_hi),
+        )
+        pi_11 = (b_soft * e_soft).astype(np.float64, copy=False)
+        log(
+            f"Calls: pulse_call_mode=soft_logistic (p@thr=0.5; p@thr±{float(args.soft_span):g}="
+            f"{1.0-float(args.soft_p_hi):.3f}/{float(args.soft_p_hi):.3f}) using "
+            f"{args.soft_log_brdu_col!r}/{args.soft_log_edu_col!r} and adata.uns thresholds"
+            + (
+                f" + deltas from {args.soft_threshold_delta_csv}"
+                if args.soft_threshold_delta_csv is not None
+                else ""
+            )
+        )
+    else:
+        log(
+            "Calls: pulse_call_mode=hard; "
+            + (
+                f"B from {args.brdu_col!r}"
+                if args.brdu_threshold is None
+                else f"B from ({args.brdu_intensity_col!r} >= {args.brdu_threshold:g})"
+            )
+            + "; "
+            + (
+                f"E from {args.edu_col!r}"
+                if args.edu_threshold is None
+                else f"E from ({args.edu_intensity_col!r} >= {args.edu_threshold:g})"
+            )
+        )
 
     animals = np.array([_animal_from_dataset(d) for d in dataset.tolist()], dtype=object)
     log(
         f"Subset: n_cells={int(row_idx.size)} n_datasets={int(pd.Series(dataset).nunique())} "
         f"animals={dict(pd.Series(animals).value_counts())}"
     )
+    log(
+        "Call prevalence in subset: "
+        f"hard_brdu_rate={float(np.mean(B_hard)):.4f} hard_edu_rate={float(np.mean(E_hard)):.4f} "
+        f"soft_brdu_rate={float(np.mean(b_soft)):.4f} soft_edu_rate={float(np.mean(e_soft)):.4f}"
+    )
+
+    brdu_int: np.ndarray | None = None
+    edu_int: np.ndarray | None = None
+    if str(args.brdu_intensity_col) in obs.columns:
+        brdu_int = pd.to_numeric(obs.loc[m, str(args.brdu_intensity_col)], errors="raise").to_numpy(
+            dtype=np.float64, copy=False
+        )
+    if str(args.edu_intensity_col) in obs.columns:
+        edu_int = pd.to_numeric(obs.loc[m, str(args.edu_intensity_col)], errors="raise").to_numpy(
+            dtype=np.float64, copy=False
+        )
+
+    audit_rows: list[dict[str, object]] = []
+    for ds in pd.unique(pd.Series(dataset)):
+        m = dataset == ds
+        audit_rows.append(
+            {
+                "dataset": str(ds),
+                "animal": _animal_from_dataset(str(ds)),
+                "n_cells": int(np.sum(m)),
+                "brdu_rate": float(np.mean(B_hard[m])),
+                "edu_rate": float(np.mean(E_hard[m])),
+                "brdu_soft_rate": float(np.mean(b_soft[m])),
+                "edu_soft_rate": float(np.mean(e_soft[m])),
+                "brdu_int_median": float(np.nanmedian(brdu_int[m])) if brdu_int is not None else float("nan"),
+                "brdu_int_p90": float(np.nanquantile(brdu_int[m], 0.9)) if brdu_int is not None else float("nan"),
+                "edu_int_median": float(np.nanmedian(edu_int[m])) if edu_int is not None else float("nan"),
+                "edu_int_p90": float(np.nanquantile(edu_int[m], 0.9)) if edu_int is not None else float("nan"),
+            }
+        )
+    pd.DataFrame(audit_rows).sort_values(["animal", "dataset"], kind="mergesort").to_csv(
+        outdir / "call_audit_by_dataset.csv", index=False
+    )
 
     log("Loading Usage parquet...")
-    u = pd.read_parquet(args.usage_parquet.expanduser(), columns=["index", "dataset", usage_col])
+    usage_cols_for_merge = [usage_col, *usage_renorm_exclude_cols]
+    u = pd.read_parquet(args.usage_parquet.expanduser(), columns=["index", "dataset", *usage_cols_for_merge])
     u = u.rename(columns={"index": "obs_name"}).copy()
     u["dataset"] = u["dataset"].astype(str)
     u["obs_name"] = u["obs_name"].astype(str)
@@ -450,21 +948,51 @@ def main() -> None:
         raise ValueError("Usage parquet has duplicate (dataset, obs_name_base) keys; cannot perform a 1:1 merge.")
 
     # Sanity: within the analysis subset, obs_name should be unique within each dataset.
-    _key = pd.Series(dataset.astype(str, copy=False), copy=False) + "|" + pd.Series(obs_name.astype(str, copy=False), copy=False)
+    obs_name_base_left = (
+        pd.Series(obs_name.astype(str, copy=False), copy=False)
+        .str.split(":", n=1)
+        .str[-1]
+        .str.replace(r"-\d+$", "", regex=True)
+    )
+    _key = pd.Series(dataset.astype(str, copy=False), copy=False) + "|" + obs_name_base_left
     if bool(_key.duplicated().any()):
         raise ValueError("Within the analysis subset, obs_name is not unique within dataset (unexpected).")
 
     left = pd.DataFrame(
         {
             "dataset": dataset.astype(str, copy=False),
-            "obs_name_base": obs_name.astype(str, copy=False),
+            "obs_name_base": obs_name_base_left.to_numpy(dtype=object, copy=False),
             "pos": np.arange(row_idx.size),
         },
         copy=False,
     )
-    merged = left.merge(u.loc[:, ["dataset", "obs_name_base", usage_col]], on=["dataset", "obs_name_base"], how="left", sort=False)
+    merged = left.merge(
+        u.loc[:, ["dataset", "obs_name_base", *usage_cols_for_merge]],
+        on=["dataset", "obs_name_base"],
+        how="left",
+        sort=False,
+    )
     merged = merged.sort_values("pos", kind="mergesort")
-    usage = merged[usage_col].to_numpy(dtype=np.float64, copy=False)
+    usage_raw = pd.to_numeric(merged[usage_col], errors="raise").to_numpy(dtype=np.float64, copy=False)
+    if usage_renorm_exclude_cols:
+        excluded = np.column_stack(
+            [
+                pd.to_numeric(merged[c], errors="raise").to_numpy(dtype=np.float64, copy=False)
+                for c in usage_renorm_exclude_cols
+            ]
+        )
+        usage, usage_denom = _renormalize_usage_excluding(
+            usage_raw,
+            excluded,
+            excluded_cols=usage_renorm_exclude_cols,
+        )
+        log(
+            "Usage renormalization applied: "
+            f"usage_col={usage_col!r} excluded_cols={usage_renorm_exclude_cols!r} "
+            f"denom[min/med/max]={float(np.min(usage_denom)):.4f}/{float(np.median(usage_denom)):.4f}/{float(np.max(usage_denom)):.4f}"
+        )
+    else:
+        usage = usage_raw
     miss = float(np.mean(~np.isfinite(usage)))
     log(f"Usage join: missing_frac={miss:.6f}")
     if miss > 0.01:
@@ -479,19 +1007,23 @@ def main() -> None:
     theta = _compute_tricycle_theta(adata, trc=trc, dataset=dataset, row_idx=row_idx)
     theta_bin = _theta_bins(theta, ds_code, lei_code, n_bins=int(args.theta_bins), mode=str(args.theta_bin_mode))
 
-    log("Residualizing Usage against sin/cos(theta) within dataset...")
-    sin_t = np.sin(theta).astype(np.float64, copy=False)
-    cos_t = np.cos(theta).astype(np.float64, copy=False)
-    usage_resid = _residualize_against_theta_within_dataset(usage, sin_t=sin_t, cos_t=cos_t, dataset=dataset)
+    if bool(args.no_residualize_usage_theta):
+        log("Skipping residualization: using raw Usage for binning.")
+        usage_for_bins = usage
+    else:
+        log("Residualizing Usage against sin/cos(theta) within dataset...")
+        sin_t = np.sin(theta).astype(np.float64, copy=False)
+        cos_t = np.cos(theta).astype(np.float64, copy=False)
+        usage_for_bins = _residualize_against_theta_within_dataset(usage, sin_t=sin_t, cos_t=cos_t, dataset=dataset)
 
     log("Assigning Usage quantile bins (exact, deterministic; global over all included cells)...")
-    h = _stable_hash_u64(dataset, obs_name)
+    h = _stable_hash_u64(dataset, obs_name_base_left.to_numpy(dtype=object, copy=False))
     jitter = ((h & np.uint64(0xFFFFFFFF)).astype(np.float64) / float(2**32)) - 0.5
-    usage_bin = _assign_quantile_bins_global_exact(usage_resid, n_bins=int(args.usage_bins), jitter=jitter)
+    usage_bin = _assign_quantile_bins_global_exact(usage_for_bins, n_bins=int(args.usage_bins), jitter=jitter)
     if int(np.min(usage_bin)) < 0:
         raise ValueError("Some cells did not receive a usage_bin (unexpected).")
 
-    # Fit per animal × leiden, restricting outcome to BrdU+ cells.
+    # Fit per animal × leiden; retention axis uses hard BrdU+ slice in hard mode and soft BrdU mass in soft mode.
     out_rows: list[dict[str, object]] = []
     by_unit_rows: list[dict[str, object]] = []
     usage_bins = int(args.usage_bins)
@@ -500,36 +1032,55 @@ def main() -> None:
     for animal in np.unique(animals):
         m_a = animals == animal
         for lei in np.unique(leiden[m_a]):
-            m_b1 = m_a & (leiden == lei) & (B == 1)
+            m_b1 = m_a & (leiden == lei) & (B_hard == 1)
             m_all = m_a & (leiden == lei)
             n_b1 = int(np.sum(m_b1))
             n_all = int(np.sum(m_all))
-            raw_f = float(np.mean(E[m_b1])) if n_b1 > 0 else float("nan")
-            raw_pE = float(np.mean(E[m_all])) if n_all > 0 else float("nan")
-            log(f"[block] animal={animal} leiden={lei} n_b1={n_b1} raw_f={raw_f:.4f} n_all={n_all} raw_pE={raw_pE:.4f}")
-            if n_b1 == 0 or n_all == 0:
+            eff_b_mass = float(np.sum(b_soft[m_all])) if n_all > 0 else float("nan")
+            eff_double_mass = float(np.sum(pi_11[m_all])) if n_all > 0 else float("nan")
+            raw_f = float(eff_double_mass / eff_b_mass) if (np.isfinite(eff_b_mass) and eff_b_mass > 0.0) else float("nan")
+            raw_pE = float(np.mean(e_soft[m_all])) if n_all > 0 else float("nan")
+            log(
+                f"[block] animal={animal} leiden={lei} n_b1_hard={n_b1} raw_f={raw_f:.4f} "
+                f"n_all={n_all} raw_pE={raw_pE:.4f} eff_b_mass={eff_b_mass:.1f}"
+            )
+            if n_all == 0 or not (eff_b_mass > 0.0):
                 continue
 
-            ds_code_b1, _ = pd.factorize(dataset[m_b1], sort=True)
+            m_ret = m_b1 if pulse_mode == "hard" else m_all
+            ds_code_b1, _ = pd.factorize(dataset[m_ret], sort=True)
             if bool(args.pool_leiden):
-                lei_code_b1, _ = pd.factorize(leiden_orig[m_b1], sort=True)
+                lei_code_b1, _ = pd.factorize(leiden_orig[m_ret], sort=True)
                 n_lei_b1 = int(lei_code_b1.max()) + 1
                 stratum_idx_b1 = (
                     ds_code_b1.astype(np.int64) * int(args.theta_bins) * n_lei_b1
-                    + theta_bin[m_b1].astype(np.int64, copy=False) * n_lei_b1
+                    + theta_bin[m_ret].astype(np.int64, copy=False) * n_lei_b1
                     + lei_code_b1.astype(np.int64, copy=False)
                 )
             else:
-                stratum_idx_b1 = ds_code_b1.astype(np.int64) * int(args.theta_bins) + theta_bin[m_b1].astype(
+                stratum_idx_b1 = ds_code_b1.astype(np.int64) * int(args.theta_bins) + theta_bin[m_ret].astype(
                     np.int64, copy=False
                 )
             n_strata0_b1 = int(stratum_idx_b1.max()) + 1
 
             # Aggregate to (stratum, usage_bin) grouped-binomial rows.
-            ub_b1 = usage_bin[m_b1].astype(np.int64, copy=False)
+            ub_b1 = usage_bin[m_ret].astype(np.int64, copy=False)
             group_b1 = stratum_idx_b1 * usage_bins + ub_b1
-            y_tot = np.bincount(group_b1, minlength=int(n_strata0_b1) * usage_bins).astype(np.float64, copy=False)
-            y_succ = np.bincount(group_b1, weights=E[m_b1].astype(np.float64, copy=False), minlength=int(n_strata0_b1) * usage_bins).astype(
+            ret_trial_mass = (
+                np.ones(int(np.sum(m_ret)), dtype=np.float64)
+                if pulse_mode == "hard"
+                else b_soft[m_ret].astype(np.float64, copy=False)
+            )
+            y_tot = np.bincount(
+                group_b1,
+                weights=ret_trial_mass,
+                minlength=int(n_strata0_b1) * usage_bins,
+            ).astype(np.float64, copy=False)
+            y_succ = np.bincount(
+                group_b1,
+                weights=pi_11[m_ret].astype(np.float64, copy=False),
+                minlength=int(n_strata0_b1) * usage_bins,
+            ).astype(
                 np.float64, copy=False
             )
 
@@ -550,7 +1101,7 @@ def main() -> None:
             beta, cov_beta, alpha, strata_levels, fail, n_rows, n_strata_fit = _fit_stratified_glm_binomial(
                 y_succ=y_succ_row, y_tot=y_tot_row, strata=strata_row, X=X
             )
-            tot_by_s = np.bincount(stratum_idx_b1, minlength=n_strata0_b1).astype(np.float64, copy=False)
+            tot_by_s = np.bincount(stratum_idx_b1, weights=ret_trial_mass, minlength=n_strata0_b1).astype(np.float64, copy=False)
 
             # g-computation over fitted strata: weights are total BrdU+ cells per stratum (within this animal×leiden).
             w = tot_by_s[strata_levels.astype(int, copy=False)] if strata_levels.size else np.zeros(0, dtype=float)
@@ -575,9 +1126,9 @@ def main() -> None:
 
                 mi = pd.MultiIndex.from_arrays(
                     [
-                        dataset[m_b1].astype(str, copy=False),
-                        roi[m_b1].astype(str, copy=False),
-                        ccf_adjusted[m_b1].astype(str, copy=False),
+                        dataset[m_ret].astype(str, copy=False),
+                        roi[m_ret].astype(str, copy=False),
+                        ccf_adjusted[m_ret].astype(str, copy=False),
                     ],
                     names=["dataset", "roi", "ccf_adjusted"],
                 )
@@ -588,27 +1139,78 @@ def main() -> None:
                 if int(n_strata0_b1) >= 2**32:
                     raise ValueError("Too many strata for bitpacking (unexpected).")
 
+                # Raw counts per unit×usage_bin (total and kept strata only), for reviewability and boundary audits.
+                unit_bin = unit_code.astype(np.int64, copy=False) * usage_bins + ub_b1
+                n_b1_total = np.bincount(unit_bin, minlength=n_units_total * usage_bins).reshape(n_units_total, usage_bins)
+                eff_n_b1_total = np.bincount(
+                    unit_bin,
+                    weights=ret_trial_mass,
+                    minlength=n_units_total * usage_bins,
+                ).reshape(n_units_total, usage_bins)
+                k_b1e_total = np.bincount(
+                    unit_bin,
+                    weights=pi_11[m_ret].astype(np.float64, copy=False),
+                    minlength=n_units_total * usage_bins,
+                ).reshape(n_units_total, usage_bins)
+
+                cell_keep_b1 = in_fit[stratum_idx_b1.astype(np.int64, copy=False)]
+                unit_bin_kept = unit_code[cell_keep_b1].astype(np.int64, copy=False) * usage_bins + ub_b1[cell_keep_b1]
+                n_b1_kept = np.bincount(unit_bin_kept, minlength=n_units_total * usage_bins).reshape(n_units_total, usage_bins)
+                eff_n_b1_kept = np.bincount(
+                    unit_bin_kept,
+                    weights=ret_trial_mass[cell_keep_b1],
+                    minlength=n_units_total * usage_bins,
+                ).reshape(n_units_total, usage_bins)
+                k_b1e_kept = np.bincount(
+                    unit_bin_kept,
+                    weights=pi_11[m_ret][cell_keep_b1].astype(np.float64, copy=False),
+                    minlength=n_units_total * usage_bins,
+                ).reshape(n_units_total, usage_bins)
+
                 pair = (unit_code.astype(np.uint64) << np.uint64(32)) | stratum_idx_b1.astype(np.uint64, copy=False)
-                uniq_pair, counts = np.unique(pair, return_counts=True)
+                uniq_pair, inv_pair = np.unique(pair, return_inverse=True)
+                pair_mass = np.bincount(inv_pair, weights=ret_trial_mass, minlength=uniq_pair.size).astype(
+                    np.float64, copy=False
+                )
                 unit_of_pair = (uniq_pair >> np.uint64(32)).astype(np.int64, copy=False)
                 stratum_of_pair = (uniq_pair & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
                 w_sum_total_by_unit = np.bincount(
                     unit_of_pair,
-                    weights=counts.astype(np.float64, copy=False),
+                    weights=pair_mass,
                     minlength=n_units_total,
                 ).astype(np.float64, copy=False)
                 keep_pair = in_fit[stratum_of_pair]
                 if np.any(keep_pair):
                     unit_k = unit_of_pair[keep_pair]
-                    w_pair = counts[keep_pair].astype(np.float64, copy=False)
+                    w_pair = pair_mass[keep_pair].astype(np.float64, copy=False)
                     s_pair = stratum_of_pair[keep_pair]
                     # uniq_pair is sorted, so unit_k is already grouped.
                     idx0 = np.flatnonzero(np.r_[True, unit_k[1:] != unit_k[:-1]])
                     unit_ids = unit_k[idx0]
                     w_sum_u = np.add.reduceat(w_pair, idx0)
-                    w_sum_total_u = w_sum_total_by_unit[unit_ids]
                     if not bool(np.all(w_sum_u > 0)):
                         raise ValueError("Found unit with zero weight (unexpected).")
+
+                    unit_weight_sq_total = np.bincount(
+                        unit_code.astype(np.int64, copy=False),
+                        weights=np.square(ret_trial_mass),
+                        minlength=n_units_total,
+                    ).astype(np.float64, copy=False)
+                    unit_weight_sq_kept = np.bincount(
+                        unit_code[cell_keep_b1].astype(np.int64, copy=False),
+                        weights=np.square(ret_trial_mass[cell_keep_b1]),
+                        minlength=n_units_total,
+                    ).astype(np.float64, copy=False)
+                    w_sum_total_u = _kish_effective_sample_size(
+                        w_sum_total_by_unit[unit_ids],
+                        unit_weight_sq_total[unit_ids],
+                    )
+                    w_sum_u = _kish_effective_sample_size(
+                        w_sum_u,
+                        unit_weight_sq_kept[unit_ids],
+                    )
+                    if not bool(np.all(np.isfinite(w_sum_u) & (w_sum_u > 0.0))):
+                        raise ValueError("Found unit with invalid Kish effective sample size (unexpected).")
 
                     ds_u = unit_levels.get_level_values(0).to_numpy(dtype=object, copy=False)[unit_ids]
                     roi_u = unit_levels.get_level_values(1).to_numpy(dtype=object, copy=False)[unit_ids]
@@ -646,6 +1248,12 @@ def main() -> None:
                                     "f_hat": np.full(usage_bins, np.nan, dtype=np.float64),
                                     "inv_f_hat": np.full(usage_bins, np.nan, dtype=np.float64),
                                     "ts_over_dt": np.full(usage_bins, np.nan, dtype=np.float64),
+                                    "n_b1_total_bin": np.asarray(n_b1_total[unit_ids[j]], dtype=np.int64).copy(),
+                                    "eff_n_b1_total_bin": np.asarray(eff_n_b1_total[unit_ids[j]], dtype=np.float64).copy(),
+                                    "k_b1e_total_bin": np.asarray(k_b1e_total[unit_ids[j]], dtype=np.float64).copy(),
+                                    "n_b1_kept_bin": np.asarray(n_b1_kept[unit_ids[j]], dtype=np.int64).copy(),
+                                    "eff_n_b1_kept_bin": np.asarray(eff_n_b1_kept[unit_ids[j]], dtype=np.float64).copy(),
+                                    "k_b1e_kept_bin": np.asarray(k_b1e_kept[unit_ids[j]], dtype=np.float64).copy(),
                                 }
                                 ret_units[key] = cur
                             cur["f_hat"][t] = float(f_u[j])
@@ -673,7 +1281,7 @@ def main() -> None:
             y_tot_all = np.bincount(group_all, minlength=int(n_strata0_all) * usage_bins).astype(np.float64, copy=False)
             y_succ_all = np.bincount(
                 group_all,
-                weights=E[m_all].astype(np.float64, copy=False),
+                weights=e_soft[m_all].astype(np.float64, copy=False),
                 minlength=int(n_strata0_all) * usage_bins,
             ).astype(np.float64, copy=False)
             keep_all = y_tot_all > 0
@@ -726,6 +1334,29 @@ def main() -> None:
                 if int(n_strata0_all) >= 2**32:
                     raise ValueError("Too many strata for bitpacking (unexpected).")
 
+                unit_bin_all = unit_code_all.astype(np.int64, copy=False) * usage_bins + ub_all
+                n_all_total = np.bincount(unit_bin_all, minlength=n_units_total_all * usage_bins).reshape(
+                    n_units_total_all, usage_bins
+                )
+                k_e_total = np.bincount(
+                    unit_bin_all,
+                    weights=e_soft[m_all].astype(np.float64, copy=False),
+                    minlength=n_units_total_all * usage_bins,
+                ).reshape(n_units_total_all, usage_bins)
+
+                cell_keep_all = in_fit_all[stratum_idx_all.astype(np.int64, copy=False)]
+                unit_bin_all_kept = (
+                    unit_code_all[cell_keep_all].astype(np.int64, copy=False) * usage_bins + ub_all[cell_keep_all]
+                )
+                n_all_kept = np.bincount(unit_bin_all_kept, minlength=n_units_total_all * usage_bins).reshape(
+                    n_units_total_all, usage_bins
+                )
+                k_e_kept = np.bincount(
+                    unit_bin_all_kept,
+                    weights=e_soft[m_all][cell_keep_all].astype(np.float64, copy=False),
+                    minlength=n_units_total_all * usage_bins,
+                ).reshape(n_units_total_all, usage_bins)
+
                 pair_all = (unit_code_all.astype(np.uint64) << np.uint64(32)) | stratum_idx_all.astype(np.uint64, copy=False)
                 uniq_pair_all, counts_all = np.unique(pair_all, return_counts=True)
                 unit_of_pair_all = (uniq_pair_all >> np.uint64(32)).astype(np.int64, copy=False)
@@ -775,6 +1406,7 @@ def main() -> None:
                         pE_u_all = num_u / w_sum_u_all
                         for k, j in zip(kept_keys, idx_sel, strict=True):
                             ru = ret_units[k]
+                            unit_code_val = int(unit_ids_all[j])
                             pe = float(pE_u_all[j])
                             ts = float(ru["ts_over_dt"][t])
                             odds = float(pe / (1.0 - pe)) if (pe > 0.0 and pe < 1.0) else float("nan")
@@ -799,6 +1431,16 @@ def main() -> None:
                                     "unit_weight_all": float(w_sum_u_all[j]),
                                     "unit_weight_all_total": float(w_sum_total_u_all[j]),
                                     "unit_weight_all_frac_kept": float(w_sum_u_all[j] / w_sum_total_u_all[j]) if w_sum_total_u_all[j] > 0 else float("nan"),
+                                    "n_b1_bin_total": int(ru["n_b1_total_bin"][t]),
+                                    "eff_n_b1_bin_total": float(ru["eff_n_b1_total_bin"][t]),
+                                    "k_b1e_bin_total": float(ru["k_b1e_total_bin"][t]),
+                                    "n_b1_bin_kept": int(ru["n_b1_kept_bin"][t]),
+                                    "eff_n_b1_bin_kept": float(ru["eff_n_b1_kept_bin"][t]),
+                                    "k_b1e_bin_kept": float(ru["k_b1e_kept_bin"][t]),
+                                    "n_all_bin_total": int(n_all_total[unit_code_val, t]),
+                                    "k_e_bin_total": float(k_e_total[unit_code_val, t]),
+                                    "n_all_bin_kept": int(n_all_kept[unit_code_val, t]),
+                                    "k_e_bin_kept": float(k_e_kept[unit_code_val, t]),
                                 }
                             )
 
@@ -819,6 +1461,8 @@ def main() -> None:
                         "tc_over_dt": float(tc_over_dt),
                         "raw_f": float(raw_f),
                         "raw_pE": float(raw_pE),
+                        "eff_b_mass_block": float(eff_b_mass),
+                        "eff_double_mass_block": float(eff_double_mass),
                         "n_cells_b1": int(n_b1),
                         "n_cells_all": int(n_all),
                         "n_rows": int(n_rows),
@@ -896,6 +1540,26 @@ def main() -> None:
     meta = pd.DataFrame(meta_rows)
     meta.to_csv(outdir / "usage6_meta.csv", index=False)
     log(f"Wrote {outdir/'usage6_meta.csv'} rows={int(meta.shape[0])}")
+
+    defs = """# usage6_* outputs: column definitions (Usage_6 → BrdU/EdU dual-pulse proxies)
+
+This outdir contains stage-1 matched-strata predictions and derived proxies.
+
+## Key columns (per animal×usage_bin or per unit×usage_bin)
+
+- `f_hat`: estimated retention fraction `P(EdU+ | BrdU+, usage_bin, matched strata)`.
+- `ts_over_dt`: S-phase time proxy `T_S/Δt ≈ 1/(1 - f_hat)` (valid when `0 < f_hat < 1`).
+- `pE_hat`: estimated labeling fraction `P(EdU+ | usage_bin, matched strata)`.
+- `tc_over_dt`: **cell-cycle proxy** `T_C/Δt ≈ (T_S/Δt) / pE_hat`. This equals literal `T_C/Δt` only if the effective growth fraction is ~1; otherwise it behaves like `T_C/(GF·Δt)`.
+
+## Unit support / auditing columns (usage6_by_unit.csv)
+
+- `unit_weight_b1`: Kish effective BrdU+ support size for the strata kept by the retention fit. `unit_weight_all`: all-cell support weight for strata kept by the marginal EdU fit.
+- `n_*` / `k_*` columns: raw counts per `unit×usage_bin` (both total and restricted to kept strata), for boundary/leverage diagnostics.
+- `eff_n_b1_*` columns: effective BrdU+ trial mass per `unit×usage_bin` under soft logistic calls (equals integer counts in hard mode).
+"""
+    (outdir / "column_definitions.md").write_text(defs, encoding="utf-8")
+    log(f"Wrote {outdir/'column_definitions.md'}")
 
     log("Done.")
 

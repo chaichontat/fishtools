@@ -9,6 +9,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import SimpleITK as sitk
+from scipy.ndimage import gaussian_filter, sobel
 
 from fishtools.ccf.landmark import LandmarkRegistrationOutputs
 from fishtools.ccf.ndimage_geometry import fused_xy_to_rotated_crop_xy
@@ -28,6 +29,34 @@ def _normalize_robust(x: np.ndarray) -> np.ndarray:
             return np.zeros_like(x)
     y = (x - lo) / (hi - lo)
     return np.clip(y, 0.0, 1.0)
+
+
+def _edge_enhance_fixed_magenta(fixed_yx: np.ndarray) -> np.ndarray:
+    fixed = np.asarray(fixed_yx, dtype=np.float32)
+    if fixed.ndim != 2:
+        raise ValueError(f"Expected 2D fixed image, got shape={fixed.shape}.")
+
+    # Match the visual style used in `ccf/register_partial_section.py` overlay.
+    atlas_vals = fixed[fixed > 0] if np.any(fixed > 0) else fixed
+    atlas_lo, atlas_hi = (float(v) for v in np.percentile(atlas_vals, [1.0, 99.8]))
+    atlas_norm = (fixed - atlas_lo) / (atlas_hi - atlas_lo + 1e-8)
+    atlas_norm = np.clip(atlas_norm, 0.0, 1.0) ** 0.85
+
+    atlas_blur = gaussian_filter(atlas_norm.astype(np.float32), sigma=0.25)
+    gx = sobel(atlas_blur, axis=1)
+    gy = sobel(atlas_blur, axis=0)
+    edges = np.hypot(gx, gy)
+    edges_p99 = float(np.percentile(edges, 99))
+    edges_norm = edges / (edges_p99 + 1e-8)
+    edges_norm = np.clip(edges_norm, 0.0, 1.0)
+    edges_norm = np.clip((edges_norm - 0.25) / (1.0 - 0.25 + 1e-8), 0.0, 1.0)
+    edges_norm = edges_norm**2.5
+
+    atlas_edge_enhanced = np.clip(0.8 * atlas_norm + 1.2 * edges_norm, 0.0, 1.0)
+    rgb = np.zeros((atlas_edge_enhanced.shape[0], atlas_edge_enhanced.shape[1], 3), dtype=np.float32)
+    rgb[..., 0] = 0.8 * atlas_edge_enhanced
+    rgb[..., 2] = 0.8 * atlas_edge_enhanced
+    return rgb
 
 
 def _roi_mask(adata: ad.AnnData, *, roi: str, roi_col: str) -> np.ndarray:
@@ -305,6 +334,27 @@ def main(
     fig.savefig(output_png, dpi=200)
     plt.close(fig)
     click.echo(f"Wrote plot: {output_png}")
+
+    # Additional QC: fixed-only (edge-enhanced magenta) + warped points.
+    qc_edges_png = output_png.with_name(f"{output_png.stem}_fixed_edges{output_png.suffix}")
+    fixed_rgb_edges = _edge_enhance_fixed_magenta(fixed)
+    fig, ax = plt.subplots(1, 1, figsize=(7, 7), constrained_layout=True)
+    ax.imshow(fixed_rgb_edges[fy0:fy1, fx0:fx1], interpolation="nearest")
+    ax.scatter(
+        pts_w[:, 0] - fx0,
+        pts_w[:, 1] - fy0,
+        s=0.8,
+        alpha=0.18,
+        linewidths=0,
+        color="cyan",
+        rasterized=True,
+    )
+    ax.set_title("Fixed (edge-enhanced, magenta) + warped points")
+    ax.set_aspect("equal")
+    ax.axis("off")
+    fig.savefig(qc_edges_png, dpi=200)
+    plt.close(fig)
+    click.echo(f"Wrote plot: {qc_edges_png}")
 
 
 if __name__ == "__main__":

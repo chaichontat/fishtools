@@ -50,10 +50,10 @@ if ip is not None:
 # === EDIT THESE ===
 
 # Workspace configuration
-WORKSPACE = Path("/working/20251201_JaxA6_Coro6")
+WORKSPACE = Path("/working/20251125_JaxA6_Coro8")
 ws = Workspace(WORKSPACE)
 print(ws.rois)
-ROI = "6" #ws.rois[4]
+ROI = "7"
 
 STITCH_CODEBOOK = "pi"  # analysis/deconv/stitch--{ROI}+{STITCH_CODEBOOK}/fused.zarr
 

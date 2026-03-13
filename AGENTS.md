@@ -3,7 +3,7 @@
 Prioritize clarity over action. do not be quick to jump to an action until you’ve achieved clarity, always confirm ambiguous items with me before continuing.
 
 - ALWAYS RUN YOUR TESTS IF YOU CREATE ONE (use `conda run -n seq pytest …`).
-- DO NOT run the whole `pytest -q` unless ordered to do so. Prefer focused invocations such as `conda run -n seq pytest test/test_cli_register.py -k smoke`.
+- Do not run the whole `pytest -q` unless ordered to do so. Prefer focused invocations such as `conda run -n seq pytest test/test_cli_register.py -k smoke`.
 - USE THE `seq` CONDA ENVIRONMENT TO RUN ALL PYTHON COMMANDS INCLUDING PYTEST. Use `conda run -n seq …`; if the environment is missing, use the `cp4` environment.
 - Sandbox note: the CLI runs under a seccomp profile; `conda run` can hang if GPU plugins try to register semaphores. When that happens, set `CONDA_NO_PLUGINS=true` or ping the user to loosen sandbox restrictions before proceeding.
 - You do not need to verify `git` status after your edits. There can be changes that _I_ made that I want you to keep, but you may still inspect `git status` to confirm what you touched.
@@ -11,8 +11,10 @@ Prioritize clarity over action. do not be quick to jump to an action until you�
 - ABSOLUTELY NEVER add fallbacks (silent defaults, alternate codepaths, “best-effort” behavior) unless the user explicitly requests it. Fall-backs hide bugs and waste debugging time.
 - “Robustness” must be contract-preserving: do not change output semantics (including edge/error cases) unless the user explicitly asks. Prefer failing loudly over silently substituting defaults.
 - DO NOT preemptively handle exceptions, swallowing Exceptions are never acceptable. If you are not sure what to do, ask the user.
-- After modifications, run `conda run -n seq ruff check --output-format=concise {MODIFIED FILES}` unless told otherwise to check for errors before returning to the user.
+- Do not worry about backwards compatibility unless the user indicates so.
+- After Python modifications, run `conda run -n seq ruff check --output-format=concise {MODIFIED FILES}` unless told otherwise to check for errors before returning to the user.
 
+- When working with .h5ad files, DO NOT use h5py directly, it can corrupt the h5ad file. Only use anndata or scanpy.
 - **DO NOT EVER use %-style formatting for logging. Use f-strings.**
 
 ## Quick Start

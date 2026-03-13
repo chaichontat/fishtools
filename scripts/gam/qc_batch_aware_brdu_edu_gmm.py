@@ -114,6 +114,7 @@ def _calibrate_prob_logit_shift_by_batch(
     hard: np.ndarray,
     batch_idx: np.ndarray,
     n_batches: int,
+    mask: np.ndarray | None = None,
     eps: float = 1e-6,
     max_shift: float = 40.0,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -136,6 +137,12 @@ def _calibrate_prob_logit_shift_by_batch(
         raise ValueError("n_batches must be positive.")
     if not np.isin(hard, [0, 1]).all():
         raise ValueError("hard must be binary.")
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        if mask.shape != p.shape:
+            raise ValueError("mask must have the same shape as p.")
+        if not np.any(mask):
+            raise ValueError("mask selects zero rows.")
     if not (0.0 < float(eps) < 0.5):
         raise ValueError("eps must satisfy 0 < eps < 0.5.")
     if float(max_shift) <= 0:
@@ -144,11 +151,14 @@ def _calibrate_prob_logit_shift_by_batch(
     p = np.clip(p, float(eps), 1.0 - float(eps))
     logit_p = np.log(p) - np.log1p(-p)
 
-    out = np.empty_like(p)
+    out = p.copy()
     shift_b = np.full(int(n_batches), np.nan, dtype=np.float64)
 
     for b in range(int(n_batches)):
-        idx = np.where(bidx == b)[0]
+        if mask is None:
+            idx = np.where(bidx == b)[0]
+        else:
+            idx = np.where((bidx == b) & mask)[0]
         if idx.size == 0:
             continue
         z = logit_p[idx]
@@ -177,6 +187,184 @@ def _calibrate_prob_logit_shift_by_batch(
         c = 0.5 * (lo + hi)
         out[idx] = sigmoid(z + c)
         shift_b[b] = c
+
+    if not np.isfinite(out).all():
+        raise RuntimeError("Internal error: non-finite calibrated probabilities.")
+    return out, shift_b
+
+
+def _calibrate_prob_logit_shift_to_xmin_by_batch(
+    *,
+    p: np.ndarray,
+    x: np.ndarray,
+    batch_idx: np.ndarray,
+    n_batches: int,
+    x_min: float,
+    nearest_k: int = 2000,
+    mask: np.ndarray | None = None,
+    eps: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Per-batch monotone calibration that only raises the implied intensity threshold.
+
+    We apply a per-batch additive shift to logit(p):
+      p' = sigmoid(logit(p) + shift_b)
+
+    shift_b is estimated from cells near a target intensity x_min, and is clamped
+    to <= 0 so that probabilities only decrease (pushing the p=0.5 boundary to
+    higher intensities in batches where it was too low).
+    """
+    p = np.asarray(p, dtype=np.float64).reshape(-1)
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    bidx = np.asarray(batch_idx, dtype=np.int64).reshape(-1)
+    if not (p.shape == x.shape == bidx.shape):
+        raise ValueError("p, x, and batch_idx must have the same shape.")
+    if int(n_batches) <= 0:
+        raise ValueError("n_batches must be positive.")
+    if not math.isfinite(float(x_min)):
+        raise ValueError("x_min must be finite.")
+    k = int(nearest_k)
+    if k <= 0:
+        raise ValueError("nearest_k must be positive.")
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        if mask.shape != p.shape:
+            raise ValueError("mask must have the same shape as p.")
+        if not np.any(mask):
+            raise ValueError("mask selects zero rows.")
+    if not (0.0 < float(eps) < 0.5):
+        raise ValueError("eps must satisfy 0 < eps < 0.5.")
+
+    p = np.clip(p, float(eps), 1.0 - float(eps))
+    logit_p = np.log(p) - np.log1p(-p)
+
+    out = p.copy()
+    shift_b = np.full(int(n_batches), np.nan, dtype=np.float64)
+
+    x_min_f = float(x_min)
+    for b in range(int(n_batches)):
+        if mask is None:
+            idx = np.where(bidx == b)[0]
+        else:
+            idx = np.where((bidx == b) & mask)[0]
+        if idx.size == 0:
+            continue
+        xb = x[idx]
+        zb = logit_p[idx]
+        ok = np.isfinite(xb) & np.isfinite(zb)
+        if not np.any(ok):
+            continue
+        xb = xb[ok]
+        zb = zb[ok]
+        if xb.size == 0:
+            continue
+
+        order = np.argsort(np.abs(xb - x_min_f))
+        take = order[: min(k, int(order.size))]
+        shift = -float(np.median(zb[take]))
+        shift = min(0.0, shift)
+        shift_b[b] = shift
+        if shift == 0.0:
+            continue
+        out[idx] = sigmoid(logit_p[idx] + shift)
+
+    if not np.isfinite(out).all():
+        raise RuntimeError("Internal error: non-finite calibrated probabilities.")
+    return out, shift_b
+
+
+def _calibrate_prob_logit_shift_to_xrange_by_batch(
+    *,
+    p: np.ndarray,
+    x: np.ndarray,
+    batch_idx: np.ndarray,
+    n_batches: int,
+    x_min: float,
+    x_max: float,
+    nearest_k: int = 2000,
+    mask: np.ndarray | None = None,
+    eps: float = 1e-6,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Per-batch monotone calibration that constrains the implied p=0.5 boundary to lie within [x_min, x_max].
+
+    If the current boundary is below x_min (i.e. p(x_min) > 0.5), we apply a negative logit shift so that
+    p'(x_min) ≈ 0.5 (raises threshold).
+
+    If the current boundary is above x_max (i.e. p(x_max) < 0.5), we apply a positive logit shift so that
+    p'(x_max) ≈ 0.5 (lowers threshold).
+
+    Otherwise, shift=0.
+    """
+    p = np.asarray(p, dtype=np.float64).reshape(-1)
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    bidx = np.asarray(batch_idx, dtype=np.int64).reshape(-1)
+    if not (p.shape == x.shape == bidx.shape):
+        raise ValueError("p, x, and batch_idx must have the same shape.")
+    if int(n_batches) <= 0:
+        raise ValueError("n_batches must be positive.")
+    if not math.isfinite(float(x_min)) or not math.isfinite(float(x_max)):
+        raise ValueError("x_min and x_max must be finite.")
+    if float(x_min) >= float(x_max):
+        raise ValueError("x_min must be < x_max.")
+    k = int(nearest_k)
+    if k <= 0:
+        raise ValueError("nearest_k must be positive.")
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool).reshape(-1)
+        if mask.shape != p.shape:
+            raise ValueError("mask must have the same shape as p.")
+        if not np.any(mask):
+            raise ValueError("mask selects zero rows.")
+    if not (0.0 < float(eps) < 0.5):
+        raise ValueError("eps must satisfy 0 < eps < 0.5.")
+
+    p = np.clip(p, float(eps), 1.0 - float(eps))
+    logit_p = np.log(p) - np.log1p(-p)
+
+    out = p.copy()
+    shift_b = np.full(int(n_batches), np.nan, dtype=np.float64)
+
+    x_min_f = float(x_min)
+    x_max_f = float(x_max)
+    for b in range(int(n_batches)):
+        if mask is None:
+            idx = np.where(bidx == b)[0]
+        else:
+            idx = np.where((bidx == b) & mask)[0]
+        if idx.size == 0:
+            continue
+        xb = x[idx]
+        zb = logit_p[idx]
+        ok = np.isfinite(xb) & np.isfinite(zb)
+        if not np.any(ok):
+            continue
+        xb = xb[ok]
+        zb = zb[ok]
+        if xb.size == 0:
+            continue
+
+        # Median logit among nearest-to-xmin / nearest-to-xmax cells.
+        order_min = np.argsort(np.abs(xb - x_min_f))
+        take_min = order_min[: min(k, int(order_min.size))]
+        m_min = float(np.median(zb[take_min]))
+
+        order_max = np.argsort(np.abs(xb - x_max_f))
+        take_max = order_max[: min(k, int(order_max.size))]
+        m_max = float(np.median(zb[take_max]))
+
+        # Decide direction: if p(xmin)>0.5 -> boundary<xmin -> decrease probs (negative shift).
+        # If p(xmax)<0.5 -> boundary>xmax -> increase probs (positive shift).
+        shift = 0.0
+        if m_min > 0.0:
+            shift = -m_min
+        elif m_max < 0.0:
+            shift = -m_max
+
+        shift_b[b] = float(shift)
+        if shift == 0.0:
+            continue
+        out[idx] = sigmoid(logit_p[idx] + float(shift))
 
     if not np.isfinite(out).all():
         raise RuntimeError("Internal error: non-finite calibrated probabilities.")
@@ -243,6 +431,48 @@ def _select_pos_components_1d(
         return np.asarray([k for k in range(K) if k != main], dtype=int)
 
     raise ValueError(f"Unknown pos mode: {mode!r}")
+
+
+def _select_pos_components_1d_by_manual(
+    *,
+    resp: np.ndarray,
+    hard: np.ndarray,
+) -> np.ndarray:
+    """
+    Select which mixture components should count as "positive", using manual hard calls
+    as a mapping layer only (no supervision in fitting).
+
+    We compute per-component manual-positive rates:
+        theta_k = sum_i resp[i,k] * hard[i] / sum_i resp[i,k]
+    Then select the number of positive components m=1..K that makes the implied
+    positive mass closest to the manual positive fraction:
+        mean_i sum_{k in top-m(theta)} resp[i,k]  ~  mean_i hard[i]
+    """
+    resp = np.asarray(resp, dtype=np.float64)
+    if resp.ndim != 2:
+        raise ValueError("resp must be (N,K)")
+    hard = np.asarray(hard, dtype=np.int8).reshape(-1)
+    if resp.shape[0] != hard.shape[0]:
+        raise ValueError("resp and hard must have matching N")
+    if not np.isin(hard, [0, 1]).all():
+        raise ValueError("hard must be binary (0/1)")
+
+    Nk = resp.sum(axis=0) + 1e-12
+    theta = (resp.T @ hard.astype(np.float64, copy=False)) / Nk
+    order = np.argsort(theta)  # ascending
+    target = float(np.mean(hard))
+
+    best_m = 1
+    best_err = float("inf")
+    for m in range(1, int(resp.shape[1]) + 1):
+        pos = order[-m:]
+        frac = float(np.mean(resp[:, pos].sum(axis=1)))
+        err = abs(frac - target)
+        if err < best_err:
+            best_err = err
+            best_m = m
+
+    return np.sort(order[-best_m:]).astype(int, copy=False)
 
 
 class BatchAwareDiagGMM2D:
@@ -757,6 +987,7 @@ class BatchAwareGMM1D:
         n_components: int,
         pi_prior: float = 1e-2,
         affine: str = "shift",
+        variance: str = "component",
         reg_covar: float = 1e-3,
         max_iter: int = 200,
         tol: float = 1e-5,
@@ -778,6 +1009,10 @@ class BatchAwareGMM1D:
         if affine not in {"shift", "shift_scale"}:
             raise ValueError("affine must be 'shift' or 'shift_scale'.")
         self.affine = affine
+        variance = str(variance).strip().lower()
+        if variance not in {"component", "tied"}:
+            raise ValueError("variance must be 'component' or 'tied'.")
+        self.variance = variance
         self.reg_covar = float(reg_covar)
         self.max_iter = int(max_iter)
         self.tol = float(tol)
@@ -848,18 +1083,51 @@ class BatchAwareGMM1D:
         batch_idx: np.ndarray,
         *,
         ref_batch: int | None = None,
+        init: str = "quantile",
+        hard: np.ndarray | None = None,
         learn_affine: bool = False,
         affine_init_mask: np.ndarray | None = None,
+        fit_mask: np.ndarray | None = None,
     ) -> BatchAwareGMM1D:
-        X = np.asarray(X, dtype=np.float64).reshape(-1)
-        batch_idx = np.asarray(batch_idx, dtype=np.int64).reshape(-1)
-        if batch_idx.shape != (X.shape[0],):
+        X_full = np.asarray(X, dtype=np.float64).reshape(-1)
+        batch_idx_full = np.asarray(batch_idx, dtype=np.int64).reshape(-1)
+        if batch_idx_full.shape != (X_full.shape[0],):
             raise ValueError("batch_idx must be (N,) and match X length.")
 
-        N = int(X.shape[0])
-        B = int(batch_idx.max()) + 1
+        B = int(batch_idx_full.max()) + 1
         if B < 1:
             raise ValueError("no batches found")
+
+        hard_full: np.ndarray | None
+        if hard is None:
+            hard_full = None
+        else:
+            hard_full = np.asarray(hard, dtype=bool).reshape(-1)
+            if hard_full.shape != (X_full.shape[0],):
+                raise ValueError("hard must be (N,) and match X length.")
+
+        if fit_mask is None:
+            X = X_full
+            batch_idx = batch_idx_full
+            hard = hard_full
+        else:
+            fit_mask = np.asarray(fit_mask, dtype=bool).reshape(-1)
+            if fit_mask.shape != (X_full.shape[0],):
+                raise ValueError("fit_mask must be (N,) and match X length.")
+            if not np.any(fit_mask):
+                raise ValueError("fit_mask selects zero rows.")
+            X = X_full[fit_mask]
+            batch_idx = batch_idx_full[fit_mask]
+            hard = None if hard_full is None else hard_full[fit_mask]
+            counts_fit = np.bincount(batch_idx, minlength=B)
+            bad = np.where(counts_fit < 50)[0]
+            if bad.size:
+                examples = ", ".join(str(int(i)) for i in bad[:8])
+                raise ValueError(
+                    f"too few rows after fit_mask in some batches (need >=50). Example batch_idx: {examples}"
+                )
+
+        N = int(X.shape[0])
 
         if ref_batch is None:
             counts = np.bincount(batch_idx, minlength=B)
@@ -921,33 +1189,80 @@ class BatchAwareGMM1D:
         self.gamma_ = gamma
 
         U0 = self.transform_to_u(X, batch_idx)
-        means_init = np.quantile(U0, np.linspace(0.15, 0.85, num=self.K), axis=0).reshape(-1, 1)
-        try:
-            from sklearn.mixture import GaussianMixture
+        init = str(init).strip().lower()
+        if init not in {"quantile", "tail_quantile", "manual_seed"}:
+            raise ValueError(f"Unknown init mode: {init!r}")
+        if init == "manual_seed" and hard is None:
+            raise ValueError("init='manual_seed' requires hard labels to be provided.")
 
-            gmm = GaussianMixture(
-                n_components=self.K,
-                covariance_type="full",
-                reg_covar=self.reg_covar,
-                random_state=self.random_state,
-                means_init=means_init,
-                n_init=3,
-                max_iter=200,
+        if init == "manual_seed":
+            hard = np.asarray(hard, dtype=bool).reshape(-1)
+            n_pos = int(np.sum(hard))
+            n_neg = int(np.sum(~hard))
+            if n_pos < 50 or n_neg < 50:
+                raise ValueError(f"manual_seed requires >=50 pos and >=50 neg (got pos={n_pos}, neg={n_neg}).")
+            U_neg = U0[~hard]
+            U_pos = U0[hard]
+
+            q = np.linspace(0.15, 0.95, num=max(self.K - 1, 1))
+            pos_means = np.quantile(U_pos, q).reshape(-1)
+            mu = np.concatenate([[float(np.mean(U_neg))], pos_means]).astype(np.float64, copy=False)
+            if mu.size != self.K:
+                raise RuntimeError("internal error: unexpected manual_seed mu size")
+            self.mu_ = mu
+
+            var_neg = float(np.var(U_neg) + self.reg_covar)
+            var_pos = float(np.var(U_pos) + self.reg_covar)
+            var = np.concatenate([[var_neg], np.full(self.K - 1, var_pos, dtype=np.float64)]).astype(
+                np.float64, copy=False
             )
-            gmm.fit(U0.reshape(-1, 1))
-            pi0 = np.asarray(gmm.weights_, dtype=np.float64).copy()
-            self.pi_ = pi0
-            self.mu_ = np.asarray(gmm.means_, dtype=np.float64).reshape(self.K).copy()
-            cov = np.asarray(gmm.covariances_, dtype=np.float64)
-            if cov.ndim == 3:
-                var = cov[:, 0, 0].reshape(self.K)
+            if self.variance == "tied":
+                var = np.full((self.K,), float(np.mean(var)), dtype=np.float64)
+            self.var_ = np.clip(var, self.reg_covar, np.inf)
+
+            frac_pos = float(n_pos) / float(n_pos + n_neg)
+            pi = np.concatenate(
+                [[1.0 - frac_pos], np.full(self.K - 1, frac_pos / float(self.K - 1), dtype=np.float64)],
+            ).astype(np.float64, copy=False)
+            self.pi_ = np.clip(pi, 1e-12, np.inf)
+            self.pi_ = self.pi_ / float(np.sum(self.pi_))
+        else:
+            if init == "quantile":
+                q = np.linspace(0.15, 0.85, num=self.K)
             else:
-                var = cov.reshape(self.K)
-            self.var_ = np.clip(var + self.reg_covar, self.reg_covar, np.inf).astype(np.float64, copy=False)
-        except Exception:
-            self.pi_ = np.ones((self.K,), dtype=np.float64) / float(self.K)
-            self.mu_ = means_init.reshape(self.K)
-            self.var_ = np.full((self.K,), float(np.var(U0) + self.reg_covar), dtype=np.float64)
+                t = np.linspace(0.0, 1.0, num=self.K)
+                q = 0.15 + (0.995 - 0.15) * (t**2)
+            means_init = np.quantile(U0, q, axis=0).reshape(-1, 1)
+            try:
+                from sklearn.mixture import GaussianMixture
+
+                gmm = GaussianMixture(
+                    n_components=self.K,
+                    covariance_type="full",
+                    reg_covar=self.reg_covar,
+                    random_state=self.random_state,
+                    means_init=means_init,
+                    n_init=3,
+                    max_iter=200,
+                )
+                gmm.fit(U0.reshape(-1, 1))
+                pi0 = np.asarray(gmm.weights_, dtype=np.float64).copy()
+                self.pi_ = pi0
+                self.mu_ = np.asarray(gmm.means_, dtype=np.float64).reshape(self.K).copy()
+                cov = np.asarray(gmm.covariances_, dtype=np.float64)
+                if cov.ndim == 3:
+                    var = cov[:, 0, 0].reshape(self.K)
+                else:
+                    var = cov.reshape(self.K)
+                var = np.clip(var + self.reg_covar, self.reg_covar, np.inf).astype(np.float64, copy=False)
+                if self.variance == "tied":
+                    var = np.full((self.K,), float(np.mean(var)), dtype=np.float64)
+                self.var_ = var
+            except Exception:
+                self.pi_ = np.ones((self.K,), dtype=np.float64) / float(self.K)
+                self.mu_ = means_init.reshape(self.K)
+                var0 = float(np.var(U0) + self.reg_covar)
+                self.var_ = np.full((self.K,), var0, dtype=np.float64)
 
         prev_ll = -np.inf
         ll_trace: list[float] = []
@@ -1015,8 +1330,13 @@ class BatchAwareGMM1D:
             denom = w_rg.sum(axis=0) + 1e-12
             self.mu_ = (w_rg.T @ U) / denom
             diff = U[:, None] - self.mu_[None, :]
-            self.var_ = (w_rg * (diff**2)).sum(axis=0) / Nk
-            self.var_ = np.clip(self.var_ + self.reg_covar, self.reg_covar, np.inf)
+            if self.variance == "component":
+                self.var_ = (w_rg * (diff**2)).sum(axis=0) / Nk
+                self.var_ = np.clip(self.var_ + self.reg_covar, self.reg_covar, np.inf)
+            else:
+                var = float((w_rg * (diff**2)).sum() / float(N))
+                var = float(np.clip(var + self.reg_covar, self.reg_covar, np.inf))
+                self.var_ = np.full((self.K,), var, dtype=np.float64)
 
             # Update global mixing proportions pi_k
             Nk_all = resp.sum(axis=0) + float(self.pi_prior)
@@ -2160,6 +2480,47 @@ def main() -> int:
         help="For --model independent1d: per-batch affine nuisance transform (default: shift).",
     )
     p.add_argument(
+        "--batchaware1d-variance",
+        type=str,
+        default="component",
+        choices=["component", "tied"],
+        help="For --model independent1d: variance in u-space (per-component or tied across components).",
+    )
+    p.add_argument(
+        "--edu-init",
+        type=str,
+        default="quantile",
+        choices=["quantile", "tail_quantile", "manual_seed"],
+        help=(
+            "For --model independent1d: how to initialize the 1D EdU mixture. "
+            "'manual_seed' uses edu_pos as initialization only (then runs standard unsupervised EM)."
+        ),
+    )
+    p.add_argument(
+        "--brdu-init",
+        type=str,
+        default="quantile",
+        choices=["quantile", "tail_quantile", "manual_seed"],
+        help=(
+            "For --model independent1d: how to initialize the 1D BrdU mixture. "
+            "'manual_seed' uses brdu_pos as initialization only (then runs standard unsupervised EM)."
+        ),
+    )
+    p.add_argument(
+        "--edu-zero-policy",
+        type=str,
+        default="include",
+        choices=["include", "exclude"],
+        help="For --model independent1d: whether to exclude edu_x==0 cells from fitting (still inferred).",
+    )
+    p.add_argument(
+        "--brdu-zero-policy",
+        type=str,
+        default="include",
+        choices=["include", "exclude"],
+        help="For --model independent1d: whether to exclude brdu_x==0 cells from fitting (still inferred).",
+    )
+    p.add_argument(
         "--edu-pos-topk",
         type=int,
         default=1,
@@ -2169,11 +2530,11 @@ def main() -> int:
         "--edu-pos-mode",
         type=str,
         default="topk",
-        choices=["topk", "not_main"],
+        choices=["topk", "not_main", "manual_match"],
         help=(
             "When --model independent1d, how to define EdU-positive components. "
             "'topk' uses --edu-pos-topk highest-mean components; 'not_main' treats all but the highest-weight "
-            "component as EdU-positive."
+            "component as EdU-positive; 'manual_match' selects components to match edu_pos fraction (mapping only)."
         ),
     )
     p.add_argument(
@@ -2186,11 +2547,11 @@ def main() -> int:
         "--brdu-pos-mode",
         type=str,
         default="topk",
-        choices=["topk", "not_main"],
+        choices=["topk", "not_main", "manual_match"],
         help=(
             "When --model independent1d, how to define BrdU-positive components. "
             "'topk' uses --brdu-pos-topk highest-mean components; 'not_main' treats all but the highest-weight "
-            "component as BrdU-positive."
+            "component as BrdU-positive; 'manual_match' selects components to match brdu_pos fraction (mapping only)."
         ),
     )
     p.add_argument(
@@ -2256,6 +2617,52 @@ def main() -> int:
             "to match manual edu_pos/brdu_pos fractions. Calibration requires manual columns and is applied "
             "before forming joint quadrant probabilities."
         ),
+    )
+    p.add_argument(
+        "--calibrate-to-xmin",
+        action="store_true",
+        help=(
+            "For --model independent1d: enable per-batch monotone calibration that only raises the implied "
+            "p=0.5 intensity boundary in batches where it is too low. Uses --edu-xmin / --brdu-xmin."
+        ),
+    )
+    p.add_argument(
+        "--calibrate-to-xrange",
+        action="store_true",
+        help=(
+            "For --model independent1d: enable per-batch monotone calibration that constrains the implied "
+            "p=0.5 intensity boundary to lie within [xmin, xmax]. Uses --*-xmin/--*-xmax."
+        ),
+    )
+    p.add_argument(
+        "--edu-xmin",
+        type=float,
+        default=float("nan"),
+        help="When --calibrate-to-xmin is set: minimum desired EdU x-space p=0.5 boundary (floor).",
+    )
+    p.add_argument(
+        "--edu-xmax",
+        type=float,
+        default=float("nan"),
+        help="When --calibrate-to-xrange is set: maximum desired EdU x-space p=0.5 boundary (ceiling).",
+    )
+    p.add_argument(
+        "--brdu-xmin",
+        type=float,
+        default=float("nan"),
+        help="When --calibrate-to-xmin is set: minimum desired BrdU x-space p=0.5 boundary (floor).",
+    )
+    p.add_argument(
+        "--brdu-xmax",
+        type=float,
+        default=float("nan"),
+        help="When --calibrate-to-xrange is set: maximum desired BrdU x-space p=0.5 boundary (ceiling).",
+    )
+    p.add_argument(
+        "--xmin-nearest-k",
+        type=int,
+        default=2000,
+        help="When --calibrate-to-xmin is set: number of nearest-to-xmin cells used per batch to estimate the logit shift.",
     )
     p.add_argument(
         "--manual-group-cols",
@@ -2555,9 +2962,24 @@ def main() -> int:
     params_1d: pd.DataFrame | None = None
 
     if model_kind == "independent1d":
+        edu_fit_mask: np.ndarray | None = None
+        brdu_fit_mask: np.ndarray | None = None
+        if str(args.edu_zero_policy) == "exclude":
+            edu_fit_mask = X[:, 0] > 0
+        if str(args.brdu_zero_policy) == "exclude":
+            brdu_fit_mask = X[:, 1] > 0
+
+        edu_affine_init_mask = affine_init_mask_edu
+        if edu_affine_init_mask is not None and edu_fit_mask is not None:
+            edu_affine_init_mask = edu_affine_init_mask[edu_fit_mask]
+        brdu_affine_init_mask = affine_init_mask_brdu
+        if brdu_affine_init_mask is not None and brdu_fit_mask is not None:
+            brdu_affine_init_mask = brdu_affine_init_mask[brdu_fit_mask]
+
         edu_model = BatchAwareGMM1D(
             n_components=int(args.n_components_1d),
             affine=str(args.batchaware1d_affine),
+            variance=str(args.batchaware1d_variance),
             reg_covar=float(args.reg_covar),
             max_iter=int(args.max_iter),
             tol=float(args.tol),
@@ -2571,12 +2993,16 @@ def main() -> int:
             X[:, 0],
             batch_codes.astype(np.int64, copy=False),
             ref_batch=ref_idx,
+            init=str(args.edu_init),
+            hard=edu_hard,
             learn_affine=bool(args.learn_affine),
-            affine_init_mask=affine_init_mask_edu,
+            affine_init_mask=edu_affine_init_mask,
+            fit_mask=edu_fit_mask,
         )
         brdu_model = BatchAwareGMM1D(
             n_components=int(args.n_components_1d),
             affine=str(args.batchaware1d_affine),
+            variance=str(args.batchaware1d_variance),
             reg_covar=float(args.reg_covar),
             max_iter=int(args.max_iter),
             tol=float(args.tol),
@@ -2590,28 +3016,49 @@ def main() -> int:
             X[:, 1],
             batch_codes.astype(np.int64, copy=False),
             ref_batch=ref_idx,
+            init=str(args.brdu_init),
+            hard=brdu_hard,
             learn_affine=bool(args.learn_affine),
-            affine_init_mask=affine_init_mask_brdu,
+            affine_init_mask=brdu_affine_init_mask,
+            fit_mask=brdu_fit_mask,
         )
 
         resp_edu = edu_model.predict_proba(X[:, 0], batch_codes.astype(np.int64, copy=False))
         resp_brdu = brdu_model.predict_proba(X[:, 1], batch_codes.astype(np.int64, copy=False))
 
-        edu_pos_comps = _select_pos_components_1d(
-            mu=edu_model.mu_,
-            pi=edu_model.pi_,
-            mode=str(args.edu_pos_mode),
-            topk=int(args.edu_pos_topk),
-        )
-        brdu_pos_comps = _select_pos_components_1d(
-            mu=brdu_model.mu_,
-            pi=brdu_model.pi_,
-            mode=str(args.brdu_pos_mode),
-            topk=int(args.brdu_pos_topk),
-        )
+        if str(args.edu_pos_mode) == "manual_match":
+            if edu_hard is None:
+                raise ValueError("--edu-pos-mode manual_match requires edu_pos (do not set --no-benchmark-manual).")
+            edu_pos_comps = _select_pos_components_1d_by_manual(resp=resp_edu, hard=edu_hard.astype(np.int8, copy=False))
+        else:
+            edu_pos_comps = _select_pos_components_1d(
+                mu=edu_model.mu_,
+                pi=edu_model.pi_,
+                mode=str(args.edu_pos_mode),
+                topk=int(args.edu_pos_topk),
+            )
+
+        if str(args.brdu_pos_mode) == "manual_match":
+            if brdu_hard is None:
+                raise ValueError("--brdu-pos-mode manual_match requires brdu_pos (do not set --no-benchmark-manual).")
+            brdu_pos_comps = _select_pos_components_1d_by_manual(
+                resp=resp_brdu, hard=brdu_hard.astype(np.int8, copy=False)
+            )
+        else:
+            brdu_pos_comps = _select_pos_components_1d(
+                mu=brdu_model.mu_,
+                pi=brdu_model.pi_,
+                mode=str(args.brdu_pos_mode),
+                topk=int(args.brdu_pos_topk),
+            )
 
         pE_raw = resp_edu[:, edu_pos_comps].sum(axis=1).astype(np.float64, copy=False)
         pB_raw = resp_brdu[:, brdu_pos_comps].sum(axis=1).astype(np.float64, copy=False)
+
+        if bool(args.calibrate_to_manual) and (bool(args.calibrate_to_xmin) or bool(args.calibrate_to_xrange)):
+            raise ValueError("--calibrate-to-manual cannot be combined with x-anchored calibration flags.")
+        if bool(args.calibrate_to_xmin) and bool(args.calibrate_to_xrange):
+            raise ValueError("--calibrate-to-xmin and --calibrate-to-xrange are mutually exclusive.")
 
         if bool(args.calibrate_to_manual):
             if bool(args.no_benchmark_manual) or edu_hard is None or brdu_hard is None:
@@ -2620,17 +3067,31 @@ def main() -> int:
                     "because calibration requires edu_pos/brdu_pos."
                 )
 
+            edu_mask = edu_fit_mask if edu_fit_mask is not None else None
+            brdu_mask = brdu_fit_mask if brdu_fit_mask is not None else None
+
+            pE_in = pE_raw
+            if edu_mask is not None:
+                pE_in = np.asarray(pE_in, dtype=np.float64).copy()
+                pE_in[~edu_mask] = 0.0
+            pB_in = pB_raw
+            if brdu_mask is not None:
+                pB_in = np.asarray(pB_in, dtype=np.float64).copy()
+                pB_in[~brdu_mask] = 0.0
+
             pE, shiftE = _calibrate_prob_logit_shift_by_batch(
-                p=pE_raw,
+                p=pE_in,
                 hard=edu_hard.astype(np.int8, copy=False),
                 batch_idx=batch_codes.astype(np.int64, copy=False),
                 n_batches=len(batch_levels_str),
+                mask=edu_mask,
             )
             pB, shiftB = _calibrate_prob_logit_shift_by_batch(
-                p=pB_raw,
+                p=pB_in,
                 hard=brdu_hard.astype(np.int8, copy=False),
                 batch_idx=batch_codes.astype(np.int64, copy=False),
                 n_batches=len(batch_levels_str),
+                mask=brdu_mask,
             )
 
             calib_rows: list[dict[str, object]] = []
@@ -2663,9 +3124,134 @@ def main() -> int:
                     }
                 )
             _write_tsv(cache_dir / "batchaware_1d_calibration_by_batch.tsv", pd.DataFrame(calib_rows))
+        elif bool(args.calibrate_to_xmin):
+            if not math.isfinite(float(args.edu_xmin)) or not math.isfinite(float(args.brdu_xmin)):
+                raise ValueError("--edu-xmin and --brdu-xmin must be finite when --calibrate-to-xmin is set.")
+
+            edu_mask = edu_fit_mask if edu_fit_mask is not None else None
+            brdu_mask = brdu_fit_mask if brdu_fit_mask is not None else None
+
+            pE, shiftE = _calibrate_prob_logit_shift_to_xmin_by_batch(
+                p=pE_raw,
+                x=X[:, 0],
+                batch_idx=batch_codes.astype(np.int64, copy=False),
+                n_batches=len(batch_levels_str),
+                x_min=float(args.edu_xmin),
+                nearest_k=int(args.xmin_nearest_k),
+                mask=edu_mask,
+            )
+            pB, shiftB = _calibrate_prob_logit_shift_to_xmin_by_batch(
+                p=pB_raw,
+                x=X[:, 1],
+                batch_idx=batch_codes.astype(np.int64, copy=False),
+                n_batches=len(batch_levels_str),
+                x_min=float(args.brdu_xmin),
+                nearest_k=int(args.xmin_nearest_k),
+                mask=brdu_mask,
+            )
+
+            rows: list[dict[str, object]] = []
+            for b, name in enumerate(batch_levels_str):
+                idx_b = batch_codes == b
+                if not np.any(idx_b):
+                    continue
+                rows.append(
+                    {
+                        "batch_idx": int(b),
+                        "batch": str(name),
+                        "channel": "edu",
+                        "method": "logit_shift_floor_xmin",
+                        "xmin": float(args.edu_xmin),
+                        "raw_mean": float(np.mean(pE_raw[idx_b])),
+                        "cal_mean": float(np.mean(pE[idx_b])),
+                        "param": float(shiftE[b]),
+                    }
+                )
+                rows.append(
+                    {
+                        "batch_idx": int(b),
+                        "batch": str(name),
+                        "channel": "brdu",
+                        "method": "logit_shift_floor_xmin",
+                        "xmin": float(args.brdu_xmin),
+                        "raw_mean": float(np.mean(pB_raw[idx_b])),
+                        "cal_mean": float(np.mean(pB[idx_b])),
+                        "param": float(shiftB[b]),
+                    }
+                )
+            _write_tsv(cache_dir / "batchaware_1d_xmin_calibration_by_batch.tsv", pd.DataFrame(rows))
+        elif bool(args.calibrate_to_xrange):
+            if not math.isfinite(float(args.edu_xmin)) or not math.isfinite(float(args.edu_xmax)):
+                raise ValueError("--edu-xmin and --edu-xmax must be finite when --calibrate-to-xrange is set.")
+            if not math.isfinite(float(args.brdu_xmin)) or not math.isfinite(float(args.brdu_xmax)):
+                raise ValueError("--brdu-xmin and --brdu-xmax must be finite when --calibrate-to-xrange is set.")
+
+            edu_mask = edu_fit_mask if edu_fit_mask is not None else None
+            brdu_mask = brdu_fit_mask if brdu_fit_mask is not None else None
+
+            pE, shiftE = _calibrate_prob_logit_shift_to_xrange_by_batch(
+                p=pE_raw,
+                x=X[:, 0],
+                batch_idx=batch_codes.astype(np.int64, copy=False),
+                n_batches=len(batch_levels_str),
+                x_min=float(args.edu_xmin),
+                x_max=float(args.edu_xmax),
+                nearest_k=int(args.xmin_nearest_k),
+                mask=edu_mask,
+            )
+            pB, shiftB = _calibrate_prob_logit_shift_to_xrange_by_batch(
+                p=pB_raw,
+                x=X[:, 1],
+                batch_idx=batch_codes.astype(np.int64, copy=False),
+                n_batches=len(batch_levels_str),
+                x_min=float(args.brdu_xmin),
+                x_max=float(args.brdu_xmax),
+                nearest_k=int(args.xmin_nearest_k),
+                mask=brdu_mask,
+            )
+
+            rows: list[dict[str, object]] = []
+            for b, name in enumerate(batch_levels_str):
+                idx_b = batch_codes == b
+                if not np.any(idx_b):
+                    continue
+                rows.append(
+                    {
+                        "batch_idx": int(b),
+                        "batch": str(name),
+                        "channel": "edu",
+                        "method": "logit_shift_xrange",
+                        "xmin": float(args.edu_xmin),
+                        "xmax": float(args.edu_xmax),
+                        "raw_mean": float(np.mean(pE_raw[idx_b])),
+                        "cal_mean": float(np.mean(pE[idx_b])),
+                        "param": float(shiftE[b]),
+                    }
+                )
+                rows.append(
+                    {
+                        "batch_idx": int(b),
+                        "batch": str(name),
+                        "channel": "brdu",
+                        "method": "logit_shift_xrange",
+                        "xmin": float(args.brdu_xmin),
+                        "xmax": float(args.brdu_xmax),
+                        "raw_mean": float(np.mean(pB_raw[idx_b])),
+                        "cal_mean": float(np.mean(pB[idx_b])),
+                        "param": float(shiftB[b]),
+                    }
+                )
+            _write_tsv(cache_dir / "batchaware_1d_xrange_calibration_by_batch.tsv", pd.DataFrame(rows))
         else:
             pE = pE_raw
             pB = pB_raw
+
+        if edu_fit_mask is not None:
+            pE = np.asarray(pE, dtype=np.float64).copy()
+            pE[~edu_fit_mask] = 0.0
+        if brdu_fit_mask is not None:
+            pB = np.asarray(pB, dtype=np.float64).copy()
+            pB[~brdu_fit_mask] = 0.0
 
         pi_11 = (pB * pE).astype(np.float64, copy=False)
         pi_10 = (pB * (1.0 - pE)).astype(np.float64, copy=False)
@@ -2796,14 +3382,30 @@ def main() -> int:
         "edu_col": args.edu_col,
         "brdu_col": args.brdu_col,
         "batch_col": args.batch_col,
+        "n_components_1d": int(args.n_components_1d) if model_kind == "independent1d" else 0,
         "edu_pos_topk": int(args.edu_pos_topk) if model_kind == "independent1d" else 0,
         "brdu_pos_topk": int(args.brdu_pos_topk) if model_kind == "independent1d" else 0,
         "edu_pos_mode": str(args.edu_pos_mode) if model_kind == "independent1d" else "",
         "brdu_pos_mode": str(args.brdu_pos_mode) if model_kind == "independent1d" else "",
+        "batchaware1d_affine": str(args.batchaware1d_affine) if model_kind == "independent1d" else "",
+        "batchaware1d_variance": str(args.batchaware1d_variance) if model_kind == "independent1d" else "",
+        "edu_zero_policy": str(args.edu_zero_policy) if model_kind == "independent1d" else "",
+        "brdu_zero_policy": str(args.brdu_zero_policy) if model_kind == "independent1d" else "",
+        "edu_init": str(args.edu_init) if model_kind == "independent1d" else "",
+        "brdu_init": str(args.brdu_init) if model_kind == "independent1d" else "",
         "pi_mode_1d": "global" if model_kind == "independent1d" else "",
         "covariance": str(args.covariance),
         "manual_supervision": bool(args.manual_supervision),
         "calibrate_to_manual": bool(model_kind == "independent1d" and bool(args.calibrate_to_manual)),
+        "calibrate_to_xmin": bool(model_kind == "independent1d" and bool(args.calibrate_to_xmin)),
+        "calibrate_to_xrange": bool(model_kind == "independent1d" and bool(args.calibrate_to_xrange)),
+        "edu_xmin": float(args.edu_xmin) if (model_kind == "independent1d" and bool(args.calibrate_to_xmin)) else float("nan"),
+        "brdu_xmin": float(args.brdu_xmin) if (model_kind == "independent1d" and bool(args.calibrate_to_xmin)) else float("nan"),
+        "edu_xmax": float(args.edu_xmax) if (model_kind == "independent1d" and bool(args.calibrate_to_xrange)) else float("nan"),
+        "brdu_xmax": float(args.brdu_xmax) if (model_kind == "independent1d" and bool(args.calibrate_to_xrange)) else float("nan"),
+        "xmin_nearest_k": int(args.xmin_nearest_k)
+        if (model_kind == "independent1d" and (bool(args.calibrate_to_xmin) or bool(args.calibrate_to_xrange)))
+        else 0,
         "manual_group_cols": args.manual_group_cols if args.manual_supervision else "",
         "edu_pos_col": args.edu_pos_col if args.manual_supervision else "",
         "brdu_pos_col": args.brdu_pos_col if args.manual_supervision else "",

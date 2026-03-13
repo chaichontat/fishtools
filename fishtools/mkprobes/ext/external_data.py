@@ -2,7 +2,6 @@
 import gzip
 import json
 import re
-from collections.abc import Callable
 from functools import cache
 from io import StringIO
 from itertools import chain
@@ -36,6 +35,13 @@ def get_ensembl(path: Path | str, id_: str, overwrite: bool = False):
     res.raise_for_status()
     p.write_text(json.dumps(j := res.json(), indent=2))
     return j
+
+
+def _strip_version_suffix(token: str) -> str:
+    head, dot, tail = token.rpartition(".")
+    if dot and tail.isdigit():
+        return head
+    return token
 
 
 class MockGTF:
@@ -133,12 +139,12 @@ class ExternalData:
         - This mode is intended for scenarios where only FASTA access is needed, or
           GTF data is managed externally.
 
-    - **FASTA Key Function (`fasta_key_func`)**:
+    - **FASTA Key Function (`fasta_key_regex`)**:
         - This function normalizes sequence headers from the FASTA file to generate
           keys for sequence lookup (e.g., extracting transcript IDs).
         - The default function captures the first word.
         - If your FASTA headers have a different format, you MUST provide a custom
-          `fasta_key_func` to ensure IDs match those used/derived from the GTF.
+          `fasta_key_regex` to ensure IDs match those used/derived from the GTF.
           Mismatched keys will lead to `KeyError` or `ValueError` when fetching sequences.
 
     - **Required GTF Attributes**:
@@ -183,7 +189,7 @@ class ExternalData:
             fasta: Path to the FASTA file.
             gtf_path: Path to the GTF file. Optional if cache exists or only FASTA access is needed.
             regen_cache: If True, forces re-parsing of the GTF file and overwrites the cache.
-            fasta_key_func: Function to extract a lookup key from FASTA headers.
+            fasta_key_regex: Regex used to extract a lookup key from FASTA headers.
             bowtie2_index: Optional explicit name for the Bowtie2 index files (stem).
             kmer18: Optional explicit name for the 18-mer Jellyfish output file.
         """
@@ -191,7 +197,13 @@ class ExternalData:
 
         self.key_regex = fasta_key_regex
         regex = re.compile(fasta_key_regex)
-        self.key_func: Callable[[str], str] = lambda x: match.group(1) if (match := regex.match(x)) else x
+
+        def key_func(value: str) -> str:
+            match = regex.match(value)
+            token = (match.group(1) if match else value).strip()
+            return _strip_version_suffix(token)
+
+        self.key_func = key_func
 
         try:
             self.fa = pyfastx.Fasta(Path(fasta).as_posix(), key_func=self.key_func)
@@ -531,17 +543,19 @@ class ExternalData:
                     f"Could not convert {eid} from transcript_name to transcript_id. Trying to get the sequence directly."
                 )
 
-        try:
-            res = self.fa[eid].seq
-        except KeyError:
+        eid_key = self.key_func(eid)
+        keys = (eid_key,) if eid_key == eid else (eid_key, eid)
+        for key in keys:
             try:
-                res = self.fa[eid].seq
+                res = self.fa[key].seq
+                break
             except KeyError:
-                raise ValueError(f"Could not find {eid} in fasta file.")
+                continue
+        else:
+            raise ValueError(f"Could not find {eid} in fasta file.")
 
         if not res:
             raise ValueError(f"Could not find {eid}")
-        print(f"Found {eid} in fasta file.")
         return res
 
     def filter_gene(self, gene: str) -> pl.DataFrame:

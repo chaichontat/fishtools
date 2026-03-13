@@ -227,6 +227,7 @@ def test_preprocess_status_ccf_tracks_imagej_pipeline(tmp_path: Path) -> None:
 
     (ccf_root / f"{roi}.syn.h5ad").touch()
     (ccf_root / f"{roi}.syn.annotated.h5ad").touch()
+    (ccf_root / f"{roi}.syn.annotated.princurve.h5ad").touch()
 
     runner = CliRunner()
     result = runner.invoke(status_cmd, [str(workspace), "--ccf", "--json"])
@@ -243,6 +244,7 @@ def test_preprocess_status_ccf_tracks_imagej_pipeline(tmp_path: Path) -> None:
     assert roi_payload["imagej_roi"]["complete"] is True
     assert roi_payload["warp_h5ad"]["complete"] is True
     assert roi_payload["filter_h5ad"]["complete"] is True
+    assert roi_payload["princurve_h5ad"]["complete"] is True
 
 
 def test_preprocess_status_ccf_imagej_stale_only_vs_tileconfig(tmp_path: Path) -> None:

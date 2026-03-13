@@ -10,6 +10,16 @@ import numpy as np
 import pandas as pd
 
 
+def _dataset_animal(dataset: str) -> str:
+    import re
+
+    m = re.search(r"(jaxa\d+)", str(dataset), flags=re.IGNORECASE)
+    if m is None:
+        raise ValueError(f"Cannot infer animal from dataset={dataset!r} (expected contains 'JaxA#').")
+    s = m.group(1)
+    return s[0].upper() + s[1:]
+
+
 def _load_tricycle_ref(path: pathlib.Path) -> pd.DataFrame:
     trc = pd.read_csv(path)
     required = {"symbol", "pc1.rot", "pc2.rot"}
@@ -178,7 +188,10 @@ def _residualize_matrix_within_dataset(X: np.ndarray, sin_t: np.ndarray, cos_t: 
 def _stable_hash_u64(dataset: np.ndarray, obs_name: np.ndarray) -> np.ndarray:
     ds = dataset.astype(str)
     on = obs_name.astype(str)
-    s = pd.Series([f"{d}|{o}" for d, o in zip(ds.tolist(), on.tolist(), strict=True)], copy=False)
+    s = pd.Series(
+        [f"{d}|{o}|{i}" for i, (d, o) in enumerate(zip(ds.tolist(), on.tolist(), strict=True))],
+        copy=False,
+    )
     return pd.util.hash_pandas_object(s, index=False).to_numpy(np.uint64, copy=False)
 
 
@@ -314,6 +327,7 @@ def _mh_ds_contrib(
     n_leiden: int,
     theta_bins: int,
     cc: float,
+    keep_strata: np.ndarray | None = None,
 ) -> MhDsContrib:
     # a,b,c,d per stratum (no cc)
     g = G.astype(float, copy=False)
@@ -325,6 +339,11 @@ def _mh_ds_contrib(
     d0 = np.bincount(stratum_idx, weights=(1.0 - g) * y0, minlength=int(n_strata)).astype(np.float64, copy=False)
     n0 = a0 + b0 + c0 + d0
     keep = n0 > 0
+    if keep_strata is not None:
+        keep_strata = np.asarray(keep_strata, dtype=bool)
+        if keep_strata.shape != (int(n_strata),):
+            raise ValueError(f"keep_strata must have shape (n_strata,), got {keep_strata.shape}")
+        keep = keep & keep_strata
     if not np.any(keep):
         return MhDsContrib(delta=float("nan"), R_by_ds=np.zeros(int(n_datasets)), S_by_ds=np.zeros(int(n_datasets)))
 
@@ -350,37 +369,68 @@ def _mh_ds_contrib(
 
 
 def _bootstrap_ci_from_ds_contrib(
-    contrib: MhDsContrib, *, rng: np.random.Generator, n_boot: int
+    contrib: MhDsContrib,
+    *,
+    rng: np.random.Generator,
+    n_boot: int,
+    group_of_ds: np.ndarray | None = None,
 ) -> tuple[float, float]:
-    present = (contrib.R_by_ds + contrib.S_by_ds) > 0
-    ds_present = np.flatnonzero(present)
-    if ds_present.size == 0:
+    if group_of_ds is not None:
+        group_of_ds = np.asarray(group_of_ds, dtype=int)
+        if group_of_ds.shape != contrib.R_by_ds.shape:
+            raise ValueError("group_of_ds must have shape (n_datasets,).")
+        n_groups = int(group_of_ds.max()) + 1
+        R = np.bincount(group_of_ds, weights=contrib.R_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        S = np.bincount(group_of_ds, weights=contrib.S_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+    else:
+        R, S = contrib.R_by_ds, contrib.S_by_ds
+
+    present = (R + S) > 0
+    groups_present = np.flatnonzero(present)
+    if groups_present.size == 0:
         return (float("nan"), float("nan"))
     boots = np.empty(int(n_boot), dtype=np.float64)
     for i in range(int(n_boot)):
-        samp = rng.choice(ds_present, size=ds_present.size, replace=True)
-        Rb = float(contrib.R_by_ds[samp].sum())
-        Sb = float(contrib.S_by_ds[samp].sum())
+        samp = rng.choice(groups_present, size=groups_present.size, replace=True)
+        Rb = float(R[samp].sum())
+        Sb = float(S[samp].sum())
         boots[i] = float(math.log(Rb / Sb))
     lo, hi = np.nanquantile(boots, [0.025, 0.975])
     return (float(lo), float(hi))
 
 
 def _bootstrap_ci_for_delta_diff(
-    c1: MhDsContrib, c2: MhDsContrib, *, rng: np.random.Generator, n_boot: int
+    c1: MhDsContrib,
+    c2: MhDsContrib,
+    *,
+    rng: np.random.Generator,
+    n_boot: int,
+    group_of_ds: np.ndarray | None = None,
 ) -> tuple[float, float, float]:
     # Bootstrap datasets with shared resamples to preserve covariance between the two deltas.
-    present = (c1.R_by_ds + c1.S_by_ds + c2.R_by_ds + c2.S_by_ds) > 0
-    ds_present = np.flatnonzero(present)
-    if ds_present.size == 0:
+    if group_of_ds is not None:
+        group_of_ds = np.asarray(group_of_ds, dtype=int)
+        if group_of_ds.shape != c1.R_by_ds.shape:
+            raise ValueError("group_of_ds must have shape (n_datasets,).")
+        n_groups = int(group_of_ds.max()) + 1
+        R1 = np.bincount(group_of_ds, weights=c1.R_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        S1 = np.bincount(group_of_ds, weights=c1.S_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        R2 = np.bincount(group_of_ds, weights=c2.R_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        S2 = np.bincount(group_of_ds, weights=c2.S_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+    else:
+        R1, S1, R2, S2 = c1.R_by_ds, c1.S_by_ds, c2.R_by_ds, c2.S_by_ds
+
+    present = (R1 + S1 + R2 + S2) > 0
+    groups_present = np.flatnonzero(present)
+    if groups_present.size == 0:
         return (float("nan"), float("nan"), float("nan"))
 
     d_point = float(c1.delta - c2.delta)
     boots = np.empty(int(n_boot), dtype=np.float64)
     for i in range(int(n_boot)):
-        samp = rng.choice(ds_present, size=ds_present.size, replace=True)
-        d1 = float(math.log(float(c1.R_by_ds[samp].sum()) / float(c1.S_by_ds[samp].sum())))
-        d2 = float(math.log(float(c2.R_by_ds[samp].sum()) / float(c2.S_by_ds[samp].sum())))
+        samp = rng.choice(groups_present, size=groups_present.size, replace=True)
+        d1 = float(math.log(float(R1[samp].sum()) / float(S1[samp].sum())))
+        d2 = float(math.log(float(R2[samp].sum()) / float(S2[samp].sum())))
         boots[i] = d1 - d2
     lo, hi = np.nanquantile(boots, [0.025, 0.975])
     return (d_point, float(lo), float(hi))
@@ -437,6 +487,18 @@ def main() -> None:
         help="CSV with columns gene,q.",
     )
     ap.add_argument("--tricycle-ref-csv", type=pathlib.Path, default=pathlib.Path("neuroRef.csv"))
+    ap.add_argument(
+        "--theta-exclude-genes",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Exclude these genes from the tricycle reference set when computing theta (theta-leakage sensitivity).",
+    )
+    ap.add_argument(
+        "--theta-exclude-tested-genes",
+        action="store_true",
+        help="Exclude all tested gate genes (from --genes-csv) from the tricycle reference when computing theta.",
+    )
     ap.add_argument("--theta-bins", type=int, default=12)
     ap.add_argument(
         "--theta-bin-mode",
@@ -446,6 +508,20 @@ def main() -> None:
         help="Theta binning: quantile within (dataset×leiden) vs fixed absolute angular bins.",
     )
     ap.add_argument("--n-bootstrap", type=int, default=300)
+    ap.add_argument(
+        "--bootstrap-unit",
+        type=str,
+        choices=["dataset", "animal"],
+        default="dataset",
+        help="Resampling unit for MH uncertainty: dataset bootstrap (default) vs animal bootstrap (more conservative if datasets nest within animals).",
+    )
+    ap.add_argument(
+        "--no-theta-matching",
+        dest="theta_matching",
+        action="store_false",
+        help="Ablation: disable theta-bin matching (strata become dataset×leiden only).",
+    )
+    ap.set_defaults(theta_matching=True)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cc", type=float, default=0.5)
     ap.add_argument("--pearson-theta", type=float, default=100.0, help="Pearson residual theta (NB overdispersion).")
@@ -456,6 +532,35 @@ def main() -> None:
         help="Clip Pearson residuals to +/-clip; use 'none' to disable clipping.",
     )
     ap.add_argument("--pearson-block-size", type=int, default=64)
+    ap.add_argument(
+        "--no-gate-theta-residualize",
+        dest="gate_theta_residualize",
+        action="store_false",
+        help="Ablation: do not residualize gate scores against sin/cos(theta) within dataset before thresholding.",
+    )
+    ap.set_defaults(gate_theta_residualize=True)
+    ap.add_argument(
+        "--no-support-filter",
+        dest="support_filter",
+        action="store_false",
+        help=(
+            "Disable gene×dataset support filtering. By default, for each gene we exclude datasets where the "
+            "gate selects zero detected (raw>0) gate+ cells, to avoid manufacturing gate+ cells for all-zero genes."
+        ),
+    )
+    ap.set_defaults(support_filter=True)
+    ap.add_argument(
+        "--support-min-detected",
+        type=int,
+        default=1,
+        help="Per gene×dataset: minimum number of detected (raw>0) cells required to include a dataset.",
+    )
+    ap.add_argument(
+        "--support-min-detected-gatepos",
+        type=int,
+        default=1,
+        help="Per gene×dataset: minimum number of detected (raw>0) cells among gate+ required to include a dataset.",
+    )
     ap.add_argument(
         "--outdir",
         type=pathlib.Path,
@@ -495,22 +600,53 @@ def main() -> None:
     lei_code, lei_uniq = pd.factorize(leiden, sort=True)
     n_datasets = int(ds_uniq.size)
     n_leiden = int(lei_uniq.size)
-
-    trc = _load_tricycle_ref(args.tricycle_ref_csv.expanduser())
-    theta = _compute_tricycle_theta(adata, trc=trc, dataset=dataset)
-    n_strata = n_datasets * int(args.theta_bins) * n_leiden
-
-    if str(args.theta_bin_mode) == "quantile":
-        # Shared theta-bin edges across all endpoints (per dataset×leiden), matching legacy behavior.
-        edges = _theta_edges_by_dataset_leiden(theta, ds_code, lei_code, n_bins=int(args.theta_bins))
-        theta_bin_shared = _assign_theta_bins_from_edges(theta, ds_code, lei_code, edges, n_bins=int(args.theta_bins))
+    animal_by_ds = np.array([_dataset_animal(d) for d in ds_uniq.tolist()], dtype=object)
+    animal_code_by_ds, _animal_uniq = pd.factorize(animal_by_ds, sort=True)
+    if str(args.bootstrap_unit) == "animal":
+        bootstrap_group_of_ds = animal_code_by_ds.astype(np.int32, copy=False)
+        bootstrap_unit = "animal"
     else:
-        # Fixed absolute angular bins: ensure "theta_bin=k" refers to the same geometric interval across datasets.
-        t = (theta.astype(np.float64, copy=False) + (2.0 * np.pi)) % (2.0 * np.pi)
-        w = (2.0 * np.pi) / float(int(args.theta_bins))
-        theta_bin_shared = np.clip(np.floor(t / w), 0, int(args.theta_bins) - 1).astype(np.int16, copy=False)
+        bootstrap_group_of_ds = None
+        bootstrap_unit = "dataset"
 
-    stratum_idx_all = (ds_code * int(args.theta_bins) + theta_bin_shared.astype(int)) * n_leiden + lei_code
+    theta_bins_used = int(args.theta_bins) if bool(args.theta_matching) else 1
+    n_strata = n_datasets * int(theta_bins_used) * n_leiden
+
+    need_theta = bool(args.theta_matching) or bool(args.gate_theta_residualize)
+    if need_theta:
+        trc = _load_tricycle_ref(args.tricycle_ref_csv.expanduser())
+        exclude = {str(x) for x in (args.theta_exclude_genes or []) if str(x).strip()}
+        if bool(args.theta_exclude_tested_genes):
+            exclude |= {str(g) for g in genes}
+        if exclude:
+            trc = trc.loc[~trc["symbol"].isin(sorted(exclude))].copy()
+        theta = _compute_tricycle_theta(adata, trc=trc, dataset=dataset)
+    else:
+        theta = np.zeros(dataset.shape[0], dtype=np.float32)
+
+    if bool(args.theta_matching):
+        if str(args.theta_bin_mode) == "quantile":
+            # Shared theta-bin edges across all endpoints (per dataset×leiden), matching legacy behavior.
+            edges = _theta_edges_by_dataset_leiden(theta, ds_code, lei_code, n_bins=int(args.theta_bins))
+            theta_bin_shared = _assign_theta_bins_from_edges(
+                theta, ds_code, lei_code, edges, n_bins=int(args.theta_bins)
+            )
+        else:
+            # Fixed absolute angular bins: ensure "theta_bin=k" refers to the same geometric interval across datasets.
+            t = (theta.astype(np.float64, copy=False) + (2.0 * np.pi)) % (2.0 * np.pi)
+            w = (2.0 * np.pi) / float(int(args.theta_bins))
+            theta_bin_shared = np.clip(np.floor(t / w), 0, int(args.theta_bins) - 1).astype(np.int16, copy=False)
+    else:
+        theta_bin_shared = np.zeros(theta.shape[0], dtype=np.int16)
+
+    stratum_idx_all = (ds_code * int(theta_bins_used) + theta_bin_shared.astype(int)) * n_leiden + lei_code
+    ds_of_stratum = (np.arange(int(n_strata), dtype=np.int64) // (int(theta_bins_used) * int(n_leiden))).astype(
+        np.int32, copy=False
+    )
+
+    present_B1 = np.bincount(stratum_idx_all[brdu == 1], minlength=int(n_strata)).astype(np.int64, copy=False)
+    present_B0 = np.bincount(stratum_idx_all[brdu == 0], minlength=int(n_strata)).astype(np.int64, copy=False)
+    keep_overlap = (present_B1 > 0) & (present_B0 > 0)
 
     X_raw = _raw_counts_for_genes(adata, genes=genes)
     X = _pearson_residuals_by_dataset(
@@ -522,16 +658,19 @@ def main() -> None:
         clip=pearson_clip,
         block_size=int(args.pearson_block_size),
     )
-    sin_t = np.sin(theta).astype(np.float32, copy=False)
-    cos_t = np.cos(theta).astype(np.float32, copy=False)
-    R = _residualize_matrix_within_dataset(X, sin_t=sin_t, cos_t=cos_t, dataset=dataset)
+    if bool(args.gate_theta_residualize):
+        sin_t = np.sin(theta).astype(np.float32, copy=False)
+        cos_t = np.cos(theta).astype(np.float32, copy=False)
+        R = _residualize_matrix_within_dataset(X, sin_t=sin_t, cos_t=cos_t, dataset=dataset)
+    else:
+        R = X
     h = _stable_hash_u64(dataset, obs_name)
     jitter = ((h & np.uint64(0xFFFFFFFF)).astype(np.float64) / float(2**32)) - 0.5
     Gmat = _make_gates_by_dataset_quantile_exact(R, dataset=dataset, q_by_gene=q_by_gene, jitter=jitter)
 
     # Endpoint definitions.
     endpoints = [
-        ("BrdUplus_Edu", brdu == 1, edu),  # A vs B within BrdU+
+        ("BrdUplus_Edu", brdu == 1, edu),  # q11 vs q10 within BrdU+
         ("Eduplus_BrdU", edu == 1, brdu),  # A vs C within EdU+
         ("BrdUminus_Edu", brdu == 0, edu),  # C vs D within BrdU-
         ("EdUminus_BrdU", edu == 0, brdu),  # B vs D within EdU-
@@ -540,8 +679,38 @@ def main() -> None:
     rows: list[dict[str, object]] = []
     for j, g in enumerate(genes):
         G = Gmat[:, j]
-        row: dict[str, object] = {"gene": g, "q": float(q_by_gene[j])}
+        row: dict[str, object] = {
+            "gene": g,
+            "q": float(q_by_gene[j]),
+            "bootstrap_unit": bootstrap_unit,
+            "theta_matching_enabled": bool(args.theta_matching),
+            "theta_bin_mode": str(args.theta_bin_mode),
+            "theta_bins_used": int(theta_bins_used),
+            "gate_theta_residualize_enabled": bool(args.gate_theta_residualize),
+        }
+
+        xg = X_raw[:, j]
+        detected = (xg > 0).astype(np.int64, copy=False)
+        n_detect_by_ds = np.bincount(ds_code, weights=detected, minlength=int(n_datasets)).astype(np.int64, copy=False)
+        n_detect_gatepos_by_ds = np.bincount(
+            ds_code, weights=detected * G.astype(np.int64, copy=False), minlength=int(n_datasets)
+        ).astype(np.int64, copy=False)
+        if bool(args.support_filter):
+            ds_keep = (n_detect_by_ds >= int(args.support_min_detected)) & (
+                n_detect_gatepos_by_ds >= int(args.support_min_detected_gatepos)
+            )
+        else:
+            ds_keep = np.ones(int(n_datasets), dtype=bool)
+        keep_strata_gene = ds_keep[ds_of_stratum]
+        keep_overlap_gene = keep_overlap & keep_strata_gene
+        row["support_filter_enabled"] = bool(args.support_filter)
+        row["support_min_detected"] = int(args.support_min_detected)
+        row["support_min_detected_gatepos"] = int(args.support_min_detected_gatepos)
+        row["support_n_datasets_kept"] = int(np.sum(ds_keep))
+        row["support_n_datasets_dropped"] = int(int(n_datasets) - int(np.sum(ds_keep)))
+
         contribs: dict[str, MhDsContrib] = {}
+        contribs_ov: dict[str, MhDsContrib] = {}
         for name, cohort, y_all in endpoints:
             sidx = stratum_idx_all[cohort]
             c = _mh_ds_contrib(
@@ -551,12 +720,27 @@ def main() -> None:
                 n_strata=n_strata,
                 n_datasets=n_datasets,
                 n_leiden=n_leiden,
-                theta_bins=int(args.theta_bins),
+                theta_bins=int(theta_bins_used),
                 cc=float(args.cc),
+                keep_strata=keep_strata_gene,
             )
-            lo, hi = _bootstrap_ci_from_ds_contrib(c, rng=rng, n_boot=int(args.n_bootstrap))
+            c_ov = _mh_ds_contrib(
+                stratum_idx=sidx,
+                G=G[cohort],
+                y=y_all[cohort],
+                n_strata=n_strata,
+                n_datasets=n_datasets,
+                n_leiden=n_leiden,
+                theta_bins=int(theta_bins_used),
+                cc=float(args.cc),
+                keep_strata=keep_overlap_gene,
+            )
+            lo, hi = _bootstrap_ci_from_ds_contrib(
+                c, rng=rng, n_boot=int(args.n_bootstrap), group_of_ds=bootstrap_group_of_ds
+            )
             mh = Mh(delta=float(c.delta), lo=float(lo), hi=float(hi))
             contribs[name] = c
+            contribs_ov[name] = c_ov
             row[f"delta_{name}"] = float(mh.delta)
             row[f"ci_low_{name}"] = float(mh.lo)
             row[f"ci_high_{name}"] = float(mh.hi)
@@ -567,7 +751,11 @@ def main() -> None:
         # Three-way interaction (ratio of odds ratios) estimands.
         # δ_int,E = δ(EdU | BrdU+) - δ(EdU | BrdU-)
         d_int_E, loE, hiE = _bootstrap_ci_for_delta_diff(
-            contribs["BrdUplus_Edu"], contribs["BrdUminus_Edu"], rng=rng, n_boot=int(args.n_bootstrap)
+            contribs["BrdUplus_Edu"],
+            contribs["BrdUminus_Edu"],
+            rng=rng,
+            n_boot=int(args.n_bootstrap),
+            group_of_ds=bootstrap_group_of_ds,
         )
         row["delta_int_E"] = float(d_int_E)
         row["ci_low_int_E"] = float(loE)
@@ -576,9 +764,27 @@ def main() -> None:
         row["Ts_ci_low_int_E"] = float(math.exp(loE))
         row["Ts_ci_high_int_E"] = float(math.exp(hiE))
 
+        d_int_E_ov, loE_ov, hiE_ov = _bootstrap_ci_for_delta_diff(
+            contribs_ov["BrdUplus_Edu"],
+            contribs_ov["BrdUminus_Edu"],
+            rng=rng,
+            n_boot=int(args.n_bootstrap),
+            group_of_ds=bootstrap_group_of_ds,
+        )
+        row["delta_int_E_overlap"] = float(d_int_E_ov)
+        row["ci_low_int_E_overlap"] = float(loE_ov)
+        row["ci_high_int_E_overlap"] = float(hiE_ov)
+        row["Ts_fold_int_E_overlap"] = float(math.exp(d_int_E_ov)) if math.isfinite(d_int_E_ov) else float("nan")
+        row["Ts_ci_low_int_E_overlap"] = float(math.exp(loE_ov)) if math.isfinite(loE_ov) else float("nan")
+        row["Ts_ci_high_int_E_overlap"] = float(math.exp(hiE_ov)) if math.isfinite(hiE_ov) else float("nan")
+
         # δ_int,B = δ(BrdU | EdU+) - δ(BrdU | EdU-)
         d_int_B, loB, hiB = _bootstrap_ci_for_delta_diff(
-            contribs["Eduplus_BrdU"], contribs["EdUminus_BrdU"], rng=rng, n_boot=int(args.n_bootstrap)
+            contribs["Eduplus_BrdU"],
+            contribs["EdUminus_BrdU"],
+            rng=rng,
+            n_boot=int(args.n_bootstrap),
+            group_of_ds=bootstrap_group_of_ds,
         )
         row["delta_int_B"] = float(d_int_B)
         row["ci_low_int_B"] = float(loB)

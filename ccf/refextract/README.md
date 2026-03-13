@@ -286,6 +286,53 @@ the AP/ML overlays remain visible as a raster overlay while path tracing runs.
 If you get a JSON parse error that starts with `<!doctype html>`, the assets URL is wrong and Vite returned `index.html`
 instead of `manifest.json`. Use the URL above, or an absolute `/@fs/.../threejs_unfold` path.
 
+### Three.js ijk point-cloud viewer (global cloud)
+
+For principal-curve outputs mapped into 3D `ijk` space (`midline_normal`), use:
+
+1) Export static viewer assets:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python ccf/refextract/export_ijk_threejs_assets.py \
+  --summary-json results/refextract/princurve_h5ad_ijk_plot/phase1_summary.json \
+  --output-dir results/refextract/princurve_h5ad_ijk_plot/threejs_ijk_assets \
+  --max-points 1500000 --seed 0
+```
+
+2) Run the viewer:
+
+```bash
+cd ccf/refextract/threejs_ijk_viewer
+npm install
+npm run dev
+```
+
+3) Open with exported assets:
+
+```text
+http://localhost:5173/?assets=/@fs/home/chaichontat/fishtools2/results/refextract/princurve_h5ad_ijk_plot/threejs_ijk_assets
+```
+
+This viewer is intentionally minimal in v1: one global cloud, colored by `r_um` / `t_lookup` / axis.
+
+If the exported `manifest.json` includes `leiden` assets, the viewer enables a `leiden` color mode and
+defaults to it on load.
+
+To visualize the aggregated dataset in `~/nvme/all.h5ad` colored by `obs['leiden']` (with 3D `ijk` in `obsm['ijk']`):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python ccf/refextract/export_all_h5ad_threejs_assets.py \
+  --h5ad ~/nvme/all.h5ad \
+  --output-dir results/refextract/all_h5ad_threejs_ijk_assets \
+  --max-points 1500000 --seed 0
+```
+
+Then open:
+
+```text
+http://localhost:5173/?assets=/@fs/home/chaichontat/fishtools2/results/refextract/all_h5ad_threejs_ijk_assets
+```
+
 Notes:
 
 - In `*midline_columns.csv`, **`t` is `t_all`**: normalized along-midline arc-length on the full representative path (`[0,1]`; not the volumetric depth field `halfway_u_3d_ds.npy`).

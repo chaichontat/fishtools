@@ -4,6 +4,7 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 
@@ -12,21 +13,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from ccf.refextract.plot_ap_ml_heatmap import compute_ap_ml_native_grid_details
-from ccf.refextract.plot_ap_ml_heatmap import compute_ap_ml_support_mask_neomeso_on_native_grid
-from fishtools.ccf.transforms import build_apml_native_surface_projection_context
-from fishtools.gam.io_helpers import safe_gene_name
-from fishtools.gam.mgcv_predict import RPredictor
-from fishtools.gam.native_surface_plotting import _mask_r_ap_ml_pair_by_support
-from fishtools.gam.native_surface_plotting import plot_coronal_surface_projection
-from fishtools.gam.native_surface_plotting import write_apml_native_proj_montage
-from fishtools.gam.surface_predict import GAMPredictorConfig
-from fishtools.gam.surface_predict import make_newdata_for_fit
-
+from ccf.refextract.plot_ap_ml_heatmap import compute_ap_ml_support_mask_native_grid
+from fishtools.ccf.native_surface_plotting import (
+    _mask_r_ap_ml_pair_by_support,
+    build_apml_native_surface_projection_context,
+    plot_coronal_surface_projection,
+    write_apml_native_proj_montage,
+)
 
 PNG_NAME = "fit_ap_ml_native_proj_simplex_u.png"
 MONTAGE_NAME = "montage_fit_ap_ml_native_proj_simplex_u.png"
 APMLR_PNG_NAME = "fit_ap_r_ml_r_simplex_u.png"
+
+
+def safe_gene_name(gene: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in gene)
 
 
 def _load_meta(meta_path: Path) -> dict[str, object]:
@@ -265,7 +266,7 @@ def _convex_hull_path(ap: np.ndarray, ml: np.ndarray):
 
 def _predict_link_no_re(
     *,
-    predictor: RPredictor,
+    predictor: Any,
     fit,
     newdata: pd.DataFrame,
     exclude_terms: tuple[str, ...] = ("s(animal)", "s(ab)"),
@@ -311,6 +312,8 @@ def _predict_link_excluding_terms(
 
 
 def main() -> int:
+    from scripts.gam.plot_significant_gams import RPredictor
+
     p = argparse.ArgumentParser(description="Plot logistic-normal (ALR) simplex topic fits on native projection.")
     p.add_argument("panel_dir", type=Path, help="Panel directory containing cells.tsv and simplex_meta.json.")
     p.add_argument("--meta", type=Path, default=None, help="Path to simplex_meta.json (default: <panel_dir>/simplex_meta.json).")
@@ -451,14 +454,14 @@ def main() -> int:
         roll_deg=float(args.roll_deg),
     )
 
-    support_flat = np.asarray(surface_ctx["support_flat"], dtype=bool).reshape(-1)
-    neomeso_flat = np.asarray(surface_ctx["neomeso_flat"], dtype=bool).reshape(-1)
+    support_flat = np.asarray(surface_ctx.support_flat, dtype=bool).reshape(-1)
+    neomeso_flat = np.asarray(surface_ctx.neomeso_flat, dtype=bool).reshape(-1)
     predict_mask = support_flat & (neomeso_flat if bool(args.restrict_t_neomeso) else True)
     if not np.any(predict_mask):
         raise ValueError("No vertices available for prediction after applying support masks")
 
-    ap_flat = np.asarray(surface_ctx["ap_um_flat"], dtype=np.float64).reshape(-1)
-    ml_flat = np.asarray(surface_ctx["ml_um_flat"], dtype=np.float64).reshape(-1)
+    ap_flat = np.asarray(surface_ctx.ap_um_flat, dtype=np.float64).reshape(-1)
+    ml_flat = np.asarray(surface_ctx.ml_um_flat, dtype=np.float64).reshape(-1)
     ap_s = ap_flat[predict_mask]
     ml_s = ml_flat[predict_mask]
 
@@ -704,15 +707,7 @@ def main() -> int:
             tri_alpha = hull_fade_alpha + (1.0 - hull_fade_alpha) * inside_t
         plot_coronal_surface_projection(
             vals_all,
-            x2d=x2d,
-            y2d=y2d,
-            z2d=z2d,
-            x3d=x3d,
-            y3d=y3d,
-            z3d=z3d,
-            faces=faces,
-            tri_support=tri_support,
-            tri_neomeso=tri_neomeso,
+            context=surface_ctx,
             restrict_t_neomeso=bool(args.restrict_t_neomeso),
             gray_context=bool(args.gray_context),
             latlon=bool(args.latlon),
@@ -721,12 +716,6 @@ def main() -> int:
             lon_stride=int(args.lon_stride),
             max_lat_lines=int(args.max_lat_lines),
             max_lon_lines=int(args.max_lon_lines),
-            vertex_support=support_flat,
-            vertex_neomeso=neomeso_flat,
-            vertex_ap_um=ap_flat,
-            vertex_ml_um=ml_flat,
-            n_rows=n_rows,
-            n_cols=n_cols,
             shade=False,
             shade_strength=0.75,
             shade_elev_deg=float(args.elev_deg),
@@ -750,15 +739,7 @@ def main() -> int:
         ncols=max(1, min(int(args.montage_cols), len(gene_values))),
         suptitle="Simplex topic model (logistic-normal)",
         scale_bar=str(args.montage_scale_bar),
-        x2d=x2d,
-        y2d=y2d,
-        z2d=z2d,
-        x3d=x3d,
-        y3d=y3d,
-        z3d=z3d,
-        faces=faces,
-        tri_support=tri_support,
-        tri_neomeso=tri_neomeso,
+        context=surface_ctx,
         restrict_t_neomeso=bool(args.restrict_t_neomeso),
         gray_context=bool(args.gray_context),
         latlon=bool(args.latlon),
@@ -767,17 +748,10 @@ def main() -> int:
         lon_stride=int(args.lon_stride),
         max_lat_lines=int(args.max_lat_lines),
         max_lon_lines=int(args.max_lon_lines),
-        vertex_support=support_flat,
-        vertex_neomeso=neomeso_flat,
-        vertex_ap_um=ap_flat,
-        vertex_ml_um=ml_flat,
-        n_rows=n_rows,
-        n_cols=n_cols,
         shade=False,
         shade_strength=0.75,
         shade_elev_deg=float(args.elev_deg),
         shade_azim_deg=float(args.azim_deg),
-        ordered_geometry=ordered_geom,
         cmap=cmap,
         cbar_label="predicted loading (simplex)",
         cbar_ticks=None,
@@ -801,7 +775,7 @@ def main() -> int:
                 float(args.refextract_res_ijk_um[2]),
             )
         )
-        apml_native_grid = compute_ap_ml_native_grid_details(
+        ap_grid, ml_grid, apml_support_mask = compute_ap_ml_support_mask_native_grid(
             outdir=Path(args.refextract_outdir).expanduser(),
             slice_i_min=int(args.refextract_slice_i_min),
             slice_i_max=int(args.refextract_slice_i_max),
@@ -812,14 +786,20 @@ def main() -> int:
             res_ijk_um=refextract_res_ijk_um,
             restrict_t_neomeso=False,
         )
-        ap_grid = np.asarray(apml_native_grid.ap_um, dtype=float)
-        ml_grid = np.asarray(apml_native_grid.ml_um, dtype=float)
-        apml_support_mask = np.asarray(apml_native_grid.support_mask, dtype=bool)
         if bool(args.restrict_t_neomeso):
-            apml_support_mask = compute_ap_ml_support_mask_neomeso_on_native_grid(
+            _ap_grid_neomeso, _ml_grid_neomeso, apml_support_mask = compute_ap_ml_support_mask_native_grid(
                 outdir=Path(args.refextract_outdir).expanduser(),
-                grid=apml_native_grid,
+                slice_i_min=int(args.refextract_slice_i_min),
+                slice_i_max=int(args.refextract_slice_i_max),
+                n_t=int(args.refextract_n_t),
+                n_ml=int(args.apml_n),
+                ref_t=float(args.refextract_ref_t),
+                band_frac=float(args.refextract_band_frac),
+                res_ijk_um=refextract_res_ijk_um,
+                restrict_t_neomeso=True,
             )
+            if not np.allclose(ap_grid, _ap_grid_neomeso) or not np.allclose(ml_grid, _ml_grid_neomeso):
+                raise ValueError("Neomeso support grid does not match the base AP/ML grid.")
 
         j_ml0 = int(np.nanargmin(np.abs(ml_grid - float(ml0))))
         i_ap0 = int(np.nanargmin(np.abs(ap_grid - float(ap0))))

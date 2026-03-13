@@ -7,32 +7,41 @@ import numpy as np
 import polars as pl
 from shapely.geometry import MultiPolygon, Polygon
 
-from fishtools.segment.overlay_spots import (
-    assign_spots_to_polygons,
-    build_spatial_index,
-    extract_polygons_from_roifile,
-)
-from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.io.workspace import Workspace
+
+# )
 from fishtools.utils.utils import noglobal
 
-roi = "big"
-path = Path(f"/working/20250612_ebe00219_3/analysis/deconv/ficture--{roi}")
+# from fishtools.segment.overlay_spots import (
+    # assign_spots_to_polygons,
+    # build_spatial_index,
+    # extract_polygons_from_roifile,
+
+roi = "4"
+stitch_codebook = "cs_base"
+spots_codebook = stitch_codebook
+
+ws = Workspace("/home/chaichontat/nvme/20251005_JaxA3_Coro2")
+
+ficture_root = ws.output / "ficture"
+path = ficture_root / roi
 path.mkdir(exist_ok=True, parents=True)
+spots_parquet = ws.spots_parquet(roi, spots_codebook, must_exist=True)
 dfs = [
-    pl.scan_parquet(path.parent.as_posix() + f"/{roi}*.parquet").collect().with_row_index("idx")
+    pl.scan_parquet(str(spots_parquet)).collect().with_row_index("idx")
     # .filter(pl.col("y").is_between(-7500, 0)),
     # pl.read_parquet("/mnt/working/e155trcdeconv/registered--leftold/tricycleplus/spots.parquet"),
 ]
 
 
-tc = TileConfiguration.from_file(path.parent / f"stitch--{roi}" / "TileConfiguration.registered.txt")
+tc = ws.tileconfig(roi)
 coords = tc.df
 x_offset = coords["x"].min()
 y_offset = coords["y"].min()
 
-rois = extract_polygons_from_roifile(path.parent / f"stitch--{roi}+edu/RoiSet.zip", 0, 0.5)
+# rois = extract_polygons_from_roifile(ws.stitch(roi, stitch_codebook) / "RoiSet.zip", 0, 0.5)
 
-tree, idxs = build_spatial_index(rois, 0)
+# tree, idxs = build_spatial_index(rois, 0)
 df = (
     pl.concat(dfs)
     .with_columns(x_adj=pl.col("x") - x_offset, y_adj=pl.col("y") - y_offset)
@@ -40,48 +49,48 @@ df = (
 )
 
 
+# # %%
+# path_subsetted = path / "whitebody.parquet"
+# if not path_subsetted.exists():
+#     assigned = assign_spots_to_polygons(df, tree, idxs, rois, 0)
+#     subsetted = assigned.join(df, "spot_id")
+#     subsetted.write_parquet(path_subsetted)
+# else:
+#     subsetted = pl.read_parquet(path / "whitebody.parquet")
+
+# subsetted = pl.scan_parquet(str(ficture_root / "*" / "whitebody.parquet")).collect()
+
 # %%
-path_subsetted = path / "whitebody.parquet"
-if not path_subsetted.exists():
-    assigned = assign_spots_to_polygons(df, tree, idxs, rois, 0)
-    subsetted = assigned.join(df, "spot_id")
-    subsetted.write_parquet(path_subsetted)
-else:
-    subsetted = pl.read_parquet(path / "whitebody.parquet")
+# import matplotlib.pyplot as plt  # noqa: E402
+# import seaborn as sns  # noqa: E402
 
-subsetted = pl.scan_parquet(f"{path.parent}/*/whitebody.parquet").collect()
+# sns.set_theme()
 
-# %%
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-sns.set_theme()
-
-fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
+# fig, ax = plt.subplots(figsize=(8, 6), dpi=200)
 
 
-for poly, meta in rois:
-    if poly.is_empty:
-        continue
+# for poly, meta in rois:
+#     if poly.is_empty:
+#         continue
 
-    def plot_poly_outline(p, ax):
-        x, y = p.exterior.xy
-        ax.plot(np.array(x), np.array(y), color="cyan", linewidth=0.7)
+#     def plot_poly_outline(p, ax):
+#         x, y = p.exterior.xy
+#         ax.plot(np.array(x), np.array(y), color="cyan", linewidth=0.7)
 
-    if isinstance(poly, Polygon):
-        plot_poly_outline(poly, ax)
-    elif isinstance(poly, MultiPolygon):
-        for p_geom in poly.geoms:
-            if isinstance(p_geom, Polygon):
-                plot_poly_outline(p_geom, ax)
+#     if isinstance(poly, Polygon):
+#         plot_poly_outline(poly, ax)
+#     elif isinstance(poly, MultiPolygon):
+#         for p_geom in poly.geoms:
+#             if isinstance(p_geom, Polygon):
+#                 plot_poly_outline(p_geom, ax)
 
 
-fig, ax = plt.subplots(figsize=(8, 6))
-ax.scatter(subsetted["x"][::10], subsetted["y"][::10], s=0.1, alpha=0.5)
+# fig, ax = plt.subplots(figsize=(8, 6))
+# ax.scatter(subsetted["x"][::10], subsetted["y"][::10], s=0.1, alpha=0.5)
 # ax.set_xlim(0, 18000)
 # ax.set_ylim(0, 18000)
-ax.set_aspect("equal")
-ax.invert_yaxis()
+# ax.set_aspect("equal")
+# ax.invert_yaxis()
 # subsetted.write_parquet(path / "whitebody.parquet")
 # %%
 
@@ -137,11 +146,6 @@ def run(path: Path, df: pl.DataFrame, z_range: tuple[int, int] | None = None):
         f.write(f"ymin\t{df['Y'].min()}\n")
         f.write(f"ymax\t{df['Y'].max()}\n")
 
-    batch_size = 100
-    batch_buff = 30
-    path_out = path / "batched.matrix.tsv.gz"
-    path_batch = path / "batched.matrix.tsv"
-
     subprocess.run(
         f"""ficture run_together \
 --in-tsv {path_ts.with_suffix(".tsv.gz")} \
@@ -150,10 +154,10 @@ def run(path: Path, df: pl.DataFrame, z_range: tuple[int, int] | None = None):
 --out-dir {path / "output"} \
 --n-jobs 16 \
 --gzip "pigz -p 4" \
---train-width 6 \
+--train-width 10 \
 --plot-each-factor \
 --major-axis Y \
---n-factor 25 \
+--n-factor 20 \
 --all""",
         shell=True,
         check=True,
@@ -166,7 +170,7 @@ def run(path: Path, df: pl.DataFrame, z_range: tuple[int, int] | None = None):
 with ThreadPoolExecutor(16) as exc:
     futs = []
     for i in range(1):  # z_range in z_ranges:
-        futs.append(exc.submit(run, path, subsetted, z_range=(10, 30)))
+        futs.append(exc.submit(run, path, df, z_range=(5, 34)))
 
     for f in as_completed(futs):
         f.result()

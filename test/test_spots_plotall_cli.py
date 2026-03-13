@@ -68,6 +68,53 @@ def test_spots_plotall_single_roi(tmp_path: Path) -> None:
     assert out_png.exists()
 
 
+def test_spots_plotall_genes_prefix_filter(tmp_path: Path) -> None:
+    _make_workspace(tmp_path, ["roiA"])  # ROI discovery
+    _write_parquet(tmp_path, "roiA", "cs_base")
+
+    runner = CliRunner()
+    res = runner.invoke(
+        spots_cli,
+        [
+            "plotall",
+            str(tmp_path),
+            "roiA",
+            "--codebook",
+            "cs-base",
+            "--threads",
+            "1",
+            "--genes",
+            "GeneA",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    out_png = tmp_path / "analysis" / "output" / "plots" / "plotall--roiA+cs_base--genes-GeneA.png"
+    assert out_png.exists()
+
+
+def test_spots_plotall_genes_prefix_filter_no_matches(tmp_path: Path) -> None:
+    _make_workspace(tmp_path, ["roiA"])  # ROI discovery
+    _write_parquet(tmp_path, "roiA", "cs_base")
+
+    runner = CliRunner()
+    res = runner.invoke(
+        spots_cli,
+        [
+            "plotall",
+            str(tmp_path),
+            "roiA",
+            "--codebook",
+            "cs-base",
+            "--threads",
+            "1",
+            "--genes",
+            "DoesNotExist",
+        ],
+    )
+    assert res.exit_code != 0
+    assert "No genes matched filters" in res.output
+
+
 def test_spots_plotall_use_raw_decoded(tmp_path: Path) -> None:
     _make_workspace(tmp_path, ["roiA"])  # ROI discovery
     _write_raw_decoded_parquet(tmp_path, "roiA", "cs-base")

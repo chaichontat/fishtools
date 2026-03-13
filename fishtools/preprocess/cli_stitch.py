@@ -1623,20 +1623,6 @@ def n4(
     show_default=True,
     help="Z/XY voxel-size ratio used to set sigma_z = highpass_px / anisotropy.",
 )
-@click.option(
-    "--perc-lo",
-    type=float,
-    default=1.0,
-    show_default=True,
-    help="Lower percentile for highpass quantization (0-100).",
-)
-@click.option(
-    "--perc-hi",
-    type=float,
-    default=99.999,
-    show_default=True,
-    help="Upper percentile for highpass quantization (0-100).",
-)
 @click.option("--overwrite", is_flag=True, help="Overwrite existing outputs.")
 @batch_roi("stitch--*", include_codebook=True, split_codebook=True)
 def highpass(
@@ -1646,8 +1632,6 @@ def highpass(
     *,
     highpass_px: float,
     anisotropy: float,
-    perc_lo: float,
-    perc_hi: float,
     overwrite: bool,
 ) -> None:
     """Write a high-pass filtered fused zarr as `fused_highpassed.zarr` (uint16)."""
@@ -1661,8 +1645,6 @@ def highpass(
             "codebook": codebook,
             "highpass_px": highpass_px,
             "anisotropy": anisotropy,
-            "perc_lo": perc_lo,
-            "perc_hi": perc_hi,
         },
     )
 
@@ -1670,8 +1652,6 @@ def highpass(
         raise click.ClickException("--anisotropy must be > 0.")
     if highpass_px <= 0:
         raise click.ClickException("--highpass-px must be > 0.")
-    if not (0.0 <= perc_lo < perc_hi <= 100.0):
-        raise click.ClickException("--perc-lo/--perc-hi must satisfy 0 <= perc_lo < perc_hi <= 100.")
 
     from fishtools.io.workspace import Workspace
     from fishtools.preprocess.highpass import run_highpass_workflow
@@ -1684,8 +1664,6 @@ def highpass(
             stitch_root=stitch_root,
             sigma_px=highpass_px,
             anisotropy=anisotropy,
-            percentile_lo=perc_lo,
-            percentile_hi=perc_hi,
             overwrite=overwrite,
         )
     except Exception as exc:

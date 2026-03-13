@@ -1,4 +1,5 @@
 # %%
+import hashlib
 import json
 import multiprocessing as mp
 import os
@@ -7,6 +8,7 @@ import random
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from datetime import timedelta
 from itertools import chain, groupby
@@ -23,7 +25,7 @@ import starfish
 import xarray as xr
 from loguru import logger
 from numpy.typing import NDArray
-from pydantic import BaseModel, TypeAdapter, field_validator
+from pydantic import BaseModel, TypeAdapter, ValidationError, field_validator
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -58,7 +60,7 @@ from fishtools.gpu.memory import release_all as _gpu_release_all
 from fishtools.io.workspace import CorruptedTiffError, Workspace, safe_imwrite
 from fishtools.preprocess.addition import ElementWiseAddition
 from fishtools.preprocess.cli_spotlook import threshold
-from fishtools.preprocess.config import OPTIMIZE_DECODE, SpotDecodeConfig
+from fishtools.preprocess.config import Config, OPTIMIZE_DECODE, SpotDecodeConfig
 from fishtools.preprocess.config_loader import load_config
 from fishtools.preprocess.simple_spots import simple, simple_batch
 from fishtools.preprocess.spots.align_batchoptimize import optimize
@@ -85,6 +87,122 @@ else:
 
 
 os.environ["TQDM_DISABLE"] = "1"
+
+
+@dataclass(frozen=True)
+class NormFieldCorrection:
+    gain: np.ndarray  # (grid_h, grid_w)
+    full_w: int
+    full_h: int
+    grid_w: int
+    grid_h: int
+
+    @classmethod
+    def from_dir(cls, path: Path) -> "NormFieldCorrection":
+        cfg_path = path / "run_config.json"
+        if not cfg_path.exists():
+            raise click.ClickException(
+                f"--norm-field-correction must point to an output directory from scripts/decoded_norm_field_correction.py "
+                f"(missing {cfg_path})"
+            )
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except Exception as e:
+            raise click.ClickException(f"Failed to read norm-field run_config.json at {cfg_path}: {e}") from e
+
+        tile_geom = cfg.get("tile_geom", {})
+        full_w = int(tile_geom.get("full_w"))
+        full_h = int(tile_geom.get("full_h"))
+        grid_w = int(cfg.get("grid_w"))
+        grid_h = int(cfg.get("grid_h"))
+        if full_w <= 0 or full_h <= 0 or grid_w <= 0 or grid_h <= 0:
+            raise click.ClickException(f"Invalid run_config.json contents at {cfg_path} (missing dims).")
+
+        gain_path = path / "gain.tif"
+        if not gain_path.exists():
+            raise click.ClickException(f"Missing gain map {gain_path}")
+        try:
+            with TiffFile(gain_path) as tif:
+                gain = tif.asarray()
+        except Exception as e:
+            raise click.ClickException(f"Failed to read gain map {gain_path}: {e}") from e
+
+        gain = np.asarray(gain, dtype=np.float32)
+        if gain.ndim != 2:
+            raise click.ClickException(f"Expected 2D gain map at {gain_path}, got shape={gain.shape}")
+        if gain.shape != (grid_h, grid_w):
+            raise click.ClickException(
+                f"Gain map shape mismatch at {gain_path}: expected {(grid_h, grid_w)}, got {gain.shape}"
+            )
+        return cls(gain=gain, full_w=full_w, full_h=full_h, grid_w=grid_w, grid_h=grid_h)
+
+
+def _slice_bounds(sl: slice, full: int) -> tuple[int, int]:
+    start = 0 if sl.start is None else int(sl.start)
+    stop = full if sl.stop is None else int(sl.stop)
+    if start < 0:
+        start += full
+    if stop < 0:
+        stop += full
+    start = max(0, min(full, start))
+    stop = max(0, min(full, stop))
+    if stop < start:
+        start, stop = stop, start
+    return start, stop
+
+
+def _gain_crop(field: NormFieldCorrection, *, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+    # Map full-res tile coordinates to gain grid bins, then broadcast into a crop array.
+    xs = np.arange(int(x0), int(x1), dtype=np.float32)
+    ys = np.arange(int(y0), int(y1), dtype=np.float32)
+    ix = np.floor(xs / float(field.full_w) * float(field.grid_w)).astype(np.int32)
+    iy = np.floor(ys / float(field.full_h) * float(field.grid_h)).astype(np.int32)
+    ix = np.clip(ix, 0, field.grid_w - 1)
+    iy = np.clip(iy, 0, field.grid_h - 1)
+    return field.gain[iy[:, None], ix[None, :]].astype(np.float32, copy=False)
+
+
+def _apply_norm_field_to_imagestack(
+    imgs: ImageStack, *, field: NormFieldCorrection, tile_shape_yx: tuple[int, int], spatial_slice: tuple[slice, slice]
+) -> None:
+    full_h = int(tile_shape_yx[0])
+    full_w = int(tile_shape_yx[1])
+    if full_w != field.full_w or full_h != field.full_h:
+        raise click.ClickException(
+            f"Norm-field correction tile size mismatch: correction expects {field.full_w}x{field.full_h}, "
+            f"but current tile is {full_w}x{full_h}."
+        )
+    y_sl, x_sl = spatial_slice
+    y0, y1 = _slice_bounds(y_sl, full_h)
+    x0, x1 = _slice_bounds(x_sl, full_w)
+    g = _gain_crop(field, y0=y0, y1=y1, x0=x0, x1=x1)
+    # Broadcast multiply across (r, c, z, y, x) or equivalent; rely on trailing y,x alignment.
+    imgs.xarray.values *= g  # type: ignore[assignment]
+
+
+def _resolve_percentiles_json(
+    *,
+    workspace_root: Path,
+    codebook_stem: str,
+    roi: str | None,
+    global_scale: Path | None,
+) -> Path:
+    candidates: list[Path] = []
+    if roi and roi not in {"*", "all"}:
+        candidates.append(workspace_root / f"opt_{codebook_stem}+{roi}" / "percentiles.json")
+    candidates.append(workspace_root / f"opt_{codebook_stem}" / "percentiles.json")
+    if global_scale is not None:
+        candidates.append(global_scale.parent / "percentiles.json")
+
+    for p in candidates:
+        if p.exists():
+            return p
+    joined = "\n  - ".join([c.as_posix() for c in candidates])
+    raise click.ClickException(
+        "Missing percentiles.json for ZeroByChannelMagnitude. "
+        "Run `preprocess spots find-threshold` (or `fishtools find-threshold`) first.\n"
+        f"Tried:\n  - {joined}"
+    )
 
 
 def _field_store_path(ws: Workspace, roi: str, codebook_label: str) -> Path:
@@ -529,6 +647,26 @@ def _setup_command_logging(
     setup_cli_logging(path, component=component, file=file_tag, debug=debug, extra=payload)
 
 
+def _load_project_config(json_config: Path | None) -> Config | None:
+    if json_config is None:
+        return None
+    try:
+        return load_config(json_config)
+    except (FileNotFoundError, ValueError, ValidationError) as e:
+        raise click.ClickException(f"Failed to load JSON config {json_config}: {e}") from e
+
+
+def _resolve_spot_decode_config(
+    decode: SpotDecodeConfig | None, *, json_config: Path | None
+) -> SpotDecodeConfig:
+    if decode is not None:
+        return decode
+    config = _load_project_config(json_config)
+    if config is None or config.spot_decode is None:
+        return SpotDecodeConfig()
+    return config.spot_decode
+
+
 def _batch(
     paths: list[Path],
     mode: str,
@@ -960,6 +1098,32 @@ def _sanitize_codebook_name(codebook: str) -> str:
     return codebook.replace("-", "_").replace(" ", "_")
 
 
+def _genes_prefixes_tag_body(prefixes: Sequence[str]) -> str:
+    cleaned: list[str] = []
+    for prefix in prefixes:
+        token = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix.strip())
+        if token:
+            cleaned.append(token)
+    if not cleaned:
+        return ""
+
+    joined = "_".join(cleaned)
+    if len(joined) <= 48:
+        return joined
+
+    digest = hashlib.sha1(joined.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned[0]}_{len(cleaned)}_{digest}"
+
+
+def _parse_genes_prefixes(opt: str | None) -> list[str] | None:
+    if opt is None:
+        return None
+    prefixes = [p.strip() for p in opt.split(",") if p.strip()]
+    if not prefixes:
+        raise click.BadParameter("--genes expects comma-separated gene name prefixes (e.g., GeneA,GeneB).")
+    return prefixes
+
+
 def _resolve_spots_parquet(base: Path, roi: str, codebook: str, *, use_raw_decoded: bool = False) -> Path:
     ws = Workspace(base)
     if use_raw_decoded:
@@ -987,6 +1151,7 @@ def _render_one_roi_plot(
     use_raw_decoded: bool = False,
     dark: bool = False,
     only_blank: bool = False,
+    genes_prefixes: list[str] | None = None,
     overwrite: bool = False,
     max_per_plot: int | None = None,
     figure_sizes: list[tuple[float, float]] | None = None,
@@ -1001,7 +1166,11 @@ def _render_one_roi_plot(
     """
     outdir.mkdir(parents=True, exist_ok=True)
     cb_s = _sanitize_codebook_name(codebook)
-    base_name = f"plotall--{roi}+{cb_s}{'--blank' if only_blank else ''}{'--dark' if dark else ''}"
+    genes_tag = ""
+    if genes_prefixes:
+        body = _genes_prefixes_tag_body(genes_prefixes)
+        genes_tag = f"--genes-{body}" if body else "--genes"
+    base_name = f"plotall--{roi}+{cb_s}{genes_tag}{'--blank' if only_blank else ''}{'--dark' if dark else ''}"
 
     spots_path = _resolve_spots_parquet(base, roi, codebook, use_raw_decoded=use_raw_decoded)
     spots_df = pl.read_parquet(spots_path)
@@ -1009,6 +1178,14 @@ def _render_one_roi_plot(
     genes = sorted(g for g in genes if isinstance(g, str))
     if only_blank:
         genes = [g for g in genes if g.startswith("Blank")]
+    if genes_prefixes:
+        genes = [g for g in genes if any(g.startswith(prefix) for prefix in genes_prefixes)]
+    if not genes:
+        raise ValueError(
+            f"No genes matched filters for roi='{roi}', codebook='{cb_s}' "
+            f"(only_blank={only_blank}, genes_prefixes={genes_prefixes})."
+        )
+    spots_df = spots_df.filter(pl.col("target").is_in(genes))
 
     outputs: list[Path] = []
     skipped = 0
@@ -1022,7 +1199,7 @@ def _render_one_roi_plot(
             skipped += 1
         else:
             size0 = figure_sizes[0] if figure_sizes else None
-            fig, _ = plot_all_genes(spots_df, dark=dark, only_blank=only_blank, figsize=size0, cmap=cmap)
+            fig, _ = plot_all_genes(spots_df, dark=dark, only_blank=False, figsize=size0, cmap=cmap)
             fig.tight_layout()
             fig.savefig(out_png.as_posix(), dpi=200, bbox_inches="tight")
             plt.close(fig)
@@ -1074,6 +1251,13 @@ def _render_one_roi_plot(
     is_flag=True,
     help="Plot only genes with names starting with 'Blank'.",
 )
+@click.option(
+    "--genes",
+    "genes_prefixes_opt",
+    type=str,
+    default=None,
+    help="Comma-separated gene name prefixes; only render genes whose names start with any prefix.",
+)
 @click.option("--dark", is_flag=True, help="Use dark background + magma colormap.")
 @click.option(
     "--outdir",
@@ -1114,6 +1298,7 @@ def plot_all_genes_cli(
     codebook_label: str,
     threads: int = 8,
     only_blank: bool = False,
+    genes_prefixes_opt: str | None = None,
     dark: bool = False,
     outdir: Path | None = None,
     overwrite: bool = False,
@@ -1130,16 +1315,22 @@ def plot_all_genes_cli(
     - Wildcard:   preprocess spots plotall /workspace * --codebook cs-base
     """
     cb_stem = Path(codebook_label).stem if Path(codebook_label).exists() else codebook_label
+    genes_prefixes = _parse_genes_prefixes(genes_prefixes_opt)
+    genes_tag_part = None
+    if genes_prefixes:
+        body = _genes_prefixes_tag_body(genes_prefixes)
+        genes_tag_part = f"genes-{body}" if body else "genes"
     _setup_command_logging(
         path,
         component="preprocess.spots.plotall",
-        file_tag=_make_tag("plotall", roi, cb_stem),
+        file_tag=_make_tag("plotall", roi, cb_stem, genes_tag_part),
         extra={
             "roi": roi,
             "codebook": cb_stem,
             "threads": threads,
             "overwrite": overwrite,
             "use_raw_decoded": use_raw_decoded,
+            "genes": genes_prefixes_opt,
         },
     )
     ws = Workspace(path)
@@ -1236,6 +1427,7 @@ def plot_all_genes_cli(
                         use_raw_decoded=use_raw_decoded,
                         dark=dark,
                         only_blank=only_blank,
+                        genes_prefixes=genes_prefixes,
                         overwrite=overwrite,
                         max_per_plot=mpp,
                         figure_sizes=fig_sizes,
@@ -1276,6 +1468,7 @@ def plot_all_genes_cli(
                         use_raw_decoded=use_raw_decoded,
                         dark=dark,
                         only_blank=only_blank,
+                        genes_prefixes=genes_prefixes,
                         overwrite=overwrite,
                         max_per_plot=mpp,
                         figure_sizes=fig_sizes,
@@ -1781,6 +1974,12 @@ def generate_subtraction_matrix(blanks: xr.DataArray, coefs: pl.DataFrame, keys:
     default=False,
     help="Apply illumination field correction using discovered TCYX field stores.",
 )
+@click.option(
+    "--norm-field-correction",
+    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Apply a decoded-norm-derived gain plane (output dir from scripts/decoded_norm_field_correction.py).",
+)
 @click.option("--simple", is_flag=True)
 @click.option("--roi", type=str, default=None)
 @click.option("--blank", type=str, default=None)
@@ -1808,6 +2007,7 @@ def run(
     blank: str | None = None,
     json_config: Path | None = None,
     field_correct: bool = False,
+    norm_field_correction: Path | None = None,
 ):
     """
     Run spot calling.
@@ -1838,21 +2038,18 @@ def run(
             "calc_deviations": calc_deviations,
             "blank": blank,
             "highpass_only": highpass_only,
+            "norm_field_correction": norm_field_correction.as_posix() if norm_field_correction else None,
         },
     )
 
     # Defaults for parameters now typically provided via JSON
     subsample_z: int = 1
 
-    # Merge project config if provided
-    config = None
+    decode = _resolve_spot_decode_config(decode, json_config=json_config)
+    if norm_field_correction is not None:
+        decode = decode.model_copy(update={"norm_field_correction_dir": norm_field_correction.as_posix()})
     if json_config is not None:
-        try:
-            config = load_config(json_config)
-        except Exception as e:
-            logger.warning(f"Failed to load JSON config {json_config}: {e}")
-
-        # Project config does not override runtime flags here
+        logger.debug(f"spot_decode from {json_config}: {decode.model_dump()}")
 
     if calc_deviations and round_num is None:
         raise ValueError("Round must be provided for calculating deviations.")
@@ -1886,20 +2083,15 @@ def run(
         path_pickle = _path_out / f"{path.stem}{f'-{split}' if split is not None else ''}.pkl"
 
     if not highpass_only and not calc_deviations and path_pickle.exists() and not overwrite:
-        logger.info(f"Skipping {path.name}. Already exists.")
+        split_msg = f" (split {split})" if split is not None else ""
+        logger.info(f"Skipping {path.name}{split_msg}. Already exists.")
         return
-
-    # Default decode config when not optimizing and not provided via JSON
-    if decode is None:
-        if config is not None and hasattr(config, "spot_decode"):
-            decode = config.spot_decode  # type: ignore[attr-defined]
-        else:
-            decode = SpotDecodeConfig()
 
     logger.info(f"Running {path.parent.name}/{path.name} {f'split {split}' if split is not None else ''}")
     with TiffFile(path) as tif:
         img_keys = tif.shaped_metadata[0]["key"]
         raw = tif.asarray()
+    tile_shape_yx = (int(raw.shape[-2]), int(raw.shape[-1]))
 
     bit_mapping = {str(k): i for i, k in enumerate(img_keys)}
 
@@ -1920,7 +2112,7 @@ def run(
     # blurred = levels(blurred)  # clip negative values to 0.
     # filtered = image - blurred
     split_slice = _run_spatial_slices(
-        raw.shape[-2:],
+        tile_shape_yx,
         split=split,
         optimize_crop=(calc_deviations or highpass_only),
     )
@@ -2082,20 +2274,31 @@ def run(
         # global_scale.unlink()
         raise ValueError("Scale factor dim mismatch. Deleted. Please rerun.")
 
-    # Zero out low norm
-    try:
-        perc = np.mean(
-            list(
-                json.loads(
-                    (
-                        path.parent.parent
-                        / f"opt_{codebook_path.stem}{f'+{roi}' if roi and roi != '*' else ''}/percentiles.json"
-                    ).read_text()
-                )[(round_num - 1) if round_num is not None and calc_deviations else -1].values()
-            )
+    norm_field: NormFieldCorrection | None = None
+    if decode.norm_field_correction_dir:
+        norm_field = NormFieldCorrection.from_dir(Path(decode.norm_field_correction_dir))
+        logger.info(f"Applying norm-field correction from {decode.norm_field_correction_dir}")
+        _apply_norm_field_to_imagestack(
+            imgs,
+            field=norm_field,
+            tile_shape_yx=tile_shape_yx,
+            spatial_slice=split_slice,
         )
-    except FileNotFoundError as e:
-        raise Exception("Please run `fishtools find-threshold` first.") from e
+
+    # Zero out low norm
+    percentiles_json = _resolve_percentiles_json(
+        workspace_root=path.parent.parent,
+        codebook_stem=codebook_path.stem,
+        roi=roi,
+        global_scale=global_scale,
+    )
+    perc = np.mean(
+        list(
+            json.loads(percentiles_json.read_text())[
+                (round_num - 1) if round_num is not None and calc_deviations else -1
+            ].values()
+        )
+    )
 
     z_filt = Filter.ZeroByChannelMagnitude(perc, normalize=False)
     imgs = z_filt.run(imgs)
@@ -2188,6 +2391,12 @@ def run(
         "fishtools_commit": git_hash(),
         "config": decode.model_dump(),
     }
+    if norm_field is not None:
+        meta["norm_field_correction"] = {
+            "dir": decode.norm_field_correction_dir,
+            "tile_size": [norm_field.full_h, norm_field.full_w],
+            "grid": [norm_field.grid_h, norm_field.grid_w],
+        }
 
     with path_pickle.open("wb") as f:
         pickle.dump((decoded_spots, morph, meta), f)
@@ -2257,6 +2466,12 @@ def parse_duration(duration_str: str) -> timedelta:
     default=False,
     help="Apply illumination field correction using discovered TCYX field stores.",
 )
+@click.option(
+    "--norm-field-correction",
+    type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Apply a decoded-norm-derived gain plane (output dir from scripts/decoded_norm_field_correction.py).",
+)
 def batch(
     path: Path,
     roi: str,
@@ -2274,6 +2489,7 @@ def batch(
     stagger: float = 0.0,
     stagger_jitter: float = 0.0,
     field_correct: bool = False,
+    norm_field_correction: Path | None = None,
 ):
     _setup_command_logging(
         path,
@@ -2398,6 +2614,7 @@ def batch(
                 f"--blank={blank}" if blank else "",
                 *(["--config", json_config.as_posix()] if json_config else []),
                 *(["--field-correct"] if field_correct else []),
+                *(["--norm-field-correction", norm_field_correction.as_posix()] if norm_field_correction else []),
             ],
             threads=threads,
             split=split,
@@ -2419,6 +2636,7 @@ def batch(
                 f"--blank={blank}" if blank else "",
                 *(["--config", json_config.as_posix()] if json_config else []),
                 *(["--field-correct"] if field_correct else []),
+                *(["--norm-field-correction", norm_field_correction.as_posix()] if norm_field_correction else []),
             ],
             threads=threads,
             split=split,

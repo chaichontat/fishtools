@@ -227,8 +227,17 @@ def _cellpose(model, image: np.ndarray, *, config: RunConfig):
         "invert": False,
     }
 
+    eval_image = image
+    backend_kwargs: dict[str, tuple[int, ...] | int]
+    if backend == "sam":
+        sam_channels = [c - 1 for c in config.channels]
+        eval_image = eval_image[:, sam_channels, :, :]
+        backend_kwargs = {"z_axis": 0}
+    else:
+        backend_kwargs = {"channels": config.channels}
+
     masks, flows, styles = model.eval(
-        image,#[:, :, :400, :1386],
+        eval_image,  # [:, :, :400, :1386],
         channel_axis=1,
         normalize=normalization,
         batch_size=1,
@@ -254,7 +263,7 @@ def _cellpose(model, image: np.ndarray, *, config: RunConfig):
         variance_alpha_cellprob=config.variance_alpha_cellprob,
         # bsize=224,
         # augment=True,
-        **({"channels": config.channels} if backend == "unet" else {"z_axis": 0}),
+        **backend_kwargs,
     )
 
     return masks, flows, styles

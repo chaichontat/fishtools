@@ -103,8 +103,6 @@ class Config:
     min_neg_cells: int
     min_datasets: int
     phase_matched: bool
-    phase_matched_method: str
-    phase_bins: int
     residual_block_size: int
     pearson_theta: float
     pearson_clip: float | None
@@ -139,24 +137,6 @@ def _parse_args() -> argparse.Namespace:
             "If set, define the gene gate on residualized expression after regressing log1p(raw) on "
             "sin(theta),cos(theta) within each dataset (tricycle-phase matched gating)."
         ),
-    )
-    p.add_argument(
-        "--phase-matched-method",
-        type=str,
-        choices=["residual", "stratified"],
-        default="residual",
-        help=(
-            "Only used when --phase-matched is set. "
-            "residual: gate on residualized expression (log1p(raw) residualized on sin/cos(theta)). "
-            "stratified: (DEPRECATED) gate within theta bins per dataset (forces uniform positives per bin). "
-            "This is not appropriate for zero-inflated targeted panels and is disabled in this pipeline."
-        ),
-    )
-    p.add_argument(
-        "--phase-bins",
-        type=int,
-        default=12,
-        help="Only used for --phase-matched-method=stratified (deprecated). Number of within-dataset theta bins.",
     )
     p.add_argument("--residual-block-size", type=int, default=64)
     p.add_argument("--pearson-theta", type=float, default=100.0, help="Pearson residual theta (NB overdispersion).")
@@ -558,49 +538,22 @@ def _run_mode_a(
         base_logloss = float(nll_base_sum / n_total)
 
         if cfg.phase_matched:
-            if cfg.phase_matched_method == "residual":
-                X_gate_q = _residualize_against_tricycle_within_dataset(
-                    X_pearson_q,
-                    tri_theta_q,
-                    ds_codes_q,
-                    n_datasets_q,
-                    block_size=cfg.residual_block_size,
-                )
-                gate_source = "resid_pearson_on_sin_cos_theta_within_dataset"
-            elif cfg.phase_matched_method == "stratified":
-                raise ValueError(
-                    "phase_matched_method='stratified' is disabled: it gates within each dataset×theta_bin, "
-                    "forcing uniform positives in bins where the gene is off (a real artifact in zero-inflated panels). "
-                    "Use phase_matched_method='residual' instead."
-                )
-            else:
-                raise ValueError(f"Unknown phase_matched_method={cfg.phase_matched_method!r}")
+            X_gate_q = _residualize_against_tricycle_within_dataset(
+                X_pearson_q,
+                tri_theta_q,
+                ds_codes_q,
+                n_datasets_q,
+                block_size=cfg.residual_block_size,
+            )
+            gate_source = "resid_pearson_on_sin_cos_theta_within_dataset"
         else:
             X_gate_q = X_pearson_q
             gate_source = "pearson"
 
-        # Precompute per-dataset thresholds for this q (used in all non-stratified cases).
-        thr = None
-        if not (cfg.phase_matched and cfg.phase_matched_method == "stratified"):
-            thr = np.zeros((n_datasets_q, var_names.size), dtype=np.float32)
-            for d in range(n_datasets_q):
-                sel = ds_codes_q == d
-                thr[d, :] = np.quantile(X_gate_q[sel, :], q, axis=0).astype(np.float32, copy=False)
-
-        # Precompute within-dataset theta bins for stratified gating.
-        phase_bin = None
-        if cfg.phase_matched and cfg.phase_matched_method == "stratified":
-            if int(cfg.phase_bins) < 2:
-                raise ValueError("phase_bins must be >= 2")
-            phase_bin = np.zeros(tri_theta_q.shape[0], dtype=np.int16)
-            edges = np.linspace(0.0, 1.0, int(cfg.phase_bins) + 1, dtype=np.float64)
-            for d in range(n_datasets_q):
-                sel = ds_codes_q == d
-                theta_d = np.asarray(tri_theta_q[sel], dtype=np.float64)
-                qs = np.quantile(theta_d, edges)
-                qs[0] = -np.inf
-                qs[-1] = np.inf
-                phase_bin[sel] = np.digitize(theta_d, qs[1:-1], right=False).astype(np.int16)
+        thr = np.zeros((n_datasets_q, var_names.size), dtype=np.float32)
+        for d in range(n_datasets_q):
+            sel = ds_codes_q == d
+            thr[d, :] = np.quantile(X_gate_q[sel, :], q, axis=0).astype(np.float32, copy=False)
 
         nll_gate_sum = np.zeros(var_names.size, dtype=np.float64)
         delta_pooled = np.zeros(var_names.size, dtype=np.float64)
@@ -612,33 +565,7 @@ def _run_mode_a(
         eta0_q_all = np.asarray(clf0_all.decision_function(X0_q), dtype=np.float64)
 
         for j in range(var_names.size):
-            if cfg.phase_matched and cfg.phase_matched_method == "stratified":
-                # Build a phase-stratified gate: within each dataset and theta-bin, take the top (1-q) fraction.
-                G = np.zeros(X_gate_q.shape[0], dtype=bool)
-                for d in range(n_datasets_q):
-                    ds_sel = ds_codes_q == d
-                    for b in range(int(cfg.phase_bins)):
-                        sel = ds_sel & (phase_bin == b)
-                        n = int(sel.sum())
-                        if n == 0:
-                            continue
-                        k = int(np.ceil((1.0 - q) * n))
-                        if k <= 0:
-                            continue
-                        if k >= n:
-                            G[sel] = True
-                            continue
-                        vals = np.asarray(X_gate_q[sel, j], dtype=np.float64)
-                        # Deterministic tie-breaking: add tiny increasing epsilon by local order.
-                        eps = (np.arange(n, dtype=np.float64) / float(n)) * 1e-6
-                        adj = vals + eps
-                        loc = np.flatnonzero(sel)
-                        pos_loc = loc[np.argpartition(adj, n - k)[n - k :]]
-                        G[pos_loc] = True
-            else:
-                if thr is None:
-                    raise RuntimeError("Internal error: thr is None in non-stratified gating.")
-                G = X_gate_q[:, j] >= thr[ds_codes_q, j]
+            G = X_gate_q[:, j] >= thr[ds_codes_q, j]
 
             # Enforce per-dataset min pos/neg (ties can break exact quantile fractions).
             ok = True
@@ -688,7 +615,7 @@ def _run_mode_a(
                 "quantile_q": q,
                 "gate_source": gate_source,
                 "phase_matched": bool(cfg.phase_matched),
-                "phase_matched_method": str(cfg.phase_matched_method),
+                "phase_matched_method": "residual",
                 "gene": var_names,
                 "in_tricycle_ref": in_tricycle_ref,
                 "base_logloss_LODO": base_logloss,
@@ -720,32 +647,7 @@ def _run_mode_a(
         for rank in range(min(int(top_forest_n), df_q.shape[0])):
             gene = str(df_q.loc[rank, "gene"])
             j = int(np.where(var_names == gene)[0][0])
-            if cfg.phase_matched and cfg.phase_matched_method == "stratified":
-                # Recompute G for this gene for diagnostics.
-                G = np.zeros(X_gate_q.shape[0], dtype=bool)
-                for d in range(n_datasets_q):
-                    ds_sel = ds_codes_q == d
-                    for b in range(int(cfg.phase_bins)):
-                        sel = ds_sel & (phase_bin == b)
-                        n = int(sel.sum())
-                        if n == 0:
-                            continue
-                        k = int(np.ceil((1.0 - q) * n))
-                        if k <= 0:
-                            continue
-                        if k >= n:
-                            G[sel] = True
-                            continue
-                        vals = np.asarray(X_gate_q[sel, j], dtype=np.float64)
-                        eps = (np.arange(n, dtype=np.float64) / float(n)) * 1e-6
-                        adj = vals + eps
-                        loc = np.flatnonzero(sel)
-                        pos_loc = loc[np.argpartition(adj, n - k)[n - k :]]
-                        G[pos_loc] = True
-            else:
-                if thr is None:
-                    raise RuntimeError("Internal error: thr is None in non-stratified diagnostics.")
-                G = X_gate_q[:, j] >= thr[ds_codes_q, j]
+            G = X_gate_q[:, j] >= thr[ds_codes_q, j]
 
             per_ds_rows: list[dict[str, object]] = []
             for d, ds_name in enumerate(ds_uniques_q):
@@ -837,8 +739,6 @@ def main() -> None:
         min_neg_cells=int(args.min_neg_cells),
         min_datasets=int(args.min_datasets),
         phase_matched=bool(args.phase_matched),
-        phase_matched_method=str(args.phase_matched_method),
-        phase_bins=int(args.phase_bins),
         residual_block_size=int(args.residual_block_size),
         pearson_theta=float(args.pearson_theta),
         pearson_clip=pearson_clip,

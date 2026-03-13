@@ -17,6 +17,7 @@ from skimage.filters import gaussian
 from skimage.transform import rotate
 
 from fishtools.preprocess.tileconfig import TileConfiguration
+from fishtools.segmentation.geojson import pixel_geojson_to_labels
 
 plt.rcParams["image.aspect"] = "equal"
 sns.set_theme()
@@ -43,44 +44,44 @@ except FileNotFoundError as e:
 # %%
 
 
-def get_new_dimensions(shape: tuple[int, int], angle_degrees: float) -> tuple[int, int]:
-    height, width = shape
-    # Convert degrees to radians
-    angle_rad = np.abs(np.deg2rad(angle_degrees))
+# def get_new_dimensions(shape: tuple[int, int], angle_degrees: float) -> tuple[int, int]:
+#     height, width = shape
+#     # Convert degrees to radians
+#     angle_rad = np.abs(np.deg2rad(angle_degrees))
 
-    # Calculate new width and height
-    new_width = np.ceil(width * np.abs(np.cos(angle_rad)) + height * np.abs(np.sin(angle_rad)))
-    new_height = np.ceil(width * np.abs(np.sin(angle_rad)) + height * np.abs(np.cos(angle_rad)))
+#     # Calculate new width and height
+#     new_width = np.ceil(width * np.abs(np.cos(angle_rad)) + height * np.abs(np.sin(angle_rad)))
+#     new_height = np.ceil(width * np.abs(np.sin(angle_rad)) + height * np.abs(np.cos(angle_rad)))
 
-    return (int(new_height), int(new_width))
+#     return (int(new_height), int(new_width))
 
 
-def rotate_points(spots: pl.DataFrame, deg: float, center: np.ndarray, *, divide: bool = True):
-    coords = spots[["x", "y"]].to_numpy()
+# def rotate_points(spots: pl.DataFrame, deg: float, center: np.ndarray, *, divide: bool = True):
+#     coords = spots[["x", "y"]].to_numpy()
 
-    θ = np.radians(deg)
-    c, s = np.cos(θ), np.sin(θ)
-    # Standard counterclockwise rotation matrix
-    rotation_matrix = np.array([[c, -s], [s, c]])
+#     θ = np.radians(deg)
+#     c, s = np.cos(θ), np.sin(θ)
+#     # Standard counterclockwise rotation matrix
+#     rotation_matrix = np.array([[c, -s], [s, c]])
 
-    # Center, rotate, and uncenter points
-    centered = coords - center
-    print(f"before")
-    print(f"x: {spots['x'].min()}, {spots['x'].max()}")
-    print(f"y: {spots['y'].min()}, {spots['y'].max()}")
-    print(center)
-    plt.scatter(coords[:, 0], coords[:, 1], s=0.05, alpha=0.1, label="before")
+#     # Center, rotate, and uncenter points
+#     centered = coords - center
+#     print(f"before")
+#     print(f"x: {spots['x'].min()}, {spots['x'].max()}")
+#     print(f"y: {spots['y'].min()}, {spots['y'].max()}")
+#     print(center)
+#     plt.scatter(coords[:, 0], coords[:, 1], s=0.05, alpha=0.1, label="before")
 
-    rotated = (centered @ rotation_matrix) + center
-    spots_rotated = spots.with_columns(x=rotated[:, 0], y=rotated[:, 1])
+#     rotated = (centered @ rotation_matrix) + center
+#     spots_rotated = spots.with_columns(x=rotated[:, 0], y=rotated[:, 1])
 
-    plt.scatter(spots_rotated["x"], spots_rotated["y"], s=0.1, alpha=0.5, label="after")
-    plt.gca().set_aspect("equal")
-    print("after")
-    print(f"x: {spots_rotated['x'].min()}, {spots_rotated['x'].max()}")
-    print(f"y: {spots_rotated['y'].min()}, {spots_rotated['y'].max()}")
-    plt.show()
-    return spots_rotated
+#     plt.scatter(spots_rotated["x"], spots_rotated["y"], s=0.1, alpha=0.5, label="after")
+#     plt.gca().set_aspect("equal")
+#     print("after")
+#     print(f"x: {spots_rotated['x'].min()}, {spots_rotated['x'].max()}")
+#     print(f"y: {spots_rotated['y'].min()}, {spots_rotated['y'].max()}")
+#     plt.show()
+#     return spots_rotated
 
 
 # %%
@@ -400,39 +401,11 @@ spots.select(x="x", y="y", z="z", gene=pl.col("target").str.split("-").list.get(
 )
 
 # %%
-import shapely
-
 geo = json.loads((path / "segmentation.cortex_polygons_3d.json").read_text())
 # %%
 it = iter(geo)
 for i in range(100):
     print(next(it))
-
-
-# %%
-import numpy as np
-from rasterio.features import rasterize
-from shapely.geometry import shape
-
-# def geojson_to_labels(geojson_data, width, height, bounds=None):
-#     # Create (geometry, id) pairs
-#     shapes = [
-#         (shape(feature["geometry"]), int(feature["id"].rsplit("-", 1)[1]))
-#         for feature in geojson_data["features"]
-#     ]
-
-
-def pixel_geojson_to_labels(geojson_data, width, height):
-    # Create (geometry, id) pairs, assuming coordinates are already pixels
-    shapes = [
-        (shape(feature["geometry"]), int(feature["id"].rsplit("-", 1)[1]))
-        for feature in geojson_data["features"]
-    ]
-
-    # Rasterize directly without transform
-    labels = rasterize(shapes, out_shape=(height, width), fill=0, dtype=np.uint32)
-
-    return labels
 
 
 labels = [

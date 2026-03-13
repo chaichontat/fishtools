@@ -88,6 +88,47 @@ class _DummyEmptyMaskAtlas:
         }
 
 
+class _ExplodingAtlas:
+    def __init__(self, _name: str) -> None:
+        raise AssertionError("BrainGlobeAtlas should not be constructed in --reference-only mode.")
+
+
+def test_export_mask_edit_pack_reference_only_does_not_require_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fishtools.ccf import cli_export_mask_edit_pack as export
+
+    monkeypatch.setattr(export, "BrainGlobeAtlas", _ExplodingAtlas)
+
+    roi = "2"
+    codebook = "pi"
+    workspace = _write_minimal_workspace(root=tmp_path / "ws", roi=roi, codebook=codebook, channels=[codebook, "c1", "c2"])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        export.main,
+        [
+            str(workspace),
+            roi,
+            "--run-dirname",
+            "test_run",
+            "--reference-only",
+            "--z-idx",
+            "0",
+            "--moving-pre-downsample",
+            "8",
+            "--target-spacing-um",
+            "2",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    out_dir = workspace / "analysis" / "output" / "ccf-transforms" / roi / "test_run" / "mask_edit"
+    assert (out_dir / "reference_slice_z0_ds8_target2um.png").exists()
+    assert not (out_dir / "warped_moving_z0_ds8_target2um.png").exists()
+    assert not (out_dir / "mask_z0_ds8_target2um.tif").exists()
+
+
 def test_export_mask_edit_pack_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ccf import ants_landmark_syn_init as syn
     from fishtools.ccf import cli_export_mask_edit_pack as export
@@ -149,8 +190,10 @@ def test_export_mask_edit_pack_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     out_dir = workspace / "analysis" / "output" / "ccf-transforms" / roi / "test_run" / "mask_edit"
     png = out_dir / "warped_moving_z0_ds8_target2um.png"
+    ref_png = out_dir / "reference_slice_z0_ds8_target2um.png"
     mask = out_dir / "mask_z0_ds8_target2um.tif"
     assert png.exists()
+    assert ref_png.exists()
     assert mask.exists()
 
     mask_yx = tifffile.imread(mask)
@@ -169,6 +212,10 @@ def test_export_mask_edit_pack_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert rgb[0, 0, 0] < rgb[inside, inside, 0]
     assert rgb[0, 0, 1] > rgb[inside, inside, 1]
     assert float(np.abs(rgb[inside, inside, 0] - rgb[inside, inside, 2])) > 1e-3
+
+    ref_yx = mpimg.imread(ref_png)
+    assert ref_yx.shape[0] == mask_yx.shape[0]
+    assert ref_yx.shape[1] == mask_yx.shape[1]
 
 
 def test_export_mask_edit_pack_skips_rois_without_a_mask(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -232,8 +279,10 @@ def test_export_mask_edit_pack_skips_rois_without_a_mask(tmp_path: Path, monkeyp
 
     out_dir = workspace / "analysis" / "output" / "ccf-transforms" / roi / "test_run" / "mask_edit"
     png = out_dir / "warped_moving_z0_ds8_target2um.png"
+    ref_png = out_dir / "reference_slice_z0_ds8_target2um.png"
     mask = out_dir / "mask_z0_ds8_target2um.tif"
     assert not png.exists()
+    assert not ref_png.exists()
     assert not mask.exists()
 
 
@@ -300,4 +349,5 @@ def test_export_mask_edit_pack_all_rois_skips_missing_run_dir(tmp_path: Path, mo
 
     out_dir = workspace / "analysis" / "output" / "ccf-transforms" / "2" / "test_run" / "mask_edit"
     assert (out_dir / "warped_moving_z0_ds8_target2um.png").exists()
+    assert (out_dir / "reference_slice_z0_ds8_target2um.png").exists()
     assert (out_dir / "mask_z0_ds8_target2um.tif").exists()

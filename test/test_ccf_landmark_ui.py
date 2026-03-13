@@ -32,6 +32,53 @@ def test_pick_atlas_slice_idx_returns_latest_slider_value(monkeypatch: pytest.Mo
     assert picker.idx == 7
 
 
+def test_pick_atlas_slice_idx_save_button_calls_callback_with_latest_idx(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fishtools.ccf.landmark_ui as ui
+
+    captured: dict[str, object] = {}
+    original_slider = ui.Slider
+    original_button = ui.Button
+
+    class CapturingSlider(original_slider):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            captured["slider"] = self
+
+    class CapturingButton(original_button):  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__(*args, **kwargs)
+            captured["button"] = self
+
+        def on_clicked(self, func):  # type: ignore[no-untyped-def]
+            captured["button_callback"] = func
+            return super().on_clicked(func)
+
+    saved: list[int] = []
+
+    def _on_save(idx: int) -> None:
+        saved.append(int(idx))
+
+    def _show() -> None:
+        slider = captured["slider"]
+        assert isinstance(slider, original_slider)
+        slider.set_val(5)
+
+        cb = captured.get("button_callback")
+        assert callable(cb)
+        cb(None)
+
+        fig = ui.plt.gcf()
+        ui.plt.close(fig)
+
+    monkeypatch.setattr(ui, "Slider", CapturingSlider)
+    monkeypatch.setattr(ui, "Button", CapturingButton)
+    monkeypatch.setattr(ui.plt, "show", _show)
+
+    atlas_reference = np.zeros((10, 8, 8), dtype=np.float32)
+    ui.pick_atlas_slice_idx(atlas_reference_zyx=atlas_reference, initial_idx=2, on_save=_on_save)
+    assert saved == [5]
+
+
 def test_pick_rotation_deg_returns_latest_slider_value(monkeypatch: pytest.MonkeyPatch) -> None:
     import fishtools.ccf.landmark_ui as ui
 
@@ -114,7 +161,7 @@ def test_pick_paired_landmarks_undo_button_click_removes_last_pair(monkeypatch: 
         assert callable(cb)
 
         # Axes order: fixed, moving, then the button axes.
-        ax_fixed, ax_moving, ax_undo, _ax_clear, _ax_save = fig.axes
+        ax_fixed, ax_moving, ax_undo, _ax_clear, _ax_save, _ax_toggle = fig.axes
 
         def click(inaxes, xdata: float | None = None, ydata: float | None = None) -> None:
             event = types.SimpleNamespace(button=1, inaxes=inaxes, xdata=xdata, ydata=ydata)
@@ -156,7 +203,7 @@ def test_pick_paired_landmarks_save_button_click_sets_status(monkeypatch: pytest
         cb = captured["button_press_event"]
         assert callable(cb)
 
-        ax_fixed, ax_moving, _ax_undo, _ax_clear, ax_save = fig.axes
+        ax_fixed, ax_moving, _ax_undo, _ax_clear, ax_save, _ax_toggle = fig.axes
 
         def click(inaxes, xdata: float | None = None, ydata: float | None = None) -> None:
             event = types.SimpleNamespace(button=1, inaxes=inaxes, xdata=xdata, ydata=ydata)
@@ -182,4 +229,107 @@ def test_pick_paired_landmarks_save_button_click_sets_status(monkeypatch: pytest
         moving_downsample=2,
         min_pairs=0,
         on_change=_on_change,
+    )
+
+
+def test_pick_paired_landmarks_on_change_only_called_on_save(monkeypatch: pytest.MonkeyPatch) -> None:
+    import matplotlib.backend_bases
+
+    import fishtools.ccf.landmark_ui as ui
+
+    captured: dict[str, object] = {}
+    original_mpl_connect = matplotlib.backend_bases.FigureCanvasBase.mpl_connect
+
+    def _capturing_mpl_connect(self, event: str, callback):  # type: ignore[no-untyped-def]
+        if event == "button_press_event":
+            captured["button_press_event"] = callback
+        return original_mpl_connect(self, event, callback)
+
+    calls: list[tuple[list[tuple[float, float]], list[tuple[float, float]]]] = []
+
+    def _on_change(fixed, moving):  # type: ignore[no-untyped-def]
+        calls.append((list(fixed), list(moving)))
+
+    def _show() -> None:
+        fig = ui.plt.gcf()
+        cb = captured["button_press_event"]
+        assert callable(cb)
+
+        ax_fixed, ax_moving, _ax_undo, _ax_clear, ax_save, _ax_toggle = fig.axes
+
+        def click(inaxes, xdata: float | None = None, ydata: float | None = None) -> None:
+            event = types.SimpleNamespace(button=1, inaxes=inaxes, xdata=xdata, ydata=ydata)
+            cb(event)
+
+        click(ax_fixed, xdata=10.0, ydata=12.0)
+        click(ax_moving, xdata=4.0, ydata=5.0)
+        assert calls == []
+
+        click(ax_save)
+        assert len(calls) == 1
+        ui.plt.close(fig)
+
+    monkeypatch.setattr(matplotlib.backend_bases.FigureCanvasBase, "mpl_connect", _capturing_mpl_connect)
+    monkeypatch.setattr(ui.plt, "show", _show)
+
+    ui.pick_paired_landmarks(
+        fixed_image_yx=np.zeros((10, 10), dtype=np.float32),
+        moving_image_yx_preview=np.zeros((10, 10), dtype=np.float32),
+        moving_downsample=2,
+        min_pairs=0,
+        on_change=_on_change,
+    )
+
+
+def test_pick_paired_landmarks_toggle_button_hides_and_shows_markers(monkeypatch: pytest.MonkeyPatch) -> None:
+    import matplotlib.backend_bases
+
+    import fishtools.ccf.landmark_ui as ui
+
+    captured: dict[str, object] = {}
+    original_mpl_connect = matplotlib.backend_bases.FigureCanvasBase.mpl_connect
+
+    def _capturing_mpl_connect(self, event: str, callback):  # type: ignore[no-untyped-def]
+        if event == "button_press_event":
+            captured["button_press_event"] = callback
+        return original_mpl_connect(self, event, callback)
+
+    def _show() -> None:
+        fig = ui.plt.gcf()
+        cb = captured["button_press_event"]
+        assert callable(cb)
+
+        ax_fixed, ax_moving, _ax_undo, _ax_clear, _ax_save, ax_toggle = fig.axes
+
+        def click(inaxes, xdata: float | None = None, ydata: float | None = None) -> None:
+            event = types.SimpleNamespace(button=1, inaxes=inaxes, xdata=xdata, ydata=ydata)
+            cb(event)
+
+        click(ax_fixed, xdata=10.0, ydata=12.0)
+        click(ax_moving, xdata=4.0, ydata=5.0)
+
+        scatter_fixed = ax_fixed.collections[0]
+        scatter_moving = ax_moving.collections[0]
+        assert scatter_fixed.get_visible() is True
+        assert scatter_moving.get_visible() is True
+
+        click(ax_toggle)
+        assert scatter_fixed.get_visible() is False
+        assert scatter_moving.get_visible() is False
+
+        click(ax_toggle)
+        assert scatter_fixed.get_visible() is True
+        assert scatter_moving.get_visible() is True
+
+        ui.plt.close(fig)
+
+    monkeypatch.setattr(matplotlib.backend_bases.FigureCanvasBase, "mpl_connect", _capturing_mpl_connect)
+    monkeypatch.setattr(ui.plt, "show", _show)
+
+    ui.pick_paired_landmarks(
+        fixed_image_yx=np.zeros((10, 10), dtype=np.float32),
+        fixed_overlays=[(np.ones((10, 10), dtype=bool), (0.1, 0.4, 1.0, 0.30))],
+        moving_image_yx_preview=np.zeros((10, 10), dtype=np.float32),
+        moving_downsample=2,
+        min_pairs=0,
     )

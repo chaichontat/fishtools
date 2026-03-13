@@ -18,6 +18,9 @@ from fishtools.preprocess.spots.align_prod import (
     Deviation,
     Deviations,
     InitialScale,
+    NormFieldCorrection,
+    _gain_crop,
+    _slice_bounds,
     append_json,
     batch,
     create_opt_path,
@@ -118,7 +121,34 @@ def test_create_opt_path_variants(tmp_path: Path) -> None:
     )
     assert p_folder.name == "opt_cb1+roi1"
 
-    # Invalid argument combinations
+
+def test_norm_field_gain_crop_and_slice_bounds() -> None:
+    # 10x10 full-res tile with a 2x2 gain grid.
+    # grid bins: x [0..4]->0, [5..9]->1; same for y.
+    gain = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    field = NormFieldCorrection(gain=gain, full_w=10, full_h=10, grid_w=2, grid_h=2)
+
+    # Negative slice bounds should map to full-res indices.
+    assert _slice_bounds(slice(-5, None), 10) == (5, 10)
+    assert _slice_bounds(slice(None, -5), 10) == (0, 5)
+
+    # Top-right quadrant crop: y [0..4], x [5..9] -> gain bin (0,1) == 2.0
+    g_tr = _gain_crop(field, y0=0, y1=5, x0=5, x1=10)
+    assert g_tr.shape == (5, 5)
+    assert float(np.unique(g_tr)[0]) == pytest.approx(2.0)
+
+    # Bottom-left quadrant crop: y [5..9], x [0..4] -> gain bin (1,0) == 3.0
+    g_bl = _gain_crop(field, y0=5, y1=10, x0=0, x1=5)
+    assert g_bl.shape == (5, 5)
+    assert float(np.unique(g_bl)[0]) == pytest.approx(3.0)
+
+
+def test_create_opt_path_invalid_argument_combinations(tmp_path: Path) -> None:
+    codebook_path = tmp_path / "cb1.json"
+    codebook_path.write_text("{}", encoding="utf-8")
+    tif_path = tmp_path / "reg0001.tif"
+    tif_path.write_bytes(b"\x00")
+
     with pytest.raises(ValueError):
         create_opt_path(codebook_path=codebook_path, mode="json")  # neither provided
 

@@ -46,6 +46,15 @@ class SagittalPanel:
     neomeso_curve: np.ndarray
 
 
+@dataclass(frozen=True)
+class SampleThumbnail:
+    workspace: Path
+    roi: str
+    thumb_png: Path
+    atlas_plane: str
+    atlas_slice_idx: int
+
+
 def _load_midsurface_coords_module():
     spec = importlib.util.spec_from_file_location("midsurface_coords", COORDS_SCRIPT)
     if spec is None or spec.loader is None:
@@ -122,6 +131,110 @@ def _map_sagittal_to_coronal_t2d(
     out_slice = np.interp(t_clip, t_grid, slice_row).astype(np.float64, copy=False)
     out_t = np.interp(t_clip, t_grid, t_row).astype(np.float64, copy=False)
     return out_slice, out_t
+
+
+def _discover_sample_thumbnails(glob_pattern: str) -> list[SampleThumbnail]:
+    import glob
+    import json
+
+    if not glob_pattern:
+        raise ValueError("Empty sample thumbnail glob pattern.")
+    paths = sorted(Path(p) for p in glob.glob(glob_pattern))
+    if not paths:
+        raise FileNotFoundError(f"No sample thumbnails matched glob: {glob_pattern}")
+
+    samples: list[SampleThumbnail] = []
+    problems: list[str] = []
+    for thumb_png in paths:
+        if thumb_png.suffix.lower() != ".png":
+            continue
+        try:
+            parts = thumb_png.parts
+            if "analysis" not in parts:
+                raise ValueError("path does not contain 'analysis' component")
+            idx = parts.index("analysis")
+            workspace = Path(*parts[:idx])
+            rel = thumb_png.relative_to(workspace)
+            if rel.parts[:3] != ("analysis", "output", "thumbnails"):
+                raise ValueError(f"unexpected thumbnail layout under workspace: {rel.as_posix()}")
+        except Exception as exc:
+            problems.append(f"{thumb_png}: {exc}")
+            continue
+
+        roi_dir = thumb_png.parent.name
+        if "+" not in roi_dir:
+            problems.append(f"{thumb_png}: expected parent dir like <roi>+<codebook>, got {roi_dir!r}")
+            continue
+        roi = roi_dir.split("+", 1)[0].strip()
+        if not roi:
+            problems.append(f"{thumb_png}: could not parse ROI from parent dir {roi_dir!r}")
+            continue
+
+        p1_json = workspace / "analysis/output/ccf-transforms" / roi / "p1_landmarks.json"
+        if not p1_json.exists():
+            problems.append(f"{thumb_png}: missing {p1_json}")
+            continue
+        try:
+            d = json.loads(p1_json.read_text())
+        except Exception as exc:
+            problems.append(f"{thumb_png}: failed to read {p1_json}: {exc}")
+            continue
+
+        plane = str(d.get("atlas_plane", "")).strip()
+        if not plane:
+            problems.append(f"{thumb_png}: missing atlas_plane in {p1_json}")
+            continue
+        if plane != "sagittal":
+            problems.append(f"{thumb_png}: atlas_plane={plane!r} (expected 'sagittal') in {p1_json}")
+            continue
+
+        if "atlas_slice_idx" not in d:
+            problems.append(f"{thumb_png}: missing atlas_slice_idx in {p1_json}")
+            continue
+        try:
+            atlas_slice_idx = int(d["atlas_slice_idx"])
+        except Exception as exc:
+            problems.append(f"{thumb_png}: invalid atlas_slice_idx in {p1_json}: {exc}")
+            continue
+
+        samples.append(
+            SampleThumbnail(
+                workspace=workspace,
+                roi=str(roi),
+                thumb_png=thumb_png,
+                atlas_plane=plane,
+                atlas_slice_idx=int(atlas_slice_idx),
+            )
+        )
+
+    if problems:
+        msg = "\n".join(problems[:30])
+        more = "" if len(problems) <= 30 else f"\n... and {len(problems) - 30} more"
+        raise ValueError(f"Failed to parse some sample thumbnails:\n{msg}{more}")
+    if not samples:
+        raise ValueError(f"No usable sample thumbnails found for glob: {glob_pattern}")
+    return samples
+
+
+def _atlas_downsample_factor_for_midsurface(*, outdir: Path, atlas_name: str, brainglobe_config_dir: Path) -> int:
+    outdir = Path(outdir)
+    brain_mask_path = outdir / "brain_mask_3d_ds.npy"
+    if not brain_mask_path.exists():
+        raise FileNotFoundError(f"Missing {brain_mask_path} (needed to infer atlas downsample factor).")
+    brain_3d = np.load(brain_mask_path, mmap_mode="r")
+    if brain_3d.ndim != 3:
+        raise ValueError(f"Expected {brain_mask_path} to be 3D, got shape={brain_3d.shape}")
+
+    if brainglobe_config_dir.exists():
+        import os
+
+        os.environ["BRAINGLOBE_CONFIG_DIR"] = str(brainglobe_config_dir.resolve())
+    from brainglobe_atlasapi import BrainGlobeAtlas  # noqa: E402
+
+    atlas = BrainGlobeAtlas(str(atlas_name))
+    ref_full = np.asarray(atlas.reference)
+    ds = int(max(1, int(np.rint(float(ref_full.shape[0]) / float(brain_3d.shape[0])))))
+    return int(ds)
 
 
 def _load_overlap_t_ranges_csv(path: Path, *, slice_label: str) -> dict[int, list[tuple[float, float]]]:
@@ -1271,6 +1384,7 @@ def save_ap_ml_mapping_figure_sagittal(
     brainglobe_config_dir: Path,
     sagittal_k_step: int,
     sagittal_n_sample: int,
+    sample_thumbnails_glob: str | None = None,
 ) -> None:
     import matplotlib
 
@@ -1278,6 +1392,45 @@ def save_ap_ml_mapping_figure_sagittal(
     import matplotlib.pyplot as plt  # noqa: E402
     from matplotlib.collections import LineCollection  # noqa: E402
     from matplotlib.patches import ConnectionPatch  # noqa: E402
+
+    @dataclass(frozen=True)
+    class _BottomPanelItem:
+        panel: SagittalPanel
+        label: str
+        pos: float | None
+        pos_ml_um: float | None = None
+        row: int = 0
+        pos_group_index: int = 0
+        pos_group_size: int = 1
+
+    def _curve_x_at_ap_anchor(panel: SagittalPanel, *, ap_anchor_um: float) -> float | None:
+        x = np.asarray(panel.ml_curve, dtype=np.float64)
+        y = np.asarray(panel.ap_curve, dtype=np.float64)
+        finite = np.isfinite(x) & np.isfinite(y)
+        if int(np.count_nonzero(finite)) < 2:
+            return None
+        xf = x[finite]
+        yf = y[finite]
+
+        crossings = (yf[:-1] - ap_anchor_um) * (yf[1:] - ap_anchor_um) <= 0.0
+        if np.any(crossings):
+            x_hits: list[float] = []
+            for i in np.flatnonzero(crossings).tolist():
+                y0 = float(yf[int(i)])
+                y1 = float(yf[int(i + 1)])
+                x0 = float(xf[int(i)])
+                x1 = float(xf[int(i + 1)])
+                if abs(y1 - y0) < 1.0e-9:
+                    x_hits.append(0.5 * (x0 + x1))
+                else:
+                    t = (ap_anchor_um - y0) / (y1 - y0)
+                    x_hits.append(x0 + t * (x1 - x0))
+            if x_hits:
+                x_arr = np.asarray(x_hits, dtype=np.float64)
+                return float(x_arr[int(np.argmin(np.abs(x_arr)))])
+
+        idx = int(np.argmin(np.abs(yf - ap_anchor_um)))
+        return float(xf[idx])
 
     legend_rgb = _build_legend_rgb(ap_range_um=data.ap_range_um, ml_range_um=data.ml_range_um, b_const=float(b_const))
     support_mask = _build_legend_range_mask(
@@ -1299,6 +1452,7 @@ def save_ap_ml_mapping_figure_sagittal(
     ap_lines = _ap_hline_values(ap_range_um=data.ap_range_um, step_um=float(ap_hline_step_um))
     if ap_lines.size > 1:
         ap_lines = ap_lines[1:]
+    ap_anchor_um = 3000.0
     panels_all = _prepare_sagittal_slice_panels(
         outdir=Path(outdir),
         data=data,
@@ -1310,28 +1464,105 @@ def save_ap_ml_mapping_figure_sagittal(
     if not panels_all:
         raise ValueError("No sagittal panels available.")
 
-    ks_arr = np.asarray([p.slice_k for p in panels_all], dtype=np.int32)
-    ap0_arr = np.asarray([p.ap0_um for p in panels_all], dtype=np.float64)
-    selected_ks: list[int] = []
-    used: set[int] = set()
-    for ap_t in np.asarray(ap_lines, dtype=np.float64).tolist():
-        d = np.abs(ap0_arr - float(ap_t))
-        order = np.argsort(d)
-        picked = None
-        for oi in order.tolist():
-            k = int(ks_arr[int(oi)])
-            if k not in used:
-                picked = k
-                break
-        if picked is not None:
-            used.add(int(picked))
-            selected_ks.append(int(picked))
-    panels_show = [p for p in panels_all if int(p.slice_k) in set(selected_ks)]
-    if not panels_show:
-        raise ValueError("No sagittal panels selected for display.")
-    panels_show.sort(key=lambda p: float(p.ap0_um), reverse=True)
-    if len(panels_show) >= 2:
-        panels_show[0], panels_show[1] = panels_show[1], panels_show[0]
+    panel_items: list[_BottomPanelItem] = []
+    highlight_ks: set[int] = set()
+    extra_curve_panels: dict[int, SagittalPanel] = {}
+    if sample_thumbnails_glob is None:
+        ks_arr = np.asarray([p.slice_k for p in panels_all], dtype=np.int32)
+        ap0_arr = np.asarray([p.ap0_um for p in panels_all], dtype=np.float64)
+        selected_ks: list[int] = []
+        used: set[int] = set()
+        for ap_t in np.asarray(ap_lines, dtype=np.float64).tolist():
+            d = np.abs(ap0_arr - float(ap_t))
+            order = np.argsort(d)
+            picked = None
+            for oi in order.tolist():
+                k = int(ks_arr[int(oi)])
+                if k not in used:
+                    picked = k
+                    break
+            if picked is not None:
+                used.add(int(picked))
+                selected_ks.append(int(picked))
+        panels_show = [p for p in panels_all if int(p.slice_k) in set(selected_ks)]
+        if not panels_show:
+            raise ValueError("No sagittal panels selected for display.")
+        panels_show.sort(key=lambda p: float(p.ap0_um), reverse=True)
+        if len(panels_show) >= 2:
+            panels_show[0], panels_show[1] = panels_show[1], panels_show[0]
+        panel_items = [_BottomPanelItem(panel=p, label=f"k={int(p.slice_k)}", pos=None) for p in panels_show]
+    else:
+        try:
+            from PIL import Image  # noqa: E402
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"Sample thumbnail mode requires Pillow (PIL). Import failed: {exc}") from exc
+
+        panels_map_all = _prepare_sagittal_slice_panels(
+            outdir=Path(outdir),
+            data=data,
+            atlas_name=str(atlas_name),
+            brainglobe_config_dir=Path(brainglobe_config_dir),
+            sagittal_k_step=1,
+            sagittal_n_sample=int(sagittal_n_sample),
+        )
+        if not panels_map_all:
+            raise ValueError("No sagittal panels available for sample mapping.")
+
+        samples = _discover_sample_thumbnails(str(sample_thumbnails_glob))
+        ds = _atlas_downsample_factor_for_midsurface(
+            outdir=Path(outdir),
+            atlas_name=str(atlas_name),
+            brainglobe_config_dir=Path(brainglobe_config_dir),
+        )
+        ks_arr = np.asarray([p.slice_k for p in panels_map_all], dtype=np.int32)
+        k_supported_min = int(np.min(ks_arr))
+        k_supported_max = int(np.max(ks_arr))
+        panels_by_k = {int(p.slice_k): p for p in panels_map_all}
+
+        items: list[tuple[int, SampleThumbnail, np.ndarray]] = []
+        for s in samples:
+            k_ds = int(np.rint(float(s.atlas_slice_idx) / float(ds)))
+            if not (int(k_supported_min) <= int(k_ds) <= int(k_supported_max)):
+                raise ValueError(
+                    f"Sample ROI {s.roi!r} atlas_slice_idx={int(s.atlas_slice_idx)} maps to k_ds={int(k_ds)}, "
+                    f"but supported sagittal k range is [{int(k_supported_min)},{int(k_supported_max)}]. "
+                    "Restrict the thumbnail glob or regenerate midsurface sagittal columns/LUTs."
+                )
+            if int(k_ds) not in panels_by_k:
+                raise ValueError(
+                    f"Sample ROI {s.roi!r} atlas_slice_idx={int(s.atlas_slice_idx)} maps to k_ds={int(k_ds)}, "
+                    "but that k is not present in chart LUT / sagittal columns. "
+                    "Regenerate sagittal columns/LUTs to include this slice, or restrict the thumbnail glob."
+                )
+            k_match = int(k_ds)
+            img_rgb = np.asarray(Image.open(s.thumb_png).convert("RGB"))
+            items.append((k_match, s, img_rgb))
+
+        items.sort(key=lambda t: (int(t[1].atlas_slice_idx), str(t[1].roi)))
+        for k_match, s, img_rgb in items:
+            p_ref = panels_by_k[int(k_match)]
+            x_anchor = _curve_x_at_ap_anchor(p_ref, ap_anchor_um=float(ap_anchor_um))
+            if x_anchor is None:
+                raise ValueError(
+                    f"Could not compute ML anchor for sample ROI {s.roi!r} (atlas_slice_idx={int(s.atlas_slice_idx)}, "
+                    f"k_ds={int(k_match)}). Increase --sagittal-n-sample or check chart LUTs."
+                )
+            highlight_ks.add(int(p_ref.slice_k))
+            extra_curve_panels.setdefault(int(p_ref.slice_k), p_ref)
+            p_show = SagittalPanel(
+                slice_k=int(p_ref.slice_k),
+                ap0_um=float(p_ref.ap0_um),
+                img2=img_rgb,
+                neomeso2=np.full((1, 1), np.nan, dtype=np.float32),
+                midline_xy_local=np.empty((0, 2), dtype=np.float32),
+                dot_xy_local=None,
+                ml_curve=np.asarray(p_ref.ml_curve),
+                ap_curve=np.asarray(p_ref.ap_curve),
+                support_curve=np.asarray(p_ref.support_curve),
+                neomeso_curve=np.asarray(p_ref.neomeso_curve),
+            )
+            label = f"{s.roi}  atlas_k={int(s.atlas_slice_idx)}"
+            panel_items.append(_BottomPanelItem(panel=p_show, label=label, pos=None, pos_ml_um=float(x_anchor)))
 
     fig_w_in = 9.6
     axes_w_frac = 0.64
@@ -1352,16 +1583,7 @@ def save_ap_ml_mapping_figure_sagittal(
     top_margin_in = float(fig_h_coronal_in) * (1.0 - (0.08 + float(axes_h_frac)))
     panel_y0_in = 0.20
     panel_h_in = 2.28
-    bottom_band_in = panel_y0_in + panel_h_in + 0.15
-    fig_h_in = bottom_band_in + axis_h_in + top_margin_in
 
-    ax0_y0 = bottom_band_in / fig_h_in
-    ax0_h_frac = axis_h_in / fig_h_in
-    fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=200)
-    ax0 = fig.add_axes([0.08, ax0_y0, axes_w_frac, ax0_h_frac])
-
-    ap_min, ap_max = data.ap_range_um
-    ml_min, ml_max = data.ml_range_um
     ml_supported = np.asarray(data.ml_um_at_t, dtype=np.float64)[np.asarray(data.support_mask_tall, dtype=bool)]
     ml_supported = ml_supported[np.isfinite(ml_supported)]
     if ml_supported.size == 0:
@@ -1374,6 +1596,91 @@ def save_ap_ml_mapping_figure_sagittal(
     ml_xlim_min = float(min(ml_xlim_min, 0.0))
     ml_xlim_max = float(max(ml_xlim_max, 0.0))
 
+    # Convert positional items (given in ML um) into axis fractions [0..1] for layout.
+    if any(item.pos_ml_um is not None for item in panel_items):
+        span = float(ml_xlim_max - ml_xlim_min)
+        if not (span > 0.0):
+            raise ValueError(f"Invalid ML x-limits span: [{ml_xlim_min}, {ml_xlim_max}]")
+        updated: list[_BottomPanelItem] = []
+        for item in panel_items:
+            if item.pos_ml_um is None:
+                updated.append(item)
+                continue
+            pos_frac = (float(item.pos_ml_um) - float(ml_xlim_min)) / float(span)
+            updated.append(
+                _BottomPanelItem(
+                    panel=item.panel,
+                    label=item.label,
+                    pos=float(np.clip(pos_frac, 0.0, 1.0)),
+                    pos_ml_um=float(item.pos_ml_um),
+                )
+            )
+        panel_items = updated
+
+    def _estimate_row_count(*, items: list[_BottomPanelItem]) -> int:
+        if not items:
+            return 1
+        if not any(it.pos is not None for it in items):
+            return 1
+        n_show = int(len(items))
+        panel_total_w_est = float(axes_w_frac)
+        axis_w_in_est = float(fig_w_in) * float(panel_total_w_est)
+        panel_w_in_est = float(min(1.15, 0.95 * float(axis_w_in_est) / float(max(1, n_show))))
+        panel_w_in_est = float(max(panel_w_in_est, 0.40))
+        panel_w_est = float(panel_w_in_est / fig_w_in)
+        x0_est = 0.08
+        x_min = float(x0_est)
+        x_max = float(x0_est) + float(panel_total_w_est) - float(panel_w_est)
+        margin = 0.08 * float(panel_w_est)
+        rows_end: list[float] = []
+        for it in sorted((it for it in items if it.pos is not None), key=lambda t: float(t.pos)):  # type: ignore[arg-type]
+            center_x = float(x0_est) + float(it.pos) * float(panel_total_w_est)  # type: ignore[arg-type]
+            panel_x0 = float(np.clip(center_x - 0.5 * float(panel_w_est), x_min, x_max))
+            panel_x1 = float(panel_x0 + float(panel_w_est))
+            placed = False
+            for ri, end in enumerate(rows_end):
+                if panel_x0 >= float(end) + float(margin):
+                    rows_end[ri] = panel_x1
+                    placed = True
+                    break
+            if not placed:
+                rows_end.append(panel_x1)
+        return int(max(1, len(rows_end)))
+
+    panel_row_gap_in = 0.16
+    n_rows_est = _estimate_row_count(items=panel_items)
+    # Keep the figure compact, but allow the bottom band to grow only as much as needed
+    # to fit multiple thumbnail rows without making them illegibly small.
+    bottom_band_target_in = float(panel_y0_in) + float(panel_h_in) + 0.15
+    bottom_band_in = float(bottom_band_target_in)
+    if int(n_rows_est) > 1:
+        min_panel_h_in = 0.24
+        needed_band_in = (
+            float(panel_y0_in)
+            + float(int(n_rows_est)) * float(min_panel_h_in)
+            + float(int(n_rows_est) - 1) * float(panel_row_gap_in)
+            + 0.15
+        )
+        bottom_band_in = float(max(bottom_band_in, needed_band_in))
+        usable_h_in = (
+            float(bottom_band_in) - float(panel_y0_in) - 0.15 - float(int(n_rows_est) - 1) * float(panel_row_gap_in)
+        )
+        panel_h_in_fit = float(usable_h_in) / float(int(n_rows_est))
+        if float(panel_h_in_fit) + 1.0e-9 < float(min_panel_h_in):
+            raise ValueError(
+                f"Too many sample thumbnails to fit ({len(panel_items)} items need ~{int(n_rows_est)} rows). "
+                "Restrict --sagittal-samples-thumbnails-glob."
+            )
+        panel_h_in = float(panel_h_in_fit)
+    fig_h_in = bottom_band_in + axis_h_in + top_margin_in
+
+    ax0_y0 = bottom_band_in / fig_h_in
+    ax0_h_frac = axis_h_in / fig_h_in
+    fig = plt.figure(figsize=(fig_w_in, fig_h_in), dpi=200)
+    ax0 = fig.add_axes([0.08, ax0_y0, axes_w_frac, ax0_h_frac])
+
+    ap_min, ap_max = data.ap_range_um
+    ml_min, ml_max = data.ml_range_um
     legend_display_t = np.transpose(legend_display, (1, 0, 2))
     ax0.imshow(
         legend_display_t,
@@ -1402,7 +1709,20 @@ def save_ap_ml_mapping_figure_sagittal(
         ax0.axhline(float(ap), color="#000000", linestyle=":", linewidth=0.9, alpha=0.9)
 
     # Sagittal slice overlays: curves in the AP/ML chart.
+    panels_for_overlay: list[SagittalPanel] = []
+    seen_overlay: set[int] = set()
     for p in panels_all:
+        if int(p.slice_k) in seen_overlay:
+            continue
+        panels_for_overlay.append(p)
+        seen_overlay.add(int(p.slice_k))
+    for k in sorted(extra_curve_panels.keys()):
+        if int(k) in seen_overlay:
+            continue
+        panels_for_overlay.append(extra_curve_panels[int(k)])
+        seen_overlay.add(int(k))
+
+    for p in panels_for_overlay:
         x = np.asarray(p.ml_curve, dtype=np.float64)
         y = np.asarray(p.ap_curve, dtype=np.float64)
         neo = np.asarray(p.neomeso_curve, dtype=bool)
@@ -1411,12 +1731,18 @@ def save_ap_ml_mapping_figure_sagittal(
             continue
         xy = np.column_stack([x[finite], y[finite]]).astype(np.float64, copy=False)
         seg = np.stack([xy[:-1], xy[1:]], axis=1)
+        if int(p.slice_k) in highlight_ks:
+            base_rgba = (1.0, 0.65, 0.0, 0.95)
+            base_lw = 2.6
+        else:
+            base_rgba = (1.0, 1.0, 0.0, 0.5)
+            base_lw = 1.2
         # Base curve (t_all support).
         ax0.add_collection(
             LineCollection(
                 seg,
-                colors=[(1.0, 1.0, 0.0, 0.5)],
-                linewidths=1.2,
+                colors=[base_rgba],
+                linewidths=float(base_lw),
                 zorder=6,
             )
         )
@@ -1448,10 +1774,12 @@ def save_ap_ml_mapping_figure_sagittal(
     fig.canvas.draw()
     legend_pos = ax0.get_position()
     legend_pos_orig = ax0.get_position(original=True)
-    n_show = int(len(panels_show))
+    n_show = int(len(panel_items))
     panel_total_w = float(legend_pos_orig.width)
     panel_scale = 1.0
-    panel_w_in = 1.15
+    axis_w_in = float(fig_w_in) * float(panel_total_w)
+    panel_w_in = float(min(1.15, 0.95 * float(axis_w_in) / float(max(1, n_show))))
+    panel_w_in = float(max(panel_w_in, 0.40))
     panel_w = float(panel_w_in / fig_w_in)
     if n_show > 1:
         center_step = float(max(0.0, panel_total_w - panel_w)) / float(n_show - 1)
@@ -1465,90 +1793,159 @@ def save_ap_ml_mapping_figure_sagittal(
 
     cmap_neomeso = plt.cm.colors.ListedColormap(["#ff00ff"])
     panel_axes: list[tuple[SagittalPanel, "plt.Axes"]] = []
-    # Draw right panels first so left panels are rendered on top.
-    for idx_panel in range(n_show - 1, -1, -1):
-        p = panels_show[idx_panel]
-        center_x = float(legend_pos_orig.x0) + 0.5 * float(panel_w) + float(idx_panel) * float(center_step)
-        panel_x0 = center_x - 0.5 * float(panel_w)
-        axp = fig.add_axes([panel_x0, panel_y0, panel_w, panel_h])
-        img2_rot = np.rot90(np.asarray(p.img2), k=-1)
-        neomeso2_rot = np.rot90(np.asarray(p.neomeso2), k=-1)
-        h_orig, _w_orig = int(np.asarray(p.img2).shape[0]), int(np.asarray(p.img2).shape[1])
-        w_rot = int(img2_rot.shape[1])
-        if idx_panel == int(n_show - 1):
-            crop_frac = 0.70
-        elif idx_panel == 3:
-            crop_frac = 0.58
-        elif idx_panel >= int(max(0, n_show - 2)):
-            crop_frac = 0.55
-        else:
-            crop_frac = 0.50
-        crop_x0 = int(np.floor(float(crop_frac) * float(w_rot)))
-        img2_rot = img2_rot[:, crop_x0:]
-        neomeso2_rot = neomeso2_rot[:, crop_x0:]
 
-        axp.imshow(
-            np.clip(img2_rot + 0.10, 0.0, 1.0), cmap="gray", interpolation="nearest", origin="upper", vmin=0.0, vmax=1.0
-        )
-        neomeso_im = axp.imshow(
-            neomeso2_rot,
-            cmap=cmap_neomeso,
-            interpolation="nearest",
-            alpha=0.25,
-            origin="upper",
-            vmin=0.0,
-            vmax=1.0,
-        )
-        neomeso_im.cmap.set_bad(alpha=0.0)
-
-        xy = np.asarray(p.midline_xy_local, dtype=np.float64)
-        if xy.ndim == 2 and xy.shape[0] >= 2 and xy.shape[1] == 2:
-            finite = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
-            if int(np.count_nonzero(finite)) >= 2:
-                xyp_raw = xy[finite]
-                xyp = np.empty_like(xyp_raw)
-                xyp[:, 0] = (float(h_orig) - 1.0) - xyp_raw[:, 1]
-                xyp[:, 1] = xyp_raw[:, 0]
-                xyp[:, 0] -= float(crop_x0)
-                seg = np.stack([xyp[:-1], xyp[1:]], axis=1)
-                axp.add_collection(
-                    LineCollection(
-                        seg,
-                        colors=[(1.0, 1.0, 0.0, 0.5)],
-                        linewidths=1.4,
-                        zorder=5,
-                    )
-                )
-                seg_mid = 0.5 * (seg[:, 0, :] + seg[:, 1, :])
-                h2, w2 = int(neomeso2_rot.shape[0]), int(neomeso2_rot.shape[1])
-                mx = np.clip(np.rint(seg_mid[:, 0]).astype(np.int64, copy=False), 0, w2 - 1)
-                my = np.clip(np.rint(seg_mid[:, 1]).astype(np.int64, copy=False), 0, h2 - 1)
-                neo_seg = np.isfinite(neomeso2_rot[my, mx]) & (neomeso2_rot[my, mx] > 0.5)
-                if np.any(neo_seg):
-                    axp.add_collection(
-                        LineCollection(
-                            seg[neo_seg],
-                            colors=[(1.0, 1.0, 0.0, 0.95)],
-                            linewidths=2.2,
-                            zorder=6,
+    # Assign rows to avoid overlaps when panels are positioned by ML.
+    row_gap = float(panel_row_gap_in / fig_h_in)
+    if any(it.pos is not None for it in panel_items):
+        x_min = float(legend_pos_orig.x0)
+        x_max = float(legend_pos_orig.x0) + float(panel_total_w) - float(panel_w)
+        margin = 0.08 * float(panel_w)
+        rows_end: list[float] = []
+        assigned: list[_BottomPanelItem] = []
+        for it in sorted(panel_items, key=lambda t: (1.0 if t.pos is None else float(t.pos), t.label)):
+            if it.pos is None:
+                assigned.append(it)
+                continue
+            center_x = float(legend_pos_orig.x0) + float(it.pos) * float(panel_total_w)
+            panel_x0 = float(np.clip(center_x - 0.5 * float(panel_w), x_min, x_max))
+            panel_x1 = float(panel_x0 + float(panel_w))
+            placed = False
+            for ri, end in enumerate(rows_end):
+                if panel_x0 >= float(end) + float(margin):
+                    rows_end[ri] = panel_x1
+                    assigned.append(
+                        _BottomPanelItem(
+                            panel=it.panel,
+                            label=it.label,
+                            pos=float(it.pos),
+                            pos_ml_um=it.pos_ml_um,
+                            row=int(ri),
                         )
                     )
-
-        if p.dot_xy_local is not None:
-            dot_x = (float(h_orig) - 1.0) - float(p.dot_xy_local[1])
-            dot_y = float(p.dot_xy_local[0])
-            dot_x -= float(crop_x0)
-            axp.plot(
-                [dot_x],
-                [dot_y],
-                marker="o",
-                markersize=5.0,
-                color="#0000ff",
-                alpha=0.95,
-                markeredgecolor="#ffffff",
-                markeredgewidth=0.8,
-                zorder=10,
+                    placed = True
+                    break
+            if not placed:
+                rows_end.append(panel_x1)
+                assigned.append(
+                    _BottomPanelItem(
+                        panel=it.panel,
+                        label=it.label,
+                        pos=float(it.pos),
+                        pos_ml_um=it.pos_ml_um,
+                        row=int(len(rows_end) - 1),
+                    )
+                )
+        panel_items = assigned
+        if len(rows_end) > int(n_rows_est):
+            raise ValueError(
+                f"Need {len(rows_end)} thumbnail rows but figure reserved {int(n_rows_est)}; "
+                "reduce thumbnails, or increase panel size/spacing."
             )
+
+    layout: list[tuple[float, _BottomPanelItem, float]] = []
+    x_min = float(legend_pos_orig.x0)
+    x_max = float(legend_pos_orig.x0) + float(panel_total_w) - float(panel_w)
+    for idx_panel, item in enumerate(panel_items):
+        if item.pos is None:
+            center_x = float(legend_pos_orig.x0) + 0.5 * float(panel_w) + float(idx_panel) * float(center_step)
+        else:
+            center_x = float(legend_pos_orig.x0) + float(item.pos) * float(panel_total_w)
+        panel_x0 = float(np.clip(center_x - 0.5 * float(panel_w), x_min, x_max))
+        layout.append((float(center_x), item, float(panel_x0)))
+
+    # Draw right panels first so left panels are rendered on top.
+    for _center_x, item, panel_x0 in sorted(layout, key=lambda t: float(t[0]), reverse=True):
+        p = item.panel
+        panel_label = item.label
+        panel_y0_i = float(panel_y0 - float(item.row) * (float(panel_h) + float(row_gap)))
+        axp = fig.add_axes([panel_x0, panel_y0_i, panel_w, panel_h])
+        img = np.asarray(p.img2)
+        if img.ndim == 3 and img.shape[2] in (3, 4):
+            axp.imshow(img, interpolation="nearest", origin="upper")
+        else:
+            img2_rot = np.rot90(img.astype(np.float32, copy=False), k=-1)
+            neomeso2_rot = np.rot90(np.asarray(p.neomeso2), k=-1)
+            h_orig, _w_orig = int(img.shape[0]), int(img.shape[1])
+            w_rot = int(img2_rot.shape[1])
+            if idx_panel == int(n_show - 1):
+                crop_frac = 0.70
+            elif idx_panel == 3:
+                crop_frac = 0.58
+            elif idx_panel >= int(max(0, n_show - 2)):
+                crop_frac = 0.55
+            else:
+                crop_frac = 0.50
+            crop_x0 = int(np.floor(float(crop_frac) * float(w_rot)))
+            img2_rot = img2_rot[:, crop_x0:]
+            neomeso2_rot = neomeso2_rot[:, crop_x0:]
+
+            axp.imshow(
+                np.clip(img2_rot + 0.10, 0.0, 1.0),
+                cmap="gray",
+                interpolation="nearest",
+                origin="upper",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            neomeso_im = axp.imshow(
+                neomeso2_rot,
+                cmap=cmap_neomeso,
+                interpolation="nearest",
+                alpha=0.25,
+                origin="upper",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            neomeso_im.cmap.set_bad(alpha=0.0)
+
+            xy = np.asarray(p.midline_xy_local, dtype=np.float64)
+            if xy.ndim == 2 and xy.shape[0] >= 2 and xy.shape[1] == 2:
+                finite = np.isfinite(xy[:, 0]) & np.isfinite(xy[:, 1])
+                if int(np.count_nonzero(finite)) >= 2:
+                    xyp_raw = xy[finite]
+                    xyp = np.empty_like(xyp_raw)
+                    xyp[:, 0] = (float(h_orig) - 1.0) - xyp_raw[:, 1]
+                    xyp[:, 1] = xyp_raw[:, 0]
+                    xyp[:, 0] -= float(crop_x0)
+                    seg = np.stack([xyp[:-1], xyp[1:]], axis=1)
+                    axp.add_collection(
+                        LineCollection(
+                            seg,
+                            colors=[(1.0, 1.0, 0.0, 0.5)],
+                            linewidths=1.4,
+                            zorder=5,
+                        )
+                    )
+                    seg_mid = 0.5 * (seg[:, 0, :] + seg[:, 1, :])
+                    h2, w2 = int(neomeso2_rot.shape[0]), int(neomeso2_rot.shape[1])
+                    mx = np.clip(np.rint(seg_mid[:, 0]).astype(np.int64, copy=False), 0, w2 - 1)
+                    my = np.clip(np.rint(seg_mid[:, 1]).astype(np.int64, copy=False), 0, h2 - 1)
+                    neo_seg = np.isfinite(neomeso2_rot[my, mx]) & (neomeso2_rot[my, mx] > 0.5)
+                    if np.any(neo_seg):
+                        axp.add_collection(
+                            LineCollection(
+                                seg[neo_seg],
+                                colors=[(1.0, 1.0, 0.0, 0.95)],
+                                linewidths=2.2,
+                                zorder=6,
+                            )
+                        )
+
+            if p.dot_xy_local is not None:
+                dot_x = (float(h_orig) - 1.0) - float(p.dot_xy_local[1])
+                dot_y = float(p.dot_xy_local[0])
+                dot_x -= float(crop_x0)
+                axp.plot(
+                    [dot_x],
+                    [dot_y],
+                    marker="o",
+                    markersize=5.0,
+                    color="#0000ff",
+                    alpha=0.95,
+                    markeredgecolor="#ffffff",
+                    markeredgewidth=0.8,
+                    zorder=10,
+                )
 
         axp.set_xticks([])
         axp.set_yticks([])
@@ -1556,7 +1953,7 @@ def save_ap_ml_mapping_figure_sagittal(
         axp.text(
             0.02,
             0.06,
-            f"k={int(p.slice_k)}",
+            str(panel_label),
             transform=axp.transAxes,
             fontsize=7,
             color="w",
@@ -1566,40 +1963,11 @@ def save_ap_ml_mapping_figure_sagittal(
         panel_axes.append((p, axp))
 
     # Link each panel to its sagittal curve at AP=3000um.
-    ap_anchor_um = 3000.0
     for p, axp in panel_axes:
-        x = np.asarray(p.ml_curve, dtype=np.float64)
-        y = np.asarray(p.ap_curve, dtype=np.float64)
-        finite = np.isfinite(x) & np.isfinite(y)
-        if int(np.count_nonzero(finite)) < 2:
+        x_anchor = _curve_x_at_ap_anchor(p, ap_anchor_um=float(ap_anchor_um))
+        if x_anchor is None:
             continue
-        xf = x[finite]
-        yf = y[finite]
-
-        # Prefer true AP=3000 intersections; fallback to nearest sampled point.
-        x_anchor = None
-        y_anchor = None
-        crossings = (yf[:-1] - ap_anchor_um) * (yf[1:] - ap_anchor_um) <= 0.0
-        if np.any(crossings):
-            x_hits: list[float] = []
-            for i in np.flatnonzero(crossings).tolist():
-                y0 = float(yf[int(i)])
-                y1 = float(yf[int(i + 1)])
-                x0 = float(xf[int(i)])
-                x1 = float(xf[int(i + 1)])
-                if abs(y1 - y0) < 1.0e-9:
-                    x_hits.append(0.5 * (x0 + x1))
-                else:
-                    t = (ap_anchor_um - y0) / (y1 - y0)
-                    x_hits.append(x0 + t * (x1 - x0))
-            if x_hits:
-                x_arr = np.asarray(x_hits, dtype=np.float64)
-                x_anchor = float(x_arr[int(np.argmin(np.abs(x_arr)))])
-                y_anchor = float(ap_anchor_um)
-        if x_anchor is None or y_anchor is None:
-            idx = int(np.argmin(np.abs(yf - ap_anchor_um)))
-            x_anchor = float(xf[idx])
-            y_anchor = float(yf[idx])
+        y_anchor = float(ap_anchor_um)
 
         fig.add_artist(
             ConnectionPatch(
@@ -2180,9 +2548,31 @@ def main() -> None:
         help="Output PNG path for sagittal view (default: <outdir>/ap_ml_mapping_surface_sagittal.png).",
     )
     p.add_argument(
+        "--output-sagittal-samples",
+        type=Path,
+        default=None,
+        help="Output PNG path for sagittal view with sample thumbnails under the plot.",
+    )
+    p.add_argument(
         "--write-sagittal",
         action="store_true",
         help="Also write sagittal view figure (sagittal slices map to curved lines in AP/ML space).",
+    )
+    p.add_argument(
+        "--write-sagittal-samples",
+        action="store_true",
+        help="Also write sagittal view figure with bottom panels replaced by sample thumbnails.",
+    )
+    p.add_argument(
+        "--sagittal-samples-thumbnails-glob",
+        type=str,
+        default=None,
+        help=(
+            "Glob for sample thumbnails to use as bottom panels, e.g. "
+            "'/working/2025*JaxA*Sag*/analysis/output/thumbnails/*+pi/thumbnail_z008.png'. "
+            "Each thumbnail must have a matching p1_landmarks.json under "
+            "<workspace>/analysis/output/ccf-transforms/<roi>/p1_landmarks.json with atlas_plane='sagittal'."
+        ),
     )
     p.add_argument(
         "--write-coronal",
@@ -2225,8 +2615,9 @@ def main() -> None:
     outdir = Path(args.outdir)
     write_coronal = bool(args.write_coronal)
     write_sagittal = bool(args.write_sagittal)
+    write_sagittal_samples = bool(args.write_sagittal_samples)
     write_combined = bool(args.write_combined)
-    if not (write_coronal or write_sagittal or write_combined):
+    if not (write_coronal or write_sagittal or write_sagittal_samples or write_combined):
         write_combined = True
 
     out_png = (args.output if args.output is not None else (outdir / "ap_ml_mapping_surface.png")) if write_coronal else None
@@ -2237,6 +2628,15 @@ def main() -> None:
             else (outdir / f"ap_ml_mapping_surface_sagittal_step{int(args.sagittal_k_step)}.png")
         )
         if write_sagittal
+        else None
+    )
+    out_png_sag_samples = (
+        (
+            args.output_sagittal_samples
+            if args.output_sagittal_samples is not None
+            else (outdir / f"ap_ml_mapping_surface_sagittal_step{int(args.sagittal_k_step)}_samples.png")
+        )
+        if write_sagittal_samples
         else None
     )
     out_png_combined = (
@@ -2286,6 +2686,26 @@ def main() -> None:
             sagittal_n_sample=int(args.sagittal_n_sample),
         )
         print(f"Wrote: {out_png_sag}")
+    if out_png_sag_samples is not None:
+        if args.sagittal_samples_thumbnails_glob is None:
+            raise ValueError(
+                "--write-sagittal-samples requires --sagittal-samples-thumbnails-glob "
+                "(example: /working/2025*JaxA*Sag*/analysis/output/thumbnails/*+pi/thumbnail_z008.png)."
+            )
+        out_png_sag_samples.parent.mkdir(parents=True, exist_ok=True)
+        save_ap_ml_mapping_figure_sagittal(
+            out_png=out_png_sag_samples,
+            data=data,
+            b_const=float(args.b_const),
+            outdir=outdir,
+            ap_hline_step_um=float(args.ap_hline_step_um),
+            atlas_name=str(args.atlas_name),
+            brainglobe_config_dir=Path(args.brainglobe_config_dir),
+            sagittal_k_step=int(args.sagittal_k_step),
+            sagittal_n_sample=int(args.sagittal_n_sample),
+            sample_thumbnails_glob=str(args.sagittal_samples_thumbnails_glob),
+        )
+        print(f"Wrote: {out_png_sag_samples}")
     if out_png_combined is not None:
         out_png_combined.parent.mkdir(parents=True, exist_ok=True)
         save_ap_ml_mapping_figure_combined(

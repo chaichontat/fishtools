@@ -52,7 +52,8 @@ def construct_idt(seq_encoding: pl.DataFrame, idxs: Sequence[int]):
             out_pad = rotate(
                 READOUTS[bit].lower() + x + s[1] + "tattcaat"[: max(0, 46 - len(s[1]) - 20)].lower(), 12 + 1
             )
-            if all(seq not in out_pad for seq in ["AAAAA", "TTTTT", "CCCCC", "GGGGG"]):
+            out_pad_upper = out_pad.upper()
+            if all(seq not in out_pad_upper for seq in ["AAAAA", "TTTTT", "CCCCC", "GGGGG"]):
                 break
         else:
             raise ValueError("Homopolymers")
@@ -101,9 +102,10 @@ def construct_encoding(
         assert pad_start > 17
         for sep, codes in zip(["AA", "TA", "AT", "TT"], perms):
             stitched = stitch(pad, codes, sep=sep)
-            if "AAAAAA" in stitched or "TTTTTT" in stitched or "CCCCC" in stitched or "GGGGG" in stitched:
+            stitched_upper = stitched.upper()
+            if any(hp in stitched_upper for hp in ["AAAAA", "TTTTT", "CCCCC", "GGGGG"]):
                 continue
-            if Restriction.BamHI.search(s_ := Seq.Seq(stitched)):
+            if Restriction.BamHI.search(Seq.Seq(stitched)):
                 continue
             out["name"].append(name)  # f"{name};;{sep}{','.join(map(str,codes))}")
             out["seq"].append(stitched)

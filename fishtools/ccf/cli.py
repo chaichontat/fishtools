@@ -9,6 +9,11 @@ LAZY_COMMANDS: dict[str, SimpleNamespace] = {
     "export-atlas-slice": SimpleNamespace(module="fishtools.ccf.cli_export_atlas_slice", attr="main"),
     "warp-h5ad-spatial": SimpleNamespace(module="fishtools.ccf.cli_warp_h5ad_spatial", attr="main"),
     "filter-h5ad-ccf": SimpleNamespace(module="fishtools.ccf.cli_filter_h5ad_ccf", attr="main"),
+    "princurve-qc-review": SimpleNamespace(module="fishtools.ccf.cli_princurve_qc_review", attr="main"),
+    "princurve-signed-r-review": SimpleNamespace(module="fishtools.ccf.cli_princurve_signed_r_review", attr="main"),
+    "princurve-signed-r-review-all": SimpleNamespace(
+        module="fishtools.ccf.cli_princurve_signed_r_review_all", attr="main"
+    ),
 }
 
 

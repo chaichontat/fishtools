@@ -13,8 +13,11 @@ import numpy as np
 import seaborn as sns
 
 from fishtools.postprocess import jitter
+from fishtools.preprocess.cli_register import run_fiducial
+from fishtools.utils.plot import encode_labels_for_colormap, make_rgb, plot_img, tableau20_label_cmap
 
 sns.set_theme()
+
 
 # %%
 import polars as pl
@@ -90,20 +93,17 @@ sns.set_theme()
 
 import pickle
 
-path = Path("/working/20250411_2957/analysis/deconv")
-roi = "hippo"
-codebook = "morris"
-idx = 55
+path = Path("/warm/raw/20251129_SV128_Fos-AI-7to9_plate4/analysis/deconv")
+roi = "day1"
+codebook = "alina_soma.good"
+idx = 65
+
+# /warm/raw/20251129_SV128_Fos-AI-7to9_plate4/analysis/deconv/registered--sham+alina_soma.good/decoded-alina_soma.good
 
 d = pickle.loads(
     Path(path / f"registered--{roi}+{codebook}/decoded-{codebook}/reg-{idx:04d}-0.pkl").read_bytes()
 )
 
-d = pickle.loads(
-    Path(
-        "/working/20250423_DPE00199_mpeg/analysis/deconv/opt_Dpe/reg-0045--top_left+Dpe_opt01.pkl"
-    ).read_bytes()
-)
 
 area = np.array(d[1])[d[0].coords["spot_id"].to_numpy()]
 # print(len(oks), np.unique(d[0].coords["target"].to_numpy()))
@@ -132,22 +132,19 @@ with tifffile.TiffFile(path / f"registered--{roi}+{codebook}/reg-{idx:04d}.tif")
     img = tif.asarray()
     img_keys = tif.shaped_metadata[0]["key"]
 
-with tifffile.TiffFile(
-    "/working/20250423_DPE00199_mpeg/analysis/deconv/registered--bottom_right+Dpe/reg-0084.tif"
-) as tif:
-    img = tif.asarray()
-    img_keys = tif.shaped_metadata[0]["key"]
+# with tifffile.TiffFile(
+#    path / f"registered--{roi}+{codebook}/reg-{idx:04d}.tif"
+# ) as tif:
+#     img = tif.asarray()
+#     img_keys = tif.shaped_metadata[0]["key"]
 
 bit_mapping = {k: i for i, k in enumerate(img_keys)}
 mapping_bit = {v: k for k, v in bit_mapping.items()}
-
+#%%
 import json
 
-cb = json.loads((Path.home() / "fishtools/starwork6/Dpe.json").read_text())
+cb = json.loads((path / "codebooks" / f"{codebook}.json").read_text())
 # %%
-img = tifffile.imread(
-    "/working/20250423_DPE00199_mpeg/analysis/deconv/registered--bottom_left+Dpe/_highpassed/reg-0023_Dpe.hp.tif"
-)
 
 # %%
 
@@ -221,7 +218,7 @@ def plot_blank(img, coords, name, margin=51, vmax_percentile=99.999):
     return windows
 
 
-idx = 34
+idx = 11
 
 
 oks = d[0][d[0].coords["passes_thresholds"]]
@@ -229,8 +226,8 @@ oks = d[0][d[0].coords["passes_thresholds"]]
 #     (np.linalg.norm(d[0].to_numpy().squeeze(), axis=1) > 0.2)
 #     & (4 / 3 * np.pi * oks.coords["radius"] ** 3 > 12)
 # ]
-oks = oks[np.linalg.norm(oks.to_numpy().squeeze(), axis=1).__gt__(0.2)]
-blanks = oks[oks.coords["target"].str.startswith("Blank")]
+oks = oks[np.linalg.norm(oks.to_numpy().squeeze(), axis=1).__gt__(0.05)]
+blanks = oks[oks.coords["target"].str.startswith("Blank-2")]
 want = oks[idx]
 want = blanks[idx]
 z, y, x = want.coords["z"].item(), want.coords["y"].item(), want.coords["x"].item()
@@ -297,28 +294,105 @@ for ax in axs.flat:
 plt.tight_layout()
 
 # %%
+from fishtools import Workspace
+from fishtools.utils.plot import plot_img
+
+ws = Workspace("/working/20251001_JaxA3_Coro11")
+# %%
+plot_img(
+    "/working/20251001_JaxA3_Coro11/analysis/deconv/stitch--2r+pi/fused.zarr",
+    np.s_[10, ::4, ::4, 0],
+)
+# %%
+import tifffile
+
+img = tifffile.imread(
+    "/working/20250929_JaxA3_Coro4/analysis/deconv/registered--1+cs_base/_sanity_field/canvas_raw.tif"
+)
+plt.imshow(
+    img,
+    zorder=1,
+)
+plt.colorbar()
 
 # %%
-import zarr
+img2 = tifffile.imread(
+    "/working/20251001_JaxA3_Coro11/analysis/deconv/stitch--1whole+edu/06/01/fused_01-1.tif"
+)[::4, ::4]
+plt.imshow(img, zorder=1)
 
-f = zarr.open_array("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA/half.zarr")
 
+# %%
+u = make_rgb(
+    img2,
+    img,
+    np.zeros_like(img),
+)
+# %%
+plt.imshow(u / 65535, zorder=1)
+
+# %%
+# f = zarr.open_array("/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA/half.zarr")
 # %%
 import matplotlib.pyplot as plt
 import seaborn as sns
+import zarr
 
 sns.set_theme()
 fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200, facecolor="black")
 for ax, chan in zip(axs, range(0, 12, 4)):
     ax.imshow(f[chan, 11000:12000, 5000:5500], zorder=1)
 # %%
+sl = np.s_[5, 4500:5000, 4000:5000]
 
-fi = zarr.open_array(
-    "/working/20250327_benchmark_coronal2/analysis/deconv/stitch--brain+polyA/input_image.zarr"
+mask = zarr.open_array(
+    "/working/20251001_JaxA3_Coro11/analysis/deconv/stitch--2r+pi/output_segmentation.zarr"
+)
+mask = mask[sl]
+
+# %%
+img = zarr.open_array("/working/20251001_JaxA3_Coro11/analysis/deconv/stitch--2r+edu/fused.zarr")
+img = img[*sl, 1]
+# %%
+plt.rcParams["figure.dpi"] = 300
+
+cmap, norm, lut = tableau20_label_cmap(mask, fill_interiors=True, add_border=True, border_color=(1, 1, 1, 1))
+index_img = encode_labels_for_colormap(mask, lut, border_label=-1, connectivity=8)
+plt.imshow(index_img, cmap=cmap, norm=norm, zorder=1)
+# %%
+plt.imshow(img, zorder=1)
+plt.imshow(index_img, cmap=cmap, norm=norm, zorder=1, alpha=0.3)
+
+# plt.imshow(mask[5, 8000:9000, 8000:9000], zorder=1)
+
+# %%
+# fi *= mask[np.newaxis, :, :, np.newaxis]
+# %%
+fi = zarr.open_array("/working/20251001_JaxA3_Coro11/analysis/deconv/stitch--2l+pi/fused_n4.zarr")
+fi2 = zarr.open_array(
+    "/working/20251001_JaxA3_Coro11/analysis/deconv/stitch--2l+pi/output_segmentation.zarr", mode="r"
 )
 
+# %%
+plt.imshow()
 
-plt.imshow(fi[:, 11000:12000, 5000:5500, 1].max(axis=0), zorder=1, vmax=6000)
+# %%
+plot_img(
+    "/working/20250929_JaxA3_Coro4/analysis/deconv/registered--1+cs_base/_sanity_field/canvas_corrected.tif"
+)
+
+# fi2[:] = fi[:]
+# fi2.flush()
+# %%
+plt.rcParams["figure.dpi"] = 300
+plt.imshow(fi2[15, 8000:10000, 9000:10000], zorder=1)
+# %%
+
+# %%
+
+u = unsharp_mask(
+    cp.asarray(fi[10, 9000:10000, 9000:10000, 0], dtype=np.float32), radius=2, preserve_range=True
+)
 # %%
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -328,8 +402,9 @@ fig, axs = plt.subplots(ncols=3, nrows=1, figsize=(12, 4), dpi=200, facecolor="b
 for ax, chan in zip(axs, range(0, 12, 4)):
     ax.imshow(fi[chan, 15800:16500, 18500:19500, 1], zorder=1)
 # %%
-from fishtools.utils.io import Workspace
 from tifffile import imread
+
+from fishtools.utils.io import Workspace
 
 ws = Workspace("/working/20250411_2957")
 
@@ -337,5 +412,46 @@ u = imread(ws.img("2_10_18", "hippo", 5))
 
 # %%
 t = imread(ws.img("x34_polyA", "hippo", 5))
+
+# %%
+from tifffile import imread
+img_repaired = imread("/working/20251026_JaxA1_Sag6/analysis/deconv/wga_brdu--4--repaired/wga_brdu-0011.tif")[-2][:512, :512]
+ref = imread("/working/20251026_JaxA1_Sag6/analysis/deconv/2_10_18--4/2_10_18-0011.tif")[-2][:512, :512]
+img = imread("/working/20251026_JaxA1_Sag6/analysis/deconv/wga_brdu--4/wga_brdu-0011.tif")[-2][:512, :512]
+# %%
+import matplotlib.pyplot as plt
+fig,axs= plt.subplots(1,3,figsize=(12,4),dpi=200)
+axs[0].imshow(img, zorder=1, vmin=0, vmax=20000)
+axs[0].set_title("Original")
+axs[1].imshow(img_repaired, zorder=1, vmin=0, vmax=20000)
+axs[1].set_title("Repaired")
+axs[2].imshow(ref, zorder=1, vmin=0, vmax=20000)
+axs[2].set_title("Reference")
+# %%
+img=imread("/working/20251026_JaxA1_Sag6/analysis/deconv/stitch--3--shifted-wga_brdu/fid/00/fused_00-1.tif")
+
+# %%
+from fishtools.preprocess.fiducial import phase_shift
+
+
+
+shift_val = phase_shift(ref, img)
+
+print(f"Fiducial shift = {shift_val}")
+# Fiducial shift = [ 50.53 -59.5 ]
+# %%
+shift_val = phase_shift(ref, img_repaired)
+print(f"Fiducial shift = {shift_val}")
+# Fiducial shift = [0.03 0.14]
+# %%
+import pyvista as pv
+m = pv.read("/working/20251001_JaxA3_Coro11/analysis/deconv/stitch--2l+pi/output_segmentation-sam_postproc_s1-2-2_v500.zarr/mesh.vtp")
+
+#%%
+p = pv.Plotter()
+p.add_mesh(m)
+p.show_axes()
+p.camera.zoom(5.0)
+p.show()
 
 # %%

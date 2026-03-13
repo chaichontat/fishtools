@@ -10,6 +10,7 @@ import pandas as pd
 import scanpy as sc
 import seaborn as sns
 import spaco
+from sklearn.metrics import roc_auc_score
 import tifffile
 from shapely import MultiPolygon, Point, Polygon, STRtree
 
@@ -17,7 +18,7 @@ from fishtools.postprocess import normalize_total
 
 sns.set_theme()
 plt.rcParams["figure.dpi"] = 200
-path = Path("/working/20250612_ebe00219_3/analysis/deconv/baysor10")
+path = Path("/working/20251001_JaxA3_Coro11/analysis/deconv/baysor")
 # path = Path("/working/20250407_cs3_2/analysis/deconv/baysor--br/point8")
 adata = sc.read_loom(path / "segmentation_counts.loom")
 adata.var_names = adata.var["Name"]
@@ -75,7 +76,7 @@ sc.pl.pca_variance_ratio(adata, log=True)
 # %%
 
 rsc.pp.neighbors(adata, n_neighbors=15, n_pcs=30, metric="cosine")
-sc.tl.leiden(adata, n_iterations=2, resolution=0.8, flavor="igraph")
+sc.tl.leiden(adata, n_iterations=2, resolution=2, flavor="igraph")
 rsc.tl.umap(adata, min_dist=0.1, n_components=2)
 # sc.tl.umap(adata, min_dist=0.1, n_components=2)
 # %%
@@ -90,7 +91,7 @@ sc.pl.umap(adata, color=["leiden"])
 # %%
 for i in range(adata.obs["leiden"].cat.categories.size):
     fig, ax = plt.subplots(figsize=(4, 4), dpi=200)
-    sc.pl.embedding(adata, color="leiden", basis="spatial", ax=ax, palette=palette_spaco, groups=[str(i)])
+    sc.pl.embedding(adata, color="leiden", basis="spatial", ax=ax, groups=[str(i)])
     ax.set_aspect("equal")
     plt.show()
 
@@ -102,7 +103,11 @@ for i in range(adata.obs["leiden"].cat.categories.size):
 # rsc.pp.neighbors(adata_gpu, n_neighbors=20, n_pcs=30)
 # %%
 sc.pl.umap(
-    adata, color=["leiden", "Pax6", "Gad1", "Satb2", "Tbr1", "Lhx6"], frameon=False, cmap="Blues", ncols=2
+    adata,
+    color=["leiden", "Pax6-201", "Gad1-201", "Satb2-202", "Tbr1", "Lhx6"],
+    frameon=False,
+    cmap="Blues",
+    ncols=2,
 )
 
 # %%
@@ -144,8 +149,13 @@ adata.write_h5ad(path / "pearsonedcortex.h5ad")
 # %%
 
 plt.scatter(
-    adata[:, "Slc17a7"].X.flatten() + np.random.normal(0, 0.5, size=adata.shape[0]),
-    adata[:, "Gad1"].X.flatten() + np.random.normal(0, 0.5, size=adata.shape[0]),
+    np.asarray(
+        adata[:, [x for x in adata.var_names if x.startswith("Slc17a7")][0]].X.todense().flatten()
+        + np.random.normal(0, 0.5, size=adata.shape[0])
+    ).flatten(),
+    np.asarray(
+        adata[:, "Gad1-201"].X.todense().flatten() + np.random.normal(0, 0.5, size=adata.shape[0])
+    ).flatten(),
     s=0.3,
     alpha=0.4,
 )
@@ -252,6 +262,66 @@ color_mapping = {k: color_mapping[k] for k in adata.obs["leiden"].cat.categories
 palette_spaco = list(color_mapping.values())
 
 # %%
+
+def match_gene_names(adata, gene_list):
+    """Match gene names from a list to var_names, accounting for isoform suffixes.
+
+    For each gene in gene_list, returns the first matching var_name that starts
+    with the gene name followed by a hyphen (e.g., 'Pax6' matches 'Pax6-201').
+    Falls back to exact match if no suffix variant is found.
+
+    Parameters
+    ----------
+    adata : ad.AnnData
+        AnnData object with var_names to search
+    gene_list : list[str]
+        List of gene names (without suffix)
+
+    Returns
+    -------
+    list[str]
+        List of matched var_names from adata
+    """
+    matched = []
+    for gene in gene_list:
+        # First try to find a variant with suffix
+        candidates = [v for v in adata.var_names if v.startswith(f"{gene}-")]
+        if candidates:
+            matched.append(candidates[0])
+        elif gene in adata.var_names:
+            # Fallback to exact match
+            matched.append(gene)
+        else:
+            # Gene not found, keep original name (will fail in scanpy with clear error)
+            matched.append(gene)
+    return matched
+
+
+
+genes_to_plot = [
+    "leiden",
+    "Pax6",
+    "Sox2",
+    "Hes5",
+    "Slc17a7",
+    "Lhx2",
+    "Lhx6",
+    "Pdgfra",
+    "Gad1",
+    "Cux2",
+    "Eomes",
+    "Foxp2",
+]
+
+sc.pl.embedding(
+    adata,
+    basis="umap",
+    color=match_gene_names(adata, genes_to_plot),
+    frameon=False,
+    cmap="Blues",
+    return_fig=True,
+)
+# %%
 genes = sorted(
     set(
         chain.from_iterable([
@@ -303,17 +373,7 @@ plt.show()
 
 
 # %%
-import polars as pl
 
-genes = ["CD163", "LRRK2"]
-coords_umap = adata.obsm["X_umap"]
-df = pl.concat(
-    [
-        pl.DataFrame(adata.to_df()),
-        pl.DataFrame(adata.obsm["X_umap"]).rename({"column_0": "X_umap", "column_1": "Y_umap"}),
-    ],
-    how="horizontal",
-)
 # %%
 
 fig, axs = plt.subplots(figsize=(8, 6), dpi=200, ncols=2)
@@ -381,10 +441,129 @@ from fishtools.utils.plot import plot_wheel
 
 # %%
 
+key = "log_brdu_mean"
+fig, axs = plot_wheel(
+    np.nan_to_num(adata.obsm["tricycle"], nan=0),
+    scatter_cmap="RdBu",
+    c=adata.obs[key],
+    alpha=0.1,
+    # c=adata.obs["total_intensity"],
+    # scatter_cmap="RdBu_r",
+    colorize_background=False,
+    fig=fig,
+    vmin=np.percentile(adata.obs[key], 80),
+    vmax=np.percentile(adata.obs[key], 99),
+    colorbar_label="θ",
+)
+# %%
+fig, axs = plot_wheel(
+    np.nan_to_num(m.obsm["tricycle"], nan=0),
+    # scatter_cmap="Blues",
+    alpha=0.1,
+    c=m.obs["edu_mean"],
+    scatter_cmap="Blues",
+    colorize_background=False,
+    fig=fig,
+    # vmax=np.percentile(adata.obs["total_intensity"], 99),
+    colorbar_label="mean EdU intensity",
+)
+
 
 # %%
 t = adata.obsm["tricycle"].copy()
 t[:, 0] += 0.5
 plot_wheel(t)
 
+# %%
+
+
+def compare_genes(adata, genes, ax=None, jitter=0.02, dark=False, quadrant_thresholds=None, **kwargs):
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 6), dpi=200, facecolor="white" if not dark else "black")
+
+    ax.set_aspect("equal")
+    rand = np.random.default_rng(0)
+    # Ensure gene names are valid and exist in adata
+    valid_genes = [gene for gene in genes if gene in adata.var_names]
+    if len(valid_genes) < 2:
+        raise ValueError(f"At least two valid genes are required. Found: {valid_genes} in {genes}")
+
+    x = adata[:, valid_genes[0]].X.squeeze() + rand.normal(0, jitter, len(adata))
+    y = adata[:, valid_genes[1]].X.squeeze() + rand.normal(0, jitter, len(adata))
+    print(x)
+    if not dark:
+        ax.scatter(x, y, s=0.1, alpha=0.1, **kwargs)
+    else:
+        ax.hexbin(x, y, gridsize=250)
+    ax.set_xlabel(valid_genes[0])
+    ax.set_ylabel(valid_genes[1])
+    ax.set_aspect("equal")
+    min_val = min(np.min(x), np.min(y)) - 1
+    max_val = max(np.max(x), np.max(y)) + 1
+    ax.set_xlim((min_val, max_val))
+    ax.set_ylim((min_val, max_val))
+
+    if quadrant_thresholds is not None and len(quadrant_thresholds) == 2:
+        x_thresh, y_thresh = quadrant_thresholds
+        ax.axhline(y_thresh, color="grey", linestyle="--", lw=1)
+        ax.axvline(x_thresh, color="grey", linestyle="--", lw=1)
+
+        total_points = len(x)
+        if total_points > 0:
+            q_tr = np.sum((x >= x_thresh) & (y >= y_thresh))
+            q_tl = np.sum((x < x_thresh) & (y >= y_thresh))
+            q_bl = np.sum((x < x_thresh) & (y < y_thresh))
+            q_br = np.sum((x >= x_thresh) & (y < y_thresh))
+
+            perc_tr = (q_tr / total_points) * 100
+            perc_tl = (q_tl / total_points) * 100
+            perc_bl = (q_bl / total_points) * 100
+            perc_br = (q_br / total_points) * 100
+
+            # Position text relative to plot limits and thresholds
+            text_props = dict(ha="center", va="center", fontsize=12, color="black" if not dark else "white")
+
+            # Adjust text position to be within the plot and quadrant
+            x_range = max_val - min_val
+            y_range = max_val - min_val
+
+            ax.text(
+                x_thresh + 0.5 * (max_val - x_thresh),
+                y_thresh + 0.5 * (max_val - y_thresh),
+                f"{perc_tr:.1f}%",
+                **text_props,
+            )  # TR
+            ax.text(
+                x_thresh - 0.5 * (x_thresh - min_val),
+                y_thresh + 0.5 * (max_val - y_thresh),
+                f"{perc_tl:.1f}%",
+                **text_props,
+            )  # TL
+            ax.text(
+                x_thresh - 0.5 * (x_thresh - min_val),
+                y_thresh - 0.5 * (y_thresh - min_val),
+                f"{perc_bl:.1f}%",
+                **text_props,
+            )  # BL
+            ax.text(
+                x_thresh + 0.5 * (max_val - x_thresh),
+                y_thresh - 0.5 * (y_thresh - min_val),
+                f"{perc_br:.1f}%",
+                **text_props,
+            )  # BR
+    return ax
+
+
+adata.X = np.asarray(adata.X.todense())
+
+sns.set_theme()
+with sns.axes_style("white"):
+    compare_genes(
+        adata,
+        genes=["Satb2-202", "Gad1-201"],
+        jitter=0.02,
+        dark=False,
+        quadrant_thresholds=(0.1, 0.1),
+        color="blue",
+    )
 # %%

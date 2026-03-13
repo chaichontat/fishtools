@@ -10,6 +10,16 @@ import numpy as np
 import pandas as pd
 
 
+def _dataset_animal(dataset: str) -> str:
+    import re
+
+    m = re.search(r"(jaxa\d+)", str(dataset), flags=re.IGNORECASE)
+    if m is None:
+        raise ValueError(f"Cannot infer animal from dataset={dataset!r} (expected contains 'JaxA#').")
+    s = m.group(1)
+    return s[0].upper() + s[1:]
+
+
 @dataclass(frozen=True)
 class MhDsContrib:
     """MH log-OR decomposed into per-dataset contributions.
@@ -245,8 +255,68 @@ def _residualize_matrix_within_dataset(
 def _stable_hash_u64(dataset: np.ndarray, obs_name: np.ndarray) -> np.ndarray:
     ds = dataset.astype(str)
     on = obs_name.astype(str)
-    s = pd.Series([f"{d}|{o}" for d, o in zip(ds.tolist(), on.tolist(), strict=True)], copy=False)
+    # Include a stable position to avoid collisions when obs_names are not unique (can happen in the AnnData).
+    s = pd.Series(
+        [f"{d}|{o}|{i}" for i, (d, o) in enumerate(zip(ds.tolist(), on.tolist(), strict=True))],
+        copy=False,
+    )
     return pd.util.hash_pandas_object(s, index=False).to_numpy(np.uint64, copy=False)
+
+
+def _bh_fdr(p: np.ndarray) -> np.ndarray:
+    p = np.asarray(p, dtype=float)
+    out = np.full(p.shape, np.nan, dtype=float)
+    m = np.isfinite(p)
+    if not np.any(m):
+        return out
+    pv = np.clip(p[m], 0.0, 1.0)
+    order = np.argsort(pv)
+    ranked = pv[order]
+    n = ranked.size
+    q = ranked * n / (np.arange(1, n + 1, dtype=float))
+    # monotone
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    q = np.clip(q, 0.0, 1.0)
+    tmp = np.empty_like(q)
+    tmp[order] = q
+    out[m] = tmp
+    return out
+
+
+def _z_to_p_two_sided(z: float) -> float:
+    if not math.isfinite(z):
+        return float("nan")
+    # Two-sided p-value for standard normal using erfc for numerical stability.
+    return float(math.erfc(abs(z) / math.sqrt(2.0)))
+
+
+def _mh_log_or(
+    *,
+    stratum_idx: np.ndarray,
+    G: np.ndarray,
+    y: np.ndarray,
+    n_strata: int,
+    cc: float,
+) -> float:
+    g = G.astype(float, copy=False)
+    y1 = y.astype(float, copy=False)
+    y0 = 1.0 - y1
+    a = np.bincount(stratum_idx, weights=g * y1, minlength=int(n_strata)).astype(np.float64, copy=False) + float(cc)
+    b = np.bincount(stratum_idx, weights=g * y0, minlength=int(n_strata)).astype(np.float64, copy=False) + float(cc)
+    c = (
+        np.bincount(stratum_idx, weights=(1.0 - g) * y1, minlength=int(n_strata)).astype(np.float64, copy=False)
+        + float(cc)
+    )
+    d = (
+        np.bincount(stratum_idx, weights=(1.0 - g) * y0, minlength=int(n_strata)).astype(np.float64, copy=False)
+        + float(cc)
+    )
+    n = a + b + c + d
+    r = (a * d) / n
+    s = (b * c) / n
+    R = float(r.sum())
+    S = float(s.sum())
+    return float(math.log(R / S)) if (R > 0.0 and S > 0.0) else float("nan")
 
 
 def _make_gates_by_dataset_quantile_exact(
@@ -255,7 +325,11 @@ def _make_gates_by_dataset_quantile_exact(
     q_by_gene: np.ndarray,
     *,
     jitter: np.ndarray,
+    direction: str,
 ) -> np.ndarray:
+    direction = str(direction).strip().lower()
+    if direction not in {"high", "low"}:
+        raise ValueError(f"Unknown gate direction={direction!r} (expected 'high' or 'low').")
     ds = np.asarray(dataset, dtype=object)
     G = np.zeros(R.shape, dtype=bool)
     uniq_q = np.unique(q_by_gene)
@@ -282,8 +356,12 @@ def _make_gates_by_dataset_quantile_exact(
             # This avoids prevalence explosions in zero-inflated panels when many values tie at the quantile.
             for col in j.tolist():
                 vals = Rd[:, int(col)].astype(np.float64, copy=False) + eps * jd
-                # Select the k largest values.
-                cut = np.argpartition(vals, n - k)[n - k :]
+                if direction == "high":
+                    # Select the k largest values.
+                    cut = np.argpartition(vals, n - k)[n - k :]
+                else:
+                    # Select the k smallest values.
+                    cut = np.argpartition(vals, k - 1)[:k]
                 G[rows[cut], int(col)] = True
     return G
 
@@ -408,6 +486,7 @@ def _mh_ds_contrib(
     n_leiden: int,
     theta_bins: int,
     cc: float,
+    keep_strata: np.ndarray | None = None,
 ) -> MhDsContrib:
     g = G.astype(float, copy=False)
     y1 = y.astype(float, copy=False)
@@ -418,6 +497,11 @@ def _mh_ds_contrib(
     d0 = np.bincount(stratum_idx, weights=(1.0 - g) * y0, minlength=int(n_strata)).astype(np.float64, copy=False)
     n0 = a0 + b0 + c0 + d0
     keep = n0 > 0
+    if keep_strata is not None:
+        keep_strata = np.asarray(keep_strata, dtype=bool)
+        if keep_strata.shape != (int(n_strata),):
+            raise ValueError(f"keep_strata must have shape (n_strata,), got {keep_strata.shape}")
+        keep = keep & keep_strata
     if not np.any(keep):
         return MhDsContrib(delta=float("nan"), R_by_ds=np.zeros(int(n_datasets)), S_by_ds=np.zeros(int(n_datasets)))
 
@@ -442,35 +526,66 @@ def _mh_ds_contrib(
 
 
 def _bootstrap_ci_for_delta_diff(
-    c1: MhDsContrib, c2: MhDsContrib, *, rng: np.random.Generator, n_boot: int
+    c1: MhDsContrib,
+    c2: MhDsContrib,
+    *,
+    rng: np.random.Generator,
+    n_boot: int,
+    group_of_ds: np.ndarray | None = None,
 ) -> tuple[float, float, float]:
-    present = (c1.R_by_ds + c1.S_by_ds + c2.R_by_ds + c2.S_by_ds) > 0
-    ds_present = np.flatnonzero(present)
-    if ds_present.size == 0:
+    if group_of_ds is not None:
+        group_of_ds = np.asarray(group_of_ds, dtype=int)
+        if group_of_ds.shape != c1.R_by_ds.shape:
+            raise ValueError("group_of_ds must have shape (n_datasets,).")
+        n_groups = int(group_of_ds.max()) + 1
+        R1 = np.bincount(group_of_ds, weights=c1.R_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        S1 = np.bincount(group_of_ds, weights=c1.S_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        R2 = np.bincount(group_of_ds, weights=c2.R_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        S2 = np.bincount(group_of_ds, weights=c2.S_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+    else:
+        R1, S1, R2, S2 = c1.R_by_ds, c1.S_by_ds, c2.R_by_ds, c2.S_by_ds
+
+    present = (R1 + S1 + R2 + S2) > 0
+    groups_present = np.flatnonzero(present)
+    if groups_present.size == 0:
         return (float("nan"), float("nan"), float("nan"))
     d_point = float(c1.delta - c2.delta)
     boots = np.empty(int(n_boot), dtype=np.float64)
     for i in range(int(n_boot)):
-        samp = rng.choice(ds_present, size=ds_present.size, replace=True)
-        d1 = float(math.log(float(c1.R_by_ds[samp].sum()) / float(c1.S_by_ds[samp].sum())))
-        d2 = float(math.log(float(c2.R_by_ds[samp].sum()) / float(c2.S_by_ds[samp].sum())))
+        samp = rng.choice(groups_present, size=groups_present.size, replace=True)
+        d1 = float(math.log(float(R1[samp].sum()) / float(S1[samp].sum())))
+        d2 = float(math.log(float(R2[samp].sum()) / float(S2[samp].sum())))
         boots[i] = d1 - d2
     lo, hi = np.nanquantile(boots, [0.025, 0.975])
     return (d_point, float(lo), float(hi))
 
 
 def _bootstrap_ci_from_contrib(
-    c: MhDsContrib, *, rng: np.random.Generator, n_boot: int
+    c: MhDsContrib,
+    *,
+    rng: np.random.Generator,
+    n_boot: int,
+    group_of_ds: np.ndarray | None = None,
 ) -> tuple[float, float]:
-    present = (c.R_by_ds + c.S_by_ds) > 0
-    ds_present = np.flatnonzero(present)
-    if ds_present.size == 0:
+    if group_of_ds is not None:
+        group_of_ds = np.asarray(group_of_ds, dtype=int)
+        if group_of_ds.shape != c.R_by_ds.shape:
+            raise ValueError("group_of_ds must have shape (n_datasets,).")
+        n_groups = int(group_of_ds.max()) + 1
+        R = np.bincount(group_of_ds, weights=c.R_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        S = np.bincount(group_of_ds, weights=c.S_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+    else:
+        R, S = c.R_by_ds, c.S_by_ds
+
+    present = (R + S) > 0
+    groups_present = np.flatnonzero(present)
+    if groups_present.size == 0:
         return (float("nan"), float("nan"))
     boots = np.empty(int(n_boot), dtype=np.float64)
     for i in range(int(n_boot)):
-        samp = rng.choice(ds_present, size=ds_present.size, replace=True)
-        Rb = float(c.R_by_ds[samp].sum())
-        Sb = float(c.S_by_ds[samp].sum())
+        samp = rng.choice(groups_present, size=groups_present.size, replace=True)
+        Rb = float(R[samp].sum())
+        Sb = float(S[samp].sum())
         boots[i] = float(math.log(Rb / Sb))
     lo, hi = np.nanquantile(boots, [0.025, 0.975])
     return (float(lo), float(hi))
@@ -484,30 +599,33 @@ def _bootstrap_ci_for_int_diff(
     *,
     rng: np.random.Generator,
     n_boot: int,
+    group_of_ds: np.ndarray | None = None,
 ) -> tuple[float, float, float]:
     # int_diff := (d1 - d3) - (d2 - d4) = d1 - d3 - d2 + d4
-    present = (
-        c1.R_by_ds
-        + c1.S_by_ds
-        + c2.R_by_ds
-        + c2.S_by_ds
-        + c3.R_by_ds
-        + c3.S_by_ds
-        + c4.R_by_ds
-        + c4.S_by_ds
-    ) > 0
-    ds_present = np.flatnonzero(present)
-    if ds_present.size == 0:
+    if group_of_ds is not None:
+        group_of_ds = np.asarray(group_of_ds, dtype=int)
+        if group_of_ds.shape != c1.R_by_ds.shape:
+            raise ValueError("group_of_ds must have shape (n_datasets,).")
+        n_groups = int(group_of_ds.max()) + 1
+        def _agg(x: np.ndarray) -> np.ndarray:
+            return np.bincount(group_of_ds, weights=x, minlength=n_groups).astype(np.float64, copy=False)
+        R1, S1, R2, S2, R3, S3, R4, S4 = map(_agg, [c1.R_by_ds, c1.S_by_ds, c2.R_by_ds, c2.S_by_ds, c3.R_by_ds, c3.S_by_ds, c4.R_by_ds, c4.S_by_ds])
+    else:
+        R1, S1, R2, S2, R3, S3, R4, S4 = c1.R_by_ds, c1.S_by_ds, c2.R_by_ds, c2.S_by_ds, c3.R_by_ds, c3.S_by_ds, c4.R_by_ds, c4.S_by_ds
+
+    present = (R1 + S1 + R2 + S2 + R3 + S3 + R4 + S4) > 0
+    groups_present = np.flatnonzero(present)
+    if groups_present.size == 0:
         return (float("nan"), float("nan"), float("nan"))
 
     d_point = float((c1.delta - c3.delta) - (c2.delta - c4.delta))
     boots = np.empty(int(n_boot), dtype=np.float64)
     for i in range(int(n_boot)):
-        samp = rng.choice(ds_present, size=ds_present.size, replace=True)
-        d1 = float(math.log(float(c1.R_by_ds[samp].sum()) / float(c1.S_by_ds[samp].sum())))
-        d2 = float(math.log(float(c2.R_by_ds[samp].sum()) / float(c2.S_by_ds[samp].sum())))
-        d3 = float(math.log(float(c3.R_by_ds[samp].sum()) / float(c3.S_by_ds[samp].sum())))
-        d4 = float(math.log(float(c4.R_by_ds[samp].sum()) / float(c4.S_by_ds[samp].sum())))
+        samp = rng.choice(groups_present, size=groups_present.size, replace=True)
+        d1 = float(math.log(float(R1[samp].sum()) / float(S1[samp].sum())))
+        d2 = float(math.log(float(R2[samp].sum()) / float(S2[samp].sum())))
+        d3 = float(math.log(float(R3[samp].sum()) / float(S3[samp].sum())))
+        d4 = float(math.log(float(R4[samp].sum()) / float(S4[samp].sum())))
         boots[i] = (d1 - d3) - (d2 - d4)
     lo, hi = np.nanquantile(boots, [0.025, 0.975])
     return (d_point, float(lo), float(hi))
@@ -595,11 +713,27 @@ def _rd_ds_contrib(
 
 
 def _bootstrap_ci_for_rd(
-    c: RdDsContrib, *, rng: np.random.Generator, n_boot: int
+    c: RdDsContrib,
+    *,
+    rng: np.random.Generator,
+    n_boot: int,
+    group_of_ds: np.ndarray | None = None,
 ) -> dict[str, tuple[float, float, float]]:
-    present = (c.den_B1_by_ds + c.den_B0_by_ds) > 0
-    ds_present = np.flatnonzero(present)
-    if ds_present.size == 0:
+    if group_of_ds is not None:
+        group_of_ds = np.asarray(group_of_ds, dtype=int)
+        if group_of_ds.shape != c.den_B1_by_ds.shape:
+            raise ValueError("group_of_ds must have shape (n_datasets,).")
+        n_groups = int(group_of_ds.max()) + 1
+        num_B1 = np.bincount(group_of_ds, weights=c.num_B1_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        den_B1 = np.bincount(group_of_ds, weights=c.den_B1_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        num_B0 = np.bincount(group_of_ds, weights=c.num_B0_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+        den_B0 = np.bincount(group_of_ds, weights=c.den_B0_by_ds, minlength=n_groups).astype(np.float64, copy=False)
+    else:
+        num_B1, den_B1, num_B0, den_B0 = c.num_B1_by_ds, c.den_B1_by_ds, c.num_B0_by_ds, c.den_B0_by_ds
+
+    present = (den_B1 + den_B0) > 0
+    groups_present = np.flatnonzero(present)
+    if groups_present.size == 0:
         return {
             "rd_B1": (float("nan"), float("nan"), float("nan")),
             "rd_B0": (float("nan"), float("nan"), float("nan")),
@@ -614,9 +748,9 @@ def _bootstrap_ci_for_rd(
     boots_B0 = np.empty(int(n_boot), dtype=np.float64)
     boots_int = np.empty(int(n_boot), dtype=np.float64)
     for i in range(int(n_boot)):
-        samp = rng.choice(ds_present, size=ds_present.size, replace=True)
-        b1 = _ratio(c.num_B1_by_ds, c.den_B1_by_ds, samp)
-        b0 = _ratio(c.num_B0_by_ds, c.den_B0_by_ds, samp)
+        samp = rng.choice(groups_present, size=groups_present.size, replace=True)
+        b1 = _ratio(num_B1, den_B1, samp)
+        b0 = _ratio(num_B0, den_B0, samp)
         boots_B1[i] = b1
         boots_B0[i] = b0
         boots_int[i] = b1 - b0
@@ -632,7 +766,7 @@ def _bootstrap_ci_for_rd(
 
 
 def _sparse_strata_fraction(
-    *, stratum_idx: np.ndarray, G: np.ndarray, y: np.ndarray, n_strata: int
+    *, stratum_idx: np.ndarray, G: np.ndarray, y: np.ndarray, n_strata: int, keep_strata: np.ndarray | None = None
 ) -> float:
     # Fraction of non-empty strata where any of (a,b,c,d) is exactly 0 before continuity correction.
     g = G.astype(float, copy=False)
@@ -644,6 +778,11 @@ def _sparse_strata_fraction(
     d0 = np.bincount(stratum_idx, weights=(1.0 - g) * y0, minlength=int(n_strata)).astype(np.float64, copy=False)
     n0 = a0 + b0 + c0 + d0
     keep = n0 > 0
+    if keep_strata is not None:
+        keep_strata = np.asarray(keep_strata, dtype=bool)
+        if keep_strata.shape != (int(n_strata),):
+            raise ValueError(f"keep_strata must have shape (n_strata,), got {keep_strata.shape}")
+        keep = keep & keep_strata
     if not np.any(keep):
         return float("nan")
     sparse = (a0 == 0) | (b0 == 0) | (c0 == 0) | (d0 == 0)
@@ -669,7 +808,28 @@ def main() -> None:
         type=pathlib.Path,
         default=pathlib.Path("scripts/_out/ts_scan_gate_mode_a_phase_matched/gene_validation_scorecard_minimal_no_cnksr2.csv"),
     )
+    ap.add_argument(
+        "--crossfit-bestq-by-gene-csv",
+        type=pathlib.Path,
+        default=None,
+        help=(
+            "Optional CSV produced by `scripts/brdu_regression/crossfit_bestq_intE_mh.py` "
+            "(the *_by_gene.csv output). If provided, merge cross-fit selection diagnostics by gene."
+        ),
+    )
     ap.add_argument("--tricycle-ref-csv", type=pathlib.Path, default=pathlib.Path("neuroRef.csv"))
+    ap.add_argument(
+        "--theta-exclude-genes",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Exclude these genes from the tricycle reference set when computing theta (theta-leakage sensitivity).",
+    )
+    ap.add_argument(
+        "--theta-exclude-tested-genes",
+        action="store_true",
+        help="Exclude all tested gate genes (from --quadrant-csv) from the tricycle reference when computing theta.",
+    )
     ap.add_argument("--theta-bins", type=int, default=12)
     ap.add_argument(
         "--theta-bin-mode",
@@ -678,7 +838,21 @@ def main() -> None:
         default="quantile",
         help="Theta binning: quantile within (dataset×leiden) vs fixed absolute angular bins.",
     )
+    ap.add_argument(
+        "--no-theta-matching",
+        dest="theta_matching",
+        action="store_false",
+        help="Ablation: disable theta-bin matching (strata become dataset×leiden only).",
+    )
+    ap.set_defaults(theta_matching=True)
     ap.add_argument("--n-bootstrap", type=int, default=300)
+    ap.add_argument(
+        "--bootstrap-unit",
+        type=str,
+        choices=["dataset", "animal"],
+        default="dataset",
+        help="Resampling unit for MH/RD uncertainty: dataset bootstrap (default) vs animal bootstrap (more conservative if datasets nest within animals).",
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cc", type=float, default=0.5)
     ap.add_argument("--pearson-theta", type=float, default=100.0, help="Pearson residual theta (NB overdispersion).")
@@ -689,6 +863,63 @@ def main() -> None:
         help="Clip Pearson residuals to +/-clip; use 'none' to disable clipping.",
     )
     ap.add_argument("--pearson-block-size", type=int, default=64)
+    ap.add_argument(
+        "--no-gate-theta-residualize",
+        dest="gate_theta_residualize",
+        action="store_false",
+        help="Ablation: do not residualize gate scores against sin/cos(theta) within dataset before thresholding.",
+    )
+    ap.set_defaults(gate_theta_residualize=True)
+    ap.add_argument(
+        "--gate-direction",
+        type=str,
+        choices=["high", "low"],
+        default="high",
+        help="Define gates as top-k ('high', default) or bottom-k ('low') within each dataset by the gate score.",
+    )
+    ap.add_argument(
+        "--glm-mh-divergence-abs",
+        type=float,
+        default=0.2,
+        help="Flag GLM-vs-MH(overlap) divergence when |beta_GxB - delta_int_E_overlap| exceeds this threshold.",
+    )
+    ap.add_argument(
+        "--glm-mh-divergence-z",
+        type=float,
+        default=5.0,
+        help=(
+            "Flag large GLM-vs-MH(overlap) divergence when |beta_GxB - delta_int_E_overlap| / "
+            "sqrt(se_glm^2 + se_mh^2) exceeds this threshold. (Uses mh SE approximated from its CI.)"
+        ),
+    )
+    ap.add_argument(
+        "--glm-min-usable-strata",
+        type=int,
+        default=50,
+        help="Hard-flag genes when the GLM interaction is supported by fewer than this many usable strata.",
+    )
+    ap.add_argument(
+        "--no-support-filter",
+        dest="support_filter",
+        action="store_false",
+        help=(
+            "Disable gene×dataset support filtering. By default, for each gene we exclude datasets where the "
+            "gate selects zero detected (raw>0) gate+ cells, to avoid manufacturing gate+ cells for all-zero genes."
+        ),
+    )
+    ap.set_defaults(support_filter=True)
+    ap.add_argument(
+        "--support-min-detected",
+        type=int,
+        default=1,
+        help="Per gene×dataset: minimum number of detected (raw>0) cells required to include a dataset.",
+    )
+    ap.add_argument(
+        "--support-min-detected-gatepos",
+        type=int,
+        default=1,
+        help="Per gene×dataset: minimum number of detected (raw>0) cells among gate+ required to include a dataset.",
+    )
     ap.add_argument(
         "--no-glm",
         dest="glm",
@@ -733,21 +964,48 @@ def main() -> None:
     lei_code, lei_uniq = pd.factorize(leiden, sort=True)
     n_datasets = int(ds_uniq.shape[0])
     n_leiden = int(lei_uniq.shape[0])
-    n_strata = n_datasets * int(args.theta_bins) * n_leiden
+    theta_bins_used = int(args.theta_bins) if bool(args.theta_matching) else 1
+    n_strata = n_datasets * int(theta_bins_used) * n_leiden
 
-    trc = _load_tricycle_ref(args.tricycle_ref_csv.expanduser())
-    theta = _compute_tricycle_theta(adata, trc=trc, dataset=dataset)
-    theta_bin = _theta_bins(
-        theta,
-        ds_code,
-        lei_code,
-        n_bins=int(args.theta_bins),
-        mode=str(args.theta_bin_mode),
-    )
-    stratum_idx_all = (ds_code * int(args.theta_bins) + theta_bin.astype(int)) * n_leiden + lei_code
-    ds_of_stratum = (np.arange(int(n_strata), dtype=int) // (int(args.theta_bins) * int(n_leiden))).astype(
-        int, copy=False
-    )
+    need_theta = bool(args.theta_matching) or bool(args.gate_theta_residualize)
+    if need_theta:
+        trc = _load_tricycle_ref(args.tricycle_ref_csv.expanduser())
+        exclude = {str(x) for x in (args.theta_exclude_genes or []) if str(x).strip()}
+        if bool(args.theta_exclude_tested_genes):
+            exclude |= {str(g) for g in genes}
+        if exclude:
+            trc = trc.loc[~trc["symbol"].isin(sorted(exclude))].copy()
+        theta = _compute_tricycle_theta(adata, trc=trc, dataset=dataset)
+    else:
+        theta = np.zeros(dataset.shape[0], dtype=np.float32)
+
+    if bool(args.theta_matching):
+        theta_bin = _theta_bins(
+            theta,
+            ds_code,
+            lei_code,
+            n_bins=int(args.theta_bins),
+            mode=str(args.theta_bin_mode),
+        )
+    else:
+        theta_bin = np.zeros(dataset.shape[0], dtype=np.int16)
+
+    stratum_idx_all = (ds_code * int(theta_bins_used) + theta_bin.astype(int)) * n_leiden + lei_code
+    ds_of_stratum = (np.arange(int(n_strata), dtype=int) // (int(theta_bins_used) * int(n_leiden))).astype(int, copy=False)
+
+    animal_by_ds = np.array([_dataset_animal(d) for d in ds_uniq.tolist()], dtype=object)
+    animal_code_by_ds, animal_uniq = pd.factorize(animal_by_ds, sort=True)
+    if str(args.bootstrap_unit) == "animal":
+        bootstrap_group_of_ds = animal_code_by_ds.astype(np.int32, copy=False)
+        bootstrap_unit = "animal"
+    else:
+        bootstrap_group_of_ds = None
+        bootstrap_unit = "dataset"
+
+    # Overlap support mask for interaction (shared strata for B=1 and B=0).
+    present_B1 = np.bincount(stratum_idx_all[brdu == 1], minlength=int(n_strata)).astype(np.int64, copy=False)
+    present_B0 = np.bincount(stratum_idx_all[brdu == 0], minlength=int(n_strata)).astype(np.int64, copy=False)
+    keep_overlap = (present_B1 > 0) & (present_B0 > 0)
 
     # Gates.
     X_raw = _raw_counts_for_genes(adata, genes=genes)
@@ -760,12 +1018,38 @@ def main() -> None:
         clip=pearson_clip,
         block_size=int(args.pearson_block_size),
     )
-    sin_t = np.sin(theta).astype(np.float32, copy=False)
-    cos_t = np.cos(theta).astype(np.float32, copy=False)
-    R = _residualize_matrix_within_dataset(X, sin_t=sin_t, cos_t=cos_t, dataset=dataset)
+    if bool(args.gate_theta_residualize):
+        sin_t = np.sin(theta).astype(np.float32, copy=False)
+        cos_t = np.cos(theta).astype(np.float32, copy=False)
+        R = _residualize_matrix_within_dataset(X, sin_t=sin_t, cos_t=cos_t, dataset=dataset)
+    else:
+        R = X
     h = _stable_hash_u64(dataset, obs_name)
     jitter = ((h & np.uint64(0xFFFFFFFF)).astype(np.float64) / float(2**32)) - 0.5
-    Gmat = _make_gates_by_dataset_quantile_exact(R, dataset=dataset, q_by_gene=q_by_gene, jitter=jitter)
+    Gmat = _make_gates_by_dataset_quantile_exact(
+        R, dataset=dataset, q_by_gene=q_by_gene, jitter=jitter, direction=args.gate_direction
+    )
+
+    # Support table (gene × dataset): counts and achieved gate fractions.
+    support_rows: list[dict[str, object]] = []
+    n_cells_by_ds = np.bincount(ds_code, minlength=int(n_datasets)).astype(np.int64, copy=False)
+    n_B1_by_ds = np.bincount(ds_code, weights=brdu.astype(np.int64, copy=False), minlength=int(n_datasets)).astype(
+        np.int64, copy=False
+    )
+    n_E1_by_ds = np.bincount(ds_code, weights=edu.astype(np.int64, copy=False), minlength=int(n_datasets)).astype(
+        np.int64, copy=False
+    )
+
+    present_any = np.bincount(stratum_idx_all, minlength=int(n_strata)).astype(np.int64, copy=False) > 0
+    ds_by_stratum = (np.arange(int(n_strata), dtype=np.int64) // (int(theta_bins_used) * int(n_leiden))).astype(
+        np.int32, copy=False
+    )
+    n_present_strata_by_ds = np.bincount(ds_by_stratum[present_any], minlength=int(n_datasets)).astype(
+        np.int64, copy=False
+    )
+    n_overlap_strata_by_ds = np.bincount(
+        ds_by_stratum[present_any & keep_overlap], minlength=int(n_datasets)
+    ).astype(np.int64, copy=False)
 
     # Endpoint definitions.
     endpoints: list[tuple[str, np.ndarray, np.ndarray]] = [
@@ -776,17 +1060,138 @@ def main() -> None:
     ]
 
     rows: list[dict[str, object]] = []
+    hetero_rows: list[dict[str, object]] = []
     for j, g in enumerate(genes):
         G = Gmat[:, j]
         row: dict[str, object] = {"gene": g, "q": float(q_by_gene[j])}
+        row["bootstrap_unit"] = bootstrap_unit
+        row["theta_matching_enabled"] = bool(args.theta_matching)
+        row["theta_bin_mode"] = str(args.theta_bin_mode)
+        row["theta_bins_used"] = int(theta_bins_used)
+        row["gate_theta_residualize_enabled"] = bool(args.gate_theta_residualize)
+        row["gate_direction"] = str(args.gate_direction)
+        row["strata_overlap_frac_all"] = float(np.mean(keep_overlap))
+
+        xg = X_raw[:, j]
+        detected = (xg > 0).astype(np.int64, copy=False)
+        n_detect_by_ds = np.bincount(ds_code, weights=detected, minlength=int(n_datasets)).astype(np.int64, copy=False)
+        n_detect_gatepos_by_ds = np.bincount(ds_code, weights=detected * G.astype(np.int64, copy=False), minlength=int(n_datasets)).astype(
+            np.int64, copy=False
+        )
+        if bool(args.support_filter):
+            ds_keep = (n_detect_by_ds >= int(args.support_min_detected)) & (
+                n_detect_gatepos_by_ds >= int(args.support_min_detected_gatepos)
+            )
+        else:
+            ds_keep = np.ones(int(n_datasets), dtype=bool)
+        row["support_filter_enabled"] = bool(args.support_filter)
+        row["support_min_detected"] = int(args.support_min_detected)
+        row["support_min_detected_gatepos"] = int(args.support_min_detected_gatepos)
+        row["support_n_datasets_kept"] = int(np.sum(ds_keep))
+        row["support_n_datasets_dropped"] = int(int(n_datasets) - int(np.sum(ds_keep)))
+        keep_strata_gene = ds_keep[ds_of_stratum]
+        keep_overlap_gene_bonly = keep_overlap & keep_strata_gene
+        keep_cells = ds_keep[ds_code]
+
+        # Per-gene overlap mask requiring gate variation within each B level.
+        # This is stricter than B-only overlap and prevents E1/E3 being pooled over strata
+        # where the gate contrast is absent for B=1 or B=0.
+        stratum_keep = stratum_idx_all[keep_cells].astype(np.int64, copy=False)
+        B_keep = brdu[keep_cells].astype(np.int8, copy=False)
+        G_keep = G[keep_cells].astype(np.int8, copy=False)
+        key_gb = stratum_keep * 4 + G_keep.astype(np.int64, copy=False) * 2 + B_keep.astype(np.int64, copy=False)
+        n_gb = np.bincount(key_gb, minlength=int(n_strata) * 4).astype(np.int64, copy=False).reshape(int(n_strata), 4)
+        # combo index = G*2 + B, so B=1 requires combos 1 and 3; B=0 requires combos 0 and 2.
+        keep_overlap_gene_bg = (n_gb[:, 1] > 0) & (n_gb[:, 3] > 0) & (n_gb[:, 0] > 0) & (n_gb[:, 2] > 0)
+        keep_overlap_gene = keep_overlap_gene_bg & keep_strata_gene
+
+        present_any_gene = np.bincount(stratum_keep, minlength=int(n_strata)).astype(np.int64, copy=False) > 0
+        row["strata_overlap_frac_gene_bonly"] = (
+            float(np.mean(keep_overlap_gene_bonly[present_any_gene])) if np.any(present_any_gene) else float("nan")
+        )
+        row["strata_overlap_frac_gene_bg"] = (
+            float(np.mean(keep_overlap_gene_bg[present_any_gene])) if np.any(present_any_gene) else float("nan")
+        )
+        row["glm_n_strata_total_present"] = int(np.sum(present_any_gene))
+        # Stratum-level variation diagnostics (within kept datasets for this gene).
+        present_B1_gene = np.bincount(stratum_keep[B_keep == 1], minlength=int(n_strata)).astype(np.int64, copy=False) > 0
+        present_B0_gene = np.bincount(stratum_keep[B_keep == 0], minlength=int(n_strata)).astype(np.int64, copy=False) > 0
+        B_ok = present_B1_gene & present_B0_gene
+        present_G1_gene = (n_gb[:, 2] + n_gb[:, 3]) > 0
+        present_G0_gene = (n_gb[:, 0] + n_gb[:, 1]) > 0
+        G_ok = present_G1_gene & present_G0_gene
+        # For the GLM outcome E=edu.
+        E_keep = edu[keep_cells].astype(np.int8, copy=False)
+        present_E1_gene = np.bincount(stratum_keep[E_keep == 1], minlength=int(n_strata)).astype(np.int64, copy=False) > 0
+        present_E0_gene = np.bincount(stratum_keep[E_keep == 0], minlength=int(n_strata)).astype(np.int64, copy=False) > 0
+        E_ok = present_E1_gene & present_E0_gene
+        # Interaction identifiability requires some mixed (G,B) support within a stratum.
+        mixed_ok = (n_gb[:, 1] > 0) | (n_gb[:, 2] > 0)
+        usable_for_beta_gxb = present_any_gene & B_ok & G_ok & E_ok & mixed_ok
+        row["glm_n_strata_drop_B_const"] = int(np.sum(present_any_gene & ~B_ok))
+        row["glm_n_strata_drop_G_const"] = int(np.sum(present_any_gene & ~G_ok))
+        row["glm_n_strata_drop_E_const"] = int(np.sum(present_any_gene & ~E_ok))
+        row["glm_n_strata_drop_no_mixed_GB"] = int(np.sum(present_any_gene & ~mixed_ok))
+        row["glm_n_strata_used_beta_GxB"] = int(np.sum(usable_for_beta_gxb))
+        row["glm_n_datasets_with_used_strata"] = int(np.unique(ds_of_stratum[usable_for_beta_gxb]).size) if np.any(usable_for_beta_gxb) else 0
+        row["glm_low_info_flag"] = bool(row["glm_n_strata_used_beta_GxB"] < int(args.glm_min_usable_strata))
+
+        # Per-dataset heterogeneity (MH within dataset; strata = theta_bin × leiden).
+        n_strata_ds = int(theta_bins_used) * int(n_leiden)
+        intE_by_ds: list[float] = []
+        for ds_i, ds_name in enumerate(ds_uniq.tolist()):
+            m_ds = ds_code == int(ds_i)
+            if not np.any(m_ds):
+                continue
+            if not bool(ds_keep[int(ds_i)]):
+                intE_by_ds.append(float("nan"))
+                hetero_rows.append({"gene": str(g), "q": float(q_by_gene[j]), "dataset": str(ds_name), "delta_int_E_ds": float("nan")})
+                continue
+            st_ds = (theta_bin[m_ds].astype(int) * int(n_leiden) + lei_code[m_ds].astype(int)).astype(
+                np.int32, copy=False
+            )
+            if int(np.sum(m_ds & (brdu == 1))) == 0 or int(np.sum(m_ds & (brdu == 0))) == 0:
+                intE_by_ds.append(float("nan"))
+                continue
+            d1 = _mh_log_or(
+                stratum_idx=st_ds[brdu[m_ds] == 1],
+                G=G[m_ds][brdu[m_ds] == 1],
+                y=edu[m_ds][brdu[m_ds] == 1],
+                n_strata=n_strata_ds,
+                cc=float(args.cc),
+            )
+            d0 = _mh_log_or(
+                stratum_idx=st_ds[brdu[m_ds] == 0],
+                G=G[m_ds][brdu[m_ds] == 0],
+                y=edu[m_ds][brdu[m_ds] == 0],
+                n_strata=n_strata_ds,
+                cc=float(args.cc),
+            )
+            intE = float(d1 - d0) if (math.isfinite(d1) and math.isfinite(d0)) else float("nan")
+            intE_by_ds.append(intE)
+            hetero_rows.append({"gene": str(g), "q": float(q_by_gene[j]), "dataset": str(ds_name), "delta_int_E_ds": intE})
+
+        intE_by_ds_arr = np.asarray(intE_by_ds, dtype=float)
+        finite = np.isfinite(intE_by_ds_arr)
+        row["intE_n_datasets"] = int(np.sum(finite))
+        row["intE_sd_datasets"] = float(np.nanstd(intE_by_ds_arr, ddof=1)) if int(np.sum(finite)) >= 2 else float("nan")
+        row["intE_sign_consistency_datasets"] = (
+            float(np.mean(np.sign(intE_by_ds_arr[finite]) == np.sign(np.nanmean(intE_by_ds_arr[finite]))))
+            if int(np.sum(finite)) >= 3
+            else float("nan")
+        )
 
         # GLM audit estimator (grouped binomial with stratum fixed effects).
         if bool(args.glm):
-            key = stratum_idx_all.astype(np.int64, copy=False) * 4 + G.astype(np.int64, copy=False) * 2 + brdu.astype(
-                np.int64, copy=False
+            key = (
+                stratum_idx_all[keep_cells].astype(np.int64, copy=False) * 4
+                + G[keep_cells].astype(np.int64, copy=False) * 2
+                + brdu[keep_cells].astype(np.int64, copy=False)
             )
             n_tot = np.bincount(key, minlength=int(n_strata) * 4).astype(np.float64, copy=False)
-            n_succ = np.bincount(key, weights=edu.astype(np.float64, copy=False), minlength=int(n_strata) * 4).astype(
+            n_succ = np.bincount(
+                key, weights=edu[keep_cells].astype(np.float64, copy=False), minlength=int(n_strata) * 4
+            ).astype(
                 np.float64, copy=False
             )
             nz = np.flatnonzero(n_tot > 0)
@@ -806,6 +1211,10 @@ def main() -> None:
             row["glm_se_B"] = float(math.sqrt(coef.cov[1, 1])) if coef.cov.shape == (3, 3) else float("nan")
             row["glm_se_GxB"] = float(math.sqrt(coef.cov[2, 2])) if coef.cov.shape == (3, 3) else float("nan")
             row["glm_cov_G_GxB"] = float(coef.cov[0, 2]) if coef.cov.shape == (3, 3) else float("nan")
+            z = float(row["glm_beta_GxB"] / row["glm_se_GxB"]) if float(row["glm_se_GxB"]) > 0 else float("nan")
+            p = _z_to_p_two_sided(z)
+            row["glm_z_GxB"] = z
+            row["glm_p_GxB"] = p
         else:
             row["glm_fail_reason"] = "skipped"
             row["glm_n_rows"] = 0
@@ -817,6 +1226,8 @@ def main() -> None:
             row["glm_se_B"] = float("nan")
             row["glm_se_GxB"] = float("nan")
             row["glm_cov_G_GxB"] = float("nan")
+            row["glm_z_GxB"] = float("nan")
+            row["glm_p_GxB"] = float("nan")
 
         contribs: dict[str, MhDsContrib] = {}
         for name, cohort, y_all in endpoints:
@@ -828,11 +1239,14 @@ def main() -> None:
                 n_strata=n_strata,
                 n_datasets=n_datasets,
                 n_leiden=n_leiden,
-                theta_bins=int(args.theta_bins),
+                theta_bins=int(theta_bins_used),
                 cc=float(args.cc),
+                keep_strata=keep_strata_gene,
             )
             contribs[name] = c
-            lo, hi = _bootstrap_ci_from_contrib(c, rng=rng, n_boot=int(args.n_bootstrap))
+            lo, hi = _bootstrap_ci_from_contrib(
+                c, rng=rng, n_boot=int(args.n_bootstrap), group_of_ds=bootstrap_group_of_ds
+            )
             row[f"delta_{name}"] = float(c.delta)
             row[f"ci_low_{name}"] = float(lo)
             row[f"ci_high_{name}"] = float(hi)
@@ -841,7 +1255,40 @@ def main() -> None:
             row[f"Ts_ci_high_{name}"] = float(math.exp(hi))
             # Sparse stratum diagnostics (pre-cc).
             row[f"sparse_strata_frac_{name}"] = _sparse_strata_fraction(
-                stratum_idx=sidx, G=G[cohort], y=y_all[cohort], n_strata=n_strata
+                stratum_idx=sidx, G=G[cohort], y=y_all[cohort], n_strata=n_strata, keep_strata=keep_strata_gene
+            )
+
+        # Overlap-restricted variants (shared support for B=1 and B=0 strata).
+        contribs_ov: dict[str, MhDsContrib] = {}
+        for name, cohort, y_all in endpoints:
+            sidx = stratum_idx_all[cohort]
+            c = _mh_ds_contrib(
+                stratum_idx=sidx,
+                G=G[cohort],
+                y=y_all[cohort],
+                n_strata=n_strata,
+                n_datasets=n_datasets,
+                n_leiden=n_leiden,
+                theta_bins=int(theta_bins_used),
+                cc=float(args.cc),
+                keep_strata=keep_overlap_gene,
+            )
+            contribs_ov[name] = c
+            lo, hi = _bootstrap_ci_from_contrib(
+                c, rng=rng, n_boot=int(args.n_bootstrap), group_of_ds=bootstrap_group_of_ds
+            )
+            row[f"delta_{name}_overlap"] = float(c.delta)
+            row[f"ci_low_{name}_overlap"] = float(lo)
+            row[f"ci_high_{name}_overlap"] = float(hi)
+            row[f"Ts_fold_{name}_overlap"] = float(math.exp(c.delta)) if math.isfinite(c.delta) else float("nan")
+            row[f"Ts_ci_low_{name}_overlap"] = float(math.exp(lo)) if math.isfinite(lo) else float("nan")
+            row[f"Ts_ci_high_{name}_overlap"] = float(math.exp(hi)) if math.isfinite(hi) else float("nan")
+            row[f"sparse_strata_frac_{name}_overlap"] = _sparse_strata_fraction(
+                stratum_idx=sidx,
+                G=G[cohort],
+                y=y_all[cohort],
+                n_strata=n_strata,
+                keep_strata=keep_overlap_gene,
             )
 
         # Mirror ratio: delta1 - delta2 (BrdU+ conditional minus EdU+ conditional).
@@ -854,10 +1301,18 @@ def main() -> None:
 
         # Interaction terms (same as mh_quadrant_validation.py, but also keep for downstream diffs).
         intE, intE_lo, intE_hi = _bootstrap_ci_for_delta_diff(
-            contribs["BrdUplus_Edu"], contribs["BrdUminus_Edu"], rng=rng, n_boot=int(args.n_bootstrap)
+            contribs["BrdUplus_Edu"],
+            contribs["BrdUminus_Edu"],
+            rng=rng,
+            n_boot=int(args.n_bootstrap),
+            group_of_ds=bootstrap_group_of_ds,
         )
         intB, intB_lo, intB_hi = _bootstrap_ci_for_delta_diff(
-            contribs["Eduplus_BrdU"], contribs["EdUminus_BrdU"], rng=rng, n_boot=int(args.n_bootstrap)
+            contribs["Eduplus_BrdU"],
+            contribs["EdUminus_BrdU"],
+            rng=rng,
+            n_boot=int(args.n_bootstrap),
+            group_of_ds=bootstrap_group_of_ds,
         )
         row["delta_int_E"] = float(intE)
         row["ci_low_int_E"] = float(intE_lo)
@@ -872,6 +1327,106 @@ def main() -> None:
         row["Ts_ci_low_int_B"] = float(math.exp(intB_lo))
         row["Ts_ci_high_int_B"] = float(math.exp(intB_hi))
 
+        intE_ov, intE_ov_lo, intE_ov_hi = _bootstrap_ci_for_delta_diff(
+            contribs_ov["BrdUplus_Edu"],
+            contribs_ov["BrdUminus_Edu"],
+            rng=rng,
+            n_boot=int(args.n_bootstrap),
+            group_of_ds=bootstrap_group_of_ds,
+        )
+        row["delta_int_E_overlap"] = float(intE_ov)
+        row["ci_low_int_E_overlap"] = float(intE_ov_lo)
+        row["ci_high_int_E_overlap"] = float(intE_ov_hi)
+        row["Ts_fold_int_E_overlap"] = float(math.exp(intE_ov)) if math.isfinite(intE_ov) else float("nan")
+        row["Ts_ci_low_int_E_overlap"] = float(math.exp(intE_ov_lo)) if math.isfinite(intE_ov_lo) else float("nan")
+        row["Ts_ci_high_int_E_overlap"] = float(math.exp(intE_ov_hi)) if math.isfinite(intE_ov_hi) else float("nan")
+        row["delta_int_E_overlap_minus_all"] = float(intE_ov - intE) if (math.isfinite(intE_ov) and math.isfinite(intE)) else float("nan")
+        row["intE_sign_flip_overlap_vs_all"] = (
+            bool(np.sign(intE_ov) != np.sign(intE)) if (math.isfinite(intE_ov) and math.isfinite(intE) and intE != 0.0) else False
+        )
+
+        # GLM-as-primary (final shortlist stage) + explicit MH-vs-GLM divergence QC.
+        if bool(args.glm):
+            glm_beta_gxb = float(row["glm_beta_GxB"])
+            glm_se_gxb = float(row["glm_se_GxB"])
+            row["intE_primary_source"] = "glm_beta_GxB"
+            row["intE_primary"] = glm_beta_gxb if math.isfinite(glm_beta_gxb) else float("nan")
+            row["intE_primary_se"] = glm_se_gxb if math.isfinite(glm_se_gxb) else float("nan")
+            row["intE_primary_p"] = float(row["glm_p_GxB"]) if math.isfinite(float(row["glm_p_GxB"])) else float("nan")
+            row["intE_primary_fail_reason"] = str(row["glm_fail_reason"]) if row["glm_fail_reason"] is not None else ""
+            row["IOR_primary"] = float(math.exp(glm_beta_gxb)) if math.isfinite(glm_beta_gxb) else float("nan")
+            if math.isfinite(glm_beta_gxb) and glm_se_gxb > 0.0:
+                lo = glm_beta_gxb - 1.96 * glm_se_gxb
+                hi = glm_beta_gxb + 1.96 * glm_se_gxb
+                row["IOR_primary_ci_low"] = float(math.exp(lo))
+                row["IOR_primary_ci_high"] = float(math.exp(hi))
+            else:
+                row["IOR_primary_ci_low"] = float("nan")
+                row["IOR_primary_ci_high"] = float("nan")
+
+            row["glm_minus_mh_intE_overlap"] = (
+                float(glm_beta_gxb - intE_ov) if (math.isfinite(glm_beta_gxb) and math.isfinite(intE_ov)) else float("nan")
+            )
+            row["abs_glm_minus_mh_intE_overlap"] = (
+                float(abs(glm_beta_gxb - intE_ov))
+                if (math.isfinite(glm_beta_gxb) and math.isfinite(intE_ov))
+                else float("nan")
+            )
+            row["glm_mh_intE_overlap_sign_mismatch"] = (
+                bool(np.sign(glm_beta_gxb) != np.sign(intE_ov))
+                if (math.isfinite(glm_beta_gxb) and math.isfinite(intE_ov) and float(intE_ov) != 0.0)
+                else False
+            )
+            row["glm_outside_mh_intE_overlap_ci"] = (
+                bool((glm_beta_gxb < float(intE_ov_lo)) or (glm_beta_gxb > float(intE_ov_hi)))
+                if (math.isfinite(glm_beta_gxb) and math.isfinite(intE_ov_lo) and math.isfinite(intE_ov_hi))
+                else False
+            )
+            mh_se = (
+                float((float(intE_ov_hi) - float(intE_ov_lo)) / (2.0 * 1.96))
+                if (math.isfinite(intE_ov_lo) and math.isfinite(intE_ov_hi) and float(intE_ov_hi) > float(intE_ov_lo))
+                else float("nan")
+            )
+            row["mh_intE_overlap_se_approx"] = mh_se
+            diff_se = (
+                float(math.sqrt((glm_se_gxb**2) + (mh_se**2)))
+                if (math.isfinite(glm_se_gxb) and glm_se_gxb > 0.0 and math.isfinite(mh_se) and mh_se > 0.0)
+                else float("nan")
+            )
+            row["glm_mh_intE_overlap_diff_z"] = (
+                float(abs(glm_beta_gxb - intE_ov) / diff_se)
+                if (math.isfinite(glm_beta_gxb) and math.isfinite(intE_ov) and math.isfinite(diff_se) and diff_se > 0.0)
+                else float("nan")
+            )
+            row["flag_glm_vs_mh_overlap_divergent_z"] = bool(
+                math.isfinite(float(row["glm_mh_intE_overlap_diff_z"]))
+                and float(row["glm_mh_intE_overlap_diff_z"]) > float(args.glm_mh_divergence_z)
+            )
+            row["flag_glm_vs_mh_overlap_divergent"] = bool(
+                row["glm_mh_intE_overlap_sign_mismatch"]
+                or (
+                    math.isfinite(float(row["abs_glm_minus_mh_intE_overlap"]))
+                    and float(row["abs_glm_minus_mh_intE_overlap"]) > float(args.glm_mh_divergence_abs)
+                )
+            )
+        else:
+            row["intE_primary_source"] = "mh_intE_overlap"
+            row["intE_primary"] = float(intE_ov)
+            row["intE_primary_se"] = float("nan")
+            row["intE_primary_p"] = float("nan")
+            row["intE_primary_fail_reason"] = "glm_skipped"
+            row["IOR_primary"] = float(row["Ts_fold_int_E_overlap"])
+            row["IOR_primary_ci_low"] = float(row["Ts_ci_low_int_E_overlap"])
+            row["IOR_primary_ci_high"] = float(row["Ts_ci_high_int_E_overlap"])
+            row["glm_minus_mh_intE_overlap"] = float("nan")
+            row["abs_glm_minus_mh_intE_overlap"] = float("nan")
+            row["glm_mh_intE_overlap_sign_mismatch"] = False
+            row["glm_outside_mh_intE_overlap_ci"] = False
+            row["mh_intE_overlap_se_approx"] = float("nan")
+            row["glm_mh_intE_overlap_diff_z"] = float("nan")
+            row["flag_glm_vs_mh_overlap_divergent_z"] = False
+            row["flag_glm_vs_mh_overlap_divergent"] = False
+
         # int_diff = int_E - int_B with shared dataset bootstrap.
         idiff, idiff_lo, idiff_hi = _bootstrap_ci_for_int_diff(
             contribs["BrdUplus_Edu"],
@@ -880,12 +1435,14 @@ def main() -> None:
             contribs["EdUminus_BrdU"],
             rng=rng,
             n_boot=int(args.n_bootstrap),
+            group_of_ds=bootstrap_group_of_ds,
         )
         row["delta_int_diff_E_minus_B"] = float(idiff)
         row["ci_low_int_diff_E_minus_B"] = float(idiff_lo)
         row["ci_high_int_diff_E_minus_B"] = float(idiff_hi)
 
         row["sig_int_E"] = bool((intE_lo > 0) or (intE_hi < 0))
+        row["sig_int_E_overlap"] = bool((intE_ov_lo > 0) or (intE_ov_hi < 0))
         row["sig_int_B"] = bool((intB_lo > 0) or (intB_hi < 0))
         row["int_sign_match"] = bool(np.sign(intE) == np.sign(intB))
 
@@ -895,16 +1452,16 @@ def main() -> None:
 
         # (Fix 5) Probability-scale interaction metrics (risk differences) to make saturation explicit.
         rd = _rd_ds_contrib(
-            stratum_idx=stratum_idx_all,
+            stratum_idx=stratum_idx_all[keep_cells],
             ds_of_stratum=ds_of_stratum,
-            G=G.astype(int, copy=False),
-            B=brdu.astype(int, copy=False),
-            E=edu.astype(int, copy=False),
+            G=G[keep_cells].astype(int, copy=False),
+            B=brdu[keep_cells].astype(int, copy=False),
+            E=edu[keep_cells].astype(int, copy=False),
             n_strata=n_strata,
             n_datasets=n_datasets,
             cc=float(args.cc),
         )
-        rd_ci = _bootstrap_ci_for_rd(rd, rng=rng, n_boot=int(args.n_bootstrap))
+        rd_ci = _bootstrap_ci_for_rd(rd, rng=rng, n_boot=int(args.n_bootstrap), group_of_ds=bootstrap_group_of_ds)
         row["rd_B1"] = float(rd_ci["rd_B1"][0])
         row["rd_ci_low_B1"] = float(rd_ci["rd_B1"][1])
         row["rd_ci_high_B1"] = float(rd_ci["rd_B1"][2])
@@ -924,7 +1481,64 @@ def main() -> None:
 
         rows.append(row)
 
+        # Gene × dataset support rows.
+        g1 = G.astype(np.int64, copy=False)
+        n_G1_by_ds = np.bincount(ds_code, weights=g1, minlength=int(n_datasets)).astype(np.int64, copy=False)
+        n_G1_B1_by_ds = np.bincount(ds_code, weights=g1 * brdu.astype(np.int64, copy=False), minlength=int(n_datasets)).astype(
+            np.int64, copy=False
+        )
+        n_G1_B0_by_ds = n_G1_by_ds - n_G1_B1_by_ds
+        n_G0_by_ds = n_cells_by_ds - n_G1_by_ds
+        n_G0_B1_by_ds = n_B1_by_ds - n_G1_B1_by_ds
+        n_G0_B0_by_ds = n_G0_by_ds - n_G0_B1_by_ds
+        # Gene-specific BG-overlap stratum counts per dataset.
+        n_overlap_bg_strata_by_ds = np.bincount(
+            ds_of_stratum[present_any_gene & keep_overlap_gene_bg], minlength=int(n_datasets)
+        ).astype(np.int64, copy=False)
+        for ds_i, ds_name in enumerate(ds_uniq.tolist()):
+            n_cells = int(n_cells_by_ds[ds_i])
+            if n_cells == 0:
+                continue
+            support_ok = bool(ds_keep[int(ds_i)])
+            reason = ""
+            if not support_ok:
+                if int(n_detect_by_ds[ds_i]) < int(args.support_min_detected):
+                    reason = "min_detected"
+                elif int(n_detect_gatepos_by_ds[ds_i]) < int(args.support_min_detected_gatepos):
+                    reason = "min_detected_gatepos"
+                else:
+                    reason = "filtered"
+            support_rows.append(
+                {
+                    "gene": str(g),
+                    "q": float(q_by_gene[j]),
+                    "dataset": str(ds_name),
+                    "n_cells": n_cells,
+                    "n_B1": int(n_B1_by_ds[ds_i]),
+                    "n_B0": int(n_cells_by_ds[ds_i] - n_B1_by_ds[ds_i]),
+                    "n_E1": int(n_E1_by_ds[ds_i]),
+                    "n_E0": int(n_cells_by_ds[ds_i] - n_E1_by_ds[ds_i]),
+                    "n_G1": int(n_G1_by_ds[ds_i]),
+                    "gate_frac": float(n_G1_by_ds[ds_i] / n_cells_by_ds[ds_i]),
+                    "n_detect": int(n_detect_by_ds[ds_i]),
+                    "det_rate": float(n_detect_by_ds[ds_i] / n_cells_by_ds[ds_i]),
+                    "n_detect_gatepos": int(n_detect_gatepos_by_ds[ds_i]),
+                    "det_gatepos_rate": float(n_detect_gatepos_by_ds[ds_i] / max(int(n_G1_by_ds[ds_i]), 1)),
+                    "support_ok": support_ok,
+                    "support_fail_reason": str(reason),
+                    "n_G1_B1": int(n_G1_B1_by_ds[ds_i]),
+                    "n_G1_B0": int(n_G1_B0_by_ds[ds_i]),
+                    "n_G0_B1": int(n_G0_B1_by_ds[ds_i]),
+                    "n_G0_B0": int(n_G0_B0_by_ds[ds_i]),
+                    "n_present_strata_dataset_theta_leiden": int(n_present_strata_by_ds[ds_i]),
+                    "n_overlap_strata_dataset_theta_leiden": int(n_overlap_strata_by_ds[ds_i]),
+                    "n_overlap_bg_strata_dataset_theta_leiden": int(n_overlap_bg_strata_by_ds[ds_i]),
+                }
+            )
+
     out = pd.DataFrame(rows)
+    out["glm_fdr_GxB"] = _bh_fdr(out["glm_p_GxB"].to_numpy(float))
+    out["intE_primary_fdr"] = out["glm_fdr_GxB"] if bool(args.glm) else float("nan")
 
     # Merge in earlier scorecard fields (animal robustness + confound flags + Leiden confounding metrics).
     sc = pd.read_csv(args.scorecard_csv)
@@ -955,12 +1569,55 @@ def main() -> None:
         raise ValueError(f"--scorecard-csv missing columns: {missing}")
     out = out.merge(sc.loc[:, keep_sc], on="gene", how="left", validate="one_to_one")
 
-    # Sort by interaction magnitude (primary review criterion at this stage).
-    out["abs_delta_int_E"] = out["delta_int_E"].abs()
-    out = out.sort_values(["sig_int_E", "abs_delta_int_E"], ascending=[False, False])
+    if args.crossfit_bestq_by_gene_csv is not None:
+        cf = pd.read_csv(args.crossfit_bestq_by_gene_csv)
+        needed = {
+            "gene",
+            "n_folds",
+            "q_selected_mode",
+            "test_intE_selected_mean",
+            "test_intE_selected_sd",
+            "test_intE_baseline_mean",
+            "test_intE_baseline_sd",
+        }
+        missing = needed - set(cf.columns)
+        if missing:
+            raise ValueError(f"--crossfit-bestq-by-gene-csv missing columns: {sorted(missing)}")
+        cf = cf.loc[:, sorted(needed)].copy()
+        cf = cf.rename(
+            columns={
+                "n_folds": "crossfit_n_folds",
+                "q_selected_mode": "crossfit_q_selected_mode",
+                "test_intE_selected_mean": "crossfit_test_intE_selected_mean",
+                "test_intE_selected_sd": "crossfit_test_intE_selected_sd",
+                "test_intE_baseline_mean": "crossfit_test_intE_baseline_mean",
+                "test_intE_baseline_sd": "crossfit_test_intE_baseline_sd",
+            }
+        )
+        out = out.merge(cf, on="gene", how="left", validate="one_to_one")
+    else:
+        out["crossfit_n_folds"] = float("nan")
+        out["crossfit_q_selected_mode"] = float("nan")
+        out["crossfit_test_intE_selected_mean"] = float("nan")
+        out["crossfit_test_intE_selected_sd"] = float("nan")
+        out["crossfit_test_intE_baseline_mean"] = float("nan")
+        out["crossfit_test_intE_baseline_sd"] = float("nan")
+
+    if bool(args.glm):
+        out["abs_intE_primary"] = out["intE_primary"].abs()
+        glm_ok = out["glm_fail_reason"].isna() | (out["glm_fail_reason"] == "")
+        out = out.assign(glm_ok=glm_ok)
+        out = out.sort_values(["glm_ok", "intE_primary_fdr", "abs_intE_primary"], ascending=[False, True, False])
+        out = out.drop(columns=["glm_ok"])
+    else:
+        # Sort by interaction magnitude using overlap-restricted IntE (shared support for B=1 and B=0).
+        out["abs_delta_int_E_overlap"] = out["delta_int_E_overlap"].abs()
+        out = out.sort_values(["sig_int_E_overlap", "abs_delta_int_E_overlap"], ascending=[False, False])
 
     out_path = args.outdir / "consultant_exec_summary.csv"
     out.to_csv(out_path, index=False)
+    pd.DataFrame(support_rows).to_csv(args.outdir / "support_table_gene_dataset.csv", index=False)
+    pd.DataFrame(hetero_rows).to_csv(args.outdir / "heterogeneity_intE_by_dataset.csv", index=False)
 
     # Also write a compact TSV for easy paste into email.
     tsv_cols = [
@@ -975,9 +1632,28 @@ def main() -> None:
         "Ts_fold_int_E",
         "Ts_ci_low_int_E",
         "Ts_ci_high_int_E",
+        "delta_int_E_overlap",
+        "Ts_fold_int_E_overlap",
+        "Ts_ci_low_int_E_overlap",
+        "Ts_ci_high_int_E_overlap",
+        "intE_primary_source",
+        "intE_primary",
+        "intE_primary_se",
+        "intE_primary_p",
+        "intE_primary_fdr",
+        "IOR_primary",
+        "IOR_primary_ci_low",
+        "IOR_primary_ci_high",
+        "abs_glm_minus_mh_intE_overlap",
+        "glm_mh_intE_overlap_diff_z",
+        "flag_glm_vs_mh_overlap_divergent",
         "glm_beta_GxB",
         "glm_se_GxB",
         "glm_fail_reason",
+        "glm_fdr_GxB",
+        "crossfit_q_selected_mode",
+        "crossfit_test_intE_selected_mean",
+        "crossfit_test_intE_baseline_mean",
         "rd_B1",
         "rd_ci_low_B1",
         "rd_ci_high_B1",

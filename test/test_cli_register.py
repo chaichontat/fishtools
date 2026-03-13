@@ -153,6 +153,7 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
         debug: bool,
         overwrite: bool,
         no_priors: bool,
+        prior_only: bool = False,
         repaired_rounds: set[str] | None = None,
         max_iters: int = 5,
         use_shifts_from: str | None = None,
@@ -167,6 +168,7 @@ def test_cli_register_run_invokes_internal(tmp_path: Path, monkeypatch: Any) -> 
             "debug": debug,
             "overwrite": overwrite,
             "no_priors": no_priors,
+            "prior_only": prior_only,
             "repaired_rounds": repaired_rounds,
             "max_iters": max_iters,
             "use_shifts_from": use_shifts_from,
@@ -261,6 +263,7 @@ def test_cli_register_run_accepts_config_file(tmp_path: Path, monkeypatch: Any) 
         debug: bool,
         overwrite: bool,
         no_priors: bool,
+        prior_only: bool = False,
         repaired_rounds: set[str] | None = None,
         max_iters: int = 5,
         use_shifts_from: str | None = None,
@@ -325,6 +328,7 @@ def test_cli_register_run_accepts_partial_config_file(tmp_path: Path, monkeypatc
         debug: bool,
         overwrite: bool,
         no_priors: bool,
+        prior_only: bool = False,
         repaired_rounds: set[str] | None = None,
         max_iters: int = 5,
         use_shifts_from: str | None = None,
@@ -386,6 +390,7 @@ def test_cli_register_run_config_overridden_by_cli(tmp_path: Path, monkeypatch: 
         debug: bool,
         overwrite: bool,
         no_priors: bool,
+        prior_only: bool = False,
         repaired_rounds: set[str] | None = None,
         max_iters: int = 5,
         use_shifts_from: str | None = None,
@@ -420,6 +425,73 @@ def test_cli_register_run_config_overridden_by_cli(tmp_path: Path, monkeypatch: 
     assert called["reference"] == "4_12_20"
     cfg = called["config"]
     assert pytest.approx(cfg.registration.fiducial.threshold, rel=0, abs=1e-6) == 1.25
+
+
+def test_run_fiducial_prior_only_uses_priors_and_skips_alignment(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    _root, deconv = _make_workspace(tmp_path)
+    ws = Workspace(deconv)
+
+    roi = "roiA"
+    idx = 0
+    codebook_name = "cb"
+    reference = "2_10_18"
+    target = "1_9_17"
+    prior = (10.0, 20.0)
+
+    rng = np.random.default_rng(0)
+    base = rng.random((1200, 1200), dtype=np.float32)
+    target_img = cli_register_module.shift(base, [-prior[1], -prior[0]], order=1)
+
+    fids = {reference: base.copy(), target: target_img.copy()}
+    fids_raw = {reference: fids[reference].copy(), target: fids[target].copy()}
+
+    cfg = Config()
+    cfg = cfg.model_copy(
+        update={
+            "registration": cfg.registration.model_copy(
+                update={
+                    "fiducial": cfg.registration.fiducial.model_copy(
+                        update={"priors": {target: prior}}
+                    )
+                }
+            )
+        }
+    )
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("align_fiducials_with_stats should not be called when prior_only=True")
+
+    monkeypatch.setattr(cli_register_module, "align_fiducials_with_stats", boom)
+    monkeypatch.setattr(cli_register_module, "safe_imwrite", lambda *_a, **_k: None)
+
+    shifts = cli_register_module.run_fiducial(
+        deconv,
+        fids,
+        codebook_name,
+        cfg,
+        roi=roi,
+        idx=idx,
+        reference=reference,
+        debug=False,
+        prior_only=True,
+        fids_raw=fids_raw,
+    )
+
+    assert shifts[reference] == pytest.approx([0.0, 0.0])
+    assert shifts[target] == pytest.approx([prior[0], prior[1]])
+
+    pad = 50
+    assert np.allclose(
+        fids[target][pad:-pad, pad:-pad],
+        fids[reference][pad:-pad, pad:-pad],
+        atol=1e-6,
+    )
+
+    shifts_path = ws.shift_json(roi, codebook_name, idx)
+    written = Shifts.validate_json(shifts_path.read_text())
+    assert written[target].shifts == pytest.approx([prior[0], prior[1]])
 
 
 def test_cli_register_run_requires_config_when_no_default_found(tmp_path: Path) -> None:
@@ -1713,6 +1785,7 @@ def test_cli_register_run_respects_cli_overrides(tmp_path: Path, monkeypatch: An
         debug: bool,
         overwrite: bool,
         no_priors: bool,
+        prior_only: bool = False,
         repaired_rounds: set[str] | None = None,
         max_iters: int = 5,
         use_shifts_from: str | None = None,
@@ -2356,6 +2429,7 @@ def test_cli_register_run_use_shifts_from_skips_fiducial_registration(
         debug: bool,
         overwrite: bool,
         no_priors: bool,
+        prior_only: bool = False,
         repaired_rounds: set[str] | None = None,
         max_iters: int = 5,
         use_shifts_from: str | None = None,

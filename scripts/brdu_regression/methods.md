@@ -52,20 +52,25 @@ Reading guide: Sections 1–5 define inputs, gates, strata, and endpoints; secti
 ## 1) Data, cohort, and conventions
 
 - Analysis compartment: `all_progenitors2.h5ad` contains the analysis population; use `--leiden-col manual_annotation` and treat `obs['manual_annotation']` as the cluster field (e.g. `apical`, `intermediate`).
-- Pulse labels (measurement layer): fit **two independent 1D mixture models** (one for EdU intensity, one for BrdU intensity) in a *batch-aware* way across all cells, then use their posteriors as soft pulse labels.
-  Concretely, for each channel (`x = log_edu_mean` and `x = log_brdu_mean`) we fit a `K`-component Gaussian mixture in a latent intensity space `u`, with per-batch nuisance parameters:
+- Pulse labels (measurement layer): current GLM runs use **threshold-logistic soft calls** from per-unit thresholds in `adata.uns` (`p=0.5` at threshold; default `p=0.01/0.99` at threshold `±1` log unit). The GMM-based soft-call path is retained as a legacy option.
+  Legacy GMM path: for each channel (`x = log_edu_mean` and `x = log_brdu_mean`) fit a `K`-component Gaussian mixture in a latent intensity space `u`, with per-batch nuisance parameters:
   - `x = α_dataset + β_dataset * u`, and `u | k,dataset ~ Normal(μ_k, γ_dataset * σ_k^2)`
   - mixing proportions `π_k` are shared across datasets (global prevalence), while `α/β/γ` capture run-specific intensity shifts.
-  - “positive” is defined as the upper tail of components in `u` (we use `K=6` components per channel in the canonical fit),
-    with EdU+/BrdU+ taken as the **highest-mean** component (`--edu-pos-topk 1`, `--brdu-pos-topk 1`).
+  - “positive” is defined as the upper tail of components in `u`. The canonical fit uses a parsimonious setting to avoid a single very-broad tail component:
+    - `K=6` components per channel
+    - variance tied across components (`--batchaware1d-variance tied`) to avoid a very broad “tail” component eating into the main mass
+    - exclude exact zeros from the fit (`--edu-zero-policy exclude`, `--brdu-zero-policy exclude`), and force `P(pos)=0` when `x==0` at inference
+    - EdU+ taken as the top-2 highest-mean components (`--edu-pos-topk 2`)
+    - BrdU+ taken as the **highest-mean** component (`--brdu-pos-topk 1`).
+  To avoid per-dataset artifacts where the implied `p≈0.5` boundary drifts into the main mass, we optionally apply a **floor-only** per-dataset logit-shift calibration that can only raise thresholds (never lower them):
+  - `--calibrate-to-xmin --edu-xmin 4.5 --brdu-xmin 6.5`
   This yields per-cell marginals:
   - `pE_i = P(E=1 | log_edu_mean_i, dataset_i)`
   - `pB_i = P(B=1 | log_brdu_mean_i, dataset_i)`
   We then form an **approximate joint posterior** by conditional independence:
   - `pi_11 = pB * pE`, `pi_10 = pB * (1-pE)`, `pi_01 = (1-pB) * pE`, `pi_00 = (1-pB) * (1-pE)`.
   These `pi_*` are stored in the GMM cache (canonical: `~/nvme/all.gmm.npz`, fit on `~/nvme/all.h5ad`) keyed by `cell_id = dataset + ":" + obs_name`, so it aligns to any downstream `.h5ad` subset.
-  Manual hard calls (`brdu_pos`, `edu_pos`) are used only for QC benchmarking (they are *not* treated as ground truth for calibrating posteriors in the canonical soft-call cache).
-  If desired for sensitivity, the QC script can optionally apply a per-dataset monotone calibration of the marginals to match the manual positive fraction (`--calibrate-to-manual`), but we treat this as a sensitivity-only step.
+  Manual hard calls (`brdu_pos`, `edu_pos`) are used only for QC benchmarking (agreement tables vs the legacy threshold calls). They are not used to calibrate the canonical soft-call posteriors.
 - Grouping variables:
   - `dataset = obs["dataset"]` (string).
   - `animal`: parsed from dataset string as `JaxA#`.
@@ -462,7 +467,6 @@ All commands below assume you are in the repo root and use the `seq` conda env.
 ```bash
 export CONDA_NO_PLUGINS=true
 H5AD=~/nvme/all_progenitors2.h5ad
-PER_CELL_QC=~/nvme/all.gmm.npz
 TRC=neuroRef.csv
 OUT=scripts/_out/brdu_pipeline
 DATE=$(date +%Y%m%d)
@@ -470,19 +474,23 @@ CLUSTER_COL=manual_annotation
 CLUSTER_A=apical
 CLUSTER_B=intermediate
 TAG=manual_annotation
+SOFT_MODE=soft_logistic_thresholds
+SOFT_LOG_BRDU=log_brdu_mean
+SOFT_LOG_EDU=log_edu_mean
+SOFT_THR_UNS_KEY=brdu_edu_thresholds_by_dataset_roi_ccf_adjusted
+SOFT_SPAN=1
+SOFT_P_HI=0.99
 ```
 
-### 9.0a Pulse-label GMM cache (one-time; required for soft-call screening)
+### 9.0a Soft pulse mode (threshold-logistic; no `gmm.npz`)
 
-Fit the batch-aware GMM on the full dataset and copy the cache to the canonical path used by downstream scripts:
+Current GLM scripts support soft pulse calls directly from your per-unit thresholds in `adata.uns`, using a threshold-centered logistic rule:
 
-```bash
-conda run -n seq python scripts/gam/qc_batch_aware_brdu_edu_gmm.py \
-  ~/nvme/all.h5ad \
-  --out-dir ~/nvme/all_gmm_fit
+- `p=0.5` at the threshold,
+- `p=0.01` at `threshold - 1` log unit,
+- `p=0.99` at `threshold + 1` log unit.
 
-cp ~/nvme/all_gmm_fit/cache/per_cell_qc.npz "$PER_CELL_QC"
-```
+This corresponds to `--soft-span 1 --soft-p-hi 0.99`.
 
 ### 9.0 Baseline continuity by cluster (no gating; recommended context)
 
@@ -525,7 +533,12 @@ This keeps iteration time short and avoids spending compute on genes that are es
 ```bash
 conda run -n seq python scripts/brdu_regression/panel_crossfit_bestq_glm.py \
   --h5ad "$H5AD" --tricycle-ref-csv "$TRC" \
-  --per-cell-qc-npz "$PER_CELL_QC" \
+  --pulse-call-mode "$SOFT_MODE" \
+  --soft-log-brdu-col "$SOFT_LOG_BRDU" \
+  --soft-log-edu-col "$SOFT_LOG_EDU" \
+  --soft-threshold-uns-key "$SOFT_THR_UNS_KEY" \
+  --soft-span "$SOFT_SPAN" \
+  --soft-p-hi "$SOFT_P_HI" \
   --pulse-pmax-min 0.0 \
   --pulse-min-eff-mass 3 \
   --leiden-col "$CLUSTER_COL" \
@@ -537,7 +550,12 @@ conda run -n seq python scripts/brdu_regression/panel_crossfit_bestq_glm.py \
 
 conda run -n seq python scripts/brdu_regression/panel_crossfit_bestq_glm.py \
   --h5ad "$H5AD" --tricycle-ref-csv "$TRC" \
-  --per-cell-qc-npz "$PER_CELL_QC" \
+  --pulse-call-mode "$SOFT_MODE" \
+  --soft-log-brdu-col "$SOFT_LOG_BRDU" \
+  --soft-log-edu-col "$SOFT_LOG_EDU" \
+  --soft-threshold-uns-key "$SOFT_THR_UNS_KEY" \
+  --soft-span "$SOFT_SPAN" \
+  --soft-p-hi "$SOFT_P_HI" \
   --pulse-pmax-min 0.0 \
   --pulse-min-eff-mass 3 \
   --leiden-col "$CLUSTER_COL" \
@@ -561,7 +579,12 @@ Notes:
 ```bash
 conda run -n seq python scripts/brdu_regression/shortlist_glm_by_animal_meta.py \
   --h5ad "$H5AD" --tricycle-ref-csv "$TRC" \
-  --per-cell-qc-npz "$PER_CELL_QC" \
+  --pulse-call-mode "$SOFT_MODE" \
+  --soft-log-brdu-col "$SOFT_LOG_BRDU" \
+  --soft-log-edu-col "$SOFT_LOG_EDU" \
+  --soft-threshold-uns-key "$SOFT_THR_UNS_KEY" \
+  --soft-span "$SOFT_SPAN" \
+  --soft-p-hi "$SOFT_P_HI" \
   --pulse-pmax-min 0.0 \
   --pulse-min-eff-mass 3 \
   --leiden-col "$CLUSTER_COL" \
@@ -573,7 +596,12 @@ conda run -n seq python scripts/brdu_regression/shortlist_glm_by_animal_meta.py 
 
 conda run -n seq python scripts/brdu_regression/shortlist_glm_by_animal_meta.py \
   --h5ad "$H5AD" --tricycle-ref-csv "$TRC" \
-  --per-cell-qc-npz "$PER_CELL_QC" \
+  --pulse-call-mode "$SOFT_MODE" \
+  --soft-log-brdu-col "$SOFT_LOG_BRDU" \
+  --soft-log-edu-col "$SOFT_LOG_EDU" \
+  --soft-threshold-uns-key "$SOFT_THR_UNS_KEY" \
+  --soft-span "$SOFT_SPAN" \
+  --soft-p-hi "$SOFT_P_HI" \
   --pulse-pmax-min 0.0 \
   --pulse-min-eff-mass 3 \
   --leiden-col "$CLUSTER_COL" \
@@ -589,7 +617,12 @@ Optional joint heterogeneity-friendly refit (two clusters in one per-animal mode
 ```bash
 conda run -n seq python scripts/brdu_regression/shortlist_glm_by_animal_meta.py \
   --h5ad "$H5AD" --tricycle-ref-csv "$TRC" \
-  --per-cell-qc-npz "$PER_CELL_QC" \
+  --pulse-call-mode "$SOFT_MODE" \
+  --soft-log-brdu-col "$SOFT_LOG_BRDU" \
+  --soft-log-edu-col "$SOFT_LOG_EDU" \
+  --soft-threshold-uns-key "$SOFT_THR_UNS_KEY" \
+  --soft-span "$SOFT_SPAN" \
+  --soft-p-hi "$SOFT_P_HI" \
   --pulse-pmax-min 0.0 \
   --pulse-min-eff-mass 3 \
   --leiden-col "$CLUSTER_COL" \
@@ -688,13 +721,13 @@ Primary output: `.../gene_validation_scorecard.csv`
 
 ### 9.6b Optional: posterior-confidence sensitivity (replaces B/E threshold sweeps)
 
-Because inference now uses posterior quadrants instead of intensity thresholds, sensitivity is run by filtering on posterior certainty (`p_max`) and re-running the same soft-label pipeline:
+Because inference now uses posterior quadrants instead of hard calls, sensitivity is run by filtering on posterior certainty (`p_max`) and re-running the same soft-label pipeline:
 
 - all cells (`--pulse-pmax-min 0.0`)
 - moderate confidence (`--pulse-pmax-min 0.8`)
 - high confidence (`--pulse-pmax-min 0.9`)
 
-using a fixed `--per-cell-qc-npz` from the GMM measurement layer. This tests robustness to ambiguous pulse calls without re-defining BrdU/EdU thresholds.
+using a fixed pulse-call configuration (here: threshold-logistic from `adata.uns`). This tests robustness to ambiguous pulse calls without changing the gate or GLM model.
 
 ### 9.6c Optional: spatial decomposition (failure-modes #16/#17)
 
