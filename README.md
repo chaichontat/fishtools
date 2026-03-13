@@ -43,6 +43,7 @@ This workflow fits a matched (stratum fixed-effect) grouped-binomial GLM on **Br
 
 - `f_hat = P(EdU+ | BrdU+)` as a function of **Usage_6** (binned into global quantiles)
 - companions: `1/f_hat` and `T_S/Δt ≈ 1/(1−f_hat)` (standard convention)
+- plus a marginal EdU labeling-index model `pE_hat = P(EdU+)`, used to derive canonical `T_C/Δt ≈ (T_S/Δt)/pE_hat`.
 
 Run the model:
 
@@ -77,8 +78,20 @@ This writes:
 - `usage6_f_hat.png`
 - `usage6_inv_f_hat.png`
 - `usage6_Ts_over_dt.png`
+- `usage6_pE_hat.png` (if present in inputs)
+- `usage6_Tc_over_dt.png` (if present in inputs)
 
 If `usage6_by_unit.csv` exists, plots use **dataset×roi×ccf_adjusted-weighted** 95% CIs (and per-animal weighted error bars).
+
+If you want hour/minute-scaled `T_S`/`T_C`, pass the pulse lag (e.g. 90 minutes):
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/plot_usage6_brdue_fraction_model.py \
+  --indir scripts/_out/usage6_run \
+  --delta-t-minutes 90
+```
+
+This also writes `usage6_Ts_minutes.png` and `usage6_Tc_minutes.png`.
 
 ## Compression
 

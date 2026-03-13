@@ -496,37 +496,40 @@ def main() -> None:
     by_unit_rows: list[dict[str, object]] = []
     usage_bins = int(args.usage_bins)
 
-    log("Fitting per animal × leiden models (BrdU+ only)...")
+    log("Fitting per animal × leiden models...")
     for animal in np.unique(animals):
         m_a = animals == animal
         for lei in np.unique(leiden[m_a]):
-            m = m_a & (leiden == lei) & (B == 1)
-            n_b1 = int(np.sum(m))
-            raw_f = float(np.mean(E[m])) if n_b1 > 0 else float("nan")
-            log(f"[block] animal={animal} leiden={lei} n_b1={n_b1} raw_f={raw_f:.4f}")
-            if n_b1 == 0:
+            m_b1 = m_a & (leiden == lei) & (B == 1)
+            m_all = m_a & (leiden == lei)
+            n_b1 = int(np.sum(m_b1))
+            n_all = int(np.sum(m_all))
+            raw_f = float(np.mean(E[m_b1])) if n_b1 > 0 else float("nan")
+            raw_pE = float(np.mean(E[m_all])) if n_all > 0 else float("nan")
+            log(f"[block] animal={animal} leiden={lei} n_b1={n_b1} raw_f={raw_f:.4f} n_all={n_all} raw_pE={raw_pE:.4f}")
+            if n_b1 == 0 or n_all == 0:
                 continue
 
-            ds_code_m, ds_uniq_m = pd.factorize(dataset[m], sort=True)
+            ds_code_b1, _ = pd.factorize(dataset[m_b1], sort=True)
             if bool(args.pool_leiden):
-                lei_code_m, _ = pd.factorize(leiden_orig[m], sort=True)
-                n_lei = int(lei_code_m.max()) + 1
-                stratum_idx = (
-                    ds_code_m.astype(np.int64) * int(args.theta_bins) * n_lei
-                    + theta_bin[m].astype(np.int64, copy=False) * n_lei
-                    + lei_code_m.astype(np.int64, copy=False)
+                lei_code_b1, _ = pd.factorize(leiden_orig[m_b1], sort=True)
+                n_lei_b1 = int(lei_code_b1.max()) + 1
+                stratum_idx_b1 = (
+                    ds_code_b1.astype(np.int64) * int(args.theta_bins) * n_lei_b1
+                    + theta_bin[m_b1].astype(np.int64, copy=False) * n_lei_b1
+                    + lei_code_b1.astype(np.int64, copy=False)
                 )
             else:
-                stratum_idx = ds_code_m.astype(np.int64) * int(args.theta_bins) + theta_bin[m].astype(
+                stratum_idx_b1 = ds_code_b1.astype(np.int64) * int(args.theta_bins) + theta_bin[m_b1].astype(
                     np.int64, copy=False
                 )
-            n_strata0 = int(stratum_idx.max()) + 1
+            n_strata0_b1 = int(stratum_idx_b1.max()) + 1
 
             # Aggregate to (stratum, usage_bin) grouped-binomial rows.
-            ub = usage_bin[m].astype(np.int64, copy=False)
-            group = stratum_idx * usage_bins + ub
-            y_tot = np.bincount(group, minlength=int(n_strata0) * usage_bins).astype(np.float64, copy=False)
-            y_succ = np.bincount(group, weights=E[m].astype(np.float64, copy=False), minlength=int(n_strata0) * usage_bins).astype(
+            ub_b1 = usage_bin[m_b1].astype(np.int64, copy=False)
+            group_b1 = stratum_idx_b1 * usage_bins + ub_b1
+            y_tot = np.bincount(group_b1, minlength=int(n_strata0_b1) * usage_bins).astype(np.float64, copy=False)
+            y_succ = np.bincount(group_b1, weights=E[m_b1].astype(np.float64, copy=False), minlength=int(n_strata0_b1) * usage_bins).astype(
                 np.float64, copy=False
             )
 
@@ -547,13 +550,14 @@ def main() -> None:
             beta, cov_beta, alpha, strata_levels, fail, n_rows, n_strata_fit = _fit_stratified_glm_binomial(
                 y_succ=y_succ_row, y_tot=y_tot_row, strata=strata_row, X=X
             )
-            tot_by_s = np.bincount(stratum_idx, minlength=n_strata0).astype(np.float64, copy=False)
+            tot_by_s = np.bincount(stratum_idx_b1, minlength=n_strata0_b1).astype(np.float64, copy=False)
 
             # g-computation over fitted strata: weights are total BrdU+ cells per stratum (within this animal×leiden).
             w = tot_by_s[strata_levels.astype(int, copy=False)] if strata_levels.size else np.zeros(0, dtype=float)
             w_sum = float(np.sum(w))
             f_hat = np.full(usage_bins, np.nan, dtype=np.float64)
             inv_f_hat = np.full(usage_bins, np.nan, dtype=np.float64)
+            ts_over_dt = np.full(usage_bins, np.nan, dtype=np.float64)
             if fail is None and w_sum > 0 and alpha.size:
                 for t in range(usage_bins):
                     gamma_t = 0.0 if t == 0 else float(beta[t - 1])
@@ -561,30 +565,38 @@ def main() -> None:
                     f = float(np.sum(w * p) / w_sum)
                     f_hat[t] = f
                     inv_f_hat[t] = float(1.0 / f) if f > 0 else float("nan")
+                    ts_over_dt[t] = float(1.0 / (1.0 - f)) if (f > 0.0 and f < 1.0) else float("nan")
 
+            ret_units: dict[tuple[str, str, str], dict[str, object]] = {}
             if bool(args.write_by_unit) and fail is None and alpha.size:
-                alpha_full = np.full(n_strata0, np.nan, dtype=np.float64)
+                alpha_full = np.full(n_strata0_b1, np.nan, dtype=np.float64)
                 alpha_full[strata_levels.astype(int, copy=False)] = alpha.astype(np.float64, copy=False)
                 in_fit = np.isfinite(alpha_full)
 
                 mi = pd.MultiIndex.from_arrays(
                     [
-                        dataset[m].astype(str, copy=False),
-                        roi[m].astype(str, copy=False),
-                        ccf_adjusted[m].astype(str, copy=False),
+                        dataset[m_b1].astype(str, copy=False),
+                        roi[m_b1].astype(str, copy=False),
+                        ccf_adjusted[m_b1].astype(str, copy=False),
                     ],
                     names=["dataset", "roi", "ccf_adjusted"],
                 )
                 unit_code, unit_levels = pd.factorize(mi, sort=True)
+                n_units_total = int(unit_levels.size)
                 if int(np.max(unit_code)) >= 2**32:
                     raise ValueError("Too many units for bitpacking (unexpected).")
-                if int(n_strata0) >= 2**32:
+                if int(n_strata0_b1) >= 2**32:
                     raise ValueError("Too many strata for bitpacking (unexpected).")
 
-                pair = (unit_code.astype(np.uint64) << np.uint64(32)) | stratum_idx.astype(np.uint64, copy=False)
+                pair = (unit_code.astype(np.uint64) << np.uint64(32)) | stratum_idx_b1.astype(np.uint64, copy=False)
                 uniq_pair, counts = np.unique(pair, return_counts=True)
                 unit_of_pair = (uniq_pair >> np.uint64(32)).astype(np.int64, copy=False)
                 stratum_of_pair = (uniq_pair & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
+                w_sum_total_by_unit = np.bincount(
+                    unit_of_pair,
+                    weights=counts.astype(np.float64, copy=False),
+                    minlength=n_units_total,
+                ).astype(np.float64, copy=False)
                 keep_pair = in_fit[stratum_of_pair]
                 if np.any(keep_pair):
                     unit_k = unit_of_pair[keep_pair]
@@ -594,12 +606,20 @@ def main() -> None:
                     idx0 = np.flatnonzero(np.r_[True, unit_k[1:] != unit_k[:-1]])
                     unit_ids = unit_k[idx0]
                     w_sum_u = np.add.reduceat(w_pair, idx0)
+                    w_sum_total_u = w_sum_total_by_unit[unit_ids]
                     if not bool(np.all(w_sum_u > 0)):
                         raise ValueError("Found unit with zero weight (unexpected).")
 
                     ds_u = unit_levels.get_level_values(0).to_numpy(dtype=object, copy=False)[unit_ids]
                     roi_u = unit_levels.get_level_values(1).to_numpy(dtype=object, copy=False)[unit_ids]
                     ccf_u = unit_levels.get_level_values(2).to_numpy(dtype=object, copy=False)[unit_ids]
+
+                    kept_frac = float(np.sum(w_sum_u) / np.sum(w_sum_total_u)) if float(np.sum(w_sum_total_u)) > 0 else float("nan")
+                    log(
+                        f"[units_b1] animal={animal} leiden={lei} n_units_kept={int(unit_ids.size)}/{n_units_total} "
+                        f"b1_weight_kept={float(np.sum(w_sum_u)):.0f} b1_weight_total={float(np.sum(w_sum_total_u)):.0f} "
+                        f"kept_frac={kept_frac:.3f}"
+                    )
 
                     for t in range(usage_bins):
                         gamma_t = 0.0 if t == 0 else float(beta[t - 1])
@@ -611,22 +631,181 @@ def main() -> None:
                         inv_f_u = 1.0 / f_u
                         ts_over_dt_u = 1.0 / (1.0 - f_u)
                         for j in range(int(unit_ids.size)):
-                            by_unit_rows.append(
-                                {
+                            key = (str(ds_u[j]), str(roi_u[j]), str(ccf_u[j]))
+                            cur = ret_units.get(key)
+                            if cur is None:
+                                cur = {
                                     "animal": str(animal),
                                     "leiden": str(lei),
                                     "dataset": str(ds_u[j]),
                                     "roi": str(roi_u[j]),
                                     "ccf_adjusted": str(ccf_u[j]),
                                     "unit_weight_b1": float(w_sum_u[j]),
+                                    "unit_weight_b1_total": float(w_sum_total_u[j]),
+                                    "unit_weight_b1_frac_kept": float(w_sum_u[j] / w_sum_total_u[j]) if w_sum_total_u[j] > 0 else float("nan"),
+                                    "f_hat": np.full(usage_bins, np.nan, dtype=np.float64),
+                                    "inv_f_hat": np.full(usage_bins, np.nan, dtype=np.float64),
+                                    "ts_over_dt": np.full(usage_bins, np.nan, dtype=np.float64),
+                                }
+                                ret_units[key] = cur
+                            cur["f_hat"][t] = float(f_u[j])
+                            cur["inv_f_hat"][t] = float(inv_f_u[j])
+                            cur["ts_over_dt"][t] = float(ts_over_dt_u[j])
+
+            # Fit marginal EdU labeling index pE_hat(t) on all cells (same strata logic).
+            ds_code_all, _ = pd.factorize(dataset[m_all], sort=True)
+            if bool(args.pool_leiden):
+                lei_code_all, _ = pd.factorize(leiden_orig[m_all], sort=True)
+                n_lei_all = int(lei_code_all.max()) + 1
+                stratum_idx_all = (
+                    ds_code_all.astype(np.int64) * int(args.theta_bins) * n_lei_all
+                    + theta_bin[m_all].astype(np.int64, copy=False) * n_lei_all
+                    + lei_code_all.astype(np.int64, copy=False)
+                )
+            else:
+                stratum_idx_all = ds_code_all.astype(np.int64) * int(args.theta_bins) + theta_bin[m_all].astype(
+                    np.int64, copy=False
+                )
+            n_strata0_all = int(stratum_idx_all.max()) + 1
+
+            ub_all = usage_bin[m_all].astype(np.int64, copy=False)
+            group_all = stratum_idx_all * usage_bins + ub_all
+            y_tot_all = np.bincount(group_all, minlength=int(n_strata0_all) * usage_bins).astype(np.float64, copy=False)
+            y_succ_all = np.bincount(
+                group_all,
+                weights=E[m_all].astype(np.float64, copy=False),
+                minlength=int(n_strata0_all) * usage_bins,
+            ).astype(np.float64, copy=False)
+            keep_all = y_tot_all > 0
+            if not np.any(keep_all):
+                continue
+            group_ids_all = np.flatnonzero(keep_all).astype(np.int64, copy=False)
+            strata_row_all = (group_ids_all // usage_bins).astype(np.int64, copy=False)
+            ub_row_all = (group_ids_all % usage_bins).astype(np.int64, copy=False)
+            y_tot_row_all = y_tot_all[keep_all]
+            y_succ_row_all = y_succ_all[keep_all]
+
+            X_all = np.zeros((int(group_ids_all.size), usage_bins - 1), dtype=np.float64)
+            for i in range(1, usage_bins):
+                X_all[:, i - 1] = (ub_row_all == i).astype(np.float64, copy=False)
+
+            beta_all, cov_beta_all, alpha_all, strata_levels_all, fail_all, n_rows_all, n_strata_fit_all = _fit_stratified_glm_binomial(
+                y_succ=y_succ_row_all,
+                y_tot=y_tot_row_all,
+                strata=strata_row_all,
+                X=X_all,
+            )
+            tot_by_s_all = np.bincount(stratum_idx_all, minlength=n_strata0_all).astype(np.float64, copy=False)
+            w_all = tot_by_s_all[strata_levels_all.astype(int, copy=False)] if strata_levels_all.size else np.zeros(0, dtype=float)
+            w_sum_all = float(np.sum(w_all))
+            pE_hat = np.full(usage_bins, np.nan, dtype=np.float64)
+            if fail_all is None and w_sum_all > 0 and alpha_all.size:
+                for t in range(usage_bins):
+                    gamma_t = 0.0 if t == 0 else float(beta_all[t - 1])
+                    p = expit(alpha_all + gamma_t)
+                    pe = float(np.sum(w_all * p) / w_sum_all)
+                    pE_hat[t] = pe
+
+            if bool(args.write_by_unit) and fail_all is None and alpha_all.size and ret_units:
+                alpha_full_all = np.full(n_strata0_all, np.nan, dtype=np.float64)
+                alpha_full_all[strata_levels_all.astype(int, copy=False)] = alpha_all.astype(np.float64, copy=False)
+                in_fit_all = np.isfinite(alpha_full_all)
+
+                mi_all = pd.MultiIndex.from_arrays(
+                    [
+                        dataset[m_all].astype(str, copy=False),
+                        roi[m_all].astype(str, copy=False),
+                        ccf_adjusted[m_all].astype(str, copy=False),
+                    ],
+                    names=["dataset", "roi", "ccf_adjusted"],
+                )
+                unit_code_all, unit_levels_all = pd.factorize(mi_all, sort=True)
+                n_units_total_all = int(unit_levels_all.size)
+                if int(np.max(unit_code_all)) >= 2**32:
+                    raise ValueError("Too many units for bitpacking (unexpected).")
+                if int(n_strata0_all) >= 2**32:
+                    raise ValueError("Too many strata for bitpacking (unexpected).")
+
+                pair_all = (unit_code_all.astype(np.uint64) << np.uint64(32)) | stratum_idx_all.astype(np.uint64, copy=False)
+                uniq_pair_all, counts_all = np.unique(pair_all, return_counts=True)
+                unit_of_pair_all = (uniq_pair_all >> np.uint64(32)).astype(np.int64, copy=False)
+                stratum_of_pair_all = (uniq_pair_all & np.uint64(0xFFFFFFFF)).astype(np.int64, copy=False)
+                w_sum_total_by_unit_all = np.bincount(
+                    unit_of_pair_all,
+                    weights=counts_all.astype(np.float64, copy=False),
+                    minlength=n_units_total_all,
+                ).astype(np.float64, copy=False)
+                keep_pair_all = in_fit_all[stratum_of_pair_all]
+                if np.any(keep_pair_all):
+                    unit_k_all = unit_of_pair_all[keep_pair_all]
+                    w_pair_all = counts_all[keep_pair_all].astype(np.float64, copy=False)
+                    s_pair_all = stratum_of_pair_all[keep_pair_all]
+                    idx0_all = np.flatnonzero(np.r_[True, unit_k_all[1:] != unit_k_all[:-1]])
+                    unit_ids_all = unit_k_all[idx0_all]
+                    w_sum_u_all = np.add.reduceat(w_pair_all, idx0_all)
+                    w_sum_total_u_all = w_sum_total_by_unit_all[unit_ids_all]
+
+                    ds_u_all = unit_levels_all.get_level_values(0).to_numpy(dtype=object, copy=False)[unit_ids_all]
+                    roi_u_all = unit_levels_all.get_level_values(1).to_numpy(dtype=object, copy=False)[unit_ids_all]
+                    ccf_u_all = unit_levels_all.get_level_values(2).to_numpy(dtype=object, copy=False)[unit_ids_all]
+
+                    key_to_idx = {(str(ds_u_all[j]), str(roi_u_all[j]), str(ccf_u_all[j])): j for j in range(int(unit_ids_all.size))}
+                    kept_keys = [k for k in ret_units.keys() if k in key_to_idx]
+                    if len(kept_keys) != len(ret_units):
+                        missing = len(ret_units) - len(kept_keys)
+                        raise ValueError(f"Some retention units are missing from all-cells units (unexpected); missing={missing}")
+
+                    idx_sel = np.array([key_to_idx[k] for k in kept_keys], dtype=np.int64)
+                    kept_frac_all = (
+                        float(np.sum(w_sum_u_all[idx_sel]) / np.sum(w_sum_total_u_all[idx_sel]))
+                        if float(np.sum(w_sum_total_u_all[idx_sel])) > 0
+                        else float("nan")
+                    )
+                    log(
+                        f"[units_all] animal={animal} leiden={lei} n_units_kept={int(idx_sel.size)}/{n_units_total_all} "
+                        f"all_weight_kept={float(np.sum(w_sum_u_all[idx_sel])):.0f} all_weight_total={float(np.sum(w_sum_total_u_all[idx_sel])):.0f} "
+                        f"kept_frac={kept_frac_all:.3f}"
+                    )
+
+                    # Compute pE per selected unit × usage_bin.
+                    for t in range(usage_bins):
+                        gamma_t = 0.0 if t == 0 else float(beta_all[t - 1])
+                        p_pair = expit(alpha_full_all[s_pair_all] + gamma_t)
+                        num_u = np.add.reduceat(w_pair_all * p_pair, idx0_all)
+                        pE_u_all = num_u / w_sum_u_all
+                        for k, j in zip(kept_keys, idx_sel, strict=True):
+                            ru = ret_units[k]
+                            pe = float(pE_u_all[j])
+                            ts = float(ru["ts_over_dt"][t])
+                            odds = float(pe / (1.0 - pe)) if (pe > 0.0 and pe < 1.0) else float("nan")
+                            tc = float(ts / pe) if (np.isfinite(ts) and pe > 0.0) else float("nan")
+                            by_unit_rows.append(
+                                {
+                                    "animal": str(animal),
+                                    "leiden": str(lei),
+                                    "dataset": str(ru["dataset"]),
+                                    "roi": str(ru["roi"]),
+                                    "ccf_adjusted": str(ru["ccf_adjusted"]),
                                     "usage_bin": int(t),
-                                    "f_hat": float(f_u[j]),
-                                    "inv_f_hat": float(inv_f_u[j]),
-                                    "ts_over_dt": float(ts_over_dt_u[j]),
+                                    "f_hat": float(ru["f_hat"][t]),
+                                    "inv_f_hat": float(ru["inv_f_hat"][t]),
+                                    "ts_over_dt": float(ru["ts_over_dt"][t]),
+                                    "pE_hat": float(pe),
+                                    "pE_odds_hat": float(odds),
+                                    "tc_over_dt": float(tc),
+                                    "unit_weight_b1": float(ru["unit_weight_b1"]),
+                                    "unit_weight_b1_total": float(ru["unit_weight_b1_total"]),
+                                    "unit_weight_b1_frac_kept": float(ru["unit_weight_b1_frac_kept"]),
+                                    "unit_weight_all": float(w_sum_u_all[j]),
+                                    "unit_weight_all_total": float(w_sum_total_u_all[j]),
+                                    "unit_weight_all_frac_kept": float(w_sum_u_all[j] / w_sum_total_u_all[j]) if w_sum_total_u_all[j] > 0 else float("nan"),
                                 }
                             )
 
             for t in range(usage_bins):
+                pe = float(pE_hat[t])
+                odds = float(pe / (1.0 - pe)) if (pe > 0.0 and pe < 1.0) else float("nan")
+                tc_over_dt = float(ts_over_dt[t] / pe) if (np.isfinite(ts_over_dt[t]) and pe > 0.0) else float("nan")
                 out_rows.append(
                     {
                         "animal": str(animal),
@@ -634,8 +813,14 @@ def main() -> None:
                         "usage_bin": int(t),
                         "f_hat": float(f_hat[t]),
                         "inv_f_hat": float(inv_f_hat[t]),
+                        "ts_over_dt": float(ts_over_dt[t]),
+                        "pE_hat": float(pE_hat[t]),
+                        "pE_odds_hat": float(odds),
+                        "tc_over_dt": float(tc_over_dt),
                         "raw_f": float(raw_f),
+                        "raw_pE": float(raw_pE),
                         "n_cells_b1": int(n_b1),
+                        "n_cells_all": int(n_all),
                         "n_rows": int(n_rows),
                         "n_strata_fit": int(n_strata_fit),
                         "fail_reason": str(fail) if fail is not None else "",
@@ -663,6 +848,9 @@ def main() -> None:
             d = by_animal[(by_animal["leiden"] == lei) & (by_animal["usage_bin"] == t)]
             s_f = _t_summary(d["f_hat"].to_numpy(float, copy=False))
             s_inv = _t_summary(d["inv_f_hat"].to_numpy(float, copy=False))
+            s_pE = _t_summary(d["pE_hat"].to_numpy(float, copy=False))
+            s_ts = _t_summary(d["ts_over_dt"].to_numpy(float, copy=False))
+            s_tc = _t_summary(d["tc_over_dt"].to_numpy(float, copy=False))
             meta_rows.append(
                 {
                     "leiden": str(lei),
@@ -681,6 +869,27 @@ def main() -> None:
                     "animal_p_inv_f_hat": float(s_inv["p"]),
                     "animal_ci_low_inv_f_hat": float(s_inv["ci_low"]),
                     "animal_ci_high_inv_f_hat": float(s_inv["ci_high"]),
+                    "n_animals_used_pE_hat": int(s_pE["n"]),
+                    "animal_mean_pE_hat": float(s_pE["mean"]),
+                    "animal_sd_pE_hat": float(s_pE["sd"]),
+                    "animal_t_pE_hat": float(s_pE["t"]),
+                    "animal_p_pE_hat": float(s_pE["p"]),
+                    "animal_ci_low_pE_hat": float(s_pE["ci_low"]),
+                    "animal_ci_high_pE_hat": float(s_pE["ci_high"]),
+                    "n_animals_used_ts_over_dt": int(s_ts["n"]),
+                    "animal_mean_ts_over_dt": float(s_ts["mean"]),
+                    "animal_sd_ts_over_dt": float(s_ts["sd"]),
+                    "animal_t_ts_over_dt": float(s_ts["t"]),
+                    "animal_p_ts_over_dt": float(s_ts["p"]),
+                    "animal_ci_low_ts_over_dt": float(s_ts["ci_low"]),
+                    "animal_ci_high_ts_over_dt": float(s_ts["ci_high"]),
+                    "n_animals_used_tc_over_dt": int(s_tc["n"]),
+                    "animal_mean_tc_over_dt": float(s_tc["mean"]),
+                    "animal_sd_tc_over_dt": float(s_tc["sd"]),
+                    "animal_t_tc_over_dt": float(s_tc["t"]),
+                    "animal_p_tc_over_dt": float(s_tc["p"]),
+                    "animal_ci_low_tc_over_dt": float(s_tc["ci_low"]),
+                    "animal_ci_high_tc_over_dt": float(s_tc["ci_high"]),
                 }
             )
 

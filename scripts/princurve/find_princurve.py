@@ -97,9 +97,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--anchor-smoothing",
         type=float,
-        default=0.5,
+        default=0.0,
         help=(
-            "Smoothing strength for anchor-only curve construction (default: 0.5). "
+            "Smoothing strength for anchor-only curve construction (default: 0.0). "
             "0.0 means interpolate anchors exactly; larger values increasingly limit curvature."
         ),
     )
@@ -194,6 +194,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d",
         help="Refextract LUT outdir containing ap_axis_um_from_strips.npz and chart_map_sagittal_to_coronal_t2d.npz.",
+    )
+    p.add_argument(
+        "--ijk",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Compute CCF ijk voxel coordinates using refextract midline normals and obs['r_um'] "
+            "(default: on; requires p1_landmarks.json + refextract midline columns)."
+        ),
     )
     return p.parse_args()
 
@@ -377,6 +386,20 @@ def _rolling_nan_min(x: np.ndarray, half_window: int) -> np.ndarray:
     return _fill_nan_1d(out)
 
 
+def _rolling_nan_max(x: np.ndarray, half_window: int) -> np.ndarray:
+    y = np.asarray(x, dtype=float)
+    out = np.full((y.size,), np.nan, dtype=float)
+    for i in range(y.size):
+        lo = max(0, i - int(half_window))
+        hi = min(y.size, i + int(half_window) + 1)
+        w = y[lo:hi]
+        ok = np.isfinite(w)
+        if not np.any(ok):
+            continue
+        out[i] = float(np.nanmax(w))
+    return _fill_nan_1d(out)
+
+
 def compute_r_um_from_t_all(
     *,
     t_all: np.ndarray,
@@ -385,7 +408,7 @@ def compute_r_um_from_t_all(
     roll_half_window: int = R_UM_ROLL_HALF_WINDOW,
     source_um_per_px: float = R_UM_SOURCE_UM_PER_PX,
 ) -> np.ndarray:
-    """Convert principal `r` (px) into microns using rolling floor over `t_all`."""
+    """Convert principal `r` (px) into microns from the ventricular side."""
     t = np.asarray(t_all, dtype=float)
     r_signed = np.asarray(r, dtype=float)
     if t.shape != r_signed.shape:
@@ -406,7 +429,9 @@ def compute_r_um_from_t_all(
     r_keep = r_signed[keep]
     bin_idx = np.minimum((t_keep * float(n_bins - 1)).astype(np.int32), int(n_bins - 1))
     r_bin_min = np.full((n_bins,), np.inf, dtype=float)
+    r_bin_max = np.full((n_bins,), -np.inf, dtype=float)
     np.minimum.at(r_bin_min, bin_idx, r_keep)
+    np.maximum.at(r_bin_max, bin_idx, r_keep)
     r_bin_min[~np.isfinite(r_bin_min)] = np.nan
 
     r_floor_bin = _rolling_nan_min(r_bin_min, half_window=roll_half_window)
@@ -856,7 +881,6 @@ def smooth_t_on_spatial_knn(
     if np.any(idx < 0) or np.any(idx >= n):
         raise SystemExit("Anchor index out of bounds in t smoothing.")
     fixed_idx = np.unique(idx)
-
     if anchor_t is None:
         fixed_t = t_base[fixed_idx].astype(float, copy=True)
     else:
@@ -1063,7 +1087,7 @@ def apply_anchor_constraints_to_curvefit_projection(
     *,
     xy: np.ndarray,
     anchor_indices: list[int],
-    anchor_smoothing: float = 0.5,
+    anchor_smoothing: float = 0.0,
     anchor_t_smooth: bool = True,
     anchor_t_smooth_k: int = 20,
     anchor_t_smooth_lambda: float = 0.15,
@@ -1082,11 +1106,12 @@ def apply_anchor_constraints_to_curvefit_projection(
     anchor_xy = xy_arr[idx, :2].astype(float, copy=False)
     line = fit_anchor_curve(anchor_xy=anchor_xy, n_dense=int(n_dense), smoothing=float(anchor_smoothing))
 
-    _t_proj, r_signed, proj_new = project_to_polyline_arclength(
+    t_proj, r_signed, proj_new = project_to_polyline_arclength(
         xy=xy_arr,
         line=line,
         endpoint_extrapolation=float(r_sign_endpoint_extrapolation),
     )
+    t_proj = np.asarray(t_proj, dtype=float)
     t_new = assign_t_via_edt_to_anchor_curve(xy=xy_arr, line=line)
     if anchor_t_smooth:
         anchor_t_target, _, _ = project_to_polyline_arclength(xy=anchor_xy, line=line)
@@ -1102,6 +1127,9 @@ def apply_anchor_constraints_to_curvefit_projection(
             lam=float(anchor_t_smooth_lambda),
             sigma_scale=float(anchor_t_smooth_sigma_scale),
         )
+    beyond_terminal = np.isfinite(t_proj) & (t_proj > 1.0)
+    t_new = np.asarray(t_new, dtype=float)
+    t_new[beyond_terminal] = t_proj[beyond_terminal]
     if clamp_endpoints:
         t_new[int(idx[0])] = 0.0
         t_new[int(idx[-1])] = 1.0
@@ -1433,6 +1461,75 @@ def write_anchor_qc_png(
         anchor_indices=anchor_indices,
         title=title,
     )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def write_unfolded_r_um_qc_png(
+    *,
+    out_path: Path,
+    t_local: np.ndarray,
+    r_um: np.ndarray,
+    r_signed: np.ndarray,
+    title: str,
+    max_points: int = 80_000,
+    plot_mask: np.ndarray | None = None,
+) -> None:
+    t_local = np.asarray(t_local, dtype=float)
+    r_um = np.asarray(r_um, dtype=float)
+    r_signed = np.asarray(r_signed, dtype=float)
+    if t_local.shape != r_um.shape or t_local.shape != r_signed.shape:
+        raise ValueError("t_local, r_um, and r_signed must have matching shapes.")
+    if t_local.ndim != 1:
+        raise ValueError("t_local, r_um, and r_signed must be 1D.")
+
+    n = int(t_local.shape[0])
+    if plot_mask is None:
+        keep = np.ones((n,), dtype=bool)
+    else:
+        keep = np.asarray(plot_mask, dtype=bool)
+        if keep.shape != (n,):
+            raise ValueError("plot_mask must be a 1D boolean mask matching t_local length.")
+    keep &= np.isfinite(t_local) & np.isfinite(r_um) & np.isfinite(r_signed)
+    idx = np.flatnonzero(keep)
+    if idx.size == 0:
+        return
+
+    rng = np.random.default_rng(0)
+    if idx.size > max_points:
+        idx = rng.choice(idx, size=max_points, replace=False)
+
+    lim = float(np.quantile(np.abs(r_signed[keep]), 0.99))
+    if not np.isfinite(lim) or lim <= 0.0:
+        lim = 1.0
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sc = ax.scatter(
+        t_local[idx],
+        r_um[idx],
+        c=r_signed[idx],
+        s=4,
+        cmap="RdBu_r",
+        vmin=-lim,
+        vmax=lim,
+        linewidths=0.0,
+        alpha=0.8,
+    )
+    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.5)
+    t_keep = t_local[keep]
+    t_lo = float(np.min(t_keep))
+    t_hi = float(np.max(t_keep))
+    t_span = max(t_hi - t_lo, 1.0)
+    t_pad = max(0.02, 0.02 * t_span)
+    ax.set_xlim(min(-0.02, t_lo - t_pad), max(1.02, t_hi + t_pad))
+    ax.set_xlabel("t_local")
+    ax.set_ylabel("r_um")
+    ax.set_title(title)
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("signed distance to curve (px)")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -2114,6 +2211,7 @@ def _map_sagittal_to_coronal_t2d(*, s2c: S2CLut, slice_k: int, t_s: np.ndarray) 
     row = int(np.argmin(np.abs(keys.astype(np.float64) - float(slice_k))))
     t_grid = np.asarray(s2c.t_grid, dtype=np.float64).reshape(-1)
     t = np.asarray(t_s, dtype=np.float64).reshape(-1)
+    out_of_support_t = ~np.isfinite(t) | (t < 0.0) | (t > 1.0)
     t_clip = np.clip(t, 0.0, 1.0)
     slice_row = np.asarray(s2c.target_slice_idx[row], dtype=np.float64).reshape(-1)
     t_row = np.asarray(s2c.target_t[row], dtype=np.float64).reshape(-1)
@@ -2121,12 +2219,16 @@ def _map_sagittal_to_coronal_t2d(*, s2c: S2CLut, slice_k: int, t_s: np.ndarray) 
         raise ValueError("Unexpected sagittal->coronal LUT row shape.")
     out_slice = np.interp(t_clip, t_grid, slice_row).astype(np.float64, copy=False)
     out_t = np.interp(t_clip, t_grid, t_row).astype(np.float64, copy=False)
+    if np.any(out_of_support_t):
+        out_slice = np.where(out_of_support_t, np.nan, out_slice)
+        out_t = np.where(out_of_support_t, np.nan, out_t)
+    boundary_tol = 1.0e-6
     if s2c.coronal_slice_min is not None:
-        bad = out_slice < float(s2c.coronal_slice_min)
+        bad = out_slice <= (float(s2c.coronal_slice_min) + boundary_tol)
         out_slice = np.where(bad, np.nan, out_slice)
         out_t = np.where(bad, np.nan, out_t)
     if s2c.coronal_slice_max is not None:
-        bad = out_slice > float(s2c.coronal_slice_max)
+        bad = out_slice >= (float(s2c.coronal_slice_max) - boundary_tol)
         out_slice = np.where(bad, np.nan, out_slice)
         out_t = np.where(bad, np.nan, out_t)
     return out_slice, out_t
@@ -2504,6 +2606,62 @@ def _read_axis_and_slice_from_p1(p1_path: Path) -> tuple[str, int]:
     return axis, atlas_slice_idx
 
 
+def _read_axis_slice_and_voxel_um_from_p1(p1_path: Path) -> tuple[str, int, float]:
+    p1 = json.loads(p1_path.read_text(encoding="utf-8"))
+    axis = str(p1["atlas_plane"]).lower()
+    atlas_slice_idx = int(p1["atlas_slice_idx"])
+    voxel_um_raw = p1.get("atlas_voxel_um", 20.0)
+    voxel_um = float(voxel_um_raw)
+    if not np.isfinite(voxel_um) or voxel_um <= 0:
+        raise ValueError(f"Invalid atlas_voxel_um={voxel_um_raw!r} in {p1_path}")
+    return axis, atlas_slice_idx, voxel_um
+
+
+def compute_ijk_from_refextract_midline_normal(
+    *,
+    lut_outdir: Path,
+    axis: str,
+    atlas_slice_idx: int,
+    t_all: np.ndarray,
+    r_um: np.ndarray,
+    atlas_voxel_um: float,
+) -> tuple[np.ndarray, int]:
+    """Map (t_all, r_um) -> atlas ijk using midline + pia-oriented normals.
+
+    This mirrors the `midline_normal` mapping used in `ccf/refextract/princurve_h5ad_to_ijk_plot.py`.
+    """
+    from ccf.refextract.midsurface_coords import (
+        evaluate_midline_normal_bundle,
+        load_coronal_midline_columns,
+        load_sagittal_midline_columns,
+        nearest_midline_slice_key,
+    )
+
+    axis_norm = str(axis).lower()
+    t = np.asarray(t_all, dtype=np.float64).reshape(-1)
+    r = np.asarray(r_um, dtype=np.float64).reshape(-1)
+    if t.shape != r.shape:
+        raise ValueError("t_all and r_um must have the same shape.")
+    if not np.isfinite(float(atlas_voxel_um)) or float(atlas_voxel_um) <= 0:
+        raise ValueError("atlas_voxel_um must be finite and > 0.")
+
+    if axis_norm == "coronal":
+        columns_by_slice = load_coronal_midline_columns(lut_outdir / "coronal_midline_columns.csv")
+    elif axis_norm == "sagittal":
+        columns_by_slice = load_sagittal_midline_columns(lut_outdir / "sagittal_midline_columns.csv")
+    else:
+        raise ValueError(f"Unsupported axis={axis!r}; expected 'coronal' or 'sagittal'.")
+
+    source_slice_used = int(
+        nearest_midline_slice_key(columns_by_slice=columns_by_slice, atlas_slice_idx=int(atlas_slice_idx))
+    )
+    cols = columns_by_slice[int(source_slice_used)]
+    mid_ijk, normal_ijk = evaluate_midline_normal_bundle(columns=cols, axis=axis_norm, t_query=t)
+    r_px = r / float(atlas_voxel_um)
+    ijk = mid_ijk + r_px[:, None] * normal_ijk
+    return ijk.astype(np.float32, copy=False), source_slice_used
+
+
 def _resolve_refextract_lut_outdir(raw: str) -> Path:
     p = Path(str(raw))
     if p.is_absolute():
@@ -2830,7 +2988,7 @@ def _run_single(
             r_signed_store = np.asarray(r_, dtype=float).copy()
             r_scale_info = {
                 "mode": "signed_normal_distance",
-                "t_mode": "knn_screened_harmonic_spatial" if args.anchor_t_smooth else "edt_nearest_wall_spatial",
+                    "t_mode": "knn_screened_harmonic_spatial" if args.anchor_t_smooth else "edt_nearest_wall_spatial",
                 "reverse_r_sign": bool(anchor_reverse_r_sign),
                 "source": "curvefit_anchored",
             }
@@ -2960,7 +3118,11 @@ def _run_single(
     adata.obs["t_all"] = t_all
     adata.obs["t_neomeso"] = t_neomeso
     adata.obs["t_local"] = t_local
-    adata.obs["r_um"] = compute_r_um_from_t_all(t_all=t_all, r=r_)
+    r_um_source = np.asarray(r_signed_store, dtype=float) if r_signed_store is not None else np.asarray(r_, dtype=float)
+    r_midline = np.asarray(r_um_source, dtype=float)
+    r_um = compute_r_um_from_t_all(t_all=t_all, r=r_um_source)
+    adata.obs["r_midline"] = r_midline
+    adata.obs["r_um"] = r_um
     adata.obsm["principal"] = np.column_stack([t, r_]).astype(float, copy=False)
     adata.obsm["principal_curve_proj_xy"] = proj
     if r_signed_store is not None:
@@ -2973,6 +3135,17 @@ def _run_single(
         fit_meta["rois"] = list(rois_to_process)
     if r_scale_info is not None:
         fit_meta["r_scale"] = r_scale_info
+    fit_meta["r_um"] = {
+        "source_key": "obsm['principal_r_signed']" if r_signed_store is not None else "obsm['principal'][:,1]",
+        "mode": "rolling_floor_nonnegative",
+        "n_bins": int(R_UM_BIN_COUNT),
+        "roll_half_window": int(R_UM_ROLL_HALF_WINDOW),
+        "source_um_per_px": float(R_UM_SOURCE_UM_PER_PX),
+    }
+    fit_meta["r_midline"] = {
+        "source_key": "obsm['principal_r_signed']" if r_signed_store is not None else "obsm['principal'][:,1]",
+        "mode": "signed_distance_to_curve_px",
+    }
     fit_meta["t_names"] = {
         "t_local": "obsm['principal'][:,0] (slice-local anchored curve coordinate)",
         "t_all": "A0_all + (1 - t_local) * (A1_all - A0_all), where A*_all are per-mask global anchor endpoints",
@@ -2998,36 +3171,73 @@ def _run_single(
         uns["principal_anchors"] = anchor_meta
     adata.uns = uns
 
-    if bool(getattr(args, "ap_ml", True)):
+    wants_ap_ml = bool(getattr(args, "ap_ml", True))
+    wants_ijk = bool(getattr(args, "ijk", True))
+    if wants_ap_ml or wants_ijk:
         p1_path = in_path.with_name("p1_landmarks.json")
         if not p1_path.exists():
-            print("Note: p1_landmarks.json not found; skipping obsm['AP_ML_um'].")
+            if wants_ap_ml:
+                print("Note: p1_landmarks.json not found; skipping obsm['AP_ML_um'].")
+            if wants_ijk:
+                print("Note: p1_landmarks.json not found; skipping obsm['ijk'].")
         else:
-            axis, atlas_slice_idx = _read_axis_and_slice_from_p1(p1_path)
-            try:
-                ap_ml_um = compute_ap_ml_um_from_refextract(
-                    lut_outdir=_resolve_refextract_lut_outdir(str(getattr(args, "ap_ml_lut_outdir"))),
-                    axis=axis,
-                    atlas_slice_idx=int(atlas_slice_idx),
-                    t_all=t_all,
-                )
-            except Exception as exc:
-                raise SystemExit(
-                    f"Failed to compute obsm['AP_ML_um'] from refextract artifacts "
-                    f"(lut_outdir={getattr(args, 'ap_ml_lut_outdir')!r}): {exc}"
-                ) from exc
-            if ap_ml_um.shape != (adata.n_obs, 2):
-                raise SystemExit(f"Internal error: AP_ML_um has unexpected shape {ap_ml_um.shape}.")
-            adata.obsm["AP_ML_um"] = ap_ml_um.astype(np.float32, copy=False)
-            if not isinstance(adata.uns, dict):
-                adata.uns = {}
-            adata.uns["AP_ML_um_meta"] = {
-                "units": "um",
-                "method": "s2c_t",
-                "lut_outdir": str(getattr(args, "ap_ml_lut_outdir")),
-                "axis": str(axis),
-                "atlas_slice_idx": int(atlas_slice_idx),
-            }
+            axis, atlas_slice_idx, atlas_voxel_um = _read_axis_slice_and_voxel_um_from_p1(p1_path)
+            lut_outdir = _resolve_refextract_lut_outdir(str(getattr(args, "ap_ml_lut_outdir")))
+            if wants_ap_ml:
+                try:
+                    ap_ml_um = compute_ap_ml_um_from_refextract(
+                        lut_outdir=lut_outdir,
+                        axis=axis,
+                        atlas_slice_idx=int(atlas_slice_idx),
+                        t_all=t_all,
+                    )
+                except Exception as exc:
+                    raise SystemExit(
+                        f"Failed to compute obsm['AP_ML_um'] from refextract artifacts "
+                        f"(lut_outdir={getattr(args, 'ap_ml_lut_outdir')!r}): {exc}"
+                    ) from exc
+                if ap_ml_um.shape != (adata.n_obs, 2):
+                    raise SystemExit(f"Internal error: AP_ML_um has unexpected shape {ap_ml_um.shape}.")
+                adata.obsm["AP_ML_um"] = ap_ml_um.astype(np.float32, copy=False)
+                if not isinstance(adata.uns, dict):
+                    adata.uns = {}
+                adata.uns["AP_ML_um_meta"] = {
+                    "units": "um",
+                    "method": "s2c_t",
+                    "lut_outdir": str(getattr(args, "ap_ml_lut_outdir")),
+                    "axis": str(axis),
+                    "atlas_slice_idx": int(atlas_slice_idx),
+                }
+
+            if wants_ijk:
+                try:
+                    ijk, source_slice_used = compute_ijk_from_refextract_midline_normal(
+                        lut_outdir=lut_outdir,
+                        axis=axis,
+                        atlas_slice_idx=int(atlas_slice_idx),
+                        t_all=t_all,
+                        r_um=r_um,
+                        atlas_voxel_um=float(atlas_voxel_um),
+                    )
+                except Exception as exc:
+                    raise SystemExit(
+                        f"Failed to compute obsm['ijk'] from refextract midline columns "
+                        f"(lut_outdir={getattr(args, 'ap_ml_lut_outdir')!r}): {exc}"
+                    ) from exc
+                if ijk.shape != (adata.n_obs, 3):
+                    raise SystemExit(f"Internal error: ijk has unexpected shape {ijk.shape}.")
+                adata.obsm["ijk"] = ijk.astype(np.float32, copy=False)
+                if not isinstance(adata.uns, dict):
+                    adata.uns = {}
+                adata.uns["ijk_meta"] = {
+                    "units": "atlas_vox",
+                    "method": "midline_normal",
+                    "lut_outdir": str(getattr(args, "ap_ml_lut_outdir")),
+                    "axis": str(axis),
+                    "atlas_slice_idx": int(atlas_slice_idx),
+                    "source_slice_used": int(source_slice_used),
+                    "r_um_key": "obs['r_um']",
+                }
 
     if rois_to_process is not None and roi_values is not None:
         qc_path = Path(f"{out_prefix}.curve.qc.png")
@@ -3063,6 +3273,7 @@ def _run_single(
     if args.anchors_json is not None:
         anchored_qc_path = Path(f"{out_prefix}.anchors.qc.png")
         anchored_rsigned_qc_path = Path(f"{out_prefix}.anchors.r_signed.qc.png")
+        anchored_unfolded_qc_path = Path(f"{out_prefix}.anchors.unfolded_r_um.qc.png")
 
         if anchor_meta is None:
             raise SystemExit("Internal error: expected anchor_meta when --anchors-json is provided.")
@@ -3131,6 +3342,17 @@ def _run_single(
             plot_mask=plot_mask,
         )
         print(f"Wrote: {anchored_rsigned_qc_path}")
+
+        if r_signed_store is not None:
+            write_unfolded_r_um_qc_png(
+                out_path=anchored_unfolded_qc_path,
+                t_local=t,
+                r_um=r_um,
+                r_signed=np.asarray(r_signed_store, dtype=float),
+                title=f"Unfolded cortex QC (n={int(np.count_nonzero(plot_mask))})",
+                plot_mask=plot_mask,
+            )
+            print(f"Wrote: {anchored_unfolded_qc_path}")
 
         if args.keep_intermediates:
             anchored_curvefit_path = Path(f"{out_prefix}.anchors.curvefit.csv")

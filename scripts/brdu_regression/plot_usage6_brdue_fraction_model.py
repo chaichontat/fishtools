@@ -54,6 +54,7 @@ def _plot_grid(
     *,
     by_unit: pd.DataFrame | None,
     value_col: str,
+    weight_col: str | None,
     ylabel: str,
     out_png: Path,
     title_prefix: str,
@@ -96,7 +97,11 @@ def _plot_grid(
                 raise ValueError(f"by_unit provided but has no rows for leiden={leiden!r}")
 
             du["usage_bin"] = du["usage_bin"].astype(int)
-            du["unit_weight_b1"] = du["unit_weight_b1"].astype(float)
+            if weight_col is None:
+                raise ValueError("by_unit provided but weight_col is None")
+            if weight_col not in du.columns:
+                raise ValueError(f"by_unit missing weight_col={weight_col!r} for plot {out_png.name}")
+            du[weight_col] = du[weight_col].astype(float)
             du["animal"] = du["animal"].astype(str)
             du[value_col] = du[value_col].astype(float)
 
@@ -114,7 +119,7 @@ def _plot_grid(
                     dt = da.loc[da["usage_bin"] == t]
                     m, lo, hi = _weighted_ci_normal(
                         dt[value_col].to_numpy(float),
-                        dt["unit_weight_b1"].to_numpy(float),
+                        dt[weight_col].to_numpy(float),
                     )
                     xs.append(int(t))
                     ys.append(float(m))
@@ -131,6 +136,7 @@ def _plot_grid(
                     linewidth=1.0,
                     alpha=0.7,
                     capsize=2,
+                    label=str(animal),
                 )
 
             # Pooled weighted mean+CI across all units (across all animals).
@@ -140,7 +146,7 @@ def _plot_grid(
             yhi: list[float] = []
             for t in sorted(du["usage_bin"].unique().tolist()):
                 dt = du.loc[du["usage_bin"] == t]
-                m, lo, hi = _weighted_ci_normal(dt[value_col].to_numpy(float), dt["unit_weight_b1"].to_numpy(float))
+                m, lo, hi = _weighted_ci_normal(dt[value_col].to_numpy(float), dt[weight_col].to_numpy(float))
                 xs.append(int(t))
                 ys.append(float(m))
                 ylo.append(float(lo))
@@ -154,7 +160,9 @@ def _plot_grid(
                 color="#2b8cbe",
                 linewidth=2.5,
                 capsize=3,
+                label="pooled",
             )
+            ax.legend(loc="best", fontsize=8, frameon=False)
         else:
             animals = sorted(sub["animal"].unique().tolist())
             for animal in animals:
@@ -196,6 +204,12 @@ def main() -> None:
         )
     )
     p.add_argument("--indir", type=Path, required=True, help="Directory containing usage6_by_animal.csv")
+    p.add_argument(
+        "--delta-t-minutes",
+        type=float,
+        default=None,
+        help="If set, also write Ts/Tc plots in minutes (e.g. 90 for a 90 min pulse lag).",
+    )
     args = p.parse_args()
 
     indir: Path = args.indir
@@ -208,6 +222,7 @@ def main() -> None:
         by_animal=by_animal,
         by_unit=by_unit,
         value_col="f_hat",
+        weight_col="unit_weight_b1" if by_unit is not None else None,
         ylabel="f_hat = P(EdU+ | BrdU+)",
         out_png=indir / "usage6_f_hat.png",
         title_prefix="BrdU+ retention vs Usage_6",
@@ -216,17 +231,21 @@ def main() -> None:
         by_animal=by_animal,
         by_unit=by_unit,
         value_col="inv_f_hat",
+        weight_col="unit_weight_b1" if by_unit is not None else None,
         ylabel="1 / f_hat",
         out_png=indir / "usage6_inv_f_hat.png",
         title_prefix="BrdU+EdU+ / BrdU+ inverse fraction vs Usage_6",
     )
 
-    if "f_hat" not in by_animal.columns:
-        raise ValueError("usage6_by_animal.csv missing f_hat (needed for T_S/Δt plot).")
-    if np.any(pd.to_numeric(by_animal["f_hat"], errors="coerce").to_numpy(float) >= 1.0):
-        raise ValueError("Some f_hat values are >= 1.0; T_S/Δt = 1/(1-f_hat) would be undefined.")
-    by_animal_ts = by_animal.copy()
-    by_animal_ts["ts_over_dt"] = 1.0 / (1.0 - by_animal_ts["f_hat"].astype(float))
+    if "ts_over_dt" not in by_animal.columns:
+        if "f_hat" not in by_animal.columns:
+            raise ValueError("usage6_by_animal.csv missing f_hat (needed for T_S/Δt plot).")
+        if np.any(pd.to_numeric(by_animal["f_hat"], errors="coerce").to_numpy(float) >= 1.0):
+            raise ValueError("Some f_hat values are >= 1.0; T_S/Δt = 1/(1-f_hat) would be undefined.")
+        by_animal_ts = by_animal.copy()
+        by_animal_ts["ts_over_dt"] = 1.0 / (1.0 - by_animal_ts["f_hat"].astype(float))
+    else:
+        by_animal_ts = by_animal
     if by_unit is not None and "ts_over_dt" not in by_unit.columns:
         by_unit = by_unit.copy()
         by_unit["ts_over_dt"] = 1.0 / (1.0 - by_unit["f_hat"].astype(float))
@@ -234,6 +253,7 @@ def main() -> None:
         by_animal=by_animal_ts,
         by_unit=by_unit,
         value_col="ts_over_dt",
+        weight_col="unit_weight_b1" if by_unit is not None else None,
         ylabel="T_S / Δt ≈ 1 / (1 − f_hat)",
         out_png=indir / "usage6_Ts_over_dt.png",
         title_prefix="S-phase time (dimensionless) vs Usage_6",
@@ -242,6 +262,71 @@ def main() -> None:
     print(f"Wrote: {indir / 'usage6_f_hat.png'}")
     print(f"Wrote: {indir / 'usage6_inv_f_hat.png'}")
     print(f"Wrote: {indir / 'usage6_Ts_over_dt.png'}")
+
+    if "pE_hat" in by_animal.columns:
+        _plot_grid(
+            by_animal=by_animal,
+            by_unit=by_unit,
+            value_col="pE_hat",
+            weight_col="unit_weight_all" if by_unit is not None else None,
+            ylabel="pE_hat = P(EdU+)",
+            out_png=indir / "usage6_pE_hat.png",
+            title_prefix="EdU labeling index vs Usage_6",
+        )
+        print(f"Wrote: {indir / 'usage6_pE_hat.png'}")
+
+    if "tc_over_dt" in by_animal.columns:
+        _plot_grid(
+            by_animal=by_animal,
+            by_unit=by_unit,
+            value_col="tc_over_dt",
+            weight_col="unit_weight_all" if by_unit is not None else None,
+            ylabel="T_C / Δt ≈ (T_S/Δt) / P(EdU+)",
+            out_png=indir / "usage6_Tc_over_dt.png",
+            title_prefix="Cell-cycle time (dimensionless) vs Usage_6",
+        )
+        print(f"Wrote: {indir / 'usage6_Tc_over_dt.png'}")
+
+    if args.delta_t_minutes is not None:
+        dt_min = float(args.delta_t_minutes)
+        if not (dt_min > 0):
+            raise ValueError("--delta-t-minutes must be > 0")
+
+        if "ts_over_dt" in by_animal_ts.columns:
+            by_animal_ts_min = by_animal_ts.copy()
+            by_animal_ts_min["ts_minutes"] = dt_min * by_animal_ts_min["ts_over_dt"].astype(float)
+            by_unit_ts_min = None
+            if by_unit is not None:
+                by_unit_ts_min = by_unit.copy()
+                by_unit_ts_min["ts_minutes"] = dt_min * by_unit_ts_min["ts_over_dt"].astype(float)
+            _plot_grid(
+                by_animal=by_animal_ts_min,
+                by_unit=by_unit_ts_min,
+                value_col="ts_minutes",
+                weight_col="unit_weight_b1" if by_unit_ts_min is not None else None,
+                ylabel="T_S (minutes) = (T_S/Δt) × Δt",
+                out_png=indir / "usage6_Ts_minutes.png",
+                title_prefix=f"S-phase time vs Usage_6 (Δt={dt_min:g} min)",
+            )
+            print(f"Wrote: {indir / 'usage6_Ts_minutes.png'}")
+
+        if "tc_over_dt" in by_animal.columns:
+            by_animal_tc_min = by_animal.copy()
+            by_animal_tc_min["tc_minutes"] = dt_min * by_animal_tc_min["tc_over_dt"].astype(float)
+            by_unit_tc_min = None
+            if by_unit is not None:
+                by_unit_tc_min = by_unit.copy()
+                by_unit_tc_min["tc_minutes"] = dt_min * by_unit_tc_min["tc_over_dt"].astype(float)
+            _plot_grid(
+                by_animal=by_animal_tc_min,
+                by_unit=by_unit_tc_min,
+                value_col="tc_minutes",
+                weight_col="unit_weight_all" if by_unit_tc_min is not None else None,
+                ylabel="T_C (minutes) = (T_C/Δt) × Δt",
+                out_png=indir / "usage6_Tc_minutes.png",
+                title_prefix=f"Cell-cycle time vs Usage_6 (Δt={dt_min:g} min)",
+            )
+            print(f"Wrote: {indir / 'usage6_Tc_minutes.png'}")
 
 
 if __name__ == "__main__":
