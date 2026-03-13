@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import dataclass
 import importlib.util
 import sys
 from pathlib import Path
@@ -9,7 +10,17 @@ from pathlib import Path
 import numpy as np
 
 
-COORDS_SCRIPT = Path("ccf/refextract/midsurface_coords.py")
+COORDS_SCRIPT = Path(__file__).resolve().with_name("midsurface_coords.py")
+
+
+@dataclass(frozen=True)
+class ApMlNativeGrid:
+    ap_um: np.ndarray
+    ml_um: np.ndarray
+    support_mask: np.ndarray
+    coronal_slice_i: np.ndarray
+    t_grid: np.ndarray
+    ml_um_signed_at_t: np.ndarray
 
 
 def _load_midsurface_coords_module():
@@ -40,6 +51,42 @@ def compute_ap_ml_support_mask_native_grid(
       - ap_grid: (N_ap,) AP (um) centers (ordered by AP)
       - ml_grid: (N_ml,) ML (um) centers (anchored arclength along per-slice t)
       - support_mask: (N_ap, N_ml) True where the refextract surface is defined
+    """
+    details = compute_ap_ml_native_grid_details(
+        outdir=outdir,
+        slice_i_min=slice_i_min,
+        slice_i_max=slice_i_max,
+        n_t=n_t,
+        n_ml=n_ml,
+        ref_t=ref_t,
+        band_frac=band_frac,
+        res_ijk_um=res_ijk_um,
+        restrict_t_neomeso=restrict_t_neomeso,
+    )
+    return details.ap_um, details.ml_um, details.support_mask
+
+
+def compute_ap_ml_native_grid_details(
+    *,
+    outdir: Path,
+    slice_i_min: int,
+    slice_i_max: int,
+    n_t: int,
+    n_ml: int,
+    ref_t: float,
+    band_frac: float,
+    res_ijk_um: tuple[float, float, float] | None,
+    restrict_t_neomeso: bool,
+) -> ApMlNativeGrid:
+    """Compute AP/ML native-grid details needed for inverse mapping back to atlas ijk.
+
+    Returns:
+      - ap_um: (N_ap,) AP (um) centers
+      - ml_um: (N_ml,) ML (um) centers
+      - support_mask: (N_ap, N_ml) valid AP/ML support mask
+      - coronal_slice_i: (N_ap,) corresponding coronal slice index per AP row
+      - t_grid: (N_t,) midsurface t grid used for per-slice anchoring
+      - ml_um_signed_at_t: (N_ap, N_t) signed anchored ML arclength at each t
     """
     outdir = Path(outdir)
     mod = _load_midsurface_coords_module()
@@ -169,7 +216,248 @@ def compute_ap_ml_support_mask_native_grid(
             thickness[row] = _interp_series_on_grid(x=ml_um_signed_at_t[row], y=thickness_t[row], x_grid=ml_grid)
 
     support_mask = np.isfinite(thickness)
-    return ap_grid.astype(np.float64, copy=False), ml_grid.astype(np.float64, copy=False), support_mask.astype(bool, copy=False)
+    return ApMlNativeGrid(
+        ap_um=ap_grid.astype(np.float64, copy=False),
+        ml_um=ml_grid.astype(np.float64, copy=False),
+        support_mask=support_mask.astype(bool, copy=False),
+        coronal_slice_i=np.asarray(keys, dtype=np.int32),
+        t_grid=t_grid.astype(np.float64, copy=False),
+        ml_um_signed_at_t=ml_um_signed_at_t.astype(np.float64, copy=False),
+    )
+
+
+def _invert_ml_um_to_t_piecewise(
+    *,
+    ml_um_signed_at_t_row: np.ndarray,
+    t_grid: np.ndarray,
+    ml_grid: np.ndarray,
+    support_mask_row: np.ndarray,
+    slice_i: int,
+) -> np.ndarray:
+    ml_vals = np.asarray(ml_um_signed_at_t_row, dtype=np.float64).reshape(-1)
+    t_vals = np.asarray(t_grid, dtype=np.float64).reshape(-1)
+    ml_q = np.asarray(ml_grid, dtype=np.float64).reshape(-1)
+    support = np.asarray(support_mask_row, dtype=bool).reshape(-1)
+    if ml_vals.shape != t_vals.shape:
+        raise ValueError(f"slice_i={int(slice_i)}: ml/t shape mismatch {ml_vals.shape} vs {t_vals.shape}")
+    if support.shape != ml_q.shape:
+        raise ValueError(f"slice_i={int(slice_i)}: support/ml_grid shape mismatch {support.shape} vs {ml_q.shape}")
+
+    out = np.full(ml_q.shape, np.nan, dtype=np.float64)
+    finite = np.isfinite(ml_vals) & np.isfinite(t_vals)
+    idx = np.flatnonzero(finite).astype(np.int64, copy=False)
+    if idx.size < 2:
+        if np.any(support):
+            raise ValueError(f"slice_i={int(slice_i)}: not enough finite (ml,t) points to invert support row")
+        return out
+
+    cuts = np.where(np.diff(idx) > 1)[0] + 1
+    runs = np.split(idx, cuts)
+    for run in runs:
+        if run.size < 2:
+            continue
+        ml_run = ml_vals[run]
+        t_run = t_vals[run]
+        d = np.diff(ml_run)
+        if np.all(d > 0.0):
+            pass
+        elif np.all(d < 0.0):
+            ml_run = ml_run[::-1]
+            t_run = t_run[::-1]
+        else:
+            raise ValueError(f"slice_i={int(slice_i)}: non-monotone ML(t) segment encountered while inverting to t")
+
+        if np.any(np.diff(ml_run) <= 0.0):
+            raise ValueError(f"slice_i={int(slice_i)}: duplicate/non-increasing ML values prevent inversion")
+
+        m = support & (ml_q >= float(ml_run[0])) & (ml_q <= float(ml_run[-1]))
+        if not np.any(m):
+            continue
+        if np.any(np.isfinite(out[m])):
+            raise ValueError(f"slice_i={int(slice_i)}: overlapping ML support segments while inverting to t")
+        out[m] = np.interp(ml_q[m], ml_run, t_run).astype(np.float64, copy=False)
+
+    missing = support & ~np.isfinite(out)
+    if np.any(missing):
+        raise ValueError(f"slice_i={int(slice_i)}: failed to invert ML->t for {int(np.count_nonzero(missing))} support bins")
+    return out
+
+
+def _interp_column_values_at_t(
+    *,
+    t_source: np.ndarray,
+    values: np.ndarray,
+    t_query: np.ndarray,
+    slice_i: int,
+    field_name: str,
+) -> np.ndarray:
+    t_src = np.asarray(t_source, dtype=np.float64).reshape(-1)
+    v_src = np.asarray(values, dtype=np.float64).reshape(-1)
+    t_q = np.asarray(t_query, dtype=np.float64).reshape(-1)
+    if t_src.shape != v_src.shape:
+        raise ValueError(f"slice_i={int(slice_i)} field={field_name}: t/value shape mismatch {t_src.shape} vs {v_src.shape}")
+    finite = np.isfinite(t_src) & np.isfinite(v_src)
+    if int(np.count_nonzero(finite)) < 2:
+        raise ValueError(f"slice_i={int(slice_i)} field={field_name}: not enough finite samples for interpolation")
+    t_f = t_src[finite]
+    v_f = v_src[finite]
+    order = np.argsort(t_f)
+    t_f = t_f[order]
+    v_f = v_f[order]
+    t_u, uidx = np.unique(t_f, return_index=True)
+    v_u = v_f[uidx]
+    if t_u.size < 2:
+        raise ValueError(f"slice_i={int(slice_i)} field={field_name}: t grid is degenerate")
+    out = np.interp(t_q, t_u, v_u, left=np.nan, right=np.nan).astype(np.float64, copy=False)
+    if np.any(~np.isfinite(out)):
+        raise ValueError(f"slice_i={int(slice_i)} field={field_name}: interpolation produced non-finite values on support")
+    return out
+
+
+def compute_ap_ml_native_ijk_map(
+    *,
+    outdir: Path,
+    grid: ApMlNativeGrid,
+    r01: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Map AP/ML native-grid support points back to atlas ijk coordinates."""
+    outdir = Path(outdir)
+    r01f = float(r01)
+    if not np.isfinite(r01f) or not (0.0 <= r01f <= 1.0):
+        raise ValueError(f"r01 must be in [0,1], got {r01f}")
+
+    mod = _load_midsurface_coords_module()
+    coronal = mod.load_coronal_midline_columns(outdir / "coronal_midline_columns.csv")
+    if not coronal:
+        raise ValueError(f"No coronal midline columns found under {outdir}")
+
+    ap_um = np.asarray(grid.ap_um, dtype=np.float64).reshape(-1)
+    ml_um = np.asarray(grid.ml_um, dtype=np.float64).reshape(-1)
+    support_mask = np.asarray(grid.support_mask, dtype=bool)
+    coronal_slice_i = np.asarray(grid.coronal_slice_i, dtype=np.int32).reshape(-1)
+    t_grid = np.asarray(grid.t_grid, dtype=np.float64).reshape(-1)
+    ml_um_signed_at_t = np.asarray(grid.ml_um_signed_at_t, dtype=np.float64)
+
+    n_ap = int(ap_um.size)
+    n_ml = int(ml_um.size)
+    if support_mask.shape != (n_ap, n_ml):
+        raise ValueError(f"support_mask shape {support_mask.shape} does not match expected {(n_ap, n_ml)}")
+    if coronal_slice_i.shape != (n_ap,):
+        raise ValueError(f"coronal_slice_i shape {coronal_slice_i.shape} does not match expected {(n_ap,)}")
+    if ml_um_signed_at_t.shape != (n_ap, int(t_grid.size)):
+        raise ValueError(
+            f"ml_um_signed_at_t shape {ml_um_signed_at_t.shape} does not match expected {(n_ap, int(t_grid.size))}"
+        )
+
+    i_map = np.full((n_ap, n_ml), np.nan, dtype=np.float64)
+    j_map = np.full((n_ap, n_ml), np.nan, dtype=np.float64)
+    k_map = np.full((n_ap, n_ml), np.nan, dtype=np.float64)
+
+    for row in range(n_ap):
+        support_row = np.asarray(support_mask[row], dtype=bool)
+        if not np.any(support_row):
+            continue
+        slice_i = int(coronal_slice_i[row])
+        cols = coronal.get(slice_i)
+        if cols is None:
+            raise ValueError(f"slice_i={slice_i} missing from coronal_midline_columns.csv")
+
+        t_at_ml = _invert_ml_um_to_t_piecewise(
+            ml_um_signed_at_t_row=ml_um_signed_at_t[row],
+            t_grid=t_grid,
+            ml_grid=ml_um,
+            support_mask_row=support_row,
+            slice_i=slice_i,
+        )
+        t_query = t_at_ml[support_row]
+
+        vent_y = _interp_column_values_at_t(
+            t_source=cols.t,
+            values=cols.vent_y,
+            t_query=t_query,
+            slice_i=slice_i,
+            field_name="vent_y",
+        )
+        vent_x = _interp_column_values_at_t(
+            t_source=cols.t,
+            values=cols.vent_x,
+            t_query=t_query,
+            slice_i=slice_i,
+            field_name="vent_x",
+        )
+        pia_y = _interp_column_values_at_t(
+            t_source=cols.t,
+            values=cols.pia_y,
+            t_query=t_query,
+            slice_i=slice_i,
+            field_name="pia_y",
+        )
+        pia_x = _interp_column_values_at_t(
+            t_source=cols.t,
+            values=cols.pia_x,
+            t_query=t_query,
+            slice_i=slice_i,
+            field_name="pia_x",
+        )
+
+        i_map[row, support_row] = float(slice_i)
+        j_map[row, support_row] = vent_y + r01f * (pia_y - vent_y)
+        k_map[row, support_row] = vent_x + r01f * (pia_x - vent_x)
+
+    return i_map, j_map, k_map
+
+
+def compute_ap_ml_support_mask_neomeso_on_native_grid(
+    *,
+    outdir: Path,
+    grid: ApMlNativeGrid,
+    t_neomeso_csv: Path | None = None,
+) -> np.ndarray:
+    """Compute a t_neomeso support mask on an existing native grid.
+
+    This is intended for plotting: use a full `t_all` native grid for geometry, but
+    restrict colored values to the neocortex+mesocortex overlap interval(s) by slice.
+    """
+    outdir = Path(outdir)
+    t_ranges_path = (outdir / "coronal_neocortex_mesocortex_overlap_t_ranges.csv") if t_neomeso_csv is None else Path(t_neomeso_csv)
+    t_ranges = _load_overlap_t_ranges_csv(t_ranges_path, slice_label="slice_i")
+    if not t_ranges:
+        raise FileNotFoundError(f"No overlap t ranges found in {t_ranges_path}")
+
+    support_mask = np.asarray(grid.support_mask, dtype=bool)
+    coronal_slice_i = np.asarray(grid.coronal_slice_i, dtype=np.int32).reshape(-1)
+    t_grid = np.asarray(grid.t_grid, dtype=np.float64).reshape(-1)
+    ml_um = np.asarray(grid.ml_um, dtype=np.float64).reshape(-1)
+    ml_um_signed_at_t = np.asarray(grid.ml_um_signed_at_t, dtype=np.float64)
+
+    n_ap = int(coronal_slice_i.size)
+    n_ml = int(ml_um.size)
+    if support_mask.shape != (n_ap, n_ml):
+        raise ValueError(f"support_mask shape {support_mask.shape} does not match expected {(n_ap, n_ml)}")
+    if ml_um_signed_at_t.shape != (n_ap, int(t_grid.size)):
+        raise ValueError(
+            f"ml_um_signed_at_t shape {ml_um_signed_at_t.shape} does not match expected {(n_ap, int(t_grid.size))}"
+        )
+
+    out = np.zeros((n_ap, n_ml), dtype=bool)
+    for row in range(n_ap):
+        slice_i = int(coronal_slice_i[row])
+        ranges = t_ranges.get(slice_i, [])
+        if not ranges:
+            continue
+        support_row = np.asarray(support_mask[row], dtype=bool)
+        if not np.any(support_row):
+            continue
+        t_at_ml = _invert_ml_um_to_t_piecewise(
+            ml_um_signed_at_t_row=ml_um_signed_at_t[row],
+            t_grid=t_grid,
+            ml_grid=ml_um,
+            support_mask_row=support_row,
+            slice_i=slice_i,
+        )
+        for t0, t1 in ranges:
+            out[row] |= support_row & (t_at_ml >= float(t0)) & (t_at_ml <= float(t1))
+    return out
 
 
 def _edges_from_centers(x: np.ndarray) -> np.ndarray:

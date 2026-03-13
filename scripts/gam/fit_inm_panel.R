@@ -360,6 +360,35 @@ if (!disable_pos) {
   cat("Positivity covariates disabled via --no-pos\n")
 }
 
+usage_cols <- grep("^Usage_", names(cells), value = TRUE)
+usage_df <- NULL
+usage_ref <- NULL
+if (length(usage_cols) > 0) {
+  usage_df <- cells[, usage_cols, drop = FALSE]
+  for (nm in usage_cols) {
+    v <- suppressWarnings(as.numeric(usage_df[[nm]]))
+    if (any(!is.finite(v))) stop(sprintf("cells$%s must be finite.", nm))
+    usage_df[[nm]] <- v
+  }
+  rs <- rowSums(usage_df)
+  if (all(is.finite(rs)) && (sd(rs) < 1e-6)) {
+    drop_nm <- usage_cols[[length(usage_cols)]]
+    usage_df <- usage_df[, setdiff(usage_cols, drop_nm), drop = FALSE]
+    usage_cols <- colnames(usage_df)
+    cat(sprintf("Usage covariates: detected simplex (rowSums ~ constant); dropping %s to avoid rank deficiency.\n", drop_nm))
+  }
+  if (ncol(usage_df) > 0) {
+    usage_ref <- vapply(usage_cols, function(nm) median(usage_df[[nm]]), numeric(1))
+  } else {
+    usage_df <- NULL
+    usage_cols <- character(0)
+  }
+}
+usage_extra_cols <- unlist(lapply(
+  usage_cols,
+  function(nm) c(paste0("beta_", nm), paste0("p_", nm), paste0("log_p_", nm))
+), use.names = FALSE)
+
 done <- character(0)
 	if (file.exists(out_tsv) && file.info(out_tsv)$size > 0) {
   existing <- read.delim(out_tsv, stringsAsFactors = FALSE, check.names = FALSE)
@@ -372,7 +401,8 @@ done <- character(0)
 		    "p_brdu_pos", "p_edu_pos", "p_brdu_edu",
 	      "log_p_spatial", "log_p_cycle", "log_p_interaction", "log_p_apml", "log_p_apml_r_um",
       "log_p_brdu_pos", "log_p_edu_pos", "log_p_brdu_edu",
-	    "cycle_amp_link", "spatial_grad_link", "gating_index_link"
+	    "cycle_amp_link", "spatial_grad_link", "gating_index_link",
+      usage_extra_cols
 	  )
 	  if (!identical(names(existing), expected_cols)) {
     stop("Cannot resume: existing OUT_TSV columns differ from expected output columns (likely from an older version).")
@@ -419,7 +449,7 @@ write_fit_row <- function(row) {
 }
 
 na_row <- function(gene) {
-  data.frame(
+  row <- data.frame(
     gene = gene,
     inm_r2 = coupling_r2,
     p_spatial = NA_real_,
@@ -443,6 +473,14 @@ na_row <- function(gene) {
     gating_index_link = NA_real_,
     stringsAsFactors = FALSE
   )
+  if (length(usage_cols) > 0) {
+    for (nm in usage_cols) {
+      row[[paste0("beta_", nm)]] <- NA_real_
+      row[[paste0("p_", nm)]] <- NA_real_
+      row[[paste0("log_p_", nm)]] <- NA_real_
+    }
+  }
+  row
 }
 
 write_concurvity <- function(out_tsv, fit) {
@@ -624,6 +662,7 @@ fit_one <- function(task) {
         theta = theta_model,
         AP_um = AP_um,
         ML_um = ML_um,
+        usage = usage_df,
         brdu_pos = brdu_pos,
         edu_pos = edu_pos,
         batch = batch_model,
@@ -643,7 +682,7 @@ fit_one <- function(task) {
     return(list(j = j, gene = gene, write_row = write_row, row = na_row(gene), fit_path = fit_path, dt = proc.time()[[3]] - t0, err = fit, p = c(NA_real_, NA_real_, NA_real_), diag = NULL, diag_err = NULL))
   }
 
-  pv <- extract_component_pvals(fit)
+  pv <- extract_component_pvals(fit, extra_params = usage_cols)
   es <- effect_sizes_from_fit(
     fit,
     r_um = r_um,
@@ -654,6 +693,7 @@ fit_one <- function(task) {
     batch_ref = batch_ref_model,
     has_animal = !is.null(animal),
     animal_ref = animal_ref,
+    usage_ref = usage_ref,
     use_theta = use_theta
   )
 
@@ -718,6 +758,13 @@ fit_one <- function(task) {
     gating_index_link = es$gating_index_link,
     stringsAsFactors = FALSE
   )
+  if (length(usage_cols) > 0) {
+    for (nm in usage_cols) {
+      row[[paste0("beta_", nm)]] <- pv[[paste0("beta_", nm)]]
+      row[[paste0("p_", nm)]] <- pv[[paste0("p_", nm)]]
+      row[[paste0("log_p_", nm)]] <- pv[[paste0("log_p_", nm)]]
+    }
+  }
   dt <- proc.time()[[3]] - t0
   list(
     j = j,

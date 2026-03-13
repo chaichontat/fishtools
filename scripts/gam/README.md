@@ -668,6 +668,13 @@ Rscript scripts/gam/synthetic_smoke_test.R
 This mode is for modeling **topic loadings** (e.g. cNMF `Usage_*`) as a composition that must sum to `1`.
 It fits Gaussian `bam()` models on ALR coordinates `log(u_k/u_ref)` and reconstructs per-topic loadings with a softmax so outputs are always on the simplex.
 
+Important caveats (reviewer-facing):
+- The model is fit on **log-ratios**: each fitted response is `z_k = log(u_k/u_ref)`, so effects are always **relative to the reference topic** (and therefore relative to the rest after closure).
+- This is `K-1` **separate univariate** Gaussian GAM fits (one per ALR component). We do not model cross-topic covariance, and results are **not invariant** to the ALR reference choice.
+- We apply an `eps` floor then re-close to the simplex before taking logs. This avoids `log(0)` but changes the estimand; treat `eps` as a hyperparameter and check sensitivity.
+- The plotted simplex loadings are a **plug-in** back-transform: `u_hat(x) = softmax(z_hat(x))`. This is not exactly `E[u|x]` under a logistic-normal (nonlinearity/Jensen).
+- `--exclude-random-effects` means “set `s(animal)` and `s(ab)` to 0 in prediction”, not “marginalize/average over animals/batches”.
+
 Inputs:
 - `${PANEL}/cells.tsv` with at least: `cell_id`, `r_um`, `AP_um`, `ML_um`, `batch` (and `theta` unless you pass `--no-theta`).
   - `r_um`, `AP_um`, `ML_um` must be finite for all rows used in the fit.
@@ -715,9 +722,52 @@ Notes:
 - `--r-max` filters the input cells to `r_um <= r_max` *before fitting* (useful if coverage is poor at high `r`).
 - `--exclude-random-effects` subtracts `s(animal)` and `s(ab)` from the ALR link predictions before simplex inversion.
   - Use this when you want a population-level spatial pattern instead of conditioning on a single reference `animal`/`ab` level.
+- `--marginalize-animal` (plotting) averages simplex loadings across animal levels (uniform weights).
+  - This keeps `s(animal)` but excludes `s(ab)` to avoid conditioning on a specific batch.
+  - Incompatible with `--exclude-random-effects`.
 - Optional: pass `--label-tsv PATH` to name topics in plot titles. The TSV must contain `program` and either `curated_label` or `label`.
 
 Outputs under `${PANEL}`:
 - `fit_results.simplex.tsv`
 - `simplex_meta.json`
 - `fits_rds__fit_results_simplex/ALR_P*_vs_P*.gam.rds`
+
+### ILR Variant (Reference-Free Coordinates)
+
+If you want to avoid choosing an ALR reference topic, you can fit in ILR (isometric log-ratio) coordinates.
+This still fits `K-1` separate Gaussian GAMs, but uses an orthonormal basis in clr space (pivot ILR).
+
+Fit:
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/fit_inm_simplex_panel_ilr.R \
+  ${PANEL} \
+  --usage-tsv ${USAGE} \
+  --eps 1e-4 \
+  --r-max 400 \
+  --threads 6 \
+  --bam-threads 1 \
+  --basis standard \
+  --k-uv 15
+```
+
+Plot (note `--meta`):
+
+```bash
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_simplex_native_proj.py \
+  ${PANEL} \
+  --meta ${PANEL}/simplex_meta_ilr.json \
+  --exclude-random-effects \
+  --out-dir ${PANEL}/plots_native_proj_simplex_u__ilr \
+  --apmlr-out-dir ${PANEL}/plots_apmlr_simplex_u__ilr \
+  --latlon \
+  --graticule ijk \
+  --elev-deg -10 \
+  --azim-deg -110 \
+  --roll-deg 180
+```
+
+ILR outputs under `${PANEL}`:
+- `fit_results.simplex_ilr.tsv`
+- `simplex_meta_ilr.json`
+- `fits_rds__fit_results_simplex_ilr/ILR_C*.gam.rds`

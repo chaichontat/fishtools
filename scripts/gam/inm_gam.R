@@ -104,6 +104,7 @@ fit_gene_gam <- function(
   theta,
   AP_um,
   ML_um,
+  usage = NULL,
   brdu_pos = NULL,
   edu_pos = NULL,
   batch = NULL,
@@ -143,6 +144,24 @@ fit_gene_gam <- function(
   bs_r <- if (shrinkage_basis == "shrink") "cs" else "cr"
 
   df <- data.frame(y = y, sf = sf, r_um = r_um, theta = theta, AP_um = AP_um, ML_um = ML_um)
+  usage_terms <- ""
+  if (!is.null(usage)) {
+    if (nrow(usage) != length(y)) stop("usage must have nrow == length(y).")
+    if (is.matrix(usage)) {
+      usage <- as.data.frame(usage, stringsAsFactors = FALSE)
+    }
+    if (!is.data.frame(usage)) stop("usage must be a data.frame or matrix.")
+    if (ncol(usage) < 1) stop("usage must have at least one column.")
+    if (is.null(colnames(usage)) || any(!nzchar(colnames(usage)))) {
+      stop("usage must have non-empty column names.")
+    }
+    for (nm in colnames(usage)) {
+      v <- suppressWarnings(as.numeric(usage[[nm]]))
+      if (any(!is.finite(v))) stop(sprintf("usage column %s must be finite.", nm))
+      df[[nm]] <- v
+    }
+    usage_terms <- paste(colnames(usage), collapse = " + ")
+  }
   has_pos <- FALSE
   if (!is.null(brdu_pos) || !is.null(edu_pos)) {
     if (is.null(brdu_pos) || is.null(edu_pos)) stop("Provide both brdu_pos and edu_pos, or neither.")
@@ -185,7 +204,7 @@ fit_gene_gam <- function(
     if (!isTRUE(use_theta)) "" else sprintf(" + ti(r_um, theta, bs = c('%s', 'cc'), k = k_rtheta)", bs_r)
   )
   pos_terms <- if (!has_pos) "" else " + brdu_pos + edu_pos + brdu_pos:edu_pos"
-  rhs <- paste0(base_terms, pos_terms, smooth_terms)
+  rhs <- paste0(base_terms, pos_terms, smooth_terms, if (usage_terms == "") "" else paste0(" + ", usage_terms))
   formula <- as.formula(paste("y ~", rhs))
   engine <- match.arg(engine)
   if (engine == "auto") {
@@ -224,6 +243,7 @@ effect_sizes_from_fit <- function(
   batch_ref = NULL,
   has_animal = FALSE,
   animal_ref = NULL,
+  usage_ref = NULL,
   use_theta = TRUE,
   sf_ref = 1.0,
   n_theta = 64
@@ -267,6 +287,14 @@ effect_sizes_from_fit <- function(
       lev <- get_factor_levels(fit, "ab")
       ab0 <- interaction(nd$animal, nd$batch, drop = TRUE)
       nd$ab <- if (is.null(lev)) ab0 else factor(as.character(ab0), levels = lev)
+    }
+    if (!is.null(usage_ref)) {
+      if (is.null(names(usage_ref)) || any(!nzchar(names(usage_ref)))) {
+        stop("usage_ref must be a named numeric vector.")
+      }
+      for (nm in names(usage_ref)) {
+        nd[[nm]] <- rep(as.numeric(usage_ref[[nm]]), nrow(nd))
+      }
     }
     nd
   }
@@ -351,7 +379,7 @@ effect_sizes_from_fit <- function(
   )
 }
 
-extract_component_pvals <- function(fit) {
+extract_component_pvals <- function(fit, extra_params = character(0)) {
   log_p_min <- log(.Machine$double.xmin)
   empty_pvals <- list(
     p_spatial = NA_real_, p_cycle = NA_real_, p_interaction = NA_real_,
@@ -364,7 +392,19 @@ extract_component_pvals <- function(fit) {
   sum_fit <- summary(fit)
   st <- sum_fit$s.table
   pt <- sum_fit$p.table
-  if (is.null(st)) return(empty_pvals)
+  if (is.null(st)) {
+    out <- empty_pvals
+    extra_params <- unique(as.character(extra_params))
+    extra_params <- extra_params[nzchar(extra_params)]
+    if (length(extra_params) > 0) {
+      for (nm in extra_params) {
+        out[[paste0("beta_", nm)]] <- NA_real_
+        out[[paste0("p_", nm)]] <- NA_real_
+        out[[paste0("log_p_", nm)]] <- NA_real_
+      }
+    }
+    return(out)
+  }
 
   rn <- rownames(st)
   rn_compact <- gsub("\\s+", "", rn)
@@ -478,7 +518,7 @@ extract_component_pvals <- function(fit) {
   ed <- pick_param("edu_pos")
   be <- pick_param("brdu_pos:edu_pos")
 
-  list(
+  out <- list(
     p_spatial = sp$p,
     p_cycle = cy$p,
     p_interaction = it$p,
@@ -498,6 +538,23 @@ extract_component_pvals <- function(fit) {
     log_p_edu_pos = ed$log_p,
     log_p_brdu_edu = be$log_p
   )
+
+  extra_params <- unique(as.character(extra_params))
+  extra_params <- extra_params[nzchar(extra_params)]
+  if (length(extra_params) > 0) {
+    for (nm in extra_params) {
+      pr <- pick_param(nm)
+      beta <- NA_real_
+      if (!is.null(fit$coefficients) && (nm %in% names(fit$coefficients))) {
+        beta <- as.numeric(fit$coefficients[[nm]])
+      }
+      out[[paste0("beta_", nm)]] <- beta
+      out[[paste0("p_", nm)]] <- pr$p
+      out[[paste0("log_p_", nm)]] <- pr$log_p
+    }
+  }
+
+  out
 }
 
 fit_panel <- function(

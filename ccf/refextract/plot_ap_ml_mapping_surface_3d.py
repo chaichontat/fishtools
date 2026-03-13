@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 
-COORDS_SCRIPT = Path("ccf/refextract/midsurface_coords.py")
+COORDS_SCRIPT = Path(__file__).resolve().with_name("midsurface_coords.py")
 
 
 @dataclass(frozen=True)
