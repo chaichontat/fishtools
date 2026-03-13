@@ -93,6 +93,31 @@ CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/plot_usage
 
 This also writes `usage6_Ts_minutes.png` and `usage6_Tc_minutes.png`.
 
+## Mclust label smoothing
+
+To regenerate the current smoothed label images for ROI 3 with clusters `4` and `6` merged, run:
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/mclust_label_image_smooth.py \
+  --in-h5ad /fast2/cs_outputs/all.stagate.h5ad \
+  --labels-parquet /fast2/cs_outputs/all.stagate.mclust_sweep.parquet \
+  --dataset 20251229_JaxA4_Sag5 \
+  --roi 3 \
+  --ccf-adjusted cortex \
+  --outdir /tmp/mclust_label_demo_point_roi3_less_smooth \
+  --label-key mclust_7 \
+  --merge-labels 4,6 \
+  --sigma 25.0 \
+  --radius-multiplier 3.0 \
+  --pixel-size 10.0 \
+  --support-radius 3 \
+  --raster-sigma 4.0 \
+  --min-island-size 512 \
+  --spline-smoothing 24.0
+```
+
+This overwrites the outputs in `/tmp/mclust_label_demo_point_roi3_less_smooth`.
+
 ## Compression
 
 - `fishtools compress` is a command-line interface (CLI) tool that converts TIFF, JP2, and DAX image files to JPEG XL (JXL) files.
