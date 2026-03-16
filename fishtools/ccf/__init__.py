@@ -5,9 +5,8 @@ in `ccf/` so those workflows can share a stable, testable implementation.
 """
 
 from fishtools.ccf.landmark import LandmarkRegistrationOutputs, P1Landmarks
-from fishtools.ccf.native_surface_plotting import (
-    ApMlNativeSurfaceProjectionContext,
-    build_apml_native_surface_projection_context,
+from fishtools.ccf.transforms import build_apml_native_surface_projection_context
+from fishtools.gam.native_surface_plotting import (
     plot_coronal_surface_projection,
     write_apml_native_proj_montage,
 )
@@ -17,7 +16,6 @@ __all__ = [
     "CCFTermKind",
     "P1Landmarks",
     "LandmarkRegistrationOutputs",
-    "ApMlNativeSurfaceProjectionContext",
     "build_apml_native_surface_projection_context",
     "plot_coronal_surface_projection",
     "write_apml_native_proj_montage",

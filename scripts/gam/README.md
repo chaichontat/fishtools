@@ -691,12 +691,56 @@ CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/fit_inm_simplex_panel
   ${PANEL} \
   --usage-tsv ${USAGE} \
   --eps 1e-4 \
-  --alr-ref auto \
   --r-max 400 \
   --threads 6 \
   --bam-threads 1 \
   --basis standard \
   --k-uv 15
+```
+
+Recommended end-to-end run for the current cNMF usage panel:
+
+```bash
+PANEL=_out/gam_panel__cnmf_topics_k9_dt0.1__all_progenitors__20260303
+USAGE=_out/cnmf_all_progenitors/usage_norm.k9.dt0.1.tsv
+
+CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/fit_inm_simplex_panel.R \
+  ${PANEL} \
+  --usage-tsv ${USAGE} \
+  --eps 1e-4 \
+  --r-max 400 \
+  --no-theta \
+  --threads 6 \
+  --bam-threads 1 \
+  --basis standard \
+  --k-uv 15
+
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_simplex_native_proj.py \
+  ${PANEL} \
+  --label-tsv ${PANEL}/topic_labels.tsv \
+  --marginalize-animal \
+  --no-plot-apmlr \
+  --apml-percentile-range 5 95 \
+  --out-dir ${PANEL}/plots_native_proj_simplex_u__ilr__animalavg_q05_95
+
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_simplex_native_proj.py \
+  ${PANEL} \
+  --label-tsv ${PANEL}/topic_labels.tsv \
+  --marginalize-animal \
+  --no-plot-apmlr \
+  --apml-percentile-range 5 95 \
+  --display-scale zscore \
+  --out-dir ${PANEL}/plots_native_proj_simplex_u__ilr__animalavg_q05_95_zscore
+
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_simplex_native_proj.py \
+  ${PANEL} \
+  --label-tsv ${PANEL}/topic_labels.tsv \
+  --marginalize-animal \
+  --no-plot-apmlr \
+  --apml-percentile-range 5 95 \
+  --display-scale percentile \
+  --display-percentiles 1 99 \
+  --out-dir ${PANEL}/plots_native_proj_simplex_u__ilr__animalavg_q05_95_pct01_99
 ```
 
 Plot native projection:
@@ -716,11 +760,13 @@ CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_simplex_native_pr
 Plot outputs:
 - Native projection (one PNG per program + montage): `${PANEL}/plots_native_proj_simplex_u/`
 - 2D slices (one PNG per program, with `AP_um×r_um` and `ML_um×r_um` panels): `${PANEL}/plots_apmlr_simplex_u/`
-  - By default, the `r` axis is capped at the fitted `r_max` recorded in `simplex_meta.json` (to avoid showing extrapolation past the fitted range).
+  - By default, the `r` axis is capped at the fitted `r_max` recorded in the selected simplex metadata JSON (prefers `simplex_meta_ilr.json`, else `simplex_meta.json`).
 
 Notes:
 - `--r-max` filters the input cells to `r_um <= r_max` *before fitting* (useful if coverage is poor at high `r`).
-- `--exclude-random-effects` subtracts `s(animal)` and `s(ab)` from the ALR link predictions before simplex inversion.
+- The canonical simplex fit now uses ILR (pivot ILR basis), not ALR.
+- `plot_simplex_native_proj.py` now auto-selects `simplex_meta_ilr.json` when present, so `--meta` is usually unnecessary for the default ILR workflow.
+- `--exclude-random-effects` subtracts `s(animal)` and `s(ab)` from the fitted link predictions before simplex inversion.
   - Use this when you want a population-level spatial pattern instead of conditioning on a single reference `animal`/`ab` level.
 - `--marginalize-animal` (plotting) averages simplex loadings across animal levels (uniform weights).
   - This keeps `s(animal)` but excludes `s(ab)` to avoid conditioning on a specific batch.
@@ -728,46 +774,6 @@ Notes:
 - Optional: pass `--label-tsv PATH` to name topics in plot titles. The TSV must contain `program` and either `curated_label` or `label`.
 
 Outputs under `${PANEL}`:
-- `fit_results.simplex.tsv`
-- `simplex_meta.json`
-- `fits_rds__fit_results_simplex/ALR_P*_vs_P*.gam.rds`
-
-### ILR Variant (Reference-Free Coordinates)
-
-If you want to avoid choosing an ALR reference topic, you can fit in ILR (isometric log-ratio) coordinates.
-This still fits `K-1` separate Gaussian GAMs, but uses an orthonormal basis in clr space (pivot ILR).
-
-Fit:
-
-```bash
-CONDA_NO_PLUGINS=true conda run -n seq Rscript scripts/gam/fit_inm_simplex_panel_ilr.R \
-  ${PANEL} \
-  --usage-tsv ${USAGE} \
-  --eps 1e-4 \
-  --r-max 400 \
-  --threads 6 \
-  --bam-threads 1 \
-  --basis standard \
-  --k-uv 15
-```
-
-Plot (note `--meta`):
-
-```bash
-CONDA_NO_PLUGINS=true conda run -n seq python scripts/gam/plot_simplex_native_proj.py \
-  ${PANEL} \
-  --meta ${PANEL}/simplex_meta_ilr.json \
-  --exclude-random-effects \
-  --out-dir ${PANEL}/plots_native_proj_simplex_u__ilr \
-  --apmlr-out-dir ${PANEL}/plots_apmlr_simplex_u__ilr \
-  --latlon \
-  --graticule ijk \
-  --elev-deg -10 \
-  --azim-deg -110 \
-  --roll-deg 180
-```
-
-ILR outputs under `${PANEL}`:
 - `fit_results.simplex_ilr.tsv`
 - `simplex_meta_ilr.json`
 - `fits_rds__fit_results_simplex_ilr/ILR_C*.gam.rds`

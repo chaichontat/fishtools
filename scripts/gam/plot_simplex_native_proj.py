@@ -14,12 +14,15 @@ import numpy as np
 import pandas as pd
 
 from ccf.refextract.plot_ap_ml_heatmap import compute_ap_ml_support_mask_native_grid
-from fishtools.ccf.native_surface_plotting import (
+from fishtools.ccf.transforms import build_apml_native_surface_projection_context
+from fishtools.gam.mgcv_predict import RPredictor
+from fishtools.gam.native_surface_plotting import (
     _mask_r_ap_ml_pair_by_support,
-    build_apml_native_surface_projection_context,
     plot_coronal_surface_projection,
     write_apml_native_proj_montage,
 )
+from fishtools.gam.surface_predict import GAMPredictorConfig
+from fishtools.gam.surface_predict import make_newdata_for_fit
 
 PNG_NAME = "fit_ap_ml_native_proj_simplex_u.png"
 MONTAGE_NAME = "montage_fit_ap_ml_native_proj_simplex_u.png"
@@ -38,6 +41,13 @@ def _load_meta(meta_path: Path) -> dict[str, object]:
         if key not in raw:
             raise KeyError(f"{meta_path}: missing key {key!r}")
     return raw
+
+
+def _default_meta_path(panel_dir: Path) -> Path:
+    ilr_meta_path = panel_dir / "simplex_meta_ilr.json"
+    if ilr_meta_path.exists():
+        return ilr_meta_path
+    return panel_dir / "simplex_meta.json"
 
 
 def _load_topic_titles(topic_ids: list[int], label_tsv: Path | None) -> list[str]:
@@ -264,6 +274,111 @@ def _convex_hull_path(ap: np.ndarray, ml: np.ndarray):
     return MplPath(poly, closed=True)
 
 
+def _compute_apml_percentile_bounds(
+    *,
+    ap: np.ndarray,
+    ml: np.ndarray,
+    valid_mask: np.ndarray,
+    percentile_range: tuple[float, float],
+) -> tuple[float, float, float, float]:
+    q_lo = float(percentile_range[0])
+    q_hi = float(percentile_range[1])
+    if not np.isfinite(q_lo) or not np.isfinite(q_hi) or not (0.0 <= q_lo < q_hi <= 100.0):
+        raise ValueError(f"Invalid AP/ML percentile range: {percentile_range!r}")
+    keep = np.asarray(valid_mask, dtype=bool).reshape(-1)
+    ap_vals = np.asarray(ap, dtype=np.float64).reshape(-1)
+    ml_vals = np.asarray(ml, dtype=np.float64).reshape(-1)
+    if ap_vals.shape != ml_vals.shape or ap_vals.shape != keep.shape:
+        raise ValueError("AP/ML percentile inputs must have matching shapes.")
+    if not np.any(keep):
+        raise ValueError("No cells available to compute AP/ML percentile bounds.")
+    ap_lo, ap_hi = np.nanpercentile(ap_vals[keep], [q_lo, q_hi]).astype(float)
+    ml_lo, ml_hi = np.nanpercentile(ml_vals[keep], [q_lo, q_hi]).astype(float)
+    if not np.isfinite(ap_lo) or not np.isfinite(ap_hi) or not np.isfinite(ml_lo) or not np.isfinite(ml_hi):
+        raise ValueError("Computed non-finite AP/ML percentile bounds.")
+    return ap_lo, ap_hi, ml_lo, ml_hi
+
+
+def _feather_box_alpha(
+    *,
+    ap: np.ndarray,
+    ml: np.ndarray,
+    bounds: tuple[float, float, float, float],
+    feather_fraction: float = 0.05,
+) -> np.ndarray:
+    ap_vals = np.asarray(ap, dtype=np.float64).reshape(-1)
+    ml_vals = np.asarray(ml, dtype=np.float64).reshape(-1)
+    if ap_vals.shape != ml_vals.shape:
+        raise ValueError("AP/ML alpha inputs must have matching shapes.")
+    ap_lo, ap_hi, ml_lo, ml_hi = map(float, bounds)
+    frac = float(feather_fraction)
+    if not np.isfinite(frac) or frac < 0.0 or frac >= 0.5:
+        raise ValueError(f"feather_fraction must be in [0, 0.5), got {feather_fraction!r}")
+
+    def _axis_weight(vals: np.ndarray, lo: float, hi: float) -> np.ndarray:
+        width = hi - lo
+        if not np.isfinite(width) or width <= 0.0:
+            raise ValueError(f"Invalid percentile bounds: lo={lo}, hi={hi}")
+        fade = width * frac
+        out = np.ones(vals.shape, dtype=np.float64)
+        out[(vals < lo) | (vals > hi)] = 0.0
+        if fade <= 0.0:
+            return out
+        lo_band = (vals >= lo) & (vals < lo + fade)
+        hi_band = (vals > hi - fade) & (vals <= hi)
+        out[lo_band] = np.clip((vals[lo_band] - lo) / fade, 0.0, 1.0)
+        out[hi_band] = np.clip((hi - vals[hi_band]) / fade, 0.0, 1.0)
+        return out
+
+    return _axis_weight(ap_vals, ap_lo, ap_hi) * _axis_weight(ml_vals, ml_lo, ml_hi)
+
+
+def _transform_display_values(
+    values: np.ndarray,
+    *,
+    mode: str,
+    percentile_range: tuple[float, float],
+    z_limit: float,
+) -> tuple[np.ndarray, float, float, str, matplotlib.colors.Colormap]:
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(vals)
+    if not np.any(finite):
+        raise ValueError("Cannot scale display values with no finite entries.")
+
+    if mode == "raw":
+        cmap = plt.get_cmap("turbo").copy()
+        cmap.set_bad(color="lightgray")
+        return vals, 0.0, 1.0, "predicted loading (simplex)", cmap
+
+    if mode == "zscore":
+        mu = float(np.mean(vals[finite]))
+        sigma = float(np.std(vals[finite]))
+        if not np.isfinite(sigma) or sigma <= 0.0:
+            raise ValueError("Cannot z-score display values with zero/invalid standard deviation.")
+        out = (vals - mu) / sigma
+        zmax = float(z_limit)
+        if not np.isfinite(zmax) or zmax <= 0.0:
+            raise ValueError(f"Invalid --display-z-limit: {z_limit!r}")
+        cmap = plt.get_cmap("coolwarm").copy()
+        cmap.set_bad(color="lightgray")
+        return out, -zmax, zmax, "per-topic z-score", cmap
+
+    if mode == "percentile":
+        q_lo = float(percentile_range[0])
+        q_hi = float(percentile_range[1])
+        if not np.isfinite(q_lo) or not np.isfinite(q_hi) or not (0.0 <= q_lo < q_hi <= 100.0):
+            raise ValueError(f"Invalid display percentile range: {percentile_range!r}")
+        lo, hi = np.nanpercentile(vals[finite], [q_lo, q_hi]).astype(float)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            raise ValueError("Cannot percentile-scale display values with degenerate quantiles.")
+        out = np.clip((vals - lo) / (hi - lo), 0.0, 1.0)
+        cmap = plt.get_cmap("turbo").copy()
+        cmap.set_bad(color="lightgray")
+        return out, 0.0, 1.0, f"per-topic scaled loading ({q_lo:g}-{q_hi:g}%)", cmap
+
+    raise ValueError(f"Unknown display mode: {mode}")
+
+
 def _predict_link_no_re(
     *,
     predictor: Any,
@@ -312,11 +427,14 @@ def _predict_link_excluding_terms(
 
 
 def main() -> int:
-    from scripts.gam.plot_significant_gams import RPredictor
-
-    p = argparse.ArgumentParser(description="Plot logistic-normal (ALR) simplex topic fits on native projection.")
-    p.add_argument("panel_dir", type=Path, help="Panel directory containing cells.tsv and simplex_meta.json.")
-    p.add_argument("--meta", type=Path, default=None, help="Path to simplex_meta.json (default: <panel_dir>/simplex_meta.json).")
+    p = argparse.ArgumentParser(description="Plot logistic-normal simplex topic fits on native projection.")
+    p.add_argument("panel_dir", type=Path, help="Panel directory containing cells.tsv and simplex_meta*.json.")
+    p.add_argument(
+        "--meta",
+        type=Path,
+        default=None,
+        help="Path to simplex metadata JSON (default: prefer <panel_dir>/simplex_meta_ilr.json, else simplex_meta.json).",
+    )
     p.add_argument(
         "--label-tsv",
         type=Path,
@@ -344,6 +462,34 @@ def main() -> int:
     p.add_argument("--apmlr-out-dir", type=Path, default=None)
     p.add_argument("--apml-n", type=int, default=256, help="Number of ML bins for AP/ML native grid (also used for AP grid).")
     p.add_argument("--apmlr-r-n", type=int, default=200, help="Number of r bins for r×AP and r×ML plots.")
+    p.add_argument(
+        "--display-scale",
+        choices=("raw", "zscore", "percentile"),
+        default="raw",
+        help="How to scale native simplex values for display.",
+    )
+    p.add_argument(
+        "--display-percentiles",
+        type=float,
+        nargs=2,
+        default=(1.0, 99.0),
+        metavar=("LO", "HI"),
+        help="Percentile range used when --display-scale=percentile.",
+    )
+    p.add_argument(
+        "--display-z-limit",
+        type=float,
+        default=2.5,
+        help="Symmetric color limit used when --display-scale=zscore.",
+    )
+    p.add_argument(
+        "--apml-percentile-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("LO", "HI"),
+        help="Mask AP/ML support to the independent [LO, HI] percentiles of AP_um and ML_um from cells.tsv.",
+    )
     p.add_argument(
         "--mask-apml-by-hull",
         action=argparse.BooleanOptionalAction,
@@ -392,7 +538,7 @@ def main() -> int:
         raise ValueError("--hull-fade-alpha must be in [0,1]")
 
     panel_dir = Path(args.panel_dir).expanduser()
-    meta_path = (panel_dir / "simplex_meta.json") if args.meta is None else Path(args.meta).expanduser()
+    meta_path = _default_meta_path(panel_dir) if args.meta is None else Path(args.meta).expanduser()
     meta = _load_meta(meta_path)
 
     topic_ids = [int(x) for x in meta["topic_ids"]]  # type: ignore[arg-type]
@@ -454,29 +600,40 @@ def main() -> int:
         roll_deg=float(args.roll_deg),
     )
 
-    support_flat = np.asarray(surface_ctx.support_flat, dtype=bool).reshape(-1)
-    neomeso_flat = np.asarray(surface_ctx.neomeso_flat, dtype=bool).reshape(-1)
+    support_flat = np.asarray(surface_ctx["support_flat"], dtype=bool).reshape(-1)
+    neomeso_flat = np.asarray(surface_ctx["neomeso_flat"], dtype=bool).reshape(-1)
     predict_mask = support_flat & (neomeso_flat if bool(args.restrict_t_neomeso) else True)
     if not np.any(predict_mask):
         raise ValueError("No vertices available for prediction after applying support masks")
 
-    ap_flat = np.asarray(surface_ctx.ap_um_flat, dtype=np.float64).reshape(-1)
-    ml_flat = np.asarray(surface_ctx.ml_um_flat, dtype=np.float64).reshape(-1)
+    ap_flat = np.asarray(surface_ctx["ap_um_flat"], dtype=np.float64).reshape(-1)
+    ml_flat = np.asarray(surface_ctx["ml_um_flat"], dtype=np.float64).reshape(-1)
     ap_s = ap_flat[predict_mask]
     ml_s = ml_flat[predict_mask]
 
+    ap_cells = pd.to_numeric(cells["AP_um"], errors="coerce").to_numpy(dtype=float)
+    ml_cells = pd.to_numeric(cells["ML_um"], errors="coerce").to_numpy(dtype=float)
+    r_cells = pd.to_numeric(cells["r_um"], errors="coerce").to_numpy(dtype=float)
+    valid_apml_cells = np.isfinite(ap_cells) & np.isfinite(ml_cells) & np.isfinite(r_cells)
+    fit_r_max = meta.get("r_max")
+    if fit_r_max is not None:
+        try:
+            valid_apml_cells &= r_cells <= float(fit_r_max)
+        except Exception:
+            raise ValueError(f"simplex_meta.json r_max is not numeric: {fit_r_max!r}")
+
+    percentile_bounds = None
+    if args.apml_percentile_range is not None:
+        percentile_bounds = _compute_apml_percentile_bounds(
+            ap=ap_cells,
+            ml=ml_cells,
+            valid_mask=valid_apml_cells,
+            percentile_range=(float(args.apml_percentile_range[0]), float(args.apml_percentile_range[1])),
+        )
+
     hull_path = None
     if bool(args.mask_apml_by_hull) or bool(args.mask_apmlr_by_hull):
-        ap_cells = pd.to_numeric(cells["AP_um"], errors="coerce").to_numpy(dtype=float)
-        ml_cells = pd.to_numeric(cells["ML_um"], errors="coerce").to_numpy(dtype=float)
-        r_cells = pd.to_numeric(cells["r_um"], errors="coerce").to_numpy(dtype=float)
-        ok = np.isfinite(ap_cells) & np.isfinite(ml_cells) & np.isfinite(r_cells)
-        fit_r_max = meta.get("r_max")
-        if fit_r_max is not None:
-            try:
-                ok &= r_cells <= float(fit_r_max)
-            except Exception:
-                raise ValueError(f"simplex_meta.json r_max is not numeric: {fit_r_max!r}")
+        ok = valid_apml_cells.copy()
         hull_path = _convex_hull_path(ap_cells[ok], ml_cells[ok])
         if hull_path is None:
             raise ValueError("Requested convex-hull masking, but could not construct a hull (too few unique points).")
@@ -688,26 +845,54 @@ def main() -> int:
     n_rows = int(surface_ctx["n_rows"])
     n_cols = int(surface_ctx["n_cols"])
 
-    cmap = plt.get_cmap("turbo").copy()
-    cmap.set_bad(color="lightgray")
     gene_values: list[tuple[str, np.ndarray]] = []
+    montage_tri_alpha = None
+    display_cmap = None
+    display_label = None
+    display_vmin = None
+    display_vmax = None
     for k, title in enumerate(topic_titles):
+        vals_scaled, vmin_k, vmax_k, label_k, cmap_k = _transform_display_values(
+            u_hat[:, k],
+            mode=str(args.display_scale),
+            percentile_range=(float(args.display_percentiles[0]), float(args.display_percentiles[1])),
+            z_limit=float(args.display_z_limit),
+        )
         vals_all = np.full(support_flat.shape, np.nan, dtype=np.float64)
-        vals_all[predict_mask] = u_hat[:, k]
+        vals_all[predict_mask] = vals_scaled
         out_png = out_dir / safe_gene_name(f"P{topic_ids[k]}") / PNG_NAME
         tri_alpha = None
-        if hull_path is not None and bool(args.mask_apml_by_hull):
+        if percentile_bounds is not None or (hull_path is not None and bool(args.mask_apml_by_hull)):
             if ordered_geom is None:
-                raise ValueError("--mask-apml-by-hull requires ordered geometry for stable triangle alpha fading")
+                raise ValueError("Native-projection masking requires ordered geometry for stable triangle alpha fading")
             tris_k = np.asarray(ordered_geom["tris"], dtype=np.int32)
             # Use triangle centroid-in-hull for a more visible boundary than vertex-fraction smoothing.
             cent_ap = np.mean(ap_flat[tris_k], axis=1)
             cent_ml = np.mean(ml_flat[tris_k], axis=1)
-            inside_t = hull_path.contains_points(np.column_stack([cent_ap, cent_ml]), radius=1e-9).astype(np.float64)
-            tri_alpha = hull_fade_alpha + (1.0 - hull_fade_alpha) * inside_t
+            tri_alpha = np.ones(cent_ap.shape, dtype=np.float64)
+            if percentile_bounds is not None:
+                tri_alpha *= _feather_box_alpha(ap=cent_ap, ml=cent_ml, bounds=percentile_bounds)
+            if hull_path is not None and bool(args.mask_apml_by_hull):
+                inside_t = hull_path.contains_points(np.column_stack([cent_ap, cent_ml]), radius=1e-9).astype(np.float64)
+                tri_alpha *= hull_fade_alpha + (1.0 - hull_fade_alpha) * inside_t
+            if montage_tri_alpha is None:
+                montage_tri_alpha = tri_alpha.copy()
+        if display_cmap is None:
+            display_cmap = cmap_k
+            display_label = label_k
+            display_vmin = vmin_k
+            display_vmax = vmax_k
         plot_coronal_surface_projection(
             vals_all,
-            context=surface_ctx,
+            x2d=x2d,
+            y2d=y2d,
+            z2d=z2d,
+            x3d=x3d,
+            y3d=y3d,
+            z3d=z3d,
+            faces=faces,
+            tri_support=tri_support,
+            tri_neomeso=tri_neomeso,
             restrict_t_neomeso=bool(args.restrict_t_neomeso),
             gray_context=bool(args.gray_context),
             latlon=bool(args.latlon),
@@ -716,6 +901,12 @@ def main() -> int:
             lon_stride=int(args.lon_stride),
             max_lat_lines=int(args.max_lat_lines),
             max_lon_lines=int(args.max_lon_lines),
+            vertex_support=support_flat,
+            vertex_neomeso=neomeso_flat,
+            vertex_ap_um=ap_flat,
+            vertex_ml_um=ml_flat,
+            n_rows=n_rows,
+            n_cols=n_cols,
             shade=False,
             shade_strength=0.75,
             shade_elev_deg=float(args.elev_deg),
@@ -724,12 +915,12 @@ def main() -> int:
             tri_alpha=tri_alpha,
             out_png=out_png,
             title=str(title),
-            cmap=cmap,
-            cbar_label="predicted loading (simplex)",
+            cmap=display_cmap,
+            cbar_label=str(display_label),
             cbar_ticks=None,
             cbar_ticklabels=None,
-            vmin=0.0,
-            vmax=1.0,
+            vmin=float(display_vmin),
+            vmax=float(display_vmax),
         )
         gene_values.append((str(title), vals_all))
 
@@ -739,7 +930,15 @@ def main() -> int:
         ncols=max(1, min(int(args.montage_cols), len(gene_values))),
         suptitle="Simplex topic model (logistic-normal)",
         scale_bar=str(args.montage_scale_bar),
-        context=surface_ctx,
+        x2d=x2d,
+        y2d=y2d,
+        z2d=z2d,
+        x3d=x3d,
+        y3d=y3d,
+        z3d=z3d,
+        faces=faces,
+        tri_support=tri_support,
+        tri_neomeso=tri_neomeso,
         restrict_t_neomeso=bool(args.restrict_t_neomeso),
         gray_context=bool(args.gray_context),
         latlon=bool(args.latlon),
@@ -748,16 +947,24 @@ def main() -> int:
         lon_stride=int(args.lon_stride),
         max_lat_lines=int(args.max_lat_lines),
         max_lon_lines=int(args.max_lon_lines),
+        vertex_support=support_flat,
+        vertex_neomeso=neomeso_flat,
+        vertex_ap_um=ap_flat,
+        vertex_ml_um=ml_flat,
+        n_rows=n_rows,
+        n_cols=n_cols,
         shade=False,
         shade_strength=0.75,
         shade_elev_deg=float(args.elev_deg),
         shade_azim_deg=float(args.azim_deg),
-        cmap=cmap,
-        cbar_label="predicted loading (simplex)",
+        ordered_geometry=ordered_geom,
+        tri_alpha=montage_tri_alpha,
+        cmap=display_cmap,
+        cbar_label=str(display_label),
         cbar_ticks=None,
         cbar_ticklabels=None,
-        vmin=0.0,
-        vmax=1.0,
+        vmin=float(display_vmin),
+        vmax=float(display_vmax),
     )
 
     if bool(args.plot_apmlr):
@@ -800,6 +1007,14 @@ def main() -> int:
             )
             if not np.allclose(ap_grid, _ap_grid_neomeso) or not np.allclose(ml_grid, _ml_grid_neomeso):
                 raise ValueError("Neomeso support grid does not match the base AP/ML grid.")
+        if percentile_bounds is not None:
+            ap_lo, ap_hi, ml_lo, ml_hi = percentile_bounds
+            apml_support_mask &= (
+                (ap_grid[:, None] >= ap_lo)
+                & (ap_grid[:, None] <= ap_hi)
+                & (ml_grid[None, :] >= ml_lo)
+                & (ml_grid[None, :] <= ml_hi)
+            )
 
         j_ml0 = int(np.nanargmin(np.abs(ml_grid - float(ml0))))
         i_ap0 = int(np.nanargmin(np.abs(ap_grid - float(ap0))))
