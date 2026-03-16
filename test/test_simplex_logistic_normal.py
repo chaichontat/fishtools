@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import runpy
 from pathlib import Path
 
@@ -47,6 +48,21 @@ def test_plot_simplex_native_proj_script_loads() -> None:
     assert "inv_alr" in loaded
 
 
+def test_main_parser_defaults_to_unlabeled_topics(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    def _fake_parse_args(self: argparse.ArgumentParser, *args: object, **kwargs: object) -> argparse.Namespace:
+        observed["label_tsv"] = self.get_default("label_tsv")
+        raise SystemExit(0)
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", _fake_parse_args)
+
+    with pytest.raises(SystemExit):
+        mod.main()
+
+    assert observed["label_tsv"] is None
+
+
 def test_default_meta_path_prefers_ilr(tmp_path: Path) -> None:
     alr_meta = tmp_path / "simplex_meta.json"
     ilr_meta = tmp_path / "simplex_meta_ilr.json"
@@ -79,6 +95,20 @@ def test_compute_apml_percentile_bounds_applies_independent_ranges() -> None:
     assert ap_hi == pytest.approx(22.5)
     assert ml_lo == pytest.approx(107.5)
     assert ml_hi == pytest.approx(122.5)
+
+
+def test_compute_r_percentile_bounds_applies_requested_range() -> None:
+    r = np.array([0.0, 10.0, 20.0, 30.0, 40.0], dtype=float)
+    keep = np.array([True, True, True, True, False])
+
+    r_lo, r_hi = mod._compute_r_percentile_bounds(
+        r=r,
+        valid_mask=keep,
+        percentile_range=(25.0, 75.0),
+    )
+
+    assert r_lo == pytest.approx(7.5)
+    assert r_hi == pytest.approx(22.5)
 
 
 def test_feather_box_alpha_softens_box_edges() -> None:
@@ -124,3 +154,46 @@ def test_transform_display_values_percentile_scales_to_unit_interval() -> None:
     assert np.all(out <= 1.0)
     assert (vmin, vmax) == (0.0, 1.0)
     assert "25-75%" in label
+
+
+def test_compute_apmlr_support_grid_uses_percentile_crop_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[bool] = []
+
+    def _fake_support_grid(**kwargs):
+        calls.append(bool(kwargs["restrict_t_neomeso"]))
+        ap_grid = np.array([0.0, 10.0, 20.0], dtype=float)
+        ml_grid = np.array([100.0, 110.0, 120.0], dtype=float)
+        support = np.ones((3, 3), dtype=bool)
+        return ap_grid, ml_grid, support
+
+    monkeypatch.setattr(mod, "compute_ap_ml_support_mask_native_grid", _fake_support_grid)
+    args = argparse.Namespace(
+        refextract_outdir=Path("/tmp/refextract"),
+        refextract_slice_i_min=1,
+        refextract_slice_i_max=2,
+        refextract_n_t=3,
+        apml_n=3,
+        refextract_ref_t=0.5,
+        refextract_band_frac=0.15,
+        refextract_res_ijk_um=None,
+    )
+
+    ap_grid, ml_grid, support = mod._compute_apmlr_support_grid(
+        args=args,
+        percentile_bounds=(5.0, 15.0, 105.0, 115.0),
+    )
+
+    assert calls == [False]
+    assert np.allclose(ap_grid, [0.0, 10.0, 20.0])
+    assert np.allclose(ml_grid, [100.0, 110.0, 120.0])
+    assert np.array_equal(
+        support,
+        np.array(
+            [
+                [False, False, False],
+                [False, True, False],
+                [False, False, False],
+            ],
+            dtype=bool,
+        ),
+    )

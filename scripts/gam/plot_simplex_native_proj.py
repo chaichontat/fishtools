@@ -299,6 +299,28 @@ def _compute_apml_percentile_bounds(
     return ap_lo, ap_hi, ml_lo, ml_hi
 
 
+def _compute_r_percentile_bounds(
+    *,
+    r: np.ndarray,
+    valid_mask: np.ndarray,
+    percentile_range: tuple[float, float],
+) -> tuple[float, float]:
+    r_vals = np.asarray(r, dtype=np.float64).reshape(-1)
+    keep = np.asarray(valid_mask, dtype=bool).reshape(-1)
+    if r_vals.shape != keep.shape:
+        raise ValueError("r and valid_mask must have matching shapes.")
+    if not np.any(keep):
+        raise ValueError("No valid cells available to compute radial percentile bounds.")
+    q_lo = float(percentile_range[0])
+    q_hi = float(percentile_range[1])
+    if not np.isfinite(q_lo) or not np.isfinite(q_hi) or not (0.0 <= q_lo < q_hi <= 100.0):
+        raise ValueError(f"Invalid percentile range: {percentile_range!r}")
+    r_lo, r_hi = np.nanpercentile(r_vals[keep], [q_lo, q_hi]).astype(float)
+    if not np.isfinite(r_lo) or not np.isfinite(r_hi) or r_hi <= r_lo:
+        raise ValueError("Degenerate radial percentile bounds.")
+    return r_lo, r_hi
+
+
 def _feather_box_alpha(
     *,
     ap: np.ndarray,
@@ -331,6 +353,42 @@ def _feather_box_alpha(
         return out
 
     return _axis_weight(ap_vals, ap_lo, ap_hi) * _axis_weight(ml_vals, ml_lo, ml_hi)
+
+
+def _compute_apmlr_support_grid(
+    *,
+    args: argparse.Namespace,
+    percentile_bounds: tuple[float, float, float, float] | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    refextract_res_ijk_um = (
+        None
+        if args.refextract_res_ijk_um is None
+        else (
+            float(args.refextract_res_ijk_um[0]),
+            float(args.refextract_res_ijk_um[1]),
+            float(args.refextract_res_ijk_um[2]),
+        )
+    )
+    ap_grid, ml_grid, apml_support_mask = compute_ap_ml_support_mask_native_grid(
+        outdir=Path(args.refextract_outdir).expanduser(),
+        slice_i_min=int(args.refextract_slice_i_min),
+        slice_i_max=int(args.refextract_slice_i_max),
+        n_t=int(args.refextract_n_t),
+        n_ml=int(args.apml_n),
+        ref_t=float(args.refextract_ref_t),
+        band_frac=float(args.refextract_band_frac),
+        res_ijk_um=refextract_res_ijk_um,
+        restrict_t_neomeso=False,
+    )
+    if percentile_bounds is not None:
+        ap_lo, ap_hi, ml_lo, ml_hi = percentile_bounds
+        apml_support_mask &= (
+            (ap_grid[:, None] >= ap_lo)
+            & (ap_grid[:, None] <= ap_hi)
+            & (ml_grid[None, :] >= ml_lo)
+            & (ml_grid[None, :] <= ml_hi)
+        )
+    return ap_grid, ml_grid, apml_support_mask
 
 
 def _transform_display_values(
@@ -438,9 +496,7 @@ def main() -> int:
     p.add_argument(
         "--label-tsv",
         type=Path,
-        default=Path(
-            "/fast2/cs_outputs/fishtools2/_out/cnmf_all_progenitors/annotations/program_annotations.k9.dt0.1.curated.tsv"
-        ),
+        default=None,
     )
     p.add_argument("--out-dir", type=Path, default=None)
     p.add_argument(
@@ -525,6 +581,12 @@ def main() -> int:
     p.add_argument("--max-lon-lines", type=int, default=10)
     p.add_argument("--montage-cols", type=int, default=3)
     p.add_argument("--montage-scale-bar", choices=("first", "all", "none"), default="first")
+    p.add_argument(
+        "--montage-title",
+        type=str,
+        default="Simplex topic model (logistic-normal)",
+        help="Suptitle for the native-projection montage PNG.",
+    )
     p.add_argument("--refextract-outdir", type=Path, default=Path("ccf/out/refextract/midsurface_neocortex_mesocortex_allocortex_3d"))
     p.add_argument("--refextract-slice-i-min", type=int, default=161)
     p.add_argument("--refextract-slice-i-max", type=int, default=305)
@@ -928,7 +990,7 @@ def main() -> int:
         gene_values=gene_values,
         out_png=out_dir / MONTAGE_NAME,
         ncols=max(1, min(int(args.montage_cols), len(gene_values))),
-        suptitle="Simplex topic model (logistic-normal)",
+        suptitle=str(args.montage_title),
         scale_bar=str(args.montage_scale_bar),
         x2d=x2d,
         y2d=y2d,
@@ -973,48 +1035,10 @@ def main() -> int:
         )
         apmlr_out_dir.mkdir(parents=True, exist_ok=True)
 
-        refextract_res_ijk_um = (
-            None
-            if args.refextract_res_ijk_um is None
-            else (
-                float(args.refextract_res_ijk_um[0]),
-                float(args.refextract_res_ijk_um[1]),
-                float(args.refextract_res_ijk_um[2]),
-            )
+        ap_grid, ml_grid, apml_support_mask = _compute_apmlr_support_grid(
+            args=args,
+            percentile_bounds=percentile_bounds,
         )
-        ap_grid, ml_grid, apml_support_mask = compute_ap_ml_support_mask_native_grid(
-            outdir=Path(args.refextract_outdir).expanduser(),
-            slice_i_min=int(args.refextract_slice_i_min),
-            slice_i_max=int(args.refextract_slice_i_max),
-            n_t=int(args.refextract_n_t),
-            n_ml=int(args.apml_n),
-            ref_t=float(args.refextract_ref_t),
-            band_frac=float(args.refextract_band_frac),
-            res_ijk_um=refextract_res_ijk_um,
-            restrict_t_neomeso=False,
-        )
-        if bool(args.restrict_t_neomeso):
-            _ap_grid_neomeso, _ml_grid_neomeso, apml_support_mask = compute_ap_ml_support_mask_native_grid(
-                outdir=Path(args.refextract_outdir).expanduser(),
-                slice_i_min=int(args.refextract_slice_i_min),
-                slice_i_max=int(args.refextract_slice_i_max),
-                n_t=int(args.refextract_n_t),
-                n_ml=int(args.apml_n),
-                ref_t=float(args.refextract_ref_t),
-                band_frac=float(args.refextract_band_frac),
-                res_ijk_um=refextract_res_ijk_um,
-                restrict_t_neomeso=True,
-            )
-            if not np.allclose(ap_grid, _ap_grid_neomeso) or not np.allclose(ml_grid, _ml_grid_neomeso):
-                raise ValueError("Neomeso support grid does not match the base AP/ML grid.")
-        if percentile_bounds is not None:
-            ap_lo, ap_hi, ml_lo, ml_hi = percentile_bounds
-            apml_support_mask &= (
-                (ap_grid[:, None] >= ap_lo)
-                & (ap_grid[:, None] <= ap_hi)
-                & (ml_grid[None, :] >= ml_lo)
-                & (ml_grid[None, :] <= ml_hi)
-            )
 
         j_ml0 = int(np.nanargmin(np.abs(ml_grid - float(ml0))))
         i_ap0 = int(np.nanargmin(np.abs(ap_grid - float(ap0))))
@@ -1025,7 +1049,8 @@ def main() -> int:
         ap_slice = slice(int(ap_keep_idx.min()), int(ap_keep_idx.max()) + 1) if ap_keep_idx.size else slice(None)
         ml_slice = slice(int(ml_keep_idx.min()), int(ml_keep_idx.max()) + 1) if ml_keep_idx.size else slice(None)
 
-        r_hi = float(np.nanmax(pd.to_numeric(cells["r_um"], errors="coerce").to_numpy(dtype=float)))
+        r_cells_all = pd.to_numeric(cells["r_um"], errors="coerce").to_numpy(dtype=float)
+        r_hi = float(np.nanmax(r_cells_all))
         fit_r_max = meta.get("r_max")
         if fit_r_max is not None:
             try:
@@ -1035,6 +1060,19 @@ def main() -> int:
         r_grid = np.linspace(0.0, float(r_hi), int(args.apmlr_r_n))
         rr_ap, aa = np.meshgrid(r_grid, ap_grid, indexing="ij")
         rr_ml, mm = np.meshgrid(r_grid, ml_grid, indexing="ij")
+        r_percentile_bounds = None
+        if args.apml_percentile_range is not None:
+            r_valid = np.isfinite(r_cells_all)
+            if fit_r_max is not None:
+                try:
+                    r_valid &= r_cells_all <= float(fit_r_max)
+                except Exception:
+                    raise ValueError(f"simplex_meta.json r_max is not numeric: {fit_r_max!r}")
+            r_percentile_bounds = _compute_r_percentile_bounds(
+                r=r_cells_all,
+                valid_mask=r_valid,
+                percentile_range=(float(args.apml_percentile_range[0]), float(args.apml_percentile_range[1])),
+            )
 
         if transform == "alr":
             assert ref_topic is not None
@@ -1283,6 +1321,14 @@ def main() -> int:
             ml_grid_plot = ml_grid[ml_slice]
             alpha_r_ap = None
             alpha_r_ml = None
+            if (hull_path is not None and bool(args.mask_apmlr_by_hull)) or (r_percentile_bounds is not None):
+                alpha_r_ap = np.ones_like(u_r_ap_plot, dtype=np.float64)
+                alpha_r_ml = np.ones_like(u_r_ml_plot, dtype=np.float64)
+            if r_percentile_bounds is not None:
+                r_lo, r_hi_pct = r_percentile_bounds
+                r_keep = (r_grid >= float(r_lo)) & (r_grid <= float(r_hi_pct))
+                alpha_r_ap[~r_keep, :] = 0.0
+                alpha_r_ml[~r_keep, :] = 0.0
             if hull_path is not None and bool(args.mask_apmlr_by_hull):
                 assert ap_grid_plot.ndim == 1 and ml_grid_plot.ndim == 1
                 ap_keep = hull_path.contains_points(
@@ -1293,8 +1339,6 @@ def main() -> int:
                     np.column_stack([np.full_like(ml_grid_plot, float(ap0)), ml_grid_plot]),
                     radius=1e-9,
                 )
-                alpha_r_ap = np.ones_like(u_r_ap_plot, dtype=np.float64)
-                alpha_r_ml = np.ones_like(u_r_ml_plot, dtype=np.float64)
                 alpha_r_ap[:, ~ap_keep] = hull_fade_alpha
                 alpha_r_ml[:, ~ml_keep] = hull_fade_alpha
             out_png = apmlr_out_dir / safe_gene_name(f"P{topic_ids[k]}") / APMLR_PNG_NAME
