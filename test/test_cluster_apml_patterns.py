@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from scripts.gam.cluster_apml_patterns import extract_ref_levels
+
 
 def _make_small_panel(panel_dir: Path, *, seed: int = 0) -> None:
     rng = np.random.default_rng(seed)
@@ -64,6 +66,49 @@ def _make_small_panel(panel_dir: Path, *, seed: int = 0) -> None:
         }
     )
     counts_df.to_csv(panel_dir / "counts.tsv", sep="\t", index=False)
+
+
+class _StubPredictor:
+    def coefficient_names(self, _fit: object) -> list[str]:
+        return ["(Intercept)", "animalJaxA4", "batchB"]
+
+    def mean_log_sf(self, _fit: object) -> float:
+        return 0.0
+
+    def batch_levels(self, _fit: object) -> list[str]:
+        return []
+
+    def animal_levels(self, _fit: object) -> list[str]:
+        return []
+
+
+def test_extract_ref_levels_falls_back_to_cells_levels() -> None:
+    cells = pd.DataFrame(
+        {
+            "animal": ["JaxA4", "JaxA5", "JaxA4", None],
+            "batch": ["b1", "b2", "b1", "b3"],
+        }
+    )
+    (
+        include_pos,
+        include_log_sf_c,
+        include_batch,
+        mean_log_sf,
+        batch_ref,
+        batch_levels,
+        include_animal,
+        animal_ref,
+        animal_levels,
+    ) = extract_ref_levels(_StubPredictor(), fit=object(), cells=cells)
+    assert include_pos is False
+    assert include_log_sf_c is False
+    assert mean_log_sf is None
+    assert include_batch is True
+    assert batch_ref == "b1"
+    assert batch_levels == ["b1", "b2", "b3"]
+    assert include_animal is True
+    assert animal_ref == "JaxA4"
+    assert animal_levels == ["JaxA4", "JaxA5"]
 
 
 def test_cluster_apml_patterns_smoke(tmp_path: Path) -> None:

@@ -38,6 +38,11 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "plot_genes": ("fishtools.postprocess.plot_h5ad", "plot_genes"),
     "plot_leiden_genes": ("fishtools.postprocess.plot_h5ad", "plot_leiden_genes"),
     "plot_ranked_genes": ("fishtools.postprocess.plot_h5ad", "plot_ranked_genes"),
+    # layer_boundaries
+    "identify_layer_boundaries_knn": (
+        "fishtools.postprocess.layer_boundaries",
+        "identify_layer_boundaries_knn",
+    ),
     # spatial_arrange
     "auto_translate_groups": ("fishtools.postprocess.spatial_arrange", "auto_translate_groups"),
     # utils_h5ad
@@ -117,6 +122,9 @@ if TYPE_CHECKING:  # pragma: no cover - for editors only
     )
     from fishtools.postprocess.plot_h5ad import (
         plot_ranked_genes as plot_ranked_genes,
+    )
+    from fishtools.postprocess.layer_boundaries import (  # noqa: F401
+        identify_layer_boundaries_knn as identify_layer_boundaries_knn,
     )
     from fishtools.postprocess.utils_h5ad import (  # noqa: F401
         cluster as cluster,

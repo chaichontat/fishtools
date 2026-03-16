@@ -21,14 +21,13 @@ from scipy.spatial import cKDTree
 mpl.use("Agg", force=True)
 import matplotlib.pyplot as plt  # noqa: E402
 
-from fishtools.ccf.ontology import CCFTermKind, mask_ccf_subtree
 from fishtools.ccf.landmark import LandmarkRegistrationOutputs, P1Landmarks
 from fishtools.ccf.ndimage_geometry import fused_xy_to_rotated_crop_xy
+from fishtools.ccf.ontology import CCFTermKind, mask_ccf_subtree
 from fishtools.ccf.sitk_utils import UM_TO_MM, normalize_robust
 from fishtools.io.workspace import Workspace
 from fishtools.postprocess.roi_polygons import load_roi_polygons
 from fishtools.utils.logging import setup_cli_logging
-
 
 click.rich_click.SHOW_ARGUMENTS = True
 click.rich_click.GROUP_ARGUMENTS_OPTIONS = True
@@ -1922,7 +1921,7 @@ def main(  # noqa: PLR0913
                 out_name=out_name,
             )
             plot_png = qc_plot_png if qc_plot_png is not None else plot_png_default
-    
+
             output_h5ad.parent.mkdir(parents=True, exist_ok=True)
             if not overwrite:
                 existing: list[Path] = []
@@ -1935,7 +1934,7 @@ def main(  # noqa: PLR0913
                         "Skipping (output already exists; pass --overwrite to replace): " + ", ".join(str(p) for p in existing)
                     )
                     continue
-    
+
             try:
                 setup_cli_logging(
                     workspace,
@@ -1949,10 +1948,10 @@ def main(  # noqa: PLR0913
                     f"Warning: cannot write logs under {workspace}/analysis/logs (permission denied); continuing without file logging. ({exc})",
                     err=True,
                 )
-    
+
             adata = ad.read_h5ad(input_h5ad)
             n_total = int(adata.n_obs)
-    
+
             roi_mask: np.ndarray | None = None
             adata_work = adata
             if filter_roi:
@@ -1963,12 +1962,12 @@ def main(  # noqa: PLR0913
                 click.echo(
                     f"Scoped ROI for selection: {adata_work.n_obs}/{n_total} obs (roi_col={roi_col!r}, roi={roi_resolved!r})"
                 )
-    
+
             order_t = cast(SpatialOrder, str(spatial_order).lower())
             qc_units: str
             qc_coords: np.ndarray
             title: str
-    
+
             roi_path: Path | None = None
             mask_edit_dir = ws.ccf_transforms(str(roi_resolved)) / str(run_dirname) / "mask_edit"
             if not ignore_imagej_roi:
@@ -1983,7 +1982,7 @@ def main(  # noqa: PLR0913
                             click.echo(f"Warning: {msg} Falling back to --term filtering for roi={roi_resolved!r}.", err=True)
                         else:
                             raise click.ClickException(msg)
-    
+
             imagej_labels: np.ndarray | None = None
             if roi_path is not None:
                 click.echo(f"Using ImageJ ROI override: {roi_path}")
@@ -2010,7 +2009,7 @@ def main(  # noqa: PLR0913
                     raise click.ClickException(
                         "At least one --term is required unless an ImageJ ROI is available (or enabled via --imagej-roi/--imagej-roi-path)."
                     )
-    
+
                 coords_units_t = cast(CoordUnits, str(coords_units).lower())
                 coords_space_t = cast(CoordSpace, str(coords_space).lower())
                 _ensure_ccf_obsm(
@@ -2024,11 +2023,11 @@ def main(  # noqa: PLR0913
                     roi=str(roi_resolved),
                     workspace=workspace,
                 )
-    
+
                 kind_t = cast(CCFTermKind, str(kind).lower())
                 match_t = cast(MatchMode, str(match).lower())
                 combine_t = cast(CombineMode, str(combine).lower())
-    
+
                 n_work = int(adata_work.n_obs)
                 term_masks: list[np.ndarray] = []
                 term_labels = np.empty(n_work, dtype=object)
@@ -2054,7 +2053,7 @@ def main(  # noqa: PLR0913
                     mask = np.zeros(n_work, dtype=bool)
                     for m in term_masks:
                         mask |= m
-    
+
                 dilate = float(dilate_um)
                 if dilate > 0:
                     if coords_key not in adata_work.obsm:
@@ -2068,7 +2067,7 @@ def main(  # noqa: PLR0913
                         )
                     if order_t == "yx":
                         coords = coords[:, ::-1]
-    
+
                     spacing_um = coords_spacing_um
                     if coords_units_t == "px" and spacing_um is None:
                         ccf_meta = adata_work.uns.get("ccf", {})
@@ -2084,7 +2083,7 @@ def main(  # noqa: PLR0913
                         new = mask & (term_labels == "")
                         if np.any(new):
                             term_labels[new] = joined
-    
+
                 if coords_key not in adata_work.obsm:
                     raise click.ClickException(f"Missing adata.obsm[{coords_key!r}] in {input_h5ad} (needed for QC plot).")
                 qc_coords = np.asarray(adata_work.obsm[coords_key])
@@ -2092,16 +2091,16 @@ def main(  # noqa: PLR0913
                     raise click.ClickException(f"Expected obsm[{coords_key!r}] to have shape (N,2), got {qc_coords.shape}.")
                 if order_t == "yx":
                     qc_coords = qc_coords[:, ::-1]
-    
+
                 qc_units = str(coords_units_t)
                 title = (
                     f"CCF selection overlay | selected={int(mask.sum())}/{int(adata_work.n_obs)} | "
                     f"match={match_t}, combine={combine_t}, invert={invert}, dilate_um={float(dilate_um)}"
                 )
-    
+
             if invert:
                 mask = ~mask
-    
+
             labels = imagej_labels if imagej_labels is not None else term_labels
             if invert:
                 criteria = roi_path.name if roi_path is not None else "|".join(str(t) for t in terms)
@@ -2109,14 +2108,14 @@ def main(  # noqa: PLR0913
                 labels = np.where(mask, np.where(labels != "", labels, invert_label), "")
             else:
                 labels = np.where(mask, labels, "")
-    
+
             labels_full = np.empty(n_total, dtype=object)
             labels_full[:] = ""
             if roi_mask is not None:
                 labels_full[roi_mask] = labels
             else:
                 labels_full = labels
-    
+
             if qc_plot:
                 _write_qc_mask_overlay_plot(
                     coords_xy=qc_coords,
@@ -2126,7 +2125,7 @@ def main(  # noqa: PLR0913
                     units=qc_units,
                 )
                 click.echo(f"Wrote QC plot: {plot_png}")
-    
+
             t_axis_endpoints_payload: dict[str, object] | None = None
             if roi_path is not None:
                 t_axis_json_path: Path | None = None
@@ -2138,7 +2137,6 @@ def main(  # noqa: PLR0913
                         roi_path=roi_path,
                         imagej_target_spacing_um=float(imagej_target_spacing_um),
                         overwrite=bool(overwrite),
-                        keep_t_mask=bool(keep_t_mask),
                     )
                 except (FileNotFoundError, KeyError, TypeError, ValueError, OSError, RuntimeError) as exc:
                     click.echo(
@@ -2164,7 +2162,7 @@ def main(  # noqa: PLR0913
                         t_axis_json_path = candidate
                 if t_axis_json_path is not None and t_axis_json_path.exists():
                     t_axis_endpoints_payload = _load_json_object(t_axis_json_path)
-    
+
             out = adata.copy()
             out.obs[ccf_col] = pd.Series([""] * n_total, index=out.obs_names)
             out.obs[ccf_adjusted_col] = pd.Series([""] * n_total, index=out.obs_names)
@@ -2180,8 +2178,8 @@ def main(  # noqa: PLR0913
             n_labeled = int(np.sum(labels_full != ""))
             target_col = ccf_adjusted_col if imagej_labels is not None else ccf_col
             click.echo(f"Wrote: {output_h5ad} (annotated {n_labeled}/{out.n_obs} obs in {target_col!r})")
-    
-    
+
+
         except Exception as exc:
             if is_batch:
                 click.echo(f"Warning: error processing roi={roi_resolved!r}: {exc}", err=True)

@@ -21,8 +21,6 @@ from matplotlib.text import Text
 from matplotlib.ticker import FuncFormatter
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mpl_toolkits.axes_grid1.anchored_artists import AnchoredSizeBar
-from numpy.lib.index_tricks import IndexExpression  # noqa: F401 (kept for type compatibility)
-
 if TYPE_CHECKING:
     import anndata as ad
     import polars as pl
@@ -622,12 +620,7 @@ def plot_embedding(
     Parameters:
     - adata: AnnData object containing the embedding data.
     """
-    # Lazy import to avoid importing scanpy at module import time
-    try:
-        import scanpy as sc  # type: ignore
-    except Exception as e:  # pragma: no cover - runtime environment dependent
-        raise RuntimeError("plot_embedding requires 'scanpy'. Please install it to use this function.") from e
-
+    import scanpy as sc
     kwargs = kwargs | {"return_fig": True}
     fig = cast(Figure, sc.pl.embedding(adata, **kwargs))
 

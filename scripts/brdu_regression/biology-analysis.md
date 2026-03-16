@@ -70,9 +70,14 @@ Each cell has a latent quadrant (unknown); the mixture model provides posterior 
 - `q10`: BrdU-only (`B=1`, `E=0`)
 - `q01`: EdU-only (`B=0`, `E=1`)
 - `q00`: Double-negative (`B=0`, `E=0`)
+- `q11`: Dual (`B=1`, `E=1`)
+- `q10`: BrdU-only (`B=1`, `E=0`)
+- `q01`: EdU-only (`B=0`, `E=1`)
+- `q00`: Double-negative (`B=0`, `E=0`)
 
 We estimate four matched conditional ORs (phase/type matched; see `methods.md` for the exact strata and gate definition):
 
+### E1: within BrdU+ (`q11` vs `q10`)
 ### E1: within BrdU+ (`q11` vs `q10`)
 
 `OR_E1 = OR_{GE | B=1}`
@@ -82,6 +87,7 @@ Interpretation:
 - compares gate+ vs gate− among cells BrdU+ at `t=0`
 - sensitive to persistence/progression of the BrdU+ cohort (and BrdU-specific calling)
 
+### E3: within BrdU− (`q01` vs `q00`)
 ### E3: within BrdU− (`q01` vs `q00`)
 
 `OR_E3 = OR_{GE | B=0}`
@@ -205,6 +211,8 @@ Interpretation:
 
 Note: this “E3 near-null” signature is useful when the goal is to isolate a **pulse-history–specific** phenotype beyond general EdU propensity. It is *not* required for “slow/extended S-like” interpretations, where the state can plausibly affect EdU positivity even among BrdU− cells.
 
+Note: this “E3 near-null” signature is useful when the goal is to isolate a **pulse-history–specific** phenotype beyond general EdU propensity. It is *not* required for “slow/extended S-like” interpretations, where the state can plausibly affect EdU positivity even among BrdU− cells.
+
 ### 4.3 “Mixed / asymmetric”
 
 Typical pattern:
@@ -267,6 +275,7 @@ We therefore report both:
 
 - `δ_marg` (no explicit spatial conditioning)
 - `δ_space` (space-conditioned)
+- `δ_comp` (composition component): conceptually `δ_marg − δ_space`, but note that changing strata changes support/weights; for shortlist follow-up we prefer the support-aligned decomposition reported by `scripts/brdu_regression/spatial_decomposition_standardized.py` (see `delta_comp_raw` vs `delta_comp_std_support`).
 - `δ_comp` (composition component): conceptually `δ_marg − δ_space`, but note that changing strata changes support/weights; for shortlist follow-up we prefer the support-aligned decomposition reported by `scripts/brdu_regression/spatial_decomposition_standardized.py` (see `delta_comp_raw` vs `delta_comp_std_support`).
 
 ## 7) Where the mechanism tables live (current runs)

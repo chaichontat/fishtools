@@ -116,37 +116,23 @@ def test_load_adata_with_labels_replaces_stale_obs_columns(tmp_path: Path) -> No
             "x": [0.0, 1.0],
             "y": [0.0, 1.0],
         },
-        index=pd.Index(["cell_a", "cell_a"], name="roilabel"),
+        index=pd.Index(["ds1:cell_a", "ds2:cell_a"], name="index"),
     )
     adata = ad.AnnData(X=np.zeros((2, 1), dtype=np.float32), obs=obs)
     in_h5ad = tmp_path / "input.h5ad"
     adata.write_h5ad(in_h5ad)
-
-    stagate_obs = pd.DataFrame(
-        {
-            "dataset": ["ds1", "ds2"],
-        },
-        index=pd.Index(["cell_a", "cell_a-1"], name="cell_id"),
-    )
-    stagate = ad.AnnData(X=np.zeros((2, 1), dtype=np.float32), obs=stagate_obs)
-    stagate_h5ad = tmp_path / "stagate.h5ad"
-    stagate.write_h5ad(stagate_h5ad)
 
     labels = pd.DataFrame(
         {
             "mclust_k7": pd.Categorical(["4", "2"]),
             "mclust_k6": pd.Categorical(["4", "2"]),
         },
-        index=pd.Index(["cell_a", "cell_a-1"], name="cell_id"),
+        index=pd.Index(["ds1:cell_a", "ds2:cell_a"], name="cell_id"),
     )
     labels_parquet = tmp_path / "labels.parquet"
     labels.to_parquet(labels_parquet)
 
-    loaded = module.load_adata_with_labels(
-        in_h5ad=in_h5ad,
-        stagate_h5ad=stagate_h5ad,
-        labels_parquet=labels_parquet,
-    )
+    loaded = module.load_adata_with_labels(in_h5ad=in_h5ad, labels_parquet=labels_parquet)
 
     assert loaded.obs["mclust_k7"].astype(str).tolist() == ["4", "2"]
     assert str(loaded.obs["mclust_k7"].dtype) == "category"
@@ -329,6 +315,62 @@ def test_save_job_state_persists_json_before_assignment_failure(tmp_path: Path, 
     assert payload["completed"] is False
     assert payload["boundaries"]["46-2"] == [[0.0, 0.0], [1.0, 0.0]]
     assert not paths["assignments"].exists()
+
+
+def test_write_assignment_outputs_includes_obs_index_column(tmp_path: Path) -> None:
+    module = _load_module()
+
+    obs = pd.DataFrame(
+        {
+            "dataset": ["ds1", "ds1"],
+            "roi": ["4", "4"],
+            "roi_group": ["4", "4"],
+            "ccf_adjusted": ["cortex", "cortex"],
+            "obs_ix": [0, 1],
+            "mclust_k6": pd.Categorical(["46", "2"]),
+            "x": [0.0, 1.0],
+            "y": [0.0, 1.0],
+        },
+        index=pd.Index(["ds1:cell_a", "ds1:cell_b"], name="cell_id"),
+    )
+    adata_job = ad.AnnData(X=np.zeros((2, 1), dtype=np.float32), obs=obs)
+    adata_job.obsm["spatial"] = np.array([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32)
+
+    job = module.JobSpec(
+        dataset="ds1",
+        roi_group="4",
+        ccf_adjusted="cortex",
+        roi_members=("4",),
+        n_obs=2,
+    )
+    paths = {
+        "json": tmp_path / "job.json",
+        "assignments": tmp_path / "job.assignments.parquet",
+        "qc_png": tmp_path / "job.qc.png",
+    }
+    result = module.AssignmentResult(
+        manual_layers=np.array(["46", "2"], dtype=object),
+        point_components=np.array([1, 2], dtype=np.int32),
+        component_order=(1, 2),
+        component_layer_map={1: "46", 2: "2"},
+        components_raster=np.array([[1, 2]], dtype=np.int32),
+        support_mask=np.array([[True, True]], dtype=bool),
+        barrier_mask=np.array([[False, False]], dtype=bool),
+        raster_origin_xy=(0.0, 0.0),
+        pixel_size=1.0,
+    )
+
+    module.write_assignment_outputs(
+        adata_job=adata_job,
+        job=job,
+        result=result,
+        paths=paths,
+        boundaries=module.empty_boundaries(),
+    )
+
+    frame = pd.read_parquet(paths["assignments"])
+    assert frame["index"].tolist() == ["ds1:cell_a", "ds1:cell_b"]
+    assert frame["obs_ix"].tolist() == [0, 1]
 
 
 def test_save_job_boundary_state_only_writes_json(tmp_path: Path) -> None:

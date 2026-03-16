@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import anndata as ad
+
 os.environ["MATPLOTLIBRC"] = os.devnull
 import matplotlib.pyplot as plt
 import numpy as np
@@ -48,7 +49,6 @@ if ip is not None:
 
 # %%
 INPUT_H5AD = Path("/fast2/cs_outputs/all.h5ad")
-STAGATE_H5AD = Path("/fast2/cs_outputs/all.stagate.h5ad")
 LABELS_PARQUET = Path("/fast2/cs_outputs/all.stagate.mclust_sweep.parquet")
 OUTPUT_ROOT = Path("/fast2/cs_outputs/all.mclust_manual_boundaries")
 
@@ -80,7 +80,7 @@ MONTAGE_MAX_POINTS_PER_UNIT = 30_000
 MONTAGE_PANEL_SIZE = (4.2, 4.2)
 MONTAGE_DPI = 120
 MONTAGE_POINT_SIZE = 1.0
-MONTAGE_POINT_ALPHA = 0.55
+MONTAGE_POINT_ALPHA = 0.6
 
 adata: ad.AnnData | None = None
 jobs: list[JobSpec] = []
@@ -114,31 +114,14 @@ def _valid_group_value(value: object) -> bool:
     return text != "" and text.lower() not in {"nan", "none"}
 
 
-def _make_unique_obs_index(obs_index: pd.Index) -> pd.Index:
-    values = obs_index.astype(str).tolist()
-    counts: dict[str, int] = {}
-    unique_values: list[str] = []
-    for value in values:
-        count = counts.get(value, 0)
-        unique_values.append(value if count == 0 else f"{value}-{count}")
-        counts[value] = count + 1
-    return pd.Index(unique_values, name=obs_index.name)
-
-
-def _strip_unique_suffix(obs_index: pd.Index) -> pd.Index:
-    return pd.Index(obs_index.astype(str).str.replace(r"-\d+$", "", regex=True), name=obs_index.name)
-
-
 def _label_join_key(obs: pd.DataFrame, *, raw_index: pd.Index | None = None) -> pd.Index:
-    if "dataset" not in obs.columns:
-        raise KeyError("Expected `dataset` in obs before joining mclust labels.")
-    index = obs.index if raw_index is None else raw_index
-    return pd.Index(obs["dataset"].astype(str) + "_" + index.astype(str), name="cell_id")
+    if raw_index is not None:
+        raise ValueError("Direct label join no longer expects a separate raw_index.")
+    return pd.Index(obs.index.astype(str), name="cell_id")
 
 
 def load_adata_with_labels(
     in_h5ad: Path = INPUT_H5AD,
-    stagate_h5ad: Path = STAGATE_H5AD,
     labels_parquet: Path = LABELS_PARQUET,
 ) -> ad.AnnData:
     adata = ad.read_h5ad(in_h5ad)
@@ -146,14 +129,6 @@ def load_adata_with_labels(
     join_key = _label_join_key(adata.obs)
     if not join_key.is_unique:
         raise ValueError("Constructed label join key is not unique.")
-    stagate = ad.read_h5ad(stagate_h5ad, backed="r")
-    try:
-        stagate_obs = stagate.obs[["dataset"]].copy()
-    finally:
-        stagate.file.close()
-    labels.index = _label_join_key(stagate_obs, raw_index=_strip_unique_suffix(stagate_obs.index))
-    if not labels.index.is_unique:
-        raise ValueError("Constructed parquet join key is not unique.")
     for col in labels.columns:
         labels[col] = labels[col].astype("category")
         adata.obs.drop(columns=[col], inplace=True, errors="ignore")
@@ -748,6 +723,7 @@ def write_assignment_outputs(
     paths["assignments"].parent.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(
         {
+            "index": adata_job.obs_names.astype(str),
             "obs_ix": adata_job.obs["obs_ix"].to_numpy(dtype=np.int64, copy=False),
             "dataset": adata_job.obs["dataset"].astype(str).to_numpy(),
             "roi": adata_job.obs["roi"].astype(str).to_numpy(),
@@ -764,9 +740,9 @@ def write_assignment_outputs(
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=QC_DPI)
     cmap = ListedColormap(["#355070", "#6d597a", "#b56576", "#e56b6f", "#eaac8b", "#ffcc66", "#76b041"])
-    axes[0].scatter(xy[:, 0], xy[:, 1], c=pd.Categorical(original_labels).codes, cmap=cmap, s=1.5, linewidths=0)
+    axes[0].scatter(xy[:, 0], xy[:, 1], c=pd.Categorical(original_labels).codes, cmap=cmap, s=1.5, alpha=0.6, linewidths=0)
     axes[0].set_title("Current mclust_k7")
-    axes[1].scatter(xy[:, 0], xy[:, 1], c=result_codes, cmap="tab10", s=1.5, linewidths=0)
+    axes[1].scatter(xy[:, 0], xy[:, 1], c=result_codes, cmap="tab10", s=1.5, alpha=0.6, linewidths=0)
     axes[1].set_title("Manual layer assignment")
 
     axes[2].imshow(
@@ -1046,7 +1022,7 @@ def review_job(
                     curve[:, 0],
                     curve[:, 1],
                     color=color,
-                    linewidth=2.6 if is_active else 1.4,
+                    linewidth=2.0 if is_active else 1.4,
                     alpha=0.98 if is_active else 0.75,
                     zorder=4 if is_active else 3,
                 )[0]

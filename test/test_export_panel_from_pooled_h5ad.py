@@ -298,6 +298,109 @@ def test_pooled_export_subset_col_and_values_filter_rows(tmp_path: Path, monkeyp
     assert len(counts) == 4
 
 
+def test_pooled_export_multiple_subset_filters_rows(tmp_path: Path, monkeypatch) -> None:
+    module = _load_module()
+
+    h5ad_path = tmp_path / "pooled_multi_subset.h5ad"
+    out_dir = tmp_path / "panel_out_multi_subset"
+
+    obs = pd.DataFrame(
+        {
+            "ccf_adjusted": ["cortex", "cortex2", "cortex", "cortex2", "other", "cortex"],
+            "dataset": ["d1", "d1", "d2", "d2", "d2", "d1"],
+            "roi": ["1", "1", "2", "2", "2", "1"],
+            "leiden": ["7", "7", "7", "7", "7", "7"],
+            "cell_state": ["state_a", "state_b", "state_a", "state_a", "state_a", "state_a"],
+            "tricycle": np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=np.float32),
+            "t_local": np.array([0.2, 0.3, 0.4, 0.6, 0.2, 0.8], dtype=np.float32),
+            "r_um": np.array([10.0, 15.0, 20.0, 25.0, 30.0, 35.0], dtype=np.float32),
+            "total_counts": np.array([10, 20, 30, 40, 50, 60], dtype=np.float32),
+        },
+        index=pd.Index(["a", "a", "b", "b", "c", "c"], dtype=object),
+    )
+
+    X = np.array(
+        [
+            [1, 2, 3],
+            [2, 3, 4],
+            [3, 4, 5],
+            [4, 5, 6],
+            [5, 6, 7],
+            [6, 7, 8],
+        ],
+        dtype=np.float32,
+    )
+    var = pd.DataFrame(index=pd.Index(["G1", "G2", "G3"], dtype=object))
+    obsm = {
+        "AP_ML_um": np.array(
+            [
+                [1.0, 10.0],
+                [2.0, 20.0],
+                [3.0, 30.0],
+                [4.0, 40.0],
+                [5.0, 50.0],
+                [6.0, 60.0],
+            ],
+            dtype=np.float32,
+        ),
+    }
+    adata = ad.AnnData(X=X, obs=obs, var=var, obsm=obsm, layers={"raw": X.copy()})
+    adata.write_h5ad(h5ad_path)
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "export_panel_from_pooled_h5ad.py",
+            str(h5ad_path),
+            "--out-dir",
+            str(out_dir),
+            "--region-col",
+            "ccf_adjusted",
+            "--region",
+            "cortex,cortex2",
+            "--dataset-col",
+            "dataset",
+            "--roi-col",
+            "roi",
+            "--theta-col",
+            "tricycle",
+            "--subset-col",
+            "leiden",
+            "--subset-values",
+            "7",
+            "--subset-col",
+            "cell_state",
+            "--subset-values",
+            "state_a",
+            "--t-min",
+            "0.0",
+            "--t-max",
+            "1.0",
+            "--r-min",
+            "0.0",
+            "--genes",
+            "all",
+        ],
+    )
+    rc = module.main()
+    assert rc == 0
+
+    cells = pd.read_csv(out_dir / "cells.tsv", sep="\t")
+    counts = pd.read_csv(out_dir / "counts.tsv", sep="\t")
+    # Matching both filters keeps rows 0,2,3,5.
+    assert len(cells) == 4
+    assert len(counts) == 4
+    with (out_dir / "panel_meta.json").open() as f:
+        meta = json.load(f)
+    assert meta["subset_col"] is None
+    assert meta["subset_allowed"] is None
+    assert meta["subset_filters"] == [
+        {"col": "leiden", "allowed": ["7"]},
+        {"col": "cell_state", "allowed": ["state_a"]},
+    ]
+
+
 def test_pooled_export_drop_nans_allows_nonfinite_r_when_enabled(tmp_path: Path, monkeypatch) -> None:
     module = _load_module()
 

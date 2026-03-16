@@ -42,27 +42,27 @@ export TMPDIR=/fast2/cs_outputs/fishtools2/_out/tmp
 h5ad_excit=/fast2/cs_outputs/all_excit_r300.h5ad
 h5ad_neurons=/fast2/cs_outputs/all_neurons.h5ad
 
-threads=2
-bam_threads=1
+threads=4
+bam_threads=4
 
 cd "$repo_dir" || _die "could not cd to $repo_dir"
 
 _run mkdir -p "$out_root"
 _run mkdir -p "$TMPDIR"
 
-# run7="$out_root/gam_all_excit_r300_leiden7_20260220_004652"
-# _run conda run -n seq python -u scripts/gam/export_panel_from_pooled_h5ad.py \
-#     "$h5ad_excit" \
-#     --out-dir "$run7/panel" \
-#     --subset-col leiden \
-#     --subset-values 7 \
-#     --genes all
-# _run conda run -n seq Rscript scripts/gam/fit_inm_panel.R \
-#     "$run7/panel" \
-#     "$run7/fit_results.tsv" \
-#     --no-pos \
-#     --threads "$threads" \
-#     --bam-threads "$bam_threads"
+run7="$out_root/gam_all_excit_r300_leiden7"
+_run conda run -n seq python -u scripts/gam/export_panel_from_pooled_h5ad.py \
+    "$h5ad_excit" \
+    --out-dir "$run7/panel" \
+    --subset-col leiden \
+    --subset-values 7 \
+    --genes all
+_run conda run -n seq Rscript scripts/gam/fit_inm_panel.R \
+    "$run7/panel" \
+    "$run7/fit_results.tsv" \
+    --no-pos \
+    --threads "$threads" \
+    --bam-threads "$bam_threads"
 
 run4="$out_root/gam_all_excit_r300_leiden4"
 _run conda run -n seq python -u scripts/gam/export_panel_from_pooled_h5ad.py \

@@ -55,6 +55,7 @@ ROI_NAMES: tuple[str, ...] | None = None
 ROI_OBS_KEY = "ccf_adjusted"
 ROI_VALUES: tuple[str, ...] | None = None
 SKIP_EXISTING_JSON = False  # True: skip jobs when output threshold JSON already exists.
+SKIP_EXISTING_JSON = False  # True: skip jobs when output threshold JSON already exists.
 PLOT_MAX_POINTS = 200_000
 POINT_SIZE = 2
 POINT_ALPHA = 0.3

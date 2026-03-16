@@ -94,14 +94,14 @@ def normalize_pearson(
     if batch_key is not None and batch_key not in adata.obs:
         raise KeyError(f"Missing batch column in `adata.obs`: {batch_key!r}")
 
-    sc.experimental.pp.highly_variable_genes(
-        adata,
-        flavor="pearson_residuals",
-        n_top_genes=n_top_genes,
-        batch_key=batch_key,
-        theta=theta,
-        clip=clip,
-    )
+    # sc.experimental.pp.highly_variable_genes(
+    #     adata,
+    #     flavor="pearson_residuals",
+    #     n_top_genes=n_top_genes,
+    #     batch_key=batch_key,
+    #     theta=theta,
+    #     clip=clip,
+    # )
 
     def plot():
         fig, ax = plt.subplots(figsize=(8, 6))
@@ -126,7 +126,7 @@ def normalize_pearson(
         ax.xaxis.set_ticks_position("bottom")
         plt.legend()
 
-    adata = adata[:, adata.var["highly_variable"]].copy()
+    # adata = adata[:, adata.var["highly_variable"]].copy()
 
     adata.layers["raw"] = adata.X.copy()
     adata.layers["sqrt_norm"] = np.sqrt(sc.pp.normalize_total(adata, inplace=False)["X"])
