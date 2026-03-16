@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from itertools import chain
+from pathlib import Path
 from typing import Literal
+import warnings
 
 import anndata as ad
 import matplotlib.pyplot as plt
@@ -19,6 +21,11 @@ __all__ = [
     "leiden_umap",
     "normalize_total",
     "coerce_float32_for_concat",
+    "prefix_dataset_to_obs_names",
+    "write_obs_parquet",
+    "read_obs_parquet",
+    "write_obsm_h5ad",
+    "read_obsm_h5ad",
     "filter_leiden",
     "run_tricycle",
     "get_leiden_genes",
@@ -219,6 +226,93 @@ def coerce_float32_for_concat(adata: ad.AnnData) -> ad.AnnData:
     if len(float_var_cols):
         adata.var[float_var_cols] = adata.var[float_var_cols].astype(np.float32)
 
+    return adata
+
+
+def prefix_dataset_to_obs_names(
+    adata: ad.AnnData,
+    *,
+    dataset_col: str = "dataset",
+    sep: str = ":",
+) -> ad.AnnData:
+    """Prefix ``obs_names`` with ``obs[dataset_col]`` for concat-safe uniqueness."""
+
+    obs_names = adata.obs_names.astype(str)
+    prefix = adata.obs[dataset_col].astype(str)
+    first_prefix = f"{prefix.iloc[0]}{sep}" if len(obs_names) else ""
+    if not len(obs_names) or not obs_names[0].startswith(first_prefix):
+        adata.obs_names = pd.Index(prefix.str.cat(obs_names, sep=str(sep)))
+    adata.obs_names.rename("index", inplace=True)
+    adata.obs.index.rename("index", inplace=True)
+    return adata
+
+
+def write_obs_parquet(adata: ad.AnnData, path: str | Path) -> None:
+    """Write ``adata.obs`` to parquet while preserving ``obs_names`` as the index."""
+
+    adata.obs.copy().to_parquet(path, index=True)
+
+
+def _validate_one_to_one_obs_join(source_index: pd.Index, target_index: pd.Index, *, source_name: str) -> None:
+    """Validate that an obs-index join is one-to-one before alignment."""
+
+    if not source_index.is_unique or not target_index.is_unique:
+        warnings.warn(
+            "Joining obs metadata is not one-to-one because one or both indices contain duplicates.",
+            stacklevel=2,
+        )
+    if not source_index.is_unique:
+        raise ValueError(f"Expected {source_name} index to be unique.")
+    if not target_index.is_unique:
+        raise ValueError("Expected adata.obs_names to be unique.")
+
+
+def read_obs_parquet(path: str | Path, *, adata: ad.AnnData | None = None) -> pd.DataFrame | ad.AnnData:
+    """Read an ``obs`` parquet, optionally overwriting columns back into ``adata``."""
+
+    obs = pd.read_parquet(path)
+    if adata is None:
+        return obs
+
+    adata_index = pd.Index(adata.obs_names)
+    _validate_one_to_one_obs_join(obs.index, adata_index, source_name="parquet obs")
+    missing = adata_index.difference(obs.index)
+    if len(missing):
+        raise ValueError(f"Obs parquet is missing adata.obs_names entries: {missing.tolist()}.")
+
+    obs = obs.reindex(adata_index)
+    for column in obs.columns:
+        adata.obs[column] = obs[column]
+    return adata
+
+
+def write_obsm_h5ad(adata: ad.AnnData, path: str | Path) -> None:
+    """Write an obsm-only AnnData bundle that preserves obs_names."""
+
+    obsm_only = ad.AnnData(obs=pd.DataFrame(index=adata.obs_names.copy()))
+    for key in adata.obsm:
+        obsm_only.obsm[key] = adata.obsm[key].copy()
+    obsm_only.write_h5ad(path)
+
+
+def read_obsm_h5ad(path: str | Path, *, adata: ad.AnnData | None = None) -> ad.AnnData:
+    """Read an AnnData bundle created by ``write_obsm_h5ad`` and optionally join it back into ``adata``."""
+
+    obsm_adata = ad.read_h5ad(path)
+    if obsm_adata.n_vars != 0:
+        raise ValueError(f"Expected an obsm-only h5ad with zero vars, got n_vars={obsm_adata.n_vars}.")
+    if adata is None:
+        return obsm_adata
+
+    adata_index = pd.Index(adata.obs_names)
+    _validate_one_to_one_obs_join(obsm_adata.obs_names, adata_index, source_name="obsm h5ad obs")
+    missing = adata_index.difference(obsm_adata.obs_names)
+    if len(missing):
+        raise ValueError(f"Obsm h5ad is missing adata.obs_names entries: {missing.tolist()}.")
+
+    aligned = obsm_adata[adata.obs_names].copy()
+    for key in aligned.obsm:
+        adata.obsm[key] = aligned.obsm[key].copy()
     return adata
 
 

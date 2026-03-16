@@ -43,8 +43,8 @@ ip.run_line_magic("matplotlib", "widget")
 
 
 # --------------------------------
-folders = sorted(Path("/working").expanduser().glob("2025*JaxA1*"))
-FOLDER = folders[1]
+folders = sorted(Path("/working").expanduser().glob("20251230*JaxA4*"))
+FOLDER = folders[0]
 # --------------------------------
 
 print("Using folder:", FOLDER)
@@ -223,7 +223,7 @@ def get_all_progenitors_backed(path: Path) -> ad.AnnData:
     if not path.exists():
         raise FileNotFoundError(path)
     all_progenitors_backed = ad.read_h5ad(path)
-    all_progenitors_backed = all_progenitors_backed[all_progenitors_backed.obs['leiden'].isin(list(map(str,[7,8,9,10])))]
+    all_progenitors_backed = all_progenitors_backed[all_progenitors_backed.obs['leiden'].isin(list(map(str,[5,6,7])))]
     return all_progenitors_backed
 
 

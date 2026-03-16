@@ -10,6 +10,7 @@ Prioritize clarity over action. do not be quick to jump to an action until you�
 - DO NOT create conditional imports or assume that some packages are not going to be available. ALL packages are available, do not try to create a fallback unless explicitly told to do so. It adds bloat and complexity.
 - ABSOLUTELY NEVER add fallbacks (silent defaults, alternate codepaths, “best-effort” behavior) unless the user explicitly requests it. Fall-backs hide bugs and waste debugging time.
 - “Robustness” must be contract-preserving: do not change output semantics (including edge/error cases) unless the user explicitly asks. Prefer failing loudly over silently substituting defaults.
+- Do not duplicate logic within a function or patch. If two branches share cleanup, renames, returns, or post-processing, factor the shared path once instead of repeating it.
 - DO NOT preemptively handle exceptions, swallowing Exceptions are never acceptable. If you are not sure what to do, ask the user.
 - Do not worry about backwards compatibility unless the user indicates so.
 - After Python modifications, run `conda run -n seq ruff check --output-format=concise {MODIFIED FILES}` unless told otherwise to check for errors before returning to the user.

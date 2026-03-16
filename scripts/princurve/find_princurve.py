@@ -1477,6 +1477,7 @@ def write_unfolded_r_um_qc_png(
     title: str,
     max_points: int = 80_000,
     plot_mask: np.ndarray | None = None,
+    r_midline: np.ndarray | None = None,
 ) -> None:
     t_local = np.asarray(t_local, dtype=float)
     r_um = np.asarray(r_um, dtype=float)
@@ -1485,6 +1486,9 @@ def write_unfolded_r_um_qc_png(
         raise ValueError("t_local, r_um, and r_signed must have matching shapes.")
     if t_local.ndim != 1:
         raise ValueError("t_local, r_um, and r_signed must be 1D.")
+    r_midline_arr = None if r_midline is None else np.asarray(r_midline, dtype=float)
+    if r_midline_arr is not None and r_midline_arr.shape != t_local.shape:
+        raise ValueError("r_midline must have matching shape with t_local.")
 
     n = int(t_local.shape[0])
     if plot_mask is None:
@@ -1506,8 +1510,19 @@ def write_unfolded_r_um_qc_png(
     if not np.isfinite(lim) or lim <= 0.0:
         lim = 1.0
 
-    fig, ax = plt.subplots(figsize=(7, 6))
-    sc = ax.scatter(
+    if r_midline_arr is None:
+        fig, axes = plt.subplots(figsize=(7, 6))
+        axes = [axes]
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 6), sharex=True, constrained_layout=True)
+
+    t_keep = t_local[keep]
+    t_lo = float(np.min(t_keep))
+    t_hi = float(np.max(t_keep))
+    t_span = max(t_hi - t_lo, 1.0)
+    t_pad = max(0.02, 0.02 * t_span)
+
+    sc = axes[0].scatter(
         t_local[idx],
         r_um[idx],
         c=r_signed[idx],
@@ -1518,21 +1533,34 @@ def write_unfolded_r_um_qc_png(
         linewidths=0.0,
         alpha=0.8,
     )
-    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.5)
-    t_keep = t_local[keep]
-    t_lo = float(np.min(t_keep))
-    t_hi = float(np.max(t_keep))
-    t_span = max(t_hi - t_lo, 1.0)
-    t_pad = max(0.02, 0.02 * t_span)
-    ax.set_xlim(min(-0.02, t_lo - t_pad), max(1.02, t_hi + t_pad))
-    ax.set_xlabel("t_local")
-    ax.set_ylabel("r_um")
-    ax.set_title(title)
-    cbar = fig.colorbar(sc, ax=ax)
+    axes[0].axhline(0.0, color="black", linewidth=1.0, alpha=0.5)
+    axes[0].set_xlim(min(-0.02, t_lo - t_pad), max(1.02, t_hi + t_pad))
+    axes[0].set_xlabel("t_local")
+    axes[0].set_ylabel("r_um")
+    axes[0].set_title(title)
+
+    if r_midline_arr is not None:
+        axes[1].scatter(
+            t_local[idx],
+            r_midline_arr[idx],
+            c=r_signed[idx],
+            s=4,
+            cmap="RdBu_r",
+            vmin=-lim,
+            vmax=lim,
+            linewidths=0.0,
+            alpha=0.8,
+        )
+        axes[1].axhline(0.0, color="black", linewidth=1.0, alpha=0.5)
+        axes[1].set_xlim(min(-0.02, t_lo - t_pad), max(1.02, t_hi + t_pad))
+        axes[1].set_xlabel("t_local")
+        axes[1].set_ylabel("r_midline")
+        axes[1].set_title("Signed Distance To Curve")
+
+    cbar = fig.colorbar(sc, ax=list(axes))
     cbar.set_label("signed distance to curve (px)")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
 
@@ -3349,6 +3377,7 @@ def _run_single(
                 t_local=t,
                 r_um=r_um,
                 r_signed=np.asarray(r_signed_store, dtype=float),
+                r_midline=np.asarray(adata.obs["r_midline"], dtype=float),
                 title=f"Unfolded cortex QC (n={int(np.count_nonzero(plot_mask))})",
                 plot_mask=plot_mask,
             )

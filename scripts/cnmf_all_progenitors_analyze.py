@@ -18,7 +18,7 @@ from cnmf import cNMF
 # %%
 # === EDIT THESE ===
 
-OUTDIR = Path("/fast2/cs_outputs/fishtools2/_out/cnmf_all_progenitors")
+OUTDIR = Path("~/nvme/cnmf_all_progenitors").expanduser()
 RUN_NAME = "all_progenitors_cNMF"
 K_VALUES = list(range(8, 12))
 DENSITY_THRESHOLD = 0.1

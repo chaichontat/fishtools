@@ -53,10 +53,15 @@ _LAZY_ATTRS: Dict[str, Tuple[str, str]] = {
     "leiden_umap": ("fishtools.postprocess.utils_h5ad", "leiden_umap"),
     "normalize_pearson": ("fishtools.postprocess.utils_h5ad", "normalize_pearson"),
     "normalize_total": ("fishtools.postprocess.utils_h5ad", "normalize_total"),
+    "prefix_dataset_to_obs_names": ("fishtools.postprocess.utils_h5ad", "prefix_dataset_to_obs_names"),
     "qc": ("fishtools.postprocess.utils_h5ad", "qc"),
+    "read_obs_parquet": ("fishtools.postprocess.utils_h5ad", "read_obs_parquet"),
+    "read_obsm_h5ad": ("fishtools.postprocess.utils_h5ad", "read_obsm_h5ad"),
     "run_spaco": ("fishtools.postprocess.utils_h5ad", "run_spaco"),
     "run_tricycle": ("fishtools.postprocess.utils_h5ad", "run_tricycle"),
     "std_log1p": ("fishtools.postprocess.utils_h5ad", "std_log1p"),
+    "write_obs_parquet": ("fishtools.postprocess.utils_h5ad", "write_obs_parquet"),
+    "write_obsm_h5ad": ("fishtools.postprocess.utils_h5ad", "write_obsm_h5ad"),
     # spatial helpers
     "rotate_rois_in_adata": ("fishtools.utils.spatial_transform", "rotate_rois_in_adata"),
     "translate_rois_in_adata": ("fishtools.utils.spatial_transform", "translate_rois_in_adata"),
@@ -148,7 +153,16 @@ if TYPE_CHECKING:  # pragma: no cover - for editors only
         normalize_total as normalize_total,
     )
     from fishtools.postprocess.utils_h5ad import (
+        prefix_dataset_to_obs_names as prefix_dataset_to_obs_names,
+    )
+    from fishtools.postprocess.utils_h5ad import (
         qc as qc,
+    )
+    from fishtools.postprocess.utils_h5ad import (
+        read_obs_parquet as read_obs_parquet,
+    )
+    from fishtools.postprocess.utils_h5ad import (
+        read_obsm_h5ad as read_obsm_h5ad,
     )
     from fishtools.postprocess.utils_h5ad import (
         run_spaco as run_spaco,
@@ -158,6 +172,12 @@ if TYPE_CHECKING:  # pragma: no cover - for editors only
     )
     from fishtools.postprocess.utils_h5ad import (
         std_log1p as std_log1p,
+    )
+    from fishtools.postprocess.utils_h5ad import (
+        write_obs_parquet as write_obs_parquet,
+    )
+    from fishtools.postprocess.utils_h5ad import (
+        write_obsm_h5ad as write_obsm_h5ad,
     )
 
 
