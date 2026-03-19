@@ -7,10 +7,25 @@ import { applyUnfold, createUnfoldContext } from "./unfold";
 declare const __VIEWER_DIR_ABS__: string;
 declare const __REPO_ROOT_ABS__: string;
 
-const DEFAULT_CAMERA_YAW_DEG = 30.0;
-const DEFAULT_CAMERA_PITCH_DEG = -80.0;
-const DEFAULT_CAMERA_ROLL_DEG = -150.0;
+const DEFAULT_CAMERA_YAW_DEG = -180.0;
+const DEFAULT_CAMERA_PITCH_DEG = -90.0;
+const DEFAULT_CAMERA_ROLL_DEG = 180.0;
 const DEFAULT_CAMERA_DIST = 12000.0;
+const PLAYBACK_DURATION_SEC = 4.0;
+const HEMISPHERE_TRANSITION_SEC = 0.85;
+const OVERLAY_STAGE_START_FRAC = 0.12;
+const OVERLAY_STAGE_END_FRAC = 0.68;
+const BRAIN_STAGE_START_FRAC = 0.78;
+const HEMISPHERE_RIGHT_SLIDE_FRAC = 0.0;
+const HEMISPHERE_LEFT_ENTRY_FRAC = 0.0;
+const PLANE_FILL_OPACITY = 0.13;
+const PLANE_OUTLINE_OPACITY = 0.7;
+const AP_AXIS_OPACITY = 0.9;
+const CAMERA_LIGHT_ELEVATION_DEG = 30.0;
+const CAMERA_LIGHT_INTENSITY = 0.42;
+const PLANE_OFFSET_UM = 8.0;
+
+type HemisphereSide = "left" | "right";
 
 function shadeNeoSupportColors(
   baseColors: Uint8Array,
@@ -55,10 +70,10 @@ function shadeNeoSupportColors(
   return out;
 }
 
-function createDirectionSprite(
+function createDirectionSpriteTexture(
   text: string,
   colorHex: string,
-): { sprite: THREE.Sprite; aspect: number } {
+): { texture: THREE.CanvasTexture; aspect: number } {
   const canvas = document.createElement("canvas");
   const context = canvas.getContext("2d");
   if (!context) {
@@ -88,6 +103,14 @@ function createDirectionSprite(
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.needsUpdate = true;
+  return { texture, aspect: canvas.width / canvas.height };
+}
+
+function createDirectionSprite(
+  text: string,
+  colorHex: string,
+): { sprite: THREE.Sprite; aspect: number } {
+  const { texture, aspect } = createDirectionSpriteTexture(text, colorHex);
   const material = new THREE.SpriteMaterial({
     map: texture,
     transparent: true,
@@ -96,27 +119,36 @@ function createDirectionSprite(
     alphaTest: 0.02,
   });
   const sprite = new THREE.Sprite(material);
-  return { sprite, aspect: canvas.width / canvas.height };
+  return { sprite, aspect };
+}
+
+function setDirectionSpriteText(
+  label: { sprite: THREE.Sprite; aspect: number },
+  text: string,
+  colorHex: string,
+): void {
+  const { texture, aspect } = createDirectionSpriteTexture(text, colorHex);
+  const material = label.sprite.material as THREE.SpriteMaterial;
+  material.map?.dispose();
+  material.map = texture;
+  material.needsUpdate = true;
+  label.aspect = aspect;
 }
 
 function updateDirectionSprites({
-  geometry,
+  bounds,
   labels,
 }: {
-  geometry: THREE.BufferGeometry;
+  bounds: THREE.Box3;
   labels: {
     anterior: { sprite: THREE.Sprite; aspect: number };
     posterior: { sprite: THREE.Sprite; aspect: number };
-    lateral: { sprite: THREE.Sprite; aspect: number };
-    medial: { sprite: THREE.Sprite; aspect: number };
+    negativeX: { sprite: THREE.Sprite; aspect: number };
+    positiveX: { sprite: THREE.Sprite; aspect: number };
   };
 }): void {
-  const positionAttr = geometry.getAttribute(
-    "position",
-  ) as THREE.BufferAttribute;
-  const bbox = new THREE.Box3().setFromBufferAttribute(positionAttr);
-  const center = bbox.getCenter(new THREE.Vector3());
-  const size = bbox.getSize(new THREE.Vector3());
+  const center = bounds.getCenter(new THREE.Vector3());
+  const size = bounds.getSize(new THREE.Vector3());
   const extent = Math.max(size.x, size.z, 1.0);
   const apPad = 0.45 * extent;
   const y = center.y;
@@ -124,10 +156,10 @@ function updateDirectionSprites({
   const mlPad = Math.max(0.35 * extent, 1.8 * textH);
 
   // AP labels are anchored at the AP axis line endpoints.
-  labels.anterior.sprite.position.set(center.x, y, bbox.min.z - apPad);
-  labels.posterior.sprite.position.set(center.x, y, bbox.max.z + apPad);
-  labels.lateral.sprite.position.set(bbox.min.x - mlPad, y, center.z);
-  labels.medial.sprite.position.set(bbox.max.x + mlPad, y, center.z);
+  labels.anterior.sprite.position.set(center.x, y, bounds.min.z - apPad);
+  labels.posterior.sprite.position.set(center.x, y, bounds.max.z + apPad);
+  labels.negativeX.sprite.position.set(bounds.min.x - mlPad, y, center.z);
+  labels.positiveX.sprite.position.set(bounds.max.x + mlPad, y, center.z);
 
   labels.anterior.sprite.scale.set(textH * labels.anterior.aspect, textH, 1.0);
   labels.posterior.sprite.scale.set(
@@ -135,23 +167,19 @@ function updateDirectionSprites({
     textH,
     1.0,
   );
-  labels.lateral.sprite.scale.set(textH * labels.lateral.aspect, textH, 1.0);
-  labels.medial.sprite.scale.set(textH * labels.medial.aspect, textH, 1.0);
+  labels.negativeX.sprite.scale.set(textH * labels.negativeX.aspect, textH, 1.0);
+  labels.positiveX.sprite.scale.set(textH * labels.positiveX.aspect, textH, 1.0);
 }
 
 function updateApAxisLine({
-  geometry,
+  bounds,
   line,
 }: {
-  geometry: THREE.BufferGeometry;
+  bounds: THREE.Box3;
   line: THREE.Line;
 }): void {
-  const positionAttr = geometry.getAttribute(
-    "position",
-  ) as THREE.BufferAttribute;
-  const bbox = new THREE.Box3().setFromBufferAttribute(positionAttr);
-  const center = bbox.getCenter(new THREE.Vector3());
-  const size = bbox.getSize(new THREE.Vector3());
+  const center = bounds.getCenter(new THREE.Vector3());
+  const size = bounds.getSize(new THREE.Vector3());
   const extent = Math.max(size.x, size.z, 1.0);
   const pad = 0.5 * extent;
 
@@ -160,41 +188,169 @@ function updateApAxisLine({
   if (!linePos || linePos.count < 2) {
     throw new Error("AP axis line geometry is not initialized.");
   }
-  linePos.setXYZ(0, center.x, center.y, bbox.min.z - pad);
-  linePos.setXYZ(1, center.x, center.y, bbox.max.z + pad);
+  linePos.setXYZ(0, center.x, center.y, bounds.min.z - pad);
+  linePos.setXYZ(1, center.x, center.y, bounds.max.z + pad);
   linePos.needsUpdate = true;
   line.geometry.computeBoundingSphere();
 }
 
 function updateMlApPlane({
-  geometry,
+  bounds,
   planeFill,
   planeOutline,
 }: {
-  geometry: THREE.BufferGeometry;
+  bounds: THREE.Box3;
   planeFill: THREE.Mesh;
   planeOutline: THREE.LineSegments;
 }): void {
-  const positionAttr = geometry.getAttribute(
-    "position",
-  ) as THREE.BufferAttribute;
-  const bbox = new THREE.Box3().setFromBufferAttribute(positionAttr);
-  const center = bbox.getCenter(new THREE.Vector3());
-  const size = bbox.getSize(new THREE.Vector3());
+  const center = bounds.getCenter(new THREE.Vector3());
+  const size = bounds.getSize(new THREE.Vector3());
   const extent = Math.max(size.x, size.z, 1.0);
   const pad = 0.15 * extent;
   const width = Math.max(1.0, size.x + 2.0 * pad);
   const depth = Math.max(1.0, size.z + 2.0 * pad);
+  const offsetY = center.y - PLANE_OFFSET_UM;
 
-  planeFill.position.set(center.x, center.y, center.z);
+  planeFill.position.set(center.x, offsetY, center.z);
   planeFill.scale.set(width, depth, 1.0);
 
-  planeOutline.position.set(center.x, center.y, center.z);
+  planeOutline.position.set(center.x, offsetY, center.z);
   planeOutline.scale.set(width, depth, 1.0);
+}
+
+function inferSourceHemisphere(
+  positions: Float32Array,
+  mirrorPlaneX: number,
+): HemisphereSide {
+  let sumX = 0.0;
+  let count = 0;
+  for (let idx = 0; idx < positions.length; idx += 3) {
+    sumX += positions[idx];
+    count += 1;
+  }
+  if (count === 0) {
+    throw new Error("Cannot infer hemisphere from an empty positions array.");
+  }
+  return sumX / count < mirrorPlaneX ? "left" : "right";
+}
+
+function getMlAxisLabels({
+  sourceHemisphere,
+  showBoth,
+}: {
+  sourceHemisphere: HemisphereSide;
+  showBoth: boolean;
+}): { negativeX: string; positiveX: string; legendLine: string } {
+  if (showBoth) {
+    return {
+      negativeX: "Lateral (-X)",
+      positiveX: "Lateral (+X)",
+      legendLine: "Lateral on both hemispheres",
+    };
+  }
+  if (sourceHemisphere === "left") {
+    return {
+      negativeX: "Lateral (-X)",
+      positiveX: "Medial (+X)",
+      legendLine: "Lateral: -X, Medial: +X",
+    };
+  }
+  return {
+    negativeX: "Medial (-X)",
+    positiveX: "Lateral (+X)",
+    legendLine: "Medial: -X, Lateral: +X",
+  };
+}
+
+function computeActiveBounds({
+  bounds,
+  rightTranslateX,
+  mirroredPositionX,
+  blendFactor,
+}: {
+  bounds: THREE.Box3;
+  rightTranslateX: number;
+  mirroredPositionX: number;
+  blendFactor: number;
+}): THREE.Box3 {
+  const rightBounds = new THREE.Box3(
+    new THREE.Vector3(
+      bounds.min.x + rightTranslateX,
+      bounds.min.y,
+      bounds.min.z,
+    ),
+    new THREE.Vector3(
+      bounds.max.x + rightTranslateX,
+      bounds.max.y,
+      bounds.max.z,
+    ),
+  );
+  if (blendFactor <= 1.0e-6) {
+    return rightBounds;
+  }
+  const mirroredMinX = Math.min(
+    (-bounds.min.x) + mirroredPositionX,
+    (-bounds.max.x) + mirroredPositionX,
+  );
+  const mirroredMaxX = Math.max(
+    (-bounds.min.x) + mirroredPositionX,
+    (-bounds.max.x) + mirroredPositionX,
+  );
+  const bothBounds = rightBounds.clone().union(
+    new THREE.Box3(
+      new THREE.Vector3(mirroredMinX, bounds.min.y, bounds.min.z),
+      new THREE.Vector3(mirroredMaxX, bounds.max.y, bounds.max.z),
+    ),
+  );
+  const t = Math.max(0.0, Math.min(1.0, blendFactor));
+  return new THREE.Box3(
+    new THREE.Vector3(
+      THREE.MathUtils.lerp(rightBounds.min.x, bothBounds.min.x, t),
+      THREE.MathUtils.lerp(rightBounds.min.y, bothBounds.min.y, t),
+      THREE.MathUtils.lerp(rightBounds.min.z, bothBounds.min.z, t),
+    ),
+    new THREE.Vector3(
+      THREE.MathUtils.lerp(rightBounds.max.x, bothBounds.max.x, t),
+      THREE.MathUtils.lerp(rightBounds.max.y, bothBounds.max.y, t),
+      THREE.MathUtils.lerp(rightBounds.max.z, bothBounds.max.z, t),
+    ),
+  );
+}
+
+function getMedialMirrorPlaneX({
+  bounds,
+  sourceHemisphere,
+}: {
+  bounds: THREE.Box3;
+  sourceHemisphere: HemisphereSide;
+}): number {
+  return sourceHemisphere === "left" ? bounds.max.x : bounds.min.x;
+}
+
+function cubicEaseInOut(x: number): number {
+  const t = Math.max(0.0, Math.min(1.0, x));
+  if (t < 0.5) {
+    return 4.0 * t * t * t;
+  }
+  return 1.0 - Math.pow(-2.0 * t + 2.0, 3.0) / 2.0;
+}
+
+function stagedBlend(progress: number, start: number, end: number): number {
+  if (end <= start) {
+    throw new Error(`Invalid staged blend interval [${start}, ${end}].`);
+  }
+  return cubicEaseInOut((progress - start) / (end - start));
 }
 
 function wrapDegSigned(deg: number): number {
   return ((((deg + 180.0) % 360.0) + 360.0) % 360.0) - 180.0;
+}
+
+function formatSignedDegFixed(deg: number): string {
+  const wrapped = wrapDegSigned(deg);
+  const sign = wrapped < 0 ? "-" : "+";
+  const absText = Math.abs(wrapped).toFixed(1).padStart(5, " ");
+  return `${sign}${absText}`;
 }
 
 function updateCameraReadout({
@@ -216,7 +372,39 @@ function updateCameraReadout({
     Math.atan2(offset.y, Math.hypot(offset.x, offset.z)) * (180.0 / Math.PI);
   const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, "YXZ");
   const rollZ = euler.z * (180.0 / Math.PI);
-  elem.textContent = `camera yaw(Y)=${wrapDegSigned(azimuthY).toFixed(1)}° pitch(X)=${wrapDegSigned(elevX).toFixed(1)}° roll(Z)=${wrapDegSigned(rollZ).toFixed(1)}° dist=${dist.toFixed(1)}`;
+  elem.textContent =
+    `camera yaw(Y)=${formatSignedDegFixed(azimuthY)}° ` +
+    `pitch(X)=${formatSignedDegFixed(elevX)}° ` +
+    `roll(Z)=${formatSignedDegFixed(rollZ)}° ` +
+    `dist=${dist.toFixed(1)}`;
+}
+
+function updateCameraFollowLight({
+  camera,
+  controls,
+  light,
+}: {
+  camera: THREE.PerspectiveCamera;
+  controls: TrackballControls;
+  light: THREE.DirectionalLight;
+}): void {
+  const target = controls.target.clone();
+  const toCamera = camera.position.clone().sub(target);
+  const distance = Math.max(toCamera.length(), 1.0);
+  const elevated = toCamera
+    .add(
+      camera.up
+        .clone()
+        .normalize()
+        .multiplyScalar(
+          distance * Math.tan((CAMERA_LIGHT_ELEVATION_DEG * Math.PI) / 180.0),
+        ),
+    )
+    .normalize()
+    .multiplyScalar(distance);
+  light.position.copy(target).add(elevated);
+  light.target.position.copy(target);
+  light.target.updateMatrixWorld();
 }
 
 function setCameraPose({
@@ -370,20 +558,16 @@ function parseAssetsBase(): string {
 
 async function main(): Promise<void> {
   const canvasRoot = getElement<HTMLDivElement>("canvas-root");
+  const bothHemispheresInput =
+    getElement<HTMLInputElement>("both-hemispheres");
   const progressInput = getElement<HTMLInputElement>("progress");
   const playButton = getElement<HTMLButtonElement>("play");
-  const resetButton = getElement<HTMLButtonElement>("reset");
-  const flipInput = getElement<HTMLInputElement>("flip");
   const speedSelect = getElement<HTMLSelectElement>("speed");
-  const durationInput = getElement<HTMLInputElement>("duration");
-  const statusElem = getElement<HTMLDivElement>("status");
   const cameraReadoutElem = getElement<HTMLDivElement>("camera-readout");
   const scaleBarElem = getElement<HTMLDivElement>("scalebar");
   const scaleBarLabelElem = getElement<HTMLDivElement>("scalebar-label");
-  const errorElem = getElement<HTMLDivElement>("error");
 
   const assetsBase = parseAssetsBase();
-  statusElem.textContent = `Loading assets from: ${assetsBase} (repo: ${__REPO_ROOT_ABS__})`;
   const loaded = await loadAssets(assetsBase);
   const phase1Frac = loaded.manifest.phase1_frac_default;
   const shadedColors = shadeNeoSupportColors(
@@ -413,52 +597,67 @@ async function main(): Promise<void> {
   );
   geometry.computeVertexNormals();
 
-  const material = new THREE.MeshStandardMaterial({
+  const materialParams = {
     vertexColors: true,
-    roughness: 0.58,
-    metalness: 0.03,
+    color: 0xffffff,
     side: THREE.DoubleSide,
-  });
-  const mesh = new THREE.Mesh(geometry, material);
+  } as const satisfies THREE.MeshStandardMaterialParameters;
+  const rightMaterial = new THREE.MeshStandardMaterial(materialParams);
+  const leftMaterial = new THREE.MeshStandardMaterial(materialParams);
+  leftMaterial.transparent = true;
+  leftMaterial.opacity = 0.0;
+  leftMaterial.depthWrite = false;
+  const mesh = new THREE.Mesh(geometry, rightMaterial);
+  const initialBounds = new THREE.Box3().setFromBufferAttribute(
+    geometry.getAttribute("position") as THREE.BufferAttribute,
+  );
+  const sourceHemisphere = inferSourceHemisphere(loaded.positions, 5700.0);
+  const mirroredMesh = new THREE.Mesh(geometry, leftMaterial);
+  mirroredMesh.scale.x = -1.0;
+  mirroredMesh.visible = false;
+  const hemisphereSign = sourceHemisphere === "right" ? 1.0 : -1.0;
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color("#f4f7ec");
   scene.add(mesh);
+  scene.add(mirroredMesh);
   const labels = {
     anterior: createDirectionSprite("Anterior (-Z)", "#93354e"),
     posterior: createDirectionSprite("Posterior (+Z)", "#93354e"),
-    lateral: createDirectionSprite("Lateral (-X)", "#245f8f"),
-    medial: createDirectionSprite("Medial (+X)", "#245f8f"),
+    negativeX: createDirectionSprite("Lateral (-X)", "#245f8f"),
+    positiveX: createDirectionSprite("Medial (+X)", "#245f8f"),
   };
   scene.add(labels.anterior.sprite);
   scene.add(labels.posterior.sprite);
-  scene.add(labels.lateral.sprite);
-  scene.add(labels.medial.sprite);
+  scene.add(labels.negativeX.sprite);
+  scene.add(labels.positiveX.sprite);
   const mlApPlaneGeometry = new THREE.PlaneGeometry(1, 1);
   const mlApPlane = new THREE.Mesh(
     mlApPlaneGeometry,
     new THREE.MeshBasicMaterial({
       color: 0x1f3b5c,
       transparent: true,
-      opacity: 0.13,
-      side: THREE.DoubleSide,
+      opacity: PLANE_FILL_OPACITY,
+      side: THREE.FrontSide,
       depthTest: true,
-      depthWrite: false,
+      depthWrite: true,
     }),
   );
   mlApPlane.rotation.x = -Math.PI / 2.0;
+  mlApPlane.renderOrder = 2;
   scene.add(mlApPlane);
   const mlApPlaneOutline = new THREE.LineSegments(
     new THREE.EdgesGeometry(mlApPlaneGeometry),
     new THREE.LineBasicMaterial({
       color: 0x1f3b5c,
       transparent: true,
-      opacity: 0.7,
+      opacity: PLANE_OUTLINE_OPACITY,
       depthTest: true,
       depthWrite: false,
     }),
   );
   mlApPlaneOutline.rotation.x = -Math.PI / 2.0;
+  mlApPlaneOutline.renderOrder = 3;
   scene.add(mlApPlaneOutline);
   const apAxisLineGeometry = new THREE.BufferGeometry();
   apAxisLineGeometry.setAttribute(
@@ -475,16 +674,25 @@ async function main(): Promise<void> {
       depthWrite: false,
     }),
   );
+  apAxisLine.renderOrder = 3;
   scene.add(apAxisLine);
 
-  const hemi = new THREE.HemisphereLight(0xfaf9ef, 0xb9c7a0, 0.85);
+  const ambient = new THREE.AmbientLight(0xffffff, 0.32);
+  scene.add(ambient);
+  const hemi = new THREE.HemisphereLight(0xfdfcf4, 0xc9d7b4, 1.15);
   scene.add(hemi);
-  const key = new THREE.DirectionalLight(0xffffff, 0.9);
+  const key = new THREE.DirectionalLight(0xffffff, 0.75);
   key.position.set(2.0, 1.4, 1.1);
   scene.add(key);
-  const rim = new THREE.DirectionalLight(0xc8d7ff, 0.45);
+  const rim = new THREE.DirectionalLight(0xd7e4ff, 0.32);
   rim.position.set(-1.4, 0.7, -1.3);
   scene.add(rim);
+  const cameraLight = new THREE.DirectionalLight(
+    0xfff7ef,
+    CAMERA_LIGHT_INTENSITY,
+  );
+  scene.add(cameraLight);
+  scene.add(cameraLight.target);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -497,10 +705,67 @@ async function main(): Promise<void> {
     0.1,
     1e7,
   );
-  const bbox = new THREE.Box3().setFromBufferAttribute(
-    geometry.getAttribute("position") as THREE.BufferAttribute,
-  );
-  const center = bbox.getCenter(new THREE.Vector3());
+  let hemisphereBlend = bothHemispheresInput.checked ? 1.0 : 0.0;
+  let hemisphereBlendTarget = hemisphereBlend;
+  let activeBounds = computeActiveBounds({
+    bounds: initialBounds,
+    rightTranslateX: 0.0,
+    mirroredPositionX: 0.0,
+    blendFactor: hemisphereBlend,
+  });
+  let activeCenter = activeBounds.getCenter(new THREE.Vector3());
+  let displayedMlLabelsShowBoth: boolean | null = null;
+  const updateMlLabels = (showBoth: boolean): void => {
+    if (displayedMlLabelsShowBoth === showBoth) {
+      return;
+    }
+    displayedMlLabelsShowBoth = showBoth;
+    const mlLabels = getMlAxisLabels({ sourceHemisphere, showBoth });
+    setDirectionSpriteText(labels.negativeX, mlLabels.negativeX, "#245f8f");
+    setDirectionSpriteText(labels.positiveX, mlLabels.positiveX, "#245f8f");
+  };
+  const syncHemisphereMode = (): void => {
+    hemisphereBlendTarget = bothHemispheresInput.checked ? 1.0 : 0.0;
+  };
+  const updateHemispherePresentation = (bounds: THREE.Box3): void => {
+    const overlayBlend = stagedBlend(
+      hemisphereBlend,
+      OVERLAY_STAGE_START_FRAC,
+      OVERLAY_STAGE_END_FRAC,
+    );
+    const brainBlend = stagedBlend(hemisphereBlend, BRAIN_STAGE_START_FRAC, 1.0);
+    updateMlLabels(overlayBlend >= 0.5);
+    const mirrorPlaneX = getMedialMirrorPlaneX({ bounds, sourceHemisphere });
+    const width = Math.max(bounds.max.x - bounds.min.x, 1.0);
+    const rightTranslateX =
+      hemisphereSign * HEMISPHERE_RIGHT_SLIDE_FRAC * width * brainBlend;
+    const leftEntryOffset =
+      hemisphereSign *
+      HEMISPHERE_LEFT_ENTRY_FRAC *
+      width *
+      (1.0 - brainBlend);
+    mesh.position.x = rightTranslateX;
+    mirroredMesh.position.x = (2.0 * mirrorPlaneX) + leftEntryOffset;
+    mirroredMesh.visible = brainBlend > 1.0e-3 || hemisphereBlendTarget >= 1.0;
+    leftMaterial.opacity = brainBlend;
+    leftMaterial.depthWrite = brainBlend >= 0.999;
+    activeBounds = computeActiveBounds({
+      bounds,
+      rightTranslateX,
+      mirroredPositionX: mirroredMesh.position.x,
+      blendFactor: overlayBlend,
+    });
+    activeCenter = activeBounds.getCenter(new THREE.Vector3());
+    (
+      mlApPlane.material as THREE.MeshBasicMaterial
+    ).opacity = PLANE_FILL_OPACITY;
+    (
+      mlApPlaneOutline.material as THREE.LineBasicMaterial
+    ).opacity = PLANE_OUTLINE_OPACITY;
+    (
+      apAxisLine.material as THREE.LineBasicMaterial
+    ).opacity = AP_AXIS_OPACITY;
+  };
 
   const controls = new TrackballControls(camera, renderer.domElement);
   controls.rotateSpeed = 4.0;
@@ -511,12 +776,15 @@ async function main(): Promise<void> {
   setCameraPose({
     camera,
     controls,
-    target: center,
+    target: activeCenter,
     yawDeg: DEFAULT_CAMERA_YAW_DEG,
     pitchDeg: DEFAULT_CAMERA_PITCH_DEG,
     rollDeg: DEFAULT_CAMERA_ROLL_DEG,
     dist: DEFAULT_CAMERA_DIST,
   });
+  updateCameraFollowLight({ camera, controls, light: cameraLight });
+  updateMlLabels(hemisphereBlendTarget > 0.5);
+  syncHemisphereMode();
 
   window.addEventListener("resize", () => {
     const w = canvasRoot.clientWidth;
@@ -532,11 +800,10 @@ async function main(): Promise<void> {
   let lastTimeSec = performance.now() * 0.001;
 
   const applyCurrentState = (): void => {
-    const flipXZ = flipInput.checked;
     applyUnfold(context, {
       progress,
       phase1Frac,
-      flipXZ,
+      flipXZ: false,
       outXYZ: dynamicPositions,
     });
     const positionAttr = geometry.getAttribute(
@@ -544,14 +811,15 @@ async function main(): Promise<void> {
     ) as THREE.BufferAttribute;
     positionAttr.needsUpdate = true;
     geometry.computeVertexNormals();
-    updateDirectionSprites({ geometry, labels });
-    updateApAxisLine({ geometry, line: apAxisLine });
+    const currentBounds = new THREE.Box3().setFromBufferAttribute(positionAttr);
+    updateHemispherePresentation(currentBounds);
+    updateDirectionSprites({ bounds: activeBounds, labels });
+    updateApAxisLine({ bounds: activeBounds, line: apAxisLine });
     updateMlApPlane({
-      geometry,
+      bounds: activeBounds,
       planeFill: mlApPlane,
       planeOutline: mlApPlaneOutline,
     });
-    statusElem.textContent = `progress=${progress.toFixed(3)} flipXZ=${flipXZ}`;
   };
 
   const setPlaying = (value: boolean): void => {
@@ -564,19 +832,11 @@ async function main(): Promise<void> {
     setPlaying(false);
     applyCurrentState();
   });
-  flipInput.addEventListener("change", applyCurrentState);
-  playButton.addEventListener("click", () => setPlaying(!playing));
-  resetButton.addEventListener("click", () => {
-    setCameraPose({
-      camera,
-      controls,
-      target: center,
-      yawDeg: DEFAULT_CAMERA_YAW_DEG,
-      pitchDeg: DEFAULT_CAMERA_PITCH_DEG,
-      rollDeg: DEFAULT_CAMERA_ROLL_DEG,
-      dist: DEFAULT_CAMERA_DIST,
-    });
+  bothHemispheresInput.addEventListener("change", () => {
+    setPlaying(false);
+    syncHemisphereMode();
   });
+  playButton.addEventListener("click", () => setPlaying(!playing));
 
   applyCurrentState();
 
@@ -587,8 +847,7 @@ async function main(): Promise<void> {
 
     if (playing) {
       const speed = Number(speedSelect.value);
-      const duration = Math.max(1.0, Number(durationInput.value));
-      progress = Math.min(1.0, progress + (dt * speed) / duration);
+      progress = Math.min(1.0, progress + (dt * speed) / PLAYBACK_DURATION_SEC);
       progressInput.value = progress.toFixed(3);
       if (progress >= 1.0) {
         setPlaying(false);
@@ -596,7 +855,21 @@ async function main(): Promise<void> {
       applyCurrentState();
     }
 
+    if (Math.abs(hemisphereBlend - hemisphereBlendTarget) > 1.0e-4) {
+      const step = dt / HEMISPHERE_TRANSITION_SEC;
+      if (hemisphereBlend < hemisphereBlendTarget) {
+        hemisphereBlend = Math.min(hemisphereBlendTarget, hemisphereBlend + step);
+      } else {
+        hemisphereBlend = Math.max(hemisphereBlendTarget, hemisphereBlend - step);
+      }
+      applyCurrentState();
+      if (Math.abs(hemisphereBlend - hemisphereBlendTarget) <= 1.0e-4) {
+        hemisphereBlend = hemisphereBlendTarget;
+      }
+    }
+
     controls.update();
+    updateCameraFollowLight({ camera, controls, light: cameraLight });
     updateCameraReadout({ camera, controls, elem: cameraReadoutElem });
     updateScaleBar({
       camera,

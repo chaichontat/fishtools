@@ -39,8 +39,8 @@
       }
       #controls {
         position: absolute;
-        top: 16px;
-        left: 16px;
+        right: 16px;
+        bottom: 16px;
         min-width: 330px;
         max-width: min(500px, calc(100vw - 32px));
         padding: 14px;
@@ -50,11 +50,52 @@
         box-shadow: 0 14px 40px rgba(28, 32, 20, 0.16);
         backdrop-filter: blur(5px);
       }
+      #hemisphere-toggle {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 10px 12px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        box-shadow: 0 14px 40px rgba(28, 32, 20, 0.16);
+        backdrop-filter: blur(5px);
+        font-size: 13px;
+      }
       .row {
         display: flex;
         gap: 10px;
         align-items: center;
         margin-top: 10px;
+      }
+      .row.controls-main {
+        margin-top: 0;
+      }
+      .row.controls-main input[type="range"] {
+        flex: 1 1 auto;
+        min-width: 120px;
+      }
+      .row.controls-main button,
+      .row.controls-main select {
+        flex: 0 0 auto;
+      }
+      .legend-note {
+        margin-top: 10px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 12px;
+        color: #33413a;
+      }
+      .legend-swatch {
+        width: 14px;
+        height: 14px;
+        border-radius: 3px;
+        border: 1px solid rgba(36, 41, 34, 0.18);
+        background: linear-gradient(135deg, #6b7580 0%, #4f5862 100%);
       }
       .row label {
         min-width: 100px;
@@ -81,6 +122,7 @@
         margin-top: 6px;
         font-size: 12px;
         color: #2f4a60;
+        white-space: pre;
         font-family:
           ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas,
           "Liberation Mono", "Courier New", monospace;
@@ -90,18 +132,6 @@
         color: #9f2424;
         font-size: 12px;
         white-space: pre-wrap;
-      }
-      #axis-legend {
-        margin-top: 8px;
-        padding: 8px 10px;
-        border: 1px solid #d3d9c1;
-        border-radius: 8px;
-        background: #f7f9ef;
-        font-size: 12px;
-        line-height: 1.35;
-      }
-      #axis-legend b {
-        font-weight: 600;
       }
       #scalebar-wrap {
         position: absolute;
@@ -128,18 +158,19 @@
   <body>
     <div id="app">
       <div id="canvas-root"></div>
+      <label id="hemisphere-toggle">
+        <input id="both-hemispheres" type="checkbox" />
+        Both hemispheres
+      </label>
       <div id="controls">
-        <div><strong>AP/ML Unfold Viewer</strong></div>
-        <div style="font-size: 12px; margin-top: 2px">
-          Trackball: left-drag rotate, right-drag pan, wheel zoom
-        </div>
-        <div id="axis-legend">
-          <div><b>Directions</b></div>
-          <div>Anterior: -Z, Posterior: +Z</div>
-          <div>Lateral: -X, Medial: +X</div>
-        </div>
-        <div class="row">
-          <label for="progress">Progress</label>
+        <div class="row controls-main">
+          <button id="play">Play</button>
+          <select id="speed">
+            <option value="0.25">0.25x</option>
+            <option value="0.5">0.5x</option>
+            <option value="1" selected>1x</option>
+            <option value="2">2x</option>
+          </select>
           <input
             id="progress"
             type="range"
@@ -149,32 +180,10 @@
             value="0"
           />
         </div>
-        <div class="row">
-          <button id="play">Play</button>
-          <button id="reset">Reset Camera</button>
-          <label
-            style="
-              min-width: auto;
-              display: flex;
-              align-items: center;
-              gap: 6px;
-            "
-          >
-            <input id="flip" type="checkbox" />
-            Flip xz
-          </label>
-          <select id="speed">
-            <option value="0.25">0.25x</option>
-            <option value="0.5">0.5x</option>
-            <option value="1" selected>1x</option>
-            <option value="2">2x</option>
-          </select>
+        <div class="legend-note">
+          <span class="legend-swatch"></span>
+          <span>Shaded region: neocortex</span>
         </div>
-        <div class="row">
-          <label for="duration">Duration (s)</label>
-          <input id="duration" type="number" min="1" step="1" value="8" />
-        </div>
-        <div id="status"></div>
         <div id="camera-readout"></div>
         <div id="error"></div>
       </div>
