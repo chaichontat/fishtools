@@ -47,15 +47,15 @@
         background: var(--panel);
         border: 1px solid var(--line);
         border-radius: 10px;
-        box-shadow: 0 14px 40px rgba(28, 32, 20, 0.16);
+        box-shadow: 0 8px 20px rgba(28, 32, 20, 0.12);
         backdrop-filter: blur(5px);
       }
-      #hemisphere-toggle {
+      #scene-toggles {
         position: absolute;
         top: 16px;
         right: 16px;
         display: flex;
-        align-items: center;
+        flex-direction: column;
         gap: 6px;
         padding: 10px 12px;
         background: var(--panel);
@@ -63,6 +63,11 @@
         border-radius: 10px;
         box-shadow: 0 14px 40px rgba(28, 32, 20, 0.16);
         backdrop-filter: blur(5px);
+      }
+      .scene-toggle {
+        display: flex;
+        align-items: center;
+        gap: 6px;
         font-size: 13px;
       }
       .row {
@@ -153,7 +158,8 @@
       }
       #scalebar-label {
         margin-top: 6px;
-        font-size: 12px;
+        font-size: 15px;
+        font-weight: 400;
         color: #000000;
         text-align: center;
         font-family: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
@@ -163,10 +169,16 @@
   <body>
     <div id="app">
       <div id="canvas-root"></div>
-      <label id="hemisphere-toggle">
-        <input id="both-hemispheres" type="checkbox" />
-        Both hemispheres
-      </label>
+      <div id="scene-toggles">
+        <label class="scene-toggle">
+          <input id="both-hemispheres" type="checkbox" />
+          Both hemispheres
+        </label>
+        <label class="scene-toggle">
+          <input id="reference-lines" type="checkbox" />
+          Sagittal + coronal lines
+        </label>
+      </div>
       <div id="controls">
         <div class="row controls-main">
           <button id="play">Play</button>

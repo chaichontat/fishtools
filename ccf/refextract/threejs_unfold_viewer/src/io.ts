@@ -12,6 +12,19 @@ export interface UnfoldManifest {
   src_anchor_i: number;
   j_plane: number;
   flip_y0: number;
+  reference_lines: {
+    n_points: number;
+    n_ranges: number;
+    kinds: {
+      coronal: number;
+      sagittal: number;
+    };
+    defaults: {
+      ap_hline_step_um: number;
+      sagittal_k_step: number;
+      sagittal_n_sample: number;
+    };
+  };
   files: {
     positions_f32: string;
     faces_u32: string;
@@ -20,6 +33,8 @@ export interface UnfoldManifest {
     theta_f32: string;
     ap_um_f32: string;
     neo_t_support_u8?: string;
+    line_points_f32: string;
+    line_ranges_u32: string;
   };
 }
 
@@ -32,6 +47,8 @@ export interface LoadedAssets {
   theta: Float32Array;
   ap: Float32Array;
   neoTSupport: Uint8Array | null;
+  linePoints: Float32Array;
+  lineRanges: Uint32Array;
 }
 
 function joinUrl(base: string, file: string): string {
@@ -68,7 +85,7 @@ async function fetchBytes(url: string): Promise<ArrayBuffer> {
 export async function loadAssets(baseUrl: string): Promise<LoadedAssets> {
   const manifestUrl = joinUrl(baseUrl, "manifest.json");
   const manifest = await fetchJson<UnfoldManifest>(manifestUrl);
-  if (manifest.version !== 1) {
+  if (manifest.version !== 2) {
     throw new Error(`Unsupported manifest version ${manifest.version}`);
   }
   const neoMaskUrl = manifest.files.neo_t_support_u8
@@ -82,6 +99,8 @@ export async function loadAssets(baseUrl: string): Promise<LoadedAssets> {
     thetaBuf,
     apBuf,
     neoMaskBuf,
+    linePointsBuf,
+    lineRangesBuf,
   ] = await Promise.all([
     fetchBytes(joinUrl(baseUrl, manifest.files.positions_f32)),
     fetchBytes(joinUrl(baseUrl, manifest.files.faces_u32)),
@@ -90,6 +109,8 @@ export async function loadAssets(baseUrl: string): Promise<LoadedAssets> {
     fetchBytes(joinUrl(baseUrl, manifest.files.theta_f32)),
     fetchBytes(joinUrl(baseUrl, manifest.files.ap_um_f32)),
     neoMaskUrl ? fetchBytes(neoMaskUrl) : Promise.resolve(null),
+    fetchBytes(joinUrl(baseUrl, manifest.files.line_points_f32)),
+    fetchBytes(joinUrl(baseUrl, manifest.files.line_ranges_u32)),
   ]);
   return {
     manifest,
@@ -100,5 +121,7 @@ export async function loadAssets(baseUrl: string): Promise<LoadedAssets> {
     theta: new Float32Array(thetaBuf),
     ap: new Float32Array(apBuf),
     neoTSupport: neoMaskBuf ? new Uint8Array(neoMaskBuf) : null,
+    linePoints: new Float32Array(linePointsBuf),
+    lineRanges: new Uint32Array(lineRangesBuf),
   };
 }

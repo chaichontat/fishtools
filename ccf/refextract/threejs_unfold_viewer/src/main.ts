@@ -792,10 +792,9 @@ function setCameraPose({
 function formatScaleLabelUm(lenUm: number): string {
   if (lenUm >= 1000.0) {
     const mm = lenUm / 1000.0;
-    const decimals = mm >= 10.0 ? 0 : 1;
-    return `${mm.toFixed(decimals)} mm`;
+    return `${mm} mm`;
   }
-  return `${Math.round(lenUm)} um`;
+  return `${lenUm} μm`;
 }
 
 function updateScaleBar({
