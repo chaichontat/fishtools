@@ -1432,6 +1432,8 @@ def save_ap_ml_mapping_figure(
         pe.SimpleLineShadow(offset=(0.8, -0.8), shadow_color="black", alpha=0.04),
         pe.Normal(),
     ]
+    coronal_tick_dash = (0, (1.0, 1.0))
+    coronal_connector_dash = (1.08, (1.0, 1.0))
     ap_lines = _ap_hline_values(ap_range_um=data.ap_range_um, step_um=float(ap_hline_step_um))
     if ap_lines.size > 1:
         ap_lines = ap_lines[1:]
@@ -1482,7 +1484,8 @@ def save_ap_ml_mapping_figure(
         aspect="auto",
     )
     for ap in ap_lines.tolist():
-        ax0.axhline(float(ap), color="#000000", linestyle=":", linewidth=0.9, alpha=0.9)
+        tick_line = ax0.axhline(float(ap), color="#000000", linestyle=coronal_tick_dash, linewidth=0.9, alpha=0.9)
+        tick_line.set_dash_capstyle("butt")
     ap_vals = np.asarray(data.ap_um_by_slice, dtype=np.float64)
     for ap in ap_lines.tolist():
         idx = int(np.argmin(np.abs(ap_vals - float(ap))))
@@ -1627,21 +1630,21 @@ def save_ap_ml_mapping_figure(
 
     x_anchor = float(ax0.get_xlim()[0])
     for ap_um, axp, link_xy_data in panel_axes:
-        fig.add_artist(
-            ConnectionPatch(
-                xyA=(x_anchor, float(ap_um)),
-                coordsA=ax0.transData,
-                xyB=(1.0, 0.5) if link_xy_data is None else link_xy_data,
-                coordsB=axp.transAxes if link_xy_data is None else axp.transData,
-                arrowstyle="-",
-                linestyle=":",
-                linewidth=1.0,
-                color="#000000",
-                alpha=0.65,
-                zorder=30,
-                clip_on=False,
-            )
+        link = ConnectionPatch(
+            xyA=(x_anchor, float(ap_um)),
+            coordsA=ax0.transData,
+            xyB=(1.0, 0.5) if link_xy_data is None else link_xy_data,
+            coordsB=axp.transAxes if link_xy_data is None else axp.transData,
+            arrowstyle="-",
+            linestyle=coronal_connector_dash,
+            linewidth=0.9,
+            color="#000000",
+            alpha=0.9,
+            zorder=30,
+            clip_on=False,
         )
+        link.set_capstyle("butt")
+        fig.add_artist(link)
 
     fig.savefig(out_png, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -1686,6 +1689,7 @@ def save_ap_ml_mapping_figure_sagittal(
         pe.SimpleLineShadow(offset=(0.8, -0.8), shadow_color="black", alpha=0.04),
         pe.Normal(),
     ]
+    coronal_tick_dash = (0, (1.0, 1.0))
 
 
     def _curve_x_at_ap_anchor(panel: SagittalPanel, *, ap_anchor_um: float) -> float | None:
@@ -1989,7 +1993,8 @@ def save_ap_ml_mapping_figure_sagittal(
         aspect="auto",
     )
     for ap in ap_lines.tolist():
-        ax0.axhline(float(ap), color="#000000", linestyle=":", linewidth=0.9, alpha=0.9)
+        tick_line = ax0.axhline(float(ap), color="#000000", linestyle=coronal_tick_dash, linewidth=0.9, alpha=0.9)
+        tick_line.set_dash_capstyle("butt")
 
     # Sagittal slice overlays: curves in the AP/ML chart.
     panels_for_overlay: list[SagittalPanel] = []
@@ -2329,6 +2334,8 @@ def save_ap_ml_mapping_figure_combined(
         pe.SimpleLineShadow(offset=(0.8, -0.8), shadow_color="black", alpha=0.04),
         pe.Normal(),
     ]
+    coronal_tick_dash = (0, (1.0, 1.0))
+    coronal_connector_dash = (1.08, (1.0, 1.0))
 
     ap_lines = _ap_hline_values(ap_range_um=data.ap_range_um, step_um=float(ap_hline_step_um))
     if ap_lines.size > 1:
@@ -2432,7 +2439,8 @@ def save_ap_ml_mapping_figure_combined(
         aspect="auto",
     )
     for ap in ap_lines.tolist():
-        ax0.axhline(float(ap), color="#000000", linestyle=":", linewidth=0.9, alpha=0.9)
+        tick_line = ax0.axhline(float(ap), color="#000000", linestyle=coronal_tick_dash, linewidth=0.9, alpha=0.9)
+        tick_line.set_dash_capstyle("butt")
 
     ap_vals = np.asarray(data.ap_um_by_slice, dtype=np.float64)
     for ap in ap_lines.tolist():
@@ -2653,21 +2661,21 @@ def save_ap_ml_mapping_figure_combined(
 
     x_anchor = float(ax0.get_xlim()[0])
     for ap_um, axp, link_xy_data in coronal_panel_axes:
-        fig.add_artist(
-            ConnectionPatch(
-                xyA=(x_anchor, float(ap_um)),
-                coordsA=ax0.transData,
-                xyB=(1.0, 0.5) if link_xy_data is None else link_xy_data,
-                coordsB=axp.transAxes if link_xy_data is None else axp.transData,
-                arrowstyle="-",
-                linestyle=":",
-                linewidth=1.0,
-                color="#000000",
-                alpha=0.65,
-                zorder=30,
-                clip_on=False,
-            )
+        link = ConnectionPatch(
+            xyA=(x_anchor, float(ap_um)),
+            coordsA=ax0.transData,
+            xyB=(1.0, 0.5) if link_xy_data is None else link_xy_data,
+            coordsB=axp.transAxes if link_xy_data is None else axp.transData,
+            arrowstyle="-",
+            linestyle=coronal_connector_dash,
+            linewidth=0.9,
+            color="#000000",
+            alpha=0.9,
+            zorder=30,
+            clip_on=False,
         )
+        link.set_capstyle("butt")
+        fig.add_artist(link)
 
     n_show = int(len(panel_entries))
     panel_total_w = float(legend_pos_orig.width)
