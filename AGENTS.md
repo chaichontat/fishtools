@@ -7,6 +7,7 @@ Prioritize clarity over action. do not be quick to jump to an action until you�
 - USE THE `seq` CONDA ENVIRONMENT TO RUN ALL PYTHON COMMANDS INCLUDING PYTEST. Use `conda run -n seq …`; if the environment is missing, use the `cp4` environment.
 - Sandbox note: the CLI runs under a seccomp profile; `conda run` can hang if GPU plugins try to register semaphores. When that happens, set `CONDA_NO_PLUGINS=true` or ping the user to loosen sandbox restrictions before proceeding.
 - You do not need to verify `git` status after your edits. There can be changes that _I_ made that I want you to keep, but you may still inspect `git status` to confirm what you touched.
+- Unless the user says otherwise, when rerunning experiments or regenerating analysis outputs, overwrite the existing output folder instead of creating a new sibling folder with a variant suffix.
 - DO NOT create conditional imports or assume that some packages are not going to be available. ALL packages are available, do not try to create a fallback unless explicitly told to do so. It adds bloat and complexity.
 - ABSOLUTELY NEVER add fallbacks (silent defaults, alternate codepaths, “best-effort” behavior) unless the user explicitly requests it. Fall-backs hide bugs and waste debugging time.
 - “Robustness” must be contract-preserving: do not change output semantics (including edge/error cases) unless the user explicitly asks. Prefer failing loudly over silently substituting defaults.

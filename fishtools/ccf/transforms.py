@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from mpl_toolkits.mplot3d import art3d
 from mpl_toolkits.mplot3d import proj3d
+from scipy.interpolate import UnivariateSpline
 
 from ccf.refextract.plot_ap_ml_mapping_surface_3d import build_coronal_ap_ml_surface
 
@@ -127,6 +128,276 @@ def prepare_ordered_surface_geometry(
     }
 
 
+def _clip_polygon_against_signed_distance(
+    poly_param: np.ndarray,
+    poly_proj: np.ndarray,
+    poly_xyz: np.ndarray,
+    *,
+    signed_distance,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if poly_param.shape[0] == 0:
+        return poly_param, poly_proj, poly_xyz
+    out_param: list[np.ndarray] = []
+    out_proj: list[np.ndarray] = []
+    out_xyz: list[np.ndarray] = []
+    prev_param = np.asarray(poly_param[-1], dtype=np.float64)
+    prev_proj = np.asarray(poly_proj[-1], dtype=np.float64)
+    prev_xyz = np.asarray(poly_xyz[-1], dtype=np.float64)
+    prev_dist = float(signed_distance(prev_param))
+    prev_inside = np.isfinite(prev_dist) and prev_dist >= 0.0
+    for idx in range(poly_param.shape[0]):
+        curr_param = np.asarray(poly_param[idx], dtype=np.float64)
+        curr_proj = np.asarray(poly_proj[idx], dtype=np.float64)
+        curr_xyz = np.asarray(poly_xyz[idx], dtype=np.float64)
+        curr_dist = float(signed_distance(curr_param))
+        curr_inside = np.isfinite(curr_dist) and curr_dist >= 0.0
+        if prev_inside != curr_inside and np.isfinite(prev_dist) and np.isfinite(curr_dist) and prev_dist != curr_dist:
+            t = float(np.clip(prev_dist / (prev_dist - curr_dist), 0.0, 1.0))
+            out_param.append(prev_param + t * (curr_param - prev_param))
+            out_proj.append(prev_proj + t * (curr_proj - prev_proj))
+            out_xyz.append(prev_xyz + t * (curr_xyz - prev_xyz))
+        if curr_inside:
+            out_param.append(curr_param)
+            out_proj.append(curr_proj)
+            out_xyz.append(curr_xyz)
+        prev_param = curr_param
+        prev_proj = curr_proj
+        prev_xyz = curr_xyz
+        prev_dist = curr_dist
+        prev_inside = curr_inside
+    if len(out_param) < 3:
+        return (
+            np.empty((0, 2), dtype=np.float64),
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.float64),
+        )
+    return (
+        np.asarray(out_param, dtype=np.float64),
+        np.asarray(out_proj, dtype=np.float64),
+        np.asarray(out_xyz, dtype=np.float64),
+    )
+
+
+def prepare_ordered_surface_geometry_clipped_to_parametric_band(
+    *,
+    x2d: np.ndarray,
+    y2d: np.ndarray,
+    z2d: np.ndarray,
+    x3d: np.ndarray,
+    y3d: np.ndarray,
+    z3d: np.ndarray,
+    faces: np.ndarray,
+    tri_support: np.ndarray,
+    n_cols: int,
+    start_fit: np.ndarray | None,
+    end_fit: np.ndarray | None,
+) -> dict[str, object]:
+    """Clip support triangles to a continuous row->t band and keep painter order."""
+    if start_fit is None or end_fit is None:
+        raise ValueError("start_fit/end_fit are required for clipped ordered geometry")
+    x2 = np.asarray(x2d, dtype=np.float64).reshape(-1)
+    y2 = np.asarray(y2d, dtype=np.float64).reshape(-1)
+    z2 = np.asarray(z2d, dtype=np.float64).reshape(-1)
+    x3 = np.asarray(x3d, dtype=np.float64).reshape(-1)
+    y3 = np.asarray(y3d, dtype=np.float64).reshape(-1)
+    z3 = np.asarray(z3d, dtype=np.float64).reshape(-1)
+    tris = np.asarray(faces, dtype=np.int32)
+    tri_support_b = np.asarray(tri_support, dtype=bool).reshape(-1)
+    if tris.ndim != 2 or tris.shape[1] != 3:
+        raise ValueError("faces must be (F,3) in clipped ordered geometry prep")
+    if tri_support_b.shape != (tris.shape[0],):
+        raise ValueError("tri_support shape mismatch in clipped ordered geometry prep")
+    start_arr = np.asarray(start_fit, dtype=np.float64).reshape(-1)
+    end_arr = np.asarray(end_fit, dtype=np.float64).reshape(-1)
+    if start_arr.shape != end_arr.shape:
+        raise ValueError("start_fit/end_fit shape mismatch in clipped ordered geometry prep")
+    valid_rows = np.isfinite(start_arr) & np.isfinite(end_arr)
+    valid_idx = np.flatnonzero(valid_rows)
+    if valid_idx.size < 2:
+        raise ValueError("Need at least two valid rows for clipped ordered geometry prep")
+
+    rows_valid = valid_idx.astype(np.float64)
+    start_valid = start_arr[valid_rows]
+    end_valid = end_arr[valid_rows]
+    row_lo = float(rows_valid[0])
+    row_hi = float(rows_valid[-1])
+
+    def interp_start(row: float) -> float:
+        return float(np.interp(row, rows_valid, start_valid))
+
+    def interp_end(row: float) -> float:
+        return float(np.interp(row, rows_valid, end_valid))
+
+    polys2d: list[np.ndarray] = []
+    polys3d: list[np.ndarray] = []
+    source_tris: list[np.ndarray] = []
+    depths: list[float] = []
+    normals: list[np.ndarray] = []
+    normal_valid: list[bool] = []
+
+    for tri_i in np.flatnonzero(tri_support_b):
+        tri = tris[int(tri_i)]
+        tri_rows = (tri // int(n_cols)).astype(np.float64)
+        tri_cols = (tri % int(n_cols)).astype(np.float64)
+        poly_param = np.column_stack([tri_rows, tri_cols]).astype(np.float64, copy=False)
+        poly_proj = np.column_stack([x2[tri], y2[tri], z2[tri]]).astype(np.float64, copy=False)
+        poly_xyz = np.column_stack([x3[tri], y3[tri], z3[tri]]).astype(np.float64, copy=False)
+        poly_param, poly_proj, poly_xyz = _clip_polygon_against_signed_distance(
+            poly_param,
+            poly_proj,
+            poly_xyz,
+            signed_distance=lambda p: p[0] - row_lo,
+        )
+        poly_param, poly_proj, poly_xyz = _clip_polygon_against_signed_distance(
+            poly_param,
+            poly_proj,
+            poly_xyz,
+            signed_distance=lambda p: row_hi - p[0],
+        )
+        poly_param, poly_proj, poly_xyz = _clip_polygon_against_signed_distance(
+            poly_param,
+            poly_proj,
+            poly_xyz,
+            signed_distance=lambda p: p[1] - interp_start(float(p[0])),
+        )
+        poly_param, poly_proj, poly_xyz = _clip_polygon_against_signed_distance(
+            poly_param,
+            poly_proj,
+            poly_xyz,
+            signed_distance=lambda p: interp_end(float(p[0])) - p[1],
+        )
+        if poly_param.shape[0] < 3:
+            continue
+        polys2d.append(poly_proj[:, :2].astype(np.float64, copy=False))
+        polys3d.append(poly_xyz.astype(np.float64, copy=False))
+        source_tris.append(tri.astype(np.int32, copy=False))
+        depths.append(float(np.nanmean(poly_proj[:, 2])))
+        normal = np.cross(poly_xyz[1] - poly_xyz[0], poly_xyz[2] - poly_xyz[0])
+        norm = float(np.linalg.norm(normal))
+        valid = np.isfinite(norm) and norm > 0.0
+        normal_valid.append(valid)
+        normals.append((normal / norm) if valid else np.zeros((3,), dtype=np.float64))
+
+    if not polys2d:
+        raise ValueError("No triangles remain after clipping ordered geometry to neomeso band")
+
+    order = np.argsort(np.asarray(depths, dtype=np.float64))
+    return {
+        "tris": np.asarray([source_tris[int(i)] for i in order], dtype=np.int32),
+        "tri_neomeso": np.ones((len(order),), dtype=bool),
+        "polys2d": [polys2d[int(i)] for i in order],
+        "polys3d": [polys3d[int(i)] for i in order],
+        "normals_unit": np.asarray([normals[int(i)] for i in order], dtype=np.float64),
+        "normal_valid": np.asarray([normal_valid[int(i)] for i in order], dtype=bool),
+    }
+
+
+def smooth_neomeso_mask_tall_parametric(
+    *,
+    support_mask_tall: np.ndarray,
+    neomeso_mask_tall: np.ndarray,
+    smoothing: float = 6.0,
+) -> np.ndarray:
+    """Smooth row-wise neomeso t-bounds across AP before native triangulation."""
+    support = np.asarray(support_mask_tall, dtype=bool)
+    start_fit, end_fit = _smooth_neomeso_t_bounds(
+        support_mask_tall=support,
+        neomeso_mask_tall=neomeso_mask_tall,
+        smoothing=smoothing,
+    )
+    if start_fit is None or end_fit is None:
+        return support & np.asarray(neomeso_mask_tall, dtype=bool)
+    n_rows, n_cols = support.shape
+    cols = np.arange(n_cols, dtype=np.float64)
+    out = np.zeros_like(support, dtype=bool)
+    valid_rows = np.isfinite(start_fit) & np.isfinite(end_fit)
+    row_idx = np.flatnonzero(valid_rows)
+    if row_idx.size == 0:
+        return out
+    row_start = int(row_idx[0])
+    row_stop = int(row_idx[-1]) + 1
+    for row in range(row_start, row_stop):
+        out[row] = support[row] & (cols >= start_fit[row]) & (cols <= end_fit[row])
+    return out
+
+
+def _smooth_neomeso_t_bounds(
+    *,
+    support_mask_tall: np.ndarray,
+    neomeso_mask_tall: np.ndarray,
+    smoothing: float,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    support = np.asarray(support_mask_tall, dtype=bool)
+    neomeso = np.asarray(neomeso_mask_tall, dtype=bool)
+    if support.shape != neomeso.shape or support.ndim != 2:
+        raise ValueError("support_mask_tall and neomeso_mask_tall must be matching 2D arrays.")
+    n_rows, n_cols = support.shape
+    start = np.full((n_rows,), np.nan, dtype=np.float64)
+    end = np.full((n_rows,), np.nan, dtype=np.float64)
+    for row in range(n_rows):
+        idx = np.flatnonzero(support[row] & neomeso[row])
+        if idx.size == 0:
+            continue
+        start[row] = float(idx[0])
+        end[row] = float(idx[-1])
+    valid = np.isfinite(start) & np.isfinite(end)
+    if np.count_nonzero(valid) < 4:
+        return None, None
+
+    row_idx = np.flatnonzero(valid).astype(np.float64)
+    smooth_s = float(smoothing) * float(row_idx.size)
+    if not np.isfinite(smooth_s) or smooth_s < 0.0:
+        raise ValueError(f"smoothing must be finite and >= 0, got {smoothing!r}")
+    k = min(3, int(row_idx.size) - 1)
+    start_spline = UnivariateSpline(row_idx, start[valid], k=k, s=smooth_s)
+    end_spline = UnivariateSpline(row_idx, end[valid], k=k, s=smooth_s)
+    eval_rows = np.arange(n_rows, dtype=np.float64)
+    start_fit = np.clip(start_spline(eval_rows), 0.0, float(n_cols - 1))
+    end_fit = np.clip(end_spline(eval_rows), 0.0, float(n_cols - 1))
+    mid = 0.5 * (start_fit + end_fit)
+    half = 0.5 * np.maximum(end_fit - start_fit, 0.0)
+    start_fit = np.clip(mid - half, 0.0, float(n_cols - 1))
+    end_fit = np.clip(mid + half, 0.0, float(n_cols - 1))
+    outside = ~valid
+    start_fit[outside] = np.nan
+    end_fit[outside] = np.nan
+    return start_fit, end_fit
+
+
+def smooth_neomeso_tri_mask_parametric(
+    *,
+    faces: np.ndarray,
+    tri_support: np.ndarray,
+    n_cols: int,
+    start_fit: np.ndarray | None,
+    end_fit: np.ndarray | None,
+) -> np.ndarray:
+    """Evaluate the smoothed neomeso boundary at triangle centroids."""
+    tris = np.asarray(faces, dtype=np.int32)
+    tri_support_b = np.asarray(tri_support, dtype=bool).reshape(-1)
+    if tris.ndim != 2 or tris.shape[1] != 3:
+        raise ValueError(f"faces must be (F,3), got {tris.shape}")
+    if tri_support_b.shape != (tris.shape[0],):
+        raise ValueError("tri_support shape mismatch")
+    if start_fit is None or end_fit is None:
+        return tri_support_b.copy()
+    start_arr = np.asarray(start_fit, dtype=np.float64).reshape(-1)
+    end_arr = np.asarray(end_fit, dtype=np.float64).reshape(-1)
+    if start_arr.shape != end_arr.shape:
+        raise ValueError("start_fit/end_fit shape mismatch")
+    rows = np.arange(start_arr.size, dtype=np.float64)
+    row_cent = np.mean((tris // int(n_cols)).astype(np.float64), axis=1)
+    col_cent = np.mean((tris % int(n_cols)).astype(np.float64), axis=1)
+    valid_rows = np.isfinite(start_arr) & np.isfinite(end_arr)
+    valid_idx = np.flatnonzero(valid_rows)
+    if valid_idx.size < 2:
+        return tri_support_b.copy()
+    start_cent = np.interp(row_cent, rows[valid_rows], start_arr[valid_rows], left=np.nan, right=np.nan)
+    end_cent = np.interp(row_cent, rows[valid_rows], end_arr[valid_rows], left=np.nan, right=np.nan)
+    inside = np.isfinite(start_cent) & np.isfinite(end_cent) & (col_cent >= start_cent) & (col_cent <= end_cent)
+    return tri_support_b & inside
+
+
 def build_apml_native_surface_projection_context(
     *,
     outdir: Path,
@@ -171,10 +442,28 @@ def build_apml_native_surface_projection_context(
     )
 
     faces = np.asarray(data.faces, dtype=np.int32)
-    support_flat = np.asarray(data.support_mask_tall, dtype=bool).reshape(-1)
-    neomeso_flat = np.asarray(data.neomeso_mask_tall, dtype=bool).reshape(-1)
+    support_mask_tall = np.asarray(data.support_mask_tall, dtype=bool).reshape(n_rows, n_cols)
+    raw_neomeso_mask_tall = np.asarray(data.neomeso_mask_tall, dtype=bool).reshape(n_rows, n_cols)
+    start_fit, end_fit = _smooth_neomeso_t_bounds(
+        support_mask_tall=support_mask_tall,
+        neomeso_mask_tall=raw_neomeso_mask_tall,
+        smoothing=6.0,
+    )
+    neomeso_mask_tall = smooth_neomeso_mask_tall_parametric(
+        support_mask_tall=support_mask_tall,
+        neomeso_mask_tall=raw_neomeso_mask_tall,
+        smoothing=6.0,
+    )
+    support_flat = support_mask_tall.reshape(-1)
+    neomeso_flat = neomeso_mask_tall.reshape(-1)
     tri_support = np.all(support_flat[faces], axis=1)
-    tri_neomeso = np.all(neomeso_flat[faces], axis=1)
+    tri_neomeso = smooth_neomeso_tri_mask_parametric(
+        faces=faces,
+        tri_support=tri_support,
+        n_cols=n_cols,
+        start_fit=start_fit,
+        end_fit=end_fit,
+    )
     ordered_geom_support = prepare_ordered_surface_geometry(
         x2d=x2d,
         y2d=y2d,
@@ -186,7 +475,7 @@ def build_apml_native_surface_projection_context(
         tri_neomeso=tri_neomeso,
         keep_tri=tri_support,
     )
-    ordered_geom_neomeso = prepare_ordered_surface_geometry(
+    ordered_geom_neomeso = prepare_ordered_surface_geometry_clipped_to_parametric_band(
         x2d=x2d,
         y2d=y2d,
         z2d=z2d,
@@ -194,13 +483,14 @@ def build_apml_native_surface_projection_context(
         y3d=y3,
         z3d=z3,
         faces=faces,
-        tri_neomeso=tri_neomeso,
-        keep_tri=tri_support & tri_neomeso,
+        tri_support=tri_support,
+        n_cols=n_cols,
+        start_fit=start_fit,
+        end_fit=end_fit,
     )
 
     ap_um_by_slice = np.asarray(data.ap_um_by_slice, dtype=np.float64).reshape(-1)
     ml_um_at_t = np.asarray(data.ml_um_at_t, dtype=np.float64).reshape(n_rows, n_cols)
-    support_mask_tall = np.asarray(data.support_mask_tall, dtype=bool).reshape(n_rows, n_cols)
     ap_um_flat = np.broadcast_to(ap_um_by_slice[:, None], (n_rows, n_cols)).reshape(-1).astype(np.float64, copy=False)
     ml_um_flat = ml_um_at_t.reshape(-1).astype(np.float64, copy=False)
 
@@ -214,6 +504,8 @@ def build_apml_native_surface_projection_context(
         "triangles": faces.astype(np.int32, copy=False),
         "tri_support": tri_support.astype(bool, copy=False),
         "tri_neomeso": tri_neomeso.astype(bool, copy=False),
+        "neomeso_start_fit": start_fit.astype(np.float64, copy=False) if start_fit is not None else None,
+        "neomeso_end_fit": end_fit.astype(np.float64, copy=False) if end_fit is not None else None,
         "ordered_geom_support": ordered_geom_support,
         "ordered_geom_neomeso": ordered_geom_neomeso,
         "support_flat": support_flat.astype(bool, copy=False),
