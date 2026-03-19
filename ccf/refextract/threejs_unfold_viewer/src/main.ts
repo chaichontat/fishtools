@@ -1,5 +1,8 @@
 import * as THREE from "three";
 import { TrackballControls } from "three/examples/jsm/controls/TrackballControls.js";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
+import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 
 import { loadAssets } from "./io";
 import { applyUnfold, createUnfoldContext } from "./unfold";
@@ -24,8 +27,28 @@ const AP_AXIS_OPACITY = 0.9;
 const CAMERA_LIGHT_ELEVATION_DEG = 30.0;
 const CAMERA_LIGHT_INTENSITY = 0.42;
 const PLANE_OFFSET_UM = 8.0;
+const CORONAL_LINE_KIND = 0;
+const SAGITTAL_LINE_KIND = 1;
+const CORONAL_LINE_COLOR = 0xff9900;
+const SAGITTAL_LINE_COLOR = 0xffff00;
+const REFERENCE_LINE_OPACITY = 0.8;
+const REFERENCE_LINE_SURFACE_OFFSET_UM = 6.0;
+const REFERENCE_LINE_WIDTH_PX = 1.0;
 
 type HemisphereSide = "left" | "right";
+type ReferenceLineKind = 0 | 1;
+
+interface ReferenceLineSet {
+  segmentParams: Float32Array;
+  sampledPositions: Float32Array;
+  sampledNormals: Float32Array;
+  rightPositions: Float32Array;
+  leftPositions: Float32Array;
+  right: LineSegments2;
+  left: LineSegments2;
+  rightMaterial: LineMaterial;
+  leftMaterial: LineMaterial;
+}
 
 function shadeNeoSupportColors(
   baseColors: Uint8Array,
@@ -216,6 +239,319 @@ function updateMlApPlane({
 
   planeOutline.position.set(center.x, offsetY, center.z);
   planeOutline.scale.set(width, depth, 1.0);
+}
+
+function buildReferenceLineSegmentParams({
+  linePoints,
+  lineRanges,
+  kind,
+}: {
+  linePoints: Float32Array;
+  lineRanges: Uint32Array;
+  kind: ReferenceLineKind;
+}): Float32Array {
+  if (linePoints.length % 2 !== 0) {
+    throw new Error(`line_points_f32 length must be even, got ${linePoints.length}.`);
+  }
+  if (lineRanges.length % 4 !== 0) {
+    throw new Error(`line_ranges_u32 length must be divisible by 4, got ${lineRanges.length}.`);
+  }
+
+  const nPoints = linePoints.length / 2;
+  const params: number[] = [];
+  for (let idx = 0; idx < lineRanges.length; idx += 4) {
+    const offset = lineRanges[idx];
+    const count = lineRanges[idx + 1];
+    const rangeKind = lineRanges[idx + 2];
+    if (rangeKind !== kind) {
+      continue;
+    }
+    if (offset + count > nPoints) {
+      throw new Error(
+        `Line range [${offset}, ${offset + count}) exceeds ${nPoints} line points.`,
+      );
+    }
+    for (let pointIdx = offset; pointIdx < offset + count - 1; pointIdx += 1) {
+      const base0 = 2 * pointIdx;
+      const base1 = 2 * (pointIdx + 1);
+      params.push(
+        linePoints[base0],
+        linePoints[base0 + 1],
+        linePoints[base1],
+        linePoints[base1 + 1],
+      );
+    }
+  }
+  return new Float32Array(params);
+}
+
+function createReferenceLineSet({
+  segmentParams,
+  color,
+}: {
+  segmentParams: Float32Array;
+  color: number;
+}): ReferenceLineSet {
+  if (segmentParams.length % 4 !== 0) {
+    throw new Error(
+      `Reference line segment params length must be divisible by 4, got ${segmentParams.length}.`,
+    );
+  }
+  const sampledPositions = new Float32Array((segmentParams.length / 4) * 6);
+  const sampledNormals = new Float32Array((segmentParams.length / 4) * 6);
+  const rightPositions = new Float32Array((segmentParams.length / 4) * 6);
+  const leftPositions = new Float32Array((segmentParams.length / 4) * 6);
+  const rightGeometry = new LineSegmentsGeometry();
+  rightGeometry.setPositions(rightPositions);
+  const leftGeometry = new LineSegmentsGeometry();
+  leftGeometry.setPositions(leftPositions);
+
+  const materialParams = {
+    color,
+    transparent: true,
+    opacity: REFERENCE_LINE_OPACITY,
+    depthTest: true,
+    depthWrite: false,
+    linewidth: REFERENCE_LINE_WIDTH_PX,
+    worldUnits: false,
+  } as const;
+  const rightMaterial = new LineMaterial(materialParams);
+  const leftMaterial = new LineMaterial(materialParams);
+  leftMaterial.opacity = 0.0;
+
+  const right = new LineSegments2(rightGeometry, rightMaterial);
+  right.renderOrder = 4;
+  right.frustumCulled = false;
+  const left = new LineSegments2(leftGeometry, leftMaterial);
+  left.scale.x = -1.0;
+  left.visible = false;
+  left.renderOrder = 4;
+  left.frustumCulled = false;
+  return {
+    segmentParams,
+    sampledPositions,
+    sampledNormals,
+    rightPositions,
+    leftPositions,
+    right,
+    left,
+    rightMaterial,
+    leftMaterial,
+  };
+}
+
+function writeInterpolatedSurfacePoint({
+  values,
+  nRows,
+  nCols,
+  rowF,
+  t,
+  out,
+  outOffset,
+}: {
+  values: Float32Array;
+  nRows: number;
+  nCols: number;
+  rowF: number;
+  t: number;
+  out: Float32Array;
+  outOffset: number;
+}): void {
+  const row = THREE.MathUtils.clamp(rowF, 0.0, nRows - 1);
+  const col = THREE.MathUtils.clamp(t, 0.0, 1.0) * (nCols - 1);
+  const row0 = Math.floor(row);
+  const row1 = Math.min(nRows - 1, row0 + 1);
+  const col0 = Math.floor(col);
+  const col1 = Math.min(nCols - 1, col0 + 1);
+  const rowAlpha = row - row0;
+  const colAlpha = col - col0;
+
+  const idx00 = 3 * (row0 * nCols + col0);
+  const idx01 = 3 * (row0 * nCols + col1);
+  const idx10 = 3 * (row1 * nCols + col0);
+  const idx11 = 3 * (row1 * nCols + col1);
+
+  for (let axis = 0; axis < 3; axis += 1) {
+    const top = THREE.MathUtils.lerp(
+      values[idx00 + axis],
+      values[idx01 + axis],
+      colAlpha,
+    );
+    const bottom = THREE.MathUtils.lerp(
+      values[idx10 + axis],
+      values[idx11 + axis],
+      colAlpha,
+    );
+    out[outOffset + axis] = THREE.MathUtils.lerp(top, bottom, rowAlpha);
+  }
+}
+
+function sampleReferenceLineSurface({
+  lineSet,
+  positions,
+  normals,
+  nRows,
+  nCols,
+}: {
+  lineSet: ReferenceLineSet;
+  positions: Float32Array;
+  normals: Float32Array;
+  nRows: number;
+  nCols: number;
+}): void {
+  const params = lineSet.segmentParams;
+  const outPositions = lineSet.sampledPositions;
+  const outNormals = lineSet.sampledNormals;
+  for (let idx = 0, outOffset = 0; idx < params.length; idx += 4, outOffset += 6) {
+    writeInterpolatedSurfacePoint({
+      values: positions,
+      nRows,
+      nCols,
+      rowF: params[idx],
+      t: params[idx + 1],
+      out: outPositions,
+      outOffset,
+    });
+    writeInterpolatedSurfacePoint({
+      values: positions,
+      nRows,
+      nCols,
+      rowF: params[idx + 2],
+      t: params[idx + 3],
+      out: outPositions,
+      outOffset: outOffset + 3,
+    });
+    writeInterpolatedSurfacePoint({
+      values: normals,
+      nRows,
+      nCols,
+      rowF: params[idx],
+      t: params[idx + 1],
+      out: outNormals,
+      outOffset,
+    });
+    writeInterpolatedSurfacePoint({
+      values: normals,
+      nRows,
+      nCols,
+      rowF: params[idx + 2],
+      t: params[idx + 3],
+      out: outNormals,
+      outOffset: outOffset + 3,
+    });
+  }
+}
+
+function writeCameraAwareReferenceLinePositions({
+  sourcePositions,
+  sourceNormals,
+  out,
+  cameraPosition,
+  objectTranslateX,
+  mirrorX,
+}: {
+  sourcePositions: Float32Array;
+  sourceNormals: Float32Array;
+  out: Float32Array;
+  cameraPosition: THREE.Vector3;
+  objectTranslateX: number;
+  mirrorX: boolean;
+}): void {
+  for (let idx = 0; idx < sourcePositions.length; idx += 3) {
+    const localX = sourcePositions[idx];
+    const localY = sourcePositions[idx + 1];
+    const localZ = sourcePositions[idx + 2];
+    const localNormalX = sourceNormals[idx];
+    const localNormalY = sourceNormals[idx + 1];
+    const localNormalZ = sourceNormals[idx + 2];
+
+    const worldX = (mirrorX ? -localX : localX) + objectTranslateX;
+    const worldY = localY;
+    const worldZ = localZ;
+    let worldNormalX = mirrorX ? -localNormalX : localNormalX;
+    let worldNormalY = localNormalY;
+    let worldNormalZ = localNormalZ;
+    const normalLenSq =
+      worldNormalX * worldNormalX +
+      worldNormalY * worldNormalY +
+      worldNormalZ * worldNormalZ;
+
+    if (normalLenSq <= 1.0e-12) {
+      out[idx] = localX;
+      out[idx + 1] = localY;
+      out[idx + 2] = localZ;
+      continue;
+    }
+
+    const normalInvLen = 1.0 / Math.sqrt(normalLenSq);
+    worldNormalX *= normalInvLen;
+    worldNormalY *= normalInvLen;
+    worldNormalZ *= normalInvLen;
+
+    const viewX = cameraPosition.x - worldX;
+    const viewY = cameraPosition.y - worldY;
+    const viewZ = cameraPosition.z - worldZ;
+    const facingDot =
+      worldNormalX * viewX + worldNormalY * viewY + worldNormalZ * viewZ;
+    if (facingDot < 0.0) {
+      worldNormalX = -worldNormalX;
+      worldNormalY = -worldNormalY;
+      worldNormalZ = -worldNormalZ;
+    }
+
+    const offsetWorldX = worldNormalX * REFERENCE_LINE_SURFACE_OFFSET_UM;
+    const offsetWorldY = worldNormalY * REFERENCE_LINE_SURFACE_OFFSET_UM;
+    const offsetWorldZ = worldNormalZ * REFERENCE_LINE_SURFACE_OFFSET_UM;
+
+    out[idx] = localX + (mirrorX ? -offsetWorldX : offsetWorldX);
+    out[idx + 1] = localY + offsetWorldY;
+    out[idx + 2] = localZ + offsetWorldZ;
+  }
+}
+
+function refreshReferenceLineForCamera({
+  lineSet,
+  cameraPosition,
+}: {
+  lineSet: ReferenceLineSet;
+  cameraPosition: THREE.Vector3;
+}): void {
+  const rightOut = lineSet.rightPositions;
+  writeCameraAwareReferenceLinePositions({
+    sourcePositions: lineSet.sampledPositions,
+    sourceNormals: lineSet.sampledNormals,
+    out: rightOut,
+    cameraPosition,
+    objectTranslateX: lineSet.right.position.x,
+    mirrorX: false,
+  });
+  lineSet.right.geometry.setPositions(rightOut);
+
+  const leftOut = lineSet.leftPositions;
+  writeCameraAwareReferenceLinePositions({
+    sourcePositions: lineSet.sampledPositions,
+    sourceNormals: lineSet.sampledNormals,
+    out: leftOut,
+    cameraPosition,
+    objectTranslateX: lineSet.left.position.x,
+    mirrorX: true,
+  });
+  lineSet.left.geometry.setPositions(leftOut);
+}
+
+function setReferenceLineResolution({
+  lineSets,
+  width,
+  height,
+}: {
+  lineSets: ReferenceLineSet[];
+  width: number;
+  height: number;
+}): void {
+  for (const lineSet of lineSets) {
+    lineSet.rightMaterial.resolution.set(width, height);
+    lineSet.leftMaterial.resolution.set(width, height);
+  }
 }
 
 function inferSourceHemisphere(
@@ -520,6 +856,65 @@ function updateScaleBar({
   labelElem.textContent = formatScaleLabelUm(bestUm);
 }
 
+function updateCameraDepthRange({
+  camera,
+  bounds,
+}: {
+  camera: THREE.PerspectiveCamera;
+  bounds: THREE.Box3;
+}): void {
+  const diag = bounds.getSize(new THREE.Vector3()).length();
+  const radius = 0.5 * diag;
+  const center = bounds.getCenter(new THREE.Vector3());
+  const centerDist = camera.position.distanceTo(center);
+  const boxDistance = bounds.distanceToPoint(camera.position);
+  const padding = Math.max(200.0, 0.15 * diag);
+  const nextNear = Math.max(0.5, boxDistance * 0.2);
+  const nextFar = Math.max(
+    nextNear + 1000.0,
+    centerDist + radius + padding,
+  );
+  if (
+    Math.abs(camera.near - nextNear) > 1.0e-3 ||
+    Math.abs(camera.far - nextFar) > 1.0e-3
+  ) {
+    camera.near = nextNear;
+    camera.far = nextFar;
+    camera.updateProjectionMatrix();
+  }
+}
+
+function timestampToken(date: Date): string {
+  return date.toISOString().replace(/:/g, "-").replace(/\..+$/, "");
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        resolve(blob);
+        return;
+      }
+      reject(new Error("Failed to encode snapshot canvas as PNG."));
+    }, "image/png");
+  });
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function clampProgressValue(value: number): number {
+  return Math.max(0.0, Math.min(1.0, value));
+}
+
 function getElement<T extends HTMLElement>(id: string): T {
   const elem = document.getElementById(id);
   if (!elem) {
@@ -560,10 +955,15 @@ async function main(): Promise<void> {
   const canvasRoot = getElement<HTMLDivElement>("canvas-root");
   const bothHemispheresInput =
     getElement<HTMLInputElement>("both-hemispheres");
+  const referenceLinesInput = getElement<HTMLInputElement>("reference-lines");
   const progressInput = getElement<HTMLInputElement>("progress");
+  const progressNumberInput = getElement<HTMLInputElement>("progress-number");
   const playButton = getElement<HTMLButtonElement>("play");
+  const snapshotButton = getElement<HTMLButtonElement>("snapshot");
   const speedSelect = getElement<HTMLSelectElement>("speed");
+  const statusElem = getElement<HTMLDivElement>("status");
   const cameraReadoutElem = getElement<HTMLDivElement>("camera-readout");
+  const errorElem = getElement<HTMLDivElement>("error");
   const scaleBarElem = getElement<HTMLDivElement>("scalebar");
   const scaleBarLabelElem = getElement<HTMLDivElement>("scalebar-label");
 
@@ -616,11 +1016,31 @@ async function main(): Promise<void> {
   mirroredMesh.scale.x = -1.0;
   mirroredMesh.visible = false;
   const hemisphereSign = sourceHemisphere === "right" ? 1.0 : -1.0;
+  const coronalReferenceLines = createReferenceLineSet({
+    segmentParams: buildReferenceLineSegmentParams({
+      linePoints: loaded.linePoints,
+      lineRanges: loaded.lineRanges,
+      kind: CORONAL_LINE_KIND,
+    }),
+    color: CORONAL_LINE_COLOR,
+  });
+  const sagittalReferenceLines = createReferenceLineSet({
+    segmentParams: buildReferenceLineSegmentParams({
+      linePoints: loaded.linePoints,
+      lineRanges: loaded.lineRanges,
+      kind: SAGITTAL_LINE_KIND,
+    }),
+    color: SAGITTAL_LINE_COLOR,
+  });
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color("#f4f7ec");
   scene.add(mesh);
   scene.add(mirroredMesh);
+  scene.add(coronalReferenceLines.right);
+  scene.add(coronalReferenceLines.left);
+  scene.add(sagittalReferenceLines.right);
+  scene.add(sagittalReferenceLines.left);
   const labels = {
     anterior: createDirectionSprite("Anterior (-Z)", "#93354e"),
     posterior: createDirectionSprite("Posterior (+Z)", "#93354e"),
@@ -676,6 +1096,15 @@ async function main(): Promise<void> {
   );
   apAxisLine.renderOrder = 3;
   scene.add(apAxisLine);
+  const overlayObjects: THREE.Object3D[] = [
+    labels.anterior.sprite,
+    labels.posterior.sprite,
+    labels.negativeX.sprite,
+    labels.positiveX.sprite,
+    mlApPlane,
+    mlApPlaneOutline,
+    apAxisLine,
+  ];
 
   const ambient = new THREE.AmbientLight(0xffffff, 0.32);
   scene.add(ambient);
@@ -698,6 +1127,11 @@ async function main(): Promise<void> {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(canvasRoot.clientWidth, canvasRoot.clientHeight);
   canvasRoot.appendChild(renderer.domElement);
+  setReferenceLineResolution({
+    lineSets: [coronalReferenceLines, sagittalReferenceLines],
+    width: canvasRoot.clientWidth,
+    height: canvasRoot.clientHeight,
+  });
 
   const camera = new THREE.PerspectiveCamera(
     40,
@@ -749,6 +1183,20 @@ async function main(): Promise<void> {
     mirroredMesh.visible = brainBlend > 1.0e-3 || hemisphereBlendTarget >= 1.0;
     leftMaterial.opacity = brainBlend;
     leftMaterial.depthWrite = brainBlend >= 0.999;
+    const showReferenceLines = referenceLinesInput.checked;
+    const lineSets = [coronalReferenceLines, sagittalReferenceLines];
+    for (const lineSet of lineSets) {
+      const hasSegments = lineSet.segmentParams.length > 0;
+      lineSet.right.position.x = rightTranslateX;
+      lineSet.right.visible = showReferenceLines && hasSegments;
+      lineSet.rightMaterial.opacity = REFERENCE_LINE_OPACITY;
+      lineSet.left.position.x = mirroredMesh.position.x;
+      lineSet.left.visible =
+        showReferenceLines &&
+        hasSegments &&
+        (brainBlend > 1.0e-3 || hemisphereBlendTarget >= 1.0);
+      lineSet.leftMaterial.opacity = REFERENCE_LINE_OPACITY * brainBlend;
+    }
     activeBounds = computeActiveBounds({
       bounds,
       rightTranslateX,
@@ -782,6 +1230,7 @@ async function main(): Promise<void> {
     rollDeg: DEFAULT_CAMERA_ROLL_DEG,
     dist: DEFAULT_CAMERA_DIST,
   });
+  updateCameraDepthRange({ camera, bounds: activeBounds });
   updateCameraFollowLight({ camera, controls, light: cameraLight });
   updateMlLabels(hemisphereBlendTarget > 0.5);
   syncHemisphereMode();
@@ -793,11 +1242,36 @@ async function main(): Promise<void> {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     controls.handleResize();
+    setReferenceLineResolution({
+      lineSets: [coronalReferenceLines, sagittalReferenceLines],
+      width: w,
+      height: h,
+    });
   });
 
   let progress = Number(progressInput.value);
   let playing = false;
   let lastTimeSec = performance.now() * 0.001;
+
+  const formatProgressValue = (): string => progress.toFixed(3);
+
+  const syncProgressInputs = (): void => {
+    const text = formatProgressValue();
+    progressInput.value = text;
+    progressNumberInput.value = text;
+  };
+
+  const refreshReferenceLinesForCamera = (): void => {
+    const cameraPosition = camera.position;
+    refreshReferenceLineForCamera({
+      lineSet: coronalReferenceLines,
+      cameraPosition,
+    });
+    refreshReferenceLineForCamera({
+      lineSet: sagittalReferenceLines,
+      cameraPosition,
+    });
+  };
 
   const applyCurrentState = (): void => {
     applyUnfold(context, {
@@ -811,6 +1285,22 @@ async function main(): Promise<void> {
     ) as THREE.BufferAttribute;
     positionAttr.needsUpdate = true;
     geometry.computeVertexNormals();
+    const normalAttr = geometry.getAttribute("normal") as THREE.BufferAttribute;
+    const normals = normalAttr.array as Float32Array;
+    sampleReferenceLineSurface({
+      lineSet: coronalReferenceLines,
+      positions: dynamicPositions,
+      normals,
+      nRows: loaded.manifest.n_rows,
+      nCols: loaded.manifest.n_cols,
+    });
+    sampleReferenceLineSurface({
+      lineSet: sagittalReferenceLines,
+      positions: dynamicPositions,
+      normals,
+      nRows: loaded.manifest.n_rows,
+      nCols: loaded.manifest.n_cols,
+    });
     const currentBounds = new THREE.Box3().setFromBufferAttribute(positionAttr);
     updateHemispherePresentation(currentBounds);
     updateDirectionSprites({ bounds: activeBounds, labels });
@@ -820,6 +1310,80 @@ async function main(): Promise<void> {
       planeFill: mlApPlane,
       planeOutline: mlApPlaneOutline,
     });
+    updateCameraDepthRange({ camera, bounds: activeBounds });
+    refreshReferenceLinesForCamera();
+  };
+
+  const setProgress = ({
+    value,
+    stopPlaying,
+    syncNumberInput,
+  }: {
+    value: number;
+    stopPlaying: boolean;
+    syncNumberInput: boolean;
+  }): void => {
+    progress = clampProgressValue(value);
+    progressInput.value = formatProgressValue();
+    if (syncNumberInput) {
+      progressNumberInput.value = formatProgressValue();
+    }
+    if (stopPlaying) {
+      setPlaying(false);
+    }
+    applyCurrentState();
+  };
+
+  /**
+   * Render a one-off PNG export from the live scene state while hiding the
+   * explanatory overlays and clearing against alpha.
+   */
+  const takeSnapshot = async (): Promise<void> => {
+    snapshotButton.disabled = true;
+    statusElem.textContent = "Saving transparent PNG...";
+    errorElem.textContent = "";
+
+    const snapshotRenderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: true,
+      preserveDrawingBuffer: true,
+    });
+    const overlayVisibility = overlayObjects.map((object) => object.visible);
+    const previousBackground = scene.background;
+    const viewportSize = renderer.getSize(new THREE.Vector2());
+
+    try {
+      snapshotRenderer.outputColorSpace = renderer.outputColorSpace;
+      snapshotRenderer.toneMapping = renderer.toneMapping;
+      snapshotRenderer.toneMappingExposure = renderer.toneMappingExposure;
+      snapshotRenderer.setPixelRatio(renderer.getPixelRatio());
+      snapshotRenderer.setSize(viewportSize.x, viewportSize.y, false);
+      snapshotRenderer.setClearColor(0x000000, 0.0);
+
+      try {
+        scene.background = null;
+        overlayObjects.forEach((object) => {
+          object.visible = false;
+        });
+        refreshReferenceLinesForCamera();
+        snapshotRenderer.render(scene, camera);
+      } finally {
+        scene.background = previousBackground;
+        overlayObjects.forEach((object, index) => {
+          object.visible = overlayVisibility[index];
+        });
+        renderer.render(scene, camera);
+      }
+
+      const filename = `hemisphere-snapshot-${timestampToken(new Date())}.png`;
+      const blob = await canvasToBlob(snapshotRenderer.domElement);
+      downloadBlob(blob, filename);
+      statusElem.textContent = `Saved ${filename}`;
+    } finally {
+      snapshotRenderer.dispose();
+      snapshotRenderer.forceContextLoss();
+      snapshotButton.disabled = false;
+    }
   };
 
   const setPlaying = (value: boolean): void => {
@@ -828,16 +1392,61 @@ async function main(): Promise<void> {
   };
 
   progressInput.addEventListener("input", () => {
-    progress = Number(progressInput.value);
-    setPlaying(false);
-    applyCurrentState();
+    setProgress({
+      value: Number(progressInput.value),
+      stopPlaying: true,
+      syncNumberInput: true,
+    });
+  });
+  progressNumberInput.addEventListener("input", () => {
+    if (progressNumberInput.value.trim() === "") {
+      return;
+    }
+    const value = Number(progressNumberInput.value);
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    setProgress({
+      value,
+      stopPlaying: true,
+      syncNumberInput: false,
+    });
+  });
+  progressNumberInput.addEventListener("change", () => {
+    const value = Number(progressNumberInput.value);
+    if (!Number.isFinite(value)) {
+      progressNumberInput.value = formatProgressValue();
+      return;
+    }
+    setProgress({
+      value,
+      stopPlaying: true,
+      syncNumberInput: true,
+    });
   });
   bothHemispheresInput.addEventListener("change", () => {
     setPlaying(false);
     syncHemisphereMode();
+    applyCurrentState();
+  });
+  referenceLinesInput.addEventListener("change", () => {
+    setPlaying(false);
+    applyCurrentState();
   });
   playButton.addEventListener("click", () => setPlaying(!playing));
+  snapshotButton.addEventListener("click", () => {
+    void takeSnapshot().catch((err: unknown) => {
+      const message =
+        err instanceof Error ? (err.stack ?? err.message) : String(err);
+      errorElem.textContent = message;
+      statusElem.textContent = "";
+      queueMicrotask(() => {
+        throw err;
+      });
+    });
+  });
 
+  syncProgressInputs();
   applyCurrentState();
 
   const tick = (): void => {
@@ -848,7 +1457,7 @@ async function main(): Promise<void> {
     if (playing) {
       const speed = Number(speedSelect.value);
       progress = Math.min(1.0, progress + (dt * speed) / PLAYBACK_DURATION_SEC);
-      progressInput.value = progress.toFixed(3);
+      syncProgressInputs();
       if (progress >= 1.0) {
         setPlaying(false);
       }
@@ -869,8 +1478,10 @@ async function main(): Promise<void> {
     }
 
     controls.update();
+    updateCameraDepthRange({ camera, bounds: activeBounds });
     updateCameraFollowLight({ camera, controls, light: cameraLight });
     updateCameraReadout({ camera, controls, elem: cameraReadoutElem });
+    refreshReferenceLinesForCamera();
     updateScaleBar({
       camera,
       controls,
