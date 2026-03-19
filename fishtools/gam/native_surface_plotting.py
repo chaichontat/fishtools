@@ -69,6 +69,45 @@ def _with_png_suffix(png_name: str, suffix: str) -> str:
     return str(path.with_name(f"{path.name}{suffix}"))
 
 
+def add_direction_compass(
+    ax: plt.Axes,
+    *,
+    center: tuple[float, float] = (0.89, 0.145),
+    arm: float = 0.038,
+    color: str = "black",
+    fontsize: float = 6.5,
+    linewidth: float = 1.0,
+    mutation_scale: float = 6.5,
+    labels: tuple[str, str, str, str] = ("M", "L", "R", "C"),
+) -> None:
+    """Add a small four-direction compass in axes coordinates."""
+    cx, cy = (float(center[0]), float(center[1]))
+    left_label, right_label, up_label, down_label = labels
+    arrow_kw = {
+        "arrowstyle": "-|>,head_length=0.35,head_width=0.12",
+        "color": str(color),
+        "lw": float(linewidth),
+        "shrinkA": 0.0,
+        "shrinkB": 0.0,
+        "mutation_scale": float(mutation_scale),
+    }
+    for x_tip, y_tip in ((cx - arm, cy), (cx + arm, cy), (cx, cy + arm), (cx, cy - arm)):
+        ax.annotate(
+            "",
+            xy=(x_tip, y_tip),
+            xytext=(cx, cy),
+            xycoords="axes fraction",
+            textcoords="axes fraction",
+            arrowprops=arrow_kw,
+            annotation_clip=False,
+        )
+    label_kw = {"xycoords": "axes fraction", "textcoords": "offset points", "fontsize": float(fontsize), "color": str(color)}
+    ax.annotate(left_label, xy=(cx - arm, cy), xytext=(-2, 0), ha="right", va="center", annotation_clip=False, **label_kw)
+    ax.annotate(right_label, xy=(cx + arm, cy), xytext=(2, 0), ha="left", va="center", annotation_clip=False, **label_kw)
+    ax.annotate(up_label, xy=(cx, cy + arm), xytext=(0, 2), ha="center", va="bottom", annotation_clip=False, **label_kw)
+    ax.annotate(down_label, xy=(cx, cy - arm), xytext=(0, -2), ha="center", va="top", annotation_clip=False, **label_kw)
+
+
 def _transform_mu_for_display(values: np.ndarray, *, scale: str, mask: np.ndarray | None = None) -> np.ndarray:
     x = np.asarray(values, dtype=np.float64).copy()
     if mask is not None:
@@ -830,6 +869,7 @@ def _draw_coronal_surface_projection_perspective(
     title: str | None,
     show_title: bool,
     show_scale_bar: bool,
+    show_direction_compass: bool = True,
 ) -> mpl_colors.Normalize:
     if params.x3d is None or params.y3d is None or params.z3d is None:
         raise ValueError("Perspective native projection requires x3d/y3d/z3d")
@@ -1029,7 +1069,7 @@ def _draw_coronal_surface_projection_perspective(
                     visible_segments,
                     colors="k",
                     linewidths=0.5,
-                    alpha=0.35,
+                    alpha=0.2,
                 )
                 line_coll.set_sort_zpos(-1e9)
                 line_coll.set_zorder(100)
@@ -1050,8 +1090,18 @@ def _draw_coronal_surface_projection_perspective(
         x0 = float(mins[0] + 0.08 * spans[0])
         y0 = float(mins[1] + 0.07 * spans[1])
         z0 = float(mins[2] + 0.04 * spans[2])
-        ax.plot([x0, x0 + bar_len], [y0, y0], [z0, z0], color="black", linewidth=2.2)
-        ax.text(x0 + (0.5 * bar_len), y0, z0, f"{int(round(bar_len))} um", ha="center", va="bottom", fontsize=8)
+        ax.plot([x0, x0 + bar_len], [y0, y0], [z0, z0], color="black", linewidth=1.4)
+        ax.text(
+            x0 + (0.5 * bar_len),
+            y0 + (0.03 * spans[1]),
+            z0,
+            f"{int(round(bar_len))} μm",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+    if show_direction_compass:
+        add_direction_compass(ax)
     ax.set_axis_off()
     return norm
 
@@ -1068,6 +1118,7 @@ def _draw_coronal_surface_projection(
     show_title: bool,
     show_scale_bar: bool,
     latlon_visibility: bool,
+    show_direction_compass: bool = True,
 ) -> mpl_colors.Normalize:
     if str(params.proj_type) == "persp":
         return _draw_coronal_surface_projection_perspective(
@@ -1080,6 +1131,7 @@ def _draw_coronal_surface_projection(
             title=title,
             show_title=show_title,
             show_scale_bar=show_scale_bar,
+            show_direction_compass=show_direction_compass,
         )
 
     x = np.asarray(params.x2d, dtype=np.float64).reshape(-1)
@@ -1381,7 +1433,7 @@ def _draw_coronal_surface_projection(
                         xline[seg],
                         yline[seg],
                         color="k",
-                        alpha=0.35,
+                        alpha=0.2,
                         linewidth=0.5,
                         solid_capstyle="round",
                         zorder=10,
@@ -1393,7 +1445,7 @@ def _draw_coronal_surface_projection(
                     xline[seg],
                     yline[seg],
                     color="k",
-                    alpha=0.35,
+                    alpha=0.2,
                     linewidth=0.5,
                     solid_capstyle="round",
                     zorder=10,
@@ -1619,11 +1671,13 @@ def _draw_coronal_surface_projection(
             location="lower left",
             pad=0.2,
             borderpad=0.3,
-            sep=4,
-            bar_thickness=3,
+            sep=10,
+            bar_thickness=2,
             font_size=13,
             color="black",
         )
+    if show_direction_compass:
+        add_direction_compass(ax)
     if show_title and title is not None:
         ax.set_title(title, loc="center", fontsize=17, pad=2)
     ax.set_axis_off()
@@ -1733,6 +1787,7 @@ def plot_coronal_surface_projection(
         show_title=True,
         show_scale_bar=True,
         latlon_visibility=True,
+        show_direction_compass=True,
     )
 
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
@@ -1849,6 +1904,7 @@ def plot_coronal_surface_projection_triptych(
             show_title=True,
             show_scale_bar=True,
             latlon_visibility=True,
+            show_direction_compass=True,
         )
         norms.append(norm)
 
@@ -1911,8 +1967,10 @@ def _write_apml_native_proj_montage(
     cbar_label: str,
     cbar_ticks: list[float] | None,
     cbar_ticklabels: list[str] | None,
-    vmin: float,
-    vmax: float,
+    vmin: float | None,
+    vmax: float | None,
+    panel_limits: list[tuple[float, float]] | None = None,
+    show_colorbar: bool = True,
 ) -> None:
     if not gene_values:
         raise ValueError("No gene values provided for montage.")
@@ -1977,22 +2035,24 @@ def _write_apml_native_proj_montage(
             continue
         gene, vals_all = gene_values[i]
         show_sb = (scale_bar == "all") or (scale_bar == "first" and i == 0)
+        if panel_limits is None:
+            panel_vmin = None if vmin is None else float(vmin)
+            panel_vmax = None if vmax is None else float(vmax)
+        else:
+            panel_vmin, panel_vmax = panel_limits[i]
         _draw_coronal_surface_projection(
             ax,
             vals_all,
             params=draw_params,
             cmap=cmap,
-            vmin=float(vmin),
-            vmax=float(vmax),
+            vmin=panel_vmin,
+            vmax=panel_vmax,
             title=str(gene),
             show_title=True,
             show_scale_bar=bool(show_sb),
             latlon_visibility=True,
+            show_direction_compass=(i == 0),
         )
-
-    norm = mpl_colors.Normalize(vmin=float(vmin), vmax=float(vmax), clip=False)
-    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
-    sm.set_array([])
 
     if suptitle is not None:
         fig.suptitle(str(suptitle), fontsize=20, y=0.985)
@@ -2000,15 +2060,22 @@ def _write_apml_native_proj_montage(
     else:
         rect_top = 0.985
 
-    fig.tight_layout(rect=(0.0, 0.0, 0.90, rect_top))
-    cax = fig.add_axes([0.915, 0.14, 0.02, 0.72])
-    cbar = fig.colorbar(sm, cax=cax)
-    cbar.set_label(str(cbar_label), fontsize=16)
-    cbar.ax.tick_params(labelsize=13)
-    if cbar_ticks is not None:
-        cbar.set_ticks([float(x) for x in cbar_ticks])
-    if cbar_ticklabels is not None:
-        cbar.set_ticklabels([str(x) for x in cbar_ticklabels])
+    rect_right = 0.90 if bool(show_colorbar) else 0.98
+    fig.tight_layout(rect=(0.0, 0.0, rect_right, rect_top), pad=0.04, w_pad=0.0, h_pad=0.02)
+    if bool(show_colorbar):
+        if vmin is None or vmax is None or panel_limits is not None:
+            raise ValueError("show_colorbar=True requires shared vmin/vmax and no panel_limits")
+        norm = mpl_colors.Normalize(vmin=float(vmin), vmax=float(vmax), clip=False)
+        sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+        cax = fig.add_axes([0.915, 0.14, 0.02, 0.72])
+        cbar = fig.colorbar(sm, cax=cax)
+        cbar.set_label(str(cbar_label), fontsize=16)
+        cbar.ax.tick_params(labelsize=13)
+        if cbar_ticks is not None:
+            cbar.set_ticks([float(x) for x in cbar_ticks])
+        if cbar_ticklabels is not None:
+            cbar.set_ticklabels([str(x) for x in cbar_ticklabels])
 
     fig.savefig(out_png, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
@@ -2059,10 +2126,12 @@ def write_apml_native_proj_montage(
     cbar_label: str,
     cbar_ticks: list[float] | None,
     cbar_ticklabels: list[str] | None,
-    vmin: float,
-    vmax: float,
+    vmin: float | None,
+    vmax: float | None,
+    panel_limits: list[tuple[float, float]] | None = None,
+    show_colorbar: bool = True,
 ) -> None:
-    """Public wrapper for writing native-projection montages with shared colorbar."""
+    """Public wrapper for writing native-projection montages."""
     _write_apml_native_proj_montage(
         gene_values=gene_values,
         out_png=out_png,
@@ -2109,6 +2178,8 @@ def write_apml_native_proj_montage(
         cbar_ticklabels=cbar_ticklabels,
         vmin=vmin,
         vmax=vmax,
+        panel_limits=panel_limits,
+        show_colorbar=show_colorbar,
     )
 
 

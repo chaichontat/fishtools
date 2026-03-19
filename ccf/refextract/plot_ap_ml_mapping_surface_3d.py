@@ -59,11 +59,11 @@ class SampleThumbnail:
 
 def _bottom_panel_crop_frac(*, idx_panel: int, n_show: int) -> float:
     if idx_panel == int(n_show - 1):
-        return 0.70
+        return 0.56
+    if idx_panel == int(max(0, n_show - 2)):
+        return 0.52
     if idx_panel == 3:
         return 0.58
-    if idx_panel >= int(max(0, n_show - 2)):
-        return 0.55
     return 0.50
 
 
@@ -765,12 +765,54 @@ def _build_legend_range_mask(*, data: SurfaceMappingData, row_mask: np.ndarray, 
     return mask
 
 
+def _interp_slice_t_grid(
+    *,
+    slice_keys: np.ndarray,
+    t_grid: np.ndarray,
+    values: np.ndarray,
+    slice_f: np.ndarray,
+    t_f: np.ndarray,
+    method: str = "linear",
+) -> np.ndarray:
+    from scipy.interpolate import RectBivariateSpline, RegularGridInterpolator
+
+    keys = np.asarray(slice_keys, dtype=np.float64).reshape(-1)
+    t_axis = np.asarray(t_grid, dtype=np.float64).reshape(-1)
+    vals = np.asarray(values, dtype=np.float64)
+    if vals.shape != (int(keys.size), int(t_axis.size)):
+        raise ValueError(f"values shape {vals.shape} does not match grid {(int(keys.size), int(t_axis.size))}")
+    slice_arr = np.asarray(slice_f, dtype=np.float64)
+    t_arr = np.asarray(t_f, dtype=np.float64)
+    pts = np.column_stack([slice_arr.reshape(-1), t_arr.reshape(-1)])
+    method_s = str(method).strip().lower()
+    if method_s == "linear":
+        interp = RegularGridInterpolator((keys, t_axis), vals, method="linear", bounds_error=False, fill_value=np.nan)
+        return np.asarray(interp(pts), dtype=np.float64).reshape(slice_arr.shape)
+    if method_s == "cubic":
+        kx = int(min(3, max(1, int(keys.size) - 1)))
+        ky = int(min(3, max(1, int(t_axis.size) - 1)))
+        spline = RectBivariateSpline(keys, t_axis, vals, kx=kx, ky=ky, s=0.0)
+        out = np.full(slice_arr.shape, np.nan, dtype=np.float64)
+        in_bounds = (
+            np.isfinite(slice_arr)
+            & np.isfinite(t_arr)
+            & (slice_arr >= float(keys[0]))
+            & (slice_arr <= float(keys[-1]))
+            & (t_arr >= float(t_axis[0]))
+            & (t_arr <= float(t_axis[-1]))
+        )
+        if np.any(in_bounds):
+            out[in_bounds] = spline.ev(slice_arr[in_bounds], t_arr[in_bounds])
+        return out
+    raise ValueError(f"Unknown interpolation method: {method!r}")
+
+
 def _build_legend_display_rgba(*, legend_rgb: np.ndarray, support_mask: np.ndarray, neomeso_mask: np.ndarray) -> np.ndarray:
     legend_rgba = np.zeros((*legend_rgb.shape[:2], 4), dtype=np.float64)
     legend_rgba[support_mask, :3] = np.array([0.35, 0.35, 0.35], dtype=np.float64)
     legend_rgba[support_mask, 3] = 0.35
     legend_rgba[neomeso_mask, :3] = legend_rgb[neomeso_mask]
-    legend_rgba[neomeso_mask, 3] = 0.65
+    legend_rgba[neomeso_mask, 3] = 0.70
     return legend_rgba
 
 
@@ -980,6 +1022,7 @@ def _prepare_coronal_slice_panels(
     ap_lines_um: np.ndarray,
     atlas_name: str,
     brainglobe_config_dir: Path,
+    layout_preview: bool = False,
 ) -> list[tuple[float, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     cortex_fit_path = outdir / "cortex_mask_fit_3d_ds.npy"
     cortex_clean_path = outdir / "cortex_mask_clean_3d_ds.npy"
@@ -1005,39 +1048,41 @@ def _prepare_coronal_slice_panels(
         else:
             raise ValueError(f"brain/cortex shape mismatch: {brain_3d.shape} vs {cortex_3d.shape}")
 
-    if brainglobe_config_dir.exists():
-        import os
-
-        os.environ["BRAINGLOBE_CONFIG_DIR"] = str(brainglobe_config_dir.resolve())
-    from brainglobe_atlasapi import BrainGlobeAtlas  # noqa: E402
-
-    atlas = BrainGlobeAtlas(str(atlas_name))
-    ref_full = np.asarray(atlas.reference)
-    ds = int(max(1, int(np.rint(float(ref_full.shape[0]) / float(cortex_3d.shape[0])))))
-    ref = ref_full[::ds, ::ds, ::ds]
-    if ref.shape[0] != cortex_3d.shape[0] or ref.shape[1] != cortex_3d.shape[1]:
-        raise ValueError(f"Downsampled reference shape {ref.shape} does not match cortex shape {cortex_3d.shape}; ds={ds}")
-    if ref.shape[2] != cortex_3d.shape[2]:
-        if ref.shape[2] >= cortex_3d.shape[2]:
-            ref = ref[:, :, : cortex_3d.shape[2]]
-        else:
-            raise ValueError(f"Reference k dim smaller than cortex: ref={ref.shape} cortex={cortex_3d.shape}")
-    reference_3d = ref.astype(np.float32, copy=False)
-    overlay_path = outdir / "overlay_neocortex_mesocortex_no_allocortex_3d_ds.npy"
+    reference_3d: np.ndarray | None = None
     overlay_3d: np.ndarray | None = None
-    if overlay_path.exists():
-        overlay_3d = np.load(overlay_path).astype(bool, copy=False)
-        if overlay_3d.ndim != 3:
-            raise ValueError(f"Expected overlay mask to be 3D, got shape={overlay_3d.shape}")
-        if overlay_3d.shape != cortex_3d.shape:
-            if (
-                overlay_3d.shape[0] == cortex_3d.shape[0]
-                and overlay_3d.shape[1] == cortex_3d.shape[1]
-                and overlay_3d.shape[2] >= cortex_3d.shape[2]
-            ):
-                overlay_3d = overlay_3d[:, :, : cortex_3d.shape[2]].astype(bool, copy=False)
+    if not layout_preview:
+        if brainglobe_config_dir.exists():
+            import os
+
+            os.environ["BRAINGLOBE_CONFIG_DIR"] = str(brainglobe_config_dir.resolve())
+        from brainglobe_atlasapi import BrainGlobeAtlas  # noqa: E402
+
+        atlas = BrainGlobeAtlas(str(atlas_name))
+        ref_full = np.asarray(atlas.reference)
+        ds = int(max(1, int(np.rint(float(ref_full.shape[0]) / float(cortex_3d.shape[0])))))
+        ref = ref_full[::ds, ::ds, ::ds]
+        if ref.shape[0] != cortex_3d.shape[0] or ref.shape[1] != cortex_3d.shape[1]:
+            raise ValueError(f"Downsampled reference shape {ref.shape} does not match cortex shape {cortex_3d.shape}; ds={ds}")
+        if ref.shape[2] != cortex_3d.shape[2]:
+            if ref.shape[2] >= cortex_3d.shape[2]:
+                ref = ref[:, :, : cortex_3d.shape[2]]
             else:
-                raise ValueError(f"overlay/cortex shape mismatch: {overlay_3d.shape} vs {cortex_3d.shape}")
+                raise ValueError(f"Reference k dim smaller than cortex: ref={ref.shape} cortex={cortex_3d.shape}")
+        reference_3d = ref.astype(np.float32, copy=False)
+        overlay_path = outdir / "overlay_neocortex_mesocortex_no_allocortex_3d_ds.npy"
+        if overlay_path.exists():
+            overlay_3d = np.load(overlay_path).astype(bool, copy=False)
+            if overlay_3d.ndim != 3:
+                raise ValueError(f"Expected overlay mask to be 3D, got shape={overlay_3d.shape}")
+            if overlay_3d.shape != cortex_3d.shape:
+                if (
+                    overlay_3d.shape[0] == cortex_3d.shape[0]
+                    and overlay_3d.shape[1] == cortex_3d.shape[1]
+                    and overlay_3d.shape[2] >= cortex_3d.shape[2]
+                ):
+                    overlay_3d = overlay_3d[:, :, : cortex_3d.shape[2]].astype(bool, copy=False)
+                else:
+                    raise ValueError(f"overlay/cortex shape mismatch: {overlay_3d.shape} vs {cortex_3d.shape}")
 
     jk = np.argwhere(np.any(brain_3d, axis=0))
     if jk.size == 0:
@@ -1047,8 +1092,11 @@ def _prepare_coronal_slice_panels(
     k0 = int(np.min(jk[:, 1]))
     k1 = int(np.max(jk[:, 1])) + 1
 
-    vmin, vmax = _robust_vmin_vmax(reference_3d, mask_3d=brain_3d)
-    if not (vmax > vmin):
+    if reference_3d is not None:
+        vmin, vmax = _robust_vmin_vmax(reference_3d, mask_3d=brain_3d)
+        if not (vmax > vmin):
+            vmin, vmax = (0.0, 1.0)
+    else:
         vmin, vmax = (0.0, 1.0)
 
     panels: list[tuple[float, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
@@ -1057,12 +1105,16 @@ def _prepare_coronal_slice_panels(
     for ap_um in np.asarray(ap_lines_um, dtype=np.float64).tolist():
         idx = int(np.argmin(np.abs(ap_vals - float(ap_um))))
         slice_i = int(slice_vals[idx])
-        img = reference_3d[slice_i, j0:j1, k0:k1].astype(np.float32, copy=False)
         brain2 = brain_3d[slice_i, j0:j1, k0:k1]
         cortex = cortex_3d[slice_i, j0:j1, k0:k1]
-        img_clip = np.clip((img - float(vmin)) / (float(vmax) - float(vmin)), 0.0, 1.0).astype(np.float32, copy=False)
-        img_clip = img_clip.copy()
-        img_clip[~brain2] = np.nan
+        if reference_3d is None:
+            img_clip = np.full(cortex.shape, 0.18, dtype=np.float32)
+            img_clip[~brain2] = np.nan
+        else:
+            img = reference_3d[slice_i, j0:j1, k0:k1].astype(np.float32, copy=False)
+            img_clip = np.clip((img - float(vmin)) / (float(vmax) - float(vmin)), 0.0, 1.0).astype(np.float32, copy=False)
+            img_clip = img_clip.copy()
+            img_clip[~brain2] = np.nan
         if overlay_3d is None:
             neomeso_overlay = np.full(cortex.shape, np.nan, dtype=np.float32)
         else:
@@ -1086,6 +1138,7 @@ def _prepare_sagittal_slice_panels(
     brainglobe_config_dir: Path,
     sagittal_k_step: int,
     sagittal_n_sample: int,
+    layout_preview: bool = False,
 ) -> list[SagittalPanel]:
     outdir = Path(outdir)
 
@@ -1113,40 +1166,44 @@ def _prepare_sagittal_slice_panels(
         else:
             raise ValueError(f"brain/cortex shape mismatch: {brain_3d.shape} vs {cortex_3d.shape}")
 
-    if brainglobe_config_dir.exists():
-        import os
-
-        os.environ["BRAINGLOBE_CONFIG_DIR"] = str(brainglobe_config_dir.resolve())
-    from brainglobe_atlasapi import BrainGlobeAtlas  # noqa: E402
-
-    atlas = BrainGlobeAtlas(str(atlas_name))
-    ref_full = np.asarray(atlas.reference)
-    ds = int(max(1, int(np.rint(float(ref_full.shape[0]) / float(cortex_3d.shape[0])))))
-    ref = ref_full[::ds, ::ds, ::ds]
-    if ref.shape[0] != cortex_3d.shape[0] or ref.shape[1] != cortex_3d.shape[1]:
-        raise ValueError(f"Downsampled reference shape {ref.shape} does not match cortex shape {cortex_3d.shape}; ds={ds}")
-    if ref.shape[2] != cortex_3d.shape[2]:
-        if ref.shape[2] >= cortex_3d.shape[2]:
-            ref = ref[:, :, : cortex_3d.shape[2]]
-        else:
-            raise ValueError(f"Reference k dim smaller than cortex: ref={ref.shape} cortex={cortex_3d.shape}")
-    reference_3d = ref.astype(np.float32, copy=False)
-
-    overlay_path = outdir / "overlay_neocortex_mesocortex_no_allocortex_3d_ds.npy"
+    reference_3d: np.ndarray | None = None
     overlay_3d: np.ndarray | None = None
-    if overlay_path.exists():
-        overlay_3d = np.load(overlay_path).astype(bool, copy=False)
-        if overlay_3d.ndim != 3:
-            raise ValueError(f"Expected overlay mask to be 3D, got shape={overlay_3d.shape}")
-        if overlay_3d.shape != cortex_3d.shape:
-            if (
-                overlay_3d.shape[0] == cortex_3d.shape[0]
-                and overlay_3d.shape[1] == cortex_3d.shape[1]
-                and overlay_3d.shape[2] >= cortex_3d.shape[2]
-            ):
-                overlay_3d = overlay_3d[:, :, : cortex_3d.shape[2]].astype(bool, copy=False)
+    if not layout_preview:
+        if brainglobe_config_dir.exists():
+            import os
+
+            os.environ["BRAINGLOBE_CONFIG_DIR"] = str(brainglobe_config_dir.resolve())
+        from brainglobe_atlasapi import BrainGlobeAtlas  # noqa: E402
+
+        atlas = BrainGlobeAtlas(str(atlas_name))
+        ref_full = np.asarray(atlas.reference)
+        ds = int(max(1, int(np.rint(float(ref_full.shape[0]) / float(cortex_3d.shape[0])))))
+        ref = ref_full[::ds, ::ds, ::ds]
+        if ref.shape[0] != cortex_3d.shape[0] or ref.shape[1] != cortex_3d.shape[1]:
+            raise ValueError(
+                f"Downsampled reference shape {ref.shape} does not match cortex shape {cortex_3d.shape}; ds={ds}"
+            )
+        if ref.shape[2] != cortex_3d.shape[2]:
+            if ref.shape[2] >= cortex_3d.shape[2]:
+                ref = ref[:, :, : cortex_3d.shape[2]]
             else:
-                raise ValueError(f"overlay/cortex shape mismatch: {overlay_3d.shape} vs {cortex_3d.shape}")
+                raise ValueError(f"Reference k dim smaller than cortex: ref={ref.shape} cortex={cortex_3d.shape}")
+        reference_3d = ref.astype(np.float32, copy=False)
+
+        overlay_path = outdir / "overlay_neocortex_mesocortex_no_allocortex_3d_ds.npy"
+        if overlay_path.exists():
+            overlay_3d = np.load(overlay_path).astype(bool, copy=False)
+            if overlay_3d.ndim != 3:
+                raise ValueError(f"Expected overlay mask to be 3D, got shape={overlay_3d.shape}")
+            if overlay_3d.shape != cortex_3d.shape:
+                if (
+                    overlay_3d.shape[0] == cortex_3d.shape[0]
+                    and overlay_3d.shape[1] == cortex_3d.shape[1]
+                    and overlay_3d.shape[2] >= cortex_3d.shape[2]
+                ):
+                    overlay_3d = overlay_3d[:, :, : cortex_3d.shape[2]].astype(bool, copy=False)
+                else:
+                    raise ValueError(f"overlay/cortex shape mismatch: {overlay_3d.shape} vs {cortex_3d.shape}")
 
     ij = np.argwhere(np.any(brain_3d, axis=2))
     if ij.size == 0:
@@ -1156,8 +1213,11 @@ def _prepare_sagittal_slice_panels(
     j0 = int(np.min(ij[:, 1]))
     j1 = int(np.max(ij[:, 1])) + 1
 
-    vmin, vmax = _robust_vmin_vmax(reference_3d, mask_3d=brain_3d)
-    if not (vmax > vmin):
+    if reference_3d is not None:
+        vmin, vmax = _robust_vmin_vmax(reference_3d, mask_3d=brain_3d)
+        if not (vmax > vmin):
+            vmin, vmax = (0.0, 1.0)
+    else:
         vmin, vmax = (0.0, 1.0)
 
     mod = _load_midsurface_coords_module()
@@ -1201,7 +1261,8 @@ def _prepare_sagittal_slice_panels(
     n_sample = int(sagittal_n_sample)
     if n_sample < 16:
         raise ValueError(f"sagittal_n_sample must be >=16, got {n_sample}")
-    t_s_plot = np.linspace(0.0, 1.0, n_sample, dtype=np.float64)
+    n_sample_plot = int(max(n_sample, 1025))
+    t_s_plot = np.linspace(0.0, 1.0, n_sample_plot, dtype=np.float64)
 
     panels: list[SagittalPanel] = []
     for k in use_ks:
@@ -1216,17 +1277,22 @@ def _prepare_sagittal_slice_panels(
             t_s=t_s,
         )
         ap_curve_pts = np.interp(cor_slice_f, ap_keys, ap_vals, left=np.nan, right=np.nan)
-        row_idx_pts = np.argmin(np.abs(coronal_keys[:, None] - cor_slice_f[None, :]), axis=0)
-        ml_curve_pts = np.full_like(cor_t, np.nan, dtype=np.float64)
-        sup_pts = np.zeros_like(cor_t, dtype=bool)
+        ml_curve_pts = _interp_slice_t_grid(
+            slice_keys=coronal_keys,
+            t_grid=t_grid,
+            values=ml_um_at_t,
+            slice_f=cor_slice_f,
+            t_f=cor_t,
+            method="cubic",
+        )
+        sup_pts = _interp_slice_t_grid(
+            slice_keys=coronal_keys,
+            t_grid=t_grid,
+            values=support_tall.astype(np.float64),
+            slice_f=cor_slice_f,
+            t_f=cor_t,
+        ) > 0.5
         keep_pts = np.isfinite(ap_curve_pts) & np.isfinite(cor_t)
-        for ridx in np.unique(row_idx_pts[keep_pts]).tolist():
-            ridx_i = int(ridx)
-            mask = keep_pts & (row_idx_pts == ridx_i)
-            ml_curve_pts[mask] = np.interp(cor_t[mask], t_grid, ml_um_at_t[ridx_i], left=np.nan, right=np.nan)
-            sup_pts[mask] = (
-                np.interp(cor_t[mask], t_grid, support_tall[ridx_i].astype(np.float64), left=0.0, right=0.0) > 0.5
-            )
         keep_pts2 = keep_pts & np.isfinite(ml_curve_pts) & sup_pts
         if int(np.count_nonzero(keep_pts2)) < 2:
             continue
@@ -1252,31 +1318,45 @@ def _prepare_sagittal_slice_panels(
             t_s=t_s_plot,
         )
         ap_curve = np.interp(cor_slice_f_plot, ap_keys, ap_vals, left=np.nan, right=np.nan)
-        row_idx = np.argmin(np.abs(coronal_keys[:, None] - cor_slice_f_plot[None, :]), axis=0)
-        ml_curve = np.full_like(cor_t_plot, np.nan, dtype=np.float64)
-        sup_curve = np.zeros_like(cor_t_plot, dtype=bool)
-        neo_curve = np.zeros_like(cor_t_plot, dtype=bool)
+        ml_curve = _interp_slice_t_grid(
+            slice_keys=coronal_keys,
+            t_grid=t_grid,
+            values=ml_um_at_t,
+            slice_f=cor_slice_f_plot,
+            t_f=cor_t_plot,
+            method="cubic",
+        )
+        sup_curve = _interp_slice_t_grid(
+            slice_keys=coronal_keys,
+            t_grid=t_grid,
+            values=support_tall.astype(np.float64),
+            slice_f=cor_slice_f_plot,
+            t_f=cor_t_plot,
+        ) > 0.5
+        neo_curve = _interp_slice_t_grid(
+            slice_keys=coronal_keys,
+            t_grid=t_grid,
+            values=neomeso_tall.astype(np.float64),
+            slice_f=cor_slice_f_plot,
+            t_f=cor_t_plot,
+        ) > 0.5
         keep = np.isfinite(ap_curve) & np.isfinite(cor_t_plot)
-        for ridx in np.unique(row_idx[keep]).tolist():
-            ridx_i = int(ridx)
-            mask = keep & (row_idx == ridx_i)
-            ml_curve[mask] = np.interp(cor_t_plot[mask], t_grid, ml_um_at_t[ridx_i], left=np.nan, right=np.nan)
-            sup_curve[mask] = np.interp(
-                cor_t_plot[mask], t_grid, support_tall[ridx_i].astype(np.float64), left=0.0, right=0.0
-            ) > 0.5
-            neo_curve[mask] = np.interp(
-                cor_t_plot[mask], t_grid, neomeso_tall[ridx_i].astype(np.float64), left=0.0, right=0.0
-            ) > 0.5
         keep2 = keep & np.isfinite(ml_curve) & sup_curve
         ml_curve = np.where(keep2, ml_curve, np.nan)
         ap_curve = np.where(keep2, ap_curve, np.nan)
         neo_curve &= keep2
 
-        img = reference_3d[i0:i1, j0:j1, int(k)].astype(np.float32, copy=False)
         brain2 = brain_3d[i0:i1, j0:j1, int(k)]
-        img_clip = np.clip((img - float(vmin)) / (float(vmax) - float(vmin)), 0.0, 1.0).astype(np.float32, copy=False)
-        img_clip = img_clip.copy()
-        img_clip[~brain2] = np.nan
+        if reference_3d is None:
+            img_clip = np.full(brain2.shape, 0.18, dtype=np.float32)
+            img_clip[~brain2] = np.nan
+        else:
+            img = reference_3d[i0:i1, j0:j1, int(k)].astype(np.float32, copy=False)
+            img_clip = np.clip((img - float(vmin)) / (float(vmax) - float(vmin)), 0.0, 1.0).astype(
+                np.float32, copy=False
+            )
+            img_clip = img_clip.copy()
+            img_clip[~brain2] = np.nan
         if overlay_3d is None:
             neomeso2 = np.full(img_clip.shape, np.nan, dtype=np.float32)
         else:
@@ -1322,10 +1402,12 @@ def save_ap_ml_mapping_figure(
     ap_hline_step_um: float,
     atlas_name: str,
     brainglobe_config_dir: Path,
+    layout_preview: bool = False,
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg", force=True)
+    import matplotlib.patheffects as pe  # noqa: E402
     import matplotlib.pyplot as plt  # noqa: E402
     from matplotlib.collections import LineCollection  # noqa: E402
 
@@ -1344,6 +1426,12 @@ def save_ap_ml_mapping_figure(
     )
     neomeso_mask = neomeso_mask & support_mask
     legend_display = _build_legend_display_rgba(legend_rgb=legend_rgb, support_mask=support_mask, neomeso_mask=neomeso_mask)
+    plot_line_outline = [
+        pe.SimpleLineShadow(offset=(0.25, -0.25), shadow_color="black", alpha=0.12),
+        pe.SimpleLineShadow(offset=(0.5, -0.5), shadow_color="black", alpha=0.08),
+        pe.SimpleLineShadow(offset=(0.8, -0.8), shadow_color="black", alpha=0.04),
+        pe.Normal(),
+    ]
     ap_lines = _ap_hline_values(ap_range_um=data.ap_range_um, step_um=float(ap_hline_step_um))
     if ap_lines.size > 1:
         ap_lines = ap_lines[1:]
@@ -1353,6 +1441,7 @@ def save_ap_ml_mapping_figure(
         ap_lines_um=ap_lines,
         atlas_name=str(atlas_name),
         brainglobe_config_dir=Path(brainglobe_config_dir),
+        layout_preview=bool(layout_preview),
     )
 
     fig_w_in = 8.4
@@ -1411,7 +1500,8 @@ def save_ap_ml_mapping_figure(
             x0 = float(np.nanmin(ml_row[int(s) : int(e)]))
             x1 = float(np.nanmax(ml_row[int(s) : int(e)]))
             if np.isfinite(x0) and np.isfinite(x1) and x1 > x0:
-                ax0.hlines(float(ap), x0, x1, colors="#ffff00", linewidth=2.0, alpha=0.95)
+                lc = ax0.hlines(float(ap), x0, x1, colors="#ffb347", linewidth=2.0, alpha=0.95)
+                lc.set_path_effects(plot_line_outline)
     ax0.set_xlabel("Mediolateral (μm)", fontsize=16)
     ax0.set_ylabel("Rostrocaudal (μm)", fontsize=16, labelpad=16)
     ax0.yaxis.tick_right()
@@ -1452,12 +1542,16 @@ def save_ap_ml_mapping_figure(
         raise ValueError(f"Invalid ax0 ylim after aspect set: {ax0.get_ylim()}")
     for panel in slice_panels:
         ap_um, slice_i, img2, _cortex2, neomeso2, midline_xy = panel
-        neomeso_rgba = _build_coronal_gradient_overlay_rgba(
-            slice_i=int(slice_i),
-            neomeso2=neomeso2,
-            midline_xy_local=midline_xy,
-            data=data,
-            b_const=float(b_const),
+        neomeso_rgba = (
+            np.zeros(neomeso2.shape + (4,), dtype=np.float32)
+            if layout_preview
+            else _build_coronal_gradient_overlay_rgba(
+                slice_i=int(slice_i),
+                neomeso2=neomeso2,
+                midline_xy_local=midline_xy,
+                data=data,
+                b_const=float(b_const),
+            )
         )
         frac_y = (float(y0) - float(ap_um)) / denom
         center_y = float(legend_pos.y0) + float(legend_pos.height) * float(frac_y)
@@ -1473,7 +1567,7 @@ def save_ap_ml_mapping_figure(
                 seg = np.stack([xy[:-1], xy[1:]], axis=1)
                 lc_all = LineCollection(
                     seg,
-                    colors=[(1.0, 1.0, 0.0, 0.5)],
+                    colors=[(1.0, 0.70, 0.28, 0.5)],
                     linewidths=1.4,
                     zorder=5,
                 )
@@ -1486,7 +1580,7 @@ def save_ap_ml_mapping_figure(
                 if np.any(neo_seg):
                     lc_neo = LineCollection(
                         seg[neo_seg],
-                        colors=[(1.0, 1.0, 0.0, 0.95)],
+                        colors=[(1.0, 0.70, 0.28, 0.95)],
                         linewidths=2.2,
                         zorder=6,
                     )
@@ -1565,10 +1659,12 @@ def save_ap_ml_mapping_figure_sagittal(
     sagittal_k_step: int,
     sagittal_n_sample: int,
     sample_thumbnails_glob: str | None = None,
+    layout_preview: bool = False,
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg", force=True)
+    import matplotlib.patheffects as pe  # noqa: E402
     import matplotlib.pyplot as plt  # noqa: E402
     from matplotlib.collections import LineCollection  # noqa: E402
     from matplotlib.patches import ConnectionPatch  # noqa: E402
@@ -1583,6 +1679,14 @@ def save_ap_ml_mapping_figure_sagittal(
         row: int = 0
         pos_group_index: int = 0
         pos_group_size: int = 1
+
+    plot_line_outline = [
+        pe.SimpleLineShadow(offset=(0.25, -0.25), shadow_color="black", alpha=0.12),
+        pe.SimpleLineShadow(offset=(0.5, -0.5), shadow_color="black", alpha=0.08),
+        pe.SimpleLineShadow(offset=(0.8, -0.8), shadow_color="black", alpha=0.04),
+        pe.Normal(),
+    ]
+
 
     def _curve_x_at_ap_anchor(panel: SagittalPanel, *, ap_anchor_um: float) -> float | None:
         x = np.asarray(panel.ml_curve, dtype=np.float64)
@@ -1641,6 +1745,7 @@ def save_ap_ml_mapping_figure_sagittal(
         brainglobe_config_dir=Path(brainglobe_config_dir),
         sagittal_k_step=int(sagittal_k_step),
         sagittal_n_sample=int(sagittal_n_sample),
+        layout_preview=bool(layout_preview),
     )
     if not panels_all:
         raise ValueError("No sagittal panels available.")
@@ -1695,6 +1800,7 @@ def save_ap_ml_mapping_figure_sagittal(
             brainglobe_config_dir=Path(brainglobe_config_dir),
             sagittal_k_step=1,
             sagittal_n_sample=int(sagittal_n_sample),
+            layout_preview=bool(layout_preview),
         )
         if not panels_map_all:
             raise ValueError("No sagittal panels available for sample mapping.")
@@ -1909,33 +2015,36 @@ def save_ap_ml_mapping_figure_sagittal(
         xy = np.column_stack([x[finite], y[finite]]).astype(np.float64, copy=False)
         seg = np.stack([xy[:-1], xy[1:]], axis=1)
         if int(p.slice_k) in highlight_ks:
-            base_rgba = (1.0, 0.65, 0.0, 0.95)
+            base_rgba = (1.0, 1.0, 0.0, 0.95)
             base_lw = 2.6
         else:
             base_rgba = (1.0, 1.0, 0.0, 0.5)
             base_lw = 1.2
         # Base curve (t_all support).
-        ax0.add_collection(
-            LineCollection(
-                seg,
-                colors=[base_rgba],
-                linewidths=float(base_lw),
-                zorder=6,
-            )
+        lc = LineCollection(
+            seg,
+            colors=[base_rgba],
+            linewidths=float(base_lw),
+            zorder=6,
         )
+        lc.set_capstyle("round")
+        lc.set_joinstyle("round")
+        ax0.add_collection(lc)
         # Highlight neomeso subset.
         neo_f = neo[finite]
         if neo_f.size >= 2:
             neo_seg = neo_f[:-1] & neo_f[1:]
             if np.any(neo_seg):
-                ax0.add_collection(
-                    LineCollection(
-                        seg[neo_seg],
-                        colors=[(1.0, 1.0, 0.0, 0.95)],
-                        linewidths=2.0,
-                        zorder=7,
-                    )
+                lc_neo = LineCollection(
+                    seg[neo_seg],
+                    colors=[(1.0, 1.0, 0.0, 0.95)],
+                    linewidths=2.0,
+                    zorder=12,
                 )
+                lc_neo.set_capstyle("round")
+                lc_neo.set_joinstyle("round")
+                lc_neo.set_path_effects(plot_line_outline)
+                ax0.add_collection(lc_neo)
 
     ax0.set_xlabel("Mediolateral (μm)", fontsize=16)
     ax0.set_ylabel("Rostrocaudal (μm)", fontsize=16, labelpad=16)
@@ -1950,7 +2059,6 @@ def save_ap_ml_mapping_figure_sagittal(
     ax0.set_anchor("E")
     for spine in ax0.spines.values():
         spine.set_visible(False)
-
     fig.canvas.draw()
     legend_pos = ax0.get_position()
     legend_pos_orig = ax0.get_position(original=True)
@@ -2047,7 +2155,12 @@ def save_ap_ml_mapping_figure_sagittal(
         else:
             img2_rot = np.rot90(img.astype(np.float32, copy=False), k=-1)
             neomeso2_rot = np.rot90(np.asarray(p.neomeso2), k=-1)
-            neomeso_rgba_rot = np.rot90(_build_sagittal_gradient_overlay_rgba(panel=p), k=-1)
+            neomeso_rgba_rot = np.rot90(
+                np.zeros(np.asarray(p.neomeso2).shape + (4,), dtype=np.float32)
+                if layout_preview
+                else _build_sagittal_gradient_overlay_rgba(panel=p),
+                k=-1,
+            )
             h_orig, _w_orig = int(img.shape[0]), int(img.shape[1])
             w_rot = int(img2_rot.shape[1])
             crop_frac = float(item.crop_frac if item.crop_frac is not None else 0.50)
@@ -2184,13 +2297,16 @@ def save_ap_ml_mapping_figure_combined(
     brainglobe_config_dir: Path,
     sagittal_k_step: int,
     sagittal_n_sample: int,
+    layout_preview: bool = False,
 ) -> None:
     import matplotlib
 
     matplotlib.use("Agg", force=True)
+    import matplotlib.patheffects as pe  # noqa: E402
     import matplotlib.pyplot as plt  # noqa: E402
     from matplotlib.collections import LineCollection  # noqa: E402
     from matplotlib.patches import ConnectionPatch  # noqa: E402
+    from fishtools.gam.native_surface_plotting import add_direction_compass  # noqa: E402
 
     legend_rgb = _build_legend_rgb(ap_range_um=data.ap_range_um, ml_range_um=data.ml_range_um, b_const=float(b_const))
     support_mask = _build_legend_range_mask(
@@ -2207,6 +2323,12 @@ def save_ap_ml_mapping_figure_combined(
     )
     neomeso_mask = neomeso_mask & support_mask
     legend_display = _build_legend_display_rgba(legend_rgb=legend_rgb, support_mask=support_mask, neomeso_mask=neomeso_mask)
+    plot_line_outline = [
+        pe.SimpleLineShadow(offset=(0.25, -0.25), shadow_color="black", alpha=0.12),
+        pe.SimpleLineShadow(offset=(0.5, -0.5), shadow_color="black", alpha=0.08),
+        pe.SimpleLineShadow(offset=(0.8, -0.8), shadow_color="black", alpha=0.04),
+        pe.Normal(),
+    ]
 
     ap_lines = _ap_hline_values(ap_range_um=data.ap_range_um, step_um=float(ap_hline_step_um))
     if ap_lines.size > 1:
@@ -2218,6 +2340,7 @@ def save_ap_ml_mapping_figure_combined(
         ap_lines_um=ap_lines,
         atlas_name=str(atlas_name),
         brainglobe_config_dir=Path(brainglobe_config_dir),
+        layout_preview=bool(layout_preview),
     )
 
     panels_all = _prepare_sagittal_slice_panels(
@@ -2228,6 +2351,7 @@ def save_ap_ml_mapping_figure_combined(
         brainglobe_config_dir=Path(brainglobe_config_dir),
         sagittal_k_step=int(sagittal_k_step),
         sagittal_n_sample=int(sagittal_n_sample),
+        layout_preview=bool(layout_preview),
     )
     if not panels_all:
         raise ValueError("No sagittal panels available.")
@@ -2327,7 +2451,8 @@ def save_ap_ml_mapping_figure_combined(
             x0 = float(np.nanmin(ml_row[int(s) : int(e)]))
             x1 = float(np.nanmax(ml_row[int(s) : int(e)]))
             if np.isfinite(x0) and np.isfinite(x1) and x1 > x0:
-                ax0.hlines(float(ap), x0, x1, colors="#ffff00", linewidth=2.0, alpha=0.95)
+                lc = ax0.hlines(float(ap), x0, x1, colors="#ffb347", linewidth=2.0, alpha=0.95)
+                lc.set_path_effects(plot_line_outline)
 
     for p in panels_all:
         x = np.asarray(p.ml_curve, dtype=np.float64)
@@ -2338,26 +2463,29 @@ def save_ap_ml_mapping_figure_combined(
             continue
         xy = np.column_stack([x[finite], y[finite]]).astype(np.float64, copy=False)
         seg = np.stack([xy[:-1], xy[1:]], axis=1)
-        ax0.add_collection(
-            LineCollection(
-                seg,
-                colors=[(1.0, 1.0, 0.0, 0.5)],
-                linewidths=1.2,
-                zorder=6,
-            )
+        lc = LineCollection(
+            seg,
+            colors=[(1.0, 1.0, 0.0, 0.5)],
+            linewidths=1.2,
+            zorder=6,
         )
+        lc.set_capstyle("round")
+        lc.set_joinstyle("round")
+        ax0.add_collection(lc)
         neo_f = neo[finite]
         if neo_f.size >= 2:
             neo_seg = neo_f[:-1] & neo_f[1:]
             if np.any(neo_seg):
-                ax0.add_collection(
-                    LineCollection(
-                        seg[neo_seg],
-                        colors=[(1.0, 1.0, 0.0, 0.95)],
-                        linewidths=2.0,
-                        zorder=7,
-                    )
+                lc_neo = LineCollection(
+                    seg[neo_seg],
+                    colors=[(1.0, 1.0, 0.0, 0.95)],
+                    linewidths=2.0,
+                    zorder=12,
                 )
+                lc_neo.set_capstyle("round")
+                lc_neo.set_joinstyle("round")
+                lc_neo.set_path_effects(plot_line_outline)
+                ax0.add_collection(lc_neo)
 
     ax0.set_xlabel("Mediolateral (μm)", fontsize=16)
     ax0.set_ylabel("Rostrocaudal (μm)", fontsize=16, labelpad=16)
@@ -2372,6 +2500,7 @@ def save_ap_ml_mapping_figure_combined(
     ax0.set_anchor("E")
     for spine in ax0.spines.values():
         spine.set_visible(False)
+    add_direction_compass(ax0, center=(0.90, 0.11), arm=0.040, fontsize=11.5, mutation_scale=9.0)
 
     fig.canvas.draw()
     legend_pos = ax0.get_position()
@@ -2404,6 +2533,14 @@ def save_ap_ml_mapping_figure_combined(
     panel_x0 = float(legend_pos.x0 - panel_x_gap - panel_w)
     if panel_w <= 0.05:
         raise ValueError("Figure layout too narrow for coronal panel column; increase figure width.")
+    fig.text(
+        float(panel_x0) + 0.5 * float(panel_w),
+        float(legend_pos.y0 - 0.03),
+        "Coronal\nslices",
+        ha="center",
+        va="top",
+        fontsize=14,
+    )
 
     coronal_panel_axes: list[tuple[float, "plt.Axes", tuple[float, float] | None]] = []
     y0, y1 = (float(ax0.get_ylim()[0]), float(ax0.get_ylim()[1]))
@@ -2412,12 +2549,16 @@ def save_ap_ml_mapping_figure_combined(
         raise ValueError(f"Invalid ax0 ylim after aspect set: {ax0.get_ylim()}")
     for panel in coronal_panels:
         ap_um, slice_i, img2, _cortex2, neomeso2, midline_xy = panel
-        neomeso_rgba = _build_coronal_gradient_overlay_rgba(
-            slice_i=int(slice_i),
-            neomeso2=neomeso2,
-            midline_xy_local=midline_xy,
-            data=data,
-            b_const=float(b_const),
+        neomeso_rgba = (
+            np.zeros(neomeso2.shape + (4,), dtype=np.float32)
+            if layout_preview
+            else _build_coronal_gradient_overlay_rgba(
+                slice_i=int(slice_i),
+                neomeso2=neomeso2,
+                midline_xy_local=midline_xy,
+                data=data,
+                b_const=float(b_const),
+            )
         )
         frac_y = (float(y0) - float(ap_um)) / denom
         center_y = float(legend_pos.y0) + float(legend_pos.height) * float(frac_y)
@@ -2433,7 +2574,7 @@ def save_ap_ml_mapping_figure_combined(
                 seg = np.stack([xy[:-1], xy[1:]], axis=1)
                 lc_all = LineCollection(
                     seg,
-                    colors=[(1.0, 1.0, 0.0, 0.5)],
+                    colors=[(1.0, 0.70, 0.28, 0.5)],
                     linewidths=1.4,
                     zorder=5,
                 )
@@ -2446,7 +2587,7 @@ def save_ap_ml_mapping_figure_combined(
                 if np.any(neo_seg):
                     lc_neo = LineCollection(
                         seg[neo_seg],
-                        colors=[(1.0, 1.0, 0.0, 0.95)],
+                        colors=[(1.0, 0.70, 0.28, 0.95)],
                         linewidths=2.2,
                         zorder=6,
                     )
@@ -2491,6 +2632,25 @@ def save_ap_ml_mapping_figure_combined(
         )
         coronal_panel_axes.append((float(ap_um), ax, link_xy_data))
 
+    if coronal_panel_axes:
+        top_coronal_ax = max(coronal_panel_axes, key=lambda item: float(item[1].get_position().y0))[1]
+        top_coronal_pos = top_coronal_ax.get_position()
+        ax_cor_compass = fig.add_axes(
+            [float(top_coronal_pos.x0), float(top_coronal_pos.y1 - 0.033), 0.055, 0.075],
+            zorder=40,
+        )
+        ax_cor_compass.set_axis_off()
+        add_direction_compass(
+            ax_cor_compass,
+            center=(0.5, 0.5),
+            arm=0.22,
+            color="black",
+            fontsize=7.8,
+            linewidth=0.9,
+            mutation_scale=6.0,
+            labels=("M", "L", "D", "V"),
+        )
+
     x_anchor = float(ax0.get_xlim()[0])
     for ap_um, axp, link_xy_data in coronal_panel_axes:
         fig.add_artist(
@@ -2519,7 +2679,12 @@ def save_ap_ml_mapping_figure_combined(
         p, crop_frac, _link_ap_um = panel_entries[idx_panel]
         img2_rot = np.rot90(np.asarray(p.img2), k=-1)
         neomeso2_rot = np.rot90(np.asarray(p.neomeso2), k=-1)
-        neomeso_rgba_rot = np.rot90(_build_sagittal_gradient_overlay_rgba(panel=p), k=-1)
+        neomeso_rgba_rot = np.rot90(
+            np.zeros(np.asarray(p.neomeso2).shape + (4,), dtype=np.float32)
+            if layout_preview
+            else _build_sagittal_gradient_overlay_rgba(panel=p),
+            k=-1,
+        )
         w_rot = int(img2_rot.shape[1])
         crop_x0 = int(np.floor(float(crop_frac) * float(w_rot)))
         img2_crop = img2_rot[:, crop_x0:]
@@ -2543,6 +2708,14 @@ def save_ap_ml_mapping_figure_combined(
     else:
         center_x0 = float(legend_pos_orig.x0) + 0.5 * float(panel_w_max)
         center_step = 0.0
+    fig.text(
+        float(legend_pos_orig.x0) + 0.5 * float(panel_total_w),
+        float(panel_y0 + 0.02),
+        "Sagittal slices",
+        ha="center",
+        va="top",
+        fontsize=14,
+    )
 
     sagittal_panel_axes: list[tuple[SagittalPanel, float, "plt.Axes", tuple[float, float] | None]] = []
     for idx_panel in range(n_show - 1, -1, -1):
@@ -2623,6 +2796,25 @@ def save_ap_ml_mapping_figure_combined(
             va="bottom",
         )
         sagittal_panel_axes.append((p, float(link_ap_um), axp, link_xy_axes))
+
+    if sagittal_panel_axes:
+        last_sagittal_ax = max(sagittal_panel_axes, key=lambda item: float(item[2].get_position().x0))[2]
+        last_sagittal_pos = last_sagittal_ax.get_position()
+        ax_sag_compass = fig.add_axes(
+            [float(last_sagittal_pos.x1 - 0.06), float(last_sagittal_pos.y0 + 0.01), 0.055, 0.075],
+            zorder=40,
+        )
+        ax_sag_compass.set_axis_off()
+        add_direction_compass(
+            ax_sag_compass,
+            center=(0.5, 0.5),
+            arm=0.22,
+            color="black",
+            fontsize=7.8,
+            linewidth=0.9,
+            mutation_scale=6.0,
+            labels=("C", "R", "D", "V"),
+        )
 
     seen_main_dots: set[tuple[int, int]] = set()
     for p, link_ap_um, axp, link_xy_axes in sagittal_panel_axes:
@@ -2766,6 +2958,11 @@ def main() -> None:
         default=Path("ccf/out/atlases/.brainglobe_config"),
         help="BRAINGLOBE_CONFIG_DIR for atlas cache/config.",
     )
+    p.add_argument(
+        "--layout-preview",
+        action="store_true",
+        help="Preserve figure layout while replacing atlas-derived panel content with cheap placeholders for faster iteration.",
+    )
     args = p.parse_args()
 
     outdir = Path(args.outdir)
@@ -2826,6 +3023,7 @@ def main() -> None:
             ap_hline_step_um=float(args.ap_hline_step_um),
             atlas_name=str(args.atlas_name),
             brainglobe_config_dir=Path(args.brainglobe_config_dir),
+            layout_preview=bool(args.layout_preview),
         )
         print(f"Wrote: {out_png}")
     if out_png_sag is not None:
@@ -2840,6 +3038,7 @@ def main() -> None:
             brainglobe_config_dir=Path(args.brainglobe_config_dir),
             sagittal_k_step=int(args.sagittal_k_step),
             sagittal_n_sample=int(args.sagittal_n_sample),
+            layout_preview=bool(args.layout_preview),
         )
         print(f"Wrote: {out_png_sag}")
     if out_png_sag_samples is not None:
@@ -2860,6 +3059,7 @@ def main() -> None:
             sagittal_k_step=int(args.sagittal_k_step),
             sagittal_n_sample=int(args.sagittal_n_sample),
             sample_thumbnails_glob=str(args.sagittal_samples_thumbnails_glob),
+            layout_preview=bool(args.layout_preview),
         )
         print(f"Wrote: {out_png_sag_samples}")
     if out_png_combined is not None:
@@ -2874,6 +3074,7 @@ def main() -> None:
             brainglobe_config_dir=Path(args.brainglobe_config_dir),
             sagittal_k_step=int(args.sagittal_k_step),
             sagittal_n_sample=int(args.sagittal_n_sample),
+            layout_preview=bool(args.layout_preview),
         )
         print(f"Wrote: {out_png_combined}")
     print(
