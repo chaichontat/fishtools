@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
+from anndata import AnnData
 
+import fishtools.brdu.ot as brdu_ot
 from fishtools.brdu.rendering import (
     barycentric_density_image,
     density_image,
@@ -21,6 +24,7 @@ from fishtools.brdu.vector_field import (
     kernel_regressed_vector_field,
     support_adaptive_quiver_mask,
 )
+from fishtools.brdu.ot import TemporalProblemConfig, fit_temporal_problem, make_brdu_pair_cost_builder
 
 
 def test_assign_temporal_order_from_brdu_edu_uses_edu_to_brdu_sequence() -> None:
@@ -257,3 +261,120 @@ def test_support_adaptive_quiver_mask_keeps_more_high_support_arrows() -> None:
 
     assert not bool(mask[0, 0])
     assert bool(mask[0, -1])
+
+
+def test_make_brdu_pair_cost_builder_returns_pairwise_cost_dataframe() -> None:
+    adata_src = AnnData(
+        X=np.zeros((1, 2), dtype=np.float32),
+        obs=pd.DataFrame(
+            {
+                "tricycle": [1.0],
+                "ap": [0.0],
+                "ml": [0.0],
+            },
+            index=["src0"],
+        ),
+        obsm={"X_pca": np.zeros((1, 2), dtype=np.float32)},
+    )
+    adata_tgt = AnnData(
+        X=np.zeros((2, 2), dtype=np.float32),
+        obs=pd.DataFrame(
+            {
+                "tricycle": [1.5, 0.5],
+                "ap": [0.0, 0.0],
+                "ml": [0.0, 0.0],
+            },
+            index=["tgt0", "tgt1"],
+        ),
+        obsm={"X_pca": np.zeros((2, 2), dtype=np.float32)},
+    )
+    subproblem = type("DummySubproblem", (), {"adata_src": adata_src, "adata_tgt": adata_tgt})()
+
+    cost = make_brdu_pair_cost_builder(ap_ml_penalty=0.0, backward_tricycle_penalty=100.0)(subproblem)
+
+    assert list(cost.index) == ["src0"]
+    assert list(cost.columns) == ["tgt0", "tgt1"]
+    assert cost.shape == (1, 2)
+    assert float(cost.iloc[0, 0]) < float(cost.iloc[0, 1])
+
+
+def test_fit_temporal_problem_applies_custom_pair_cost_builder() -> None:
+    calls: dict[str, object] = {}
+
+    class FakeSubproblem:
+        def __init__(self, adata_src: AnnData, adata_tgt: AnnData) -> None:
+            self.adata_src = adata_src
+            self.adata_tgt = adata_tgt
+            self.set_xy_calls: list[tuple[pd.DataFrame, str]] = []
+
+        def set_xy(self, xy: pd.DataFrame, tag: str) -> None:
+            self.set_xy_calls.append((xy, tag))
+
+    class FakeTemporalProblem:
+        def __init__(self, adata: AnnData) -> None:
+            self.adata = adata
+            self.problems = [(0, 1)]
+            src = adata[adata.obs["time"] == 0].copy()
+            tgt = adata[adata.obs["time"] == 1].copy()
+            self._subproblem = FakeSubproblem(src, tgt)
+
+        def score_genes_for_marginals(self, *, gene_set_proliferation: str, gene_set_apoptosis: str) -> "FakeTemporalProblem":
+            calls["marginals"] = (gene_set_proliferation, gene_set_apoptosis)
+            return self
+
+        def prepare(self, **kwargs: object) -> "FakeTemporalProblem":
+            calls["prepare"] = kwargs
+            return self
+
+        def __getitem__(self, key: tuple[int, int]) -> FakeSubproblem:
+            assert key == (0, 1)
+            return self._subproblem
+
+        def solve(self, **kwargs: object) -> "FakeTemporalProblem":
+            calls["solve"] = kwargs
+            return self
+
+    adata = AnnData(
+        X=np.zeros((4, 2), dtype=np.float32),
+        obs=pd.DataFrame({"time": [0, 0, 1, 1]}, index=["c0", "c1", "c2", "c3"]),
+        obsm={"X_scvi": np.zeros((4, 2), dtype=np.float32)},
+    )
+    cfg = TemporalProblemConfig(time_key="time", joint_attr="X_scvi", estimate_marginals=False, max_iterations=123)
+
+    original_temporal_problem = brdu_ot.TemporalProblem
+    brdu_ot.TemporalProblem = FakeTemporalProblem
+    try:
+        tp, times = fit_temporal_problem(
+            adata,
+            cfg,
+            pair_cost_builder=lambda sub: np.zeros((sub.adata_src.n_obs, sub.adata_tgt.n_obs), dtype=np.float32),
+        )
+    finally:
+        brdu_ot.TemporalProblem = original_temporal_problem
+
+    assert isinstance(tp, FakeTemporalProblem)
+    assert times == [0, 1]
+    assert calls["prepare"] == {
+        "time_key": "time",
+        "joint_attr": "X_scvi",
+        "policy": "sequential",
+        "cost": "sq_euclidean",
+        "a": False,
+        "b": False,
+        "marginal_kwargs": {},
+    }
+    assert calls["solve"] == {
+        "epsilon": 1e-3,
+        "tau_a": 0.95,
+        "tau_b": 0.95,
+        "rank": -1,
+        "scale_cost": "mean",
+        "batch_size": None,
+        "threshold": 1e-3,
+        "max_iterations": 123,
+    }
+    assert len(tp._subproblem.set_xy_calls) == 1
+    xy, tag = tp._subproblem.set_xy_calls[0]
+    assert tag == "cost_matrix"
+    assert list(xy.index) == ["c0", "c1"]
+    assert list(xy.columns) == ["c2", "c3"]

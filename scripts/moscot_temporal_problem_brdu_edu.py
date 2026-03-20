@@ -24,8 +24,8 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 from anndata import AnnData, read_h5ad
+from fishtools.brdu.ot import TemporalProblemConfig, fit_temporal_problem, make_brdu_pair_cost_builder
 from fishtools.brdu.temporal_order import assign_temporal_order_from_brdu_edu
-from fishtools.brdu.transport_cost import pairwise_sqeuclidean_with_backward_tricycle_penalty
 from matplotlib.collections import LineCollection
 from moscot.problems.time import TemporalProblem
 from scipy.sparse.csgraph import connected_components
@@ -252,46 +252,12 @@ print(cluster_counts.head(20).to_string())
 # ## Phase 2: Prepare TemporalProblem
 
 # %%
-tp = TemporalProblem(adata=adata).prepare(time_key=TIME_KEY, joint_attr=JOINT_ATTR)
-time_points = sorted({t for pair in tp.problems for t in pair})
-print("prepared TemporalProblem with timepoints:", time_points)
-
-for t_src, t_tgt in zip(time_points[:-1], time_points[1:], strict=True):
-    sub = tp[t_src, t_tgt]
-    cost = pairwise_sqeuclidean_with_backward_tricycle_penalty(
-        src_features=np.asarray(sub.adata_src.obsm[JOINT_ATTR], dtype=np.float32),
-        tgt_features=np.asarray(sub.adata_tgt.obsm[JOINT_ATTR], dtype=np.float32),
-        src_tricycle=sub.adata_src.obs[TRICYCLE_KEY].to_numpy(dtype=np.float32),
-        tgt_tricycle=sub.adata_tgt.obs[TRICYCLE_KEY].to_numpy(dtype=np.float32),
-        backward_penalty_weight=BACKWARD_TRICYCLE_PENALTY,
-        src_ap=sub.adata_src.obs[AP_KEY].to_numpy(dtype=np.float32),
-        tgt_ap=sub.adata_tgt.obs[AP_KEY].to_numpy(dtype=np.float32),
-        src_ml=sub.adata_src.obs[ML_KEY].to_numpy(dtype=np.float32),
-        tgt_ml=sub.adata_tgt.obs[ML_KEY].to_numpy(dtype=np.float32),
-        ap_ml_penalty_weight=AP_ML_DISPLACEMENT_PENALTY,
-    )
-    sub.set_xy(
-        pd.DataFrame(cost, index=sub.adata_src.obs_names, columns=sub.adata_tgt.obs_names),
-        tag="cost_matrix",
-    )
-print(
-    "set custom pairwise costs with "
-    f"backward tricycle penalty={BACKWARD_TRICYCLE_PENALTY} and "
-    f"AP/ML displacement penalty={AP_ML_DISPLACEMENT_PENALTY}"
-)
-
-
-# %% [markdown]
-# ## Phase 3 (optional): Graph-based (geodesic) cost per adjacent time pair
-#
-# This mirrors the tutorial, but uses the sparse graph form accepted by `set_graph_xy`
-# to avoid instantiating dense cost matrices.
-
-# %%
 if USE_GRAPH_COST:
     if BACKWARD_TRICYCLE_PENALTY > 0 or AP_ML_DISPLACEMENT_PENALTY > 0:
         raise ValueError("`USE_GRAPH_COST` cannot be combined with explicit linear AP/ML or tricycle penalties.")
+    tp = TemporalProblem(adata=adata).prepare(time_key=TIME_KEY, joint_attr=JOINT_ATTR)
     time_points = sorted({t for pair in tp.problems for t in pair})
+    print("prepared TemporalProblem with timepoints:", time_points)
     for t_src, t_tgt in zip(time_points[:-1], time_points[1:], strict=True):
         sub = tp[t_src, t_tgt]
         pair_obs_names = list(sub.adata_src.obs_names) + list(sub.adata_tgt.obs_names)
@@ -312,20 +278,45 @@ if USE_GRAPH_COST:
         sub.set_graph_xy((conn, idx, idx), t=GRAPH_HEAT_T)
 
     print("set graph-based costs for all adjacent time pairs")
-
-
-# %% [markdown]
-# ## Phase 4: Solve
-
-# %%
-tp = tp.solve(
-    epsilon=EPSILON,
-    tau_a=TAU_A,
-    tau_b=TAU_B,
-    scale_cost="mean",
-    max_iterations=MAX_ITERATIONS,
-)
-print("solved TemporalProblem")
+    tp = tp.solve(
+        epsilon=EPSILON,
+        tau_a=TAU_A,
+        tau_b=TAU_B,
+        scale_cost="mean",
+        max_iterations=MAX_ITERATIONS,
+    )
+    print("solved TemporalProblem")
+else:
+    cfg = TemporalProblemConfig(
+        time_key=TIME_KEY,
+        joint_attr=JOINT_ATTR,
+        policy="sequential",
+        cost="sq_euclidean",
+        epsilon=EPSILON,
+        tau_a=TAU_A,
+        tau_b=TAU_B,
+        scale_cost="mean",
+        max_iterations=MAX_ITERATIONS,
+    )
+    tp, time_points = fit_temporal_problem(
+        adata,
+        cfg,
+        pair_cost_builder=make_brdu_pair_cost_builder(
+            joint_attr=JOINT_ATTR,
+            tricycle_key=TRICYCLE_KEY,
+            ap_key=AP_KEY,
+            ml_key=ML_KEY,
+            backward_tricycle_penalty=BACKWARD_TRICYCLE_PENALTY,
+            ap_ml_penalty=AP_ML_DISPLACEMENT_PENALTY,
+        ),
+    )
+    print("prepared TemporalProblem with timepoints:", time_points)
+    print(
+        "set custom pairwise costs with "
+        f"backward tricycle penalty={BACKWARD_TRICYCLE_PENALTY} and "
+        f"AP/ML displacement penalty={AP_ML_DISPLACEMENT_PENALTY}"
+    )
+    print("solved TemporalProblem")
 
 
 # %% [markdown]
