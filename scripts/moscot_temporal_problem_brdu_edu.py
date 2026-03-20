@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -57,7 +58,10 @@ SAMPLE_N_PER_TIME = 5000
 JOINT_ATTR = "X_pca"
 UMAP_BASIS = "umap"
 TRICYCLE_KEY = "tricycle"
+AP_KEY = "ap"
+ML_KEY = "ml"
 BACKWARD_TRICYCLE_PENALTY = 30.0
+AP_ML_DISPLACEMENT_PENALTY = 10.0
 
 # Optional: use graph-based (geodesic) cost like in the tutorial
 USE_GRAPH_COST = False
@@ -172,13 +176,20 @@ def _plot_umap_barycentric_transition(
 adata_b = read_h5ad(INFILE, backed="r")
 obs = adata_b.obs
 
-mask_old = ~obs[BRDU_KEY].to_numpy(dtype=bool) & obs[EDU_KEY].to_numpy(dtype=bool)
-mask_mid = obs[BRDU_KEY].to_numpy(dtype=bool) & obs[EDU_KEY].to_numpy(dtype=bool)
-mask_young = obs[BRDU_KEY].to_numpy(dtype=bool) & ~obs[EDU_KEY].to_numpy(dtype=bool)
+spatial_ok = np.isfinite(obs[AP_KEY].to_numpy(dtype=np.float32)) & np.isfinite(obs[ML_KEY].to_numpy(dtype=np.float32))
+mask_old = spatial_ok & ~obs[BRDU_KEY].to_numpy(dtype=bool) & obs[EDU_KEY].to_numpy(dtype=bool)
+mask_mid = spatial_ok & obs[BRDU_KEY].to_numpy(dtype=bool) & obs[EDU_KEY].to_numpy(dtype=bool)
+mask_young = spatial_ok & obs[BRDU_KEY].to_numpy(dtype=bool) & ~obs[EDU_KEY].to_numpy(dtype=bool)
 
 idx_old = _sample_indices(mask_old, n=SAMPLE_N_PER_TIME, rng=rng)
 idx_mid = _sample_indices(mask_mid, n=SAMPLE_N_PER_TIME, rng=rng)
 idx_young = _sample_indices(mask_young, n=SAMPLE_N_PER_TIME, rng=rng)
+
+if len(idx_old) == 0 or len(idx_mid) == 0 or len(idx_young) == 0:
+    raise ValueError(
+        "One of the BrdU/EdU time groups has 0 eligible cells after requiring finite AP/ML coordinates. "
+        f"Counts: old={len(idx_old)}, mid={len(idx_mid)}, young={len(idx_young)}."
+    )
 
 sel = np.sort(np.concatenate([idx_old, idx_mid, idx_young]))
 adata: AnnData = adata_b[sel].to_memory()
@@ -224,6 +235,14 @@ if LEIDEN_KEY not in adata.obs:
         "You said Leiden clusters already exist in the data; if the key differs, update `LEIDEN_KEY`."
     )
 
+for key in (AP_KEY, ML_KEY):
+    if key not in adata.obs:
+        raise KeyError(f"Expected `{key}` in `adata.obs`, found columns: {list(adata.obs.columns)}")
+
+ap_ml = adata.obs[[AP_KEY, ML_KEY]].to_numpy(dtype=np.float32)
+if not np.isfinite(ap_ml).all():
+    raise ValueError(f"Found non-finite values in `{AP_KEY}`/`{ML_KEY}`; expected finite AP/ML coordinates.")
+
 cluster_counts = adata.obs[LEIDEN_KEY].value_counts()
 print(f"`{LEIDEN_KEY}` clusters: n={len(cluster_counts)}")
 print(cluster_counts.head(20).to_string())
@@ -245,12 +264,21 @@ for t_src, t_tgt in zip(time_points[:-1], time_points[1:], strict=True):
         src_tricycle=sub.adata_src.obs[TRICYCLE_KEY].to_numpy(dtype=np.float32),
         tgt_tricycle=sub.adata_tgt.obs[TRICYCLE_KEY].to_numpy(dtype=np.float32),
         backward_penalty_weight=BACKWARD_TRICYCLE_PENALTY,
+        src_ap=sub.adata_src.obs[AP_KEY].to_numpy(dtype=np.float32),
+        tgt_ap=sub.adata_tgt.obs[AP_KEY].to_numpy(dtype=np.float32),
+        src_ml=sub.adata_src.obs[ML_KEY].to_numpy(dtype=np.float32),
+        tgt_ml=sub.adata_tgt.obs[ML_KEY].to_numpy(dtype=np.float32),
+        ap_ml_penalty_weight=AP_ML_DISPLACEMENT_PENALTY,
     )
     sub.set_xy(
         pd.DataFrame(cost, index=sub.adata_src.obs_names, columns=sub.adata_tgt.obs_names),
         tag="cost_matrix",
     )
-print(f"set custom pairwise costs with backward tricycle penalty={BACKWARD_TRICYCLE_PENALTY}")
+print(
+    "set custom pairwise costs with "
+    f"backward tricycle penalty={BACKWARD_TRICYCLE_PENALTY} and "
+    f"AP/ML displacement penalty={AP_ML_DISPLACEMENT_PENALTY}"
+)
 
 
 # %% [markdown]
@@ -261,8 +289,8 @@ print(f"set custom pairwise costs with backward tricycle penalty={BACKWARD_TRICY
 
 # %%
 if USE_GRAPH_COST:
-    if BACKWARD_TRICYCLE_PENALTY > 0:
-        raise ValueError("`USE_GRAPH_COST` and `BACKWARD_TRICYCLE_PENALTY > 0` both set the linear term.")
+    if BACKWARD_TRICYCLE_PENALTY > 0 or AP_ML_DISPLACEMENT_PENALTY > 0:
+        raise ValueError("`USE_GRAPH_COST` cannot be combined with explicit linear AP/ML or tricycle penalties.")
     time_points = sorted({t for pair in tp.problems for t in pair})
     for t_src, t_tgt in zip(time_points[:-1], time_points[1:], strict=True):
         sub = tp[t_src, t_tgt]
@@ -374,21 +402,131 @@ for t_src, t_tgt in zip(time_points[:-1], time_points[1:], strict=True):
 
 
 # %% [markdown]
-# ## Phase 7: Driver genes and transcription factors (per Leiden fate)
+# ## Phase 7: Transcriptomic drivers for adjacent transitions
+#
+# For each adjacent time pair:
+# - push forward each source Leiden population onto the next timepoint and correlate those descendant
+#   probabilities with target-time transcriptomes
+# - pull back each target Leiden population onto the previous timepoint and correlate those ancestor
+#   probabilities with source-time transcriptomes
+#
+# This uses `compute_feature_correlation()` directly on OT-derived push/pull probabilities rather than
+# only on endpoint-style fates.
+
+# %%
+drivers_dir = OUTDIR / "drivers"
+drivers_dir.mkdir(parents=True, exist_ok=True)
+
+if EXPR_LAYER is not None and EXPR_LAYER not in tp.adata.layers:
+    raise KeyError(f"Expected `EXPR_LAYER={EXPR_LAYER!r}` in `tp.adata.layers`, found: {list(tp.adata.layers.keys())}")
+
+
+def _safe_id(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+
+
+def _present_clusters_at_timepoint(*, adata: AnnData, timepoint: int, key: str) -> list[str]:
+    obs = adata.obs.loc[adata.obs[TIME_KEY].astype(int) == timepoint, key]
+    return sorted(obs.astype(str).unique().tolist())
+
+
+adjacent_dir = drivers_dir / "adjacent"
+adjacent_dir.mkdir(parents=True, exist_ok=True)
+
+adjacent_summary_rows: list[dict[str, object]] = []
+
+for t_src, t_tgt in zip(time_points[:-1], time_points[1:], strict=True):
+    src_clusters = _present_clusters_at_timepoint(adata=adata, timepoint=t_src, key=LEIDEN_KEY)
+    tgt_clusters = _present_clusters_at_timepoint(adata=adata, timepoint=t_tgt, key=LEIDEN_KEY)
+
+    for leiden in src_clusters:
+        leiden_id = _safe_id(leiden)
+        obs_key = f"{LEIDEN_KEY}_{leiden_id}_push_{t_src}to{t_tgt}"
+        n_cells = int(
+            ((adata.obs[TIME_KEY].astype(int) == t_src) & (adata.obs[LEIDEN_KEY].astype(str) == leiden)).sum()
+        )
+
+        tp.push(t_src, t_tgt, data=LEIDEN_KEY, subset=leiden, key_added=obs_key, scale_by_marginals=True)
+        drivers_genes = tp.compute_feature_correlation(obs_key=obs_key, annotation={TIME_KEY: [t_tgt]}, layer=EXPR_LAYER)
+        drivers_tfs = tp.compute_feature_correlation(
+            obs_key=obs_key,
+            features="mouse",
+            annotation={TIME_KEY: [t_tgt]},
+            layer=EXPR_LAYER,
+        )
+
+        out_genes = adjacent_dir / f"drivers_genes_push_{LEIDEN_KEY}_{leiden_id}_{t_src}_to_{t_tgt}.csv"
+        out_tfs = adjacent_dir / f"drivers_tfs_push_{LEIDEN_KEY}_{leiden_id}_{t_src}_to_{t_tgt}.csv"
+        drivers_genes.to_csv(out_genes)
+        drivers_tfs.to_csv(out_tfs)
+
+        adjacent_summary_rows.append(
+            {
+                "transition": f"{t_src}->{t_tgt}",
+                "direction": "push",
+                "leiden": leiden,
+                "expression_timepoint": t_tgt,
+                "n_group_cells": n_cells,
+                "top_tfs": ";".join(drivers_tfs.head(10).index.tolist()),
+            }
+        )
+
+        print(f"[drivers][push] transition={t_src}->{t_tgt} leiden={leiden} wrote {out_tfs}")
+        print(drivers_tfs.head(10).to_string())
+        print()
+
+    for leiden in tgt_clusters:
+        leiden_id = _safe_id(leiden)
+        obs_key = f"{LEIDEN_KEY}_{leiden_id}_pull_{t_src}to{t_tgt}"
+        n_cells = int(
+            ((adata.obs[TIME_KEY].astype(int) == t_tgt) & (adata.obs[LEIDEN_KEY].astype(str) == leiden)).sum()
+        )
+
+        tp.pull(t_src, t_tgt, data=LEIDEN_KEY, subset=leiden, key_added=obs_key, scale_by_marginals=True)
+        drivers_genes = tp.compute_feature_correlation(obs_key=obs_key, annotation={TIME_KEY: [t_src]}, layer=EXPR_LAYER)
+        drivers_tfs = tp.compute_feature_correlation(
+            obs_key=obs_key,
+            features="mouse",
+            annotation={TIME_KEY: [t_src]},
+            layer=EXPR_LAYER,
+        )
+
+        out_genes = adjacent_dir / f"drivers_genes_pull_{LEIDEN_KEY}_{leiden_id}_{t_src}_to_{t_tgt}.csv"
+        out_tfs = adjacent_dir / f"drivers_tfs_pull_{LEIDEN_KEY}_{leiden_id}_{t_src}_to_{t_tgt}.csv"
+        drivers_genes.to_csv(out_genes)
+        drivers_tfs.to_csv(out_tfs)
+
+        adjacent_summary_rows.append(
+            {
+                "transition": f"{t_src}->{t_tgt}",
+                "direction": "pull",
+                "leiden": leiden,
+                "expression_timepoint": t_src,
+                "n_group_cells": n_cells,
+                "top_tfs": ";".join(drivers_tfs.head(10).index.tolist()),
+            }
+        )
+
+        print(f"[drivers][pull] transition={t_src}->{t_tgt} leiden={leiden} wrote {out_tfs}")
+        print(drivers_tfs.head(10).to_string())
+        print()
+
+adjacent_summary_df = pd.DataFrame(adjacent_summary_rows).sort_values(["transition", "direction", "leiden"])
+adjacent_summary_path = adjacent_dir / "drivers_tfs_summary_adjacent.csv"
+adjacent_summary_df.to_csv(adjacent_summary_path, index=False)
+print(f"wrote {adjacent_summary_path}")
+
+
+# %% [markdown]
+# ## Phase 8: Driver genes and transcription factors (per endpoint-like Leiden fate)
 #
 # For each Leiden cluster, compute a pull-back distribution (ancestors) and correlate it with gene expression.
 # We mimic the tutorial by combining pull distributions across adjacent time pairs and restricting correlation
 # to timepoints 0 and 1 (the timepoints where ancestors live for a 3-timepoint setup).
 
 # %%
-drivers_dir = OUTDIR / "drivers"
-drivers_dir.mkdir(parents=True, exist_ok=True)
-
 driver_timepoints = [0, 1]
 leiden_categories = adata.obs[LEIDEN_KEY].cat.categories.tolist()
-
-if EXPR_LAYER is not None and EXPR_LAYER not in tp.adata.layers:
-    raise KeyError(f"Expected `EXPR_LAYER={EXPR_LAYER!r}` in `tp.adata.layers`, found: {list(tp.adata.layers.keys())}")
 
 summary_rows: list[dict[str, object]] = []
 

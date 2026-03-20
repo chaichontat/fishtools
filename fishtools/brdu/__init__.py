@@ -16,6 +16,7 @@ from fishtools.brdu.model import (
     predict_on_adata,
     save_model_bundle,
 )
+from fishtools.brdu.sampling import proportional_sample_sizes
 from fishtools.brdu.temporal_order import assign_temporal_order_from_brdu_edu
 
 __all__ = [
@@ -31,5 +32,6 @@ __all__ = [
     "load_model_bundle",
     "predict_on_adata",
     "save_model_bundle",
+    "proportional_sample_sizes",
     "assign_temporal_order_from_brdu_edu",
 ]
