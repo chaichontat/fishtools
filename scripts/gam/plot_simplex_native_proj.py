@@ -542,7 +542,7 @@ def main() -> int:
         "--apml-percentile-range",
         type=float,
         nargs=2,
-        default=None,
+        default=(2.5, 97.5),
         metavar=("LO", "HI"),
         help="Mask AP/ML support to the independent [LO, HI] percentiles of AP_um and ML_um from cells.tsv.",
     )
@@ -573,12 +573,14 @@ def main() -> int:
     p.add_argument("--elev-deg", type=float, default=-10.0)
     p.add_argument("--azim-deg", type=float, default=-110.0)
     p.add_argument("--roll-deg", type=float, default=180.0)
+    p.add_argument("--proj-type", choices=("ortho", "persp"), default="ortho")
+    p.add_argument("--focal-length", type=float, default=0.5)
     p.add_argument("--latlon", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--graticule", choices=("apml", "param", "ijk"), default="ijk")
     p.add_argument("--lat-stride", type=int, default=10)
     p.add_argument("--lon-stride", type=int, default=10)
-    p.add_argument("--max-lat-lines", type=int, default=10)
-    p.add_argument("--max-lon-lines", type=int, default=10)
+    p.add_argument("--max-lat-lines", type=int, default=8)
+    p.add_argument("--max-lon-lines", type=int, default=8)
     p.add_argument("--montage-cols", type=int, default=3)
     p.add_argument("--montage-scale-bar", choices=("first", "all", "none"), default="first")
     p.add_argument(
@@ -973,6 +975,11 @@ def main() -> int:
             shade_strength=0.75,
             shade_elev_deg=float(args.elev_deg),
             shade_azim_deg=float(args.azim_deg),
+            camera_elev_deg=float(args.elev_deg),
+            camera_azim_deg=float(args.azim_deg),
+            camera_roll_deg=float(args.roll_deg),
+            proj_type=str(args.proj_type),
+            focal_length=float(args.focal_length),
             ordered_geometry=ordered_geom,
             tri_alpha=tri_alpha,
             out_png=out_png,
@@ -1019,6 +1026,11 @@ def main() -> int:
         shade_strength=0.75,
         shade_elev_deg=float(args.elev_deg),
         shade_azim_deg=float(args.azim_deg),
+        camera_elev_deg=float(args.elev_deg),
+        camera_azim_deg=float(args.azim_deg),
+        camera_roll_deg=float(args.roll_deg),
+        proj_type=str(args.proj_type),
+        focal_length=float(args.focal_length),
         ordered_geometry=ordered_geom,
         tri_alpha=montage_tri_alpha,
         cmap=display_cmap,

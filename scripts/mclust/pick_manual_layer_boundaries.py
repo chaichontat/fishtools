@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import anndata as ad
+import zarr
 
 os.environ["MATPLOTLIBRC"] = os.devnull
 import matplotlib.pyplot as plt
@@ -24,6 +25,31 @@ from scipy.ndimage import label as ndi_label
 from skimage.color import label2rgb
 from skimage.draw import line
 from skimage.morphology import disk
+
+from fishtools.ccf.landmark import LandmarkRegistrationOutputs
+from fishtools.ccf.ndimage_geometry import fused_xy_to_rotated_full_xy
+from fishtools.io.workspace import Workspace
+
+plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["font.sans-serif"] = ["Arial", "Liberation Sans", "DejaVu Sans"]
+
+ORIGINAL_LABEL_COLORS = {
+    "1": "#4e79a7",
+    "2": "#f28e2b",
+    "3": "#e15759",
+    "4": "#76b7b2",
+    "5": "#59a14f",
+    "6": "#edc949",
+    "7": "#af7aa1",
+}
+MANUAL_LAYER_COLORS = {
+    "46": ORIGINAL_LABEL_COLORS["4"],
+    "2": ORIGINAL_LABEL_COLORS["2"],
+    "3": ORIGINAL_LABEL_COLORS["3"],
+    "7": ORIGINAL_LABEL_COLORS["7"],
+    "5": ORIGINAL_LABEL_COLORS["5"],
+    "1": ORIGINAL_LABEL_COLORS["1"],
+}
 
 # %% [markdown]
 # # Pick manual layer boundaries from pooled mclust labels
@@ -48,9 +74,10 @@ if ip is not None:
 # Update paths and knobs here before running the workflow cells below.
 
 # %%
-INPUT_H5AD = Path("/fast2/cs_outputs/all.h5ad")
-LABELS_PARQUET = Path("/fast2/cs_outputs/all.stagate.mclust_sweep.parquet")
-OUTPUT_ROOT = Path("/fast2/cs_outputs/all.mclust_manual_boundaries")
+PATH = Path("~/nvme").expanduser()
+INPUT_H5AD = PATH / "all.h5ad"
+LABELS_PARQUET = PATH / "all.stagate.mclust_sweep.parquet"
+OUTPUT_ROOT = PATH / "all.mclust_manual_boundaries"
 
 LABEL_KEY = "mclust_k7"
 BOUNDARY_ORDER = ("46-2", "2-3", "3-7", "7-5", "5-1")
@@ -75,16 +102,18 @@ SPLINE_MIN_POINTS = 4
 CURVE_MAX_SAMPLES = 1_500
 UI_FIGSIZE = (16, 12)
 QC_DPI = 180
-MONTAGE_NCOLS = 4
+MONTAGE_NCOLS = 8
 MONTAGE_MAX_POINTS_PER_UNIT = 30_000
-MONTAGE_PANEL_SIZE = (4.2, 4.2)
-MONTAGE_DPI = 120
+MONTAGE_PANEL_SIZE = (3.6, 3.6)
+MONTAGE_DPI = 200
 MONTAGE_POINT_SIZE = 1.0
 MONTAGE_POINT_ALPHA = 0.6
+SEARCH_ROOTS: tuple[Path, ...] = (Path("/working"), Path.home() / "nvme")
 
 adata: ad.AnnData | None = None
 jobs: list[JobSpec] = []
 i = 0
+_DISPLAY_TRANSFORM_CACHE: dict[tuple[str, str], tuple[bool, float, tuple[int, int]] | None] = {}
 
 
 @dataclass(frozen=True)
@@ -194,6 +223,73 @@ def get_spatial_xy(adata: ad.AnnData) -> np.ndarray:
     if not np.isfinite(xy).all():
         raise ValueError("Coordinate array contains non-finite values.")
     return xy
+
+
+def _infer_dataset_root(dataset: str) -> Path:
+    for root in SEARCH_ROOTS:
+        candidate = root / dataset
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Dataset root not found for {dataset!r}. Expected under: {[str(root) for root in SEARCH_ROOTS]}"
+    )
+
+
+def _infer_fused_shape_yx(*, ws: Workspace, roi: str, xy: np.ndarray) -> tuple[int, int]:
+    candidates = sorted((ws.analysis / "deconv").glob(f"stitch--{roi}*/fused.zarr"))
+    for candidate in candidates:
+        try:
+            arr = zarr.open(str(candidate), mode="r")
+            if len(arr.shape) >= 3:
+                return (int(arr.shape[1]), int(arr.shape[2]))
+        except Exception:
+            continue
+
+    x = np.asarray(xy[:, 0], dtype=np.float64)
+    y = np.asarray(xy[:, 1], dtype=np.float64)
+    return (int(np.ceil(np.nanmax(y))) + 1, int(np.ceil(np.nanmax(x))) + 1)
+
+
+def _get_display_transform(job: JobSpec, xy: np.ndarray) -> tuple[bool, float, tuple[int, int]] | None:
+    cache_key = (job.dataset, job.roi_group)
+    cached = _DISPLAY_TRANSFORM_CACHE.get(cache_key)
+    if cache_key in _DISPLAY_TRANSFORM_CACHE:
+        return cached
+
+    try:
+        ws = Workspace(_infer_dataset_root(job.dataset))
+        outputs = LandmarkRegistrationOutputs(ws.ccf_transforms(job.roi_group))
+        p1 = outputs.try_read_p1_landmarks()
+        if p1 is None:
+            _DISPLAY_TRANSFORM_CACHE[cache_key] = None
+            return None
+
+        transform = (
+            bool(p1.prior_flip_x),
+            float(p1.prior_rotation_deg),
+            _infer_fused_shape_yx(ws=ws, roi=job.roi_group, xy=xy),
+        )
+        _DISPLAY_TRANSFORM_CACHE[cache_key] = transform
+        return transform
+    except Exception:
+        _DISPLAY_TRANSFORM_CACHE[cache_key] = None
+        return None
+
+
+def _transform_xy_for_display(xy: np.ndarray, *, job: JobSpec) -> np.ndarray:
+    transform = _get_display_transform(job, xy)
+    if transform is None:
+        return xy
+
+    prior_flip_x, prior_rotation_deg, fused_shape_yx = transform
+    x_rot, y_rot, _ = fused_xy_to_rotated_full_xy(
+        x_fused=np.asarray(xy[:, 0], dtype=np.float64),
+        y_fused=np.asarray(xy[:, 1], dtype=np.float64),
+        fused_shape_yx=fused_shape_yx,
+        prior_flip_x=prior_flip_x,
+        prior_rotation_deg=prior_rotation_deg,
+    )
+    return np.column_stack([x_rot, y_rot]).astype(np.float32, copy=False)
 
 
 def _job_output_stem(job: JobSpec) -> str:
@@ -735,15 +831,24 @@ def write_assignment_outputs(
     frame.to_parquet(paths["assignments"], index=False)
 
     xy = get_spatial_xy(adata_job)
+    xy_display = _transform_xy_for_display(xy, job=job)
     original_labels = adata_job.obs[LABEL_KEY].astype(str).to_numpy()
     result_codes = _manual_layer_codes(result.manual_layers)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=QC_DPI)
     cmap = ListedColormap(["#355070", "#6d597a", "#b56576", "#e56b6f", "#eaac8b", "#ffcc66", "#76b041"])
-    axes[0].scatter(xy[:, 0], xy[:, 1], c=pd.Categorical(original_labels).codes, cmap=cmap, s=1.5, alpha=0.6, linewidths=0)
-    axes[0].set_title("Current mclust_k7")
-    axes[1].scatter(xy[:, 0], xy[:, 1], c=result_codes, cmap="tab10", s=1.5, alpha=0.6, linewidths=0)
-    axes[1].set_title("Manual layer assignment")
+    axes[0].scatter(
+        xy_display[:, 0],
+        xy_display[:, 1],
+        c=pd.Categorical(original_labels).codes,
+        cmap=cmap,
+        s=1.5,
+        alpha=0.6,
+        linewidths=0,
+    )
+    axes[0].set_title("Current mclust_k7", fontname="Arial")
+    axes[1].scatter(xy_display[:, 0], xy_display[:, 1], c=result_codes, cmap="tab10", s=1.5, alpha=0.6, linewidths=0)
+    axes[1].set_title("Manual layer assignment", fontname="Arial")
 
     axes[2].imshow(
         label2rgb(result.components_raster, bg_label=0),
@@ -751,25 +856,29 @@ def write_assignment_outputs(
         interpolation="nearest",
     )
     axes[2].imshow(np.where(result.barrier_mask, 1.0, np.nan), origin="upper", cmap="gray", alpha=0.8)
-    axes[2].set_title("Raster compartments + barriers")
+    axes[2].set_title("Raster compartments + barriers", fontname="Arial")
 
     for boundary_name in BOUNDARY_ORDER:
         points = boundaries[boundary_name]
         if len(points) < 2:
             continue
         curve = densify_open_curve(np.asarray(points, dtype=np.float32))
+        curve = _transform_xy_for_display(curve, job=job)
         axes[0].plot(curve[:, 0], curve[:, 1], color="white", linewidth=1.2, alpha=0.9)
         axes[1].plot(curve[:, 0], curve[:, 1], color="black", linewidth=1.0, alpha=0.9)
 
     for ax in axes[:2]:
         ax.set_aspect("equal")
+        ax.set_anchor("N")
         ax.invert_yaxis()
         ax.set_xticks([])
         ax.set_yticks([])
+        ax.set_frame_on(False)
 
+    axes[2].set_anchor("N")
     axes[2].set_xticks([])
     axes[2].set_yticks([])
-    fig.suptitle(f"{job.dataset} | roi={job.roi_group} | ccf_adjusted={job.ccf_adjusted}")
+    axes[2].set_frame_on(False)
     fig.tight_layout()
     fig.savefig(paths["qc_png"], bbox_inches="tight")
     plt.close(fig)
@@ -891,22 +1000,24 @@ def _plot_job_panel(
     ax,
     *,
     adata_job: ad.AnnData,
+    job: JobSpec,
     title: str,
+    labels: pd.Series | None = None,
     boundaries: dict[str, list[tuple[float, float]]] | None = None,
     max_points: int = PLOT_MAX_POINTS,
     point_size: float = POINT_SIZE,
     point_alpha: float = POINT_ALPHA,
     rng_seed: int = 0,
 ) -> None:
-    xy = get_spatial_xy(adata_job)
-    labels = adata_job.obs[LABEL_KEY]
+    xy = _transform_xy_for_display(get_spatial_xy(adata_job), job=job)
+    plot_labels_all = adata_job.obs[LABEL_KEY] if labels is None else labels
 
     rng = np.random.default_rng(rng_seed)
     plot_idx = np.arange(adata_job.n_obs, dtype=np.int32)
     if plot_idx.size > max_points:
         plot_idx = np.sort(rng.choice(plot_idx, size=max_points, replace=False))
 
-    plot_labels = labels.iloc[plot_idx]
+    plot_labels = plot_labels_all.iloc[plot_idx]
     valid_mask = plot_labels.notna().to_numpy()
     if np.any(~valid_mask):
         missing_idx = plot_idx[~valid_mask]
@@ -921,12 +1032,19 @@ def _plot_job_panel(
         )
     if np.any(valid_mask):
         labeled_idx = plot_idx[valid_mask]
-        label_codes = pd.Categorical(labels.iloc[labeled_idx].astype(str)).codes
+        if labels is None:
+            label_codes = pd.Categorical(plot_labels_all.iloc[labeled_idx].astype(str)).codes
+            cmap = ListedColormap(["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949", "#af7aa1"])
+            colors = None
+        else:
+            label_codes = None
+            cmap = None
+            colors = [MANUAL_LAYER_COLORS.get(label, "#c7c7c7") for label in plot_labels_all.iloc[labeled_idx].astype(str)]
         ax.scatter(
             xy[labeled_idx, 0],
             xy[labeled_idx, 1],
-            c=label_codes,
-            cmap=ListedColormap(["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f", "#edc949", "#af7aa1"]),
+            c=colors if colors is not None else label_codes,
+            cmap=cmap,
             s=point_size,
             alpha=point_alpha,
             linewidths=0,
@@ -939,6 +1057,7 @@ def _plot_job_panel(
             if len(points) < 2:
                 continue
             curve = densify_open_curve(np.asarray(points, dtype=np.float32))
+            curve = _transform_xy_for_display(curve, job=job)
             ax.plot(
                 curve[:, 0],
                 curve[:, 1],
@@ -948,11 +1067,38 @@ def _plot_job_panel(
                 zorder=3,
             )
 
-    ax.set_title(title, fontsize=8)
+    ax.set_title(title, fontsize=12, fontname="Arial")
     ax.set_aspect("equal")
+    ax.set_anchor("N")
     ax.invert_yaxis()
     ax.set_xticks([])
     ax.set_yticks([])
+    ax.set_frame_on(False)
+
+
+def _job_panel_limits(
+    *,
+    adata_job: ad.AnnData,
+    job: JobSpec,
+    boundaries: dict[str, list[tuple[float, float]]] | None = None,
+) -> tuple[float, float, float, float]:
+    xy = _transform_xy_for_display(get_spatial_xy(adata_job), job=job)
+    xs = [np.asarray(xy[:, 0], dtype=np.float64)]
+    ys = [np.asarray(xy[:, 1], dtype=np.float64)]
+
+    if boundaries is not None:
+        for boundary_name in BOUNDARY_ORDER:
+            points = boundaries[boundary_name]
+            if len(points) < 2:
+                continue
+            curve = densify_open_curve(np.asarray(points, dtype=np.float32))
+            curve = _transform_xy_for_display(curve, job=job)
+            xs.append(np.asarray(curve[:, 0], dtype=np.float64))
+            ys.append(np.asarray(curve[:, 1], dtype=np.float64))
+
+    x_all = np.concatenate(xs)
+    y_all = np.concatenate(ys)
+    return float(np.min(x_all)), float(np.max(x_all)), float(np.min(y_all)), float(np.max(y_all))
 
 
 def review_job(
@@ -967,7 +1113,9 @@ def review_job(
     _plot_job_panel(
         ax,
         adata_job=adata_job,
+        job=job,
         title="",
+        labels=None,
         boundaries=None,
         max_points=PLOT_MAX_POINTS,
         point_size=POINT_SIZE,
@@ -1283,7 +1431,7 @@ if __name__ == "__main__":
         )
 
     review_adata = subset_job_adata(adata, review_job_spec)
-    review_xy = get_spatial_xy(review_adata)
+    review_xy = _transform_xy_for_display(get_spatial_xy(review_adata), job=review_job_spec)
     assignments = pd.read_parquet(review_paths["assignments"]).set_index("obs_ix")
     obs_ix = review_adata.obs["obs_ix"].to_numpy(dtype=np.int64, copy=False)
     manual_layer = assignments.loc[obs_ix, "manual_layer"]
@@ -1303,18 +1451,18 @@ if __name__ == "__main__":
         if len(points) < 2:
             continue
         curve = densify_open_curve(np.asarray(points, dtype=np.float32))
+        curve = _transform_xy_for_display(curve, job=review_job_spec)
         axes[0].plot(curve[:, 0], curve[:, 1], color="magenta", linewidth=1.0, alpha=0.9)
         axes[1].plot(curve[:, 0], curve[:, 1], color="magenta", linewidth=1.0, alpha=0.9)
 
     for ax in axes:
         ax.set_aspect("equal")
+        ax.set_anchor("N")
         ax.invert_yaxis()
         ax.set_xticks([])
         ax.set_yticks([])
+        ax.set_frame_on(False)
 
-    fig.suptitle(
-        f"{review_job_spec.dataset} | roi={review_job_spec.roi_group} | ccf_adjusted={review_job_spec.ccf_adjusted}"
-    )
     fig.tight_layout()
     plt.show()
 
@@ -1339,6 +1487,8 @@ if __name__ == "__main__":
     if not montage_jobs:
         raise FileNotFoundError("No saved boundary JSONs found. Save at least one unit first.")
 
+    montage_jobs = montage_jobs
+
     n_units = len(montage_jobs)
     ncols = min(MONTAGE_NCOLS, n_units)
     nrows = int(np.ceil(n_units / ncols))
@@ -1349,14 +1499,21 @@ if __name__ == "__main__":
         dpi=MONTAGE_DPI,
     )
     axes_arr = np.atleast_1d(axes).ravel()
+    panel_limits: list[tuple[float, float, float, float]] = []
 
     for ax, (montage_job, montage_paths) in zip(axes_arr, montage_jobs, strict=False):
         montage_adata = subset_job_adata(adata, montage_job)
         saved_boundaries = load_boundary_state(montage_paths["json"])
+        montage_assignments = pd.read_parquet(montage_paths["assignments"]).set_index("obs_ix")
+        montage_obs_ix = montage_adata.obs["obs_ix"].to_numpy(dtype=np.int64, copy=False)
+        montage_manual_layer = montage_assignments.loc[montage_obs_ix, "manual_layer"]
+        panel_limits.append(_job_panel_limits(adata_job=montage_adata, job=montage_job, boundaries=saved_boundaries))
         _plot_job_panel(
             ax,
             adata_job=montage_adata,
+            job=montage_job,
             title=f"{montage_job.dataset}\nroi={montage_job.roi_group} | ccf={montage_job.ccf_adjusted}",
+            labels=montage_manual_layer,
             boundaries=saved_boundaries,
             max_points=MONTAGE_MAX_POINTS_PER_UNIT,
             point_size=MONTAGE_POINT_SIZE,
@@ -1364,12 +1521,24 @@ if __name__ == "__main__":
             rng_seed=0,
         )
 
+    if panel_limits:
+        x_width = max(limit[1] - limit[0] for limit in panel_limits)
+        y_height = max(limit[3] - limit[2] for limit in panel_limits)
+        x_pad = 0.03 * max(1.0, x_width)
+        y_pad = 0.03 * max(1.0, y_height)
+        x_half = 0.5 * x_width + x_pad
+        y_half = 0.5 * y_height + y_pad
+        for ax, limit in zip(axes_arr[:n_units], panel_limits, strict=False):
+            x_center = 0.5 * (limit[0] + limit[1])
+            y_center = 0.5 * (limit[2] + limit[3])
+            ax.set_xlim(x_center - x_half, x_center + x_half)
+            ax.set_ylim(y_center + y_half, y_center - y_half)
+
     for ax in axes_arr[n_units:]:
         ax.axis("off")
 
-    fig.suptitle("Manual layer boundary montage", fontsize=14)
-    fig.tight_layout()
-    montage_png = OUTPUT_ROOT / "manual_layer_boundary_montage.png"
+    fig.subplots_adjust(left=0.02, right=0.995, bottom=0.02, top=0.92, wspace=0.04, hspace=0.08)
+    montage_png = OUTPUT_ROOT / "manual_layer_assignment_montage.png"
     fig.savefig(montage_png, bbox_inches="tight")
     print(f"Wrote montage: {montage_png}")
     plt.show()
