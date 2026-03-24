@@ -41,6 +41,8 @@ The fitter currently expects `cells.tsv` to include a `batch` column for pooled 
 
 ### Usage pseudotime `bam` rerun
 
+This script exists to test whether the `Usage_1 -> Usage_7` transition in the ventricular-zone dataset behaves like a real transcriptional trajectory. The goal is to turn the ratio `Usage_7 / (Usage_1 + Usage_7)` into a pseudotime axis, fit gene-wise smooth trends directly on cells, and then identify genes with structured expression changes along that axis while excluding cells dominated by other usage programs.
+
 The current one-off Usage pseudotime analysis is driven by the Python orchestrator at `scripts/vz_usage_mgcv_pseudotime.py`. It reads `~/nvme/vz.h5ad`, fits one `mgcv::bam` negative-binomial model per gene through `scripts/gam/fit_pseudotime_panel.R`, and keeps all R/BLAS/OpenMP thread counts at `1` while parallelizing across genes in Python.
 
 Current filter and pseudotime:
@@ -84,13 +86,103 @@ The archived per-gene fit cache, including the per-gene `.rds` directories, is h
 
 ## BrdU/EdU regression (scripts/brdu_regression)
 
+### AP/ML Ts/Tc GLM from `all_excit.h5ad`
+
+The AP/ML `Ts` / `Tc` renders are produced by `scripts/plot_brdu_edu_proportions_by_ap_ml.py`.
+
+Current behavior:
+
+- `Ts` is derived from a binomial-logit GLM for `P(BrdU-only | BrdU+)`
+- `Tc` is derived from `Ts` and a second binomial-logit GLM for `P(BrdU+EdU+)`
+- the 2D GLM includes animal fixed effects, then collapses those offsets back into a pooled intercept so the rendered surface is not tied to a single animal
+- native rendering uses the current GAM-style AP/ML surface path
+
+Commands used for the current all-Leiden excitatory reruns (`all_excit.h5ad`, Leiden `0-8`, bin width `200 um`):
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/plot_brdu_edu_proportions_by_ap_ml.py \
+  --h5ad ~/nvme/all_excit.h5ad \
+  --clusters 0,1,2,3,4,5,6,7,8 \
+  --manual-layer 1 \
+  --bin-width-um 200 \
+  --outdir scripts/_out/ts_native_all_excit_manual_layer1_all_leiden \
+  --plot-native-ts \
+  --plot-native-tc
+```
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/plot_brdu_edu_proportions_by_ap_ml.py \
+  --h5ad ~/nvme/all_excit.h5ad \
+  --clusters 0,1,2,3,4,5,6,7,8 \
+  --manual-layer 5 \
+  --bin-width-um 200 \
+  --outdir scripts/_out/ts_native_all_excit_manual_layer5_all_leiden \
+  --plot-native-ts \
+  --plot-native-tc
+```
+
+Main outputs:
+
+- `scripts/_out/ts_native_all_excit_manual_layer1_all_leiden`
+- `scripts/_out/ts_native_all_excit_manual_layer5_all_leiden`
+
+Key files in each output directory:
+
+- `ts_hours_native_proj_AP_ML_*.png`
+- `tc_hours_native_proj_AP_ML_*.png`
+- `ts_2d_plane_AP_ML_*.png`
+- `tc_2d_plane_AP_ML_*.png`
+- matching `*.csv` tables for the 2D plane plots
+
+### Raw AP/ML Areal Ts/Tc Bubble Plots
+
+The coarse 4x4 AP/ML areal plots are produced by `scripts/brdu_regression/ts_tc_areal_enrichment.py`.
+
+Current behavior:
+
+- color encodes raw `Ts` or raw `Tc` values, not log2 enrichment
+- each panel is a 4x4 AP/ML macro-bin layout
+- circle area is proportional to macro-bin cell count
+- color `vmax` is clipped at the 90th percentile to reduce outlier domination
+
+Commands used for the current `JaxA2`-excluded excitatory reruns:
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/ts_tc_areal_enrichment.py \
+  --h5ad ~/nvme/all_excit.h5ad \
+  --manual-layer 1 \
+  --include-leiden 0 1 2 3 4 5 6 7 8 \
+  --exclude-animals JaxA2 \
+  --outdir scripts/_out/ts_tc_areal_enrichment_manual_layer1_all_leiden_noJaxA2
+```
+
+```sh
+CONDA_NO_PLUGINS=true conda run -n seq python scripts/brdu_regression/ts_tc_areal_enrichment.py \
+  --h5ad ~/nvme/all_excit.h5ad \
+  --manual-layer 5 \
+  --include-leiden 0 1 2 3 4 5 6 7 8 \
+  --exclude-animals JaxA2 \
+  --outdir scripts/_out/ts_tc_areal_enrichment_manual_layer5_all_leiden_noJaxA2
+```
+
+Main outputs:
+
+- `scripts/_out/ts_tc_areal_enrichment_manual_layer1_all_leiden_noJaxA2`
+- `scripts/_out/ts_tc_areal_enrichment_manual_layer5_all_leiden_noJaxA2`
+
+Key files in each output directory:
+
+- `ts_hours_areal_enrichment_raw_heatmap.png`
+- `tc_hours_areal_enrichment_raw_heatmap.png`
+- `ts_tc_areal_assignments.csv`
+
 ### CNMF usage program → BrdU+ retention (BrdU+EdU+ / BrdU+) model
 
 This workflow fits a matched (stratum fixed-effect) grouped-binomial GLM on **BrdU+ cells only** to estimate:
 
 - `f_hat = P(EdU+ | BrdU+)` as a function of a selected CNMF usage program (binned into global quantiles; default `Usage_6`)
 - companions: `1/f_hat` and `T_S/Δt ≈ 1/(1−f_hat)` (standard convention)
-- plus a marginal EdU labeling-index model `pE_hat = P(EdU+)`, used to derive canonical `T_C/Δt ≈ (T_S/Δt)/pE_hat`.
+- plus a dual-label model `pD_hat = P(BrdU+EdU+)`, used to derive `T_C/Δt ≈ (T_S/Δt)/pD_hat`.
 
 Defaults:
 
