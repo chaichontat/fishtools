@@ -817,6 +817,9 @@ def _build_legend_display_rgba(*, legend_rgb: np.ndarray, support_mask: np.ndarr
 
 
 def _ml_pos_to_axis_frac(*, ml_um: float, ml_xlim_min: float, ml_xlim_max: float, flip: bool = True) -> float:
+    # This helper is for figure layout only. It does not define the stored
+    # obsm['AP_ML_um'] convention; the chart can be mirrored here for a clearer
+    # presentation while the underlying AP/ML coordinates remain unchanged.
     span = float(ml_xlim_max - ml_xlim_min)
     if not (span > 0.0):
         raise ValueError(f"Invalid ML x-limits span: [{ml_xlim_min}, {ml_xlim_max}]")
@@ -1509,6 +1512,9 @@ def save_ap_ml_mapping_figure(
     ax0.set_ylabel("Rostrocaudal (μm)", fontsize=16, labelpad=16)
     ax0.yaxis.tick_right()
     ax0.yaxis.set_label_position("right")
+    # Keep the historical figure orientation here. These inverted display axes
+    # are a plotting choice only; they are not the storage contract for
+    # obsm['AP_ML_um'], which remains [AP_um, ML_um].
     ax0.set_xlim(ml_xlim_max, ml_xlim_min)
     ax0.set_ylim(float(ap_max), float(ap_min))
     ax0.set_yticks(ap_lines.tolist())

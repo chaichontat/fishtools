@@ -6,7 +6,7 @@
 #
 # Run cells sequentially. Two Matplotlib slider viewers will open:
 # - coronal viewer: slice i (axis 0), showing x=k, y=j
-# - sagittal viewer: slice k (axis 2), showing x=j, y=i
+# - sagittal viewer: slice k (axis 2), rotated 90 deg CW from x=j, y=i
 
 # %%
 from __future__ import annotations
@@ -17,6 +17,8 @@ from pathlib import Path
 
 import matplotlib
 matplotlib.rcParams.update(matplotlib.rcParamsDefault)
+matplotlib.rcParams["font.family"] = "sans-serif"
+matplotlib.rcParams["font.sans-serif"] = ["Arial"]
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -842,40 +844,50 @@ if SHOW_FIGURES:
 # %%
 def view_sagittal_overlay(*, show: bool = True) -> None:
     n_k = int(reference_3d.shape[2])
+    n_i = int(reference_3d.shape[0])
     cur_k = int(np.clip(int(np.nanmedian(np.where(cortex_3d.any(axis=(0, 1)))[0])), 0, n_k - 1))
 
     fig, ax = plt.subplots(figsize=(7.7, 7.7))
     plt.subplots_adjust(bottom=0.14)
     t_field_cache: dict[int, np.ndarray] = {}
 
+    def rotate_sagittal_image(image_2d: np.ndarray) -> np.ndarray:
+        return np.rot90(image_2d, -1)
+
+    def rotate_sagittal_xy(path_xy: np.ndarray) -> np.ndarray:
+        pts = np.asarray(path_xy, dtype=np.float32)
+        if pts.size == 0:
+            return np.empty((0, 2), dtype=np.float32)
+        return np.column_stack([n_i - 1 - pts[:, 1], pts[:, 0]]).astype(np.float32, copy=False)
+
     img = ax.imshow(
-        reference_3d[:, :, cur_k],
+        rotate_sagittal_image(reference_3d[:, :, cur_k]),
         cmap="gray",
         interpolation="nearest",
         vmin=vmin,
         vmax=vmax,
         origin="upper",
-        aspect="auto",
+        aspect="equal",
     )
     mask_im = ax.imshow(
-        _binary_overlay_slice(cortex_3d[:, :, cur_k]),
+        rotate_sagittal_image(_binary_overlay_slice(cortex_3d[:, :, cur_k])),
         cmap=plt.cm.colors.ListedColormap([MASK_COLOR]),
         interpolation="nearest",
         alpha=MASK_ALPHA,
         origin="upper",
-        aspect="auto",
+        aspect="equal",
         zorder=2,
     )
     mask_im.cmap.set_bad(alpha=0.0)
     overlay_im = None
     if overlay_neo_meso_no_allocortex_3d is not None:
         overlay_im = ax.imshow(
-            _binary_overlay_slice(overlay_neo_meso_no_allocortex_3d[:, :, cur_k]),
+            rotate_sagittal_image(_binary_overlay_slice(overlay_neo_meso_no_allocortex_3d[:, :, cur_k])),
             cmap=plt.cm.colors.ListedColormap([OVERLAY_NEO_MESO_COLOR]),
             interpolation="nearest",
             alpha=float(OVERLAY_NEO_MESO_ALPHA),
             origin="upper",
-            aspect="auto",
+            aspect="equal",
             zorder=2.2,
         )
         overlay_im.cmap.set_bad(alpha=0.0)
@@ -885,11 +897,11 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
         cmap_r = plt.get_cmap("coolwarm").copy()
         cmap_r.set_bad(alpha=0.0)
         r_im = ax.imshow(
-            np.full_like(reference_3d[:, :, cur_k], np.nan, dtype=np.float32),
+            rotate_sagittal_image(np.full_like(reference_3d[:, :, cur_k], np.nan, dtype=np.float32)),
             cmap=cmap_r,
             interpolation="nearest",
             origin="upper",
-            aspect="auto",
+            aspect="equal",
             vmin=-float(R_CLIP_UM),
             vmax=float(R_CLIP_UM),
             alpha=0.55,
@@ -909,18 +921,18 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
         cmap_t = plt.get_cmap(T_FIELD_CMAP).copy()
         cmap_t.set_bad(alpha=0.0)
         t_im = ax.imshow(
-            np.full_like(reference_3d[:, :, cur_k], np.nan, dtype=np.float32),
+            rotate_sagittal_image(np.full_like(reference_3d[:, :, cur_k], np.nan, dtype=np.float32)),
             cmap=cmap_t,
             norm=curve_norm,
             interpolation="nearest",
             origin="upper",
-            aspect="auto",
+            aspect="equal",
             alpha=float(T_FIELD_ALPHA),
             zorder=2.35,
         )
 
-    ax.set_xlabel("j (y)")
-    ax.set_ylabel("i (coronal slice)")
+    ax.set_xlabel("i (coronal slice)")
+    ax.set_ylabel("j (y)")
 
     slider_ax = fig.add_axes((0.15, 0.06, 0.7, 0.03))
     slider = Slider(slider_ax, "slice k", 0, n_k - 1, valinit=cur_k, valstep=1)
@@ -928,10 +940,10 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
     def set_k(k: int) -> None:
         nonlocal curve_lc
         k = int(np.clip(int(k), 0, n_k - 1))
-        img.set_data(reference_3d[:, :, k])
-        mask_im.set_data(_binary_overlay_slice(cortex_3d[:, :, k]))
+        img.set_data(rotate_sagittal_image(reference_3d[:, :, k]))
+        mask_im.set_data(rotate_sagittal_image(_binary_overlay_slice(cortex_3d[:, :, k])))
         if overlay_im is not None and overlay_neo_meso_no_allocortex_3d is not None:
-            overlay_im.set_data(_binary_overlay_slice(overlay_neo_meso_no_allocortex_3d[:, :, k]))
+            overlay_im.set_data(rotate_sagittal_image(_binary_overlay_slice(overlay_neo_meso_no_allocortex_3d[:, :, k])))
         if r_im is not None:
             assert r_um_crop is not None and crop_origin is not None
             z0, y0, x0 = (int(crop_origin[0]), int(crop_origin[1]), int(crop_origin[2]))
@@ -942,7 +954,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
                 r2[z0 : z0 + int(r_um_crop.shape[0]), y0 : y0 + int(r_um_crop.shape[1])] = r_um_crop[:, :, xx]
                 if midline_include_3d is not None:
                     r2[~midline_include_3d[:, :, k]] = np.nan
-            r_im.set_data(r2)
+            r_im.set_data(rotate_sagittal_image(r2))
 
         _clear_artist(curve_lc)
         curve_lc = None
@@ -969,7 +981,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
             active_path_t = midline_path_t.astype(np.float32, copy=False)
             curve_lc = _plot_parametrized_curve(
                 ax,
-                [active_path_xy],
+                [rotate_sagittal_xy(active_path_xy)],
                 cmap=U_CURVE_T_CMAP,
                 norm=curve_norm,
                 linewidth=1.0,
@@ -985,7 +997,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
             active_path_t = None
             curve_lc = _plot_parametrized_curve(
                 ax,
-                [manual_path_xy],
+                [rotate_sagittal_xy(manual_path_xy)],
                 cmap=U_CURVE_T_CMAP,
                 norm=curve_norm,
                 linewidth=1.0,
@@ -1007,7 +1019,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
             _clear_contours(cont)
             curve_lc = _plot_parametrized_curve(
                 ax,
-                contour_segments,
+                [rotate_sagittal_xy(seg) for seg in contour_segments],
                 cmap=U_CURVE_T_CMAP,
                 norm=curve_norm,
                 linewidth=1.0,
@@ -1030,7 +1042,7 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
                 else:
                     t2 = np.full_like(reference_3d[:, :, k], np.nan, dtype=np.float32)
                 t_field_cache[int(k)] = t2
-            t_im.set_data(t2)
+            t_im.set_data(rotate_sagittal_image(t2))
 
         t_path_data = sagittal_midline_paths.get(int(k))
         if t_path_data is not None:
@@ -1045,8 +1057,8 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
             t_start, t_end = t_extent
             p_start = _point_on_path_xy_by_t(t_path_xy, t_path_vals, t_start)
             p_end = _point_on_path_xy_by_t(t_path_xy, t_path_vals, t_end)
-            sc_t_start.set_offsets(np.asarray([p_start], dtype=np.float64) if p_start is not None else np.empty((0, 2)))
-            sc_t_end.set_offsets(np.asarray([p_end], dtype=np.float64) if p_end is not None else np.empty((0, 2)))
+            sc_t_start.set_offsets(rotate_sagittal_xy(np.asarray([p_start], dtype=np.float32)) if p_start is not None else np.empty((0, 2)))
+            sc_t_end.set_offsets(rotate_sagittal_xy(np.asarray([p_end], dtype=np.float32)) if p_end is not None else np.empty((0, 2)))
             t_range_label = f"{float(t_start):.3f}-{float(t_end):.3f}"
         else:
             sc_t_start.set_offsets(np.empty((0, 2)))
@@ -1054,9 +1066,8 @@ def view_sagittal_overlay(*, show: bool = True) -> None:
 
         b0 = np.argwhere(b0_3d[:, :, k])
         b1 = np.argwhere(b1_3d[:, :, k])
-        # scatter uses x=j, y=i for sagittal slices.
-        sc_b0.set_offsets(np.column_stack([b0[:, 1], b0[:, 0]]) if b0.size else np.empty((0, 2)))
-        sc_b1.set_offsets(np.column_stack([b1[:, 1], b1[:, 0]]) if b1.size else np.empty((0, 2)))
+        sc_b0.set_offsets(rotate_sagittal_xy(np.column_stack([b0[:, 1], b0[:, 0]])) if b0.size else np.empty((0, 2)))
+        sc_b1.set_offsets(rotate_sagittal_xy(np.column_stack([b1[:, 1], b1[:, 0]])) if b1.size else np.empty((0, 2)))
 
         ax.set_title(
             f"sagittal k={k} | mask_px={int(cortex_3d[:, :, k].sum())} | "

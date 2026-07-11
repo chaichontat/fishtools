@@ -34,6 +34,7 @@ from fishtools.segment.extract_helpers import (
     _distribute_file_budget,
     _expand_positions_with_context,
     _format_size,
+    _format_tile_maxproj_filename,
     _format_tile_filename,
     _mask_filename,
     _normalize_reporter,
@@ -409,6 +410,19 @@ def _execute_extraction(
         )
         return
 
+    if all_zarr and config.mode == "maxproj":
+        _execute_zarr_maxproj_extraction(
+            label=label,
+            files=files,
+            config=config,
+            out_dir=out_dir,
+            max_from_path=max_from_path,
+            explicit_mask_path=explicit_mask_path,
+            enrich_boundaries=enrich_boundaries,
+            roi_points=roi_points,
+        )
+        return
+
     if all_zarr and config.mode == "ortho":
         _execute_zarr_ortho_extraction(
             label=label,
@@ -525,6 +539,103 @@ def _execute_zarr_z_extraction(
     with progress_reporter(total_outputs) as progress_update:
         for job in tile_jobs:
             _extract_tiles_from_zarr(
+                job=job,
+                roi=label,
+                out_dir=out_dir,
+                channels=config.channels,
+                dz=config.dz,
+                upscale=config.upscale,
+                max_from_path=max_from_path,
+                progress=progress_update,
+            )
+
+
+def _execute_zarr_maxproj_extraction(
+    *,
+    label: str,
+    files: list[Path],
+    config: ExtractionConfig,
+    out_dir: Path,
+    max_from_path: Path | None,
+    explicit_mask_path: Path | None,
+    enrich_boundaries: Path | None,
+    roi_points: Path | None = None,
+) -> None:
+    enrich_mask_vol: MaskLike | None = None
+    if enrich_boundaries is not None:
+        enrich_mask_vol = _open_mask_volume(enrich_boundaries)
+        logger.info(f"[{label}] Using enrichment mask for tile selection: {enrich_boundaries}")
+
+    point_coords: list[tuple[int, int]] | None = None
+    if roi_points is not None:
+        point_coords = load_roi_points(roi_points)
+        logger.info(f"[{label}] Loaded {len(point_coords)} points from ROI file for max projection")
+
+    tile_jobs: list[TileJob] = []
+    total_outputs = 0
+
+    for f in files:
+        vol, names_all = _open_volume(f)
+        mask_path = resolve_file_mask_path(f, explicit_mask_path)
+        mask_vol = open_and_validate_mask(mask_path, vol, label=f"{label}:{f.name}")
+
+        if point_coords is not None:
+            tile_half = ZARR_TILE_SIZE // 2
+            tile_origins: list[tuple[int, int]] = []
+            for px, py in point_coords:
+                y0 = max(config.crop, py - tile_half)
+                x0 = max(config.crop, px - tile_half)
+                y0 = min(y0, vol.shape[1] - config.crop - ZARR_TILE_SIZE)
+                x0 = min(x0, vol.shape[2] - config.crop - ZARR_TILE_SIZE)
+                y0 = max(0, y0)
+                x0 = max(0, x0)
+                tile_origins.append((y0, x0))
+            logger.info(f"[{label}] Using {len(tile_origins)} tile origins from ROI points")
+        elif enrich_mask_vol is not None:
+            all_tiles = _compute_tile_origins(
+                vol.shape,
+                tile_size=ZARR_TILE_SIZE,
+                n_tiles=config.n * 10,
+                crop=config.crop,
+            )
+            logger.info(f"[{label}] Scoring {len(all_tiles)} tile candidates by mask coverage...")
+            tile_origins = _score_and_select_tiles(
+                all_tiles,
+                enrich_mask_vol,
+                tile_size=ZARR_TILE_SIZE,
+                count=config.n,
+                score_fn=lambda tile: int(np.sum(tile > 0)),
+            )
+            logger.info(f"[{label}] Selected {len(tile_origins)} tiles by diversity scoring")
+        else:
+            tile_origins = _compute_tile_origins(
+                vol.shape,
+                tile_size=ZARR_TILE_SIZE,
+                n_tiles=config.n,
+                crop=config.crop,
+            )
+
+        z_candidates = list(range(0, vol.shape[0], config.dz))
+        if not z_candidates:
+            raise ValueError(f"[{label}] No Z indices available after applying dz to fused Zarr volume.")
+        total_outputs += len(tile_origins)
+        tile_jobs.append(
+            TileJob(
+                file=f,
+                vol=vol,
+                channel_names=names_all,
+                mask_vol=mask_vol,
+                mask_path=mask_path,
+                tile_origins=tile_origins,
+                z_candidates=z_candidates,
+            )
+        )
+
+    logger.info(f"[{label}] Tracking {total_outputs} max-projection output files from Zarr input(s)")
+
+    with progress_reporter(total_outputs) as progress_update:
+        for job in tile_jobs:
+            _extract_maxproj_tiles_from_zarr(
                 job=job,
                 roi=label,
                 out_dir=out_dir,
@@ -737,6 +848,27 @@ def _execute_tiff_extraction(
                     seed=file_seed,
                     progress=None,
                 )
+        elif config.mode == "maxproj":
+            for idx, f in enumerate(files):
+                mask_path = explicit_mask_path if explicit_mask_path is not None else _resolve_mask_path(f)
+                if mask_path is not None:
+                    logger.info(f"[{label}] Found mask stack: {mask_path}")
+                file_seed = (config.seed + idx) if config.seed is not None else None
+                submit(
+                    _extract_maxproj_slices,
+                    file=f,
+                    roi=label,
+                    out_dir=out_dir,
+                    channels=config.channels,
+                    dz=config.dz,
+                    n_crops=z_crops_per_file,
+                    upscale=config.upscale,
+                    max_from_path=max_from_path,
+                    mask_path=mask_path,
+                    enrich_boundaries=enrich_boundaries,
+                    seed=file_seed,
+                    progress=None,
+                )
         elif config.mode == "ortho":
             for idx, f in enumerate(files):
                 mask_path = explicit_mask_path if explicit_mask_path is not None else _resolve_mask_path(f)
@@ -930,7 +1062,7 @@ def normalize_numeric_options(
 
     Returns the normalized ``upscale`` value while preserving existing CLI semantics.
     """
-    if mode == "z" and anisotropy != ortho_anisotropy_default:
+    if mode in {"z", "maxproj"} and anisotropy != ortho_anisotropy_default:
         raise click.BadParameter("--anisotropy parameter is only valid for 'ortho' mode.")
     if mode == "ortho" and dz != 1:
         raise click.BadParameter("--dz parameter is only valid for 'z' mode.")
@@ -1228,6 +1360,66 @@ def _resolve_other_volume(file: Path, max_from_path: Path | None) -> Volume | No
     return other_vol
 
 
+def _compute_z_crop_positions(
+    *,
+    y_len: int,
+    x_len: int,
+    crop_size: int,
+    n_crops: int,
+    enrich_mask_vol: MaskLike | None,
+    rng: np.random.Generator,
+) -> list[tuple[int, int]]:
+    max_y = max(0, y_len - crop_size)
+    max_x = max(0, x_len - crop_size)
+
+    if enrich_mask_vol is not None and (max_y > 0 or max_x > 0):
+        n_candidates = n_crops * 10
+        positions: list[tuple[int, int]] = []
+        for _ in range(n_candidates):
+            cy = rng.integers(0, max_y + 1) if max_y > 0 else 0
+            cx = rng.integers(0, max_x + 1) if max_x > 0 else 0
+            positions.append((cy, cx))
+
+        return _score_and_select_tiles(
+            positions,
+            enrich_mask_vol,
+            tile_size=crop_size,
+            count=n_crops,
+            score_fn=lambda tile: len(np.unique(tile)),
+        )
+
+    return [
+        (
+            rng.integers(0, max_y + 1) if max_y > 0 else 0,
+            rng.integers(0, max_x + 1) if max_x > 0 else 0,
+        )
+        for _ in range(n_crops)
+    ]
+
+
+def _iterative_max_projection(
+    volume: Volume | MaskLike,
+    z_indices: list[int],
+    *,
+    y_slice: slice,
+    x_slice: slice,
+) -> np.ndarray:
+    if not z_indices:
+        raise ValueError("At least one Z index is required for max projection.")
+
+    projection: np.ndarray | None = None
+    for z_index in z_indices:
+        plane = np.asarray(volume[z_index, y_slice, x_slice, ...])
+        if projection is None:
+            projection = plane.copy()
+            continue
+        np.maximum(projection, plane, out=projection)
+
+    if projection is None:
+        raise ValueError("Failed to compute max projection.")
+    return projection
+
+
 def _extract_z_slices(
     *,
     file: Path,
@@ -1270,36 +1462,20 @@ def _extract_z_slices(
     z_len, y_len, x_len, _ = vol.shape
 
     crop_size = DEFAULT_CROP_SIZE
-    max_y = max(0, y_len - crop_size)
-    max_x = max(0, x_len - crop_size)
 
     n_crops = max(1, n_crops)
     rng = np.random.default_rng(seed)
 
-    if enrich_mask_vol is not None and (max_y > 0 or max_x > 0):
-        n_candidates = n_crops * 10
-        positions: list[tuple[int, int]] = []
-        for _ in range(n_candidates):
-            cy = rng.integers(0, max_y + 1) if max_y > 0 else 0
-            cx = rng.integers(0, max_x + 1) if max_x > 0 else 0
-            positions.append((cy, cx))
-
-        crop_positions = _score_and_select_tiles(
-            positions,
-            enrich_mask_vol,
-            tile_size=crop_size,
-            count=n_crops,
-            score_fn=lambda tile: len(np.unique(tile)),
-        )
+    crop_positions = _compute_z_crop_positions(
+        y_len=y_len,
+        x_len=x_len,
+        crop_size=crop_size,
+        n_crops=n_crops,
+        enrich_mask_vol=enrich_mask_vol,
+        rng=rng,
+    )
+    if enrich_mask_vol is not None:
         logger.info(f"[{roi}] Selected {len(crop_positions)} crops by diversity scoring")
-    else:
-        crop_positions = [
-            (
-                rng.integers(0, max_y + 1) if max_y > 0 else 0,
-                rng.integers(0, max_x + 1) if max_x > 0 else 0,
-            )
-            for _ in range(n_crops)
-        ]
 
     z_idxs = list(range(0, z_len, dz))
     cancel_event = get_cancel_event()
@@ -1368,6 +1544,113 @@ def _extract_z_slices(
             )
             if reporter is not None:
                 reporter.advance()
+
+
+def _extract_maxproj_slices(
+    *,
+    file: Path,
+    roi: str,
+    out_dir: Path,
+    channels: str | None,
+    dz: int,
+    n_crops: int,
+    upscale: float,
+    max_from_path: Path | None,
+    mask_path: Path | None,
+    enrich_boundaries: Path | None,
+    seed: int | None,
+    progress: ProgressReporter | Callable[[], int | None] | None,
+) -> None:
+    reporter = _normalize_reporter(progress)
+
+    size_str = _format_size(_path_size_cached(str(file.resolve())))
+    logger.info(f"3D→MaxProj: {file.name} [{size_str}] (dz={dz})")
+
+    ctx = build_extraction_context(
+        file,
+        roi,
+        channels=channels,
+        max_from_path=max_from_path,
+        mask_path=mask_path,
+        enrich_path=enrich_boundaries,
+        upscale=upscale,
+        anisotropy=1,
+        out_dir=out_dir,
+    )
+
+    vol = ctx.vol
+    selected_indices = ctx.selected_indices
+    out_names = ctx.out_names
+    other_vol = ctx.other_vol
+    mask_vol = ctx.mask_vol
+    enrich_mask_vol = ctx.enrich_mask_vol
+
+    z_len, y_len, x_len, _ = vol.shape
+    z_idxs = list(range(0, z_len, dz))
+    crop_size = DEFAULT_CROP_SIZE
+
+    n_crops = max(1, n_crops)
+    rng = np.random.default_rng(seed)
+    crop_positions = _compute_z_crop_positions(
+        y_len=y_len,
+        x_len=x_len,
+        crop_size=crop_size,
+        n_crops=n_crops,
+        enrich_mask_vol=enrich_mask_vol,
+        rng=rng,
+    )
+    if enrich_mask_vol is not None:
+        logger.info(f"[{roi}] Selected {len(crop_positions)} crops by diversity scoring")
+
+    cancel_event = get_cancel_event()
+    for crop_idx, (y_start, x_start) in enumerate(crop_positions):
+        if cancel_event.is_set():
+            raise TaskCancelledException("Cancelled by user")
+
+        y_slice = slice(y_start, min(y_start + crop_size, y_len))
+        x_slice = slice(x_start, min(x_start + crop_size, x_len))
+
+        plane = _iterative_max_projection(vol, z_idxs, y_slice=y_slice, x_slice=x_slice)
+        other_max = None
+        if other_vol is not None:
+            other_plane = _iterative_max_projection(other_vol, z_idxs, y_slice=y_slice, x_slice=x_slice)
+            other_max = other_plane.max(axis=2)
+
+        cyx_u16 = _prep_slab(
+            plane,
+            ch_idx=selected_indices,
+            channel_axis=2,
+            crop_slices=None,
+            filter_before=False,
+            append_max=other_max,
+        )
+        cyx_u16 = _resize_uint16(cyx_u16, (1.0, upscale, upscale))
+
+        out_name = (
+            _prefix_with_roi(f"{file.stem}_crop{crop_idx:02d}_maxproj.tif", roi)
+            if n_crops > 1
+            else _prefix_with_roi(f"{file.stem}_maxproj.tif", roi)
+        )
+        out_file = out_dir / out_name
+        _write_tiff(
+            out_file,
+            cyx_u16,
+            axes="CYX",
+            names=out_names,
+            channels_arg=channels,
+            upscale=upscale,
+        )
+
+        if mask_vol is not None:
+            mask_plane = _iterative_max_projection(mask_vol, z_idxs, y_slice=y_slice, x_slice=x_slice)
+            mask_plane = _squeeze_mask(mask_plane)
+            if mask_plane.ndim != 2:
+                raise ValueError("Mask max-projection expected 2D data.")
+            resized_mask = _resize_mask(mask_plane, (upscale, upscale))
+            _write_mask_tiff(out_dir / _mask_filename(out_name), resized_mask, axes="YX")
+
+        if reporter is not None:
+            reporter.advance()
 
 
 def _extract_tiles_from_zarr(
@@ -1466,6 +1749,94 @@ def _extract_tiles_from_zarr(
             logger.debug(
                 f"Skipped {skipped_for_tile} z-slice(s) in tile ({y0},{x0}) of {job.file.name} due to zeros."
             )
+
+
+def _extract_maxproj_tiles_from_zarr(
+    *,
+    job: TileJob,
+    roi: str,
+    out_dir: Path,
+    channels: str | None,
+    dz: int,
+    upscale: float,
+    max_from_path: Path | None,
+    progress: ProgressReporter | Callable[[], int | None] | None,
+) -> None:
+    reporter = _normalize_reporter(progress)
+    size_str = _format_size(_path_size_cached(str(job.file.resolve())))
+    logger.info(f"3D→MaxProj tiles: {job.file.name} [{size_str}]")
+
+    selected_indices = _parse_channels(channels, job.channel_names, job.vol.shape[-1])
+    _ensure_channel_bounds(selected_indices, job.vol.shape[-1], label=job.file.name)
+    base_names = _resolve_output_names(selected_indices, job.channel_names, channels)
+    other_vol = _resolve_other_volume(job.file, max_from_path)
+    out_names = [*base_names, "max_from"] if other_vol is not None else base_names
+
+    z_len = job.vol.shape[0]
+    if job.mask_vol is not None and job.mask_vol.shape[0] != z_len:
+        raise ValueError(f"Mask volume {_resolve_mask_path(job.file)} does not match Z dimension of {job.file}.")
+
+    coord_width = len(str(max(job.vol.shape[1], job.vol.shape[2])))
+    z_candidates = job.z_candidates or list(range(0, z_len, dz))
+    if not z_candidates:
+        raise ValueError(f"[{roi}] No Z indices available after applying dz to fused Zarr volume.")
+
+    cancel_event = get_cancel_event()
+    for y0, x0 in job.tile_origins:
+        if cancel_event.is_set():
+            raise TaskCancelledException("Cancelled by user")
+
+        y_slice_tile = slice(y0, y0 + ZARR_TILE_SIZE)
+        x_slice_tile = slice(x0, x0 + ZARR_TILE_SIZE)
+
+        plane = _iterative_max_projection(job.vol, z_candidates, y_slice=y_slice_tile, x_slice=x_slice_tile)
+        zero_fraction = np.mean(plane == 0)
+        skip_tile = zero_fraction > ZERO_PIXEL_SKIP_THRESHOLD
+
+        other_max = None
+        if other_vol is not None:
+            other_plane = _iterative_max_projection(other_vol, z_candidates, y_slice=y_slice_tile, x_slice=x_slice_tile)
+            if not skip_tile:
+                other_zero_fraction = np.mean(other_plane == 0)
+                skip_tile = other_zero_fraction > ZERO_PIXEL_SKIP_THRESHOLD
+            if not skip_tile:
+                other_max = other_plane.max(axis=2)
+
+        if skip_tile:
+            if reporter is not None:
+                reporter.advance()
+            continue
+
+        cyx_u16 = _prep_slab(
+            plane,
+            ch_idx=selected_indices,
+            channel_axis=2,
+            crop_slices=None,
+            filter_before=True,
+            append_max=other_max,
+            apply_filter=False,
+        )
+        cyx_u16 = _resize_uint16(cyx_u16, (1.0, upscale, upscale))
+        out_name = _format_tile_maxproj_filename(job.file.stem, roi, y0, x0, coord_width=coord_width)
+        out_file = out_dir / out_name
+        _write_tiff(
+            out_file,
+            cyx_u16,
+            axes="CYX",
+            names=out_names,
+            channels_arg=channels,
+            upscale=upscale,
+        )
+        if job.mask_vol is not None:
+            mask_tile = _iterative_max_projection(job.mask_vol, z_candidates, y_slice=y_slice_tile, x_slice=x_slice_tile)
+            mask_tile = _squeeze_mask(mask_tile)
+            if mask_tile.ndim != 2:
+                raise ValueError("Mask tile max-projection expected 2D data.")
+            resized_mask = _resize_mask(mask_tile, (upscale, upscale))
+            mask_out = out_dir / _mask_filename(out_name)
+            _write_mask_tiff(mask_out, resized_mask, axes="YX")
+        if reporter is not None:
+            reporter.advance()
 
 
 def _extract_ortho_slices(

@@ -10,15 +10,14 @@ import torch
 from cellpose.contrib.cellposetrt import trt_build
 from cellpose.models import CellposeModel
 from cellpose.train import train_seg as train_seg_transformer
-
-# from cellpose.train_unet import train_seg as train_seg_unet
-# from cellpose.unet import CellposeUNetModel
+from cellpose.train_unet import train_seg as train_seg_unet
+from cellpose.unet import CellposeUNetModel
 from loguru import logger
 from pydantic import BaseModel, Field
 
 from fishtools.segment.augment import PhotometricConfig, build_batch_augmenter
 from fishtools.segment.data_discovery import _compile_patterns, _discover_training_dirs, _matches_any
-from fishtools.utils.logging import setup_workspace_logging
+from fishtools.utils.logging import configure_cli_logging
 
 try:
     IS_CELLPOSE_SAM = version("cellpose").startswith("4.")
@@ -107,6 +106,7 @@ class TrainConfig(BaseModel):
     pack_k: int = 3
     pack_guard: int = 16
     pack_stripe_height: int | None = 68
+    skip_trt: bool = False
     model_md5: str | None = None
 
 
@@ -236,24 +236,30 @@ def _filter_images_by_patterns(
     )
 
 
-def _restrict_to_first_two_channels(images: Iterable[Any]) -> tuple[list[Any], int]:
-    """Return copies of images limited to the first two channels when possible.
+def _prepare_2d_training_images(images: Iterable[Any]) -> tuple[list[Any], int, int]:
+    """Return images with channel-first arrays normalized for Cellpose 2D training.
 
     Cellpose expects channel-first data when `channel_axis=0`. We trim any extra
     channels up front to avoid accidental use of higher indices that might exist
-    in the raw stacks. Images that are not NumPy arrays (e.g. placeholder paths)
-    or that already expose <=2 channels are left untouched.
+    in the raw stacks. Singleton channel-first arrays are squeezed to 2D because
+    Cellpose expands `(1, Y, X)` to a 4D array in its 2D training path.
     """
 
-    restricted: list[Any] = []
+    prepared: list[Any] = []
     trimmed = 0
+    squeezed = 0
     for image in images:
-        if isinstance(image, np.ndarray) and image.ndim >= 3 and image.shape[0] > 2:
-            restricted.append(image[:2].copy())
-            trimmed += 1
-        else:
-            restricted.append(image)
-    return restricted, trimmed
+        if isinstance(image, np.ndarray) and image.ndim >= 3:
+            if image.shape[0] == 1:
+                prepared.append(image[0].copy())
+                squeezed += 1
+                continue
+            if image.shape[0] > 2:
+                prepared.append(image[:2].copy())
+                trimmed += 1
+                continue
+        prepared.append(image)
+    return prepared, trimmed, squeezed
 
 
 # models = sorted(
@@ -469,26 +475,27 @@ def _train(out: tuple[Any, ...], path: Path, name: str, train_config: TrainConfi
     )
 
     model_path = Path(model_path)
-    _cleanup_model_artifacts(model_path)
-    build_trt_engine(
-        model_path=model_path,
-        bsize=256,
-        device=device,
-        batch_size=1,
-        backend=train_config.backend,
-    )
+    if train_config.skip_trt:
+        logger.info("Skipping TensorRT engine generation after training.")
+    else:
+        _cleanup_model_artifacts(model_path)
+        build_trt_engine(
+            model_path=model_path,
+            bsize=256,
+            device=device,
+            batch_size=1,
+            backend=train_config.backend,
+        )
 
     return model_path, train_losses, test_losses
 
 
 def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
-    log_destination = setup_workspace_logging(
-        workspace=path,
+    configure_cli_logging(
+        workspace=None,
         component="segment.train",
-        file=f"models/{name}.json",
-        extra={"model": name, "training_root": path.as_posix()},
+        extra={"file": f"models/{name}.json", "model": name, "training_root": path.as_posix()},
     )
-    logger.debug(f"Segment training logs routed to {log_destination}")
 
     logger.info(f"Started training {name} with paths: {train_config.training_paths}")
 
@@ -571,13 +578,14 @@ def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
 
     logger.info(f"Filter summary: kept {kept_images}/{total_images} images; excluded {excluded_images}.")
 
-    limited_train_images, trimmed_train = _restrict_to_first_two_channels(filtered_images)
+    limited_train_images, trimmed_train, squeezed_train = _prepare_2d_training_images(filtered_images)
 
     # Optional explicit test set discovery/loading using the same semantics as training
     final_test_images: list[Any] | None = None
     final_test_labels: list[Any] | None = None
     final_test_names: list[Any] | None = None
     trimmed_test = 0
+    squeezed_test = 0
 
     if train_config.test_folder is not None:
         # Normalize to list[str]
@@ -690,19 +698,23 @@ def run_train(name: str, path: Path, train_config: TrainConfig) -> TrainConfig:
                     final_test_names = None
                     trimmed_test = 0
             else:
-                final_test_images, trimmed_test = _restrict_to_first_two_channels(filtered_test_images)
+                final_test_images, trimmed_test, squeezed_test = _prepare_2d_training_images(filtered_test_images)
                 final_test_labels = filtered_test_labels
                 final_test_names = filtered_test_names
     else:
         # Fall back to whatever came back from the original loader (usually None)
         if test_images is not None:
-            final_test_images, trimmed_test = _restrict_to_first_two_channels(test_images)
+            final_test_images, trimmed_test, squeezed_test = _prepare_2d_training_images(test_images)
             final_test_labels = test_labels
             final_test_names = image_names_test
 
     if trimmed_train or trimmed_test:
         logger.info(
             f"Restricted image channels to first two for {trimmed_train} training and {trimmed_test} test samples."
+        )
+    if squeezed_train or squeezed_test:
+        logger.info(
+            f"Squeezed singleton channel axis for {squeezed_train} training and {squeezed_test} test samples."
         )
 
     filtered: tuple[list, ...] = (

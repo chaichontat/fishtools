@@ -322,11 +322,21 @@ def filter_leiden(adata: ad.AnnData, keep: Sequence[int | str]) -> ad.AnnData:
     return adata[adata.obs["leiden"].isin(keep)]
 
 
-def run_tricycle(adata: ad.AnnData, trc: pd.DataFrame, *, batch_key: str | None = None, layer: str | None = None) -> ad.AnnData:
+def run_tricycle(
+    adata: ad.AnnData,
+    trc: pd.DataFrame,
+    *,
+    batch_key: str | None = None,
+    layer: str | None = None,
+    center_on: Sequence[str] | None = None,
+) -> ad.AnnData:
     """Project AnnData onto tricycle cell-cycle embeddings.
 
     If ``batch_key`` is provided, gene-wise mean centering is performed within
-    each batch in ``adata.obs[batch_key]`` before projection.
+    each batch in ``adata.obs[batch_key]`` before projection. When
+    ``center_on`` is provided, only those ``adata.obs_names`` are used to
+    estimate the centering mean, while the projection is still computed for all
+    cells.
     """
 
     import scipy.sparse as sp
@@ -351,8 +361,18 @@ def run_tricycle(adata: ad.AnnData, trc: pd.DataFrame, *, batch_key: str | None 
         x = np.asarray(x)
 
     x = x.astype(np.float32, copy=False)
+    center_mask = np.ones(adata.n_obs, dtype=bool)
+    if center_on is not None:
+        center_names = pd.Index(center_on)
+        missing = center_names.difference(adata.obs_names)
+        if len(missing):
+            raise KeyError(f"`center_on` contains unknown obs_names: {missing.tolist()}")
+        center_mask = np.asarray(adata.obs_names.isin(center_names))
+        if not np.any(center_mask):
+            raise ValueError("`center_on` must contain at least one obs_name.")
     if batch_key is None:
-        x_centered = x - np.mean(x, axis=0, keepdims=True)
+        center = np.mean(x[center_mask], axis=0, keepdims=True)
+        x_centered = x - center
     else:
         if batch_key not in adata.obs.columns:
             raise KeyError(f"obs.{batch_key} not found")
@@ -362,9 +382,12 @@ def run_tricycle(adata: ad.AnnData, trc: pd.DataFrame, *, batch_key: str | None 
         batch_values = batch.astype(str).to_numpy()
         x_centered = np.empty_like(x)
         for value in np.unique(batch_values):
-            sel = batch_values == value
-            x_sel = x[sel]
-            x_centered[sel] = x_sel - np.mean(x_sel, axis=0, keepdims=True)
+            batch_mask = batch_values == value
+            center_batch_mask = batch_mask & center_mask
+            if not np.any(center_batch_mask):
+                raise ValueError(f"`center_on` does not include any cells from batch {value!r}.")
+            center = np.mean(x[center_batch_mask], axis=0, keepdims=True)
+            x_centered[batch_mask] = x[batch_mask] - center
     pls = x_centered @ loadings.to_numpy(dtype=np.float32)
 
     adata.obsm["tricycle"] = pls

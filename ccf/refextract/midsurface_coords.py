@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import time
 from typing import Literal
@@ -2113,6 +2114,88 @@ def _project_t_on_polyline_prefer_dorsal(
     return float(t_proj), float(d2[dorsal_idx])
 
 
+def _row_discontinuity_metrics(row: np.ndarray) -> dict[str, float]:
+    vals = np.asarray(row, dtype=np.float64).reshape(-1)
+    if vals.size < 2:
+        return {
+            "n_jump_ge_0p1": 0.0,
+            "n_jump_ge_0p2": 0.0,
+            "n_jump_ge_0p5": 0.0,
+            "max_abs_jump": 0.0,
+        }
+    diff = np.diff(vals)
+    finite = np.isfinite(diff)
+    if not np.any(finite):
+        return {
+            "n_jump_ge_0p1": 0.0,
+            "n_jump_ge_0p2": 0.0,
+            "n_jump_ge_0p5": 0.0,
+            "max_abs_jump": 0.0,
+        }
+    abs_diff = np.abs(diff[finite])
+    return {
+        "n_jump_ge_0p1": float(np.count_nonzero(abs_diff >= 0.1)),
+        "n_jump_ge_0p2": float(np.count_nonzero(abs_diff >= 0.2)),
+        "n_jump_ge_0p5": float(np.count_nonzero(abs_diff >= 0.5)),
+        "max_abs_jump": float(np.max(abs_diff)),
+    }
+
+
+def _target_t_periodic_residual(candidate: np.ndarray, row: np.ndarray) -> np.ndarray:
+    delta = np.asarray(candidate, dtype=np.float64) - np.asarray(row, dtype=np.float64)
+    return delta - np.rint(delta)
+
+
+def _regularize_target_t_row_soft(
+    *,
+    row: np.ndarray,
+    continuity_lambda: float,
+    curvature_lambda: float,
+    max_seams_per_row: int,
+) -> tuple[np.ndarray, dict[str, float]]:
+    vals = np.asarray(row, dtype=np.float64).reshape(-1)
+    if vals.size < 2:
+        return vals.copy(), {"seams_used": 0.0, "objective": 0.0}
+    if not np.isfinite(vals).all():
+        raise ValueError("row must be finite.")
+    if int(max_seams_per_row) < 0:
+        raise ValueError(f"max_seams_per_row must be >= 0, got {max_seams_per_row}")
+
+    continuity_lambda = float(max(0.0, continuity_lambda))
+    curvature_lambda = float(max(0.0, curvature_lambda))
+
+    def _score(candidate: np.ndarray) -> float:
+        resid = _target_t_periodic_residual(candidate, vals)
+        diff = np.diff(candidate)
+        curv = np.diff(diff)
+        return float(
+            np.sum(resid * resid)
+            + continuity_lambda * np.sum(diff * diff)
+            + curvature_lambda * np.sum(curv * curv)
+        )
+
+    best = vals.copy()
+    best_score = _score(best)
+    best_seams = int(np.count_nonzero(np.abs(np.diff(best)) >= 0.5))
+
+    if int(max_seams_per_row) >= 1:
+        for split in range(1, vals.size):
+            prefix = vals[:split]
+            suffix = vals[split:]
+            for shift in (-1.0, 1.0):
+                cand = np.concatenate([prefix, suffix + shift]).astype(np.float64, copy=False)
+                seams = int(np.count_nonzero(np.abs(np.diff(cand)) >= 0.5))
+                if seams > int(max_seams_per_row):
+                    continue
+                score = _score(cand)
+                if score < best_score:
+                    best = cand
+                    best_score = score
+                    best_seams = seams
+
+    return best.astype(np.float64, copy=False), {"seams_used": float(best_seams), "objective": float(best_score)}
+
+
 def _p3_to_sagittal(
     *,
     ijk: tuple[float, float, float],
@@ -2281,6 +2364,10 @@ def build_transition_lut_2d(
     res_ijk_um: tuple[float, float, float] | None = None,
     coronal_slice_min: int | None = None,
     coronal_slice_max: int | None = None,
+    continuity_lambda: float = 0.1,
+    curvature_lambda: float = 0.05,
+    max_seams_per_row: int = 1,
+    qc_report_path: Path | None = None,
 ) -> tuple[Path, Path]:
     if n_t < 2:
         raise ValueError("n_t must be >= 2.")
@@ -2301,6 +2388,24 @@ def build_transition_lut_2d(
             c2s_kw = int(np.asarray(c2s["k_window"]).reshape(-1)[0])
             s2c_t_domain = str(np.asarray(s2c["t_domain"]).reshape(-1)[0])
             c2s_t_domain = str(np.asarray(c2s["t_domain"]).reshape(-1)[0])
+            s2c_cont = (
+                float(np.asarray(s2c["continuity_lambda"]).reshape(-1)[0]) if "continuity_lambda" in s2c else None
+            )
+            s2c_curv = (
+                float(np.asarray(s2c["curvature_lambda"]).reshape(-1)[0]) if "curvature_lambda" in s2c else None
+            )
+            s2c_seams = (
+                int(np.asarray(s2c["max_seams_per_row"]).reshape(-1)[0]) if "max_seams_per_row" in s2c else None
+            )
+            c2s_cont = (
+                float(np.asarray(c2s["continuity_lambda"]).reshape(-1)[0]) if "continuity_lambda" in c2s else None
+            )
+            c2s_curv = (
+                float(np.asarray(c2s["curvature_lambda"]).reshape(-1)[0]) if "curvature_lambda" in c2s else None
+            )
+            c2s_seams = (
+                int(np.asarray(c2s["max_seams_per_row"]).reshape(-1)[0]) if "max_seams_per_row" in c2s else None
+            )
             s2c_cmin_raw = int(np.asarray(s2c["coronal_slice_min"]).reshape(-1)[0]) if "coronal_slice_min" in s2c else -1
             s2c_cmax_raw = int(np.asarray(s2c["coronal_slice_max"]).reshape(-1)[0]) if "coronal_slice_max" in s2c else -1
             c2s_cmin_raw = int(np.asarray(c2s["coronal_slice_min"]).reshape(-1)[0]) if "coronal_slice_min" in c2s else -1
@@ -2324,6 +2429,12 @@ def build_transition_lut_2d(
                 and c2s_kw == int(k_window)
                 and s2c_t_domain == "t_all"
                 and c2s_t_domain == "t_all"
+                and s2c_cont == float(continuity_lambda)
+                and c2s_cont == float(continuity_lambda)
+                and s2c_curv == float(curvature_lambda)
+                and c2s_curv == float(curvature_lambda)
+                and s2c_seams == int(max_seams_per_row)
+                and c2s_seams == int(max_seams_per_row)
                 and s2c_cmin == (None if coronal_slice_min is None else int(coronal_slice_min))
                 and s2c_cmax == (None if coronal_slice_max is None else int(coronal_slice_max))
                 and c2s_cmin == (None if coronal_slice_min is None else int(coronal_slice_min))
@@ -2359,6 +2470,7 @@ def build_transition_lut_2d(
     map_s2c_slice = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
     map_s2c_t = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
     map_s2c_err = np.full((sagittal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+    qc_rows_s2c: list[dict[str, object]] = []
 
     for row, slice_k in enumerate(sagittal_keys.tolist()):
         if row % 16 == 0 or row == (sagittal_keys.size - 1):
@@ -2387,8 +2499,25 @@ def build_transition_lut_2d(
     valid_s2c = np.ones((sagittal_keys.size,), dtype=bool)
     for row in range(sagittal_keys.size):
         map_s2c_slice[row] = _fill_nan_series(map_s2c_slice[row]).astype(np.float32, copy=False)
-        map_s2c_t[row] = _fill_nan_series(map_s2c_t[row]).astype(np.float32, copy=False)
+        raw_t = _fill_nan_series(map_s2c_t[row]).astype(np.float64, copy=False)
+        before = _row_discontinuity_metrics(raw_t)
+        reg_t, meta = _regularize_target_t_row_soft(
+            row=raw_t,
+            continuity_lambda=float(continuity_lambda),
+            curvature_lambda=float(curvature_lambda),
+            max_seams_per_row=int(max_seams_per_row),
+        )
+        after = _row_discontinuity_metrics(reg_t)
+        map_s2c_t[row] = reg_t.astype(np.float32, copy=False)
         map_s2c_err[row] = _fill_nan_series(map_s2c_err[row]).astype(np.float32, copy=False)
+        qc_rows_s2c.append(
+            {
+                "source_slice": int(sagittal_keys[row]),
+                "before": before,
+                "after": after,
+                "seams_used": int(meta["seams_used"]),
+            }
+        )
         if not (
             np.isfinite(map_s2c_slice[row]).all()
             and np.isfinite(map_s2c_t[row]).all()
@@ -2419,11 +2548,15 @@ def build_transition_lut_2d(
         coronal_slice_max=np.asarray([int(coronal_slice_max) if coronal_slice_max is not None else -1], dtype=np.int32),
         i_window=np.asarray([int(i_window)], dtype=np.int32),
         k_window=np.asarray([int(k_window)], dtype=np.int32),
+        continuity_lambda=np.asarray([float(continuity_lambda)], dtype=np.float32),
+        curvature_lambda=np.asarray([float(curvature_lambda)], dtype=np.float32),
+        max_seams_per_row=np.asarray([int(max_seams_per_row)], dtype=np.int32),
     )
 
     map_c2s_slice = np.full((coronal_keys.size, t_grid.size), np.nan, dtype=np.float32)
     map_c2s_t = np.full((coronal_keys.size, t_grid.size), np.nan, dtype=np.float32)
     map_c2s_err = np.full((coronal_keys.size, t_grid.size), np.nan, dtype=np.float32)
+    qc_rows_c2s: list[dict[str, object]] = []
     for row, slice_i in enumerate(coronal_keys.tolist()):
         if row % 16 == 0 or row == (coronal_keys.size - 1):
             print(f"[lut] c2s rows {row + 1}/{coronal_keys.size}")
@@ -2451,8 +2584,25 @@ def build_transition_lut_2d(
     valid_c2s = np.ones((coronal_keys.size,), dtype=bool)
     for row in range(coronal_keys.size):
         map_c2s_slice[row] = _fill_nan_series(map_c2s_slice[row]).astype(np.float32, copy=False)
-        map_c2s_t[row] = _fill_nan_series(map_c2s_t[row]).astype(np.float32, copy=False)
+        raw_t = _fill_nan_series(map_c2s_t[row]).astype(np.float64, copy=False)
+        before = _row_discontinuity_metrics(raw_t)
+        reg_t, meta = _regularize_target_t_row_soft(
+            row=raw_t,
+            continuity_lambda=float(continuity_lambda),
+            curvature_lambda=float(curvature_lambda),
+            max_seams_per_row=int(max_seams_per_row),
+        )
+        after = _row_discontinuity_metrics(reg_t)
+        map_c2s_t[row] = reg_t.astype(np.float32, copy=False)
         map_c2s_err[row] = _fill_nan_series(map_c2s_err[row]).astype(np.float32, copy=False)
+        qc_rows_c2s.append(
+            {
+                "source_slice": int(coronal_keys[row]),
+                "before": before,
+                "after": after,
+                "seams_used": int(meta["seams_used"]),
+            }
+        )
         if not (
             np.isfinite(map_c2s_slice[row]).all()
             and np.isfinite(map_c2s_t[row]).all()
@@ -2483,7 +2633,18 @@ def build_transition_lut_2d(
         coronal_slice_max=np.asarray([int(coronal_slice_max) if coronal_slice_max is not None else -1], dtype=np.int32),
         i_window=np.asarray([int(i_window)], dtype=np.int32),
         k_window=np.asarray([int(k_window)], dtype=np.int32),
+        continuity_lambda=np.asarray([float(continuity_lambda)], dtype=np.float32),
+        curvature_lambda=np.asarray([float(curvature_lambda)], dtype=np.float32),
+        max_seams_per_row=np.asarray([int(max_seams_per_row)], dtype=np.int32),
     )
+    if qc_report_path is not None:
+        qc_payload = {
+            "maps": {
+                "sagittal_to_coronal": {"rows": qc_rows_s2c},
+                "coronal_to_sagittal": {"rows": qc_rows_c2s},
+            }
+        }
+        Path(qc_report_path).write_text(json.dumps(qc_payload, indent=2), encoding="utf-8")
     dt = time.perf_counter() - t0
     print(f"[lut] 2D chart LUTs done: elapsed_s={dt:.1f}")
     return s2c_path, c2s_path

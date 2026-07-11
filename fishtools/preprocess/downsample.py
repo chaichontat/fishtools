@@ -18,6 +18,16 @@ _skimage_downscale = None
 _cuda_available: bool | None = None
 
 
+def _get_cuda_runtime_error_type() -> type[Exception] | None:
+    """Return CuPy's runtime error type when the CUDA runtime is available."""
+    cuda = getattr(cp, "cuda", None)
+    runtime = getattr(cuda, "runtime", None)
+    runtime_error_type = getattr(runtime, "CUDARuntimeError", None)
+    if isinstance(runtime_error_type, type) and issubclass(runtime_error_type, Exception):
+        return runtime_error_type
+    return None
+
+
 def _check_cuda_available() -> bool:
     """Check if CUDA is available for GPU operations."""
     global _cuda_available, cp, downscale_local_mean
@@ -37,7 +47,21 @@ def _check_cuda_available() -> bool:
     cuda = getattr(cp, "cuda", None)
     runtime = getattr(cuda, "runtime", None)
     get_device_count = getattr(runtime, "getDeviceCount", None)
-    if not callable(get_device_count) or int(get_device_count()) < 1:
+    if not callable(get_device_count):
+        _cuda_available = False
+        return _cuda_available
+
+    runtime_error_type = _get_cuda_runtime_error_type()
+    if runtime_error_type is not None:
+        try:
+            device_count = int(get_device_count())
+        except runtime_error_type:
+            _cuda_available = False
+            return _cuda_available
+    else:
+        device_count = int(get_device_count())
+
+    if device_count < 1:
         _cuda_available = False
         return _cuda_available
 
@@ -155,15 +179,28 @@ def downsample_xy(
 
     Uses GPU acceleration when available, falls back to CPU otherwise.
     """
-    if _check_cuda_available():
-        return _gpu_downsample_xy(
-            volume, crop=crop, factor=factor, clip_range=clip_range, output_dtype=output_dtype
-        )
-    else:
+    global _cuda_available
+    downsample_kwargs = {
+        "crop": crop,
+        "factor": factor,
+        "clip_range": clip_range,
+        "output_dtype": output_dtype,
+    }
+
+    if not _check_cuda_available():
         logger.debug("CUDA not available, using CPU downsampling")
-        return _cpu_downsample_xy(
-            volume, crop=crop, factor=factor, clip_range=clip_range, output_dtype=output_dtype
-        )
+        return _cpu_downsample_xy(volume, **downsample_kwargs)
+
+    runtime_error_type = _get_cuda_runtime_error_type()
+    if runtime_error_type is None:
+        return _gpu_downsample_xy(volume, **downsample_kwargs)
+
+    try:
+        return _gpu_downsample_xy(volume, **downsample_kwargs)
+    except runtime_error_type as exc:
+        _cuda_available = False
+        logger.warning(f"CUDA downsampling unavailable ({exc}); falling back to CPU.")
+        return _cpu_downsample_xy(volume, **downsample_kwargs)
 
 
 # Legacy alias for backwards compatibility

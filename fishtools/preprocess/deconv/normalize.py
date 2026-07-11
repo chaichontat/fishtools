@@ -511,8 +511,8 @@ def quantize(
 ) -> None:
     """Quantize float32 deconvolved tiles in ws.deconv32 to uint16 deliverables."""
 
-    if n_fids <= 0:
-        raise click.BadParameter("--n-fids must be positive.")
+    if n_fids < 0:
+        raise click.BadParameter("--n-fids must be non-negative.")
 
     ws = Workspace(workspace)
     workspace = ws.path

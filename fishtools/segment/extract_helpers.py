@@ -52,7 +52,7 @@ Volume: TypeAlias = np.ndarray | zarr.Array
 
 @dataclass(frozen=True)
 class ExtractionConfig:
-    mode: Literal["z", "ortho"]
+    mode: Literal["z", "ortho", "maxproj"]
     channels: str | None
     crop: int
     dz: int
@@ -483,6 +483,18 @@ def _format_tile_filename(
     coord_width: int,
 ) -> str:
     name = f"{stem}_y{y0:0{coord_width}d}_x{x0:0{coord_width}d}_z{z_index:02d}.tif"
+    return _prefix_with_roi(name, roi)
+
+
+def _format_tile_maxproj_filename(
+    stem: str,
+    roi: str,
+    y0: int,
+    x0: int,
+    *,
+    coord_width: int,
+) -> str:
+    name = f"{stem}_maxproj-y{y0:0{coord_width}d}-x{x0:0{coord_width}d}.tif"
     return _prefix_with_roi(name, roi)
 
 

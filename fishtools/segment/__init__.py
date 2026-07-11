@@ -34,12 +34,14 @@ def _strip_line_comments(text: str) -> str:
     default=False,
     help="Enable packed-stripe training to align with accelerated inference.",
 )
+@click.option("--skip-trt", is_flag=True, help="Skip TensorRT engine generation after training.")
 def train(
     path: Path,
     name: str,
     use_te: bool,
     te_fp8: bool,
     packed: bool,
+    skip_trt: bool,
 ) -> None:
     from fishtools.segment.train import TrainConfig as TrainConfigCls
     from fishtools.segment.train import run_train
@@ -69,6 +71,8 @@ def train(
         updates.update({"use_te": effective_use_te, "te_fp8": effective_te_fp8})
     if packed != train_config.packed:
         updates["packed"] = packed
+    if skip_trt:
+        updates["skip_trt"] = True
     if updates:
         train_config = train_config.model_copy(update=updates)
 
@@ -980,7 +984,7 @@ def postproc_batch_command(
 
 
 @app.command("extract")
-@click.argument("mode", type=click.Choice(["z", "ortho"], case_sensitive=False))
+@click.argument("mode", type=click.Choice(["z", "ortho", "maxproj"], case_sensitive=False))
 @click.argument(
     "path",
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
@@ -993,19 +997,23 @@ def postproc_batch_command(
     help="Output directory; defaults under analysis/deconv/segment--{roi}+{codebook}.",
 )
 @click.option(
-    "--dz", default=1, show_default=True, type=click.IntRange(1, None), help="Step between Z planes (z mode)."
+    "--dz",
+    default=1,
+    show_default=True,
+    type=click.IntRange(1, None),
+    help="Step between Z planes (z/maxproj modes).",
 )
 @click.option(
     "--n",
     default=None,
     type=click.IntRange(1, None),
-    help="Number of images to sample per ROI. Default: 50 for z, 20 for ortho.",
+    help="Number of images to sample per ROI. Default: 50 for z/maxproj, 20 for ortho.",
 )
 @click.option(
     "--n-crops",
     default=None,
     type=click.IntRange(1, None),
-    help="Number of crops per image (z mode). Default: 1.",
+    help="Number of crops per image (z/maxproj modes). Default: 1.",
 )
 @click.option(
     "--anisotropy",

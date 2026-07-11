@@ -42,8 +42,8 @@ def cmd_extract(
     roi_points: Path | None = None,
 ) -> None:
     mode = mode.lower().strip()
-    if mode not in {"z", "ortho"}:
-        raise click.BadParameter("Mode must be 'z' or 'ortho'.")
+    if mode not in {"z", "ortho", "maxproj"}:
+        raise click.BadParameter("Mode must be 'z', 'ortho', or 'maxproj'.")
 
     setup_cli_logging(
         path,

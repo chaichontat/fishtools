@@ -241,7 +241,7 @@ def extract_data_from_tiff(
             if file.parent.name not in n_zs:
                 n_zs[file.parent.name] = len(tif.pages) // nc
             nz = n_zs[file.parent.name]
-            meta = tif.shaped_metadata[0]
+            meta = tif.shaped_metadata[0] if deconv_meta is not None and tif.shaped_metadata is not None else None
 
             for c in range(nc):
                 for k, z in enumerate(zs):
@@ -333,7 +333,7 @@ def extract_data_from_tiff_channels(
             if file.parent.name not in n_zs:
                 n_zs[file.parent.name] = len(tif.pages) // nc
             nz = n_zs[file.parent.name]
-            meta = tif.shaped_metadata[0]
+            meta = tif.shaped_metadata[0] if deconv_meta is not None and tif.shaped_metadata is not None else None
 
             for out_c, c in enumerate(channel_indices):
                 for k, z in enumerate(zs):
@@ -636,6 +636,21 @@ def extract_data_from_registered_channels(
 
     logger.info(f"Loaded {n} files. Output shape: {out.shape}")
     return out
+
+
+def _parse_z_values(zs: str | None, nz: int | None) -> tuple[float, ...]:
+    if nz is not None:
+        if zs is not None:
+            raise click.ClickException("--zs and --nz cannot be used together.")
+        return tuple(float(z) for z in np.linspace(0.0, 1.0, nz + 2)[1:-1])
+
+    if zs is None:
+        return (0.5,)
+
+    z_values = tuple(float(z.strip()) for z in zs.split(",") if z.strip())
+    if not z_values:
+        raise click.ClickException("--zs must contain at least one value.")
+    return z_values
 
 
 def run_with_extractor(
@@ -997,7 +1012,13 @@ def basic(): ...
 @basic.command()
 @click.argument("path", type=click.Path(exists=True, dir_okay=True, file_okay=False, path_type=Path))
 @click.argument("round_", type=str)
-@click.option("--zs", type=str, default="0.5")
+@click.option("--zs", type=str, default=None, help="Comma-separated relative z positions. Defaults to 0.5.")
+@click.option(
+    "--nz",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Number of uniformly spaced interior z planes to sample per tile.",
+)
 @click.option("--overwrite", is_flag=True)
 @click.option("--random-flip", is_flag=True, help="Randomly flip tiles vertically and/or horizontally.")
 @click.option(
@@ -1030,7 +1051,8 @@ def run(
     include_edge_tiles: bool = False,
     max_n_tiles: int = 1000,
     threads: int = 3,
-    zs: str = "0.5",
+    zs: str | None = None,
+    nz: int | None = None,
     seed: int | None = None,
 ):
     # Workspace-scoped logging to {workspace}/analysis/logs; compatible with progress bars
@@ -1055,7 +1077,7 @@ def run(
         if expected_pkls and all(p.exists() for p in expected_pkls):
             logger.info(f"BaSiC already complete for {round_} in {path}. Use --overwrite to re-run.")
             return
-    z_values = tuple(map(float, zs.split(",")))
+    z_values = _parse_z_values(zs, nz)
     extractor = extract_data_from_registered if round_ == "registered" else extract_data_from_tiff
 
     return run_with_extractor(
