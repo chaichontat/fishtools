@@ -4,8 +4,8 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from fishtools.ccf.landmark import LandmarkRegistrationOutputs, P1Landmarks
-from fishtools.ccf.sitk_utils import compute_similarity2d_from_landmarks
+from ccf.landmark import LandmarkRegistrationOutputs, P1Landmarks
+from ccf.sitk_utils import compute_similarity2d_from_landmarks
 
 
 @pytest.mark.unit

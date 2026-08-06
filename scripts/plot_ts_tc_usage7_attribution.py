@@ -18,10 +18,10 @@ matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 
-from fishtools.ccf.transforms import DEFAULT_NATIVE_CAMERA_AZIM_DEG
-from fishtools.ccf.transforms import DEFAULT_NATIVE_CAMERA_ELEV_DEG
-from fishtools.ccf.transforms import DEFAULT_NATIVE_CAMERA_ROLL_DEG
-from fishtools.ccf.transforms import build_apml_native_surface_projection_context
+from ccf.transforms import DEFAULT_NATIVE_CAMERA_AZIM_DEG
+from ccf.transforms import DEFAULT_NATIVE_CAMERA_ELEV_DEG
+from ccf.transforms import DEFAULT_NATIVE_CAMERA_ROLL_DEG
+from ccf.transforms import build_apml_native_surface_projection_context
 
 
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent

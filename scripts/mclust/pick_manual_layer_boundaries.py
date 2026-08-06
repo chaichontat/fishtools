@@ -26,8 +26,8 @@ from skimage.color import label2rgb
 from skimage.draw import line
 from skimage.morphology import disk
 
-from fishtools.ccf.landmark import LandmarkRegistrationOutputs
-from fishtools.ccf.ndimage_geometry import fused_xy_to_rotated_full_xy
+from ccf.landmark import LandmarkRegistrationOutputs
+from ccf.ndimage_geometry import fused_xy_to_rotated_full_xy
 from fishtools.io.workspace import Workspace
 
 plt.rcParams["font.family"] = "sans-serif"

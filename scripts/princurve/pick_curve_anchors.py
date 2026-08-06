@@ -21,7 +21,7 @@ import scipy.sparse as sp
 from IPython import get_ipython
 from matplotlib.widgets import Button
 
-from fishtools.ccf.princurve import fit_anchor_curve, project_to_polyline_arclength
+from ccf.princurve import fit_anchor_curve, project_to_polyline_arclength
 from fishtools.io.workspace import Workspace
 
 matplotlib.rcdefaults()

@@ -15,19 +15,19 @@ import numpy as np
 import pandas as pd
 
 from ccf.refextract.plot_ap_ml_heatmap import compute_ap_ml_support_mask_native_grid
-from fishtools.ccf.transforms import build_apml_native_surface_projection_context
-from fishtools.gam.io_helpers import build_fit_map
-from fishtools.gam.io_helpers import safe_gene_name
-from fishtools.gam.mgcv_predict import RPredictor
-from fishtools.gam.mgcv_predict import is_smooth_term
-from fishtools.gam.mgcv_predict import make_newdata_base
-from fishtools.gam.mgcv_predict import predict_response_shrunk
-from fishtools.gam.mgcv_predict import shrink_hard
-from fishtools.gam.mgcv_predict import shrink_soft
-from fishtools.gam.mgcv_predict import select_ti_apml_r
-from fishtools.gam.native_surface_plotting import native_proj_png_name
-from fishtools.gam.native_surface_plotting import plot_coronal_surface_projection
-from fishtools.gam.surface_predict import predict_term_effect_shrunk
+from ccf.transforms import build_apml_native_surface_projection_context
+from gam.io_helpers import build_fit_map
+from gam.io_helpers import safe_gene_name
+from gam.mgcv_predict import RPredictor
+from gam.mgcv_predict import is_smooth_term
+from gam.mgcv_predict import make_newdata_base
+from gam.mgcv_predict import predict_response_shrunk
+from gam.mgcv_predict import shrink_hard
+from gam.mgcv_predict import shrink_soft
+from gam.mgcv_predict import select_ti_apml_r
+from gam.native_surface_plotting import native_proj_png_name
+from gam.native_surface_plotting import plot_coronal_surface_projection
+from gam.surface_predict import predict_term_effect_shrunk
 
 
 PVAL_COLUMNS = [

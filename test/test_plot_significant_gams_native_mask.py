@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from matplotlib.transforms import IdentityTransform
 
-from fishtools.gam.native_surface_plotting import plot_coronal_surface_projection
+from gam.native_surface_plotting import plot_coronal_surface_projection
 
 
 def test_plot_coronal_surface_projection_perspective_smoke(tmp_path: Path) -> None:
@@ -142,7 +142,7 @@ def test_plot_coronal_surface_projection_perspective_with_latlon_smoke(tmp_path:
 
 
 def test_perspective_tri_alpha_uses_ordered_geometry_order(monkeypatch) -> None:
-    mod = importlib.import_module("fishtools.gam.native_surface_plotting")
+    mod = importlib.import_module("gam.native_surface_plotting")
 
     captured: list[np.ndarray] = []
 
@@ -254,7 +254,7 @@ def test_perspective_tri_alpha_uses_ordered_geometry_order(monkeypatch) -> None:
 
 
 def test_perspective_renderer_reapplies_surface_limits_after_latlon(monkeypatch) -> None:
-    mod = importlib.import_module("fishtools.gam.native_surface_plotting")
+    mod = importlib.import_module("gam.native_surface_plotting")
 
     class _FakePoly3DCollection:
         def __init__(self, *_args, **_kwargs):
@@ -395,7 +395,7 @@ def test_perspective_renderer_reapplies_surface_limits_after_latlon(monkeypatch)
 
 
 def test_rasterize_projected_face_depth_preserves_projected_depth_scale() -> None:
-    mod = importlib.import_module("fishtools.gam.native_surface_plotting")
+    mod = importlib.import_module("gam.native_surface_plotting")
     depth_img, _vis_trans = mod._rasterize_projected_face_depth(
         face_polys2d=np.asarray([[[1.0, 1.0], [5.0, 1.0], [1.0, 5.0]]], dtype=np.float64),
         face_depth=np.asarray([-1.25], dtype=np.float64),
@@ -412,7 +412,7 @@ def test_rasterize_projected_face_depth_preserves_projected_depth_scale() -> Non
 
 
 def test_rasterize_projected_face_depth_prefers_nearest_overlapping_triangle() -> None:
-    mod = importlib.import_module("fishtools.gam.native_surface_plotting")
+    mod = importlib.import_module("gam.native_surface_plotting")
     depth_img, _vis_trans = mod._rasterize_projected_face_depth(
         face_polys2d=np.asarray(
             [
@@ -434,7 +434,7 @@ def test_rasterize_projected_face_depth_prefers_nearest_overlapping_triangle() -
 
 
 def test_perspective_visible_mask_prefers_more_negative_depth() -> None:
-    mod = importlib.import_module("fishtools.gam.native_surface_plotting")
+    mod = importlib.import_module("gam.native_surface_plotting")
     mask = mod._perspective_visible_mask(
         np.asarray([-1.03, -0.97, -1.01], dtype=np.float64),
         np.asarray([-1.00, -1.00, -1.00], dtype=np.float64),
@@ -444,7 +444,7 @@ def test_perspective_visible_mask_prefers_more_negative_depth() -> None:
 
 
 def test_visible_projected_segments_split_around_hidden_interval() -> None:
-    mod = importlib.import_module("fishtools.gam.native_surface_plotting")
+    mod = importlib.import_module("gam.native_surface_plotting")
     depth_img = np.full((8, 8), np.nan, dtype=np.float64)
     row = (depth_img.shape[0] - 1) - 2
     depth_img[row, 0:6] = -1.0
@@ -475,7 +475,7 @@ def test_visible_projected_segments_split_around_hidden_interval() -> None:
 
 
 def test_build_surface_graticule_segments_preserves_mask_gap() -> None:
-    mod = importlib.import_module("fishtools.gam.native_surface_plotting")
+    mod = importlib.import_module("gam.native_surface_plotting")
     xyz = np.asarray(
         [
             [0.0, 0.0, 0.0],
@@ -540,7 +540,7 @@ def test_compute_apml_percentile_bounds_and_tri_alpha() -> None:
 
 
 def test_smooth_neomeso_mask_tall_parametric_reduces_rowwise_t_range_kink() -> None:
-    mod = importlib.import_module("fishtools.ccf.transforms")
+    mod = importlib.import_module("ccf.transforms")
     orig = np.asarray(
         [
             [False, True, True, True, True, False, False],
@@ -575,7 +575,7 @@ def test_smooth_neomeso_mask_tall_parametric_reduces_rowwise_t_range_kink() -> N
 
 
 def test_smooth_neomeso_tri_mask_parametric_uses_centroid_boundary() -> None:
-    mod = importlib.import_module("fishtools.ccf.transforms")
+    mod = importlib.import_module("ccf.transforms")
     tri_mask = mod.smooth_neomeso_tri_mask_parametric(
         faces=np.asarray([[0, 1, 4], [1, 5, 4]], dtype=np.int32),
         tri_support=np.asarray([True, True], dtype=bool),
@@ -588,7 +588,7 @@ def test_smooth_neomeso_tri_mask_parametric_uses_centroid_boundary() -> None:
 
 
 def test_prepare_ordered_surface_geometry_clipped_to_parametric_band_creates_boundary_vertices() -> None:
-    mod = importlib.import_module("fishtools.ccf.transforms")
+    mod = importlib.import_module("ccf.transforms")
     geom = mod.prepare_ordered_surface_geometry_clipped_to_parametric_band(
         x2d=np.asarray([0.0, 1.0, 2.0, 0.0, 1.0, 2.0], dtype=np.float64),
         y2d=np.asarray([0.0, 0.0, 0.0, 1.0, 1.0, 1.0], dtype=np.float64),
@@ -611,7 +611,7 @@ def test_prepare_ordered_surface_geometry_clipped_to_parametric_band_creates_bou
 
 
 def test_build_surface_graticule_segments_3d_uses_continuous_neomeso_boundary() -> None:
-    mod = importlib.import_module("fishtools.gam.native_surface_plotting")
+    mod = importlib.import_module("gam.native_surface_plotting")
     xyz = np.column_stack(
         [
             np.asarray([0.0, 1.0, 2.0, 0.0, 1.0, 2.0], dtype=np.float64),

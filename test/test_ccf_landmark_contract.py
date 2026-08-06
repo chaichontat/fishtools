@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fishtools.ccf.landmark import LandmarkRegistrationOutputs, P1Landmarks
-from fishtools.ccf.sitk_utils import normalize_robust
+from ccf.landmark import LandmarkRegistrationOutputs, P1Landmarks
+from ccf.sitk_utils import normalize_robust
 
 
 def test_outputs_contract_paths(tmp_path: Path) -> None:

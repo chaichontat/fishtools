@@ -21,7 +21,7 @@ from scipy.ndimage import distance_transform_edt
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import cKDTree
 
-from fishtools.ccf.princurve import (
+from ccf.princurve import (
     fit_anchor_curve as shared_fit_anchor_curve,
     project_to_polyline_arclength as shared_project_to_polyline_arclength,
     signed_distance_to_polyline as shared_signed_distance_to_polyline,

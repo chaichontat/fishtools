@@ -96,7 +96,7 @@ class _ExplodingAtlas:
 def test_export_mask_edit_pack_reference_only_does_not_require_summary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from fishtools.ccf import cli_export_mask_edit_pack as export
+    from ccf import cli_export_mask_edit_pack as export
 
     monkeypatch.setattr(export, "BrainGlobeAtlas", _ExplodingAtlas)
 
@@ -131,7 +131,7 @@ def test_export_mask_edit_pack_reference_only_does_not_require_summary(
 
 def test_export_mask_edit_pack_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ccf import ants_landmark_syn_init as syn
-    from fishtools.ccf import cli_export_mask_edit_pack as export
+    from ccf import cli_export_mask_edit_pack as export
 
     monkeypatch.setattr(syn, "BrainGlobeAtlas", _DummyAtlas)
     monkeypatch.setattr(export, "BrainGlobeAtlas", _DummyAtlas)
@@ -220,7 +220,7 @@ def test_export_mask_edit_pack_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def test_export_mask_edit_pack_skips_rois_without_a_mask(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ccf import ants_landmark_syn_init as syn
-    from fishtools.ccf import cli_export_mask_edit_pack as export
+    from ccf import cli_export_mask_edit_pack as export
 
     monkeypatch.setattr(syn, "BrainGlobeAtlas", _DummyAtlas)
     monkeypatch.setattr(export, "BrainGlobeAtlas", _DummyEmptyMaskAtlas)
@@ -288,7 +288,7 @@ def test_export_mask_edit_pack_skips_rois_without_a_mask(tmp_path: Path, monkeyp
 
 def test_export_mask_edit_pack_all_rois_skips_missing_run_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from ccf import ants_landmark_syn_init as syn
-    from fishtools.ccf import cli_export_mask_edit_pack as export
+    from ccf import cli_export_mask_edit_pack as export
 
     monkeypatch.setattr(syn, "BrainGlobeAtlas", _DummyAtlas)
     monkeypatch.setattr(export, "BrainGlobeAtlas", _DummyAtlas)

@@ -1422,7 +1422,7 @@ def thumbnail_command(
     from loguru import logger
     from scipy.ndimage import rotate as ndimage_rotate
 
-    from fishtools.ccf.landmark import LandmarkRegistrationOutputs
+    from ccf.landmark import LandmarkRegistrationOutputs
     from fishtools.io.workspace import Workspace
     from fishtools.segment.normalize import sample_percentile
 

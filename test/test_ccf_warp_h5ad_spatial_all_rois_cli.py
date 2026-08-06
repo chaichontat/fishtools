@@ -4,7 +4,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from fishtools.ccf.cli_warp_h5ad_spatial import main
+from ccf.cli_warp_h5ad_spatial import main
 
 
 def _make_workspace(tmp_path: Path, *, rois: list[str]) -> Path:

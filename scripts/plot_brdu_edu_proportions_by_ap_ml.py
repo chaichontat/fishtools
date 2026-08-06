@@ -5,13 +5,13 @@ import pathlib
 import re
 
 import anndata as ad
-from fishtools.ccf.transforms import DEFAULT_NATIVE_CAMERA_AZIM_DEG
-from fishtools.ccf.transforms import DEFAULT_NATIVE_CAMERA_ELEV_DEG
-from fishtools.ccf.transforms import DEFAULT_NATIVE_CAMERA_ROLL_DEG
-from fishtools.ccf.transforms import DEFAULT_NATIVE_FOCAL_LENGTH
-from fishtools.ccf.transforms import DEFAULT_NATIVE_PROJ_TYPE
-from fishtools.ccf.transforms import build_apml_native_surface_projection_context
-from fishtools.gam.native_surface_plotting import plot_coronal_surface_projection
+from ccf.transforms import DEFAULT_NATIVE_CAMERA_AZIM_DEG
+from ccf.transforms import DEFAULT_NATIVE_CAMERA_ELEV_DEG
+from ccf.transforms import DEFAULT_NATIVE_CAMERA_ROLL_DEG
+from ccf.transforms import DEFAULT_NATIVE_FOCAL_LENGTH
+from ccf.transforms import DEFAULT_NATIVE_PROJ_TYPE
+from ccf.transforms import build_apml_native_surface_projection_context
+from gam.native_surface_plotting import plot_coronal_surface_projection
 from fishtools.postprocess.utils_h5ad import read_obsm_h5ad
 import matplotlib
 import numpy as np

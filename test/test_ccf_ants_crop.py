@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from fishtools.ccf.ants_crop import fixed_crop_bounds_from_masks_xy
+from ccf.ants_crop import fixed_crop_bounds_from_masks_xy
 
 
 def test_fixed_crop_bounds_from_masks_xy_uses_warped_moving_mask_not_overlap() -> None:

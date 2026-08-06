@@ -7,7 +7,7 @@ import pytest
 
 
 def test_pick_atlas_slice_idx_returns_latest_slider_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fishtools.ccf.landmark_ui as ui
+    import ccf.landmark_ui as ui
 
     captured: dict[str, object] = {}
     original_slider = ui.Slider
@@ -33,7 +33,7 @@ def test_pick_atlas_slice_idx_returns_latest_slider_value(monkeypatch: pytest.Mo
 
 
 def test_pick_atlas_slice_idx_save_button_calls_callback_with_latest_idx(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fishtools.ccf.landmark_ui as ui
+    import ccf.landmark_ui as ui
 
     captured: dict[str, object] = {}
     original_slider = ui.Slider
@@ -80,7 +80,7 @@ def test_pick_atlas_slice_idx_save_button_calls_callback_with_latest_idx(monkeyp
 
 
 def test_pick_rotation_deg_returns_latest_slider_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fishtools.ccf.landmark_ui as ui
+    import ccf.landmark_ui as ui
 
     captured: dict[str, object] = {}
     original_slider = ui.Slider
@@ -106,7 +106,7 @@ def test_pick_rotation_deg_returns_latest_slider_value(monkeypatch: pytest.Monke
 
 
 def test_pick_rotation_deg_flip_x_toggle_updates_picker_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    import fishtools.ccf.landmark_ui as ui
+    import ccf.landmark_ui as ui
 
     captured: dict[str, object] = {}
     original_slider = ui.Slider
@@ -145,7 +145,7 @@ def test_pick_rotation_deg_flip_x_toggle_updates_picker_state(monkeypatch: pytes
 def test_pick_paired_landmarks_undo_button_click_removes_last_pair(monkeypatch: pytest.MonkeyPatch) -> None:
     import matplotlib.backend_bases
 
-    import fishtools.ccf.landmark_ui as ui
+    import ccf.landmark_ui as ui
 
     captured: dict[str, object] = {}
     original_mpl_connect = matplotlib.backend_bases.FigureCanvasBase.mpl_connect
@@ -188,7 +188,7 @@ def test_pick_paired_landmarks_undo_button_click_removes_last_pair(monkeypatch: 
 def test_pick_paired_landmarks_save_button_click_sets_status(monkeypatch: pytest.MonkeyPatch) -> None:
     import matplotlib.backend_bases
 
-    import fishtools.ccf.landmark_ui as ui
+    import ccf.landmark_ui as ui
 
     captured: dict[str, object] = {}
     original_mpl_connect = matplotlib.backend_bases.FigureCanvasBase.mpl_connect
@@ -235,7 +235,7 @@ def test_pick_paired_landmarks_save_button_click_sets_status(monkeypatch: pytest
 def test_pick_paired_landmarks_on_change_only_called_on_save(monkeypatch: pytest.MonkeyPatch) -> None:
     import matplotlib.backend_bases
 
-    import fishtools.ccf.landmark_ui as ui
+    import ccf.landmark_ui as ui
 
     captured: dict[str, object] = {}
     original_mpl_connect = matplotlib.backend_bases.FigureCanvasBase.mpl_connect
@@ -284,7 +284,7 @@ def test_pick_paired_landmarks_on_change_only_called_on_save(monkeypatch: pytest
 def test_pick_paired_landmarks_toggle_button_hides_and_shows_markers(monkeypatch: pytest.MonkeyPatch) -> None:
     import matplotlib.backend_bases
 
-    import fishtools.ccf.landmark_ui as ui
+    import ccf.landmark_ui as ui
 
     captured: dict[str, object] = {}
     original_mpl_connect = matplotlib.backend_bases.FigureCanvasBase.mpl_connect

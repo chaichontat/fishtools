@@ -14,15 +14,15 @@ import numpy as np
 import pandas as pd
 
 from ccf.refextract.plot_ap_ml_heatmap import compute_ap_ml_support_mask_native_grid
-from fishtools.ccf.transforms import build_apml_native_surface_projection_context
-from fishtools.gam.mgcv_predict import RPredictor
-from fishtools.gam.native_surface_plotting import (
+from ccf.transforms import build_apml_native_surface_projection_context
+from gam.mgcv_predict import RPredictor
+from gam.native_surface_plotting import (
     _mask_r_ap_ml_pair_by_support,
     plot_coronal_surface_projection,
     write_apml_native_proj_montage,
 )
-from fishtools.gam.surface_predict import GAMPredictorConfig
-from fishtools.gam.surface_predict import make_newdata_for_fit
+from gam.surface_predict import GAMPredictorConfig
+from gam.surface_predict import make_newdata_for_fit
 
 PNG_NAME = "fit_ap_ml_native_proj_simplex_u.png"
 MONTAGE_NAME = "montage_fit_ap_ml_native_proj_simplex_u.png"

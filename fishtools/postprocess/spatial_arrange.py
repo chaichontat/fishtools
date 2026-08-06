@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, TypedDict
 import numpy as np
 from loguru import logger
 
-from fishtools.ccf.landmark import LandmarkRegistrationOutputs
+from ccf.landmark import LandmarkRegistrationOutputs
 from fishtools.io.workspace import Workspace
 from fishtools.utils.utils import create_rotation_matrix
 
