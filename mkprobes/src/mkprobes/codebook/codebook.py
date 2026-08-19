@@ -1,0 +1,295 @@
+# %%
+import json
+from hashlib import md5
+from pathlib import Path
+from typing import Any, Collection, Literal, Sized, overload
+
+import numpy as np
+import numpy.typing as npt
+import polars as pl
+from loguru import logger
+from pydantic import BaseModel, TypeAdapter
+from scipy.stats import entropy
+
+
+def hash_codebook(cb: dict[str, Collection[int]]) -> str:
+    return md5(
+        json.dumps(cb, sort_keys=True, ensure_ascii=True).encode(),
+        usedforsecurity=False,
+    ).hexdigest()[-6:]
+
+
+def bit_count(arr: npt.NDArray[np.integer[Any]]) -> npt.ArrayLike:
+    # Make the values type-agnostic (as long as it's integers)
+    t = arr.dtype.type
+    mask = np.array(-1).astype(arr.dtype)
+    s55 = t(0x5555555555555555 & mask)  # Add more digits for 128bit support
+    s33 = t(0x3333333333333333 & mask)
+    s0F = t(0x0F0F0F0F0F0F0F0F & mask)
+    s01 = t(0x0101010101010101 & mask)
+
+    arr = arr - ((arr >> 1) & s55)
+    arr = (arr & s33) + ((arr >> 2) & s33)
+    arr = (arr + (arr >> 4)) & s0F
+    return (arr * s01) >> (8 * (arr.itemsize - 1))
+
+
+def n_to_bit(arr: np.ndarray, n: int, on: int):
+    """
+    Convert an array of integers into a 2D array of binary representations.
+
+    Each integer in the input array is represented as an `n`-bit binary number in the output array.
+    The function also checks that the number of 1s in each binary representation is equal to `on`.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        A 1D numpy array of integers.
+    n : int
+        The number of bits to use for the binary representation of each integer.
+    on : int
+        The expected number of 1s in each binary representation.
+
+    Returns
+    -------
+    np.ndarray
+        A 2D numpy array where each row is the `n`-bit binary representation of the corresponding integer in the input array.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> print(n_to_bit(np.array([1, 2, 4]), 3, 1))
+    array([[1, 0, 0],
+          [0, 1, 0],
+          [0, 0, 1]])
+    """
+
+    if not isinstance(arr, np.ndarray):  # type: ignore
+        raise TypeError("Input array must be a numpy array.")
+
+    arr = ((arr[:, None] & (1 << np.arange(n))) > 0).astype(int)
+    if not np.all(arr.sum(axis=1) == on):
+        raise ValueError(f"Number of 1s is not equal to {on=}.")
+    return arr
+
+
+def _entropy(loads: npt.ArrayLike) -> float:
+    values = np.asarray(loads, dtype=np.float64)
+    if not np.all(np.isfinite(values)) or np.any(values < 0):
+        raise ValueError("Expression values must be finite and nonnegative")
+    if values.sum() <= 0:
+        raise ValueError("Expression values must have a positive total")
+    return float(entropy(values, base=2, axis=None))
+
+
+class CodebookPicker:
+    def __init__(
+        self,
+        mhd4: npt.NDArray[np.bool_] | str | Path,
+        genes: list[str],
+        subset: tuple[int, int] | None = None,
+        existing: npt.NDArray[np.bool_] | None = None,
+    ) -> None:
+        if isinstance(mhd4, str | Path):
+            mhd4 = np.loadtxt(mhd4, delimiter=",", dtype=bool, ndmin=2)
+
+        codes = np.asarray(mhd4)
+        if codes.ndim != 2:
+            raise ValueError("MHD4 must be a two-dimensional code matrix")
+        if codes.shape[0] == 0 or codes.shape[1] == 0:
+            raise ValueError("MHD4 must contain at least one code and one barcode")
+        if not np.all(np.logical_or(codes == 0, codes == 1)):
+            raise ValueError("MHD4 must only contain 0 and 1")
+        if np.unique(codes, axis=0).shape[0] != codes.shape[0]:
+            raise ValueError("MHD4 must not contain duplicate codes")
+
+        if len(set(genes)) != len(genes):
+            raise ValueError("Gene names must be unique")
+        if any(gene.startswith("Blank") for gene in genes):
+            raise ValueError("Gene names starting with 'Blank' are reserved")
+
+        self.mhd4 = codes.astype(bool, copy=True)
+        self.genes = list(genes)
+        self.subset = subset
+        self.existing: npt.NDArray[np.bool_] | None = None
+
+        if existing is not None:
+            existing_codes = np.asarray(existing)
+            if existing_codes.ndim != 2:
+                raise ValueError("Existing codes must be a two-dimensional code matrix")
+            if existing_codes.shape[1] > self.mhd4.shape[1]:
+                raise ValueError("Existing codes cannot have more barcodes than MHD4")
+            if not np.all(np.logical_or(existing_codes == 0, existing_codes == 1)):
+                raise ValueError("Existing codes must only contain 0 and 1")
+
+            self.existing = np.pad(
+                existing_codes.astype(bool, copy=False),
+                ((0, 0), (0, self.mhd4.shape[1] - existing_codes.shape[1])),
+            )
+            existing_rows = {tuple(row) for row in self.existing}
+            if missing := existing_rows - {tuple(row) for row in self.mhd4}:
+                raise ValueError(f"Existing codes are not present in MHD4: {len(missing)}")
+            keep = np.array([tuple(row) not in existing_rows for row in self.mhd4], dtype=bool)
+            self.mhd4 = self.mhd4[keep]
+
+        if len(self.genes) > self.mhd4.shape[0]:
+            raise ValueError("Cannot assign more genes than possible codes")
+
+    def gen_codebook(self, seed: int):
+        rand = np.random.RandomState(seed)
+        rmhd4 = self.mhd4.copy()
+        rand.shuffle(rmhd4)
+        return rmhd4
+
+    def _calc_entropy(self, seed: int, fpkm: Sized):
+        rmhd4 = self.gen_codebook(seed)
+        loads = (rmhd4[: len(fpkm)] * np.asarray(fpkm).reshape(-1, 1)).sum(axis=0)
+
+        return _entropy(loads), loads
+
+    def find_optimalish(self, fpkm: npt.NDArray[Any], iterations: int = 200):
+        if iterations <= 0:
+            raise ValueError("iterations must be positive")
+
+        fpkm = np.asarray(fpkm)
+        if not np.all(np.isfinite(fpkm)) or np.any(fpkm < 0):
+            raise ValueError("Expression values must be finite and nonnegative")
+
+        if fpkm.size != len(self.genes):
+            raise ValueError("Mismatch array size between gene name list and counts matrix")
+
+        if fpkm.size > self.mhd4.shape[0]:
+            raise ValueError("Number of genes is larger than the number of possible codes")
+
+        if fpkm.size > 0.95 * self.mhd4.shape[0]:
+            logger.warning(
+                f"Number of genes ({fpkm.size}) is close to the number of possible codes ({self.mhd4.shape[0]}). "
+                "This may result in a suboptimal codebook. "
+                "Consider using a larger codebook or a smaller number of genes."
+            )
+
+        res = [self._calc_entropy(i, fpkm)[0] for i in range(iterations)]
+        best = np.argmax(res)
+        logger.info(
+            f"Best codebook found at seed {best} with entropy {res[best]:.3f} (worst entropy is {np.min(res):.3f})."
+        )
+
+        return int(best), self._calc_entropy(int(best), fpkm)[1]
+
+    @overload
+    def export_codebook(
+        self, seed: int, type: Literal["json"] = ..., offset: int = ...
+    ) -> dict[str, list[int]]: ...
+
+    @overload
+    def export_codebook(self, seed: int, type: Literal["csv"], offset: int = ...) -> pl.DataFrame: ...
+
+    def export_codebook(
+        self, seed: int, type: Literal["csv", "json"] = "json", offset: int = 1
+    ) -> pl.DataFrame | dict[str, list[int]]:
+        rmhd4 = self.gen_codebook(seed)
+        n_blanks = self.mhd4.shape[0] - len(self.genes)
+        match type:
+            case "csv":
+                return pl.concat(
+                    [
+                        pl.DataFrame(dict(genes=self.genes + [f"Blank-{i + 1}" for i in range(n_blanks)])),
+                        pl.DataFrame(rmhd4.astype(np.uint8)),
+                    ],
+                    how="horizontal",
+                )
+            case "json":
+                return {
+                    gene: sorted(np.flatnonzero(code) + offset)
+                    for gene, code in zip(
+                        self.genes + [f"Blank-{i + 1}" for i in range(n_blanks)], rmhd4.astype(int)
+                    )
+                }
+            case _:  # type: ignore
+                raise ValueError(f"Unknown type {type}")
+
+
+class CodebookPickerSingleCell(CodebookPicker):
+    def find_optimalish(
+        self,
+        counts: npt.NDArray[Any],
+        *,
+        iterations: int = 200,
+        percentile: float = 99.9,
+    ):
+        if iterations <= 0:
+            raise ValueError("iterations must be positive")
+
+        counts = np.asarray(counts)
+        if counts.ndim != 2:
+            raise ValueError("Counts must be a two-dimensional matrix")
+        if not np.all(np.isfinite(counts)) or np.any(counts < 0):
+            raise ValueError("Expression values must be finite and nonnegative")
+
+        def _find(seed: int):
+            rmhd4 = self.gen_codebook(seed)
+            loads = np.percentile(
+                counts @ rmhd4[: counts.shape[1]],
+                percentile,
+                axis=0,
+            ).squeeze()
+            return _entropy(loads), loads
+
+        if counts.shape[1] != len(self.genes):
+            raise ValueError("Mismatch array size between gene name list and counts matrix")
+
+        if counts.shape[1] > self.mhd4.shape[0]:
+            raise ValueError("Number of genes is larger than the number of possible codes")
+
+        if counts.shape[1] > 0.95 * self.mhd4.shape[0]:
+            logger.warning(
+                f"Number of genes ({counts.shape[1]}) is close to the number of possible codes ({self.mhd4.shape[0]}). "
+                "This may result in a suboptimal codebook. "
+                "Consider using a larger codebook or a smaller number of genes."
+            )
+
+        res = [_find(i)[0] for i in range(iterations)]
+        best = np.argmax(res)
+        logger.info(
+            f"Best codebook found at seed {best} with entropy {res[best]:.3f} (worst entropy is {np.min(res):.3f})."
+        )
+
+        return best, _find(int(best))[1]
+
+
+class ProbeSet(BaseModel):
+    name: str
+    species: str
+    codebook: str
+    bcidx: int
+    existing: str | None = None
+    single: bool = False
+    all_bit: int = 29
+    n_probes: Literal["high", "low"] | int | None = None
+
+    def load_codebook(self, path: Path | str, include_blank: bool = False) -> dict[str, list[int]]:
+        path = Path(path)
+        try:
+            cb = json.loads((path / self.codebook).read_text())
+        except FileNotFoundError:
+            cb = json.loads((path / self.codebook.split("/")[-1]).read_text())
+        return {k: v for k, v in cb.items() if not k.startswith("Blank") or include_blank}
+
+    # def codebook_dfs(self, path: Path | str):
+    #     codebook = self.load_codebook(path)
+    #     tss = list(codebook)
+    #     dfs = pl.concat([
+    #         pl.read_parquet(Path(path) / f"{hash_codebook(codebook)}/output/{ts}_final_BamHIKpnI.parquet")
+    #         # .sample(shuffle=True, seed=4, fraction=1)
+    #         .sort(["priority", "hp"])
+    #         for ts in tss
+    #     ])
+    #     return dfs
+
+    @classmethod
+    def from_list_json(cls, path: str | Path):
+        return TypeAdapter(list[cls]).validate_json(Path(path).read_text())
+
+    @classmethod
+    def from_manifest(cls, path: str | Path):
+        return cls.from_list_json(path)

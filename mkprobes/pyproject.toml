@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mkprobes"
+version = "0.1.0"
+description = "Combinatorial FISH probe design tools"
+authors = [{ name = "Chaichontat Sriworarat", email = "csriwor1@jh.edu" }]
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anndata>=0.12.2",
+    "biopython>=1.84",
+    "click>=8.1.1",
+    "colorama>=0.4.6",
+    "loguru>=0.7.0",
+    "matplotlib",
+    "mygene>=3.2.2",
+    "numpy>=1.25.1",
+    "pandas",
+    "polars>=1.32.3",
+    "primer3-py>=2.2.0",
+    "pyfastx>=2.1.0",
+    "pydantic>=2.11.7",
+    "questionary>=2.1.1",
+    "requests",
+    "rich",
+    "rich-click>=1.8.9",
+    "scikit-learn",
+    "scipy>=1.16.1",
+    "seaborn>=0.13.2",
+    "tqdm>=4.65.0",
+    "typing-extensions",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.4.1",
+    "pytest-mock>=3.14.1",
+    "ruff",
+]
+
+[project.scripts]
+mkprobes = "mkprobes.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mkprobes"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/mkprobes", "tests", "scripts", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+ignore = ["E501", "E713", "E731"]
+
+[tool.pyright]
+include = ["src/mkprobes"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
